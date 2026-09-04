@@ -4936,6 +4936,38 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
     }
 
+    #[tokio::test]
+    async fn main_system_prompt_reaches_the_first_chat_request_after_builtin_instructions() {
+        const MARKER: &str = "MAIN_SYSTEM_PROMPT_WIRE_MARKER";
+        let builtin = format!(
+            "{}\n\n{}",
+            include_str!("../../assets/prompts/system.md").trim(),
+            include_str!("../../assets/prompts/profile_default.md").trim()
+        );
+        let mut config = ResolvedConfig::default();
+        config.model.system_prompt = format!("  {MARKER}  ");
+
+        let run = run_scripted(
+            config,
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("done".to_string())],
+                finish_reason: FinishReason::Stop,
+            }],
+        )
+        .await
+        .expect("scripted run");
+
+        assert!(run.summary.is_ok());
+        let first_request = run.requests.first().expect("first chat request");
+        assert!(
+            first_request.system_prompt.starts_with(&format!(
+                "{builtin}\n\n## User-configured system prompt\n\n{MARKER}"
+            )),
+            "configured prompt must follow the unchanged built-in prompt"
+        );
+        assert_eq!(first_request.system_prompt.matches(MARKER).count(), 1);
+    }
+
     struct ScriptedClient {
         outcomes: Mutex<Vec<ScriptedOutcome>>,
         requests: Arc<Mutex<Vec<ChatRequest>>>,

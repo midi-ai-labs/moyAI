@@ -32,6 +32,7 @@ function sideState(
       chat_id: "side-a",
       owner_session_id: ownerSessionId,
       model: "gemma-test",
+      system_prompt: "",
       base_url: "http://127.0.0.1:1234/v1",
       status: "idle",
       phase: "idle",

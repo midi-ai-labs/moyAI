@@ -228,6 +228,7 @@ test("agent inspector separates ordered list and selected execution detail", () 
       chat_id: null,
       owner_session_id: "session-a",
       model: "",
+      system_prompt: "",
       base_url: "",
       status: "idle",
       phase: "idle",

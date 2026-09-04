@@ -268,10 +268,10 @@ const EXACT_DELIVERY_ACTION_IDS = [
     "insert-command",
   ] as const;
 
-test("the single GUI action registry owns all 98 actions without duplicates", () => {
+test("the single GUI action registry owns all 97 actions without duplicates", () => {
   const actionIds = ACTIONS.map((action) => action.id);
 
-  assert.equal(actionIds.length, 98);
+  assert.equal(actionIds.length, 97);
   assert.deepEqual(ACTION_IDS, actionIds);
   assert.equal(new Set(actionIds).size, actionIds.length);
   assert.equal(ACTION_BY_ID.size, actionIds.length);

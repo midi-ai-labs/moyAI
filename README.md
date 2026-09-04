@@ -151,7 +151,7 @@ By default, release artifacts are written outside the repository under `project_
 
 ## Configuration
 
-moyAI uses one user-wide config file, then layers environment variables, a durable root-session override, and CLI/run overrides where applicable. The left-rail **Connection Settings / 接続設定** shortcut opens Desktop **Preferences**, which edits the user-wide baseline and contains the selected session's Side Chat provider section. The smaller **Session Settings** panel, opened from the model or access chip in the top bar, edits only the current root session and never exposes a global-save action. These entry points do not create another provider-settings owner.
+moyAI uses one user-wide config file, then layers environment variables, a durable root-session override, and CLI/run overrides where applicable. The left-rail **Connection Settings / 接続設定** shortcut opens **Settings**. Its navigation separates **Global Settings** (including **Main Chat Settings** and **Side Chat Settings**), **Session-scoped Settings** (the **Session Overrides** entry), and **Desktop Preferences**. Global Main and Side Chat settings are both part of the importable user-wide TOML configuration, while the Session Overrides entry opens the smaller **Session Settings** panel for the current root Main-chat session only. Session Settings never exposes a global-save action and does not edit Side Chat defaults.
 
 Default Windows config path:
 
@@ -174,11 +174,22 @@ Example:
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
 provider_profile = "lm_studio"
+# system_prompt = """Additional instructions for Main.""" # optional
 # api_key_env = "OPENAI_API_KEY" # optional; names an environment variable
 request_timeout_ms = 3600000
 context_window = 131072
 supports_tools = true
 supports_images = true
+
+[side_chat]
+base_url = "http://127.0.0.1:1234"
+model = "qwen/qwen3.6-27b"
+provider_profile = "lm_studio"
+# system_prompt = """Additional instructions for Side Chat.""" # optional
+request_timeout_ms = 3600000
+connect_timeout_ms = 10000
+max_retries = 2
+context_window = 131072
 
 [permissions]
 access_mode = "default"
@@ -196,6 +207,24 @@ base_url = "http://127.0.0.1:8123"
 [mcp]
 enabled = false
 ```
+
+`model.system_prompt` optionally adds instructions for Main. moyAI keeps its built-in system and
+default-profile instructions first, then appends the configured text under a
+`## User-configured system prompt` section. Leading and trailing whitespace is removed; an omitted or
+blank value adds nothing. The limit is 16,384 Unicode characters, and changes affect turns admitted
+after the updated configuration is applied.
+
+`[side_chat]` is an independent global configuration section; it does not inherit values from
+`[model]`, even when their defaults happen to match. It can be imported and saved with the rest of the
+user-wide configuration. `side_chat.system_prompt` is appended after the built-in Side Chat prompt and
+is counted during context preflight. The blank and 16,384-character rules are the same as for Main.
+
+The first time a Side Chat is created for a session—or when it is created again after an explicit
+close—moyAI snapshots the current global Side Chat provider, model, prompt, timeout, retry, and context
+settings into that conversation. An existing Side Chat keeps its captured settings, history, and draft
+across pane hiding, session navigation, window closing, and app restart. Explicitly closing it deletes
+that Side Chat conversation, draft, and snapshot, but never deletes or resets the global `[side_chat]`
+settings.
 
 `request_timeout_ms` is moyAI's client-side liveness timeout. From the first POST attempt through a
 successful response header it is one absolute deadline covering eligible retry delays, request upload,
@@ -226,13 +255,13 @@ Configuration parsing is strict at every nested section. Unknown or retired keys
 The error names the exact config file that failed. Existing user-wide files are not silently rewritten:
 remove or replace retired `stream_max_retries`, `[model_providers.*]`, and
 `session.auto_compact_*` entries in the reported file before restarting.
-Desktop Preferences keeps its in-progress complete config values, baseline, dirty state, and monotonic
+Desktop Global Settings keeps its in-progress complete config values, baseline, dirty state, and monotonic
 revision in one frontend-local draft owner; Rust keeps no field-value, dirty, or revision mirror.
-Preferences Apply, Save, and Reset send the complete stable key/value draft with the config target;
+Global Settings Apply, Save, and Reset send the complete stable key/value draft with the config target;
 remembered Access, Provider Apply/Save, and Import use that same global-config draft with their own
 target. Rust validates completeness, the current global/effective baseline, and admission before any
 side effect. Config generation crosses the Rust/TypeScript boundary as an exact `u64` decimal string,
-never a JavaScript number. Preferences Apply builds one complete temporary `ResolvedConfig`, while
+never a JavaScript number. Global Settings Apply builds one complete temporary `ResolvedConfig`, while
 Global Save merges only dirty fields into the current TOML document.
 
 Session Settings has a separate frontend draft limited to the complete provider connection, access mode,
@@ -801,7 +830,7 @@ local values only:
 - configured Docling enabled flag and base URL
 
 The splash does not wait for network activity. Cold start sends no provider catalog, availability,
-or Docling health request. Invalid local settings open Initial Setup or Preferences; the left-rail
+or Docling health request. Invalid local settings open Initial Setup or Settings; the left-rail
 Connection Settings shortcut and top-bar Session Settings entry remain the normal repair routes. Live connectivity is
 checked only by the explicit model-load/diagnostic action or when the configured service is used.
 

@@ -38,12 +38,10 @@ function localPresentation(): DesktopRenderLocalPresentation {
     configMutationPending: false,
     sideChat: {
       draft: "",
-      setupBaseUrl: "",
-      setupModel: "",
+      pendingQuote: null,
       catalog: {
         status: "idle",
         source: "none",
-        ownerSessionId: null,
         baseUrl: "",
         models: [],
         error: "",
@@ -166,6 +164,19 @@ test("local presentation values participate in the same render identity", () => 
     {
       ...localPresentation(),
       sideChat: { ...localPresentation().sideChat, draft: "local side-chat draft" },
+    },
+    {
+      ...localPresentation(),
+      sideChat: {
+        ...localPresentation().sideChat,
+        catalog: {
+          status: "ready",
+          source: "global",
+          baseUrl: "http://side.example",
+          models: [{ id: "side-model", label: "Side model" }],
+          error: "",
+        },
+      },
     },
     {
       ...localPresentation(),

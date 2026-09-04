@@ -2,12 +2,18 @@ import { isDeepStrictEqual } from "node:util";
 import { waitForObservation } from "../core/deadline.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { waitForSemanticTargetSettlement } from "../core/semantic_target_settlement.mjs";
+import {
+  DesktopCommandProbe,
+  assertExactDesktopCommandSequence,
+} from "../drivers/desktop_command_probe.mjs";
 import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
 import {
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT as ALPHA_PROMPT,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE as ALPHA_RESPONSE,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT as BETA_PROMPT,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE as BETA_RESPONSE,
+  SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_PROMPT as MAIN_AFTER_CONFIG_PROMPT,
+  SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_RESPONSE as MAIN_AFTER_CONFIG_RESPONSE,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION as QUESTION,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE as SIDE_RESPONSE,
   createSideChatSessionProviderScript,
@@ -25,8 +31,9 @@ import {
   projectSessionSelectionLocator,
 } from "./settings_session.mjs";
 import {
-  configureSideChat,
+  inspectGlobalSideChatSettings,
   observeSideChatQuoteSurface,
+  saveGlobalSideChatAndOpen,
   surfaceHasNoErrors,
   trustedClick,
   trustedInsert,
@@ -36,11 +43,17 @@ import {
 const OWNER = "scenario:side-chat.session";
 export const SIDE_SESSION_MAIN_DRAFT = "メイン側の未送信メモは変更しない";
 export const SIDE_SESSION_UNSENT_DRAFT = "次回は公開までの確認事項を相談する";
+export const SIDE_SESSION_SYSTEM_PROMPT_MARKER = "E2E_SIDE_SYSTEM_PROMPT_MARKER";
 const MAIN_PROMPT = { selector: "section.composer textarea#prompt", identity: { tag: "TEXTAREA", id: "prompt" } };
 const MAIN_SEND = { selector: 'section.composer button[data-action="send"]', identity: { tag: "BUTTON", action: "send" } };
 const SHOW_SIDE = { selector: 'button[data-action="show-side-chat-pane"]', identity: { tag: "BUTTON", action: "show-side-chat-pane" } };
 const SIDE_PROMPT = { selector: "aside.side-chat-pane textarea#side-chat-prompt", identity: { tag: "TEXTAREA", id: "side-chat-prompt" } };
-const ROLES = ["side_session_alpha", "side_session_beta", "side_session_consult"];
+const ROLES = [
+  "side_session_alpha",
+  "side_session_beta",
+  "side_session_main_after_config",
+  "side_session_consult",
+];
 const PLACEHOLDER_SESSION_TITLES = new Set(["新規チャット", "new session", "new chat"]);
 
 function fail(code, evidence) {
@@ -52,6 +65,8 @@ export function sideSessionLedgerMatches(ledger, count) {
     && Array.isArray(ledger) && ledger.length === count
     && ledger.every((row, index) => row.method === "POST" && row.pathname === "/v1/responses"
       && row.contract?.role === ROLES[index] && row.contract.pass === true
+      && row.contract.consult_system_prompt_marker_present === (ROLES[index] === "side_session_consult")
+      && row.contract.consult_system_prompt_marker_exactly_once === (ROLES[index] === "side_session_consult")
       && row.response_status === 200 && row.response_phase === "completed");
 }
 
@@ -136,6 +151,7 @@ export function sideSessionBindingSnapshot(side) {
     provider_profile: side?.provider_profile ?? null,
     base_url: side?.base_url ?? null,
     model: side?.model ?? null,
+    system_prompt: side?.system_prompt ?? null,
     context_as_of_append_position: side?.context_as_of_append_position ?? null,
     draft_revision: side?.draft_revision ?? null,
     draft_text: side?.draft_text ?? null,
@@ -158,15 +174,27 @@ export function sideSessionRestored(surface, { main, binding, mainDraft }) {
     && surface.side.pending_count === 0;
 }
 
-export function sideSessionBetaIsolated(surface, beta) {
+export function sideSessionFreshBinding(surface, beta, {
+  previousChatId,
+  providerBaseUrl,
+  model,
+  systemPrompt,
+  providerProfile = "openai_responses",
+}) {
   const side = surface?.projection?.side_chat;
-  return mainMatches(surface, beta, "") && side?.configured === false
+  return mainMatches(surface, beta, "") && side?.configured === true
     && side.owner_session_id === beta.session_id && side.status === "idle" && side.last_error === ""
-    && side.can_send === false && side.can_cancel === false && side.draft_quote === null
-    && side.chat_id === null && side.messages.length === 0
+    && side.deleting === false && side.context_scope === "owner_session"
+    && typeof side.context_as_of_append_position === "string"
+    && /^\d+$/.test(side.context_as_of_append_position) && side.context_truncated === false
+    && side.can_send === true && side.can_cancel === false && side.draft_quote === null
+    && typeof side.chat_id === "string" && side.chat_id.length > 0 && side.chat_id !== previousChatId
+    && side.provider_profile === providerProfile && side.base_url === providerBaseUrl
+    && side.model === model && side.system_prompt === systemPrompt
+    && side.messages.length === 0
     && side.draft_text === "" && surface.side.messages.length === 0
     && surface.side.pane_count === 1 && surface.side.pane_visible === true
-    && surface.side.setup_visible === true && surface.side.prompt_value === null;
+    && surface.side.setup_visible === false && surface.side.prompt_value === "";
 }
 
 export function sideSessionDraftSaved(surface, completedBinding, text) {
@@ -195,9 +223,17 @@ async function createRoot({ cdp, input, provider, prompt, response, count }) {
 
 async function openSidePane(cdp, input) {
   const before = await observeSideChatQuoteSurface(cdp);
-  if (!before.side.pane_visible) await trustedClick(input, SHOW_SIDE);
-  return waitSurface(cdp, "selected session Side Chat pane is visible", (surface) =>
-    surface.side.pane_count === 1 && surface.side.pane_visible && surfaceHasNoErrors(surface));
+  if (!before.side.pane_visible || !before.projection?.side_chat?.configured) {
+    await trustedClick(input, SHOW_SIDE);
+  }
+  const surface = await waitSurface(cdp, "selected session Side Chat pane is visible", (candidate) =>
+    candidate.projection?.side_chat?.configured === true
+      && candidate.projection.side_chat.owner_session_id === candidate.projection.draft_target?.sessionId
+      && candidate.side.owner_session_id === candidate.projection.draft_target?.sessionId
+      && candidate.side.setup_visible === false
+      && candidate.side.prompt_value !== null
+      && candidate.side.pane_count === 1 && candidate.side.pane_visible && surfaceHasNoErrors(candidate));
+  return { before, surface };
 }
 
 export async function waitForSideSessionSelection(input, sessionId) {
@@ -242,12 +278,16 @@ export function createSideChatSessionScenario() {
     id: "side-chat.session", productOracle: "pass", manualGate: "not_required", databaseRequired: true,
     requestGracefulExit,
     async prepare({ context, sink, phase }) {
-      state.provider = await startScriptedProvider({ script: createSideChatSessionProviderScript() });
+      state.provider = await startScriptedProvider({
+        script: createSideChatSessionProviderScript({
+          expectedConsultSystemPromptMarker: SIDE_SESSION_SYSTEM_PROMPT_MARKER,
+        }),
+      });
       await prepareDesktopFixture({
         context, sink, phase, owner: OWNER,
         configText: providerRestartFixtureConfig(state.provider.baseUrl),
         sentinelName: "E2E_SIDE_CHAT_SESSION.txt",
-        sentinelText: "Session-bound Side Chat isolation fixture.\n",
+        sentinelText: "Global-default Side Chat per-session snapshot fixture.\n",
       });
       await sink.record("side-chat-session-provider-started", state.provider.resourceObservation(), { phase, owner: OWNER });
     },
@@ -262,6 +302,11 @@ export function createSideChatSessionScenario() {
         if (provider.requestLedger.length !== 0) fail("implicit-provider-request", provider.requestLedger);
         input = new WebviewInput(cdp, { probeId: "side-session-input" });
         await input.installProbe();
+        commands = new DesktopCommandProbe(cdp, {
+          probeId: "side-session-commands",
+          commands: ["save_global_config", "ensure_side_chat"],
+        });
+        await commands.install();
         await createRoot({ cdp, input, provider, prompt: ALPHA_PROMPT, response: ALPHA_RESPONSE, count: 1 });
         const alphaSurface = await waitSurface(cdp, "session A canonical terminal navigation settled", (surface) =>
           currentTerminalMainMatches(surface, ""));
@@ -293,7 +338,86 @@ export function createSideChatSessionScenario() {
           fail("distinct-project-session-owners", { alpha, beta, projectId });
         }
         await selectSession(cdp, input, alpha, "");
-        const configuration = await configureSideChat({ cdp, input, providerBaseUrl: provider.baseUrl, ownerSessionId: alpha.session_id });
+        const beforeConfigurationCommands = await commands.snapshot();
+        const noPriorConfigurationCommand = assertExactDesktopCommandSequence(
+          beforeConfigurationCommands,
+          { expected: [] },
+        );
+        const configurationCommandStart = beforeConfigurationCommands.sequence;
+        const configuration = await saveGlobalSideChatAndOpen({
+          cdp,
+          input,
+          providerBaseUrl: provider.baseUrl,
+          ownerSessionId: alpha.session_id,
+          systemPrompt: SIDE_SESSION_SYSTEM_PROMPT_MARKER,
+        });
+        const configurationCommands = assertExactDesktopCommandSequence(
+          await commands.snapshot(configurationCommandStart),
+          {
+            afterSequence: configurationCommandStart,
+            expected: configuration.expected_commands,
+          },
+        );
+        const postConfigHoverStart = (await input.snapshotProbe()).sequence;
+        await input.hover(hover);
+        assertTrustedProbeSequence(await input.snapshotProbe(postConfigHoverStart), {
+          afterSequence: postConfigHoverStart,
+          expected: [{ type: "pointermove", identity: hover.identity, buttons: 0 }],
+        });
+        const postConfigHoverReady = await waitForObservation({
+          label: "project new-session action after Side configuration",
+          timeoutMs: 2_000,
+          pollMs: 16,
+          retrySampleErrors: false,
+          sample: () => input.observeExactTarget(newSession),
+          accept: (sample) => hoveredProjectActionDecision(sample.observation, newSession).decision !== "pending",
+        });
+        if (hoveredProjectActionDecision(postConfigHoverReady.value.observation, newSession).decision !== "pass") {
+          throw new DesktopE2eError(
+            "harness",
+            "side-session-post-config-new-session-target",
+            "Post-configuration Main session action is not actionable",
+            postConfigHoverReady.value,
+          );
+        }
+        await trustedClick(input, newSession);
+        await waitSurface(cdp, "fresh post-configuration Main session owner", (surface) =>
+          surface.projection.draft_target.sessionId === null
+            && surface.projection.thread_empty
+            && surface.main.prompt_value === ""
+            && surface.projection.navigation_loading === false);
+        await createRoot({
+          cdp,
+          input,
+          provider,
+          prompt: MAIN_AFTER_CONFIG_PROMPT,
+          response: MAIN_AFTER_CONFIG_RESPONSE,
+          count: 3,
+        });
+        const mainAfterConfigSurface = await waitSurface(
+          cdp,
+          "post-configuration Main wire remained independent",
+          (surface) => currentTerminalMainMatches(surface, ""),
+        );
+        const mainAfterConfig = sideSessionMainSnapshot(mainAfterConfigSurface.projection);
+        if ([alpha.session_id, beta.session_id].includes(mainAfterConfig.session_id)) {
+          fail("post-config-main-owner-not-distinct", { alpha, beta, mainAfterConfig });
+        }
+        await selectSession(cdp, input, alpha, "");
+        const configurationProbe = commands;
+        await closeProbes(state, null, configurationProbe, null);
+        commands = null;
+        commands = new DesktopCommandProbe(cdp, {
+          probeId: "side-session-interaction-commands",
+          commands: [
+            "ensure_side_chat",
+            "submit_side_chat",
+            "cancel_side_chat",
+            "submit_prompt",
+            "cancel_run",
+          ],
+        });
+        await commands.install();
         await trustedInsert(input, MAIN_PROMPT, SIDE_SESSION_MAIN_DRAFT);
         const consultation = await executeCase52SideChatStage({
           cdp,
@@ -306,17 +430,19 @@ export function createSideChatSessionScenario() {
           promptInput: { text: QUESTION },
           timeoutMs: 30_000,
           evidenceName: "side-session-alpha-consulted",
+          commandProbe: commands,
         });
         const completed = consultation.completedSurface;
         if (!isDeepStrictEqual(
           completed.projection.side_chat.messages.map(({ role, content }) => [role, content]),
           [["user", QUESTION], ["assistant", SIDE_RESPONSE]],
-        ) || !sideSessionLedgerMatches(provider.requestLedger, 3)) {
+        ) || !sideSessionLedgerMatches(provider.requestLedger, 4)) {
           fail("consultation-response", { side: completed.projection.side_chat, ledger: provider.requestLedger });
         }
         const send = consultation.send;
         const commandEvidence = consultation.commandEvidence;
         const sentArgs = commandEvidence.calls[0].args;
+        const consultationExpected = { command: "submit_side_chat", args: structuredClone(sentArgs) };
         const contextEvidence = provider.requestLedger.at(-1).contract.owner_context;
         if (contextEvidence.owner_session_id !== alpha.session_id
           || contextEvidence.as_of_append_position !== sentArgs.expectedOwnerAppendPosition
@@ -329,28 +455,52 @@ export function createSideChatSessionScenario() {
         const draftSaved = await waitSurface(cdp, "session A unsent Side draft persisted", (surface) =>
           mainMatches(surface, alpha, SIDE_SESSION_MAIN_DRAFT)
           && sideSessionDraftSaved(surface, completedBinding, SIDE_SESSION_UNSENT_DRAFT)
-          && sideSessionLedgerMatches(provider.requestLedger, 3));
+          && sideSessionLedgerMatches(provider.requestLedger, 4));
         const binding = sideSessionBindingSnapshot(draftSaved.projection.side_chat);
         await selectSession(cdp, input, beta, "");
-        await openSidePane(cdp, input);
-        const betaIsolated = await waitSurface(cdp, "session B has no A Side binding, history, or draft", (surface) =>
-          sideSessionBetaIsolated(surface, beta)
-          && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta]));
-        const betaScreenshot = await captureScenarioScreenshot({ cdp, sink, name: "side-session-beta-isolated", owner: OWNER });
+        const betaOpen = await openSidePane(cdp, input);
+        const betaEnsureExpected = {
+          command: "ensure_side_chat",
+          args: {
+            ownerSessionId: beta.session_id,
+            expectedConfigGeneration: betaOpen.before.projection.config_target.configGeneration,
+          },
+        };
+        const betaCommands = assertExactDesktopCommandSequence(await commands.snapshot(), {
+          expected: [consultationExpected, betaEnsureExpected],
+        });
+        const betaMaterialized = await waitSurface(cdp, "session B materialized an independent Side binding from global defaults", (surface) =>
+          sideSessionFreshBinding(surface, beta, {
+            previousChatId: binding.chat_id,
+            providerBaseUrl: provider.baseUrl,
+            model: "e2e/scripted-responses",
+            systemPrompt: SIDE_SESSION_SYSTEM_PROMPT_MARKER,
+          })
+          && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta, mainAfterConfig]));
+        const betaScreenshot = await captureScenarioScreenshot({ cdp, sink, name: "side-session-beta-materialized", owner: OWNER });
         await selectSession(cdp, input, alpha, SIDE_SESSION_MAIN_DRAFT);
         await openSidePane(cdp, input);
         const restored = await waitSurface(cdp, "session A Side binding and draft restored after B", (surface) =>
           sideSessionRestored(surface, { main: alpha, binding, mainDraft: SIDE_SESSION_MAIN_DRAFT })
-          && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta]));
+          && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta, mainAfterConfig]));
         const restoredScreenshot = await captureScenarioScreenshot({ cdp, sink, name: "side-session-alpha-restored", owner: OWNER });
-        if (!sideSessionLedgerMatches(provider.requestLedger, 3)) fail("navigation-provider-replay", provider.requestLedger);
+        if (!sideSessionLedgerMatches(provider.requestLedger, 4)) fail("navigation-provider-replay", provider.requestLedger);
+        const noAlphaReensure = assertExactDesktopCommandSequence(await commands.snapshot(), {
+          expected: [consultationExpected, betaEnsureExpected],
+        });
         await sink.record("side-chat-session-selection-completed", {
-          alpha, beta, configuration, send, command_evidence: commandEvidence, owner_context: contextEvidence,
-          binding, completed: completed.projection.side_chat, beta_isolated: betaIsolated.projection.side_chat,
+          alpha, beta, main_after_config: mainAfterConfig,
+          configuration,
+          no_prior_configuration_command: noPriorConfigurationCommand,
+          configuration_commands: configurationCommands,
+          interaction_commands_through_beta: betaCommands,
+          interaction_commands_after_alpha_reopen: noAlphaReensure,
+          send, command_evidence: commandEvidence, owner_context: contextEvidence,
+          binding, completed: completed.projection.side_chat, beta_materialized: betaMaterialized.projection.side_chat,
           restored: restored.projection.side_chat,
           navigation: {
-            beta_selected: sideSessionNavigationSummary(betaIsolated.projection, [alpha, beta]),
-            alpha_restored: sideSessionNavigationSummary(restored.projection, [alpha, beta]),
+            beta_selected: sideSessionNavigationSummary(betaMaterialized.projection, [alpha, beta, mainAfterConfig]),
+            alpha_restored: sideSessionNavigationSummary(restored.projection, [alpha, beta, mainAfterConfig]),
           },
           screenshots: [completedScreenshot, betaScreenshot, restoredScreenshot],
         }, { phase: "executing", owner: OWNER });
@@ -364,23 +514,48 @@ export function createSideChatSessionScenario() {
         await acquireInteractiveShell({ context, driver: cdp, sink }, { evidenceOwner: OWNER, screenshotStem: "side-session-restarted" });
         input = new WebviewInput(cdp, { probeId: "side-session-restarted-input" });
         await input.installProbe();
+        commands = new DesktopCommandProbe(cdp, {
+          probeId: "side-session-restarted-commands",
+          commands: ["ensure_side_chat"],
+        });
+        await commands.install();
         await selectSession(cdp, input, alpha, "");
         await openSidePane(cdp, input);
         let stableSince = null;
         const reopened = await waitSurface(cdp, "stable Side restoration after Desktop restart and explicit session A reopen", (surface) => {
           const pass = sideSessionRestored(surface, { main: alpha, binding, mainDraft: "" })
-            && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta])
-            && sideSessionLedgerMatches(provider.requestLedger, 3);
+            && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta, mainAfterConfig])
+            && sideSessionLedgerMatches(provider.requestLedger, 4);
           if (!pass) { stableSince = null; return false; }
           stableSince ??= performance.now();
           return performance.now() - stableSince >= 500;
         });
+        const noRestartReensure = assertExactDesktopCommandSequence(await commands.snapshot(), { expected: [] });
+        const settingsRestored = await inspectGlobalSideChatSettings({
+          cdp,
+          input,
+          sink,
+          providerBaseUrl: provider.baseUrl,
+          model: "e2e/scripted-responses",
+          systemPrompt: SIDE_SESSION_SYSTEM_PROMPT_MARKER,
+          evidenceName: "side-session-settings-restarted-restored",
+          evidenceOwner: OWNER,
+        });
+        const reopenedAfterSettings = await waitSurface(
+          cdp,
+          "Side restoration remained stable after persisted Settings inspection",
+          (surface) => sideSessionRestored(surface, { main: alpha, binding, mainDraft: "" })
+            && sideSessionTerminalNavigationMatches(surface.projection, [alpha, beta, mainAfterConfig])
+            && sideSessionLedgerMatches(provider.requestLedger, 4),
+        );
         const restartScreenshot = await captureScenarioScreenshot({ cdp, sink, name: "side-session-alpha-restarted-restored", owner: OWNER });
         state.acceptedLedger = provider.requestLedger;
         await sink.record("side-chat-session-completed", {
-          restart: restarted.restart, alpha, beta, binding,
-          restored: sideSessionBindingSnapshot(reopened.projection.side_chat),
-          navigation: sideSessionNavigationSummary(reopened.projection, [alpha, beta]),
+          restart: restarted.restart, alpha, beta, main_after_config: mainAfterConfig, binding,
+          restored: sideSessionBindingSnapshot(reopenedAfterSettings.projection.side_chat),
+          restored_settings: settingsRestored,
+          restart_commands: noRestartReensure,
+          navigation: sideSessionNavigationSummary(reopenedAfterSettings.projection, [alpha, beta, mainAfterConfig]),
           provider_ledger: state.acceptedLedger, screenshot: restartScreenshot,
           main_draft_restart_contract: "frontend-local main draft is not persisted; Side draft is persisted",
         }, { phase: "executing", owner: OWNER });

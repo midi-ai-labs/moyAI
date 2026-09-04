@@ -6,7 +6,8 @@ use super::model::{
     AccessMode, MAX_MODEL_REQUEST_TIMEOUT_MS, McpServerConfig, MultiAgentMode,
     PartialDoclingConfig, PartialFileGuardConfig, PartialInspectionConfig, PartialMcpConfig,
     PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialShellConfig, ProviderProfile, ResolvedConfig, validate_optional_provider_float,
+    PartialShellConfig, PartialSideChatConfig, ProviderProfile, ResolvedConfig,
+    validate_optional_provider_float,
 };
 use super::turn::ProviderEndpoint;
 
@@ -14,8 +15,17 @@ use super::turn::ProviderEndpoint;
 pub enum ConfigField {
     BaseUrl,
     Model,
+    SystemPrompt,
     ProviderProfile,
     ApiKeyEnv,
+    SideChatBaseUrl,
+    SideChatModel,
+    SideChatSystemPrompt,
+    SideChatProviderProfile,
+    SideChatContextWindow,
+    SideChatRequestTimeoutMs,
+    SideChatConnectTimeoutMs,
+    SideChatMaxRetries,
     AccessMode,
     MultiAgentEnabled,
     MultiAgentMode,
@@ -91,11 +101,22 @@ pub(crate) struct ConfigFieldDescriptor {
     options: &'static [&'static str],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConfigFieldPublicValue {
     pub(crate) value: String,
     pub(crate) sensitive: bool,
     pub(crate) configured: bool,
+}
+
+impl std::fmt::Debug for ConfigFieldPublicValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigFieldPublicValue")
+            .field("value_chars", &self.value.chars().count())
+            .field("sensitive", &self.sensitive)
+            .field("configured", &self.configured)
+            .finish()
+    }
 }
 
 impl ConfigFieldDescriptor {
@@ -132,11 +153,20 @@ impl ConfigFieldDescriptor {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 44] = [
+    pub const ALL: [ConfigField; 53] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
+        ConfigField::SystemPrompt,
         ConfigField::ProviderProfile,
         ConfigField::ApiKeyEnv,
+        ConfigField::SideChatBaseUrl,
+        ConfigField::SideChatModel,
+        ConfigField::SideChatSystemPrompt,
+        ConfigField::SideChatProviderProfile,
+        ConfigField::SideChatContextWindow,
+        ConfigField::SideChatRequestTimeoutMs,
+        ConfigField::SideChatConnectTimeoutMs,
+        ConfigField::SideChatMaxRetries,
         ConfigField::AccessMode,
         ConfigField::MultiAgentEnabled,
         ConfigField::MultiAgentMode,
@@ -215,8 +245,17 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => "model.base_url",
             ConfigField::Model => "model.model",
+            ConfigField::SystemPrompt => "model.system_prompt",
             ConfigField::ProviderProfile => "model.provider_profile",
             ConfigField::ApiKeyEnv => "model.api_key_env",
+            ConfigField::SideChatBaseUrl => "side_chat.base_url",
+            ConfigField::SideChatModel => "side_chat.model",
+            ConfigField::SideChatSystemPrompt => "side_chat.system_prompt",
+            ConfigField::SideChatProviderProfile => "side_chat.provider_profile",
+            ConfigField::SideChatContextWindow => "side_chat.context_window",
+            ConfigField::SideChatRequestTimeoutMs => "side_chat.request_timeout_ms",
+            ConfigField::SideChatConnectTimeoutMs => "side_chat.connect_timeout_ms",
+            ConfigField::SideChatMaxRetries => "side_chat.max_retries",
             ConfigField::AccessMode => "permissions.access_mode",
             ConfigField::MultiAgentEnabled => "multi_agent.enabled",
             ConfigField::MultiAgentMode => "multi_agent.mode",
@@ -268,8 +307,17 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => Some("MOYAI_BASE_URL"),
             ConfigField::Model => Some("MOYAI_MODEL"),
+            ConfigField::SystemPrompt => None,
             ConfigField::ProviderProfile => Some("MOYAI_PROVIDER_PROFILE"),
             ConfigField::ApiKeyEnv => Some("MOYAI_API_KEY_ENV"),
+            ConfigField::SideChatBaseUrl
+            | ConfigField::SideChatModel
+            | ConfigField::SideChatSystemPrompt
+            | ConfigField::SideChatProviderProfile
+            | ConfigField::SideChatContextWindow
+            | ConfigField::SideChatRequestTimeoutMs
+            | ConfigField::SideChatConnectTimeoutMs
+            | ConfigField::SideChatMaxRetries => None,
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
             ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
             ConfigField::MultiAgentMode => Some("MOYAI_MULTI_AGENT_MODE"),
@@ -323,15 +371,27 @@ impl ConfigField {
 
     pub fn display_label(self) -> &'static str {
         match self {
+            ConfigField::SystemPrompt => "Main system prompt (optional)",
             ConfigField::ProviderProfile => "Connection type",
             ConfigField::ApiKeyEnv => "API key environment variable (optional)",
             ConfigField::RequestTimeoutMs => "LLM response inactivity timeout",
+            ConfigField::SideChatBaseUrl => "Side Chat Base URL",
+            ConfigField::SideChatModel => "Side Chat model",
+            ConfigField::SideChatSystemPrompt => "Side Chat system prompt (optional)",
+            ConfigField::SideChatProviderProfile => "Side Chat connection type",
+            ConfigField::SideChatContextWindow => "Side Chat context budget",
+            ConfigField::SideChatRequestTimeoutMs => "Side Chat response inactivity timeout",
+            ConfigField::SideChatConnectTimeoutMs => "Side Chat connection timeout",
+            ConfigField::SideChatMaxRetries => "Side Chat maximum retries",
             _ => self.label(),
         }
     }
 
     pub fn help(self) -> &'static str {
         match self {
+            ConfigField::SystemPrompt => {
+                "moyAI の組み込み system prompt の後へ追記します。空欄では追記せず、最大 16,384 文字です。"
+            }
             ConfigField::ProviderProfile => {
                 "モデル一覧の取得方式と生成APIを一つの接続方式として選びます。oMLX等の一般的なOpenAI互換serverにはOpenAI-compatible (Chat Completions)を選択します。"
             }
@@ -340,6 +400,12 @@ impl ConfigField {
             }
             ConfigField::RequestTimeoutMs => {
                 "応答headerまでの待機と、応答中のSSE event間の最大無進捗時間（ms）です。進捗中の総所要時間は制限せず、hostへも送信しません。"
+            }
+            ConfigField::SideChatSystemPrompt => {
+                "Side Chat の組み込み system prompt の後へ追記します。空欄では追記せず、最大 16,384 文字です。"
+            }
+            ConfigField::SideChatRequestTimeoutMs => {
+                "Side Chat の応答headerまでの待機と、応答中のSSE event間の最大無進捗時間（ms）です。"
             }
             _ => "",
         }
@@ -369,7 +435,7 @@ impl ConfigField {
         const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
 
         let (value_type, integer_min, integer_max, options) = match self {
-            ConfigField::ProviderProfile => {
+            ConfigField::ProviderProfile | ConfigField::SideChatProviderProfile => {
                 (ConfigFieldValueType::Enum, None, None, PROVIDER_PROFILES)
             }
             ConfigField::AccessMode => (ConfigFieldValueType::Enum, None, None, ACCESS_MODES),
@@ -396,7 +462,9 @@ impl ConfigField {
             ConfigField::MultiAgentMaxAgents | ConfigField::MultiAgentMaxModelRequests => {
                 (ConfigFieldValueType::Integer, Some(1), None, NONE)
             }
-            ConfigField::ContextWindow | ConfigField::MaxParallelPredictions => (
+            ConfigField::ContextWindow
+            | ConfigField::SideChatContextWindow
+            | ConfigField::MaxParallelPredictions => (
                 ConfigFieldValueType::Integer,
                 Some(1),
                 Some(u32::MAX as u64),
@@ -408,7 +476,7 @@ impl ConfigField {
                 Some(u32::MAX as u64),
                 NONE,
             ),
-            ConfigField::MaxRetries => (
+            ConfigField::MaxRetries | ConfigField::SideChatMaxRetries => (
                 ConfigFieldValueType::Integer,
                 Some(0),
                 Some(u8::MAX as u64),
@@ -419,10 +487,16 @@ impl ConfigField {
             | ConfigField::InspectionMaxExtensionsReported => {
                 (ConfigFieldValueType::Integer, Some(0), None, NONE)
             }
-            ConfigField::RequestTimeoutMs => (
+            ConfigField::RequestTimeoutMs | ConfigField::SideChatRequestTimeoutMs => (
                 ConfigFieldValueType::Integer,
                 Some(1),
                 Some(MAX_MODEL_REQUEST_TIMEOUT_MS),
+                NONE,
+            ),
+            ConfigField::SideChatConnectTimeoutMs => (
+                ConfigFieldValueType::Integer,
+                Some(1),
+                Some(i64::MAX as u64),
                 NONE,
             ),
             ConfigField::ConnectTimeoutMs
@@ -432,6 +506,10 @@ impl ConfigField {
             | ConfigField::Seed => (ConfigFieldValueType::Integer, Some(0), None, NONE),
             ConfigField::BaseUrl
             | ConfigField::Model
+            | ConfigField::SystemPrompt
+            | ConfigField::SideChatBaseUrl
+            | ConfigField::SideChatModel
+            | ConfigField::SideChatSystemPrompt
             | ConfigField::ApiKeyEnv
             | ConfigField::StopSequences
             | ConfigField::FileGuardBlockedReadExtensions
@@ -458,6 +536,8 @@ impl ConfigField {
                 | ConfigField::FrequencyPenalty
                 | ConfigField::Seed
                 | ConfigField::ApiKeyEnv
+                | ConfigField::SystemPrompt
+                | ConfigField::SideChatSystemPrompt
                 | ConfigField::StopSequences
                 | ConfigField::ExtraHeadersJson
                 | ConfigField::ExtraBodyJson
@@ -473,8 +553,23 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => config.model.base_url.clone(),
             ConfigField::Model => config.model.model.clone(),
+            ConfigField::SystemPrompt => config.model.system_prompt.clone(),
             ConfigField::ProviderProfile => config.model.provider_profile.as_str().to_string(),
             ConfigField::ApiKeyEnv => config.model.api_key_env.clone().unwrap_or_default(),
+            ConfigField::SideChatBaseUrl => config.side_chat.base_url.clone(),
+            ConfigField::SideChatModel => config.side_chat.model.clone(),
+            ConfigField::SideChatSystemPrompt => config.side_chat.system_prompt.clone(),
+            ConfigField::SideChatProviderProfile => {
+                config.side_chat.provider_profile.as_str().to_string()
+            }
+            ConfigField::SideChatContextWindow => config.side_chat.context_window.to_string(),
+            ConfigField::SideChatRequestTimeoutMs => {
+                config.side_chat.request_timeout_ms.to_string()
+            }
+            ConfigField::SideChatConnectTimeoutMs => {
+                config.side_chat.connect_timeout_ms.to_string()
+            }
+            ConfigField::SideChatMaxRetries => config.side_chat.max_retries.to_string(),
             ConfigField::AccessMode => config.permissions.access_mode.as_str().to_string(),
             ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
             ConfigField::MultiAgentMode => config.multi_agent.mode.as_str().to_string(),
@@ -598,6 +693,8 @@ pub(crate) fn build_resolved_config_from_field_values(
             ConfigField::FrequencyPenalty => config.model.frequency_penalty = None,
             ConfigField::Seed => config.model.seed = None,
             ConfigField::ApiKeyEnv => config.model.api_key_env = None,
+            ConfigField::SystemPrompt => config.model.system_prompt.clear(),
+            ConfigField::SideChatSystemPrompt => config.side_chat.system_prompt.clear(),
             ConfigField::ExtraHeadersJson => config.model.extra_headers.clear(),
             ConfigField::ExtraBodyJson => config.model.extra_body_json = None,
             ConfigField::DoclingApiKeyEnv => config.docling.api_key_env = None,
@@ -651,6 +748,7 @@ pub(crate) fn parse_config_field_patch(
 ) -> Result<PartialResolvedConfig, String> {
     let mut patch = PartialResolvedConfig::default();
     let mut model = PartialModelConfig::default();
+    let mut side_chat = PartialSideChatConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
     let mut multi_agent = PartialMultiAgentConfig::default();
     let mut shell = PartialShellConfig::default();
@@ -674,6 +772,7 @@ pub(crate) fn parse_config_field_patch(
                 }
             }
             ConfigField::Model => model.model = parse_string(text),
+            ConfigField::SystemPrompt => model.system_prompt = parse_string(text),
             ConfigField::ProviderProfile => {
                 model.provider_profile = match parse_string(text) {
                     Some(value) => Some(parse_provider_profile(&value)?),
@@ -681,6 +780,37 @@ pub(crate) fn parse_config_field_patch(
                 }
             }
             ConfigField::ApiKeyEnv => model.api_key_env = Some(parse_string(text)),
+            ConfigField::SideChatBaseUrl => {
+                side_chat.base_url = match parse_string(text) {
+                    Some(value) => Some(
+                        ProviderEndpoint::parse(&value)
+                            .map_err(|error| format!("{}: {error}", field.label()))?
+                            .as_str()
+                            .to_string(),
+                    ),
+                    None => None,
+                }
+            }
+            ConfigField::SideChatModel => side_chat.model = parse_string(text),
+            ConfigField::SideChatSystemPrompt => side_chat.system_prompt = parse_string(text),
+            ConfigField::SideChatProviderProfile => {
+                side_chat.provider_profile = match parse_string(text) {
+                    Some(value) => Some(parse_provider_profile(&value)?),
+                    None => None,
+                }
+            }
+            ConfigField::SideChatContextWindow => {
+                side_chat.context_window = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::SideChatRequestTimeoutMs => {
+                side_chat.request_timeout_ms = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::SideChatConnectTimeoutMs => {
+                side_chat.connect_timeout_ms = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::SideChatMaxRetries => {
+                side_chat.max_retries = parse_integer(text, field.descriptor())?
+            }
             ConfigField::AccessMode => {
                 permissions.access_mode = match parse_string(text) {
                     Some(value) => Some(parse_access_mode(&value)?),
@@ -803,6 +933,7 @@ pub(crate) fn parse_config_field_patch(
     }
 
     patch.model = Some(model);
+    patch.side_chat = Some(side_chat);
     patch.permissions = Some(permissions);
     patch.multi_agent = Some(multi_agent);
     patch.shell = Some(shell);
@@ -941,7 +1072,7 @@ mod tests {
 
     #[test]
     fn descriptor_inventory_has_one_stable_entry_per_field() {
-        assert_eq!(ConfigField::ALL.len(), 44);
+        assert_eq!(ConfigField::ALL.len(), 53);
         let mut keys = HashSet::new();
         for field in ConfigField::ALL {
             let descriptor = field.descriptor();
@@ -949,6 +1080,160 @@ mod tests {
             assert!(keys.insert(descriptor.key()));
             assert_eq!(descriptor.required(), !field.allows_empty_complete_value());
         }
+    }
+
+    #[test]
+    fn main_system_prompt_field_trims_clears_and_enforces_the_shared_limit() {
+        let mut base = ResolvedConfig::default();
+        base.model.system_prompt = "previous rule".to_string();
+
+        let configured = build_resolved_config_from_key_values(
+            &base,
+            vec![(
+                ConfigField::SystemPrompt.label().to_string(),
+                "  first\n  second  ".to_string(),
+            )],
+        )
+        .expect("valid main system prompt field");
+        assert_eq!(configured.model.system_prompt, "first\n  second");
+        let public = ConfigField::SystemPrompt.public_value(&configured);
+        assert_eq!(public.value, "first\n  second");
+        let public_debug = format!("{public:?}");
+        assert!(public_debug.contains("value_chars"));
+        assert!(!public_debug.contains("first"));
+
+        let cleared = build_resolved_config_from_key_values(
+            &configured,
+            vec![(
+                ConfigField::SystemPrompt.label().to_string(),
+                " \r\n\t ".to_string(),
+            )],
+        )
+        .expect("blank main system prompt field");
+        assert!(cleared.model.system_prompt.is_empty());
+
+        let oversized =
+            "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1);
+        let error = build_resolved_config_from_key_values(
+            &base,
+            vec![(ConfigField::SystemPrompt.label().to_string(), oversized)],
+        )
+        .expect_err("oversized main system prompt field");
+        assert!(error.contains("model.system_prompt"), "{error}");
+    }
+
+    #[test]
+    fn side_chat_fields_form_an_independent_typed_section_without_environment_overrides() {
+        let fields = [
+            (ConfigField::SideChatBaseUrl, "side_chat.base_url"),
+            (ConfigField::SideChatModel, "side_chat.model"),
+            (ConfigField::SideChatSystemPrompt, "side_chat.system_prompt"),
+            (
+                ConfigField::SideChatProviderProfile,
+                "side_chat.provider_profile",
+            ),
+            (
+                ConfigField::SideChatContextWindow,
+                "side_chat.context_window",
+            ),
+            (
+                ConfigField::SideChatRequestTimeoutMs,
+                "side_chat.request_timeout_ms",
+            ),
+            (
+                ConfigField::SideChatConnectTimeoutMs,
+                "side_chat.connect_timeout_ms",
+            ),
+            (ConfigField::SideChatMaxRetries, "side_chat.max_retries"),
+        ];
+        for (field, key) in fields {
+            assert_eq!(field.label(), key);
+            assert_eq!(
+                field.toml_path(),
+                ("side_chat", key.trim_start_matches("side_chat."))
+            );
+            assert_eq!(field.env_override(), None);
+        }
+
+        let base = ResolvedConfig::default();
+        let configured = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    ConfigField::SideChatBaseUrl.label().to_string(),
+                    " https://side.example.test/v1/ ".to_string(),
+                ),
+                (
+                    ConfigField::SideChatModel.label().to_string(),
+                    "side-model".to_string(),
+                ),
+                (
+                    ConfigField::SideChatSystemPrompt.label().to_string(),
+                    "  side instructions  ".to_string(),
+                ),
+                (
+                    ConfigField::SideChatProviderProfile.label().to_string(),
+                    "openai_compatible".to_string(),
+                ),
+                (
+                    ConfigField::SideChatContextWindow.label().to_string(),
+                    "65536".to_string(),
+                ),
+                (
+                    ConfigField::SideChatRequestTimeoutMs.label().to_string(),
+                    "45000".to_string(),
+                ),
+                (
+                    ConfigField::SideChatConnectTimeoutMs.label().to_string(),
+                    "5000".to_string(),
+                ),
+                (
+                    ConfigField::SideChatMaxRetries.label().to_string(),
+                    "4".to_string(),
+                ),
+            ],
+        )
+        .expect("valid Side Chat field values");
+
+        assert_eq!(configured.model.model, base.model.model);
+        assert_eq!(configured.model.base_url, base.model.base_url);
+        assert_eq!(configured.model.system_prompt, base.model.system_prompt);
+        assert_eq!(
+            configured.side_chat.base_url,
+            "https://side.example.test/v1"
+        );
+        assert_eq!(configured.side_chat.model, "side-model");
+        assert_eq!(configured.side_chat.system_prompt, "side instructions");
+        assert_eq!(
+            configured.side_chat.provider_profile,
+            crate::config::ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(configured.side_chat.context_window, 65_536);
+        assert_eq!(configured.side_chat.request_timeout_ms, 45_000);
+        assert_eq!(configured.side_chat.connect_timeout_ms, 5_000);
+        assert_eq!(configured.side_chat.max_retries, 4);
+
+        let secret = "side-url-secret";
+        let error = build_resolved_config_from_key_values(
+            &base,
+            vec![(
+                ConfigField::SideChatBaseUrl.label().to_string(),
+                format!("https://user:{secret}@side.example.test/v1"),
+            )],
+        )
+        .expect_err("URL-borne Side Chat credentials are rejected");
+        assert!(error.contains("side_chat.base_url"), "{error}");
+        assert!(!error.contains(secret), "{error}");
+
+        let cleared = build_resolved_config_from_key_values(
+            &configured,
+            vec![(
+                ConfigField::SideChatSystemPrompt.label().to_string(),
+                String::new(),
+            )],
+        )
+        .expect("blank Side Chat prompt clears only the prompt");
+        assert!(cleared.side_chat.system_prompt.is_empty());
     }
 
     #[test]
@@ -1133,6 +1418,24 @@ mod tests {
                 "lm_studio_chat_completions",
             ]
         );
+        let side_profile = ConfigField::SideChatProviderProfile.descriptor();
+        assert_eq!(side_profile.value_type(), profile.value_type());
+        assert_eq!(side_profile.options(), profile.options());
+        assert_eq!(
+            ConfigField::SideChatContextWindow
+                .descriptor()
+                .integer_min(),
+            Some(1)
+        );
+        assert_eq!(
+            ConfigField::SideChatRequestTimeoutMs
+                .descriptor()
+                .integer_max(),
+            Some(3_600_000)
+        );
+        let side_connect_timeout = ConfigField::SideChatConnectTimeoutMs.descriptor();
+        assert_eq!(side_connect_timeout.integer_min(), Some(1));
+        assert_eq!(side_connect_timeout.integer_max(), Some(i64::MAX as u64));
         assert!(!ConfigField::ApiKeyEnv.descriptor().required());
     }
 

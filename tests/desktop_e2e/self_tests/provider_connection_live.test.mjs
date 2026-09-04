@@ -196,7 +196,7 @@ test("post-task Side Chat asks from owner evidence and accepts only the exact to
   assert.throws(() => providerConnectionLiveSideChatQuestion({ ...time, unixMs: "not-a-number" }), TypeError);
 });
 
-test("post-task Side Chat preserves one immutable Main snapshot through configure and completion", () => {
+test("post-task Side Chat preserves one immutable Main snapshot through global save, ensure, and completion", () => {
   const transcriptRows = [
     { row_kind: "user", stable_history_identity: "history-user", body: PROVIDER_OPENAI_COMPATIBLE_PROMPT },
     { row_kind: "assistant", stable_history_identity: "history-assistant", body: ASSISTANT },

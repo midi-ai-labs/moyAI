@@ -363,7 +363,6 @@ export interface SideChatCatalogModel {
 }
 
 export interface SideChatCatalogResult {
-  ownerSessionId: string;
   baseUrl: string;
   providerProfile: ProviderProfile;
   configGeneration: string;
@@ -376,6 +375,7 @@ export interface SideChatProjection {
   chat_id: string | null;
   owner_session_id: string | null;
   model: string;
+  system_prompt: string;
   base_url: string;
   provider_profile: ProviderProfile | "";
   status: SideChatStatus;

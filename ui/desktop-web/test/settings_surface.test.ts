@@ -40,6 +40,7 @@ function settingsState(overrides: Partial<DesktopViewState> = {}): DesktopViewSt
       chat_id: null,
       owner_session_id: "session-a",
       model: "",
+      system_prompt: "",
       base_url: "http://127.0.0.1:1234/v1",
       status: "idle",
       phase: "",
@@ -128,7 +129,8 @@ test("pointer and keyboard Settings navigation focus the target editor without c
     }
 
     matches(selector: string): boolean {
-      return selector === ".settings-section" && this.name === "section";
+      return selector === ".settings-section, .settings-subsection"
+        && (this.name === "section" || this.name === "subsection");
     }
 
     querySelector<T>(selector: string): T | null {
@@ -175,7 +177,7 @@ test("pointer and keyboard Settings navigation focus the target editor without c
   editor.selectionStart = 7;
   editor.selectionEnd = 11;
   modal.selectors.set(".settings-content", [content]);
-  section.selectors.set(".settings-control, .side-chat-settings-control", [editor]);
+  section.selectors.set(".settings-control, .desktop-preference-control", [editor]);
   fakeDocument.elements.set("settings-side-chat", section);
 
   const previousElement = Object.getOwnPropertyDescriptor(globalThis, "Element");
@@ -202,6 +204,17 @@ test("pointer and keyboard Settings navigation focus the target editor without c
       assert.equal(prevented, true, detail === 0 ? "keyboard-generated click" : "pointer click");
       assert.equal(fakeDocument.activeElement, editor);
     }
+    const subsection = new FakeElement("subsection");
+    const subsectionEditor = new FakeElement("editor");
+    subsection.parent = content;
+    subsectionEditor.parent = subsection;
+    subsection.selectors.set(".settings-control, .desktop-preference-control", [subsectionEditor]);
+    fakeDocument.elements.set("settings-side-chat", subsection);
+    assert.equal(handleSettingsNavigationClick({
+      target: anchor,
+      preventDefault: () => {},
+    } as unknown as MouseEvent, settingsState()), true);
+    assert.equal(fakeDocument.activeElement, subsectionEditor);
     assert.deepEqual(section.scrollOptions, { block: "start", inline: "nearest" });
     assert.deepEqual(editor.focusOptions, { preventScroll: true });
     assert.equal(editor.value, "http://side.example/v1");
@@ -260,7 +273,7 @@ test("settings surface preserves the live subtree only for the same exact owner 
       model: "gemma-side",
       can_send: true,
     },
-  })), false, "configure response replaces the side settings section");
+  })), true, "runtime Side Chat creation must preserve browser-owned Global Settings editors");
   const configured = settingsState({
     side_chat: {
       ...before.side_chat,
@@ -271,16 +284,19 @@ test("settings surface preserves the live subtree only for the same exact owner 
     },
   });
   assert.equal(sameSettingsSurface(configured, settingsState({
+    side_chat: { ...configured.side_chat, system_prompt: "new prompt" },
+  })), true, "captured Side Chat prompt changes are outside the Global Settings owner");
+  assert.equal(sameSettingsSurface(configured, settingsState({
     side_chat: {
       ...configured.side_chat,
       status: "running",
       can_send: false,
       can_cancel: true,
     },
-  })), false, "running capability replaces stale enabled controls");
+  })), true, "runtime Side Chat activity does not replace Global Settings controls");
   assert.equal(sameSettingsSurface(configured, settingsState({
     side_chat: { ...configured.side_chat, deleting: true, can_send: false },
-  })), false, "deletion replaces stale enabled controls");
+  })), true, "runtime Side Chat deletion does not replace Global Settings controls");
   assert.equal(settingsSurfaceIdentity(settingsState({ confirmation_visible: true })), null);
 });
 
@@ -456,7 +472,7 @@ test("retained Settings availability synchronization preserves browser-owned dra
 
     querySelectorAll<T>(selector: string): T[] {
       if (selector === "button, input, select, textarea") return this.controls as T[];
-      if (selector === "select[data-main-provider-model-control]") return [];
+      if (selector === "select[data-main-provider-model-control], select[data-side-chat-model-control]") return [];
       if (selector === "[data-settings-live-region]") return this.liveRegions as T[];
       if (selector === "[data-settings-passive]") return this.passiveRegions as T[];
       assert.fail(`unexpected selector: ${selector}`);
@@ -648,7 +664,9 @@ test("a focused provider model select applies the newest catalog exactly once on
     setAttribute(name: string, value: string): void { this.attributes.set(name, value); }
     querySelectorAll<T>(selector: string): T[] {
       if (selector === "button, input, select, textarea") return [this.select] as T[];
-      if (selector === "select[data-main-provider-model-control]") return [this.select] as T[];
+      if (selector === "select[data-main-provider-model-control], select[data-side-chat-model-control]") {
+        return [this.select] as T[];
+      }
       if (selector === "[data-settings-live-region]" || selector === "[data-settings-passive]") return [];
       assert.fail(`unexpected selector: ${selector}`);
     }

@@ -76,7 +76,7 @@ pub struct DesktopInitialSetupMutationTargetProjection {
     pub setup_generation: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DesktopConfigFieldProjection {
     pub key: String,
     pub value: String,
@@ -88,6 +88,31 @@ pub struct DesktopConfigFieldProjection {
     pub min_value: Option<f64>,
     pub max_value: Option<f64>,
     pub options: Vec<String>,
+}
+
+impl std::fmt::Debug for DesktopConfigFieldProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("DesktopConfigFieldProjection");
+        debug.field("key", &self.key);
+        if matches!(
+            self.key.as_str(),
+            "model.system_prompt" | "side_chat.system_prompt"
+        ) {
+            debug.field("value_chars", &self.value.chars().count());
+        } else {
+            debug.field("value", &self.value);
+        }
+        debug
+            .field("sensitive", &self.sensitive)
+            .field("configured", &self.configured)
+            .field("env_override", &self.env_override)
+            .field("value_type", &self.value_type)
+            .field("required", &self.required)
+            .field("min_value", &self.min_value)
+            .field("max_value", &self.max_value)
+            .field("options", &self.options)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,13 +215,14 @@ impl Default for DesktopRuntimeProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopSideChatProjection {
     pub configured: bool,
     pub deleting: bool,
     pub chat_id: Option<String>,
     pub owner_session_id: Option<String>,
     pub model: String,
+    pub system_prompt: String,
     pub base_url: String,
     pub provider_profile: String,
     pub status: String,
@@ -214,6 +240,38 @@ pub struct DesktopSideChatProjection {
     pub can_cancel: bool,
 }
 
+impl std::fmt::Debug for DesktopSideChatProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesktopSideChatProjection")
+            .field("configured", &self.configured)
+            .field("deleting", &self.deleting)
+            .field("chat_id", &self.chat_id)
+            .field("owner_session_id", &self.owner_session_id)
+            .field("model", &self.model)
+            .field("system_prompt_chars", &self.system_prompt.chars().count())
+            .field("base_url", &self.base_url)
+            .field("provider_profile", &self.provider_profile)
+            .field("status", &self.status)
+            .field("phase", &self.phase)
+            .field("last_error", &self.last_error)
+            .field("generation", &self.generation)
+            .field("draft_text", &self.draft_text)
+            .field("draft_quote", &self.draft_quote)
+            .field("draft_revision", &self.draft_revision)
+            .field("context_scope", &self.context_scope)
+            .field(
+                "context_as_of_append_position",
+                &self.context_as_of_append_position,
+            )
+            .field("context_truncated", &self.context_truncated)
+            .field("messages", &self.messages)
+            .field("can_send", &self.can_send)
+            .field("can_cancel", &self.can_cancel)
+            .finish()
+    }
+}
+
 impl Default for DesktopSideChatProjection {
     fn default() -> Self {
         Self {
@@ -222,6 +280,7 @@ impl Default for DesktopSideChatProjection {
             chat_id: None,
             owner_session_id: None,
             model: String::new(),
+            system_prompt: String::new(),
             base_url: String::new(),
             provider_profile: String::new(),
             status: "idle".to_string(),
@@ -1817,6 +1876,46 @@ mod tests {
         assert_eq!(projection.draft_quote, None);
         assert!(!projection.can_send);
         assert!(!projection.can_cancel);
+    }
+
+    #[test]
+    fn system_prompt_projections_serialize_values_but_debug_only_character_counts() {
+        for (key, prompt) in [
+            ("model.system_prompt", "MAIN_PRIVATE_PROMPT"),
+            ("side_chat.system_prompt", "SIDE_PRIVATE_PROMPT"),
+        ] {
+            let field = DesktopConfigFieldProjection {
+                key: key.to_string(),
+                value: prompt.to_string(),
+                sensitive: false,
+                configured: true,
+                env_override: None,
+                value_type: "string".to_string(),
+                required: false,
+                min_value: None,
+                max_value: None,
+                options: Vec::new(),
+            };
+            let field_debug = format!("{field:?}");
+            assert!(field_debug.contains("value_chars"));
+            assert!(!field_debug.contains(prompt));
+            assert_eq!(
+                serde_json::to_value(&field).expect("serialize config field")["value"],
+                prompt
+            );
+        }
+
+        let side = DesktopSideChatProjection {
+            system_prompt: "SIDE_PRIVATE_PROMPT".to_string(),
+            ..DesktopSideChatProjection::default()
+        };
+        let side_debug = format!("{side:?}");
+        assert!(side_debug.contains("system_prompt_chars"));
+        assert!(!side_debug.contains("SIDE_PRIVATE_PROMPT"));
+        assert_eq!(
+            serde_json::to_value(&side).expect("serialize side projection")["system_prompt"],
+            "SIDE_PRIVATE_PROMPT"
+        );
     }
 
     #[test]

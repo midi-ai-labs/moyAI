@@ -152,7 +152,7 @@ publish可能な再buildはそのtagが指すcommitだけを許可し、後続so
 
 ## 設定
 
-moyAI はuser-wide config fileをbaselineとして読み、必要に応じてenvironment variable、durableなroot-session override、CLI/run overrideを重ねます。左railの **接続設定** shortcutは、user-wide baselineと選択sessionのサイドチャットprovider sectionを持つDesktop **Preferences** を開きます。topbarのmodelまたはaccess chipから開く小さな **Session Settings** panelはcurrent root sessionだけを編集し、global Saveを表示しません。これらの入口は別のprovider設定ownerを作りません。
+moyAI はuser-wide config fileをbaselineとして読み、必要に応じてenvironment variable、durableなroot-session override、CLI/run overrideを重ねます。左railの **接続設定** shortcutは **Settings** を開きます。navigationは **Global Settings**（**Main Chat Settings** と **Side Chat Settings** を含む）、**Session-scoped Settings**（**Session Overrides** への入口）、**Desktop Preferences** に分かれます。MainとSide Chatのglobal設定はいずれもuser-wide TOMLのImport / Save対象です。Session Overridesから開く小さな **Session Settings** panelはcurrent rootのMain chatだけを編集し、global SaveやSide Chat既定値の変更は行いません。
 
 Windows の既定 config path:
 
@@ -175,11 +175,22 @@ provider custom header/body、Docling header、MCP server定義等のsensitive J
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
 provider_profile = "lm_studio"
+# system_prompt = """Mainへ追加する任意の指示""" # 任意
 # api_key_env = "OPENAI_API_KEY" # 任意。環境変数の名前を指定
 request_timeout_ms = 3600000
 context_window = 131072
 supports_tools = true
 supports_images = true
+
+[side_chat]
+base_url = "http://127.0.0.1:1234"
+model = "qwen/qwen3.6-27b"
+provider_profile = "lm_studio"
+# system_prompt = """Side Chatへ追加する任意の指示""" # 任意
+request_timeout_ms = 3600000
+connect_timeout_ms = 10000
+max_retries = 2
+context_window = 131072
 
 [permissions]
 access_mode = "default"
@@ -197,6 +208,12 @@ base_url = "http://127.0.0.1:8123"
 [mcp]
 enabled = false
 ```
+
+`model.system_prompt`はMain用の追加指示です。moyAI組み込みのsystem / default profile promptを先に保ち、設定値を`## User-configured system prompt` sectionとして後へ追加します。外側の空白は除去し、未指定または空欄なら何も追加しません。上限は16,384 Unicode文字で、設定変更はApply後にadmitされるturnから反映されます。
+
+`[side_chat]`は独立したglobal config sectionです。既定値が`[model]`と同じ場合でもMainから値を継承せず、user-wide設定のほかの項目と一緒にImport / Saveできます。`side_chat.system_prompt`はSide Chat組み込みpromptの後へ追加され、context preflightにも含まれます。空欄と16,384文字上限の扱いはMainと同じです。
+
+sessionでSide Chatを初めて作成したとき、または明示的に閉じた後で作り直したとき、現在のglobal Side Chat provider / model / prompt / timeout / retry / context設定をその会話へsnapshotします。既存のSide Chatは、ペインを隠す、sessionを移動する、windowを閉じる、appを再起動する操作を越えて、capture済み設定・履歴・draftを維持します。明示的に閉じた場合はそのSide Chat会話・draft・snapshotを削除しますが、globalな`[side_chat]`設定は削除もresetもしません。
 
 `request_timeout_ms`はmoyAI client側の通信生存判定を所有します。最初のPOST attemptから成功response headerまでは、
 connect retry待機、request body送信、header待ちを含む単一deadlineです。成功header後は同じ値をdecoded SSE event間の
@@ -221,11 +238,11 @@ configは全nested sectionでstrictにparseします。未知keyや`stream_max_r
 黙って保持せず、修正が必要なconfig errorとして報告します。
 errorにはparseに失敗したconfig fileの正確なpathを含めます。既存のuser-wide configは黙って書き換えないため、
 報告されたfileからretiredな`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`を削除または置換してから再起動します。
-Desktop Preferencesでは入力途中のcomplete config値、baseline、dirty状態、monotonic revisionをfrontend local draftだけに保ち、
-Rustへfield-value / dirty / revision mirrorを作りません。PreferencesのApply / Save / Resetはcomplete stable key/value draftと
+DesktopのGlobal Settingsでは入力途中のcomplete config値、baseline、dirty状態、monotonic revisionをfrontend local draftだけに保ち、
+Rustへfield-value / dirty / revision mirrorを作りません。Global SettingsのApply / Save / Resetはcomplete stable key/value draftと
 config targetを同一commandで送り、remembered Access / Provider Apply・Save / Importも同じglobal-config draftと各owner targetを
 使います。Rustはcurrent global/effective baselineとの比較、draft completeness、target/admissionを副作用前に検証します。
-config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberにしません。Preferences Applyは
+config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberにしません。Global SettingsのApplyは
 一時的な完全`ResolvedConfig`を作り、global Saveはdirty fieldだけをcurrent TOMLへmergeします。
 
 Session Settingsは完全なprovider接続、access mode、moyAI local context budgetだけの別frontend draftを持ちます。Applyは値と
@@ -673,7 +690,7 @@ multi-agent collaboration は既定で利用可能で、通常はmodelに `spawn
 - Doclingのenabled設定とbase URL
 
 splashはnetwork応答を待ちません。cold startではprovider catalog、availability、Docling healthのrequestを
-1件も送信しません。local設定が不足している場合はInitial SetupまたはPreferencesを表示し、左railの **接続設定** と
+1件も送信しません。local設定が不足している場合はInitial SetupまたはSettingsを表示し、左railの **接続設定** と
 topbarの **Session Settings** を通常の修正導線とします。実接続は明示的な
 model load / diagnosticまたは設定済みserviceを利用する操作でだけ確認します。
 

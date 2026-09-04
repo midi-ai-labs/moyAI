@@ -7,6 +7,7 @@ import {
   type ActionPayload,
 } from "./actions.ts";
 import {
+  configDraftAppliesTo,
   configMutationValues,
   reconcileConfigDraftTarget,
   type ConfigValueInput,
@@ -67,7 +68,7 @@ import type {
   SideChatPendingQuote,
 } from "./types.ts";
 import {
-  sideChatConfigurationOpen,
+  recordSideChatCatalogConfigEdit,
   sideChatCatalogViewForState,
   sideChatDeleteConfirmationStillTargets,
   sideChatDraftForState,
@@ -75,7 +76,6 @@ import {
   sideChatModelOptions,
   sideChatMutationPending,
   sideChatOperationsOpen,
-  sideChatOwnerSessionId,
   sessionSettingsMutationAvailability,
   updateSideChatDraftFromManualEdit,
   type UiLocalState,
@@ -85,7 +85,6 @@ import {
   providerOverlayFeedback,
   validateConfigFieldValues,
   validateConfigInput,
-  validateSideChatProviderSettings,
 } from "./utils.ts";
 import {
   activateSettingsSectionNavigation,
@@ -120,6 +119,7 @@ let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
 let opacityPreviewInFlight = false;
 let delegatedEventsInstalled = false;
+const wiredOpacityInputs = new WeakSet<HTMLInputElement>();
 interface CapturedSideChatPointerQuote {
   ownerSessionId: string;
   quote: SideChatPendingQuote;
@@ -552,17 +552,20 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     updateReviewActionButtons(context);
   });
   const opacityInput = document.querySelector<HTMLInputElement>("#opacity-input");
-  opacityInput?.addEventListener("input", (event) => {
-    const input = event.currentTarget as HTMLInputElement;
-    const percent = clampOpacityPercent(Number(input.value));
-    input.setAttribute("aria-valuetext", `${percent}%`);
-    scheduleOpacityPreview(percent, context);
-  });
-  opacityInput?.addEventListener("change", (event) => {
-    void context.mutate("set_window_opacity", {
-      percent: clampOpacityPercent(Number((event.currentTarget as HTMLInputElement).value)),
+  if (opacityInput && !wiredOpacityInputs.has(opacityInput)) {
+    wiredOpacityInputs.add(opacityInput);
+    opacityInput.addEventListener("input", (event) => {
+      const input = event.currentTarget as HTMLInputElement;
+      const percent = clampOpacityPercent(Number(input.value));
+      input.setAttribute("aria-valuetext", `${percent}%`);
+      scheduleOpacityPreview(percent, context);
     });
-  });
+    opacityInput.addEventListener("change", (event) => {
+      void context.mutate("set_window_opacity", {
+        percent: clampOpacityPercent(Number((event.currentTarget as HTMLInputElement).value)),
+      });
+    });
+  }
 }
 
 function installDelegatedActionEvents(context: ActionContext): void {
@@ -644,43 +647,15 @@ function installDelegatedActionEvents(context: ActionContext): void {
       }
       return;
     }
-    if (target.matches(".side-chat-settings-control")) {
-      const currentState = context.getViewState();
-      const ownerSessionId = currentState ? sideChatOwnerSessionId(currentState) : null;
-      const draft = currentState ? sideChatDraftForState(context.uiState, currentState) : null;
-      if (
-        !currentState
-        || !ownerSessionId
-        || !draft
-        || !sideChatOperationsOpen(context.uiState)
-        || !sideChatConfigurationOpen(currentState)
-        || sideChatMutationPending(context.uiState, ownerSessionId)
-      ) return;
-      const nextValue = target.value;
-      const setting = target.dataset.sideChatSetting;
-      if (setting === "base-url" && draft.setupBaseUrl !== nextValue) {
-        draft.setupBaseUrl = nextValue;
-        draft.setupRevision += 1;
-      } else if (setting === "model" && draft.setupModel !== nextValue) {
-        draft.setupModel = nextValue;
-        draft.setupRevision += 1;
-      } else if (
-        setting === "provider-profile"
-        && isProviderProfile(nextValue)
-        && draft.setupProviderProfile !== nextValue
-      ) {
-        draft.setupProviderProfile = nextValue;
-        draft.setupRevision += 1;
-      }
-      updateSideChatActionButtons(currentState, context);
-      return;
-    }
     if (!target.matches(".settings-control") || !updateSettingsControlDraft(target, context)) return;
-    synchronizeMainProviderModelControls(target);
+    synchronizeProviderModelControls(target);
     const currentState = context.getViewState();
     if (currentState) {
       synchronizeInitialSetupProviderDraft(currentState, context.uiState);
       validateSettingsForm(context, currentState.config_fields, false);
+      if (target.dataset.configKey?.startsWith("side_chat.")) {
+        synchronizeSideChatCatalogControls(currentState, context, configDraftEditOpen(context.uiState));
+      }
     }
     if (event.type === "change" && target.dataset.configKey === "docling.enabled") {
       context.rerender();
@@ -1155,6 +1130,12 @@ function updateSettingsControlDraft(control: SettingsControl, context: ActionCon
   if (!currentState || !key) return false;
   const index = currentState.config_fields.findIndex((field) => field.key === key);
   if (index < 0) return false;
+  recordSideChatCatalogConfigEdit(
+    context.uiState,
+    key,
+    currentState.config_fields[index].value,
+    text,
+  );
   updateConfigDraftValue(
     context.uiState,
     currentState.config_target,
@@ -1165,10 +1146,15 @@ function updateSettingsControlDraft(control: SettingsControl, context: ActionCon
   return true;
 }
 
-function synchronizeMainProviderModelControls(source: SettingsControl): void {
-  if (!source.matches("[data-main-provider-model-control]")) return;
+function synchronizeProviderModelControls(source: SettingsControl): void {
+  const selector = source.matches("[data-main-provider-model-control]")
+    ? "[data-main-provider-model-control]"
+    : source.matches("[data-side-chat-model-control]")
+      ? "[data-side-chat-model-control]"
+      : null;
+  if (!selector) return;
   const value = source.value;
-  document.querySelectorAll<SettingsControl>("[data-main-provider-model-control]").forEach((control) => {
+  document.querySelectorAll<SettingsControl>(selector).forEach((control) => {
     if (control === source) return;
     if (control instanceof HTMLSelectElement) {
       control.querySelectorAll<HTMLOptionElement>("option[data-manual-option]").forEach((option) => option.remove());
@@ -1336,98 +1322,45 @@ export function shortcutActionForComposer(
   return action === "send" && sideChatComposerActive ? "send-side-chat" : action;
 }
 
-function updateSideChatActionButtons(state: DesktopWebState, context: ActionContext): void {
-  const ownerSessionId = sideChatOwnerSessionId(state);
-  const draft = sideChatDraftForState(context.uiState, state);
-  const pending = sideChatMutationPending(context.uiState, ownerSessionId);
-  const deleting = state.side_chat.deleting;
-  const operationsOpen = sideChatOperationsOpen(context.uiState);
-  const configurationOpen = operationsOpen && sideChatConfigurationOpen(state) && !pending;
-  const catalog = sideChatCatalogViewForState(context.uiState, state);
-  const settingsValidation = validateSideChatProviderSettings(
-    draft?.setupBaseUrl ?? "",
-    draft?.setupModel ?? "",
-  );
-  const invalidSettings = ownerSessionId !== null && !settingsValidation.ok;
-  document.querySelectorAll<HTMLInputElement>(".side-chat-settings-control").forEach((control) => {
-    control.disabled = !configurationOpen;
-    control.setAttribute("aria-disabled", String(!configurationOpen));
-  });
-  synchronizeSideChatCatalogControls(state, context, configurationOpen);
-  const configure = document.querySelector<HTMLButtonElement>('[data-action="configure-side-chat"]');
-  if (configure) {
-    synchronizeActionButtonAvailability(configure, context);
-    configure.textContent = pending
-      ? "処理中…"
-      : state.side_chat.configured ? "設定を更新" : "設定する";
-  }
-  const settingsStatus = document.querySelector<HTMLElement>("#side-chat-settings-status");
-  if (settingsStatus) {
-    const error = state.side_chat.last_error.trim();
-    settingsStatus.textContent = ownerSessionId === null
-      ? "通常チャットを選択すると、そのチャット専用のside providerを設定できます。"
-      : deleting
-        ? "サイドチャットを削除しています。完了するまで設定は変更できません。"
-        : !operationsOpen
-          ? "メインLLM設定の処理が完了するまで、サイドチャット設定は変更できません。"
-        : pending
-          ? "サイドチャット操作の完了を待っています…"
-          : invalidSettings
-            ? settingsValidation.message
-          : error
-            ? error
-            : state.side_chat.configured && !state.side_chat.can_send
-              ? "サイドチャットの実行中は設定を変更できません。停止または完了後に更新してください。"
-              : state.side_chat.configured
-                ? `${state.side_chat.model} を選択中のチャットで使用します。`
-                : "LLM URLとモデルを入力して、選択中のチャットへ設定してください。";
-    settingsStatus.classList.toggle("error", error.length > 0 || invalidSettings);
-    settingsStatus.classList.toggle("ok", error.length === 0 && !invalidSettings);
-  }
-  const baseUrlControl = document.querySelector<HTMLInputElement>("#side-chat-base-url");
-  if (baseUrlControl) {
-    if (ownerSessionId !== null && !settingsValidation.baseUrl.ok) {
-      baseUrlControl.setAttribute("aria-invalid", "true");
-    } else {
-      baseUrlControl.removeAttribute("aria-invalid");
-    }
-  }
-  document.querySelectorAll<HTMLElement>("[data-side-chat-setting='model']").forEach((control) => {
-    if (ownerSessionId !== null && !settingsValidation.modelOk) {
-      control.setAttribute("aria-invalid", "true");
-    } else {
-      control.removeAttribute("aria-invalid");
-    }
-  });
+function updateSideChatActionButtons(_state: DesktopWebState, context: ActionContext): void {
   const send = document.querySelector<HTMLButtonElement>('[data-action="send-side-chat"]');
   if (send) synchronizeActionButtonAvailability(send, context);
   const cancel = document.querySelector<HTMLButtonElement>('[data-action="cancel-side-chat"]');
   if (cancel) synchronizeActionButtonAvailability(cancel, context);
   const remove = document.querySelector<HTMLButtonElement>('[data-action="request-delete-side-chat"]');
   if (remove) synchronizeActionButtonAvailability(remove, context);
-
-  const sideChatSettings = document.querySelector<HTMLElement>("#settings-side-chat");
-  if (sideChatSettings) {
-    sideChatSettings.setAttribute("aria-busy", String(!operationsOpen || pending || catalog.status === "loading"));
+  const view = context.getViewState();
+  if (view?.overlay === "config") {
+    synchronizeSideChatCatalogControls(view, context, configDraftEditOpen(context.uiState));
   }
 }
 
 function synchronizeSideChatCatalogControls(
-  state: DesktopWebState,
+  state: DesktopViewState,
   context: ActionContext,
-  configurationOpen: boolean,
+  editingOpen: boolean,
 ): void {
-  const draft = sideChatDraftForState(context.uiState, state);
   const catalog = sideChatCatalogViewForState(context.uiState, state);
-  const settingsValidation = validateSideChatProviderSettings(
-    draft?.setupBaseUrl ?? "",
-    draft?.setupModel ?? "",
-  );
-  const options = sideChatModelOptions(catalog, draft?.setupModel ?? "");
+  const draftApplies = configDraftAppliesTo(context.uiState, state.config_target);
+  const activeFields = state.config_fields.map((field) => ({
+    ...field,
+    value: draftApplies
+      ? (context.uiState.configDraftValues.get(field.key) ?? field.value)
+      : field.value,
+  }));
+  const model = activeFields.find((field) => field.key === "side_chat.model")?.value ?? "";
+  const baseUrlField = activeFields.find((field) => field.key === "side_chat.base_url");
+  const baseUrlValidation = baseUrlField
+    ? validateConfigInput(baseUrlField, baseUrlField.value, activeFields.map((field) => ({
+      key: field.key,
+      text: field.value,
+    })))
+    : { ok: false, message: "Side ChatのLLM URL設定が見つかりません。" };
+  const options = sideChatModelOptions(catalog, model);
   const select = document.querySelector<HTMLSelectElement>("#side-chat-model");
   if (select) {
     const desired = [
-      ...(draft?.setupModel.trim() ? [] : [{ value: "", label: "モデルを選択してください", disabled: true }]),
+      ...(model.trim() ? [] : [{ value: "", label: "モデルを選択してください", disabled: true }]),
       ...options.map((option) => ({
         value: option.id,
         label: sideChatModelOptionLabel(option),
@@ -1449,12 +1382,12 @@ function synchronizeSideChatCatalogControls(
         return option;
       }));
     }
-    select.value = draft?.setupModel.trim() ?? "";
-    select.disabled = !configurationOpen || options.length === 0;
+    select.value = model.trim();
+    select.disabled = !editingOpen || options.length === 0;
     select.setAttribute("aria-disabled", String(select.disabled));
   }
   const manual = document.querySelector<HTMLInputElement>("#side-chat-model-manual");
-  if (manual && manual !== document.activeElement && draft) manual.value = draft.setupModel;
+  if (manual && manual !== document.activeElement) manual.value = model;
 
   const load = document.querySelector<HTMLButtonElement>('[data-action="load-side-chat-models"]');
   if (load) {
@@ -1463,12 +1396,13 @@ function synchronizeSideChatCatalogControls(
   }
   const status = document.querySelector<HTMLElement>("#side-chat-model-catalog-status");
   if (status) {
-    const invalidUrl = sideChatOwnerSessionId(state) !== null && !settingsValidation.baseUrl.ok;
-    status.textContent = invalidUrl
-      ? settingsValidation.baseUrl.message
+    status.textContent = !baseUrlValidation.ok
+      ? baseUrlValidation.message
       : sideChatCatalogStatusText(catalog);
-    status.classList.toggle("error", catalog.status === "error" || invalidUrl);
+    status.classList.toggle("error", catalog.status === "error" || !baseUrlValidation.ok);
   }
+  document.querySelector<HTMLElement>("#settings-side-chat")
+    ?.setAttribute("aria-busy", String(catalog.status === "loading"));
 }
 
 function scheduleOpacityPreview(percent: number, context: ActionContext): void {

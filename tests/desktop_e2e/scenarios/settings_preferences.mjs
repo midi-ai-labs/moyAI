@@ -8,7 +8,11 @@ import {
   SCRIPTED_PROVIDER_MODEL_ID,
   startScriptedProvider,
 } from "../drivers/scripted_provider.mjs";
-import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
+import {
+  WebviewInput,
+  assertTrustedProbeSequence,
+  assertTrustedTextInsertion,
+} from "../drivers/webview_input.mjs";
 import {
   TAURI_MAIN_WINDOW_CLASS,
   dragExactOwnedWindow,
@@ -28,6 +32,7 @@ const OWNER = "scenario:settings.preferences";
 export const SETTINGS_RESTORE_STABILITY_MS = 500;
 export const PROVIDER_CONTEXT_BEFORE = "65536";
 export const PROVIDER_CONTEXT_AFTER = "65537";
+export const MAIN_SYSTEM_PROMPT_MARKER = "E2E_MAIN_SYSTEM_PROMPT_MARKER";
 export const SETTINGS_PROVIDER_PROFILE = "openai_responses";
 export const SETTINGS_PROVIDER_API_KEY_ENV = "";
 export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
@@ -38,12 +43,16 @@ export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
 ]);
 
 const SHOW_CONNECTION_SETTINGS = Object.freeze({
-  selector: 'aside.sidebar button.rail-item[data-action="show-config"][title="PreferencesでメインLLMの既定接続を確認・変更"]',
+  selector: 'aside.sidebar button.rail-item[data-action="show-config"][title="Settingsでglobal既定値を確認・変更"]',
   identity: { tag: "BUTTON", action: "show-config" },
 });
 const PROVIDER_CONTEXT = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.context_window"]',
   identity: { tag: "INPUT", configKey: "model.context_window" },
+});
+const MAIN_SYSTEM_PROMPT = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] textarea.settings-control[data-config-key="model.system_prompt"]',
+  identity: { tag: "TEXTAREA", configKey: "model.system_prompt" },
 });
 const SHOW_SETTINGS = Object.freeze({
   selector: 'aside.sidebar button.settings[data-action="show-config"][title="設定"]',
@@ -56,6 +65,10 @@ const SETTINGS_TOOLS = Object.freeze({
 const SETTINGS_PROVIDER = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-provider"]',
   identity: { tag: "A", href: "#settings-provider" },
+});
+const SETTINGS_MODEL = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-model"]',
+  identity: { tag: "A", href: "#settings-model" },
 });
 const DOCLING_TOGGLE = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] label.settings-toggle[data-config-key="docling.enabled"]',
@@ -217,6 +230,15 @@ export async function observeSettingsPreferencesSurface(cdp) {
           : [],
       };
     };
+    const textarea = (selector) => {
+      const found = one(selector);
+      return {
+        count: found.count,
+        visible: found.visible,
+        enabled: found.node instanceof HTMLTextAreaElement && !found.node.disabled && !found.node.readOnly,
+        value: found.node instanceof HTMLTextAreaElement ? found.node.value : null,
+      };
+    };
     const button = (selector) => {
       const found = one(selector);
       return {
@@ -231,6 +253,9 @@ export async function observeSettingsPreferencesSurface(cdp) {
     const settingsProviderLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-provider"]');
     const settingsSideChatLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]');
     const settingsToolsLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-tools"]');
+    const settingsNavigationGroups = rows('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav > .settings-nav-group[role="heading"][aria-level="3"]');
+    const settingsSessionOverridesLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-session-scope"]');
+    const settingsWindowLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-desktop"]');
     const closeConfirmation = one('[role="alertdialog"][aria-labelledby="settings-close-confirm-title"]');
     const doclingLabel = one('label.settings-toggle[data-config-key="docling.enabled"]');
     const doclingReadinessStatus = one('[role="dialog"][aria-labelledby="config-dialog-title"] #docling-readiness-status[data-settings-live-region="docling-readiness"]');
@@ -267,6 +292,7 @@ export async function observeSettingsPreferencesSurface(cdp) {
         profile: select('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.provider_profile"]'),
         api_key_env: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.api_key_env"]'),
         context: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.context_window"]'),
+        system_prompt: textarea('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.system_prompt"]'),
         max_output_tokens: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.max_output_tokens"]'),
         docling: input('[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="docling.enabled"]'),
         docling_label: {
@@ -291,9 +317,16 @@ export async function observeSettingsPreferencesSurface(cdp) {
         discard: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="discard-config-draft"]:not([hidden])'),
         close: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]'),
         navigation: {
+          groups: {
+            count: settingsNavigationGroups.length,
+            visible_count: settingsNavigationGroups.filter(visible).length,
+            texts: settingsNavigationGroups.map((node) => node instanceof HTMLElement ? node.textContent.trim() : null),
+          },
           provider: { count: settingsProviderLink.count, visible: settingsProviderLink.visible, text: settingsProviderLink.node instanceof HTMLElement ? settingsProviderLink.node.innerText.trim() : null },
           side_chat: { count: settingsSideChatLink.count, visible: settingsSideChatLink.visible, text: settingsSideChatLink.node instanceof HTMLElement ? settingsSideChatLink.node.innerText.trim() : null },
           tools: { count: settingsToolsLink.count, visible: settingsToolsLink.visible, text: settingsToolsLink.node instanceof HTMLElement ? settingsToolsLink.node.innerText.trim() : null },
+          session_overrides: { count: settingsSessionOverridesLink.count, visible: settingsSessionOverridesLink.visible, text: settingsSessionOverridesLink.node instanceof HTMLElement ? settingsSessionOverridesLink.node.innerText.trim() : null },
+          window: { count: settingsWindowLink.count, visible: settingsWindowLink.visible, text: settingsWindowLink.node instanceof HTMLElement ? settingsWindowLink.node.innerText.trim() : null },
         },
       },
       close_confirmation: {
@@ -343,7 +376,7 @@ export function shellReadyForSettingsDrag(surface, ledger) {
     && surface.connection_shortcut.visible === true
     && surface.connection_shortcut.enabled === true
     && surface.connection_shortcut.text === "接続設定"
-    && surface.connection_shortcut.title === "PreferencesでメインLLMの既定接続を確認・変更"
+    && surface.connection_shortcut.title === "Settingsでglobal既定値を確認・変更"
     && surface?.titlebar?.drag_count === 1
     && surface?.titlebar?.drag_visible === true
     && Number.isFinite(rect?.left)
@@ -388,7 +421,11 @@ export function providerEditorReady(surface, ledger, expectedContext = PROVIDER_
     && surface?.visible_dialog_count === 1;
 }
 
-export function preferencesReady(surface, ledger, { contextWindow, doclingEnabled }) {
+export function preferencesReady(
+  surface,
+  ledger,
+  { contextWindow, doclingEnabled, systemPrompt = MAIN_SYSTEM_PROMPT_MARKER },
+) {
   return networkStillZero(ledger)
     && errorFree(surface)
     && surface?.projection?.overlay === "config"
@@ -405,6 +442,10 @@ export function preferencesReady(surface, ledger, { contextWindow, doclingEnable
     && surface.settings.api_key_env.value === SETTINGS_PROVIDER_API_KEY_ENV
     && surface.settings.context.count === 1
     && surface.settings.context.value === contextWindow
+    && surface.settings.system_prompt.count === 1
+    && surface.settings.system_prompt.visible === true
+    && surface.settings.system_prompt.enabled === true
+    && surface.settings.system_prompt.value === systemPrompt
     && surface.settings.max_output_tokens.count === 0
     && surface.settings.max_output_tokens.visible === false
     && surface.settings.docling.count === 1
@@ -414,16 +455,32 @@ export function preferencesReady(surface, ledger, { contextWindow, doclingEnable
     && surface.settings.save.enabled === false
     && surface.settings.discard.count === 0
     && surface.settings.close.count === 1
+    && surface.settings.navigation?.groups?.count === 3
+    && surface.settings.navigation.groups.visible_count === 3
+    && sameValue(surface.settings.navigation.groups.texts, [
+      "Global Settings",
+      "Session-scoped Settings",
+      "Desktop Preferences",
+    ])
     && surface.settings.navigation?.provider?.count === 1
     && surface.settings.navigation.provider.visible === true
-    && surface.settings.navigation.provider.text === "メインLLM"
+    && surface.settings.navigation.provider.text === "Main Chat Settings"
     && surface.settings.navigation?.side_chat?.count === 1
-    && surface.settings.navigation.side_chat.text === "サイドチャットLLM"
+    && surface.settings.navigation.side_chat.visible === true
+    && surface.settings.navigation.side_chat.text === "Side Chat Settings"
     && surface.settings.navigation?.tools?.count === 1
+    && surface.settings.navigation.tools.visible === true
     && surface.settings.navigation.tools.text === "Tools"
+    && surface.settings.navigation?.session_overrides?.count === 1
+    && surface.settings.navigation.session_overrides.visible === true
+    && surface.settings.navigation.session_overrides.text === "Session Overrides"
+    && surface.settings.navigation?.window?.count === 1
+    && surface.settings.navigation.window.visible === true
+    && surface.settings.navigation.window.text === "Window"
     && surface?.close_confirmation?.count === 0
     && surface?.visible_dialog_count === 1
     && fieldValue(surface.projection, "model.context_window") === contextWindow
+    && fieldValue(surface.projection, "model.system_prompt") === systemPrompt
     && fieldValue(surface.projection, "model.provider_profile") === SETTINGS_PROVIDER_PROFILE
     && fieldValue(surface.projection, "model.api_key_env") === SETTINGS_PROVIDER_API_KEY_ENV
     && fieldValue(surface.projection, "docling.enabled") === String(doclingEnabled);
@@ -441,6 +498,7 @@ export function dirtyDoclingPreferencesReady(surface, ledger, expectedTarget, ex
     && surface.settings.save.enabled === true
     && surface.settings.discard.count === 1
     && surface.settings.discard.enabled === true
+    && surface.settings.system_prompt.value === MAIN_SYSTEM_PROMPT_MARKER
     && surface?.close_confirmation?.count === 0
     && fieldValue(surface.projection, "docling.enabled") === String(expectedPersisted);
 }
@@ -453,6 +511,7 @@ export function dirtyCloseGuardReady(surface, ledger, expectedTarget) {
     && surface?.settings?.dialog_count === 1
     && surface.settings.dialog_inert === true
     && surface.settings.docling.checked === true
+    && surface.settings.system_prompt.value === MAIN_SYSTEM_PROMPT_MARKER
     && surface.settings.dirty_badge_visible === true
     && surface?.close_confirmation?.count === 1
     && surface.close_confirmation.visible === true
@@ -469,8 +528,10 @@ export function savedPreferencesReady(surface, ledger, baselineTarget) {
     && surface?.projection?.overlay === "config"
     && advancedConfigGeneration(surface?.projection?.config_target, baselineTarget)
     && fieldValue(surface.projection, "model.context_window") === PROVIDER_CONTEXT_AFTER
+    && fieldValue(surface.projection, "model.system_prompt") === MAIN_SYSTEM_PROMPT_MARKER
     && fieldValue(surface.projection, "docling.enabled") === "true"
     && surface?.settings?.context?.value === PROVIDER_CONTEXT_AFTER
+    && surface?.settings?.system_prompt?.value === MAIN_SYSTEM_PROMPT_MARKER
     && surface?.settings?.docling?.checked === true
     && surface?.settings?.dirty_badge_visible === false
     && surface?.settings?.save?.enabled === false
@@ -480,6 +541,7 @@ export function savedPreferencesReady(surface, ledger, baselineTarget) {
 export function createStablePreferencesDecision({
   expectedContext = PROVIDER_CONTEXT_AFTER,
   expectedDocling = true,
+  expectedSystemPrompt = MAIN_SYSTEM_PROMPT_MARKER,
   minimumStableMs = SETTINGS_RESTORE_STABILITY_MS,
   now = () => Date.now(),
 } = {}) {
@@ -489,6 +551,7 @@ export function createStablePreferencesDecision({
     const accepted = preferencesReady(surface, ledger, {
       contextWindow: expectedContext,
       doclingEnabled: expectedDocling,
+      systemPrompt: expectedSystemPrompt,
     });
     if (!accepted) {
       acceptedSince = null;
@@ -645,6 +708,18 @@ async function trustedReplaceDigits(input, locator, text) {
     ],
   });
   return { click, probe, sequence: snapshot.sequence };
+}
+
+async function trustedInsertText(input, locator, text) {
+  const focus = await trustedClick(input, locator);
+  const start = (await input.snapshotProbe()).sequence;
+  const insertion = await input.insertText(locator, text);
+  const probe = assertTrustedTextInsertion(await input.snapshotProbe(start), {
+    afterSequence: start,
+    identity: locator.identity,
+    text,
+  });
+  return { focus, insertion, probe };
 }
 
 async function trustedEscape(input, identity) {
@@ -820,6 +895,7 @@ export function createSettingsPreferencesScenario() {
           decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
             contextWindow: PROVIDER_CONTEXT_BEFORE,
             doclingEnabled: false,
+            systemPrompt: "",
           })),
           code: "settings-connection-shortcut-not-ready",
           message: "the connection shortcut did not open consolidated Preferences in its exact offline state",
@@ -831,6 +907,7 @@ export function createSettingsPreferencesScenario() {
           decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
             contextWindow: PROVIDER_CONTEXT_BEFORE,
             doclingEnabled: false,
+            systemPrompt: "",
           }) && surface?.active?.configKey === "model.base_url"),
           code: "settings-provider-category-not-focused",
           message: "Settings category navigation did not focus the canonical main provider editor",
@@ -839,8 +916,30 @@ export function createSettingsPreferencesScenario() {
         const providerTarget = structuredClone(providerBefore.projection.config_target);
         const providerExpected = expectedGlobalSave(providerBefore, {
           "model.context_window": PROVIDER_CONTEXT_AFTER,
+          "model.system_prompt": MAIN_SYSTEM_PROMPT_MARKER,
         });
         const providerCommandStart = (await firstCommands.snapshot()).sequence;
+        const systemPromptTyping = await trustedInsertText(
+          firstInput,
+          MAIN_SYSTEM_PROMPT,
+          MAIN_SYSTEM_PROMPT_MARKER,
+        );
+        await trustedClick(firstInput, SETTINGS_MODEL);
+        await waitForProductStage({
+          label: "model Settings category focused",
+          sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
+          decide: surfaceDecision((surface, ledger) => networkStillZero(ledger)
+            && errorFree(surface)
+            && surface?.projection?.overlay === "config"
+            && sameValue(surface?.projection?.config_target, providerTarget)
+            && surface?.settings?.context?.value === PROVIDER_CONTEXT_BEFORE
+            && surface?.settings?.system_prompt?.value === MAIN_SYSTEM_PROMPT_MARKER
+            && surface?.settings?.dirty_badge_visible === true
+            && surface?.settings?.save?.enabled === true
+            && surface?.active?.configKey === "model.context_window"),
+          code: "settings-model-category-not-focused",
+          message: "Settings category navigation did not focus the canonical model editor",
+        });
         const providerTyping = await trustedReplaceDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER);
         const providerDirty = await waitForProductStage({
           label: "provider context edit ready to save",
@@ -848,6 +947,7 @@ export function createSettingsPreferencesScenario() {
           decide: surfaceDecision((surface, ledger) => surface?.projection?.overlay === "config"
             && networkStillZero(ledger)
             && surface?.settings?.context?.value === PROVIDER_CONTEXT_AFTER
+            && surface?.settings?.system_prompt?.value === MAIN_SYSTEM_PROMPT_MARKER
             && surface.settings.dirty_badge_visible === true
             && surface.settings.save.enabled === true
             && sameValue(surface.projection.config_target, providerTarget)),
@@ -871,6 +971,7 @@ export function createSettingsPreferencesScenario() {
         const providerSavedScreenshot = await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "settings-provider-saved", owner: OWNER });
         await sink.record("settings-provider-save-acquired", {
           typing: providerTyping,
+          system_prompt_typing: systemPromptTyping,
           dirty: providerDirty.value.surface,
           saved: providerSaved.value.surface,
           command: providerCommand,

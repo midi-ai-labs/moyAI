@@ -44,7 +44,7 @@ export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_CONTENT =
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_FIRST_RESPONSE =
   "SIDE_CHAT_TRANSCRIPT_QUOTE_OK";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND = "side_chat_session";
-export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAX_RESPONSES = 3;
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAX_RESPONSES = 4;
 export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT =
   "セッションAの決定事項: テーマカラーは青、公開日は金曜日です。この内容を記録して要約してください。";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE =
@@ -53,6 +53,10 @@ export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT =
   "セッションBの決定事項: テーマカラーは赤、公開日は月曜日です。この内容を記録して要約してください。";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE =
   "セッションB: テーマカラーは赤、公開日は月曜日です。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_PROMPT =
+  "Side Chat設定後のメインチャット確認です。サイド用の追加指示を参照せず、この文だけを確認してください。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_RESPONSE =
+  "メインチャットはSide Chat設定後も独立しています。";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION =
   "このセッションで決めたテーマカラーと公開日を教えてください。";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE =
@@ -352,11 +356,17 @@ function sideChatQuoteScript(value) {
 }
 
 function sideChatSessionScript(value) {
-  if (!exactKeys(value, ["kind"])
+  if (!exactKeys(value, ["expectedConsultSystemPromptMarker", "kind"])
     || value.kind !== SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
     throw new TypeError("Side Chat session scripted provider mode must use its exact schema");
   }
-  return Object.freeze({ kind: value.kind });
+  return Object.freeze({
+    kind: value.kind,
+    expectedConsultSystemPromptMarker: nonEmptyString(
+      value.expectedConsultSystemPromptMarker,
+      "script.expectedConsultSystemPromptMarker",
+    ),
+  });
 }
 
 function responsesCompactionScript(value) {
@@ -517,8 +527,11 @@ export function createSideChatQuoteProviderScript() {
   return sideChatQuoteScript({ kind: SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND });
 }
 
-export function createSideChatSessionProviderScript() {
-  return sideChatSessionScript({ kind: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND });
+export function createSideChatSessionProviderScript({ expectedConsultSystemPromptMarker } = {}) {
+  return sideChatSessionScript({
+    kind: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND,
+    expectedConsultSystemPromptMarker,
+  });
 }
 
 export function createResponsesCompactionProviderScript({
@@ -1671,15 +1684,19 @@ export function sideChatSessionOwnerContext(text) {
 function sideChatSessionRequestContract(body, modelId, script) {
   const input = Array.isArray(body?.input) ? body.input : [];
   const firstText = exactInputText(input[0]);
+  const instructions = typeof body?.instructions === "string" ? body.instructions : "";
   const ownerContext = sideChatSessionOwnerContext(firstText);
   const role = input.length === 1 && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT
     ? "side_session_alpha"
     : input.length === 1 && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT
       ? "side_session_beta"
-      : input.length === 2 && ownerContext.pass
-          && exactInputText(input[1]) === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION
-        ? "side_session_consult"
-        : null;
+      : input.length === 1
+          && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_PROMPT
+        ? "side_session_main_after_config"
+        : input.length === 2 && ownerContext.pass
+            && exactInputText(input[1]) === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION
+          ? "side_session_consult"
+          : null;
   // Reuse the common strict tool-less wire contract; only the two-message
   // owner-context input differs from its one-user-input predicate.
   const wire = requestContract(body, modelId, firstText);
@@ -1688,7 +1705,13 @@ function sideChatSessionRequestContract(body, modelId, script) {
   const foreignSessionAbsent = role !== "side_session_consult" || ![
     SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT,
     SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE,
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_PROMPT,
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_RESPONSE,
   ].some((text) => serializedBody.includes(text));
+  const consultSystemPromptMarkerCount = instructions
+    .split(script.expectedConsultSystemPromptMarker).length - 1;
+  const consultSystemPromptMarkerPresent = consultSystemPromptMarkerCount > 0;
+  const consultSystemPromptMarkerExactlyOnce = consultSystemPromptMarkerCount === 1;
   return {
     ...wire,
     script_kind: script.kind,
@@ -1697,10 +1720,15 @@ function sideChatSessionRequestContract(body, modelId, script) {
     input_matches: inputMatches,
     owner_context: ownerContext,
     foreign_session_absent: foreignSessionAbsent,
+    consult_system_prompt_marker_present: consultSystemPromptMarkerPresent,
+    consult_system_prompt_marker_exactly_once: consultSystemPromptMarkerExactlyOnce,
     pass: wire.client_generation_fields_absent
       && wire.model_matches
       && inputMatches
       && foreignSessionAbsent
+      && (role === "side_session_consult"
+        ? consultSystemPromptMarkerExactlyOnce
+        : !consultSystemPromptMarkerPresent)
       && wire.instructions_non_empty
       && wire.top_level_keys_match
       && wire.max_output_tokens_absent
@@ -4357,7 +4385,12 @@ export class ScriptedProvider {
       return;
     }
     const role = row.contract.role;
-    const roles = ["side_session_alpha", "side_session_beta", "side_session_consult"];
+    const roles = [
+      "side_session_alpha",
+      "side_session_beta",
+      "side_session_main_after_config",
+      "side_session_consult",
+    ];
     if (this.#acceptedRoles.has(role)) {
       row.response_phase = "rejected";
       row.response_status = 409;
@@ -4378,6 +4411,7 @@ export class ScriptedProvider {
     const responseText = {
       side_session_alpha: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE,
       side_session_beta: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE,
+      side_session_main_after_config: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_RESPONSE,
       side_session_consult: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE,
     }[role];
     writeResponse(response, 200, "text/event-stream", responsesSse(responseText, {

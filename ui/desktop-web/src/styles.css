@@ -3873,6 +3873,33 @@ pre {
   font-size: 12px;
 }
 
+.settings-nav-group {
+  margin: 12px 10px 3px;
+  color: #858e9b;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-nav-group:first-child {
+  margin-top: 2px;
+}
+
+.settings-nav a.settings-nav-subitem {
+  min-height: 28px;
+  padding-block: 5px;
+  padding-left: 22px;
+  color: #aeb6c2;
+  font-size: 12px;
+}
+
+.settings-field textarea.settings-system-prompt {
+  min-height: 112px;
+  font-family: inherit;
+  line-height: 1.45;
+}
+
 .settings-toggle-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -4029,6 +4056,10 @@ pre {
   gap: 12px;
   padding-top: 14px;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.settings-scope-card > button {
+  width: fit-content;
 }
 
 .settings-raw-grid {
@@ -5045,6 +5076,11 @@ pre {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     border-right: 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .settings-nav-group {
+    grid-column: 1 / -1;
+    margin-top: 8px;
   }
 
   .settings-nav button {

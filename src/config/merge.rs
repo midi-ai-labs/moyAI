@@ -2,7 +2,8 @@ use super::model::{
     PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig, PartialInspectionConfig,
     PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig, PartialModelConfig,
     PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
-    PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
+    PartialShellConfig, PartialSideChatConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
+    ResolvedConfig,
 };
 use super::turn::ProviderEndpoint;
 
@@ -103,6 +104,9 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     if let Some(value) = patch.model {
         target.model = value;
     }
+    if let Some(value) = patch.system_prompt {
+        target.system_prompt = value;
+    }
     if let Some(value) = patch.provider_profile {
         target.provider_profile = value;
     }
@@ -155,6 +159,33 @@ fn same_provider_endpoint(left: &str, right: &str) -> bool {
     ) {
         (Ok(left), Ok(right)) => left == right,
         _ => left.trim() == right.trim(),
+    }
+}
+
+fn apply_side_chat(target: &mut crate::config::SideChatConfig, patch: PartialSideChatConfig) {
+    if let Some(value) = patch.base_url {
+        target.base_url = value;
+    }
+    if let Some(value) = patch.model {
+        target.model = value;
+    }
+    if let Some(value) = patch.system_prompt {
+        target.system_prompt = value;
+    }
+    if let Some(value) = patch.provider_profile {
+        target.provider_profile = value;
+    }
+    if let Some(value) = patch.context_window {
+        target.context_window = value;
+    }
+    if let Some(value) = patch.request_timeout_ms {
+        target.request_timeout_ms = value;
+    }
+    if let Some(value) = patch.connect_timeout_ms {
+        target.connect_timeout_ms = value;
+    }
+    if let Some(value) = patch.max_retries {
+        target.max_retries = value;
     }
 }
 
@@ -333,6 +364,9 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
     if let Some(value) = patch.model {
         apply_model(&mut target.model, value);
     }
+    if let Some(value) = patch.side_chat {
+        apply_side_chat(&mut target.side_chat, value);
+    }
     if let Some(value) = patch.session {
         apply_session(&mut target.session, value);
     }
@@ -381,8 +415,8 @@ mod tests {
     use super::{apply_patch, normalize_provider_profile_alias, normalize_request_timeout_alias};
     use crate::config::model::{
         ChatCompletionsReasoningParameters, PartialModelConfig, PartialResolvedConfig,
-        ProviderApiMode, ProviderMetadataMode, ProviderProfile, ReasoningEffort, ReasoningSummary,
-        ResolvedConfig,
+        PartialSideChatConfig, ProviderApiMode, ProviderMetadataMode, ProviderProfile,
+        ReasoningEffort, ReasoningSummary, ResolvedConfig,
     };
 
     #[test]
@@ -482,6 +516,40 @@ mod tests {
         );
 
         assert_eq!(resolved.model.request_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn side_chat_patch_updates_only_the_independent_global_defaults() {
+        let defaults = ResolvedConfig::default();
+        let main_before = defaults.model.clone();
+        let resolved = apply_patch(
+            defaults,
+            PartialResolvedConfig {
+                side_chat: Some(PartialSideChatConfig {
+                    base_url: Some("https://side.example.test/v1".to_string()),
+                    model: Some("side-model".to_string()),
+                    system_prompt: Some("side instructions".to_string()),
+                    provider_profile: Some(ProviderProfile::OpenAiCompatible),
+                    context_window: Some(65_536),
+                    request_timeout_ms: Some(45_000),
+                    connect_timeout_ms: Some(5_000),
+                    max_retries: Some(4),
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+
+        assert_eq!(resolved.model.model, main_before.model);
+        assert_eq!(resolved.model.base_url, main_before.base_url);
+        assert_eq!(resolved.side_chat.model, "side-model");
+        assert_eq!(
+            resolved.side_chat.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(resolved.side_chat.context_window, 65_536);
+        assert_eq!(resolved.side_chat.request_timeout_ms, 45_000);
+        assert_eq!(resolved.side_chat.connect_timeout_ms, 5_000);
+        assert_eq!(resolved.side_chat.max_retries, 4);
     }
 
     #[test]

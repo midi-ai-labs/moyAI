@@ -133,24 +133,32 @@ const SIDE_SETTINGS_NAV = Object.freeze({
   identity: { tag: "A", href: "#settings-side-chat" },
 });
 const SIDE_BASE_URL = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-base-url[data-side-chat-setting="base-url"]',
-  identity: { tag: "INPUT", id: "side-chat-base-url", sideSetting: "base-url" },
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-base-url[data-config-key="side_chat.base_url"]',
+  identity: { tag: "INPUT", id: "side-chat-base-url", configKey: "side_chat.base_url" },
 });
 const SIDE_PROVIDER_PROFILE = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select#side-chat-provider-profile[data-side-chat-setting="provider-profile"]',
-  identity: { tag: "SELECT", id: "side-chat-provider-profile", sideSetting: "provider-profile" },
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]',
+  identity: { tag: "SELECT", id: "side-chat-provider-profile", configKey: "side_chat.provider_profile" },
 });
 const SIDE_MANUAL_DETAILS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] details[data-details-key="side-chat-manual-model"] > summary',
   identity: { tag: "DETAILS", detailsKey: "side-chat-manual-model" },
 });
 const SIDE_MANUAL_MODEL = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-model-manual[data-side-chat-setting="model"]',
-  identity: { tag: "INPUT", id: "side-chat-model-manual", sideSetting: "model" },
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-model-manual[data-config-key="side_chat.model"]',
+  identity: { tag: "INPUT", id: "side-chat-model-manual", configKey: "side_chat.model" },
 });
-const CONFIGURE_SIDE_CHAT = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="configure-side-chat"]',
-  identity: { tag: "BUTTON", action: "configure-side-chat" },
+const SHOW_SIDE_CHAT = Object.freeze({
+  selector: 'button[data-action="show-side-chat-pane"]',
+  identity: { tag: "BUTTON", action: "show-side-chat-pane" },
+});
+const REQUEST_DELETE_SIDE_CHAT = Object.freeze({
+  selector: 'aside.side-chat-pane[data-pane-mode="side-chat"] button[data-action="request-delete-side-chat"]',
+  identity: { tag: "BUTTON", action: "request-delete-side-chat" },
+});
+const CONFIRM_DELETE_SIDE_CHAT = Object.freeze({
+  selector: '[role="alertdialog"][aria-labelledby="side-chat-delete-title"] button[data-action="confirm-delete-side-chat"]',
+  identity: { tag: "BUTTON", action: "confirm-delete-side-chat" },
 });
 const CLOSE_SETTINGS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]',
@@ -2001,6 +2009,24 @@ export function case52ExpectedMainGlobalSave(surface, options) {
   };
 }
 
+export function case52ExpectedSideGlobalSave(surface, options) {
+  const target = surface?.projection?.config_target;
+  if (target === null || typeof target !== "object") {
+    throw new TypeError("case5_2 Side Chat Settings save requires one config target");
+  }
+  return {
+    command: "save_global_config",
+    args: {
+      values: configValues(surface.projection, {
+        "side_chat.base_url": options.providerBaseUrl,
+        "side_chat.model": options.sideModel,
+        "side_chat.provider_profile": options.providerProfile,
+      }),
+      expectedTarget: structuredClone(target),
+    },
+  };
+}
+
 async function observeMainSettings(cdp) {
   return cdp.evaluate(`(async () => {
     const invoke = window.__TAURI_INTERNALS__?.invoke;
@@ -2412,20 +2438,29 @@ async function observeSideSettings(cdp) {
     };
     const settings = one('[role="dialog"][aria-labelledby="config-dialog-title"]');
     const section = one('[role="dialog"][aria-labelledby="config-dialog-title"] section#settings-side-chat');
-    const profile = one('select#side-chat-provider-profile[data-side-chat-setting="provider-profile"]');
-    const base = one('input#side-chat-base-url[data-side-chat-setting="base-url"]');
-    const manual = one('input#side-chat-model-manual[data-side-chat-setting="model"]');
+    const profile = one('select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]');
+    const base = one('input#side-chat-base-url[data-config-key="side_chat.base_url"]');
+    const manual = one('input#side-chat-model-manual[data-config-key="side_chat.model"]');
     const details = one('details[data-details-key="side-chat-manual-model"]');
-    const configure = one('button[data-action="configure-side-chat"]');
+    const save = one('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]');
+    const sidePane = one('aside.side-chat-pane[data-pane-mode="side-chat"]');
+    const deleteTrigger = one('aside.side-chat-pane[data-pane-mode="side-chat"] button[data-action="request-delete-side-chat"]');
+    const deleteDialog = one('[role="alertdialog"][aria-labelledby="side-chat-delete-title"]');
+    const deleteConfirm = one('[role="alertdialog"][aria-labelledby="side-chat-delete-title"] button[data-action="confirm-delete-side-chat"]');
     return {
       projection,
       settings: { count: settings.count, visible: visible(settings.node), viewport_visible: viewportVisible(settings.node) },
-      section: { count: section.count, visible: visible(section.node), viewport_visible: viewportVisible(section.node), owner: section.node instanceof HTMLElement ? section.node.dataset.sideChatSettingsOwner ?? null : null },
+      section: { count: section.count, visible: visible(section.node), viewport_visible: viewportVisible(section.node) },
       profile: { count: profile.count, visible: visible(profile.node), viewport_visible: viewportVisible(profile.node), value: profile.node instanceof HTMLSelectElement ? profile.node.value : null, enabled: profile.node instanceof HTMLSelectElement && !profile.node.disabled, options: profile.node instanceof HTMLSelectElement ? Array.from(profile.node.options).map((option) => option.value) : [] },
       base: { count: base.count, visible: visible(base.node), viewport_visible: viewportVisible(base.node), value: base.node instanceof HTMLInputElement ? base.node.value : null, enabled: base.node instanceof HTMLInputElement && !base.node.disabled && !base.node.readOnly },
       manual: { count: manual.count, visible: visible(manual.node), viewport_visible: viewportVisible(manual.node), value: manual.node instanceof HTMLInputElement ? manual.node.value : null, enabled: manual.node instanceof HTMLInputElement && !manual.node.disabled && !manual.node.readOnly },
       details: { count: details.count, visible: visible(details.node), viewport_visible: viewportVisible(details.node), open: details.node instanceof HTMLDetailsElement ? details.node.open : null },
-      configure: { count: configure.count, visible: visible(configure.node), enabled: configure.node instanceof HTMLButtonElement && !configure.node.disabled && configure.node.getAttribute('aria-disabled') !== 'true' },
+      dirty: Array.from(document.querySelectorAll('[role="dialog"][aria-labelledby="config-dialog-title"] .dirty-badge.visible')).filter(visible).length === 1,
+      save: { count: save.count, visible: visible(save.node), enabled: save.node instanceof HTMLButtonElement && !save.node.disabled && save.node.getAttribute('aria-disabled') !== 'true' },
+      side_pane: { count: sidePane.count, visible: visible(sidePane.node) },
+      delete_trigger: { count: deleteTrigger.count, visible: visible(deleteTrigger.node), enabled: deleteTrigger.node instanceof HTMLButtonElement && !deleteTrigger.node.disabled },
+      delete_dialog: { count: deleteDialog.count, visible: visible(deleteDialog.node) },
+      delete_confirm: { count: deleteConfirm.count, visible: visible(deleteConfirm.node), enabled: deleteConfirm.node instanceof HTMLButtonElement && !deleteConfirm.node.disabled },
       fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
       recoverable_error_count: Array.from(document.querySelectorAll('.ui-error-notice')).filter(visible).length,
       validation_error_count: Array.from(document.querySelectorAll('.validation.error')).filter(visible).length,
@@ -2459,7 +2494,6 @@ export function case52SideScreenshotSurfaceReady(surface, options, sessionId) {
     && surface.settings.viewport_visible === true
     && surface?.section?.visible === true
     && surface.section.viewport_visible === true
-    && surface.section.owner === sessionId
     && surface?.details?.open === true
     && surface?.profile?.visible === true
     && surface.profile.viewport_visible === true
@@ -2568,108 +2602,210 @@ export async function configureSideChat({
   sessionId,
   evidenceName = "case5_2-side-chat-configured",
 }) {
-  await openSideSettings({ cdp, input, sink });
-  const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
-  await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
-  let surface = await observeSideSettings(cdp);
-  if (surface.details.open !== true) {
-    await recordTrustedClick({
-      input,
-      locator: SIDE_MANUAL_DETAILS,
-      action: "open-side-chat-manual-model",
-      sink,
-      stableHitSamples: 3,
-    });
-    surface = (await waitForObservation({
-      label: "Side Chat manual model input",
-      timeoutMs: 10_000,
-      pollMs: 100,
-      sample: () => observeSideSettings(cdp),
-      accept: (value) => value.details.open === true && value.manual.visible === true && value.manual.enabled === true,
-    })).value;
-  }
-  await replaceExactText({ cdp, input, locator: SIDE_MANUAL_MODEL, text: options.sideModel, action: "side-chat-model", sink });
-  const committable = await waitForObservation({
-    label: "Side Chat Settings commit enabled",
-    timeoutMs: 10_000,
-    pollMs: 100,
-    sample: () => observeSideSettings(cdp),
-    accept: (value) => value.profile.value === options.providerProfile
-      && value.configure.count === 1 && value.configure.visible === true && value.configure.enabled === true,
+  const before = await desktopProjection(cdp);
+  const prior = before?.side_chat?.configured === true ? structuredClone(before.side_chat) : null;
+  const replaceBinding = prior !== null && !exactSideChatProjection(before, options, sessionId);
+  const commandProbe = new DesktopCommandProbe(cdp, {
+    probeId: "case5-2-side-settings",
+    commands: ["save_global_config", "delete_side_chat", "ensure_side_chat"],
   });
-  await recordTrustedClick({ input, locator: CONFIGURE_SIDE_CHAT, action: "configure-side-chat", sink });
-  const configured = await waitForObservation({
-    label: "session-scoped tool-less Side Chat persistence",
-    timeoutMs: 30_000,
-    pollMs: 100,
-    sample: () => observeSideSettings(cdp),
-    accept: (value) => exactSideChatProjection(value.projection, options, sessionId)
-      && value.section.owner === sessionId
-      && value.profile.value === options.providerProfile
-      && value.base.value === options.providerBaseUrl
-      && value.manual.value === options.sideModel
-      && value.fatal_count === 0
-      && value.recoverable_error_count === 0
-      && value.validation_error_count === 0,
-  });
-  let screenshotSurface = configured;
-  if (!case52SideScreenshotSurfaceReady(configured.value, options, sessionId)) {
-    await recordTrustedClick({
-      input,
-      locator: SIDE_SETTINGS_NAV,
-      action: "show-configured-side-chat-settings",
-      sink,
-    });
-    const visibleSection = await waitForSideScreenshotObservation({
-      action: "showing the configured Side Chat Settings section",
-      label: "visible configured Side Chat Settings controls",
-      timeoutMs: 10_000,
-      pollMs: 100,
-      sample: () => observeSideSettings(cdp),
-      accept: (value) => value?.settings?.visible === true
-        && value?.settings?.viewport_visible === true
-        && value?.section?.visible === true
-        && value?.section?.viewport_visible === true
-        && value?.profile?.visible === true
-        && value?.profile?.viewport_visible === true
-        && value?.base?.visible === true
-        && value?.base?.viewport_visible === true
-        && exactSideChatProjection(value?.projection, options, sessionId),
-    });
-    if (visibleSection.value?.details?.open !== true) {
+  const expectedCommands = [];
+  let primaryError = null;
+  try {
+    await commandProbe.install();
+    const opened = await openSideSettings({ cdp, input, sink });
+    const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
+    await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
+    let surface = await observeSideSettings(cdp);
+    if (surface.details.open !== true) {
       await recordTrustedClick({
         input,
         locator: SIDE_MANUAL_DETAILS,
-        action: "show-configured-side-chat-manual-model",
+        action: "open-side-chat-manual-model",
+        sink,
+        stableHitSamples: 3,
+      });
+      surface = (await waitForObservation({
+        label: "Side Chat manual model input",
+        timeoutMs: 10_000,
+        pollMs: 100,
+        sample: () => observeSideSettings(cdp),
+        accept: (value) => value.details.open === true && value.manual.visible === true && value.manual.enabled === true,
+      })).value;
+    }
+    await replaceExactText({ cdp, input, locator: SIDE_MANUAL_MODEL, text: options.sideModel, action: "side-chat-model", sink });
+    const committable = await waitForObservation({
+      label: "global Side Chat Settings save admission",
+      timeoutMs: 10_000,
+      pollMs: 100,
+      sample: () => observeSideSettings(cdp),
+      accept: (value) => value.profile.value === options.providerProfile
+        && value.base.value === options.providerBaseUrl
+        && value.manual.value === options.sideModel
+        && value.save.count === 1 && value.save.visible === true
+        && (value.dirty === false || value.save.enabled === true),
+    });
+    let saved = committable;
+    if (committable.value.dirty) {
+      const expectedSave = case52ExpectedSideGlobalSave(committable.value, options);
+      expectedCommands.push(expectedSave);
+      const baselineTarget = structuredClone(committable.value.projection.config_target);
+      await recordTrustedClick({ input, locator: SAVE_GLOBAL_CONFIG, action: "save-global-side-chat-settings", sink });
+      saved = await waitForObservation({
+        label: "global Side Chat Settings saved",
+        timeoutMs: 60_000,
+        pollMs: 100,
+        sample: () => observeSideSettings(cdp),
+        accept: (value) => value.dirty === false
+          && value.profile.value === options.providerProfile
+          && value.base.value === options.providerBaseUrl
+          && value.manual.value === options.sideModel
+          && configField(value.projection, "side_chat.provider_profile") === options.providerProfile
+          && configField(value.projection, "side_chat.base_url") === options.providerBaseUrl
+          && configField(value.projection, "side_chat.model") === options.sideModel
+          && advancedConfigTarget(value.projection.config_target, baselineTarget)
+          && value.fatal_count === 0
+          && value.recoverable_error_count === 0
+          && value.validation_error_count === 0,
+      });
+    }
+    await closeSettings({ cdp, input, sink });
+
+    let deleted = null;
+    if (replaceBinding) {
+      let deleteSurface = await observeSideSettings(cdp);
+      if (!deleteSurface.side_pane.visible) {
+        await recordTrustedClick({ input, locator: SHOW_SIDE_CHAT, action: "show-existing-side-chat-for-replacement", sink });
+        deleteSurface = (await waitForObservation({
+          label: "existing Side Chat visible before replacement",
+          timeoutMs: 10_000,
+          pollMs: 100,
+          sample: () => observeSideSettings(cdp),
+          accept: (value) => value.side_pane.visible === true && value.delete_trigger.enabled === true,
+        })).value;
+      }
+      const expectedDelete = {
+        command: "delete_side_chat",
+        args: {
+          ownerSessionId: prior.owner_session_id,
+          chatId: prior.chat_id,
+          expectedGeneration: prior.generation,
+        },
+      };
+      expectedCommands.push(expectedDelete);
+      await recordTrustedClick({ input, locator: REQUEST_DELETE_SIDE_CHAT, action: "request-side-chat-replacement", sink });
+      await waitForObservation({
+        label: "Side Chat replacement confirmation",
+        timeoutMs: 10_000,
+        pollMs: 100,
+        sample: () => observeSideSettings(cdp),
+        accept: (value) => value.delete_dialog.visible === true && value.delete_confirm.enabled === true,
+      });
+      await recordTrustedClick({ input, locator: CONFIRM_DELETE_SIDE_CHAT, action: "confirm-side-chat-replacement", sink });
+      deleted = await waitForObservation({
+        label: "old Side Chat snapshot deleted before replacement",
+        timeoutMs: 30_000,
+        pollMs: 100,
+        sample: () => desktopProjection(cdp),
+        accept: (projection) => projection?.side_chat?.configured === false
+          && projection.side_chat.owner_session_id === sessionId
+          && projection.side_chat.chat_id === null
+          && projection.side_chat.deleting === false,
+      });
+    }
+
+    let materialized = null;
+    if (prior === null || replaceBinding) {
+      const ensureTarget = await desktopProjection(cdp);
+      const expectedEnsure = {
+        command: "ensure_side_chat",
+        args: {
+          ownerSessionId: sessionId,
+          expectedConfigGeneration: ensureTarget.config_target.configGeneration,
+        },
+      };
+      expectedCommands.push(expectedEnsure);
+      await recordTrustedClick({ input, locator: SHOW_SIDE_CHAT, action: "materialize-side-chat-from-global-defaults", sink });
+      materialized = await waitForObservation({
+        label: "selected-session Side Chat snapshot materialized from global defaults",
+        timeoutMs: 30_000,
+        pollMs: 100,
+        sample: () => observeSideSettings(cdp),
+        accept: (value) => exactSideChatProjection(value.projection, options, sessionId)
+          && value.side_pane.visible === true
+          && value.fatal_count === 0
+          && value.recoverable_error_count === 0,
+      });
+    }
+
+    const commandObservation = await waitForObservation({
+      label: "exact global Side Chat save and snapshot commands",
+      timeoutMs: 10_000,
+      pollMs: 50,
+      sample: () => commandProbe.snapshot(),
+      accept: (snapshot) => snapshot.calls.length >= expectedCommands.length,
+    });
+    const commands = assertExactDesktopCommandSequence(commandObservation.value, { expected: expectedCommands });
+
+    await openSideSettings({ cdp, input, sink });
+    surface = await observeSideSettings(cdp);
+    if (surface.details.open !== true) {
+      await recordTrustedClick({
+        input,
+        locator: SIDE_MANUAL_DETAILS,
+        action: "show-materialized-side-chat-manual-model",
         sink,
         stableHitSamples: 3,
       });
     }
-    screenshotSurface = await waitForSideScreenshotObservation({
-      action: "showing the configured Side Chat model",
-      label: "visible configured Side Chat Settings section",
+    const screenshotSurface = await waitForSideScreenshotObservation({
+      action: "showing the materialized Side Chat global defaults",
+      label: "visible global Side Chat Settings and selected-session snapshot",
       timeoutMs: 10_000,
       pollMs: 100,
       sample: () => observeSideSettings(cdp),
       accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
     });
-  }
-  const screenshot = await captureScenarioScreenshot({ cdp, sink, name: evidenceName, owner: OWNER });
-  await sink.record("case5_2-side-chat-configured", {
-    owner_session_id: sessionId,
-    base_url: options.providerBaseUrl,
-    model: options.sideModel,
-    provider_profile: options.providerProfile,
-    provider_profile_selection: providerProfile,
-    initial_surface: committable.value,
-    configured_surface: configured.value,
-    screenshot_surface: screenshotSurface.value,
-    screenshot,
-  }, { phase: "executing", owner: OWNER });
-  await closeSettings({ cdp, input, sink });
-  const projection = await desktopProjection(cdp);
-  if (!exactSideChatProjection(projection, options, sessionId)) {
-    throw productFailure("case5_2-side-chat-persistence", "Side Chat configuration did not remain attached to the selected Project Chat after Settings closed", { projection: projection.side_chat });
+    const screenshot = await captureScenarioScreenshot({ cdp, sink, name: evidenceName, owner: OWNER });
+    await sink.record("case5_2-side-chat-configured", {
+      owner_session_id: sessionId,
+      base_url: options.providerBaseUrl,
+      model: options.sideModel,
+      provider_profile: options.providerProfile,
+      provider_profile_selection: providerProfile,
+      prior_binding: prior,
+      replaced_binding: replaceBinding,
+      opened_surface: opened.value,
+      saved_surface: saved.value,
+      deleted_surface: deleted?.value ?? null,
+      materialized_surface: materialized?.value ?? null,
+      command_evidence: commands,
+      screenshot_surface: screenshotSurface.value,
+      screenshot,
+    }, { phase: "executing", owner: OWNER });
+    await closeSettings({ cdp, input, sink });
+    const projection = await desktopProjection(cdp);
+    if (!exactSideChatProjection(projection, options, sessionId)) {
+      throw productFailure("case5_2-side-chat-persistence", "the selected-session Side Chat snapshot did not remain attached after global Settings closed", { projection: projection.side_chat });
+    }
+    return { prior, replaceBinding, commands, projection: projection.side_chat };
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      const removal = await commandProbe.remove();
+      await sink.record("case5_2-side-chat-command-probe-settled", removal, { phase: "executing", owner: OWNER });
+    } catch (error) {
+      if (primaryError === null) {
+        throw new DesktopE2eError(
+          "harness",
+          "case5_2-side-chat-command-probe-cleanup",
+          "Side Chat Settings command probe did not settle",
+          errorObservation(error),
+        );
+      }
+    }
   }
 }
 
@@ -2682,7 +2818,7 @@ async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId }) 
   if (!exactSideChatProjection(visible.value.projection, options, sessionId)
     || visible.value.base.value !== options.providerBaseUrl
     || visible.value.profile.value !== options.providerProfile) {
-    throw productFailure("case5_2-side-chat-restart-settings", "reopened Settings did not display the persisted Side Chat owner and provider", { surface: visible.value });
+    throw productFailure("case5_2-side-chat-restart-settings", "reopened Settings did not display the persisted global Side Chat defaults beside the restored session snapshot", { surface: visible.value });
   }
   if (visible.value.details.open !== true) {
     await recordTrustedClick({

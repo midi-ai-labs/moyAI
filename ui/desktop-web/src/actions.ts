@@ -71,13 +71,11 @@ import {
   finishSideChatCatalogLoad,
   openAgentPane,
   openSideChatPane,
-  rebaseSideChatDraftAfterConfigure,
   sessionSettingsDraftFromProjection,
   sessionSettingsMutationAvailability,
   setArtifactPaneCollapsed,
   showAgentList,
   showOutputPane,
-  sideChatConfigurationOpen,
   sideChatDeleteConfirmationStillTargets,
   sideChatDraftIsDirty,
   sideChatDraftForState,
@@ -99,7 +97,6 @@ import {
 import {
   doclingReadinessEndpoint,
   validateConfigFieldValues,
-  validateSideChatProviderSettings,
 } from "./utils.ts";
 
 export type ActionMenu = "file" | "edit" | "view" | "help";
@@ -143,7 +140,6 @@ export interface ActionContext {
   loadAgentExecution: (state: DesktopWebState, agentPath: string) => Promise<void>;
   loadPreviousAgentExecutionPage: (state: DesktopWebState, agentPath: string) => Promise<void>;
   loadSideChatModels: (args: {
-    ownerSessionId: string;
     baseUrl: string;
     providerProfile: ProviderProfile;
     expectedConfigGeneration: string;
@@ -891,7 +887,7 @@ async function confirmSettingsDiscardClose(context: ActionContext): Promise<void
       request.target,
       context.getViewState()?.config_target ?? null,
     );
-    failLocalDecision(context.uiState, "設定対象が変更されたため、Preferencesを閉じませんでした。");
+    failLocalDecision(context.uiState, "設定対象が変更されたため、Settingsを閉じませんでした。");
     context.rerender();
     return;
   }
@@ -903,7 +899,7 @@ async function confirmSettingsDiscardClose(context: ActionContext): Promise<void
     resetState.config_target,
     context.getViewState()?.config_target ?? null,
   )) {
-    failLocalDecision(context.uiState, "設定対象が変更されたため、Preferencesを閉じませんでした。");
+    failLocalDecision(context.uiState, "設定対象が変更されたため、Settingsを閉じませんでした。");
     context.rerender();
     return;
   }
@@ -997,7 +993,6 @@ async function loadSideChatModels(state: DesktopWebState, context: ActionContext
   context.rerender();
   try {
     const result = await context.loadSideChatModels({
-      ownerSessionId: request.ownerSessionId,
       baseUrl: request.baseUrl,
       providerProfile: request.providerProfile,
       expectedConfigGeneration: request.configGeneration,
@@ -1034,57 +1029,46 @@ function sideChatCatalogErrorMessage(error: unknown): string {
   return "モデル一覧を読み込めませんでした。";
 }
 
-async function configureSideChat(state: DesktopWebState, context: ActionContext): Promise<void> {
+async function ensureSideChatConfigured(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<DesktopViewState | null> {
   const ownerSessionId = sideChatOwnerSessionId(state);
-  const draft = sideChatDraftForState(context.uiState, state);
-  if (
-    !ownerSessionId
-    || !draft
-    || !sideChatOperationsOpen(context.uiState)
-    || !sideChatConfigurationOpen(state)
-    || sideChatMutationPending(context.uiState, ownerSessionId)
-  ) return;
-  const baseUrl = draft.setupBaseUrl.trim();
-  const model = draft.setupModel.trim();
-  const providerProfile = draft.setupProviderProfile;
-  if (!validateSideChatProviderSettings(baseUrl, model).ok) return;
-  if (
-    state.side_chat.configured
-    && baseUrl === state.side_chat.base_url.trim()
-    && model === state.side_chat.model.trim()
-    && providerProfile === state.side_chat.provider_profile
-  ) return;
+  if (!ownerSessionId || !sideChatOperationsOpen(context.uiState)) return null;
+  if (state.side_chat.configured) return state;
+  if (sideChatMutationPending(context.uiState, ownerSessionId)) return null;
   context.uiState.sideChatMutations.set(ownerSessionId, {
-    kind: "configure",
-    chatId: state.side_chat.chat_id,
+    kind: "ensure",
+    chatId: null,
     generation: state.side_chat.generation,
   });
-  const expectedConfigGeneration = state.config_target.configGeneration;
-  const setupRevision = draft.setupRevision;
   context.rerender();
   try {
-    await context.mutate("configure_side_chat", {
+    await context.mutate("ensure_side_chat", {
       ownerSessionId,
-      baseUrl,
-      model,
-      providerProfile,
-      expectedConfigGeneration,
+      expectedConfigGeneration: state.config_target.configGeneration,
     });
-    const current = context.getProjection();
-    if (current && draft.setupRevision === setupRevision) {
-      rebaseSideChatDraftAfterConfigure(
-        context.uiState,
-        current,
-        ownerSessionId,
-        baseUrl,
-        model,
-        providerProfile,
-      );
-    }
   } finally {
     context.uiState.sideChatMutations.delete(ownerSessionId);
-    context.rerender();
   }
+  const refreshed = context.getViewState();
+  if (
+    !refreshed
+    || sideChatOwnerSessionId(refreshed) !== ownerSessionId
+    || !refreshed.side_chat.configured
+  ) return null;
+  return refreshed;
+}
+
+async function showSideChatPane(state: DesktopViewState, context: ActionContext): Promise<void> {
+  const current = await ensureSideChatConfigured(state, context);
+  if (!current) {
+    context.rerender();
+    return;
+  }
+  if (!openSideChatPane(context.uiState, current)) return;
+  sideChatDraftForState(context.uiState, current);
+  context.rerender();
 }
 
 async function submitSideChat(state: DesktopWebState, context: ActionContext): Promise<void> {
@@ -1177,28 +1161,40 @@ async function submitSideChat(state: DesktopWebState, context: ActionContext): P
 }
 
 async function quoteSelectionToSideChat(
-  state: DesktopWebState,
+  state: DesktopViewState,
   context: ActionContext,
   quote: SideChatPendingQuote | null | undefined,
   quoteOwnerSessionId: string | null | undefined,
 ): Promise<void> {
   const ownerSessionId = sideChatOwnerSessionId(state);
-  const draft = sideChatDraftForState(context.uiState, state);
   if (
     !quote
     || !ownerSessionId
     || quoteOwnerSessionId !== ownerSessionId
-    || !draft
-    || !state.side_chat.configured
     || state.side_chat.deleting
     || !sideChatOperationsOpen(context.uiState)
     || quote.sourceAppendPosition !== state.side_chat.context_as_of_append_position
   ) return;
 
+  const current = await ensureSideChatConfigured(state, context);
+  const draft = current ? sideChatDraftForState(context.uiState, current) : null;
+  if (
+    !current
+    || !draft
+    || sideChatOwnerSessionId(current) !== ownerSessionId
+    || !current.side_chat.configured
+    || current.side_chat.deleting
+    || !sideChatOperationsOpen(context.uiState)
+    || quote.sourceAppendPosition !== current.side_chat.context_as_of_append_position
+  ) {
+    context.rerender();
+    return;
+  }
+
   appendQuoteToSideChatDraft(draft, quote);
-  openSideChatPane(context.uiState, state);
+  openSideChatPane(context.uiState, current);
   context.rerender();
-  await persistSideChatDraft(state, context);
+  await persistSideChatDraft(current, context);
 }
 
 export async function persistSideChatDraft(
@@ -1377,6 +1373,11 @@ async function confirmDeleteSideChat(state: DesktopWebState, context: ActionCont
     context.rerender();
   }
   const current = context.getProjection();
+  const exactTargetStillProjected = current?.side_chat.owner_session_id === confirmation.ownerSessionId
+    && current.side_chat.chat_id === confirmation.chatId;
+  const deletionAccepted = current !== null
+    && sideChatOwnerSessionId(current) === confirmation.ownerSessionId
+    && (current.side_chat.deleting || !exactTargetStillProjected);
   if (
     !current
     || current.side_chat.deleting
@@ -1392,6 +1393,7 @@ async function confirmDeleteSideChat(state: DesktopWebState, context: ActionCont
       context.uiState.sideChatDrafts.delete(confirmation.ownerSessionId);
     }
   }
+  if (deletionAccepted) showOutputPane(context.uiState);
   context.rerender();
 }
 
@@ -1467,7 +1469,8 @@ const ACTION_DEFINITIONS = [
     label: "このセッションの設定",
     palette: true,
     enabled: (state) => state.session_settings?.available === true
-      && state.session_settings.target !== null,
+      && state.session_settings.target !== null
+      && (state.overlay !== "config" || !state.config_draft.dirty),
     run: (_state, context) => context.mutate("show_session_settings"),
   },
   {
@@ -1536,7 +1539,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "open-preferences-from-session-settings",
-    label: "Preferencesで永続設定を開く",
+    label: "Global Settingsを開く",
     enabled: (state, _payload, model) => state.overlay === "session_settings"
       && !model.local.sessionSettings.dirty
       && !model.local.sessionSettings.mutationPending,
@@ -1744,20 +1747,18 @@ const ACTION_DEFINITIONS = [
     id: "show-side-chat-pane",
     label: "サイドチャットを表示",
     palette: true,
-    enabled: (state) => sideChatOwnerSessionId(state) !== null,
-    run: (state, context) => {
-      if (!openSideChatPane(context.uiState, state)) return;
-      sideChatDraftForState(context.uiState, state);
-      context.rerender();
-    },
+    enabled: (state, _payload, model) => sideChatOwnerSessionId(state) !== null
+      && model.local.sideChat.operationsOpen
+      && !model.local.sideChat.mutationPending,
+    run: (state, context) => showSideChatPane(state, context),
   },
   {
     id: "quote-selection-to-side-chat",
     label: "選択範囲をSide Chatで引用",
-    enabled: (state, _payload, model) => state.side_chat.configured
-      && !state.side_chat.deleting
+    enabled: (state, _payload, model) => !state.side_chat.deleting
       && sideChatOwnerSessionId(state) !== null
-      && model.local.sideChat.operationsOpen,
+      && model.local.sideChat.operationsOpen
+      && !model.local.sideChat.mutationPending,
     run: (state, context, payload) => quoteSelectionToSideChat(
       state,
       context,
@@ -1768,28 +1769,8 @@ const ACTION_DEFINITIONS = [
   {
     id: "load-side-chat-models",
     label: "Side Chat モデル読込",
-    enabled: (state, _payload, model) => sideChatConfigurationOpen(state)
-      && model.local.sideChat.catalogLoadEnabled,
+    enabled: (_state, _payload, model) => model.local.sideChat.catalogLoadEnabled,
     run: (state, context) => loadSideChatModels(state, context),
-  },
-  {
-    id: "configure-side-chat",
-    label: "サイドチャットモデルを設定",
-    enabled: (state, _payload, model) => {
-      const validation = validateSideChatProviderSettings(
-        model.local.sideChat.setupBaseUrl,
-        model.local.sideChat.setupModel,
-      );
-      return sideChatConfigurationOpen(state)
-        && model.local.sideChat.operationsOpen
-        && !model.local.sideChat.mutationPending
-        && validation.ok
-        && (!state.side_chat.configured
-          || model.local.sideChat.setupBaseUrl.trim() !== state.side_chat.base_url.trim()
-          || model.local.sideChat.setupModel.trim() !== state.side_chat.model.trim()
-          || model.local.sideChat.setupProviderProfile !== state.side_chat.provider_profile);
-    },
-    run: (state, context) => configureSideChat(state, context),
   },
   {
     id: "send-side-chat",

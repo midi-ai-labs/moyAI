@@ -1082,11 +1082,11 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
           if (!case52Stage5MainMatches(mainBeforeSideSurface, mainBeforeSideChat)) {
             throw productFailure(
               "provider-live-side-chat-main-baseline",
-              "the completed current_time Main session was not stable before Side Chat configuration",
+              "the completed current_time Main session was not stable before saving global Side Chat defaults",
               { main: mainBeforeSideChat },
             );
           }
-          await configureSideChat({
+          const sideSetup = await configureSideChat({
             cdp: restarted.driver,
             input: secondInput,
             sink,
@@ -1098,7 +1098,7 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
           if (!case52Stage5MainMatches(mainAfterConfigureSurface, mainBeforeSideChat)) {
             throw productFailure(
               "provider-live-side-chat-configure-main-drift",
-              "Side Chat configuration changed the completed current_time Main session",
+              "global Side Chat save or ensure changed the completed current_time Main session",
               {
                 expected: mainBeforeSideChat,
                 observed: case52Stage5MainSnapshot(mainAfterConfigureSurface),
@@ -1158,6 +1158,7 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
             main_before_side_chat: mainBeforeSideChat,
             main_after_configure: case52Stage5MainSnapshot(mainAfterConfigureSurface),
             main_after_side_chat: case52Stage5MainSnapshot(sideChat.completedSurface),
+            global_side_setup: sideSetup,
             binding: sideChat.binding,
             command_evidence: sideChat.commandEvidence,
             screenshot: sideChat.terminal_screenshot,

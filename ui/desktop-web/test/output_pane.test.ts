@@ -31,6 +31,7 @@ function outputState(): DesktopWebState {
       chat_id: null,
       owner_session_id: "session-a",
       model: "",
+      system_prompt: "",
       base_url: "",
       status: "idle",
       phase: "idle",

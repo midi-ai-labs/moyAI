@@ -335,6 +335,8 @@ pub struct FormatterRule {
 pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub system_prompt: String,
     pub provider_profile: ProviderProfile,
     pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -391,6 +393,7 @@ impl std::fmt::Debug for ModelConfig {
             .debug_struct("ModelConfig")
             .field("base_url", &"<redacted provider endpoint>")
             .field("model", &self.model)
+            .field("system_prompt_chars", &self.system_prompt.chars().count())
             .field("provider_profile", &self.provider_profile)
             .field(
                 "chat_completions_reasoning_parameters",
@@ -418,6 +421,55 @@ impl std::fmt::Debug for ModelConfig {
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("max_parallel_predictions", &self.max_parallel_predictions)
             .field("extra_body_present", &self.extra_body_json.is_some())
+            .finish()
+    }
+}
+
+/// Global defaults for Side Chat provider requests.
+///
+/// This is deliberately independent from `ModelConfig`: changing Main's
+/// provider settings does not implicitly change Side Chat, and Side Chat does
+/// not carry credentials, headers, tool, image, or generation-policy fields.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SideChatConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    pub provider_profile: ProviderProfile,
+    pub context_window: u32,
+    pub request_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    pub max_retries: u8,
+}
+
+impl Default for SideChatConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_MODEL_BASE_URL.to_string(),
+            model: DEFAULT_MODEL_NAME.to_string(),
+            system_prompt: String::new(),
+            provider_profile: ProviderProfile::LmStudio,
+            context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
+            request_timeout_ms: DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
+            connect_timeout_ms: 10_000,
+            max_retries: 2,
+        }
+    }
+}
+
+impl std::fmt::Debug for SideChatConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SideChatConfig")
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("model", &self.model)
+            .field("system_prompt_chars", &self.system_prompt.chars().count())
+            .field("provider_profile", &self.provider_profile)
+            .field("context_window", &self.context_window)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -571,6 +623,8 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedConfig {
     pub model: ModelConfig,
+    #[serde(default)]
+    pub side_chat: SideChatConfig,
     pub session: SessionConfig,
     pub multi_agent: MultiAgentConfig,
     pub permissions: PermissionsConfig,
@@ -595,6 +649,12 @@ impl ResolvedConfig {
         }
         self.model.model = model.to_string();
 
+        self.model.system_prompt = crate::system_prompt::normalize_user_configured_system_prompt(
+            Some(&self.model.system_prompt),
+        )
+        .map_err(|error| format!("config field `model.system_prompt` {error}"))?
+        .unwrap_or_default();
+
         self.model.api_key_env = canonical_api_key_env_name(self.model.api_key_env.as_deref())
             .map_err(|error| format!("config field `model.api_key_env` {error}"))?;
 
@@ -606,6 +666,44 @@ impl ResolvedConfig {
         if self.model.context_window == 0 {
             return Err(
                 "config field `model.context_window` must be greater than zero".to_string(),
+            );
+        }
+
+        self.side_chat.base_url =
+            crate::config::turn::ProviderEndpoint::parse(&self.side_chat.base_url)
+                .map_err(|error| format!("config field `side_chat.base_url` {error}"))?
+                .as_str()
+                .to_string();
+
+        let side_chat_model = self.side_chat.model.trim();
+        if side_chat_model.is_empty() {
+            return Err("config field `side_chat.model` must not be empty".to_string());
+        }
+        self.side_chat.model = side_chat_model.to_string();
+
+        self.side_chat.system_prompt =
+            crate::system_prompt::normalize_user_configured_system_prompt(Some(
+                &self.side_chat.system_prompt,
+            ))
+            .map_err(|error| format!("config field `side_chat.system_prompt` {error}"))?
+            .unwrap_or_default();
+
+        if !(1..=MAX_MODEL_REQUEST_TIMEOUT_MS).contains(&self.side_chat.request_timeout_ms) {
+            return Err(format!(
+                "config field `side_chat.request_timeout_ms` must be between 1 and {MAX_MODEL_REQUEST_TIMEOUT_MS} milliseconds inclusive"
+            ));
+        }
+        if self.side_chat.context_window == 0 {
+            return Err(
+                "config field `side_chat.context_window` must be greater than zero".to_string(),
+            );
+        }
+        if self.side_chat.connect_timeout_ms == 0
+            || self.side_chat.connect_timeout_ms > i64::MAX as u64
+        {
+            return Err(
+                "config field `side_chat.connect_timeout_ms` must fit a positive SQLite integer"
+                    .to_string(),
             );
         }
         Ok(())
@@ -813,6 +911,7 @@ impl Default for ResolvedConfig {
             model: ModelConfig {
                 base_url: DEFAULT_MODEL_BASE_URL.to_string(),
                 model: DEFAULT_MODEL_NAME.to_string(),
+                system_prompt: String::new(),
                 provider_profile: ProviderProfile::LmStudio,
                 chat_completions_reasoning_parameters: None,
                 reasoning_effort: None,
@@ -838,6 +937,7 @@ impl Default for ResolvedConfig {
                 max_parallel_predictions: 1,
                 extra_body_json: None,
             },
+            side_chat: SideChatConfig::default(),
             session: SessionConfig {
                 overflow_margin_tokens: 1_024,
             },
@@ -940,6 +1040,7 @@ impl Default for ResolvedConfig {
 #[serde(deny_unknown_fields)]
 pub struct PartialResolvedConfig {
     pub model: Option<PartialModelConfig>,
+    pub side_chat: Option<PartialSideChatConfig>,
     pub session: Option<PartialSessionConfig>,
     pub multi_agent: Option<PartialMultiAgentConfig>,
     pub permissions: Option<PartialPermissionsConfig>,
@@ -956,8 +1057,9 @@ pub struct PartialResolvedConfig {
 }
 
 impl PartialResolvedConfig {
-    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 14] = [
+    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 15] = [
         "model",
+        "side_chat",
         "session",
         "multi_agent",
         "permissions",
@@ -979,6 +1081,7 @@ impl PartialResolvedConfig {
 pub struct PartialModelConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub system_prompt: Option<String>,
     pub provider_profile: Option<ProviderProfile>,
     /// Deserialize-only compatibility input. Normalize it into `provider_profile` before merge.
     #[serde(skip_serializing)]
@@ -1052,6 +1155,13 @@ impl std::fmt::Debug for PartialModelConfig {
                     .map(|_| "<redacted provider endpoint>"),
             )
             .field("model", &self.model)
+            .field(
+                "system_prompt_chars",
+                &self
+                    .system_prompt
+                    .as_ref()
+                    .map(|prompt| prompt.chars().count()),
+            )
             .field("provider_profile", &self.provider_profile)
             .field("provider_metadata_mode", &self.provider_metadata_mode)
             .field("provider_api_mode", &self.provider_api_mode)
@@ -1094,6 +1204,47 @@ impl std::fmt::Debug for PartialModelConfig {
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("max_parallel_predictions", &self.max_parallel_predictions)
             .field("extra_body_present", &self.extra_body_json.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialSideChatConfig {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub provider_profile: Option<ProviderProfile>,
+    pub context_window: Option<u32>,
+    pub request_timeout_ms: Option<u64>,
+    pub connect_timeout_ms: Option<u64>,
+    pub max_retries: Option<u8>,
+}
+
+impl std::fmt::Debug for PartialSideChatConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PartialSideChatConfig")
+            .field(
+                "base_url",
+                &self
+                    .base_url
+                    .as_ref()
+                    .map(|_| "<redacted provider endpoint>"),
+            )
+            .field("model", &self.model)
+            .field(
+                "system_prompt_chars",
+                &self
+                    .system_prompt
+                    .as_ref()
+                    .map(|prompt| prompt.chars().count()),
+            )
+            .field("provider_profile", &self.provider_profile)
+            .field("context_window", &self.context_window)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -1226,7 +1377,7 @@ pub struct PartialLoggingConfig {
 mod config_contract_tests {
     use super::{
         AccessMode, McpServerConfig, PartialDoclingConfig, PartialMcpConfig, PartialModelConfig,
-        PartialResolvedConfig, ResolvedConfig, canonical_api_key_env_name,
+        PartialResolvedConfig, PartialSideChatConfig, ResolvedConfig, canonical_api_key_env_name,
     };
     use crate::tool::ToolEffectClass;
 
@@ -1234,6 +1385,7 @@ mod config_contract_tests {
     fn forward_compatible_top_level_section_inventory_matches_the_current_schema() {
         let complete_section_inventory = PartialResolvedConfig {
             model: Some(Default::default()),
+            side_chat: Some(Default::default()),
             session: Some(Default::default()),
             multi_agent: Some(Default::default()),
             permissions: Some(Default::default()),
@@ -1365,8 +1517,122 @@ mod config_contract_tests {
     }
 
     #[test]
-    fn provider_config_debug_omits_endpoint_and_header_secrets() {
+    fn main_system_prompt_is_trimmed_and_bounded_by_unicode_characters() {
         let mut config = ResolvedConfig::default();
+        config.model.system_prompt = "  first\n  second  ".to_string();
+        config
+            .normalize_and_validate_provider_runtime()
+            .expect("valid main system prompt");
+        assert_eq!(config.model.system_prompt, "first\n  second");
+
+        config.model.system_prompt =
+            "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1);
+        let error = config
+            .normalize_and_validate_provider_runtime()
+            .expect_err("oversized main system prompt");
+        assert!(error.contains("model.system_prompt"), "{error}");
+        assert!(
+            error.contains(
+                &crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS.to_string()
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn side_chat_defaults_are_independent_and_provider_inputs_are_normalized() {
+        let defaults = ResolvedConfig::default();
+        assert_eq!(defaults.side_chat.base_url, defaults.model.base_url);
+        assert_eq!(defaults.side_chat.model, defaults.model.model);
+        assert_eq!(
+            defaults.side_chat.system_prompt,
+            defaults.model.system_prompt
+        );
+        assert_eq!(
+            defaults.side_chat.provider_profile,
+            defaults.model.provider_profile
+        );
+        assert_eq!(
+            defaults.side_chat.context_window,
+            defaults.model.context_window
+        );
+        assert_eq!(
+            defaults.side_chat.request_timeout_ms,
+            defaults.model.request_timeout_ms
+        );
+        assert_eq!(
+            defaults.side_chat.connect_timeout_ms,
+            defaults.model.connect_timeout_ms
+        );
+        assert_eq!(defaults.side_chat.max_retries, defaults.model.max_retries);
+
+        let mut config = defaults;
+        config.model.model = "main-only-change".to_string();
+        config.side_chat.base_url = " https://side.example.test/v1/ ".to_string();
+        config.side_chat.model = "  side-model  ".to_string();
+        config.side_chat.system_prompt = "  first\n  second  ".to_string();
+        config
+            .normalize_and_validate_provider_runtime()
+            .expect("valid independent Side Chat config");
+
+        assert_eq!(config.side_chat.base_url, "https://side.example.test/v1");
+        assert_eq!(config.side_chat.model, "side-model");
+        assert_eq!(config.side_chat.system_prompt, "first\n  second");
+        assert_ne!(config.side_chat.model, config.model.model);
+    }
+
+    #[test]
+    fn side_chat_system_prompt_uses_the_shared_unicode_character_limit() {
+        let prompt_secret =
+            "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1);
+        let mut config = ResolvedConfig::default();
+        config.side_chat.system_prompt = prompt_secret.clone();
+
+        let error = config
+            .normalize_and_validate_provider_runtime()
+            .expect_err("oversized Side Chat prompt");
+        assert!(error.contains("side_chat.system_prompt"), "{error}");
+        assert!(
+            error.contains(
+                &crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS.to_string()
+            ),
+            "{error}"
+        );
+
+        let debug = format!("{:?}", config.side_chat);
+        assert!(!debug.contains(&prompt_secret));
+        assert!(debug.contains("system_prompt_chars"));
+
+        let partial = PartialSideChatConfig {
+            base_url: Some("https://user:endpoint-secret@side.example.test/v1".to_string()),
+            system_prompt: Some(prompt_secret.clone()),
+            ..PartialSideChatConfig::default()
+        };
+        let partial_debug = format!("{partial:?}");
+        assert!(!partial_debug.contains(&prompt_secret));
+        assert!(!partial_debug.contains("endpoint-secret"));
+        assert!(partial_debug.contains("system_prompt_chars"));
+    }
+
+    #[test]
+    fn side_chat_connect_timeout_matches_the_durable_binding_range() {
+        for invalid in [0, i64::MAX as u64 + 1] {
+            let mut config = ResolvedConfig::default();
+            config.side_chat.connect_timeout_ms = invalid;
+
+            let error = config
+                .normalize_and_validate_provider_runtime()
+                .expect_err("invalid Side Chat connect timeout");
+            assert!(error.contains("side_chat.connect_timeout_ms"), "{error}");
+            assert!(error.contains("positive SQLite integer"), "{error}");
+        }
+    }
+
+    #[test]
+    fn provider_config_debug_omits_endpoint_and_header_secrets() {
+        let prompt_secret = "main-system-prompt-secret";
+        let mut config = ResolvedConfig::default();
+        config.model.system_prompt = prompt_secret.to_string();
         config.model.base_url =
             "https://user:endpoint-secret@provider.example/v1?api_key=query-secret".to_string();
         config.model.extra_headers.insert(
@@ -1375,6 +1641,7 @@ mod config_contract_tests {
         );
         let partial = PartialModelConfig {
             base_url: Some(config.model.base_url.clone()),
+            system_prompt: Some(config.model.system_prompt.clone()),
             extra_headers: Some(config.model.extra_headers.clone()),
             ..PartialModelConfig::default()
         };
@@ -1383,6 +1650,8 @@ mod config_contract_tests {
             assert!(!debug.contains("endpoint-secret"));
             assert!(!debug.contains("query-secret"));
             assert!(!debug.contains("header-secret"));
+            assert!(!debug.contains(prompt_secret));
+            assert!(debug.contains("system_prompt_chars"));
         }
     }
 
@@ -1404,6 +1673,10 @@ mod config_contract_tests {
         for (input, field) in [
             ("[agent]\nretired = true\n", "agent"),
             ("[model]\nprompt_profile = \"auto\"\n", "prompt_profile"),
+            ("[side_chat]\napi_key_env = \"KEY\"\n", "api_key_env"),
+            ("[side_chat]\nextra_headers = {}\n", "extra_headers"),
+            ("[side_chat]\nsupports_tools = true\n", "supports_tools"),
+            ("[side_chat]\nsupports_images = true\n", "supports_images"),
             ("[session]\nmax_steps_per_turn = 8\n", "max_steps_per_turn"),
             ("[multi_agent]\nmax_depth = 2\n", "max_depth"),
             ("[permissions]\nallow_all = true\n", "allow_all"),

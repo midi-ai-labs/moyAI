@@ -20,7 +20,6 @@ import type {
   SideChatDeleteConfirmation,
   UiRecoverableError,
 } from "./ui_state.ts";
-import type { ProviderProfile } from "./types.ts";
 import type { SideChatPendingQuote } from "./types.ts";
 
 /**
@@ -58,9 +57,6 @@ export interface DesktopRenderLocalPresentation {
   readonly sideChat: {
     readonly draft: string;
     readonly pendingQuote: SideChatPendingQuote | null;
-    readonly setupBaseUrl: string;
-    readonly setupProviderProfile: ProviderProfile;
-    readonly setupModel: string;
     readonly catalog: SideChatCatalogView;
     readonly catalogLoadEnabled: boolean;
     readonly mutationPending: boolean;
@@ -126,13 +122,9 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
     sideChat: {
       draft: "",
       pendingQuote: null,
-      setupBaseUrl: "",
-      setupProviderProfile: "openai_compatible",
-      setupModel: "",
       catalog: {
         status: "idle",
         source: "none",
-        ownerSessionId: null,
         baseUrl: "",
         models: [],
         error: "",
@@ -227,9 +219,6 @@ function snapshotLocalPresentation(
     sideChat: {
       draft: local.sideChat.draft,
       pendingQuote: local.sideChat.pendingQuote,
-      setupBaseUrl: local.sideChat.setupBaseUrl,
-      setupProviderProfile: local.sideChat.setupProviderProfile,
-      setupModel: local.sideChat.setupModel,
       catalog: local.sideChat.catalog,
       catalogLoadEnabled: local.sideChat.catalogLoadEnabled,
       mutationPending: local.sideChat.mutationPending,

@@ -17,13 +17,26 @@ Desktopのcold startはlocal configの形式だけを確認する。provider cat
 
 ## Provider接続設定
 
-DesktopではInitial Setup、左railの **接続設定** shortcutから開くPreferences、またはtopbarのmodel/access chipから開くSession Settingsを使う。Preferencesはglobal baselineと選択sessionのサイドチャットprovider、Session Settingsはcurrent root sessionだけを所有する。
+DesktopではInitial Setup、左railの **接続設定** shortcutから開く **Settings**、またはtopbarのmodel/access chipから開くSession Settingsを使う。Settingsの分類は次の通り。
+
+```text
+Settings
+├─ Global Settings
+│  ├─ Main Chat Settings
+│  └─ Side Chat Settings
+├─ Session-scoped Settings
+│  └─ Session Overrides
+└─ Desktop Preferences
+```
+
+Global Settingsはuser-wide `config.toml`を所有し、MainとSide Chatを含むglobal fieldはTOML Import / Saveの対象になる。Session Overridesは既存のSession Settings panelを開く入口で、current rootのMain-chat/session overrideだけを所有する。Side Chatのsession別override UIではない。Desktop Preferencesはopacity等のwindow固有設定を所有し、global configとは保存先が異なる。
 
 1. `Connection type`を選ぶ。LM StudioのResponses APIなら`LM Studio (Responses API)`、oMLX / vLLM / NVIDIA NIMなどの一般的なOpenAI互換serverなら`OpenAI-compatible (Chat Completions)`を選ぶ。
 2. `Base URL`とmodel IDを入力する。
 3. 認証が必要なら`API key environment variable (optional)`へsecretを保持する環境変数名（例`OPENAI_API_KEY`）を入力する。secretそのものは入力・保存しない。
-4. 必要なら`モデル読込`でmodel catalogを確認する。手入力したmodel IDは接続不能時でもlocalにvalidなら保存できる。
-5. Preferencesではglobal設定として保存し、Session Settingsではcurrent root sessionだけへApplyする。
+4. 必要なら`追加システムプロンプト（任意）`へMain用の追加指示を入力する。moyAI組み込みpromptは置換されず、その後へ追加される。空欄は追加なし、上限は16,384 Unicode文字である。
+5. 必要なら`モデル読込`でmodel catalogを確認する。手入力したmodel IDは接続不能時でもlocalにvalidなら保存できる。
+6. Global Settingsではuser-wide設定として保存し、Session Settingsではcurrent root sessionのMain ChatだけへApplyする。
 
 provider custom header/body、Docling header、MCP server定義等のsensitive JSON fieldはraw値を再表示せず **設定済み（非表示）** と示す。complete draftで空欄または空白だけにした場合は既存値を保持する。置換またはclearする場合は`{}` / `[]`等の明示的なvalid JSONを入力する。API key環境変数名は表示・保存できるが、解決したsecret値は保存・投影しない。
 
@@ -85,8 +98,21 @@ model transportの既定値は次の通り。
 ```toml
 [model]
 provider_profile = "lm_studio"
+# system_prompt = """Mainへ追加する任意の指示"""
 request_timeout_ms = 3600000
+
+[side_chat]
+base_url = "http://127.0.0.1:1234"
+model = "qwen/qwen3.6-27b"
+provider_profile = "lm_studio"
+# system_prompt = """Side Chatへ追加する任意の指示"""
+connect_timeout_ms = 10000
+request_timeout_ms = 3600000
+max_retries = 2
+context_window = 131072
 ```
+
+`[side_chat]`は`[model]`から継承しない独立したglobal sectionであり、既定値が同じでも一方の変更はもう一方を変更しない。Side ChatはAPI key、custom header、tool、image設定を持たず、Mainのcredentialやcapabilityを転送しない。
 
 `request_timeout_ms`はmoyAI client側の通信生存判定を所有する。最初のPOST attemptから成功response headerまでは
 connect retry待機、request body送信、header待ちを含む単一deadlineとして働く。成功header後は同じ値を
@@ -166,9 +192,10 @@ Desktop:
 - command palette: `Ctrl+K` または composer の検索/コマンドボタン。
 - Markdown export: transcript 表示中に export ボタンまたは `F9`。
 - 停止: 実行中に stop button を押すと、表示時のworkspace / root session / run generation / Agent Tree epochが一致するexact current root executionだけを停止する。実行中またはdetachedなchildへcascadeしない。画面更新後の古いStopは新しいrunへ適用されず、tree全体の停止は別名の明示的なtree-stop操作として扱う。
-- Settings: 「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial Setupでは「設定を保存して開始」を推奨の完了方法として表示し、「この起動中だけ適用」は再起動後へ引き継がない。Initial Setupは保存または一時適用が完了するまで閉じず、TOML設定Importのfile pickerをcancelした場合は設定を変更しない。Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからglobal `config.toml`へ取り込む。
+- Settings: navigationはGlobal Settings（Main Chat Settings / Side Chat Settings）、Session-scoped Settings（Session Overrides）、Desktop Preferencesを区別する。「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial Setupでは「設定を保存して開始」を推奨の完了方法として表示し、「この起動中だけ適用」は再起動後へ引き継がない。Initial Setupは保存または一時適用が完了するまで閉じず、TOML設定Importのfile pickerをcancelした場合は設定を変更しない。Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからMain / Side Chatを含むglobal `config.toml`へ取り込む。Desktop Preferencesとsession overrideはこのImportの保存先ではない。
 - Provider接続: 現在のURL・Connection type・modelを変えずにmoyAI local context budgetだけを編集した場合、モデル一覧を再取得せずにsessionへ適用または設定ファイルへ保存できる。URL・Connection type・modelを変更してもlocal-validな手入力値は保存でき、catalog rowから選ぶ場合だけ対応する明示「モデル読込」のevidenceを使う。sampling、thinking、output lengthはGUIに持たず、host側の設定をそのまま使う。
-- サイドチャット: sessionを開き、左railの **接続設定** からPreferencesを開き、選択sessionの`サイドチャットLLM` sectionで専用URL、Connection type、modelを設定する。`モデル読込`の一覧にない互換modelはIDを直接入力できる。右ペインの`サイドチャット`は設定済みmodelと会話を表示し、未設定時はPreferencesへの導線だけを表示する。停止中は同じsectionからmodelを更新できるが、実行中・削除中は変更できない。設定・履歴・未送信draft・実行・Stopはowning session単位で保存され、メインtaskのmodel設定・composer・実行・Stopとは分離される。取得したmodel一覧も選択中sessionとURLに紐づけ、別sessionや別URLの結果を混ぜない。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。provider POST直前にexact owning sessionのactive canonical historyとappend fenceをcaptureし、system/question/response用の余白を残してrecentなcomplete semantic unitだけをbounded contextへ入れる。append-only source item 65,536件、derived active item 16,384件、またはeligible semantic unit 8,192件を超える場合はprovider POST前に拒否するため、compactionするか新しいtaskを開始してから再送する。範囲は`scope=owner_session`、基準は`as_of_append_position`、省略時は`truncated`で示す。transcript/artifactの一つのstable canonical rowから引用すると、source kind、history item ID、append position、selected textをtypedにdraftへ追加し、自動送信しない。送信時にowner/fence/source textが変わっていればprovider POST前に失効し、manualでSide draftを編集した場合もquote bindingをclearする。runtime notice、durable feedback、terminal、別session、hidden Side conversation、live workspaceはowner context/quote sourceへ混ぜない。現行のside provider設定は認証不要のendpointを対象とし、main providerのAPI keyやcustom headerを継承・転送しない。ペインを隠す、sessionを移動する、windowを閉じる操作では履歴を削除しない。`サイドチャットを削除`を確認した場合だけ、sideのcanonical conversationと未送信draftを破棄し、メインsessionとworkspaceは残す。
+- サイドチャット: 左railの **接続設定** からSettingsを開き、Global Settingsの **Side Chat Settings** で専用URL、Connection type、modelを設定する。`モデル読込`の一覧にない互換modelはIDを直接入力できる。Side Chatモデル一覧はglobal config generationとSide ChatのURL / Connection typeに結びつき、別targetの遅延結果を混ぜない。sessionでSide Chatを初めて開くと、現在のglobal Side Chat provider / model / prompt / timeout / retry / context設定をその会話へsnapshotする。既に存在するSide Chatはglobal設定を変更しても途中で接続先やpromptを切り替えず、capture済み設定・履歴・未送信draftを維持する。ペインを隠す、sessionを移動する、windowを閉じる、appを再起動する操作でも削除しない。明示的な`サイドチャットを削除`を確認した場合だけ、そのconversation、未送信draft、provider snapshotを破棄し、次に開くとき最新のglobal Side Chat設定から新しく作る。global設定、メインsession、workspaceは削除しない。実行・Stopはowning session単位で、メインtaskのmodel設定・composer・実行・Stopとは分離される。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。provider POST直前にexact owning sessionのactive canonical historyとappend fenceをcaptureし、system/question/response用の余白を残してrecentなcomplete semantic unitだけをbounded contextへ入れる。append-only source item 65,536件、derived active item 16,384件、またはeligible semantic unit 8,192件を超える場合はprovider POST前に拒否するため、compactionするか新しいtaskを開始してから再送する。範囲は`scope=owner_session`、基準は`as_of_append_position`、省略時は`truncated`で示す。transcript/artifactの一つのstable canonical rowから引用すると、source kind、history item ID、append position、selected textをtypedにdraftへ追加し、自動送信しない。送信時にowner/fence/source textが変わっていればprovider POST前に失効し、manualでSide draftを編集した場合もquote bindingをclearする。runtime notice、durable feedback、terminal、別session、hidden Side conversation、live workspaceはowner context/quote sourceへ混ぜない。現行のSide Chat global provider設定は認証不要のendpointを対象とし、Main providerのAPI keyやcustom headerを継承・転送しない。
+- サイドチャットの追加prompt: Global SettingsのSide Chat Settingsにある`追加システムプロンプト（任意）`へ入力する。Side Chat組み込みpromptの後へだけ追加され、Mainの追加promptは継承しない。空欄は追加なし、上限は16,384 Unicode文字で、context preflightも会話作成時にsnapshotした実際のsystem promptを数える。global promptの変更は既存Side Chatへ遡及せず、明示的に閉じて作り直したSide Chatから反映される。
 - 状態・進捗・使用量: provider/statusは短いtyped public messageだけを表示し、request ID、endpoint、elapsed、raw provider code/messageを含めない。tool進捗summaryはfailure/declinedを先に、その後に新しい作業を選び、最大8件・全体2,000文字・1行180文字。完全な内容はcanonical historyへのjumpまたはMarkdown exportで確認する。session使用量は全canonical `TurnTerminal` runtime eventから再計算し、terminal turn数とusage計測済みturn数を分けてmissing/partial/completeを表示する。usage欠損は0ではない。optionalなreasoning tokenが未報告なら0を表示せず`reasoning 未計測`、報告有無が混在する場合は計測turn数付きの部分合計として表示する。durable feedbackはlive/reopen/exportで同じseverity/category/public messageを使い、`RuntimeNotice`はliveだけに表示する。
 
 Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。

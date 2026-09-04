@@ -14,7 +14,7 @@ pub enum InputModality {
     Image,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelPolicy {
     pub id: String,
     pub base_instructions: String,
@@ -27,6 +27,34 @@ pub struct ModelPolicy {
     pub input_modalities: BTreeSet<InputModality>,
     pub supports_tools: bool,
     pub supports_parallel_tool_calls: bool,
+}
+
+impl std::fmt::Debug for ModelPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelPolicy")
+            .field("id", &self.id)
+            .field(
+                "base_instructions_chars",
+                &self.base_instructions.chars().count(),
+            )
+            .field("context_window", &self.context_window)
+            .field(
+                "working_context_token_limit",
+                &self.working_context_token_limit,
+            )
+            .field(
+                "effective_context_token_limit",
+                &self.effective_context_token_limit,
+            )
+            .field("input_modalities", &self.input_modalities)
+            .field("supports_tools", &self.supports_tools)
+            .field(
+                "supports_parallel_tool_calls",
+                &self.supports_parallel_tool_calls,
+            )
+            .finish()
+    }
 }
 
 // `ModelProfile` retains this field for old serialized/request-construction
@@ -44,12 +72,16 @@ impl ModelPolicy {
             config.model.context_window,
             config.session.overflow_margin_tokens,
         );
+        let builtin_instructions = format!(
+            "{}\n\n{}",
+            include_str!("../../assets/prompts/system.md").trim(),
+            include_str!("../../assets/prompts/profile_default.md").trim()
+        );
         Self {
             id: config.model.model.clone(),
-            base_instructions: format!(
-                "{}\n\n{}",
-                include_str!("../../assets/prompts/system.md").trim(),
-                include_str!("../../assets/prompts/profile_default.md").trim()
+            base_instructions: crate::system_prompt::append_user_configured_system_prompt(
+                &builtin_instructions,
+                Some(&config.model.system_prompt),
             ),
             context_window: config.model.context_window,
             working_context_token_limit: context_limits.working,
@@ -184,6 +216,35 @@ mod tests {
             ModelPolicy::from_config(&qwen).base_instructions,
             ModelPolicy::from_config(&other).base_instructions
         );
+    }
+
+    #[test]
+    fn main_system_prompt_is_appended_after_the_unchanged_builtin_prompt() {
+        let builtin = format!(
+            "{}\n\n{}",
+            include_str!("../../assets/prompts/system.md").trim(),
+            include_str!("../../assets/prompts/profile_default.md").trim()
+        );
+        let config = ResolvedConfig::default();
+        assert_eq!(ModelPolicy::from_config(&config).base_instructions, builtin);
+
+        let mut configured = config;
+        configured.model.system_prompt = "  first rule\n  second rule  ".to_string();
+        let instructions = ModelPolicy::from_config(&configured).base_instructions;
+        assert_eq!(
+            instructions,
+            format!("{builtin}\n\n## User-configured system prompt\n\nfirst rule\n  second rule")
+        );
+        assert_eq!(
+            instructions
+                .matches("## User-configured system prompt")
+                .count(),
+            1
+        );
+
+        let debug = format!("{:?}", ModelPolicy::from_config(&configured));
+        assert!(!debug.contains("first rule"));
+        assert!(debug.contains("base_instructions_chars"));
     }
 
     #[test]

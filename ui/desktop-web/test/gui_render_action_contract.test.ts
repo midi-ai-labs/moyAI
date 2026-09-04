@@ -269,6 +269,7 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       chat_id: SIDE_CHAT,
       owner_session_id: SESSION_IDLE,
       model: "side-model",
+      system_prompt: "",
       base_url: "http://127.0.0.1:1234/v1",
       provider_profile: "openai_compatible",
       status: "running",
@@ -410,6 +411,86 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
         max_value: null,
         options: [],
       },
+      {
+        key: "side_chat.base_url",
+        value: "http://127.0.0.1:1234/v1",
+        env_override: null,
+        value_type: "string",
+        required: true,
+        min_value: null,
+        max_value: null,
+        options: [],
+      },
+      {
+        key: "side_chat.model",
+        value: "side-model",
+        env_override: null,
+        value_type: "string",
+        required: true,
+        min_value: null,
+        max_value: null,
+        options: [],
+      },
+      {
+        key: "side_chat.provider_profile",
+        value: "openai_compatible",
+        env_override: null,
+        value_type: "enum",
+        required: true,
+        min_value: null,
+        max_value: null,
+        options: ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
+      },
+      {
+        key: "side_chat.system_prompt",
+        value: "",
+        env_override: null,
+        value_type: "string",
+        required: false,
+        min_value: null,
+        max_value: null,
+        options: [],
+      },
+      {
+        key: "side_chat.context_window",
+        value: "131072",
+        env_override: null,
+        value_type: "integer",
+        required: true,
+        min_value: 1,
+        max_value: 4294967295,
+        options: [],
+      },
+      {
+        key: "side_chat.request_timeout_ms",
+        value: "120000",
+        env_override: null,
+        value_type: "integer",
+        required: true,
+        min_value: 1,
+        max_value: 3600000,
+        options: [],
+      },
+      {
+        key: "side_chat.connect_timeout_ms",
+        value: "10000",
+        env_override: null,
+        value_type: "integer",
+        required: true,
+        min_value: 0,
+        max_value: null,
+        options: [],
+      },
+      {
+        key: "side_chat.max_retries",
+        value: "2",
+        env_override: null,
+        value_type: "integer",
+        required: true,
+        min_value: 0,
+        max_value: 255,
+        options: [],
+      },
     ],
     config_target: {
       workspacePath: "C:/workspace",
@@ -477,12 +558,9 @@ function defaultRenderLocal(overrides: {
     sideChat: {
       ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat,
       draft: "Side question",
-      setupBaseUrl: "http://127.0.0.1:1234/v1",
-      setupModel: "side-model",
       catalog: {
         status: "ready",
-        source: "side",
-        ownerSessionId: SESSION_IDLE,
+        source: "global",
         baseUrl: "http://127.0.0.1:1234",
         models: [{ id: "side-model", label: "Side model", loadState: "loaded" }],
         error: "",
@@ -830,7 +908,7 @@ test("initial setup is a six-step blocking shell and session settings exposes st
   const session = surfaces.get("overlay-session_settings") ?? "";
   assert.match(session, /class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings"/);
   assert.match(session, /data-session-scope="root-only">このセッションだけ/);
-  assert.equal(Array.from(session.matchAll(/placeholder="Preferencesを継承"/g)).length, 1);
+  assert.equal(Array.from(session.matchAll(/placeholder="Global Settingsを継承"/g)).length, 1);
   assert.match(session, /保存後の次のpermission decisionからrootと子Agentへ反映/);
   for (const field of [
     "base-url",
@@ -1294,7 +1372,7 @@ test("each primary GUI surface retains its required action routes", () => {
       "open-user-data-folder",
       "show-provider",
       "load-side-chat-models",
-      "configure-side-chat",
+      "show-session-settings",
     ],
     "overlay-workspace": [
       "close-overlay",
@@ -1343,15 +1421,15 @@ test("each primary GUI surface retains its required action routes", () => {
   assert.deepEqual(missing, []);
 });
 
-test("the sidebar connection shortcut opens Preferences instead of a duplicate provider editor", () => {
+test("the sidebar connection shortcut opens Settings instead of a duplicate provider editor", () => {
   const html = renderSidebar(representativeState());
 
-  assert.match(html, /class="rail-item" data-action="show-config" title="PreferencesでメインLLMの既定接続を確認・変更"/);
+  assert.match(html, /class="rail-item" data-action="show-config" title="Settingsでglobal既定値を確認・変更"/);
   assert.match(html, />接続設定<\/span>/);
   assert.doesNotMatch(html, /class="rail-item" data-action="show-provider"/);
 });
 
-test("Preferences shows configured sensitive fields without exposing their values", () => {
+test("Settings shows configured sensitive fields without exposing their values", () => {
   const base = representativeState();
   const state = representativeState({
     confirmation_visible: false,

@@ -75,7 +75,7 @@ use super::query::{
 use super::side_chat::{
     SideChatContextMetadata, SideChatQuoteRequest, SideChatRequestProfile, SideChatStreamEvent,
     decode_persisted_side_chat_draft, encode_persisted_side_chat_draft,
-    execute_admitted_canonical_side_chat, prepare_side_chat_input,
+    execute_admitted_canonical_side_chat, prepare_side_chat_input, side_chat_system_prompt,
 };
 use super::state::{DesktopState, DesktopStatusCode};
 #[cfg(test)]
@@ -2358,7 +2358,9 @@ mod command_projection_owner_tests {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let first_secret = "INITIAL_IMPORT_SECRET_ONE";
         let second_secret = "INITIAL_IMPORT_SECRET_TWO";
+        let prompt_marker = "INITIAL_IMPORT_MAIN_PROMPT_MARKER";
         let mut first = ResolvedConfig::default();
+        first.model.system_prompt = prompt_marker.to_string();
         first
             .model
             .extra_headers
@@ -2382,7 +2384,15 @@ mod command_projection_owner_tests {
             assert!(public.configured);
             assert!(public.text.is_empty());
         }
-        assert!(!format!("{public_values:?}").contains(first_secret));
+        let prompt_public = public_values
+            .iter()
+            .find(|value| value.key == ConfigField::SystemPrompt.label())
+            .expect("main system prompt public field");
+        assert_eq!(prompt_public.text, prompt_marker);
+        let public_debug = format!("{public_values:?}");
+        assert!(!public_debug.contains(first_secret));
+        assert!(!public_debug.contains(prompt_marker));
+        assert!(public_debug.contains("text_chars"));
 
         let mut second = ResolvedConfig::default();
         second
@@ -3582,6 +3592,138 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn side_chat_configuration_owns_its_trimmed_system_prompt_without_main_inheritance() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .system_prompt = "MAIN_PRIVATE_PROMPT".to_string();
+
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "side-model".to_string(),
+                "  SIDE_PRIVATE_PROMPT  ".to_string(),
+                ProviderProfile::OpenAiCompatible,
+            )
+            .expect("configure side chat with its own prompt");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        assert_eq!(binding.system_prompt, "SIDE_PRIVATE_PROMPT");
+        let projection = controller.side_chat_projection();
+        assert_eq!(projection.system_prompt, "SIDE_PRIVATE_PROMPT");
+        let debug = format!("{projection:?}");
+        assert!(debug.contains("system_prompt_chars"));
+        assert!(!debug.contains("SIDE_PRIVATE_PROMPT"));
+        assert!(!debug.contains("MAIN_PRIVATE_PROMPT"));
+
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "side-model".to_string(),
+                "   ".to_string(),
+                ProviderProfile::OpenAiCompatible,
+            )
+            .expect("clear side chat prompt");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        assert!(binding.system_prompt.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_side_chat_defaults_are_snapshotted_until_the_conversation_is_closed() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        {
+            let defaults = &mut controller.state.provider_config.effective_config.side_chat;
+            defaults.base_url = "http://127.0.0.1:4111".to_string();
+            defaults.model = "first-side-model".to_string();
+            defaults.system_prompt = "FIRST_SIDE_PROMPT".to_string();
+            defaults.provider_profile = ProviderProfile::OpenAiCompatible;
+            defaults.context_window = 65_536;
+        }
+
+        controller
+            .ensure_side_chat(owner_session_id)
+            .expect("materialize global Side Chat defaults");
+        let first = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("read first binding")
+            .expect("first binding");
+        assert_eq!(first.model, "first-side-model");
+        assert_eq!(first.system_prompt, "FIRST_SIDE_PROMPT");
+        assert_eq!(first.context_window, 65_536);
+
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .model = "second-side-model".to_string();
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .system_prompt = "SECOND_SIDE_PROMPT".to_string();
+        controller
+            .ensure_side_chat(owner_session_id)
+            .expect("existing Side Chat remains stable");
+        let unchanged = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("read stable binding")
+            .expect("stable binding");
+        assert_eq!(unchanged.id, first.id);
+        assert_eq!(unchanged.model, "first-side-model");
+        assert_eq!(unchanged.system_prompt, "FIRST_SIDE_PROMPT");
+
+        controller
+            .delete_side_chat(owner_session_id, first.id, first.request_generation)
+            .expect("close first Side Chat");
+        assert!(
+            controller
+                .app
+                .store
+                .side_chat_repo()
+                .get_by_owner(owner_session_id)
+                .expect("read deleted binding")
+                .is_none()
+        );
+        controller
+            .ensure_side_chat(owner_session_id)
+            .expect("materialize updated global defaults");
+        let replacement = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("read replacement binding")
+            .expect("replacement binding");
+        assert_ne!(replacement.id, first.id);
+        assert_eq!(replacement.model, "second-side-model");
+        assert_eq!(replacement.system_prompt, "SECOND_SIDE_PROMPT");
+    }
+
+    #[tokio::test]
     async fn side_chat_draft_quote_is_atomic_replaces_without_orphan_and_rehydrates_after_restart()
     {
         let (_temp, root, mut controller, owner_session_id) = side_chat_test_controller().await;
@@ -3590,6 +3732,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "side-model".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -3728,6 +3871,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:9".to_string(),
                 "never-contact-provider".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -3817,6 +3961,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:9".to_string(),
                 "never-contact-provider".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -3943,6 +4088,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 endpoint,
                 "google/gemma-4-12b-qat".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -4077,6 +4223,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 endpoint,
                 "google/gemma-4-12b-qat".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -4256,6 +4403,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -4317,6 +4465,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -4366,6 +4515,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -4463,6 +4613,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                String::new(),
                 ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
@@ -9196,12 +9347,24 @@ struct PendingInitialSetupConfigImport {
     config: ResolvedConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct InitialSetupConfigPublicValue {
     pub key: String,
     pub text: String,
     pub sensitive: bool,
     pub configured: bool,
+}
+
+impl std::fmt::Debug for InitialSetupConfigPublicValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitialSetupConfigPublicValue")
+            .field("key", &self.key)
+            .field("text_chars", &self.text.chars().count())
+            .field("sensitive", &self.sensitive)
+            .field("configured", &self.configured)
+            .finish()
+    }
 }
 
 impl DesktopSideChatRun {
@@ -9219,6 +9382,7 @@ fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfil
         connect_timeout_ms: binding.connect_timeout_ms,
         max_retries: binding.max_retries,
         context_window: binding.context_window,
+        system_prompt: side_chat_system_prompt(&binding.system_prompt),
         // Side-chat provider credentials are deliberately isolated from the main task target.
         // A future credential surface must persist its own reference rather than inheriting the
         // main provider's environment variable or request headers.
@@ -9599,21 +9763,11 @@ impl DesktopController {
         let context_as_of_append_position =
             current_owner_append_position.map(|position| position.to_string());
         let context_truncated = false;
-        let default_base_url = self
-            .state
-            .provider_config
-            .effective_config
-            .model
-            .base_url
-            .clone();
-        let default_profile = self
-            .state
-            .provider_config
-            .effective_config
-            .model
-            .provider_profile
-            .as_str()
-            .to_string();
+        let side_chat_defaults = &self.state.provider_config.effective_config.side_chat;
+        let default_base_url = side_chat_defaults.base_url.clone();
+        let default_model = side_chat_defaults.model.clone();
+        let default_system_prompt = side_chat_defaults.system_prompt.clone();
+        let default_profile = side_chat_defaults.provider_profile.as_str().to_string();
         let durable = match self
             .app
             .store
@@ -9624,6 +9778,8 @@ impl DesktopController {
             Err(error) => {
                 return DesktopSideChatProjection {
                     owner_session_id: Some(owner_session_id.to_string()),
+                    model: default_model,
+                    system_prompt: default_system_prompt,
                     base_url: default_base_url,
                     provider_profile: default_profile,
                     status: "failed".to_string(),
@@ -9638,6 +9794,8 @@ impl DesktopController {
         let Some(durable) = durable else {
             return DesktopSideChatProjection {
                 owner_session_id: Some(owner_session_id.to_string()),
+                model: default_model,
+                system_prompt: default_system_prompt,
                 base_url: default_base_url,
                 provider_profile: default_profile,
                 status: "idle".to_string(),
@@ -9717,6 +9875,7 @@ impl DesktopController {
             chat_id: Some(binding.id.to_string()),
             owner_session_id: Some(owner_session_id.to_string()),
             model: binding.model,
+            system_prompt: binding.system_prompt,
             base_url: binding.base_url,
             provider_profile: binding.provider_profile.as_str().to_string(),
             status: active
@@ -9752,32 +9911,54 @@ impl DesktopController {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn configure_side_chat(
         &mut self,
         owner_session_id: SessionId,
         base_url: String,
         model: String,
+        system_prompt: String,
         provider_profile: ProviderProfile,
     ) -> Result<(), String> {
         self.ensure_current_side_chat_owner(owner_session_id)?;
         if self.side_chat_runs.contains_key(&owner_session_id) {
             return Err("the side chat must be stopped before its provider is changed".to_string());
         }
-        let mut model_config = self.state.provider_config.effective_config.model.clone();
-        model_config.base_url = base_url;
-        model_config.model = model;
-        model_config.provider_profile = provider_profile;
-        model_config.api_key_env = None;
-        model_config.extra_headers.clear();
-        model_config.supports_tools = false;
-        model_config.supports_images = false;
-        model_config.parallel_tool_calls = false;
-        let target =
-            SideChatProviderTarget::try_from(&model_config).map_err(|error| error.to_string())?;
+        let mut side_chat_config = self
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .clone();
+        side_chat_config.base_url = base_url;
+        side_chat_config.model = model;
+        side_chat_config.system_prompt = system_prompt;
+        side_chat_config.provider_profile = provider_profile;
+        let target = SideChatProviderTarget::try_from(&side_chat_config)
+            .map_err(|error| error.to_string())?;
         self.app
             .store
             .side_chat_repo()
             .configure(owner_session_id, target)
+            .map_err(|error| error.to_string())?;
+        self.side_chat_contexts.remove(&owner_session_id);
+        self.side_chat_errors.remove(&owner_session_id);
+        Ok(())
+    }
+
+    /// Materializes the current Global Side Chat defaults as a stable snapshot
+    /// for this owner session. Existing conversations keep their captured
+    /// provider identity until the user explicitly closes them.
+    pub(crate) fn ensure_side_chat(&mut self, owner_session_id: SessionId) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        let target = SideChatProviderTarget::try_from(
+            &self.state.provider_config.effective_config.side_chat,
+        )
+        .map_err(|error| error.to_string())?;
+        self.app
+            .store
+            .side_chat_repo()
+            .ensure(owner_session_id, target)
             .map_err(|error| error.to_string())?;
         self.side_chat_contexts.remove(&owner_session_id);
         self.side_chat_errors.remove(&owner_session_id);
@@ -9871,6 +10052,8 @@ impl DesktopController {
             .ok_or_else(|| "side chat request generation is exhausted".to_string())?;
         let conversation_session_id = binding.conversation_session_id;
         let preflight_context_window = binding.context_window;
+        let preflight_system_prompt = side_chat_system_prompt(&binding.system_prompt);
+        let preflight_provider_target = binding.provider_target();
         let side_chat_id_text = binding.id.to_string();
         let turn_id = TurnId::new();
         let question = text.clone();
@@ -9939,6 +10122,7 @@ impl DesktopController {
                         expected_owner_append_position,
                         quote,
                         &question,
+                        preflight_system_prompt,
                         preflight_context_window,
                     )
                     .await
@@ -9958,6 +10142,7 @@ impl DesktopController {
                             side_chat_id,
                             expected_generation,
                             expected_draft_revision,
+                            preflight_provider_target,
                             turn_id,
                             &user_turn,
                         )
@@ -9972,7 +10157,8 @@ impl DesktopController {
                         }
                     };
                     let run_generation = admitted.generation;
-                    let profile = side_chat_request_profile(&admitted.binding);
+                    let mut profile = side_chat_request_profile(&admitted.binding);
+                    profile.system_prompt = prepared.system_prompt.clone();
                     let admission_id = admitted.admission.admission_id;
                     if admission_ack_tx
                         .send(Ok((run_generation, prepared.context.clone())))

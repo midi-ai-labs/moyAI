@@ -14,8 +14,8 @@ pub use model::{
     McpConfig, McpServerConfig, McpToolRouteConfig, McpTransportKind, ModelConfig,
     MultiAgentConfig, MultiAgentMode, NewlineStyle, PermissionsConfig, ProviderApiMode,
     ProviderMetadataMode, ProviderProfile, ProviderReasoningCapability, ReasoningEffort,
-    ReasoningSummary, ResolvedConfig, SessionConfig, ShellConfig, ShellFamily, ToolOutputConfig,
-    WorkspaceConfig, canonical_api_key_env_name,
+    ReasoningSummary, ResolvedConfig, SessionConfig, ShellConfig, ShellFamily, SideChatConfig,
+    ToolOutputConfig, WorkspaceConfig, canonical_api_key_env_name,
 };
 pub use permission_profile_catalog::{
     PermissionProfileCatalog, PermissionProfileEntry, builtin_permission_profiles,

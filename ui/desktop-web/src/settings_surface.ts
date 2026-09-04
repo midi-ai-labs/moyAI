@@ -30,13 +30,13 @@ export function activateSettingsSectionNavigation(anchor: HTMLAnchorElement): bo
     || !content
     || !modal.contains(nav)
     || !(section instanceof HTMLElement)
-    || !section.matches(".settings-section")
+    || !section.matches(".settings-section, .settings-subsection")
     || !content.contains(section)
   ) return false;
 
   section.scrollIntoView({ block: "start", inline: "nearest" });
   const editor = Array.from(
-    section.querySelectorAll<HTMLElement>(".settings-control, .side-chat-settings-control"),
+    section.querySelectorAll<HTMLElement>(".settings-control, .desktop-preference-control"),
   ).find(settingsNavigationEditorIsAvailable);
   const summary = section.querySelector<HTMLElement>("summary");
   const focusTarget = editor ?? (summary && settingsNavigationTargetIsVisible(summary) ? summary : anchor);
@@ -103,10 +103,9 @@ function settingsFocusTargetDisabled(target: HTMLElement): boolean {
 
 /**
  * Identifies the Settings form subtree that owns in-progress browser interaction.
- * Main config values are intentionally excluded: the live input nodes own unsaved edits.
- * Side-chat provider state is included because it changes the dedicated section's capability,
- * status, and committed-value display. Browser-owned side-chat inputs and the explicitly loaded
- * model catalog remain outside this identity and are synchronized onto the connected controls.
+ * Global config values are intentionally excluded: the live input nodes own unsaved edits.
+ * Runtime Side Chat state is a different owner and must not replace a focused Global Settings
+ * editor. The explicitly loaded model catalog is synchronized onto the connected controls.
  */
 export function settingsSurfaceIdentity(
   state: DesktopViewState | null,
@@ -142,18 +141,6 @@ export function settingsSurfaceIdentity(
     configGeneration: state.config_target.configGeneration,
     initialSetup: state.startup.initial_setup_required,
     editEnabled: state.config_draft.edit_enabled,
-    sideChatTarget: {
-      selectedSessionId: state.draft_target.sessionId,
-      ownerSessionId: state.side_chat.owner_session_id,
-      chatId: state.side_chat.chat_id,
-      configured: state.side_chat.configured,
-      deleting: state.side_chat.deleting,
-      model: state.side_chat.model,
-      baseUrl: state.side_chat.base_url,
-      status: state.side_chat.status,
-      lastError: state.side_chat.last_error,
-      canSend: state.side_chat.can_send,
-    },
     fields: state.config_fields.map((field) => ({
       key: field.key,
       envOverride: field.env_override,
@@ -324,11 +311,15 @@ function synchronizeRetainedModelSelects(
   synchronizeValues: boolean,
 ): void {
   const currentSelects = new Map(Array.from(
-    currentModal.querySelectorAll<HTMLSelectElement>("select[data-main-provider-model-control]"),
+    currentModal.querySelectorAll<HTMLSelectElement>(
+      "select[data-main-provider-model-control], select[data-side-chat-model-control]",
+    ),
     (select) => [select.id, select] as const,
   ));
   for (const next of Array.from(
-    nextModal.querySelectorAll<HTMLSelectElement>("select[data-main-provider-model-control]"),
+    nextModal.querySelectorAll<HTMLSelectElement>(
+      "select[data-main-provider-model-control], select[data-side-chat-model-control]",
+    ),
   )) {
     const current = currentSelects.get(next.id);
     if (!current) continue;
@@ -454,8 +445,6 @@ function settingsSurfaceControlIdentity(control: SettingsSurfaceControl): string
   if (action) return `${tag}[data-action=${action}]`;
   const configKey = control.getAttribute("data-config-key");
   if (configKey) return `${tag}[data-config-key=${configKey}]`;
-  const sideChatSetting = control.getAttribute("data-side-chat-setting");
-  if (sideChatSetting) return `${tag}[data-side-chat-setting=${sideChatSetting}]`;
   const sessionSetting = control.getAttribute("data-session-setting");
   if (sessionSetting) return `${tag}[data-session-setting=${sessionSetting}]`;
   return null;

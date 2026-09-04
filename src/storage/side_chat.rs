@@ -1,4 +1,4 @@
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::config::{AccessMode, ModelConfig, ProviderEndpoint, ProviderProfile};
+use crate::config::{AccessMode, ProviderEndpoint, ProviderProfile, SideChatConfig};
 use crate::error::StorageError;
 use crate::protocol::{ContentPart, HistoryItemId, HistoryItemPayload, RuntimeEventMsg};
 use crate::runtime::{Clock, SystemClock};
 use crate::session::{NewSession, SessionId, SessionProviderConnection, SessionStatus};
+use crate::system_prompt::normalize_user_configured_system_prompt;
 
 use super::session_repo::{
     AdmittedTurnSnapshot, DurableSessionStopState, SqliteSessionRepository, delete_session_rows,
@@ -79,17 +80,40 @@ impl SideChatContextScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SideChatProviderTarget {
     pub base_url: String,
     pub model: String,
     pub provider_profile: ProviderProfile,
+    pub system_prompt: String,
     pub context_window: u32,
     pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
     pub supports_images: bool,
     pub supports_tools: bool,
+}
+
+impl TryFrom<&SideChatConfig> for SideChatProviderTarget {
+    type Error = StorageError;
+
+    fn try_from(config: &SideChatConfig) -> Result<Self, Self::Error> {
+        Self {
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            provider_profile: config.provider_profile,
+            system_prompt: config.system_prompt.clone(),
+            context_window: config.context_window,
+            request_timeout_ms: config.request_timeout_ms,
+            connect_timeout_ms: config.connect_timeout_ms,
+            max_retries: config.max_retries,
+            // Side Chat is deliberately text-only and tool-less. Capability policy is not a
+            // configurable provider target field, while old bindings retain their full snapshot.
+            supports_images: false,
+            supports_tools: false,
+        }
+        .validate()
+    }
 }
 
 impl SideChatProviderTarget {
@@ -104,6 +128,7 @@ impl SideChatProviderTarget {
                 "side chat model must not be empty".to_string(),
             ));
         }
+        self.system_prompt = normalize_side_chat_system_prompt(&self.system_prompt)?;
         if self.context_window == 0 {
             return Err(StorageError::Message(
                 "side chat context limit must be positive".to_string(),
@@ -123,26 +148,25 @@ impl SideChatProviderTarget {
     }
 }
 
-impl TryFrom<&ModelConfig> for SideChatProviderTarget {
-    type Error = StorageError;
-
-    fn try_from(config: &ModelConfig) -> Result<Self, Self::Error> {
-        Self {
-            base_url: config.base_url.clone(),
-            model: config.model.clone(),
-            provider_profile: config.provider_profile,
-            context_window: config.context_window,
-            request_timeout_ms: config.request_timeout_ms,
-            connect_timeout_ms: config.connect_timeout_ms,
-            max_retries: config.max_retries,
-            supports_images: config.supports_images,
-            supports_tools: config.supports_tools,
-        }
-        .validate()
+impl Debug for SideChatProviderTarget {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SideChatProviderTarget")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("provider_profile", &self.provider_profile)
+            .field("system_prompt_chars", &self.system_prompt.chars().count())
+            .field("context_window", &self.context_window)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("supports_images", &self.supports_images)
+            .field("supports_tools", &self.supports_tools)
+            .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SideChatBinding {
     pub id: SideChatId,
     pub owner_session_id: SessionId,
@@ -150,6 +174,7 @@ pub struct SideChatBinding {
     pub base_url: String,
     pub model: String,
     pub provider_profile: ProviderProfile,
+    pub system_prompt: String,
     pub context_window: u32,
     /// Retired V55/V60 compatibility column. Runtime requests ignore it.
     pub max_output_tokens: u32,
@@ -175,6 +200,7 @@ impl SideChatBinding {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             provider_profile: self.provider_profile,
+            system_prompt: self.system_prompt.clone(),
             context_window: self.context_window,
             request_timeout_ms: self.request_timeout_ms,
             connect_timeout_ms: self.connect_timeout_ms,
@@ -182,6 +208,36 @@ impl SideChatBinding {
             supports_images: self.supports_images,
             supports_tools: self.supports_tools,
         }
+    }
+}
+
+impl Debug for SideChatBinding {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SideChatBinding")
+            .field("id", &self.id)
+            .field("owner_session_id", &self.owner_session_id)
+            .field("conversation_session_id", &self.conversation_session_id)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("provider_profile", &self.provider_profile)
+            .field("system_prompt_chars", &self.system_prompt.chars().count())
+            .field("context_window", &self.context_window)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("supports_images", &self.supports_images)
+            .field("supports_tools", &self.supports_tools)
+            .field("supports_reasoning", &self.supports_reasoning)
+            .field("persisted_draft", &self.persisted_draft)
+            .field("draft_revision", &self.draft_revision)
+            .field("request_generation", &self.request_generation)
+            .field("delete_requested_at_ms", &self.delete_requested_at_ms)
+            .field("context_scope", &self.context_scope)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
     }
 }
 
@@ -238,19 +294,52 @@ impl SqliteSideChatRepository {
         Self { connection }
     }
 
-    pub fn configure(
+    #[cfg(test)]
+    pub(crate) fn configure(
         &self,
         owner_session_id: SessionId,
         target: SideChatProviderTarget,
     ) -> Result<SideChatBinding, StorageError> {
-        self.configure_at(owner_session_id, target, SystemClock.now_ms())
+        self.write_provider_target_at(owner_session_id, target, SystemClock.now_ms(), true)
     }
 
+    /// Creates a Side Chat from the supplied defaults only when the owner does
+    /// not already have one. An existing binding is returned byte-for-byte so
+    /// opening the pane cannot silently reconfigure a durable conversation.
+    pub fn ensure(
+        &self,
+        owner_session_id: SessionId,
+        target: SideChatProviderTarget,
+    ) -> Result<SideChatBinding, StorageError> {
+        self.write_provider_target_at(owner_session_id, target, SystemClock.now_ms(), false)
+    }
+
+    #[cfg(test)]
     fn configure_at(
         &self,
         owner_session_id: SessionId,
         target: SideChatProviderTarget,
         now_ms: i64,
+    ) -> Result<SideChatBinding, StorageError> {
+        self.write_provider_target_at(owner_session_id, target, now_ms, true)
+    }
+
+    #[cfg(test)]
+    fn ensure_at(
+        &self,
+        owner_session_id: SessionId,
+        target: SideChatProviderTarget,
+        now_ms: i64,
+    ) -> Result<SideChatBinding, StorageError> {
+        self.write_provider_target_at(owner_session_id, target, now_ms, false)
+    }
+
+    fn write_provider_target_at(
+        &self,
+        owner_session_id: SessionId,
+        target: SideChatProviderTarget,
+        now_ms: i64,
+        replace_existing: bool,
     ) -> Result<SideChatBinding, StorageError> {
         validate_timestamp(now_ms)?;
         let target = target.validate()?;
@@ -271,55 +360,59 @@ impl SqliteSideChatRepository {
         let existing = binding_for_owner(&transaction, owner_session_id)?;
         let side_chat_id = if let Some(existing) = existing {
             ensure_delete_not_requested(&existing)?;
-            ensure_conversation_not_running(&transaction, existing.conversation_session_id)?;
-            transaction.execute(
-                "UPDATE sessions
-                 SET model_name = ?2,
-                     base_url = ?3,
-                     provider_connection_json = ?4,
-                     updated_at_ms = MAX(updated_at_ms, ?5)
-                 WHERE id = ?1",
-                params![
-                    existing.conversation_session_id.to_string(),
-                    target.model.as_str(),
-                    target.base_url.as_str(),
-                    provider_connection_json.as_str(),
-                    now_ms,
-                ],
-            )?;
-            let updated = transaction.execute(
-                "UPDATE side_chat_bindings
-                 SET base_url = ?3,
-                     model = ?4,
-                     provider_profile = ?5,
-                     context_window = ?6,
-                     request_timeout_ms = ?7,
-                     connect_timeout_ms = ?8,
-                     max_retries = ?9,
-                     supports_images = ?10,
-                     supports_tools = ?11,
-                     updated_at_ms = MAX(updated_at_ms, ?12)
-                 WHERE id = ?1 AND owner_session_id = ?2",
-                params![
-                    existing.id.to_string(),
-                    owner_session_id.to_string(),
-                    target.base_url.as_str(),
-                    target.model.as_str(),
-                    target.provider_profile.as_str(),
-                    i64::from(target.context_window),
-                    target.request_timeout_ms as i64,
-                    target.connect_timeout_ms as i64,
-                    i64::from(target.max_retries),
-                    target.supports_images,
-                    target.supports_tools,
-                    now_ms,
-                ],
-            )?;
-            if updated != 1 {
-                return Err(StorageError::Message(format!(
-                    "side chat {} changed while its provider was being configured",
-                    existing.id
-                )));
+            if replace_existing {
+                ensure_conversation_not_running(&transaction, existing.conversation_session_id)?;
+                transaction.execute(
+                    "UPDATE sessions
+                     SET model_name = ?2,
+                         base_url = ?3,
+                         provider_connection_json = ?4,
+                         updated_at_ms = MAX(updated_at_ms, ?5)
+                     WHERE id = ?1",
+                    params![
+                        existing.conversation_session_id.to_string(),
+                        target.model.as_str(),
+                        target.base_url.as_str(),
+                        provider_connection_json.as_str(),
+                        now_ms,
+                    ],
+                )?;
+                let updated = transaction.execute(
+                    "UPDATE side_chat_bindings
+                     SET base_url = ?3,
+                         model = ?4,
+                         provider_profile = ?5,
+                         system_prompt = ?6,
+                         context_window = ?7,
+                         request_timeout_ms = ?8,
+                         connect_timeout_ms = ?9,
+                         max_retries = ?10,
+                         supports_images = ?11,
+                         supports_tools = ?12,
+                         updated_at_ms = MAX(updated_at_ms, ?13)
+                     WHERE id = ?1 AND owner_session_id = ?2",
+                    params![
+                        existing.id.to_string(),
+                        owner_session_id.to_string(),
+                        target.base_url.as_str(),
+                        target.model.as_str(),
+                        target.provider_profile.as_str(),
+                        target.system_prompt.as_str(),
+                        i64::from(target.context_window),
+                        target.request_timeout_ms as i64,
+                        target.connect_timeout_ms as i64,
+                        i64::from(target.max_retries),
+                        target.supports_images,
+                        target.supports_tools,
+                        now_ms,
+                    ],
+                )?;
+                if updated != 1 {
+                    return Err(StorageError::Message(format!(
+                        "side chat {} changed while its provider was being configured",
+                        existing.id
+                    )));
+                }
             }
             existing.id
         } else {
@@ -352,7 +445,7 @@ impl SqliteSideChatRepository {
             transaction.execute(
                 "INSERT INTO side_chat_bindings (
                      id, owner_session_id, conversation_session_id,
-                     base_url, model, provider_profile,
+                     base_url, model, provider_profile, system_prompt,
                      context_window, max_output_tokens,
                      request_timeout_ms, connect_timeout_ms, max_retries,
                      supports_images, supports_tools, supports_reasoning,
@@ -360,8 +453,8 @@ impl SqliteSideChatRepository {
                      delete_requested_at_ms, context_scope,
                      created_at_ms, updated_at_ms
                  ) VALUES (
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                     ?12, ?13, ?14, '', 0, 0, NULL, ?15, ?16, ?16
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, '', 0, 0, NULL, ?16, ?17, ?17
                  )",
                 params![
                     side_chat_id.to_string(),
@@ -370,6 +463,7 @@ impl SqliteSideChatRepository {
                     target.base_url.as_str(),
                     target.model.as_str(),
                     target.provider_profile.as_str(),
+                    target.system_prompt.as_str(),
                     i64::from(target.context_window),
                     i64::from(RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER),
                     target.request_timeout_ms as i64,
@@ -537,6 +631,7 @@ impl SqliteSideChatRepository {
         side_chat_id: SideChatId,
         expected_generation: u64,
         expected_draft_revision: u64,
+        expected_provider_target: SideChatProviderTarget,
         turn_id: crate::protocol::TurnId,
         initial_user_turn: &crate::protocol::UserTurn,
     ) -> Result<SideChatAdmittedRequest, StorageError> {
@@ -553,6 +648,7 @@ impl SqliteSideChatRepository {
                 "side chat draft revision is exhausted".to_string(),
             ));
         }
+        let expected_provider_target = expected_provider_target.validate()?;
         let observed = self.get_by_owner(owner_session_id)?.ok_or_else(|| {
             StorageError::Message(format!("owner session {owner_session_id} has no side chat"))
         })?;
@@ -562,6 +658,7 @@ impl SqliteSideChatRepository {
             side_chat_id,
             expected_generation,
             expected_draft_revision,
+            expected_provider_target,
             turn_id,
             initial_user_turn,
         )
@@ -575,6 +672,7 @@ impl SqliteSideChatRepository {
         side_chat_id: SideChatId,
         expected_generation: i64,
         expected_draft_revision: i64,
+        expected_provider_target: SideChatProviderTarget,
         turn_id: crate::protocol::TurnId,
         initial_user_turn: &crate::protocol::UserTurn,
     ) -> Result<SideChatAdmittedRequest, StorageError> {
@@ -595,6 +693,11 @@ impl SqliteSideChatRepository {
                 observed.draft_revision
             )));
         }
+        if observed.provider_target() != expected_provider_target {
+            return Err(StorageError::Message(format!(
+                "side chat {side_chat_id} provider target changed before request admission"
+            )));
+        }
         ensure_delete_not_requested(&observed)?;
         let conversation_session_id = observed.conversation_session_id;
         let now_ms = SystemClock.now_ms();
@@ -613,6 +716,7 @@ impl SqliteSideChatRepository {
                         conversation_session_id,
                         expected_generation,
                         expected_draft_revision,
+                        &expected_provider_target,
                         now_ms,
                     )
                 },
@@ -817,6 +921,7 @@ fn advance_request_generation_in_transaction(
     conversation_session_id: SessionId,
     expected_generation: i64,
     expected_draft_revision: i64,
+    expected_provider_target: &SideChatProviderTarget,
     now_ms: i64,
 ) -> Result<SideChatRequestClaim, StorageError> {
     let current = binding_for_owner(connection, owner_session_id)?.ok_or_else(|| {
@@ -837,6 +942,11 @@ fn advance_request_generation_in_transaction(
         return Err(StorageError::Message(format!(
             "side chat {side_chat_id} draft revision changed: expected {expected_draft_revision}, current {}",
             current.draft_revision
+        )));
+    }
+    if current.provider_target() != *expected_provider_target {
+        return Err(StorageError::Message(format!(
+            "side chat {side_chat_id} provider target changed before request admission"
         )));
     }
     ensure_delete_not_requested(&current)?;
@@ -892,6 +1002,7 @@ type BindingColumns = (
     String,
     String,
     String,
+    String,
     i64,
     i64,
     i64,
@@ -932,11 +1043,12 @@ fn binding_columns(row: &Row<'_>) -> rusqlite::Result<BindingColumns> {
         row.get(18)?,
         row.get(19)?,
         row.get(20)?,
+        row.get(21)?,
     ))
 }
 
 const BINDING_SELECT: &str = "SELECT id, owner_session_id, conversation_session_id,
-            base_url, model, provider_profile,
+            base_url, model, provider_profile, system_prompt,
             context_window, max_output_tokens,
             request_timeout_ms, connect_timeout_ms, max_retries,
             supports_images, supports_tools, supports_reasoning,
@@ -985,27 +1097,44 @@ fn decode_binding(raw: BindingColumns) -> Result<SideChatBinding, StorageError> 
                 raw.5
             ))
         })?,
-        context_window: parse_positive_u32(raw.6, "context window")?,
-        max_output_tokens: parse_positive_u32(raw.7, "max output tokens")?,
-        request_timeout_ms: parse_positive_u64(raw.8, "request timeout")?,
-        connect_timeout_ms: parse_positive_u64(raw.9, "connect timeout")?,
-        max_retries: u8::try_from(raw.10).map_err(|_| {
+        system_prompt: decode_side_chat_system_prompt(raw.6)?,
+        context_window: parse_positive_u32(raw.7, "context window")?,
+        max_output_tokens: parse_positive_u32(raw.8, "max output tokens")?,
+        request_timeout_ms: parse_positive_u64(raw.9, "request timeout")?,
+        connect_timeout_ms: parse_positive_u64(raw.10, "connect timeout")?,
+        max_retries: u8::try_from(raw.11).map_err(|_| {
             StorageError::Message(format!(
                 "side chat binding has invalid max retries `{}`",
-                raw.10
+                raw.11
             ))
         })?,
-        supports_images: raw.11,
-        supports_tools: raw.12,
-        supports_reasoning: raw.13,
-        persisted_draft: raw.14,
-        draft_revision: parse_u64(raw.15, "draft revision")?,
-        request_generation: parse_u64(raw.16, "request generation")?,
-        delete_requested_at_ms: parse_optional_timestamp(raw.17, "delete request timestamp")?,
-        context_scope: SideChatContextScope::parse(&raw.18)?,
-        created_at_ms: raw.19,
-        updated_at_ms: raw.20,
+        supports_images: raw.12,
+        supports_tools: raw.13,
+        supports_reasoning: raw.14,
+        persisted_draft: raw.15,
+        draft_revision: parse_u64(raw.16, "draft revision")?,
+        request_generation: parse_u64(raw.17, "request generation")?,
+        delete_requested_at_ms: parse_optional_timestamp(raw.18, "delete request timestamp")?,
+        context_scope: SideChatContextScope::parse(&raw.19)?,
+        created_at_ms: raw.20,
+        updated_at_ms: raw.21,
     })
+}
+
+fn normalize_side_chat_system_prompt(value: &str) -> Result<String, StorageError> {
+    normalize_user_configured_system_prompt(Some(value))
+        .map(Option::unwrap_or_default)
+        .map_err(|message| StorageError::Message(format!("side chat system prompt {message}")))
+}
+
+fn decode_side_chat_system_prompt(value: String) -> Result<String, StorageError> {
+    let normalized = normalize_side_chat_system_prompt(&value)?;
+    if normalized != value {
+        return Err(StorageError::Message(
+            "side chat binding has a non-canonical system prompt boundary".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 fn conversation_messages(
@@ -1282,6 +1411,7 @@ mod tests {
             base_url: "http://localhost:1234/v1/".to_string(),
             model: model.to_string(),
             provider_profile: ProviderProfile::LmStudioChatCompletions,
+            system_prompt: String::new(),
             context_window: 65_536,
             request_timeout_ms: 60_000,
             connect_timeout_ms: 5_000,
@@ -1292,22 +1422,150 @@ mod tests {
     }
 
     #[test]
-    fn model_generation_compatibility_fields_do_not_change_side_chat_target() {
-        let mut first = crate::config::ResolvedConfig::default().model;
-        first.base_url = "http://localhost:1234/v1".to_string();
-        first.model = "gemma".to_string();
-        first.max_output_tokens = 65_536;
-        first.supports_reasoning = true;
-        first.reasoning_effort = Some(crate::config::ReasoningEffort::High);
-        let mut second = first.clone();
-        second.max_output_tokens = 1;
-        second.supports_reasoning = false;
-        second.reasoning_effort = None;
+    fn global_side_chat_config_converts_to_an_independent_provider_target() {
+        let config = SideChatConfig {
+            base_url: "http://localhost:8080/v1/".to_string(),
+            model: "  side-model  ".to_string(),
+            system_prompt: "  SIDE_ONLY_MARKER  ".to_string(),
+            provider_profile: ProviderProfile::OpenAiCompatible,
+            context_window: 32_768,
+            request_timeout_ms: 90_000,
+            connect_timeout_ms: 7_500,
+            max_retries: 3,
+        };
 
         assert_eq!(
-            SideChatProviderTarget::try_from(&first).expect("first target"),
-            SideChatProviderTarget::try_from(&second).expect("second target")
+            SideChatProviderTarget::try_from(&config).expect("side target"),
+            SideChatProviderTarget {
+                base_url: "http://localhost:8080/v1".to_string(),
+                model: "side-model".to_string(),
+                provider_profile: ProviderProfile::OpenAiCompatible,
+                system_prompt: "SIDE_ONLY_MARKER".to_string(),
+                context_window: 32_768,
+                request_timeout_ms: 90_000,
+                connect_timeout_ms: 7_500,
+                max_retries: 3,
+                supports_images: false,
+                supports_tools: false,
+            }
         );
+    }
+
+    #[test]
+    fn global_side_chat_prompt_does_not_inherit_the_main_prompt() {
+        let mut main = crate::config::ResolvedConfig::default().model;
+        main.system_prompt = "MAIN_ONLY_MARKER".to_string();
+        let mut side = SideChatConfig::default();
+        side.system_prompt.clear();
+
+        let blank = SideChatProviderTarget::try_from(&side).expect("blank side target");
+        assert_eq!(blank.system_prompt, "");
+        assert_ne!(blank.system_prompt, main.system_prompt);
+
+        side.system_prompt = "  SIDE_ONLY_MARKER  ".to_string();
+        let configured = SideChatProviderTarget::try_from(&side).expect("configured side target");
+        assert_eq!(configured.system_prompt, "SIDE_ONLY_MARKER");
+        assert_ne!(configured.system_prompt, main.system_prompt);
+    }
+
+    #[test]
+    fn ensure_materializes_once_and_never_reconfigures_an_existing_binding() {
+        let (_store, repo, owner) = fixture();
+        let mut first_target = target("first-side-model");
+        first_target.system_prompt = "FIRST_SIDE_PROMPT".to_string();
+        let first = repo
+            .ensure_at(owner, first_target, 1_000)
+            .expect("materialize first Side Chat");
+
+        let mut later_defaults = target("second-side-model");
+        later_defaults.system_prompt = "SECOND_SIDE_PROMPT".to_string();
+        let unchanged = repo
+            .ensure_at(owner, later_defaults, 2_000)
+            .expect("return existing Side Chat");
+
+        assert_eq!(unchanged, first);
+        assert_eq!(unchanged.model, "first-side-model");
+        assert_eq!(unchanged.system_prompt, "FIRST_SIDE_PROMPT");
+        assert_eq!(unchanged.updated_at_ms, 1_000);
+    }
+
+    #[test]
+    fn system_prompt_validation_trims_outer_boundary_and_counts_unicode_characters() {
+        let mut trimmed = target("gemma");
+        trimmed.system_prompt = " \n最初\n  次  \t".to_string();
+        let trimmed = trimmed.validate().expect("trimmed prompt");
+        assert_eq!(trimmed.system_prompt, "最初\n  次");
+
+        let mut accepted = target("gemma");
+        accepted.system_prompt =
+            "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS);
+        assert_eq!(
+            accepted
+                .validate()
+                .expect("boundary prompt")
+                .system_prompt
+                .chars()
+                .count(),
+            crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS
+        );
+
+        let mut rejected = target("gemma");
+        rejected.system_prompt =
+            "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1);
+        let error = rejected
+            .validate()
+            .expect_err("oversized prompt must reject");
+        assert!(error.to_string().contains("at most 16384 characters"));
+    }
+
+    #[test]
+    fn configured_system_prompt_persists_across_reopen_without_debug_disclosure() {
+        let (store, repo, owner) = fixture();
+        let mut configured_target = target("gemma");
+        configured_target.system_prompt = "  private side instructions  ".to_string();
+        let binding = repo
+            .configure(owner, configured_target)
+            .expect("configure prompt");
+        assert_eq!(binding.system_prompt, "private side instructions");
+        let debug = format!("{binding:?}");
+        assert!(debug.contains("system_prompt_chars: 25"));
+        assert!(!debug.contains("private side instructions"));
+
+        let reopened_store = SqliteStore::open(store.paths()).expect("reopen store");
+        reopened_store.migrate().expect("reopen current schema");
+        let reopened = reopened_store
+            .side_chat_repo()
+            .get_by_owner(owner)
+            .expect("read reopened binding")
+            .expect("durable binding");
+        assert_eq!(reopened.system_prompt, "private side instructions");
+    }
+
+    #[test]
+    fn binding_decode_rejects_noncanonical_unicode_prompt_boundary() {
+        let (_store, repo, owner) = fixture();
+        let binding = repo.configure(owner, target("gemma")).expect("configure");
+        let connection = repo.connection.lock().expect("sqlite mutex");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("enable corruption fixture");
+        connection
+            .execute(
+                "UPDATE side_chat_bindings
+                 SET system_prompt = ?2, updated_at_ms = updated_at_ms + 1
+                 WHERE id = ?1",
+                params![binding.id.to_string(), "\u{2003}corrupt boundary"],
+            )
+            .expect("inject noncanonical prompt");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore constraints");
+        drop(connection);
+
+        let error = repo
+            .get_by_owner(owner)
+            .expect_err("noncanonical prompt must fail closed");
+        assert!(error.to_string().contains("non-canonical system prompt"));
     }
 
     fn user_turn(turn_id: TurnId, text: &str) -> UserTurn {
@@ -1326,8 +1584,17 @@ mod tests {
         let binding = repo.configure(owner, target("gemma")).expect("configure");
         let turn_id = TurnId::new();
         let user_turn = user_turn(turn_id, "terminal question");
+        let expected_provider_target = binding.provider_target();
         let admitted = repo
-            .claim_and_admit_request(owner, binding.id, 0, 0, turn_id, &user_turn)
+            .claim_and_admit_request(
+                owner,
+                binding.id,
+                0,
+                0,
+                expected_provider_target,
+                turn_id,
+                &user_turn,
+            )
             .await
             .expect("claim and admit side chat turn");
         let terminal = RunEvent::TurnTerminal {
@@ -1480,6 +1747,7 @@ mod tests {
             configured.id,
             0,
             0,
+            legacy.provider_target(),
             turn_id,
             &user_turn(turn_id, "legacy columns must be inert"),
         )
@@ -1500,8 +1768,17 @@ mod tests {
             prompt_dispatch: None,
             editor_context: None,
         };
+        let expected_provider_target = binding.provider_target();
         let admitted = repo
-            .claim_and_admit_request(owner, binding.id, 0, 0, turn_id, &user_turn)
+            .claim_and_admit_request(
+                owner,
+                binding.id,
+                0,
+                0,
+                expected_provider_target,
+                turn_id,
+                &user_turn,
+            )
             .await
             .expect("claim and admit canonical turn");
         assert_eq!(admitted.generation, 1);
@@ -1605,6 +1882,7 @@ mod tests {
             .binding;
         let turn_id = TurnId::new();
         let turn = user_turn(turn_id, "stale submitted text");
+        let expected_provider_target = binding.provider_target();
 
         let error = repo
             .claim_and_admit_request(
@@ -1612,6 +1890,7 @@ mod tests {
                 binding.id,
                 binding.request_generation,
                 binding.draft_revision,
+                expected_provider_target,
                 turn_id,
                 &turn,
             )
@@ -1633,6 +1912,57 @@ mod tests {
         assert!(projection.messages.is_empty());
     }
 
+    #[tokio::test]
+    async fn request_admission_rejects_a_changed_provider_target_without_creating_evidence() {
+        let (store, repo, owner) = fixture();
+        let mut original_target = target("gemma");
+        original_target.system_prompt = "OLD_SIDE_PROMPT_MARKER".to_string();
+        let binding = repo
+            .configure(owner, original_target)
+            .expect("configure original target");
+        let expected_provider_target = binding.provider_target();
+
+        let second_store = SqliteStore::open(store.paths()).expect("second store");
+        second_store.migrate().expect("second migrate");
+        let second_repo = second_store.side_chat_repo();
+        let mut replacement_target = expected_provider_target.clone();
+        replacement_target.system_prompt = "NEW_SIDE_PROMPT_MARKER".to_string();
+        let reconfigured = second_repo
+            .configure(owner, replacement_target)
+            .expect("reconfigure during preflight");
+        assert_eq!(reconfigured.id, binding.id);
+        assert_eq!(reconfigured.request_generation, binding.request_generation);
+        assert_eq!(reconfigured.draft_revision, binding.draft_revision);
+
+        let turn_id = TurnId::new();
+        let error = repo
+            .claim_and_admit_request(
+                owner,
+                binding.id,
+                binding.request_generation,
+                binding.draft_revision,
+                expected_provider_target,
+                turn_id,
+                &user_turn(turn_id, "must not use a stale provider target"),
+            )
+            .await
+            .expect_err("changed provider target must reject admission");
+
+        assert!(error.to_string().contains("provider target changed"));
+        let projection = repo
+            .conversation_projection(owner)
+            .expect("project side chat")
+            .expect("side chat projection");
+        assert_eq!(projection.status, SessionStatus::Idle);
+        assert_eq!(
+            projection.binding.request_generation,
+            binding.request_generation
+        );
+        assert_eq!(projection.binding.draft_revision, binding.draft_revision);
+        assert_eq!(projection.binding.system_prompt, "NEW_SIDE_PROMPT_MARKER");
+        assert!(projection.messages.is_empty());
+    }
+
     #[test]
     fn concurrent_draft_save_and_request_admission_have_one_exact_revision_winner() {
         let (store, repo, owner) = fixture();
@@ -1645,6 +1975,7 @@ mod tests {
         let claim_barrier = barrier.clone();
         let save_repo = repo.clone();
         let side_chat_id = binding.id;
+        let expected_provider_target = binding.provider_target();
         let turn_id = TurnId::new();
 
         let save = std::thread::spawn(move || {
@@ -1662,6 +1993,7 @@ mod tests {
                 side_chat_id,
                 0,
                 0,
+                expected_provider_target,
                 turn_id,
                 &turn,
             ))
@@ -1712,6 +2044,8 @@ mod tests {
         let first_observed = repo.get_by_owner(owner).unwrap().unwrap();
         let second_observed = second_repo.get_by_owner(owner).unwrap().unwrap();
         assert_eq!(first_observed, second_observed);
+        let first_expected_provider_target = first_observed.provider_target();
+        let second_expected_provider_target = second_observed.provider_target();
         let expected_draft_revision = saved.draft_revision as i64;
 
         let first_turn_id = TurnId::new();
@@ -1732,6 +2066,7 @@ mod tests {
                 binding.id,
                 0,
                 expected_draft_revision,
+                first_expected_provider_target,
                 first_turn_id,
                 &turn,
             ))
@@ -1748,6 +2083,7 @@ mod tests {
                 binding.id,
                 0,
                 expected_draft_revision,
+                second_expected_provider_target,
                 second_turn_id,
                 &turn,
             ))
@@ -1855,12 +2191,14 @@ mod tests {
         }
         let turn_id = TurnId::new();
         let turn = user_turn(turn_id, "must roll back");
+        let expected_provider_target = binding.provider_target();
         assert!(
             repo.claim_and_admit_request(
                 owner,
                 binding.id,
                 0,
                 saved.draft_revision,
+                expected_provider_target,
                 turn_id,
                 &turn,
             )
@@ -1967,12 +2305,14 @@ mod tests {
         );
         let blocked_turn_id = TurnId::new();
         let blocked_turn = user_turn(blocked_turn_id, "must not admit");
+        let expected_provider_target = binding.provider_target();
         assert!(
             repo.claim_and_admit_request(
                 owner,
                 binding.id,
                 0,
                 binding.draft_revision,
+                expected_provider_target,
                 blocked_turn_id,
                 &blocked_turn,
             )
@@ -2014,8 +2354,17 @@ mod tests {
         let binding = repo.configure(owner, target("gemma")).expect("configure");
         let turn_id = TurnId::new();
         let turn = user_turn(turn_id, "running request");
+        let expected_provider_target = binding.provider_target();
         let admitted = repo
-            .claim_and_admit_request(owner, binding.id, 0, binding.draft_revision, turn_id, &turn)
+            .claim_and_admit_request(
+                owner,
+                binding.id,
+                0,
+                binding.draft_revision,
+                expected_provider_target,
+                turn_id,
+                &turn,
+            )
             .await
             .expect("claim and admit");
         let requested = repo

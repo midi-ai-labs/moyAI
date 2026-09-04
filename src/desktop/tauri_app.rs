@@ -47,7 +47,7 @@ macro_rules! desktop_command_manifest {
             desktop_state,
             submit_prompt,
             cancel_run,
-            configure_side_chat,
+            ensure_side_chat,
             load_side_chat_models,
             save_side_chat_draft,
             submit_side_chat,
@@ -1481,12 +1481,9 @@ fn apply_stop_admission(
 }
 
 #[tauri::command]
-async fn configure_side_chat(
+async fn ensure_side_chat(
     controller: State<'_, SharedController>,
     owner_session_id: String,
-    base_url: String,
-    model: String,
-    provider_profile: String,
     expected_config_generation: String,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     let conflict_owner = owner_session_id.clone();
@@ -1500,9 +1497,8 @@ async fn configure_side_chat(
             controller.state.app_state.current_session_id,
             controller.state.provider_config.config_generation,
         )?;
-        let provider_profile = parse_provider_profile_input(&provider_profile)?;
         controller
-            .configure_side_chat(owner_session_id, base_url, model, provider_profile)
+            .ensure_side_chat(owner_session_id)
             .map_err(DesktopCommandConflict::new)
     })
     .await
@@ -1510,7 +1506,6 @@ async fn configure_side_chat(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SideChatCatalogRequestTarget {
-    owner_session_id: SessionId,
     base_url: String,
     provider_profile: ProviderProfile,
     config_generation: u64,
@@ -1527,7 +1522,6 @@ struct SideChatCatalogModelProjection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SideChatCatalogProjection {
-    owner_session_id: String,
     base_url: String,
     provider_profile: String,
     config_generation: String,
@@ -1537,23 +1531,15 @@ struct SideChatCatalogProjection {
 #[tauri::command]
 async fn load_side_chat_models(
     controller: State<'_, SharedController>,
-    owner_session_id: String,
     base_url: String,
     provider_profile: String,
     expected_config_generation: String,
 ) -> Result<SideChatCatalogProjection, DesktopCommandError> {
-    let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
-        read_only_command_conflict_error(DesktopCommandConflict::new(format!(
-            "invalid side chat owner: {error}"
-        )))
-    })?;
     let (target, probe_config) = {
         let mut controller = controller.lock().await;
         controller.drain_runtime_messages();
-        validate_side_chat_config_owner(
-            owner_session_id,
+        validate_side_chat_global_config_target(
             &expected_config_generation,
-            controller.state.app_state.current_session_id,
             controller.state.provider_config.config_generation,
         )
         .map_err(read_only_command_conflict_error)?;
@@ -1566,7 +1552,6 @@ async fn load_side_chat_models(
         )
         .map_err(read_only_command_conflict_error)?;
         let target = SideChatCatalogRequestTarget {
-            owner_session_id,
             base_url: canonical_base_url,
             provider_profile,
             config_generation: controller.state.provider_config.config_generation,
@@ -1575,7 +1560,7 @@ async fn load_side_chat_models(
     };
 
     // Provider I/O deliberately runs without the controller mutex. The exact
-    // session/config owner is checked again before any result is returned.
+    // global config generation is checked again before any result is returned.
     let result = fetch_provider_model_infos(&probe_config, &target.base_url).await;
 
     {
@@ -1583,7 +1568,6 @@ async fn load_side_chat_models(
         controller.drain_runtime_messages();
         validate_side_chat_catalog_target(
             &target,
-            controller.state.app_state.current_session_id,
             controller.state.provider_config.config_generation,
         )
         .map_err(read_only_command_conflict_error)?;
@@ -1595,7 +1579,6 @@ async fn load_side_chat_models(
         .map(side_chat_catalog_model_projection)
         .collect();
     Ok(SideChatCatalogProjection {
-        owner_session_id: target.owner_session_id.to_string(),
         base_url: target.base_url,
         provider_profile: target.provider_profile.as_str().to_string(),
         config_generation: target.config_generation.to_string(),
@@ -1624,15 +1607,23 @@ fn validate_side_chat_config_owner(
 
 fn validate_side_chat_catalog_target(
     target: &SideChatCatalogRequestTarget,
-    current_owner_session_id: Option<SessionId>,
     current_config_generation: u64,
 ) -> Result<(), DesktopCommandConflict> {
-    validate_side_chat_config_owner(
-        target.owner_session_id,
+    validate_side_chat_global_config_target(
         &target.config_generation.to_string(),
-        current_owner_session_id,
         current_config_generation,
-    )?;
+    )
+}
+
+fn validate_side_chat_global_config_target(
+    expected_config_generation: &str,
+    current_config_generation: u64,
+) -> Result<(), DesktopCommandConflict> {
+    if expected_config_generation != current_config_generation.to_string() {
+        return Err(DesktopCommandConflict::new(
+            "configuration changed before the side chat operation; retry from current settings",
+        ));
+    }
     Ok(())
 }
 
@@ -1657,6 +1648,14 @@ fn side_chat_catalog_probe_config(
         .to_string();
     config.model.base_url = canonical_base_url.clone();
     config.model.provider_profile = provider_profile;
+    config.model.request_timeout_ms = config.side_chat.request_timeout_ms;
+    config.model.connect_timeout_ms = config.side_chat.connect_timeout_ms;
+    config.model.max_retries = config.side_chat.max_retries;
+    config.model.context_window = config.side_chat.context_window;
+    config.model.system_prompt.clear();
+    config.model.supports_tools = false;
+    config.model.supports_images = false;
+    config.model.parallel_tool_calls = false;
 
     // Side Chat has no credential surface and must never inherit the main
     // provider's authentication material or generation-body customization.
@@ -3689,10 +3688,20 @@ async fn save_provider_global(
     .await
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DesktopConfigValueInput {
     key: String,
     text: String,
+}
+
+impl std::fmt::Debug for DesktopConfigValueInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesktopConfigValueInput")
+            .field("key", &self.key)
+            .field("text_chars", &self.text.chars().count())
+            .finish()
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3703,13 +3712,25 @@ struct DesktopInitialSetupConfigDraft {
     values: Vec<DesktopInitialSetupConfigFieldDraft>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopInitialSetupConfigFieldDraft {
     key: String,
     text: String,
     sensitive: bool,
     configured: bool,
+}
+
+impl std::fmt::Debug for DesktopInitialSetupConfigFieldDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesktopInitialSetupConfigFieldDraft")
+            .field("key", &self.key)
+            .field("text_chars", &self.text.chars().count())
+            .field("sensitive", &self.sensitive)
+            .field("configured", &self.configured)
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -5357,6 +5378,8 @@ mod tests {
     #[test]
     fn initial_setup_import_draft_serializes_only_public_sensitive_state() {
         let mut config = ResolvedConfig::default();
+        let prompt_marker = "INITIAL_SETUP_MAIN_PROMPT_MARKER";
+        config.model.system_prompt = prompt_marker.to_string();
         let secrets = [
             "model-header-import-secret",
             "model-body-import-secret",
@@ -5382,6 +5405,12 @@ mod tests {
             sensitive: false,
             configured: true,
         }];
+        values.push(DesktopInitialSetupConfigFieldDraft {
+            key: crate::config::ConfigField::SystemPrompt.label().to_string(),
+            text: config.model.system_prompt.clone(),
+            sensitive: false,
+            configured: true,
+        });
         values.extend(
             [
                 crate::config::ConfigField::ExtraHeadersJson,
@@ -5414,6 +5443,7 @@ mod tests {
         assert_eq!(serialized["values"][0]["text"], "draft-model");
         assert_eq!(serialized["values"][0]["sensitive"], false);
         assert_eq!(serialized["values"][0]["configured"], true);
+        assert_eq!(serialized["values"][1]["text"], prompt_marker);
 
         let sensitive = serialized["values"]
             .as_array()
@@ -5432,6 +5462,9 @@ mod tests {
             assert!(!encoded.contains(secret));
             assert!(!debug.contains(secret));
         }
+        assert!(encoded.contains(prompt_marker));
+        assert!(!debug.contains(prompt_marker));
+        assert!(debug.contains("text_chars"));
     }
 
     #[test]
@@ -6769,6 +6802,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!complete_config_draft_is_dirty(&config, &values).expect("clean full draft"));
+        let prompt_input = values
+            .iter_mut()
+            .find(|value| value.key == crate::config::ConfigField::SystemPrompt.label())
+            .expect("main system prompt field");
+        prompt_input.text = "MAIN_DRAFT_PRIVATE_MARKER".to_string();
+        let prompt_debug = format!("{prompt_input:?}");
+        assert!(prompt_debug.contains("text_chars"));
+        assert!(!prompt_debug.contains("MAIN_DRAFT_PRIVATE_MARKER"));
+        prompt_input.text.clear();
         values
             .iter_mut()
             .find(|value| value.key == "model.model")
@@ -6966,7 +7008,7 @@ mod tests {
     }
 
     #[test]
-    fn side_chat_config_owner_and_catalog_target_reject_owner_and_generation_drift() {
+    fn side_chat_creation_requires_the_exact_owner_and_catalog_requires_global_generation() {
         let owner = SessionId::new();
         let other_owner = SessionId::new();
         assert!(validate_side_chat_config_owner(owner, "7", Some(owner), 7).is_ok());
@@ -6979,22 +7021,27 @@ mod tests {
             "configuration changed before the side chat operation; retry from current settings"
         );
         assert!(validate_side_chat_config_owner(owner, "07", Some(owner), 7).is_err());
+        assert!(validate_side_chat_global_config_target("7", 7).is_ok());
+        assert!(validate_side_chat_global_config_target("8", 7).is_err());
+        assert!(validate_side_chat_global_config_target("07", 7).is_err());
 
         let target = SideChatCatalogRequestTarget {
-            owner_session_id: owner,
             base_url: "http://127.0.0.1:1234".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible,
             config_generation: 7,
         };
-        assert!(validate_side_chat_catalog_target(&target, Some(owner), 7).is_ok());
-        assert!(validate_side_chat_catalog_target(&target, Some(other_owner), 7).is_err());
+        assert!(validate_side_chat_catalog_target(&target, 7).is_ok());
+        assert!(validate_side_chat_catalog_target(&target, 8).is_err());
     }
 
     #[test]
     fn side_chat_catalog_probe_is_canonical_and_credential_free() {
         let mut config = ResolvedConfig::default();
         let profile = ProviderProfile::OpenAiCompatible;
-        let connect_timeout_ms = config.model.connect_timeout_ms;
+        config.side_chat.connect_timeout_ms = 3_210;
+        config.side_chat.request_timeout_ms = 54_321;
+        config.side_chat.max_retries = 4;
+        config.side_chat.context_window = 65_536;
         config.model.api_key_env = Some("MAIN_PROVIDER_SECRET".to_string());
         config
             .model
@@ -7022,7 +7069,11 @@ mod tests {
         assert_eq!(canonical, "http://127.0.0.1:1234");
         assert_eq!(probe.model.base_url, canonical);
         assert_eq!(probe.model.provider_profile, profile);
-        assert_eq!(probe.model.connect_timeout_ms, connect_timeout_ms);
+        assert_eq!(probe.model.connect_timeout_ms, 3_210);
+        assert_eq!(probe.model.request_timeout_ms, 54_321);
+        assert_eq!(probe.model.max_retries, 4);
+        assert_eq!(probe.model.context_window, 65_536);
+        assert!(probe.model.system_prompt.is_empty());
         assert_eq!(probe.model.api_key_env, None);
         assert!(probe.model.extra_headers.is_empty());
         assert_eq!(probe.model.chat_completions_reasoning_parameters, None);
@@ -7048,7 +7099,6 @@ mod tests {
 
     #[test]
     fn side_chat_catalog_result_uses_main_model_labels_and_typed_load_state() {
-        let owner = SessionId::new();
         let model = side_chat_catalog_model_projection(ProviderModelInfo {
             id: "google/gemma-4-12b-qat".to_string(),
             display_name: Some("Gemma 4 12B QAT".to_string()),
@@ -7070,14 +7120,13 @@ mod tests {
         assert_eq!(model.load_state, ProviderModelLoadState::Loaded);
 
         let projection = SideChatCatalogProjection {
-            owner_session_id: owner.to_string(),
             base_url: "http://127.0.0.1:1234".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible.as_str().to_string(),
             config_generation: "7".to_string(),
             models: vec![model],
         };
         let json = serde_json::to_value(projection).expect("serialize side chat catalog");
-        assert_eq!(json["ownerSessionId"], owner.to_string());
+        assert!(json.get("ownerSessionId").is_none());
         assert_eq!(json["baseUrl"], "http://127.0.0.1:1234");
         assert_eq!(json["providerProfile"], "openai_compatible");
         assert_eq!(json["configGeneration"], "7");

@@ -85,7 +85,7 @@ import {
   validateConfigFieldValues,
   validateConfigInput,
   validateProviderBaseUrl,
-  validateSideChatProviderSettings,
+  USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS,
 } from "../src/utils.ts";
 import {
   acknowledgeDraftMutation,
@@ -460,6 +460,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       chat_id: null,
       owner_session_id: SESSION_A,
       model: "",
+      system_prompt: "",
       base_url: "",
       provider_profile: "",
       status: "idle",
@@ -749,6 +750,7 @@ test("installed prompt and delegated Settings handlers update capability state s
     disabled = false;
     dataset: { configKey: string };
     readonly attributes = new Map<string, string>();
+    private readonly listeners = new Map<string, Array<(event: { currentTarget: FakeInput }) => void>>();
 
     constructor(
       configKey = "model.request_timeout_ms",
@@ -775,6 +777,16 @@ test("installed prompt and delegated Settings handlers update capability state s
 
     getAttribute(name: string): string | null {
       return this.attributes.get(name) ?? null;
+    }
+
+    addEventListener(name: string, listener: (event: { currentTarget: FakeInput }) => void): void {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    dispatch(name: string): void {
+      for (const listener of this.listeners.get(name) ?? []) listener({ currentTarget: this });
     }
 
     focus(): void {}
@@ -826,6 +838,7 @@ test("installed prompt and delegated Settings handlers update capability state s
   const doclingToggle = new FakeInput("docling.enabled", "", "checkbox");
   doclingToggle.checked = true;
   const doclingUrl = new FakeInput("docling.base_url", "http://127.0.0.1:5001", "url");
+  const opacityInput = new FakeInput("", "80", "range");
   const apply = new FakeButton("apply-session-config");
   const save = new FakeButton("save-global-config");
   const doclingReadiness = new FakeButton("check-docling-readiness");
@@ -845,6 +858,7 @@ test("installed prompt and delegated Settings handlers update capability state s
       if (selector === "#prompt") return prompt;
       if (selector === '[data-action="send"]') return send;
       if (selector === "#settings-validation") return validation;
+      if (selector === "#opacity-input") return opacityInput;
       return null;
     },
     querySelectorAll: (selector: string) => {
@@ -921,21 +935,33 @@ test("installed prompt and delegated Settings handlers update capability state s
     const ui = createUiLocalState();
     reconcileUiDrafts(ui, null, rustProjection, null);
     const view = projectViewState(rustProjection, ui);
+    const opacityMutations: Array<Record<string, unknown> | undefined> = [];
     const context = {
       uiState: ui,
       getProjection: () => rustProjection,
       getViewState: () => projectViewState(rustProjection, ui),
       getRenderModel: () => actionTestModel(projectViewState(rustProjection, ui), ui),
       invalidateCommandPaletteInsertion: () => undefined,
+      mutate: async (name: string, args?: Record<string, unknown>) => {
+        if (name === "set_window_opacity") opacityMutations.push(args);
+        return rustProjection;
+      },
       rerender: () => undefined,
     } as unknown as ActionContext;
 
+    wireEvents(view, context);
     wireEvents(view, context);
     prompt.input("追加指示");
 
     assert.equal(send.disabled, false);
     assert.equal(send.title, "実行中のタスクへ追加指示を送信");
     assert.equal(send.getAttribute("aria-label"), "実行中のタスクへ追加指示を送信");
+    opacityInput.dispatch("change");
+    assert.deepEqual(
+      opacityMutations,
+      [{ percent: 80 }],
+      "a retained Settings range keeps exactly one persistence listener across rerenders",
+    );
 
     const dispatchSettings = (name: "input" | "change", value: string) => {
       settingsInput.value = value;
@@ -2876,8 +2902,33 @@ test("frontend provider URL validation mirrors the Rust ProviderEndpoint boundar
     assert.equal(view.provider_apply_enabled, false, invalid);
     assert.equal(paletteActions(view).some((action) => action.id === "load-provider-models"), false, invalid);
   }
-  assert.equal(validateSideChatProviderSettings("http://localhost/v1", " model ").ok, true);
-  assert.equal(validateSideChatProviderSettings("http://localhost/v1", "   ").ok, false);
+  const systemPromptField = {
+    key: "model.system_prompt",
+    value: "",
+    env_override: null,
+    value_type: "string",
+    required: false,
+    min_value: null,
+    max_value: null,
+    options: [],
+  };
+  for (const key of ["model.system_prompt", "side_chat.system_prompt"]) {
+    const field = { ...systemPromptField, key };
+    assert.equal(
+      validateConfigInput(
+        field,
+        `  ${"😀".repeat(USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS)}  `,
+      ).ok,
+      true,
+    );
+    assert.equal(
+      validateConfigInput(
+        field,
+        "😀".repeat(USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS + 1),
+      ).ok,
+      false,
+    );
+  }
 });
 
 test("Docling base URL validation follows the enabled value in the same complete draft", () => {
@@ -4935,7 +4986,7 @@ test("invalid local Settings values close Apply and Save while valid dirty value
   }
 });
 
-test("every Preferences field has unique connected help, validation, and explicit label ownership", () => {
+test("every Settings field has unique connected help, validation, and explicit label ownership", () => {
   const configFields: ConfigFieldProjection[] = [
     {
       key: "model.base_url",
@@ -4971,6 +5022,16 @@ test("every Preferences field has unique connected help, validation, and explici
       key: "model.api_key_env",
       value: "OPENAI_API_KEY",
       env_override: "MOYAI_API_KEY_ENV",
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.system_prompt",
+      value: "Answer with evidence.",
+      env_override: null,
       value_type: "string",
       required: false,
       min_value: null,
@@ -5128,6 +5189,86 @@ test("every Preferences field has unique connected help, validation, and explici
       options: [],
     },
     {
+      key: "side_chat.base_url",
+      value: "http://127.0.0.1:1234/v1",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "side_chat.model",
+      value: "side-model",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "side_chat.provider_profile",
+      value: "openai_compatible",
+      env_override: null,
+      value_type: "enum",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
+    },
+    {
+      key: "side_chat.system_prompt",
+      value: "Reply briefly.",
+      env_override: null,
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "side_chat.context_window",
+      value: "65536",
+      env_override: null,
+      value_type: "integer",
+      required: true,
+      min_value: 1,
+      max_value: 4294967295,
+      options: [],
+    },
+    {
+      key: "side_chat.request_timeout_ms",
+      value: "120000",
+      env_override: null,
+      value_type: "integer",
+      required: true,
+      min_value: 1,
+      max_value: 3600000,
+      options: [],
+    },
+    {
+      key: "side_chat.connect_timeout_ms",
+      value: "10000",
+      env_override: null,
+      value_type: "integer",
+      required: true,
+      min_value: 0,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "side_chat.max_retries",
+      value: "2",
+      env_override: null,
+      value_type: "integer",
+      required: true,
+      min_value: 0,
+      max_value: 255,
+      options: [],
+    },
+    {
       key: "permissions.access_mode",
       value: "default",
       env_override: "MOYAI_ACCESS_MODE",
@@ -5167,12 +5308,9 @@ test("every Preferences field has unique connected help, validation, and explici
   };
   const local = renderLocal({
     sideChat: {
-      setupBaseUrl: "http://127.0.0.1:1234",
-      setupModel: "side-model",
       catalog: {
         status: "ready",
-        source: "side",
-        ownerSessionId: SESSION_A,
+        source: "global",
         baseUrl: "http://127.0.0.1:1234",
         models: [{ id: "side-model", label: "Side Model" }],
         error: "",
@@ -5195,10 +5333,10 @@ test("every Preferences field has unique connected help, validation, and explici
   );
 
   const controls = Array.from(
-    html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*(?:settings-control|side-chat-settings-control)[^"]*"[^>]*>/g),
+    html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*settings-control[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 17, "twelve visible fields, duplicate Main model controls, and four Side controls");
+  assert.equal(controls.length, 23, "fourteen existing controls plus nine controls for eight Side fields");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];
@@ -5210,17 +5348,17 @@ test("every Preferences field has unique connected help, validation, and explici
     }
   }
 
-  const mainControls = controls.filter((control) => control.includes("data-config-key="));
-  assert.equal(mainControls.length, 13);
-  for (const control of mainControls) assert.match(control, /aria-describedby="[^"]*settings-validation/);
-  const modelHelpReferences = mainControls
+  const configControls = controls.filter((control) => control.includes("data-config-key="));
+  assert.equal(configControls.length, 23);
+  for (const control of configControls) assert.match(control, /aria-describedby="[^"]*settings-validation/);
+  const modelHelpReferences = configControls
     .filter((control) => control.includes('data-config-key="model.model"'))
     .map((control) => /aria-describedby="([^"]+)"/.exec(control)?.[1].split(/\s+/)
       .find((id) => id.startsWith("settings-config-help-")));
   assert.equal(modelHelpReferences.length, 2);
   assert.equal(modelHelpReferences[0], modelHelpReferences[1]);
 
-  const contextControl = mainControls.find((control) => control.includes('data-config-key="model.context_window"'))!;
+  const contextControl = configControls.find((control) => control.includes('data-config-key="model.context_window"'))!;
   const contextHelpId = /aria-describedby="([^"]+)"/.exec(contextControl)![1]
     .split(/\s+/)
     .find((id) => id.startsWith("settings-config-help-"))!;
@@ -5249,21 +5387,40 @@ test("every Preferences field has unique connected help, validation, and explici
   }
   for (const key of [
     "model.context_window",
+    "model.system_prompt",
     "model.request_timeout_ms",
     "model.supports_tools",
     "model.supports_images",
     "model.parallel_tool_calls",
+    "side_chat.base_url",
+    "side_chat.model",
+    "side_chat.provider_profile",
+    "side_chat.system_prompt",
+    "side_chat.context_window",
+    "side_chat.request_timeout_ms",
+    "side_chat.connect_timeout_ms",
+    "side_chat.max_retries",
   ]) {
     assert.match(html, new RegExp(`data-config-key="${escapeRegExp(key)}"`));
   }
+  assert.match(html, /id="config-dialog-title">Settings</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Global Settings</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Session-scoped Settings</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Desktop Preferences</);
+  assert.match(html, /Side Chatを開くと、この時点のモデルとプロンプトを専用snapshotとして保持します。/);
+  assert.doesNotMatch(html, /data-action="configure-side-chat"/);
   assert.match(html, /moyAI内の入力整理とAPI機能を設定します。sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
   assert.match(html, /id="settings-validation"[^>]*role="status"[^>]*aria-live="polite"/);
-  for (const section of ["provider", "model", "side-chat", "permissions", "agents", "tools", "files", "advanced"]) {
+  for (const section of ["provider", "side-chat", "permissions", "agents", "tools", "files", "advanced"]) {
     assert.match(
       html,
       new RegExp(`<section id="settings-${section}"[^>]*aria-labelledby="settings-${section}-title"[^>]*aria-describedby="[^"]+"`),
     );
   }
+  assert.match(
+    html,
+    /<div id="settings-model" class="settings-subsection"[^>]*aria-labelledby="settings-model-title"[^>]*aria-describedby="settings-model-help"/,
+  );
   assert.doesNotMatch(html, /<unsafe>|future<type>|ENV<unsafe>/);
   assert.match(html, /future\.&lt;unsafe&gt;&amp;&quot;/);
   assert.match(html, /future&lt;type&gt;/);

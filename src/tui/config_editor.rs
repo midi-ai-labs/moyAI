@@ -33,20 +33,24 @@ pub struct ConfigFieldState {
 
 impl std::fmt::Debug for ConfigFieldState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let debug_value = if matches!(
+            self.key,
+            ConfigField::SystemPrompt | ConfigField::SideChatSystemPrompt
+        ) {
+            format!("<{} chars>", self.value.chars().count())
+        } else if self.key.is_sensitive() {
+            self.value
+                .is_empty()
+                .then_some("<not configured>")
+                .unwrap_or("<redacted; configured>")
+                .to_string()
+        } else {
+            self.value.clone()
+        };
         formatter
             .debug_struct("ConfigFieldState")
             .field("key", &self.key)
-            .field(
-                "value",
-                &if self.key.is_sensitive() {
-                    self.value
-                        .is_empty()
-                        .then_some("<not configured>")
-                        .unwrap_or("<redacted; configured>")
-                } else {
-                    self.value.as_str()
-                },
-            )
+            .field("value", &debug_value)
             .field("dirty", &self.dirty)
             .finish()
     }
@@ -518,7 +522,11 @@ mod tests {
     #[test]
     fn raw_editor_values_remain_mutable_but_debug_is_credential_safe() {
         let secret = "editor-header-super-secret";
+        let main_prompt = "editor-main-system-prompt-secret";
+        let side_prompt = "editor-side-system-prompt-secret";
         let mut config = ResolvedConfig::default();
+        config.model.system_prompt = main_prompt.to_string();
+        config.side_chat.system_prompt = side_prompt.to_string();
         config
             .model
             .extra_headers
@@ -536,7 +544,11 @@ mod tests {
         let debug = format!("{editor:?}");
 
         assert!(!debug.contains(secret));
+        assert!(!debug.contains(main_prompt));
+        assert!(!debug.contains(side_prompt));
         assert!(debug.contains("<redacted; configured>"));
+        assert!(debug.contains(&format!("<{} chars>", main_prompt.chars().count())));
+        assert!(debug.contains(&format!("<{} chars>", side_prompt.chars().count())));
 
         let redacted = ConfigEditorState::from_config_values(
             &config,

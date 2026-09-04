@@ -332,6 +332,7 @@ async function stopStage5ControlTokenLeak({
   sink,
   dependencies,
   commandProbe,
+  commandStart,
   expectedSubmit,
   evidenceName,
   main,
@@ -400,7 +401,8 @@ async function stopStage5ControlTokenLeak({
   let commandEvidence = null;
   let commandError = null;
   try {
-    commandEvidence = assertExactDesktopCommandSequence(await commandProbe.snapshot(), {
+    commandEvidence = assertExactDesktopCommandSequence(await commandProbe.snapshot(commandStart), {
+      afterSequence: commandStart,
       expected: cancelRequired ? [expectedSubmit, cancelExpected] : [expectedSubmit],
     });
   } catch (error) { commandError = errorObservation(error); }
@@ -567,6 +569,11 @@ function validateArguments(options) {
   }
   const evidenceName = options.evidenceName ?? "case5_2-stage5";
   if (!EVIDENCE_NAME.test(evidenceName)) throw new TypeError("case5_2 Stage5 evidenceName is invalid");
+  if (options.commandProbe !== undefined && options.commandProbe !== null
+    && (typeof options.commandProbe !== "object"
+      || typeof options.commandProbe.snapshot !== "function")) {
+    throw new TypeError("case5_2 Stage5 commandProbe must expose snapshot when provided");
+  }
   return { timeoutMs, evidenceName };
 }
 
@@ -590,12 +597,14 @@ export async function executeCase52SideChatStage(options, injected = {}) {
   const { timeoutMs, evidenceName } = validateArguments(options);
   const {
     cdp, input, sink, sessionId, providerProfile, providerBaseUrl, model, promptInput,
+    commandProbe: suppliedCommandProbe = null,
   } = options;
   const submittedQuestion = promptInput.text.trim();
   const dependencies = { ...defaultDependencies(cdp), ...injected };
   const started = dependencies.now();
   const deadline = started + timeoutMs;
-  let commandProbe = null;
+  let commandProbe = suppliedCommandProbe;
+  let ownsCommandProbe = false;
   let primaryError = null;
   let cleanupError = null;
   let outcome = null;
@@ -654,8 +663,11 @@ export async function executeCase52SideChatStage(options, injected = {}) {
         text: submittedQuestion,
       },
     };
-    commandProbe = dependencies.createCommandProbe();
-    await commandProbe.install();
+    if (commandProbe === null) {
+      commandProbe = dependencies.createCommandProbe();
+      await commandProbe.install();
+      ownsCommandProbe = true;
+    }
     const commandStart = (await commandProbe.snapshot()).sequence;
     const sendStarted = dependencies.now();
     const send = await dependencies.click(input, SIDE_SEND);
@@ -763,6 +775,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
           sink,
           dependencies,
           commandProbe,
+          commandStart,
           expectedSubmit: expectedCommand,
           evidenceName,
           main,
@@ -846,7 +859,8 @@ export async function executeCase52SideChatStage(options, injected = {}) {
         { active_context_observation: activeContextObservation, first_progress_latency_ms: firstProgressLatencyMs },
       );
     }
-    const commandEvidence = assertStage5CommandSequence(await commandProbe.snapshot(), {
+    const commandEvidence = assertStage5CommandSequence(await commandProbe.snapshot(commandStart), {
+      afterSequence: commandStart,
       expected: [expectedCommand],
     }, "terminal");
     const answer = answerFromSide(terminal.projection.side_chat);
@@ -905,7 +919,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
   } catch (error) {
     primaryError = error;
   } finally {
-    if (commandProbe !== null) {
+    if (ownsCommandProbe && commandProbe !== null) {
       try { await commandProbe.remove(); }
       catch (error) { cleanupError = error; }
     }

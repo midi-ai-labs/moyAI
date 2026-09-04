@@ -2,7 +2,7 @@
   "desktop_state",
   "submit_prompt",
   "cancel_run",
-  "configure_side_chat",
+  "ensure_side_chat",
   "load_side_chat_models",
   "save_side_chat_draft",
   "submit_side_chat",

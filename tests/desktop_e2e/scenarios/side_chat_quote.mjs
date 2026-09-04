@@ -56,12 +56,24 @@ const SIDE_MANUAL_DETAILS = Object.freeze({
   identity: { tag: "DETAILS", detailsKey: "side-chat-manual-model" },
 });
 const SIDE_MANUAL_MODEL = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-model-manual[data-side-chat-setting="model"]',
-  identity: { tag: "INPUT", id: "side-chat-model-manual", sideSetting: "model" },
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-model-manual[data-config-key="side_chat.model"]',
+  identity: { tag: "INPUT", id: "side-chat-model-manual", configKey: "side_chat.model" },
 });
-const CONFIGURE_SIDE_CHAT = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="configure-side-chat"]',
-  identity: { tag: "BUTTON", action: "configure-side-chat" },
+const SIDE_BASE_URL = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-base-url[data-config-key="side_chat.base_url"]',
+  identity: { tag: "INPUT", id: "side-chat-base-url", configKey: "side_chat.base_url" },
+});
+const SIDE_PROVIDER_PROFILE_CONTROL = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]',
+  identity: { tag: "SELECT", id: "side-chat-provider-profile", configKey: "side_chat.provider_profile" },
+});
+const SIDE_SYSTEM_PROMPT = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] textarea#side-chat-system-prompt[data-config-key="side_chat.system_prompt"]',
+  identity: { tag: "TEXTAREA", id: "side-chat-system-prompt", configKey: "side_chat.system_prompt" },
+});
+const SAVE_GLOBAL_CONFIG = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]',
+  identity: { tag: "BUTTON", action: "save-global-config" },
 });
 const CLOSE_SETTINGS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]',
@@ -78,6 +90,10 @@ const SIDE_SEND = Object.freeze({
 const SIDE_STOP = Object.freeze({
   selector: 'aside.side-chat-pane[data-pane-mode="side-chat"] button[data-action="cancel-side-chat"]',
   identity: { tag: "BUTTON", action: "cancel-side-chat" },
+});
+const SHOW_SIDE = Object.freeze({
+  selector: 'button[data-action="show-side-chat-pane"]',
+  identity: { tag: "BUTTON", action: "show-side-chat-pane" },
 });
 
 function sameValue(left, right) {
@@ -202,7 +218,8 @@ export async function observeSideChatQuoteSurface(cdp) {
     const base = sideSettings?.querySelector('input#side-chat-base-url') ?? null;
     const manualDetails = sideSettings?.querySelector('details[data-details-key="side-chat-manual-model"]') ?? null;
     const manualModel = sideSettings?.querySelector('input#side-chat-model-manual') ?? null;
-    const configure = sideSettings?.querySelector('button[data-action="configure-side-chat"]') ?? null;
+    const systemPrompt = sideSettings?.querySelector('textarea#side-chat-system-prompt') ?? null;
+    const save = settings?.querySelector('button[data-action="save-global-config"]') ?? null;
     const quoteActions = Array.from(document.querySelectorAll(
       'article.message[data-history-identity] button[data-action="quote-selection-to-side-chat"]'
     )).map((button) => {
@@ -266,17 +283,18 @@ export async function observeSideChatQuoteSurface(cdp) {
       settings: {
         visible: visible(settings),
         side_visible: visible(sideSettings),
-        owner_session_id: sideSettings instanceof HTMLElement
-          ? (sideSettings.dataset.sideChatSettingsOwner ?? null)
-          : null,
         profile_value: profile instanceof HTMLSelectElement ? profile.value : null,
         base_value: base instanceof HTMLInputElement ? base.value : null,
         manual_details_open: manualDetails instanceof HTMLDetailsElement ? manualDetails.open : null,
         manual_value: manualModel instanceof HTMLInputElement ? manualModel.value : null,
         manual_visible: visible(manualModel),
         manual_enabled: enabled(manualModel),
-        configure_visible: visible(configure),
-        configure_enabled: enabled(configure),
+        system_prompt_value: systemPrompt instanceof HTMLTextAreaElement ? systemPrompt.value : null,
+        system_prompt_visible: visible(systemPrompt),
+        system_prompt_enabled: enabled(systemPrompt),
+        dirty: settings?.querySelectorAll('.dirty-badge.visible').length === 1,
+        save_visible: visible(save),
+        save_enabled: enabled(save),
       },
       quote_actions: quoteActions,
       visible_fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
@@ -338,6 +356,73 @@ export async function trustedInsert(input, locator, text) {
     text,
   });
   return { focus, insertion, probe };
+}
+
+async function trustedReplace(input, locator, text) {
+  const focus = await trustedClick(input, locator);
+  const clearStart = (await input.snapshotProbe()).sequence;
+  await input.keyDown("Control");
+  try {
+    await input.pressKey("a");
+  } finally {
+    await input.keyUp("Control");
+  }
+  await input.pressKey("Backspace");
+  const cleared = await input.snapshotProbe(clearStart);
+  const clearProbe = assertTrustedProbeSequence(cleared, {
+    afterSequence: clearStart,
+    expected: [
+      { type: "keydown", identity: locator.identity, key: "Control", code: "ControlLeft" },
+      { type: "keydown", identity: locator.identity, key: "a", code: "KeyA" },
+      { type: "keyup", identity: locator.identity, key: "a", code: "KeyA" },
+      { type: "keyup", identity: locator.identity, key: "Control", code: "ControlLeft" },
+      { type: "keydown", identity: locator.identity, key: "Backspace", code: "Backspace" },
+      { type: "keyup", identity: locator.identity, key: "Backspace", code: "Backspace" },
+    ],
+  });
+  let insertion = null;
+  if (text.length > 0) {
+    const insertStart = cleared.sequence;
+    const inserted = await input.insertText(locator, text);
+    insertion = {
+      inserted,
+      probe: assertTrustedTextInsertion(await input.snapshotProbe(insertStart), {
+        afterSequence: insertStart,
+        identity: locator.identity,
+        text,
+      }),
+    };
+  }
+  return { focus, clear_probe: clearProbe, insertion };
+}
+
+async function trustedSelectSideProviderProfile(input) {
+  const focus = await trustedClick(input, SIDE_PROVIDER_PROFILE_CONTROL);
+  const start = (await input.snapshotProbe()).sequence;
+  await input.pressKey("Home");
+  await input.pressKey("ArrowDown");
+  await input.pressKey("ArrowDown");
+  await input.pressKey("Enter");
+  return {
+    focus,
+    probe: assertTrustedProbeSequence(await input.snapshotProbe(start), {
+      afterSequence: start,
+      expected: [{ type: "change", identity: SIDE_PROVIDER_PROFILE_CONTROL.identity }],
+    }),
+  };
+}
+
+function globalConfigValues(projection, overrides) {
+  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
+  return fields.map((field) => ({
+    key: field.key,
+    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
+  }));
+}
+
+function configFieldValue(projection, key) {
+  const matches = (projection?.config_fields ?? []).filter((field) => field?.key === key);
+  return matches.length === 1 ? matches[0].value : null;
 }
 
 function quoteActionLocator(historyItemId) {
@@ -489,7 +574,13 @@ function exactQuoteSurface(surface, {
     && surface.side.pending_text === selectedText;
 }
 
-export async function configureSideChat({ cdp, input, providerBaseUrl, ownerSessionId }) {
+export async function saveGlobalSideChatAndOpen({
+  cdp,
+  input,
+  providerBaseUrl,
+  ownerSessionId,
+  systemPrompt = "",
+}) {
   const open = await trustedClick(input, SHOW_SETTINGS);
   await waitForProductStage({
     label: "Side Chat quote Settings overlay",
@@ -499,20 +590,22 @@ export async function configureSideChat({ cdp, input, providerBaseUrl, ownerSess
       && surface?.settings?.visible === true
       && surfaceHasNoErrors(surface),
     code: "side-chat-quote-settings-open",
-    message: "trusted Settings activation did not open the exact Preferences owner",
+    message: "trusted Settings activation did not open the global Settings owner",
   });
   const navigate = await trustedClick(input, SIDE_SETTINGS_NAV);
   const ready = await waitForProductStage({
-    label: "Side Chat quote settings section",
+    label: "global Side Chat settings section",
     timeoutMs: 10_000,
     sample: () => observeSideChatQuoteSurface(cdp),
     accept: (surface) => surface?.settings?.side_visible === true
-      && surface.settings.owner_session_id === ownerSessionId
-      && surface.settings.profile_value === SIDE_PROVIDER_PROFILE
-      && surface.settings.base_value === providerBaseUrl
+      && typeof surface.settings.profile_value === "string"
+      && typeof surface.settings.base_value === "string"
+      && surface.settings.system_prompt_value === ""
+      && surface.settings.system_prompt_visible === true
+      && surface.settings.system_prompt_enabled === true
       && surfaceHasNoErrors(surface),
-    code: "side-chat-quote-settings-owner",
-    message: "Side Chat Settings did not bind the fresh main-session owner and Responses endpoint",
+    code: "side-chat-quote-global-settings",
+    message: "Settings did not expose the independent global Side Chat fields",
   });
   let details = null;
   if (ready.value.settings.manual_details_open !== true) {
@@ -525,45 +618,69 @@ export async function configureSideChat({ cdp, input, providerBaseUrl, ownerSess
     accept: (surface) => surface?.settings?.manual_details_open === true
       && surface.settings.manual_visible === true
       && surface.settings.manual_enabled === true
-      && surface.settings.manual_value === "",
+      && typeof surface.settings.manual_value === "string",
     code: "side-chat-quote-manual-model",
-    message: "the Side Chat manual model input was not fresh and editable",
+    message: "the global Side Chat manual model input was not editable",
   });
-  const model = await trustedInsert(input, SIDE_MANUAL_MODEL, SCRIPTED_PROVIDER_MODEL_ID);
+  const profile = ready.value.settings.profile_value === SIDE_PROVIDER_PROFILE
+    ? null
+    : await trustedSelectSideProviderProfile(input);
+  const baseUrl = await trustedReplace(input, SIDE_BASE_URL, providerBaseUrl);
+  const model = await trustedReplace(input, SIDE_MANUAL_MODEL, SCRIPTED_PROVIDER_MODEL_ID);
+  const systemPromptTyping = await trustedReplace(input, SIDE_SYSTEM_PROMPT, systemPrompt);
   const committable = await waitForProductStage({
-    label: "Side Chat quote configuration admission",
+    label: "global Side Chat settings save admission",
     timeoutMs: 10_000,
     sample: () => observeSideChatQuoteSurface(cdp),
-    accept: (surface) => surface?.settings?.manual_value === SCRIPTED_PROVIDER_MODEL_ID
-      && surface.settings.configure_visible === true
-      && surface.settings.configure_enabled === true
+    accept: (surface) => surface?.settings?.profile_value === SIDE_PROVIDER_PROFILE
+      && surface.settings.base_value === providerBaseUrl
+      && surface.settings.manual_value === SCRIPTED_PROVIDER_MODEL_ID
+      && surface.settings.system_prompt_value === systemPrompt
+      && surface.settings.dirty === true
+      && surface.settings.save_visible === true
+      && surface.settings.save_enabled === true
       && surfaceHasNoErrors(surface),
-    code: "side-chat-quote-config-admission",
-    message: "the exact tool-less Side Chat configuration did not become committable",
+    code: "side-chat-quote-global-save-admission",
+    message: "the exact global tool-less Side Chat defaults did not become saveable",
   });
-  const configure = await trustedClick(input, CONFIGURE_SIDE_CHAT);
-  const configured = await waitForProductStage({
-    label: "Side Chat quote configured owner",
+  const expectedSave = {
+    command: "save_global_config",
+    args: {
+      values: globalConfigValues(ready.value.projection, {
+        "side_chat.base_url": providerBaseUrl,
+        "side_chat.model": SCRIPTED_PROVIDER_MODEL_ID,
+        "side_chat.system_prompt": systemPrompt.trim(),
+        "side_chat.provider_profile": SIDE_PROVIDER_PROFILE,
+      }),
+      expectedTarget: structuredClone(ready.value.projection.config_target),
+    },
+  };
+  const save = await trustedClick(input, SAVE_GLOBAL_CONFIG);
+  const saved = await waitForProductStage({
+    label: "global Side Chat defaults saved",
     timeoutMs: 30_000,
     sample: () => observeSideChatQuoteSurface(cdp),
     accept: (surface) => {
       const side = surface?.projection?.side_chat;
-      return side?.configured === true
+      return side?.configured === false
         && side.owner_session_id === ownerSessionId
         && side.base_url === providerBaseUrl
         && side.model === SCRIPTED_PROVIDER_MODEL_ID
+        && side.system_prompt === systemPrompt.trim()
         && side.provider_profile === SIDE_PROVIDER_PROFILE
         && side.status === "idle"
-        && side.context_scope === "owner_session"
-        && typeof side.context_as_of_append_position === "string"
-        && /^\d+$/.test(side.context_as_of_append_position)
-        && side.context_truncated === false
-        && side.can_send === true
+        && side.chat_id === null
+        && side.can_send === false
         && side.can_cancel === false
+        && configFieldValue(surface.projection, "side_chat.base_url") === providerBaseUrl
+        && configFieldValue(surface.projection, "side_chat.model") === SCRIPTED_PROVIDER_MODEL_ID
+        && configFieldValue(surface.projection, "side_chat.system_prompt") === systemPrompt.trim()
+        && configFieldValue(surface.projection, "side_chat.provider_profile") === SIDE_PROVIDER_PROFILE
+        && surface.settings.dirty === false
         && surfaceHasNoErrors(surface);
     },
-    code: "side-chat-quote-config-settlement",
-    message: "Side Chat configuration did not settle with the canonical owner-context fence",
+    code: "side-chat-quote-global-save-settlement",
+    message: "global Side Chat defaults did not persist independently of a conversation binding",
   });
   const close = await trustedClick(input, CLOSE_SETTINGS);
   const closed = await waitForProductStage({
@@ -574,17 +691,127 @@ export async function configureSideChat({ cdp, input, providerBaseUrl, ownerSess
       && surface?.settings?.visible === false
       && surfaceHasNoErrors(surface),
     code: "side-chat-quote-settings-close",
-    message: "configured Side Chat Settings did not close cleanly",
+    message: "saved global Side Chat Settings did not close cleanly",
+  });
+  const ensureExpected = {
+    command: "ensure_side_chat",
+    args: {
+      ownerSessionId,
+      expectedConfigGeneration: closed.value.projection.config_target.configGeneration,
+    },
+  };
+  const openSide = await trustedClick(input, SHOW_SIDE);
+  const configured = await waitForProductStage({
+    label: "Side Chat binding materialized from global defaults",
+    timeoutMs: 30_000,
+    sample: () => observeSideChatQuoteSurface(cdp),
+    accept: (surface) => {
+      const side = surface?.projection?.side_chat;
+      return side?.configured === true
+        && side.owner_session_id === ownerSessionId
+        && side.base_url === providerBaseUrl
+        && side.model === SCRIPTED_PROVIDER_MODEL_ID
+        && side.system_prompt === systemPrompt.trim()
+        && side.provider_profile === SIDE_PROVIDER_PROFILE
+        && side.status === "idle"
+        && side.context_scope === "owner_session"
+        && typeof side.context_as_of_append_position === "string"
+        && /^\d+$/.test(side.context_as_of_append_position)
+        && side.context_truncated === false
+        && side.can_send === true
+        && side.can_cancel === false
+        && surface.side.pane_count === 1
+        && surface.side.pane_visible === true
+        && surface.side.setup_visible === false
+        && surface.side.prompt_value === ""
+        && surfaceHasNoErrors(surface);
+    },
+    code: "side-chat-quote-ensure-settlement",
+    message: "opening Side Chat did not snapshot the saved global defaults for the selected session",
   });
   return {
     open,
     navigate,
     details,
     manual: manual.value,
+    profile,
+    base_url: baseUrl,
     model,
+    system_prompt_typing: systemPromptTyping,
     committable: committable.value,
-    configure,
+    save,
+    saved: saved.value.settings,
+    expected_save_command: expectedSave,
+    expected_ensure_command: ensureExpected,
+    expected_commands: [expectedSave, ensureExpected],
+    open_side: openSide,
     configured: configured.value.projection.side_chat,
+    close,
+    closed_projection_revision: closed.value.projection.projection_revision,
+  };
+}
+
+export async function inspectGlobalSideChatSettings({
+  cdp,
+  input,
+  sink,
+  providerBaseUrl,
+  model,
+  systemPrompt,
+  evidenceName,
+  evidenceOwner = OWNER,
+}) {
+  const open = await trustedClick(input, SHOW_SETTINGS);
+  await waitForProductStage({
+    label: "persisted Side Chat Settings overlay",
+    timeoutMs: 10_000,
+    sample: () => observeSideChatQuoteSurface(cdp),
+    accept: (surface) => surface?.projection?.overlay === "config"
+      && surface?.settings?.visible === true
+      && surfaceHasNoErrors(surface),
+    code: "side-chat-settings-reopen",
+    message: "trusted Settings activation did not reopen the persisted global Side Chat defaults",
+  });
+  const navigate = await trustedClick(input, SIDE_SETTINGS_NAV);
+  const restored = await waitForProductStage({
+    label: "persisted Side Chat Settings values",
+    timeoutMs: 10_000,
+    sample: () => observeSideChatQuoteSurface(cdp),
+    accept: (surface) => surface?.settings?.side_visible === true
+      && surface.settings.profile_value === SIDE_PROVIDER_PROFILE
+      && surface.settings.base_value === providerBaseUrl
+      && surface.settings.manual_value === model
+      && surface.settings.system_prompt_value === systemPrompt
+      && surface.settings.system_prompt_visible === true
+      && surface.settings.system_prompt_enabled === true
+      && surfaceHasNoErrors(surface),
+    code: "side-chat-settings-values-not-restored",
+    message: "Side Chat Settings did not restore the exact persisted global values",
+  });
+  const prompt = await trustedClick(input, SIDE_SYSTEM_PROMPT);
+  const screenshot = await captureScenarioScreenshot({
+    cdp,
+    sink,
+    name: evidenceName,
+    owner: evidenceOwner,
+  });
+  const close = await trustedClick(input, CLOSE_SETTINGS);
+  const closed = await waitForProductStage({
+    label: "persisted Side Chat Settings close",
+    timeoutMs: 10_000,
+    sample: () => observeSideChatQuoteSurface(cdp),
+    accept: (surface) => surface?.projection?.overlay === "none"
+      && surface?.settings?.visible === false
+      && surfaceHasNoErrors(surface),
+    code: "side-chat-settings-reopen-close",
+    message: "persisted Side Chat Settings did not close cleanly",
+  });
+  return {
+    open,
+    navigate,
+    restored: restored.value.settings,
+    prompt,
+    screenshot,
     close,
     closed_projection_revision: closed.value.projection.projection_revision,
   };
@@ -657,7 +884,14 @@ export function createSideChatQuoteScenario() {
       const input = new WebviewInput(cdp, { probeId: "side-chat-quote" });
       const commands = new DesktopCommandProbe(cdp, {
         probeId: "side-chat-quote-commands",
-        commands: ["submit_side_chat", "cancel_side_chat", "submit_prompt", "cancel_run"],
+        commands: [
+          "save_global_config",
+          "ensure_side_chat",
+          "submit_side_chat",
+          "cancel_side_chat",
+          "submit_prompt",
+          "cancel_run",
+        ],
       });
       let primaryError = null;
       try {
@@ -694,19 +928,24 @@ export function createSideChatQuoteScenario() {
           );
         }
 
-        const configuration = await configureSideChat({
+        await commands.install();
+        const configuration = await saveGlobalSideChatAndOpen({
           cdp,
           input,
           providerBaseUrl: provider.baseUrl,
           ownerSessionId: owner.session_id,
         });
+        const configurationCommands = assertExactDesktopCommandSequence(
+          await commands.snapshot(),
+          { expected: configuration.expected_commands },
+        );
         if (!exactResponseRoles(provider.requestLedger, [
           "side_quote_main_initial",
           "side_quote_main_continuation",
         ])) {
           throw productFailure(
             "side-chat-quote-config-network",
-            "manual-model Side Chat configuration issued an unexpected provider generation request",
+            "saving global Side Chat defaults and materializing the binding issued an unexpected provider generation request",
             { ledger: provider.requestLedger },
           );
         }
@@ -735,8 +974,6 @@ export function createSideChatQuoteScenario() {
           code: "side-chat-quote-source-actions",
           message: "settled canonical source rows did not expose owner-bound Side Chat quote actions",
         });
-        await commands.install();
-
         const transcriptSelection = await selectExactRowText(
           cdp,
           sources.assistant_identity,
@@ -761,7 +998,7 @@ export function createSideChatQuoteScenario() {
           sample: async () => ({
             surface: await observeSideChatQuoteSurface(cdp),
             ledger: provider.requestLedger,
-            commands: await commands.snapshot(),
+            commands: await commands.snapshot(configurationCommands.last_sequence),
           }),
           accept: (sample) => exactQuoteSurface(sample?.surface, {
             ownerSessionId: owner.session_id,
@@ -777,6 +1014,7 @@ export function createSideChatQuoteScenario() {
           message: "trusted pointer quote did not update only the Side draft without auto-send",
         });
         const noPointerAutoSend = assertExactDesktopCommandSequence(pointerQuote.value.commands, {
+          afterSequence: configurationCommands.last_sequence,
           expected: [],
         });
         const pointerScreenshot = await captureScenarioScreenshot({
@@ -1017,7 +1255,12 @@ export function createSideChatQuoteScenario() {
         const finalCommands = assertExactDesktopCommandSequence(
           await commands.snapshot(),
           {
-            expected: [firstExpected, secondExpected, cancelExpected],
+            expected: [
+              ...configuration.expected_commands,
+              firstExpected,
+              secondExpected,
+              cancelExpected,
+            ],
           },
         );
         const finalScreenshot = await captureScenarioScreenshot({
@@ -1043,6 +1286,7 @@ export function createSideChatQuoteScenario() {
             },
           },
           configuration,
+          configuration_command_evidence: configurationCommands,
           pointer_quote: {
             configured_surface: configured.value,
             selection: transcriptSelection,

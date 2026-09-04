@@ -332,6 +332,7 @@ test("executeCase52SideChatStage sends one exact Side command and records active
   const records = [];
   const writes = [];
   const clicks = [];
+  let installed = false;
   let removed = false;
   const sink = {
     async record(name, value) { records.push({ name, value }); },
@@ -368,24 +369,30 @@ test("executeCase52SideChatStage sends one exact Side command and records active
     });
   };
   const probe = {
-    async install() { return { installed: true }; },
+    async install() { installed = true; return { installed: true }; },
     async snapshot(afterSequence = 0) {
-      const calls = ["running", "completed"].includes(phase) ? [{
-        sequence: 1,
-        command: "submit_side_chat",
-        args: {
-          ownerSessionId: SESSION,
-          chatId: CHAT,
-          expectedGeneration: "0",
-          expectedDraftRevision: "1",
-          expectedOwnerAppendPosition: "194",
-          quote: null,
-          text: QUESTION,
-        },
-      }] : [];
+      const calls = [
+        { sequence: 1, command: "save_global_config", args: { fixture: true } },
+        { sequence: 2, command: "ensure_side_chat", args: { fixture: true } },
+      ];
+      if (["running", "completed"].includes(phase)) {
+        calls.push({
+          sequence: 3,
+          command: "submit_side_chat",
+          args: {
+            ownerSessionId: SESSION,
+            chatId: CHAT,
+            expectedGeneration: "0",
+            expectedDraftRevision: "1",
+            expectedOwnerAppendPosition: "194",
+            quote: null,
+            text: QUESTION,
+          },
+        });
+      }
       return {
         found: true,
-        sequence: calls.length,
+        sequence: calls.at(-1).sequence,
         dropped_through: 0,
         calls: calls.filter((call) => call.sequence > afterSequence),
       };
@@ -396,6 +403,7 @@ test("executeCase52SideChatStage sends one exact Side command and records active
     cdp: {}, input: {}, sink, sessionId: SESSION,
     providerProfile: PROFILE, providerBaseUrl: BASE_URL, model: MODEL,
     promptInput: { text: QUESTION_INPUT }, timeoutMs: 10_000, evidenceName: "stage5-self-test",
+    commandProbe: probe,
   }, {
     now: () => now,
     sleep: async (milliseconds) => { now += milliseconds; },
@@ -416,7 +424,6 @@ test("executeCase52SideChatStage sends one exact Side command and records active
       phase = "draft";
       return { trusted: true };
     },
-    createCommandProbe: () => probe,
     screenshot: async ({ name }) => ({ relative_path: `${name}.png`, sha256: "e".repeat(64) }),
   });
   assert.equal(result.stage, "stage5");
@@ -427,7 +434,8 @@ test("executeCase52SideChatStage sends one exact Side command and records active
   assert.equal(result.first_progress_latency_ms, 500);
   assert.deepEqual(clicks, ["show-side-chat-pane", "send-side-chat"]);
   assert.equal(result.commandEvidence.calls.length, 1);
-  assert.equal(removed, true);
+  assert.equal(installed, false);
+  assert.equal(removed, false);
   assert.equal(writes.length, 1);
   assert.equal(writes[0].value.main.primary_rows[0].body.bytes > 0, true);
   assert.equal(writes[0].value.answer.text, ANSWER);

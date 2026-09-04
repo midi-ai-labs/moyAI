@@ -122,6 +122,8 @@ const V59_SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW: &str =
     include_str!("../../migrations/V59__session_settings_revision_and_context_window.sql");
 const V60_PROVIDER_CONNECTION_PROFILES: &str =
     include_str!("../../migrations/V60__provider_connection_profiles.sql");
+const V61_SIDE_CHAT_SYSTEM_PROMPT: &str =
+    include_str!("../../migrations/V61__side_chat_system_prompt.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -151,6 +153,7 @@ const SESSION_ADMISSION_REVISIONS_VERSION: i64 = 57;
 const EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION: i64 = 58;
 const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION: i64 = 59;
 const PROVIDER_CONNECTION_PROFILES_VERSION: i64 = 60;
+const SIDE_CHAT_SYSTEM_PROMPT_VERSION: i64 = 61;
 const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
 const RECURSIVE_SESSION_SPAWN_EDGES_NAME: &str = "recursive_session_spawn_edges";
 const AGENT_OWNER_RESUME_REQUESTS_NAME: &str = "agent_owner_resume_requests";
@@ -167,6 +170,7 @@ const EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME: &str = "exact_execution_interrupt
 const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME: &str =
     "session_settings_revision_and_context_window";
 const PROVIDER_CONNECTION_PROFILES_NAME: &str = "provider_connection_profiles";
+const SIDE_CHAT_SYSTEM_PROMPT_NAME: &str = "side_chat_system_prompt";
 const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
@@ -188,6 +192,27 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, SIDE_CHAT_SYSTEM_PROMPT_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_side_chat_system_prompt_schema(connection)?;
+        validate_side_chat_system_prompt_data(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        validate_exact_execution_interrupt_requests_schema(connection)?;
+        validate_exact_execution_interrupt_requests_data(connection)?;
+        validate_session_settings_revision_and_context_window_schema(connection)?;
+        validate_session_settings_revision_and_context_window_data(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, PROVIDER_CONNECTION_PROFILES_VERSION)? {
         validate_canonical_protocol_schema(connection)?;
         validate_durable_agent_mailbox_data(connection)?;
@@ -207,7 +232,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         validate_exact_execution_interrupt_requests_data(connection)?;
         validate_session_settings_revision_and_context_window_schema(connection)?;
         validate_session_settings_revision_and_context_window_data(connection)?;
-        return Ok(());
+        return run_side_chat_system_prompt(connection);
     }
     if schema_migration_applied(
         connection,
@@ -572,14 +597,14 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
     // Recent migrations deliberately validate and commit one authority boundary at a time.
     // A product startup is nevertheless one user-visible migration attempt, so keep advancing
     // until the current endpoint is present instead of requiring one app restart per version.
-    for _ in 0..=PROVIDER_CONNECTION_PROFILES_VERSION {
+    for _ in 0..=SIDE_CHAT_SYSTEM_PROMPT_VERSION {
         run(connection)?;
-        if schema_migration_applied(connection, PROVIDER_CONNECTION_PROFILES_VERSION)? {
+        if schema_migration_applied(connection, SIDE_CHAT_SYSTEM_PROMPT_VERSION)? {
             return Ok(());
         }
     }
     Err(StorageError::Message(format!(
-        "storage migration did not reach current endpoint V{PROVIDER_CONNECTION_PROFILES_VERSION}"
+        "storage migration did not reach current endpoint V{SIDE_CHAT_SYSTEM_PROMPT_VERSION}"
     )))
 }
 
@@ -1770,6 +1795,49 @@ fn run_provider_connection_profiles(connection: &Connection) -> Result<(), Stora
     }
 }
 
+fn run_side_chat_system_prompt(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_canonical_protocol_schema(connection)?;
+        validate_provider_connection_profiles_schema(connection)?;
+        validate_provider_connection_profiles_data(connection)?;
+        if !schema_migration_applied(connection, SIDE_CHAT_SYSTEM_PROMPT_VERSION)? {
+            connection.execute_batch(V61_SIDE_CHAT_SYSTEM_PROMPT)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            SIDE_CHAT_SYSTEM_PROMPT_VERSION,
+            SIDE_CHAT_SYSTEM_PROMPT_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V61 side-chat system-prompt migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_side_chat_system_prompt_schema(connection)?;
+        validate_side_chat_system_prompt_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V61 side-chat system-prompt migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn run_session_settings_revision_and_context_window(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2295,6 +2363,25 @@ fn validate_provider_connection_profiles_schema(
             "V60 provider connection profile marker has a name other than `{PROVIDER_CONNECTION_PROFILES_NAME}`"
         )));
     }
+    validate_provider_connection_profiles_session_schema(connection)?;
+
+    let expected_connection = canonical_provider_connection_profiles_connection()?;
+    let expected_side_chats =
+        normalized_schema_objects_for_table(&expected_connection, "side_chat_bindings")?;
+    let observed_side_chats =
+        normalized_schema_objects_for_table(connection, "side_chat_bindings")?;
+    if observed_side_chats != expected_side_chats {
+        return Err(StorageError::Message(
+            "V60 marker exists but side_chat_bindings does not own the canonical provider-profile schema"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_connection_profiles_session_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
     let column = connection
         .query_row(
             "SELECT type, \"notnull\", dflt_value, pk
@@ -2347,14 +2434,64 @@ fn validate_provider_connection_profiles_schema(
                 .to_string(),
         ));
     }
+    Ok(())
+}
 
+fn validate_side_chat_system_prompt_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_has_exact_name(
+        connection,
+        DURABLE_SIDE_CHATS_VERSION,
+        DURABLE_SIDE_CHATS_NAME,
+    )? || !schema_migration_has_exact_name(
+        connection,
+        PROVIDER_CONNECTION_PROFILES_VERSION,
+        PROVIDER_CONNECTION_PROFILES_NAME,
+    )? {
+        return Err(StorageError::Message(
+            "V61 storage has a stale side-chat or provider-profile predecessor marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        SIDE_CHAT_SYSTEM_PROMPT_VERSION,
+        SIDE_CHAT_SYSTEM_PROMPT_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V61 side-chat system-prompt marker has a name other than `{SIDE_CHAT_SYSTEM_PROMPT_NAME}`"
+        )));
+    }
+    validate_provider_connection_profiles_session_schema(connection)?;
+
+    let column = connection
+        .query_row(
+            "SELECT type, \"notnull\", dflt_value, pk
+             FROM pragma_table_info('side_chat_bindings')
+             WHERE name = 'system_prompt'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if column != Some(("TEXT".to_string(), 1, Some("''".to_string()), 0)) {
+        return Err(StorageError::Message(
+            "V61 marker exists but side_chat_bindings.system_prompt has stale schema".to_string(),
+        ));
+    }
+
+    let expected_connection = canonical_side_chat_system_prompt_connection()?;
     let expected_side_chats =
         normalized_schema_objects_for_table(&expected_connection, "side_chat_bindings")?;
     let observed_side_chats =
         normalized_schema_objects_for_table(connection, "side_chat_bindings")?;
     if observed_side_chats != expected_side_chats {
         return Err(StorageError::Message(
-            "V60 marker exists but side_chat_bindings does not own the canonical provider-profile schema"
+            "V61 marker exists but side_chat_bindings does not own the canonical system-prompt schema"
                 .to_string(),
         ));
     }
@@ -2399,6 +2536,12 @@ fn canonical_provider_connection_profiles_connection() -> Result<Connection, Sto
     )?;
     connection.execute_batch(V55_DURABLE_SIDE_CHATS)?;
     connection.execute_batch(V60_PROVIDER_CONNECTION_PROFILES)?;
+    Ok(connection)
+}
+
+fn canonical_side_chat_system_prompt_connection() -> Result<Connection, StorageError> {
+    let connection = canonical_provider_connection_profiles_connection()?;
+    connection.execute_batch(V61_SIDE_CHAT_SYSTEM_PROMPT)?;
     Ok(connection)
 }
 
@@ -2562,6 +2705,49 @@ fn validate_provider_connection_profiles_data(connection: &Connection) -> Result
         {
             return Err(StorageError::Message(format!(
                 "V60 side chat binding `{id}` has invalid provider profile `{profile}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_side_chat_system_prompt_data(connection: &Connection) -> Result<(), StorageError> {
+    validate_provider_connection_profiles_data(connection)?;
+
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM side_chat_bindings
+         WHERE typeof(system_prompt) <> 'text'
+            OR length(system_prompt) > 16384",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V61 marker exists but {invalid_rows} side chat system prompt row(s) violate the text or character-limit contract"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT id, system_prompt
+         FROM side_chat_bindings
+         ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, system_prompt) = row?;
+        if system_prompt.chars().count()
+            > crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS
+        {
+            return Err(StorageError::Message(format!(
+                "V61 side chat binding `{id}` has an oversized system prompt"
+            )));
+        }
+        if system_prompt.trim() != system_prompt {
+            return Err(StorageError::Message(format!(
+                "V61 side chat binding `{id}` has a non-canonical system prompt boundary"
             )));
         }
     }
@@ -16290,7 +16476,7 @@ mod tests {
     }
 
     #[test]
-    fn current_runner_upgrades_exact_v53_through_v55_in_one_startup() {
+    fn current_runner_upgrades_exact_v53_through_current_in_one_startup() {
         let connection = Connection::open_in_memory().expect("database");
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -16328,8 +16514,24 @@ mod tests {
             )
             .expect("V55 marker")
         );
-        validate_provider_connection_profiles_schema(&connection).expect("exact current schema");
-        validate_provider_connection_profiles_data(&connection).expect("valid current data");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                PROVIDER_CONNECTION_PROFILES_VERSION,
+                PROVIDER_CONNECTION_PROFILES_NAME,
+            )
+            .expect("V60 marker")
+        );
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                SIDE_CHAT_SYSTEM_PROMPT_VERSION,
+                SIDE_CHAT_SYSTEM_PROMPT_NAME,
+            )
+            .expect("V61 marker")
+        );
+        validate_side_chat_system_prompt_schema(&connection).expect("exact current schema");
+        validate_side_chat_system_prompt_data(&connection).expect("valid current data");
         assert!(foreign_key_violations(&connection).is_empty());
     }
 
@@ -17413,8 +17615,10 @@ mod tests {
             fixtures.push((owner_id, conversation_id, binding_id, expected_profile));
         }
 
-        run(&connection).expect("V59 to V60 migration");
-        run(&connection).expect("idempotent V60 reopen");
+        run_provider_connection_profiles(&connection).expect("V59 to V60 migration");
+        validate_provider_connection_profiles_schema(&connection)
+            .expect("idempotent V60 schema audit");
+        validate_provider_connection_profiles_data(&connection).expect("idempotent V60 data audit");
 
         assert!(
             schema_migration_has_exact_name(
@@ -17553,9 +17757,7 @@ mod tests {
 
         let error = run(&connection).expect_err("stale V60 schema must fail closed");
         assert!(
-            error
-                .to_string()
-                .contains("canonical provider-profile schema"),
+            error.to_string().contains("canonical system-prompt schema"),
             "unexpected V60 schema audit error: {error}"
         );
 
@@ -17638,6 +17840,198 @@ mod tests {
                 )
                 .expect("new side-chat column absent"),
             0
+        );
+    }
+
+    #[test]
+    fn v61_fresh_schema_records_exact_marker_and_owns_prompt_constraints() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_to_current(&connection).expect("fresh V61 schema");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                SIDE_CHAT_SYSTEM_PROMPT_VERSION,
+                SIDE_CHAT_SYSTEM_PROMPT_NAME,
+            )
+            .expect("V61 marker")
+        );
+        validate_side_chat_system_prompt_schema(&connection).expect("canonical V61 schema");
+        validate_side_chat_system_prompt_data(&connection).expect("canonical V61 data");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT type, \"notnull\", dflt_value
+                     FROM pragma_table_info('side_chat_bindings')
+                     WHERE name = 'system_prompt'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .expect("system prompt column"),
+            ("TEXT".to_string(), 1, "''".to_string())
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v61_migrates_v60_rows_to_empty_prompt_and_reopens_idempotently() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v59_endpoint(&connection);
+        let (_, _, binding_id) =
+            insert_v59_side_chat(&connection, "openai_compatible_only", "chat_completions");
+        run_provider_connection_profiles(&connection).expect("V60 endpoint");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('side_chat_bindings')
+                     WHERE name = 'system_prompt'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("V60 column absence"),
+            0
+        );
+
+        run(&connection).expect("V60 to V61 migration");
+        run(&connection).expect("idempotent V61 reopen");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT system_prompt FROM side_chat_bindings WHERE id = ?1",
+                    [&binding_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("migrated prompt"),
+            ""
+        );
+        validate_side_chat_system_prompt_schema(&connection).expect("canonical V61 schema");
+        validate_side_chat_system_prompt_data(&connection).expect("canonical V61 data");
+    }
+
+    #[test]
+    fn v61_write_boundary_enforces_unicode_character_limit_and_canonical_whitespace() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v59_endpoint(&connection);
+        let (_, _, binding_id) =
+            insert_v59_side_chat(&connection, "openai_compatible_only", "chat_completions");
+        run_provider_connection_profiles(&connection).expect("V60 endpoint");
+        run_side_chat_system_prompt(&connection).expect("V61 endpoint");
+
+        let accepted = "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS);
+        connection
+            .execute(
+                "UPDATE side_chat_bindings
+                 SET system_prompt = ?2, updated_at_ms = updated_at_ms + 1
+                 WHERE id = ?1",
+                params![binding_id, accepted],
+            )
+            .expect("Unicode boundary prompt");
+        let rejected =
+            "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1);
+        connection
+            .execute(
+                "UPDATE side_chat_bindings
+                 SET system_prompt = ?2, updated_at_ms = updated_at_ms + 1
+                 WHERE id = ?1",
+                params![binding_id, rejected],
+            )
+            .expect_err("oversized Unicode prompt must fail at the write boundary");
+        for rejected in [
+            "\tnoncanonical",
+            "noncanonical\n",
+            "\u{85}noncanonical",
+            "\u{a0}noncanonical",
+            "\u{1680}noncanonical",
+            "\u{2003}noncanonical",
+            "\u{2028}noncanonical",
+            "\u{202f}noncanonical",
+            "\u{205f}noncanonical",
+            "\u{3000}noncanonical",
+        ] {
+            connection
+                .execute(
+                    "UPDATE side_chat_bindings
+                     SET system_prompt = ?2, updated_at_ms = updated_at_ms + 1
+                     WHERE id = ?1",
+                    params![binding_id, rejected],
+                )
+                .expect_err("non-canonical Unicode whitespace must fail at the write boundary");
+        }
+        run(&connection).expect("valid boundary prompt must reopen");
+    }
+
+    #[test]
+    fn v61_reopen_rejects_prompt_data_corruption() {
+        let corruptions = [
+            (
+                "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1),
+                "character-limit contract",
+            ),
+            (
+                "\u{2003}noncanonical boundary".to_string(),
+                "non-canonical system prompt boundary",
+            ),
+        ];
+        for (corruption, expected_error) in corruptions {
+            let connection = Connection::open_in_memory().expect("database");
+            connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .expect("foreign keys");
+            run_through_exact_v59_endpoint(&connection);
+            let (_, _, binding_id) =
+                insert_v59_side_chat(&connection, "openai_compatible_only", "chat_completions");
+            run_provider_connection_profiles(&connection).expect("V60 endpoint");
+            run_side_chat_system_prompt(&connection).expect("V61 endpoint");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("enable corruption fixture");
+            connection
+                .execute(
+                    "UPDATE side_chat_bindings
+                     SET system_prompt = ?2, updated_at_ms = updated_at_ms + 1
+                     WHERE id = ?1",
+                    params![binding_id, corruption],
+                )
+                .expect("inject prompt corruption");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .expect("restore constraints");
+
+            let error = run(&connection).expect_err("prompt corruption must fail closed");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected V61 data audit error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v61_reopen_rejects_transition_trigger_tampering() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_to_current(&connection).expect("fresh V61 schema");
+        connection
+            .execute_batch("DROP TRIGGER validate_side_chat_binding_before_update")
+            .expect("tamper V61 transition trigger");
+
+        let error = run(&connection).expect_err("stale V61 schema must fail closed");
+        assert!(
+            error.to_string().contains("canonical system-prompt schema"),
+            "unexpected V61 schema audit error: {error}"
         );
     }
 }

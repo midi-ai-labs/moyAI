@@ -80,29 +80,10 @@ export function providerOverlayFeedback(
   };
 }
 
-export interface SideChatProviderSettingsValidation {
-  ok: boolean;
-  baseUrl: ProviderBaseUrlValidation;
-  modelOk: boolean;
-  message: string;
-}
+export const USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS = 16_384;
 
-export function validateSideChatProviderSettings(
-  baseUrl: string,
-  model: string,
-): SideChatProviderSettingsValidation {
-  const baseUrlValidation = validateProviderBaseUrl(baseUrl);
-  const modelOk = model.trim().length > 0;
-  return {
-    ok: baseUrlValidation.ok && modelOk,
-    baseUrl: baseUrlValidation,
-    modelOk,
-    message: !baseUrlValidation.ok
-      ? baseUrlValidation.message
-      : modelOk
-        ? "サイドチャットLLMの入力形式は問題ありません。"
-        : "モデルIDを入力してください。",
-  };
+function unicodeCharacterCount(value: string): number {
+  return Array.from(value).length;
 }
 
 export function fileName(path: string): string {
@@ -157,7 +138,20 @@ export function validateConfigInput(
     if (field.required) return { ok: false, message: "値を入力してください。" };
     return { ok: true, message: "空欄は継承または削除として扱います。" };
   }
-  if (field.key === "model.base_url" || field.key === "docling.base_url") {
+  if (
+    (field.key === "model.system_prompt" || field.key === "side_chat.system_prompt")
+    && unicodeCharacterCount(value) > USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS
+  ) {
+    return {
+      ok: false,
+      message: `追加システムプロンプトは${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内で入力してください。`,
+    };
+  }
+  if (
+    field.key === "model.base_url"
+    || field.key === "side_chat.base_url"
+    || field.key === "docling.base_url"
+  ) {
     const validation = validateProviderBaseUrl(value);
     if (!validation.ok) return { ok: false, message: validation.message };
   } else if (field.key.endsWith("base_url")) {

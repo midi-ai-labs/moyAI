@@ -9,6 +9,8 @@ import {
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND,
+  SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_PROMPT,
+  SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_RESPONSE,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAX_RESPONSES,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION,
   SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE,
@@ -21,15 +23,23 @@ const OWNER_ID = `${"0".repeat(25)}1`;
 const USER_ID = `${"0".repeat(25)}2`;
 const ASSISTANT_ID = `${"0".repeat(25)}3`;
 const APPEND_POSITION = "17";
+const INSTRUCTIONS = "Deterministic Side Chat selected-session fixture instructions.";
+const SYSTEM_PROMPT_MARKER = "SELF_TEST_SIDE_SYSTEM_PROMPT_MARKER";
+
+function providerScript() {
+  return createSideChatSessionProviderScript({
+    expectedConsultSystemPromptMarker: SYSTEM_PROMPT_MARKER,
+  });
+}
 
 function userMessage(text) {
   return { type: "message", role: "user", content: [{ type: "input_text", text }] };
 }
 
-function request(input) {
+function request(input, instructions = INSTRUCTIONS) {
   return {
     model: SCRIPTED_PROVIDER_MODEL_ID,
-    instructions: "Deterministic Side Chat selected-session fixture instructions.",
+    instructions,
     input,
     store: false,
     stream: true,
@@ -58,10 +68,13 @@ ${SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE}
 }
 
 function consultRequest(context = ownerContext()) {
-  return request([
-    userMessage(context),
-    userMessage(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION),
-  ]);
+  return request(
+    [
+      userMessage(context),
+      userMessage(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION),
+    ],
+    `${INSTRUCTIONS}\n${SYSTEM_PROMPT_MARKER}`,
+  );
 }
 
 async function post(provider, body) {
@@ -80,6 +93,18 @@ async function assertCompleted(response, expectedText) {
   });
   assert.equal(events.at(-1).response.output[0].content[0].text, expectedText);
 }
+
+test("Side Chat selected-session provider requires an explicit non-empty consult prompt marker", () => {
+  assert.equal(providerScript().expectedConsultSystemPromptMarker, SYSTEM_PROMPT_MARKER);
+  assert.throws(
+    () => createSideChatSessionProviderScript(),
+    /script\.expectedConsultSystemPromptMarker must be a non-empty string/,
+  );
+  assert.throws(
+    () => createSideChatSessionProviderScript({ expectedConsultSystemPromptMarker: "   " }),
+    /script\.expectedConsultSystemPromptMarker must be a non-empty string/,
+  );
+});
 
 test("Side Chat selected-session context binds exact Alpha units and canonical identities", () => {
   const parsed = sideChatSessionOwnerContext(ownerContext());
@@ -127,34 +152,47 @@ test("Side Chat selected-session context rejects cross-session data and malforme
   }
 });
 
-test("Side Chat selected-session provider accepts only Alpha, Beta, then one tool-less Alpha consult", async (context) => {
-  const provider = await startScriptedProvider({ script: createSideChatSessionProviderScript() });
+test("Side Chat selected-session provider accepts Alpha, Beta, a post-config Main, then one tool-less Alpha consult", async (context) => {
+  const provider = await startScriptedProvider({ script: providerScript() });
   context.after(() => provider.close());
   await assertCompleted(await post(provider, request([userMessage(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT)])), SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE);
   await assertCompleted(await post(provider, request([userMessage(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT)])), SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE);
+  await assertCompleted(
+    await post(provider, request([userMessage(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_PROMPT)])),
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAIN_AFTER_CONFIG_RESPONSE,
+  );
   await assertCompleted(await post(provider, consultRequest()), SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE);
   const ledger = provider.requestLedger;
   assert.deepEqual(ledger.map((row) => [row.contract.role, row.contract.pass, row.response_phase, row.response_status]), [
     ["side_session_alpha", true, "completed", 200],
     ["side_session_beta", true, "completed", 200],
+    ["side_session_main_after_config", true, "completed", 200],
     ["side_session_consult", true, "completed", 200],
   ]);
-  assert.equal(ledger[2].contract.owner_context.owner_session_id, OWNER_ID);
-  assert.equal(ledger[2].contract.owner_context.as_of_append_position, APPEND_POSITION);
-  assert.deepEqual(ledger[2].contract.owner_context.source_history_item_ids, [USER_ID, ASSISTANT_ID]);
-  assert.equal(ledger[2].contract.foreign_session_absent, true);
+  assert.deepEqual(ledger.map((row) => [
+    row.contract.consult_system_prompt_marker_present,
+    row.contract.consult_system_prompt_marker_exactly_once,
+  ]), [[false, false], [false, false], [false, false], [true, true]]);
+  assert.equal(
+    JSON.stringify(ledger).includes(SYSTEM_PROMPT_MARKER),
+    false,
+  );
+  assert.equal(ledger[3].contract.owner_context.owner_session_id, OWNER_ID);
+  assert.equal(ledger[3].contract.owner_context.as_of_append_position, APPEND_POSITION);
+  assert.deepEqual(ledger[3].contract.owner_context.source_history_item_ids, [USER_ID, ASSISTANT_ID]);
+  assert.equal(ledger[3].contract.foreign_session_absent, true);
   const resource = provider.resourceObservation();
   assert.equal(resource.script_kind, SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND);
   assert.equal(resource.scripted_responses_maximum, SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAX_RESPONSES);
-  assert.equal(resource.accepted_response_count, 3);
-  assert.equal(resource.successful_response_count, 3);
+  assert.equal(resource.accepted_response_count, 4);
+  assert.equal(resource.successful_response_count, 4);
   const extra = await post(provider, consultRequest());
   assert.equal(extra.status, 409);
   assert.match(await extra.text(), /scripted_response_request_limit_exceeded/);
 });
 
 test("Side Chat selected-session provider rejects out-of-order and duplicate roles", async (context) => {
-  const provider = await startScriptedProvider({ script: createSideChatSessionProviderScript() });
+  const provider = await startScriptedProvider({ script: providerScript() });
   context.after(() => provider.close());
   const early = await post(provider, request([userMessage(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT)]));
   assert.equal(early.status, 409);
@@ -177,6 +215,10 @@ test("Side Chat selected-session provider rejects tools, generation overrides, r
     ["stream", (body) => { body.stream = false; }],
     ["model", (body) => { body.model = "other/model"; }],
     ["empty instructions", (body) => { body.instructions = ""; }],
+    ["missing Side system prompt marker", (body) => { body.instructions = INSTRUCTIONS; }],
+    ["duplicate Side system prompt marker", (body) => {
+      body.instructions += `\n${SYSTEM_PROMPT_MARKER}`;
+    }],
     ["changed question", (body) => { body.input[1] = userMessage("別の質問"); }],
     ["question role", (body) => { body.input[1].role = "assistant"; }],
     ["extra input key", (body) => { body.input[1].injected = true; }],
@@ -189,7 +231,7 @@ test("Side Chat selected-session provider rejects tools, generation overrides, r
   ];
   for (const [label, mutate] of mutations) {
     await context.test(label, async (subcontext) => {
-      const provider = await startScriptedProvider({ script: createSideChatSessionProviderScript() });
+      const provider = await startScriptedProvider({ script: providerScript() });
       subcontext.after(() => provider.close());
       const body = consultRequest();
       mutate(body);
@@ -200,6 +242,14 @@ test("Side Chat selected-session provider rejects tools, generation overrides, r
       if (label.endsWith("in instructions")) {
         assert.equal(provider.requestLedger[0].contract.role, "side_session_consult");
         assert.equal(provider.requestLedger[0].contract.foreign_session_absent, false);
+      }
+      if (label === "missing Side system prompt marker") {
+        assert.equal(provider.requestLedger[0].contract.consult_system_prompt_marker_present, false);
+        assert.equal(provider.requestLedger[0].contract.consult_system_prompt_marker_exactly_once, false);
+      }
+      if (label === "duplicate Side system prompt marker") {
+        assert.equal(provider.requestLedger[0].contract.consult_system_prompt_marker_present, true);
+        assert.equal(provider.requestLedger[0].contract.consult_system_prompt_marker_exactly_once, false);
       }
       assert.equal(provider.resourceObservation().accepted_response_count, 0);
     });

@@ -5,6 +5,7 @@ import {
   PROVIDER_CONTEXT_AFTER,
   PROVIDER_CONTEXT_BEFORE,
   PROVIDER_PROFILE_OPTIONS,
+  MAIN_SYSTEM_PROMPT_MARKER,
   SETTINGS_PROVIDER_API_KEY_ENV,
   SETTINGS_PROVIDER_PROFILE,
   createSettingsPreferencesScenario,
@@ -39,6 +40,7 @@ function projection(overrides = {}) {
       { key: "model.provider_profile", value: SETTINGS_PROVIDER_PROFILE },
       { key: "model.api_key_env", value: SETTINGS_PROVIDER_API_KEY_ENV },
       { key: "model.context_window", value: PROVIDER_CONTEXT_AFTER },
+      { key: "model.system_prompt", value: MAIN_SYSTEM_PROMPT_MARKER },
       { key: "model.max_output_tokens", value: "32768" },
       { key: "docling.enabled", value: "false" },
       { key: "docling.base_url", value: "http://127.0.0.1:43111" },
@@ -62,7 +64,7 @@ function cleanSurface(overrides = {}) {
       visible: true,
       enabled: true,
       text: "接続設定",
-      title: "PreferencesでメインLLMの既定接続を確認・変更",
+      title: "Settingsでglobal既定値を確認・変更",
     },
     settings: {
       dialog_count: 1,
@@ -70,6 +72,12 @@ function cleanSurface(overrides = {}) {
       profile: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_PROFILE, options: [...PROVIDER_PROFILE_OPTIONS] },
       api_key_env: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_API_KEY_ENV },
       context: { count: 1, value: PROVIDER_CONTEXT_AFTER },
+      system_prompt: {
+        count: 1,
+        visible: true,
+        enabled: true,
+        value: MAIN_SYSTEM_PROMPT_MARKER,
+      },
       max_output_tokens: { count: 0, visible: false, enabled: false, value: null },
       docling: { count: 1, checked: false },
       docling_label: { count: 1, visible: false, text: "Docling を有効化" },
@@ -78,9 +86,16 @@ function cleanSurface(overrides = {}) {
       discard: { count: 0, visible: false, enabled: false },
       close: { count: 1, visible: true, enabled: true },
       navigation: {
-        provider: { count: 1, visible: true, text: "メインLLM" },
-        side_chat: { count: 1, visible: true, text: "サイドチャットLLM" },
+        groups: {
+          count: 3,
+          visible_count: 3,
+          texts: ["Global Settings", "Session-scoped Settings", "Desktop Preferences"],
+        },
+        provider: { count: 1, visible: true, text: "Main Chat Settings" },
+        side_chat: { count: 1, visible: true, text: "Side Chat Settings" },
         tools: { count: 1, visible: true, text: "Tools" },
+        session_overrides: { count: 1, visible: true, text: "Session Overrides" },
+        window: { count: 1, visible: true, text: "Window" },
       },
     },
     close_confirmation: {
@@ -180,6 +195,23 @@ test("shell, provider, and clean Preferences predicates reject network and visib
     contextWindow: PROVIDER_CONTEXT_AFTER,
     doclingEnabled: false,
   }), false);
+
+  for (const [name, mutate] of [
+    ["legacy Main label", (value) => { value.settings.navigation.provider.text = "メインLLM"; }],
+    ["legacy Side label", (value) => { value.settings.navigation.side_chat.text = "サイドチャットLLM"; }],
+    ["missing hierarchy group", (value) => { value.settings.navigation.groups.count = 2; }],
+    ["reordered hierarchy groups", (value) => { value.settings.navigation.groups.texts.reverse(); }],
+    ["missing Session Overrides", (value) => { value.settings.navigation.session_overrides.count = 0; }],
+    ["missing Window", (value) => { value.settings.navigation.window.visible = false; }],
+  ]) {
+    const drifted = structuredClone(settings);
+    mutate(drifted);
+    assert.equal(
+      preferencesReady(drifted, [], { contextWindow: PROVIDER_CONTEXT_AFTER, doclingEnabled: false }),
+      false,
+      name,
+    );
+  }
 });
 
 test("dirty close predicates preserve the exact target and distinguish guard from ordinary dirty state", () => {
@@ -236,14 +268,23 @@ test("command expectations preserve complete ordered values and exact config tar
   const save = expectedGlobalSave(dirty);
   assert.equal(save.command, "save_global_config");
   assert.equal(save.args.values.find((row) => row.key === "docling.enabled").text, "true");
+  assert.equal(
+    save.args.values.find((row) => row.key === "model.system_prompt").text,
+    MAIN_SYSTEM_PROMPT_MARKER,
+  );
   assert.deepEqual(save.args.expectedTarget, target);
 
   const contextSave = expectedGlobalSave(cleanSurface(), {
     "model.context_window": PROVIDER_CONTEXT_AFTER,
+    "model.system_prompt": MAIN_SYSTEM_PROMPT_MARKER,
   });
   assert.equal(contextSave.command, "save_global_config");
   assert.equal(contextSave.args.values.find((row) => row.key === "model.context_window").text, PROVIDER_CONTEXT_AFTER);
   assert.equal(contextSave.args.values.find((row) => row.key === "docling.enabled").text, "false");
+  assert.equal(
+    contextSave.args.values.find((row) => row.key === "model.system_prompt").text,
+    MAIN_SYSTEM_PROMPT_MARKER,
+  );
 });
 
 test("saved and restored predicates require a generation advance, clean state, and continuous zero-network stability", () => {

@@ -15,8 +15,8 @@ use crate::config::model::{
     AccessMode, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
     PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
     PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
-    ProviderApiMode, ProviderProfile, ResolvedConfig,
+    PartialSessionConfig, PartialShellConfig, PartialSideChatConfig, PartialToolOutputConfig,
+    PartialWorkspaceConfig, ProviderApiMode, ProviderProfile, ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -334,6 +334,7 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
         model: Some(PartialModelConfig {
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
+            system_prompt: Some(config.model.system_prompt.clone()),
             provider_profile: Some(config.model.provider_profile),
             provider_metadata_mode: None,
             provider_api_mode: None,
@@ -361,6 +362,16 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             parallel_tool_calls: Some(config.model.parallel_tool_calls),
             max_parallel_predictions: Some(config.model.max_parallel_predictions),
             extra_body_json: None,
+        }),
+        side_chat: Some(PartialSideChatConfig {
+            base_url: Some(config.side_chat.base_url.clone()),
+            model: Some(config.side_chat.model.clone()),
+            system_prompt: Some(config.side_chat.system_prompt.clone()),
+            provider_profile: Some(config.side_chat.provider_profile),
+            context_window: Some(config.side_chat.context_window),
+            request_timeout_ms: Some(config.side_chat.request_timeout_ms),
+            connect_timeout_ms: Some(config.side_chat.connect_timeout_ms),
+            max_retries: Some(config.side_chat.max_retries),
         }),
         session: Some(PartialSessionConfig {
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
@@ -866,6 +877,29 @@ mod tests {
         assert!(!text.contains("stream_idle_timeout_ms"));
         assert!(!text.contains("prompt_profile"));
         assert!(!text.contains("max_steps_per_turn"));
+        assert!(text.contains("[side_chat]"));
+        let document = toml::from_str::<toml::Value>(&text).expect("generated config document");
+        let side_chat = document["side_chat"]
+            .as_table()
+            .expect("generated Side Chat defaults");
+        assert_eq!(
+            side_chat.get("base_url").and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:1234")
+        );
+        assert_eq!(
+            side_chat
+                .get("provider_profile")
+                .and_then(toml::Value::as_str),
+            Some("lm_studio")
+        );
+        for excluded in [
+            "api_key_env",
+            "extra_headers",
+            "supports_tools",
+            "supports_images",
+        ] {
+            assert!(!side_chat.contains_key(excluded), "unexpected {excluded}");
+        }
         assert!(text.contains("[docling]"));
         assert!(text.contains("enabled = false"));
         assert!(text.contains("base_url = \"http://127.0.0.1:8123\""));
@@ -894,6 +928,10 @@ mod tests {
         assert_eq!(document["multi_agent"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             document["model"]["provider_profile"].as_str(),
+            Some("lm_studio")
+        );
+        assert_eq!(
+            document["side_chat"]["provider_profile"].as_str(),
             Some("lm_studio")
         );
 
@@ -945,6 +983,63 @@ mod tests {
 
         assert_eq!(config.model.model, "global-model");
         assert_eq!(config.model.base_url, "http://global");
+    }
+
+    #[test]
+    fn global_config_loads_and_normalizes_the_main_system_prompt() {
+        let config = ConfigLoader::resolve_global_config_text_without_environment(
+            Utf8Path::new("system-prompt.toml"),
+            "[model]\nsystem_prompt = \"  first\\n  second  \"\n",
+        )
+        .expect("valid main system prompt config");
+
+        assert_eq!(config.model.system_prompt, "first\n  second");
+    }
+
+    #[test]
+    fn global_side_chat_config_round_trips_with_independent_normalized_values() {
+        let source = Utf8Path::new("side-chat.toml");
+        let config = ConfigLoader::resolve_global_config_text_without_environment(
+            source,
+            r#"
+[model]
+model = "main-model"
+
+[side_chat]
+base_url = " https://side.example.test/v1/ "
+model = "  side-model  "
+system_prompt = "  first\n  second  "
+provider_profile = "openai_compatible"
+context_window = 65536
+request_timeout_ms = 45000
+connect_timeout_ms = 5000
+max_retries = 4
+"#,
+        )
+        .expect("valid global Side Chat config");
+
+        assert_eq!(config.model.model, "main-model");
+        assert_eq!(config.side_chat.base_url, "https://side.example.test/v1");
+        assert_eq!(config.side_chat.model, "side-model");
+        assert_eq!(config.side_chat.system_prompt, "first\n  second");
+        assert_eq!(
+            config.side_chat.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(config.side_chat.context_window, 65_536);
+        assert_eq!(config.side_chat.request_timeout_ms, 45_000);
+        assert_eq!(config.side_chat.connect_timeout_ms, 5_000);
+        assert_eq!(config.side_chat.max_retries, 4);
+
+        let exported = toml::to_string_pretty(&default_config_patch(&config))
+            .expect("export normalized global config");
+        let imported = ConfigLoader::resolve_global_config_text_without_environment(
+            Utf8Path::new("side-chat-round-trip.toml"),
+            &exported,
+        )
+        .expect("re-import normalized global config");
+        assert_eq!(imported.side_chat, config.side_chat);
+        assert_eq!(imported.model.model, "main-model");
     }
 
     #[test]

@@ -27,6 +27,7 @@ import {
   case52EvaluatorWorkspaceDiff,
   case52EvidenceOptions,
   case52ExpectedMainGlobalSave,
+  case52ExpectedSideGlobalSave,
   case52ExternalLmStudioObservation,
   case52ExtraBodyEvidence,
   case52ForbiddenWorkspacePaths,
@@ -321,6 +322,31 @@ test("manual.case5_2 can seed a neutral connection for same-execution trusted Ma
       expectedTarget: { workspacePath: "C:\\workspace", sessionId: null, configGeneration: "7" },
     },
   });
+
+  const sideSurface = structuredClone(surface);
+  sideSurface.projection.config_fields.push(
+    { key: "side_chat.base_url", value: "http://127.0.0.1:1234" },
+    { key: "side_chat.model", value: "side-before-save" },
+    { key: "side_chat.provider_profile", value: "lm_studio" },
+    { key: "side_chat.system_prompt", value: "preserve-side-prompt" },
+  );
+  assert.deepEqual(case52ExpectedSideGlobalSave(sideSurface, normalized), {
+    command: "save_global_config",
+    args: {
+      values: [
+        { key: "model.base_url", text: "http://127.0.0.1:9" },
+        { key: "model.model", text: "moyai-case5-2-before-gui-save" },
+        { key: "model.provider_profile", text: "lm_studio" },
+        { key: "model.api_key_env", text: "" },
+        { key: "model.context_window", text: "131072" },
+        { key: "side_chat.base_url", text: "http://192.0.2.1:1234" },
+        { key: "side_chat.model", text: "side" },
+        { key: "side_chat.provider_profile", text: "lm_studio" },
+        { key: "side_chat.system_prompt", text: "preserve-side-prompt" },
+      ],
+      expectedTarget: { workspacePath: "C:\\workspace", sessionId: null, configGeneration: "7" },
+    },
+  });
 });
 
 test("manual.case5_2 classifies only Main Preferences observation timeouts as product failures", () => {
@@ -494,7 +520,7 @@ test("manual.case5_2 rejects unresolved or mismatched Main Preferences command p
   }
 });
 
-test("manual.case5_2 Side screenshot readiness requires every configured value in the viewport", () => {
+test("manual.case5_2 Side screenshot readiness requires global values and the materialized snapshot in the viewport", () => {
   const options = {
     providerBaseUrl: "http://192.0.2.10:1234",
     providerProfile: "lm_studio",
@@ -521,7 +547,7 @@ test("manual.case5_2 Side screenshot readiness requires every configured value i
       },
     },
     settings: { ...visible },
-    section: { ...visible, owner: SESSION_ID },
+    section: { ...visible },
     details: { ...visible, open: true },
     profile: { ...visible, value: options.providerProfile },
     base: { ...visible, value: options.providerBaseUrl },

@@ -105,7 +105,7 @@ export function renderLocalConfirmation(confirm: LocalConfirmation, pending = fa
           <div class="confirm-summary" id="session-settings-close-confirm-summary">Session Settingsを閉じると、未適用の入力は破棄されます。</div>
           <dl class="confirm-details">
             <dt>対象</dt><dd>${escapeHtml(confirm.expectedTarget.rootSessionId)}</dd>
-            <dt>影響</dt><dd>保存済みのroot session設定とPreferencesには影響しません。</dd>
+            <dt>影響</dt><dd>保存済みのroot session設定とGlobal Settingsには影響しません。</dd>
           </dl>
           <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Session Settingsを閉じています。" : escapeHtml(error)}</div>
           <div class="modal-actions">
@@ -124,12 +124,12 @@ export function renderLocalConfirmation(confirm: LocalConfirmation, pending = fa
       <div class="modal-backdrop">
         <section class="modal confirmation settings-close-confirmation" role="alertdialog" data-modal="settings-close-confirmation" aria-modal="true" aria-labelledby="settings-close-confirm-title" aria-describedby="settings-close-confirm-summary" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
           <h2 id="settings-close-confirm-title">未保存の変更を破棄しますか？</h2>
-          <div class="confirm-summary" id="settings-close-confirm-summary">Preferencesを閉じると、入力中の変更は破棄されます。この操作は元に戻せません。</div>
+          <div class="confirm-summary" id="settings-close-confirm-summary">Settingsを閉じると、入力中の変更は破棄されます。この操作は元に戻せません。</div>
           <dl class="confirm-details">
             <dt>設定対象</dt><dd>${escapeHtml(target)}</dd>
             <dt>影響</dt><dd>保存済みの設定と現在の実行中セッションには影響しません。</dd>
           </dl>
-          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Preferencesを閉じています。" : escapeHtml(error)}</div>
+          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Settingsを閉じています。" : escapeHtml(error)}</div>
           <div class="modal-actions">
             <button data-action="cancel-local-confirm" ${pending ? "disabled" : "autofocus"}>キャンセル</button>
             <button class="danger-button" data-action="confirm-settings-discard-close" ${pending ? "disabled" : ""}>${pending ? "閉じています…" : "変更を破棄して閉じる"}</button>

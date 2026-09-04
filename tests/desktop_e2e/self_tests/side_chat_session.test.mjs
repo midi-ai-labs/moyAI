@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SIDE_SESSION_MAIN_DRAFT,
+  SIDE_SESSION_SYSTEM_PROMPT_MARKER,
   SIDE_SESSION_UNSENT_DRAFT,
   sideSessionBindingSnapshot,
-  sideSessionBetaIsolated,
   sideSessionDraftSaved,
+  sideSessionFreshBinding,
   sideSessionLedgerMatches,
   sideSessionMainSnapshot,
   sideSessionNavigationSummary,
@@ -65,8 +66,9 @@ function surface(sessionId = ALPHA) {
       side_chat: {
         owner_session_id: sessionId, chat_id: CHAT, generation: "1", provider_profile: "openai_responses",
         base_url: "http://127.0.0.1:1234", model: "test", context_as_of_append_position: "11",
+        system_prompt: SIDE_SESSION_SYSTEM_PROMPT_MARKER,
         draft_revision: "3", draft_text: SIDE_SESSION_UNSENT_DRAFT, messages,
-        configured: true, status: "completed", last_error: "", context_scope: "owner_session",
+        configured: true, deleting: false, status: "completed", last_error: "", context_scope: "owner_session",
         context_truncated: false, can_send: true, can_cancel: false,
         draft_quote: null,
       },
@@ -108,6 +110,7 @@ test("session Side restoration requires the exact binding, main history, draft, 
     "draft owner B": (value) => { value.projection.draft_target.sessionId = BETA; },
     "side owner B": (value) => { value.projection.side_chat.owner_session_id = BETA; },
     "new hidden chat": (value) => { value.projection.side_chat.chat_id = BETA; },
+    "system prompt changed": (value) => { value.projection.side_chat.system_prompt = "wrong prompt"; },
     "main history contaminated": (value) => { value.projection.transcript_rows.push({ row_kind: "assistant", body: "Side answer" }); },
     "main draft changed": (value) => { value.main.prompt_value = ""; },
     "stale rendered main history": (value) => { value.main.primary_rows[0].body = "赤、月曜日"; },
@@ -132,26 +135,47 @@ test("session Side restoration requires the exact binding, main history, draft, 
   assert.equal(sideSessionRestored(restarted, { ...expected, mainDraft: "" }), true);
 });
 
-test("unconfigured B must display setup and no A Side conversation or draft", () => {
+test("first open for B materializes global defaults without leaking A conversation or draft", () => {
   const beta = surface(BETA);
   const main = sideSessionMainSnapshot(beta.projection);
   beta.main.prompt_value = "";
-  Object.assign(beta.projection.side_chat, { configured: false, chat_id: null, messages: [], draft_text: "", status: "idle", can_send: false });
-  Object.assign(beta.side, { setup_visible: true, messages: [], prompt_value: null });
-  assert.equal(sideSessionBetaIsolated(beta, main), true);
+  Object.assign(beta.projection.side_chat, {
+    chat_id: BETA,
+    messages: [],
+    draft_text: "",
+    status: "idle",
+    can_send: true,
+  });
+  Object.assign(beta.side, { setup_visible: false, messages: [], prompt_value: "" });
+  const expected = {
+    previousChatId: CHAT,
+    providerBaseUrl: "http://127.0.0.1:1234",
+    model: "test",
+    systemPrompt: SIDE_SESSION_SYSTEM_PROMPT_MARKER,
+  };
+  assert.equal(sideSessionFreshBinding(beta, main, expected), true);
   const leaked = structuredClone(beta);
   leaked.projection.side_chat.owner_session_id = ALPHA;
-  assert.equal(sideSessionBetaIsolated(leaked, main), false);
+  assert.equal(sideSessionFreshBinding(leaked, main, expected), false);
+  const reusedChat = structuredClone(beta);
+  reusedChat.projection.side_chat.chat_id = CHAT;
+  assert.equal(sideSessionFreshBinding(reusedChat, main, expected), false);
+  const leakedHistory = structuredClone(beta);
+  leakedHistory.projection.side_chat.messages = surface().projection.side_chat.messages;
+  assert.equal(sideSessionFreshBinding(leakedHistory, main, expected), false);
   const hidden = structuredClone(beta);
   hidden.side.pane_visible = false;
-  assert.equal(sideSessionBetaIsolated(hidden, main), false);
+  assert.equal(sideSessionFreshBinding(hidden, main, expected), false);
   const staleDom = structuredClone(beta);
   staleDom.side.messages = surface().side.messages;
-  assert.equal(sideSessionBetaIsolated(staleDom, main), false);
+  assert.equal(sideSessionFreshBinding(staleDom, main, expected), false);
+  const staleGlobal = structuredClone(beta);
+  staleGlobal.projection.side_chat.system_prompt = "old prompt";
+  assert.equal(sideSessionFreshBinding(staleGlobal, main, expected), false);
   const storageError = structuredClone(beta);
   storageError.projection.side_chat.status = "failed";
   storageError.projection.side_chat.last_error = "storage read failed";
-  assert.equal(sideSessionBetaIsolated(storageError, main), false);
+  assert.equal(sideSessionFreshBinding(storageError, main, expected), false);
 });
 
 test("terminal navigation summary rejects stale rows by stable session identity", async (t) => {
@@ -223,15 +247,38 @@ test("Side autosave advances only the draft and cannot redefine the completed co
 });
 
 test("session provider ledger admits only exact ordered successful requests", () => {
-  const ledger = ["side_session_alpha", "side_session_beta", "side_session_consult"].map((role) => ({
-    method: "POST", pathname: "/v1/responses", contract: { role, pass: true },
+  const ledger = [
+    "side_session_alpha",
+    "side_session_beta",
+    "side_session_main_after_config",
+    "side_session_consult",
+  ].map((role) => ({
+    method: "POST",
+    pathname: "/v1/responses",
+    contract: {
+      role,
+      pass: true,
+      consult_system_prompt_marker_present: role === "side_session_consult",
+      consult_system_prompt_marker_exactly_once: role === "side_session_consult",
+    },
     response_status: 200, response_phase: "completed",
   }));
-  assert.equal(sideSessionLedgerMatches(ledger, 3), true);
-  assert.equal(sideSessionLedgerMatches([...ledger, ledger[2]], 3), false);
-  assert.equal(sideSessionLedgerMatches([...ledger, ledger[2]], 4), false);
-  assert.equal(sideSessionLedgerMatches([ledger[1], ledger[0], ledger[2]], 3), false);
+  assert.equal(sideSessionLedgerMatches(ledger, 4), true);
+  assert.equal(sideSessionLedgerMatches([...ledger, ledger[3]], 4), false);
+  assert.equal(sideSessionLedgerMatches(ledger.slice(0, 3), 4), false);
+  assert.equal(sideSessionLedgerMatches([ledger[1], ledger[0], ledger[2], ledger[3]], 4), false);
   const rejected = structuredClone(ledger);
-  rejected[2].contract.pass = false;
-  assert.equal(sideSessionLedgerMatches(rejected, 3), false);
+  rejected[3].contract.pass = false;
+  assert.equal(sideSessionLedgerMatches(rejected, 4), false);
+  const missingMarker = structuredClone(ledger);
+  missingMarker[3].contract.consult_system_prompt_marker_present = false;
+  missingMarker[3].contract.consult_system_prompt_marker_exactly_once = false;
+  assert.equal(sideSessionLedgerMatches(missingMarker, 4), false);
+  const duplicateMarker = structuredClone(ledger);
+  duplicateMarker[3].contract.consult_system_prompt_marker_exactly_once = false;
+  assert.equal(sideSessionLedgerMatches(duplicateMarker, 4), false);
+  const leakedToMain = structuredClone(ledger);
+  leakedToMain[2].contract.consult_system_prompt_marker_present = true;
+  leakedToMain[2].contract.consult_system_prompt_marker_exactly_once = true;
+  assert.equal(sideSessionLedgerMatches(leakedToMain, 4), false);
 });
