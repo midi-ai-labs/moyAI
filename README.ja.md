@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.0.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.1.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -85,15 +85,14 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の release を公開しています。
 
-[**moyAI v2.0.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1)
+[**moyAI v2.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1)
 
-v2.0.1では、session単位の設定・履歴・未送信draftを永続化するtool-less Side Chat、
-初回・global・session別の設定workflow、provider discoveryとgenerationを統合するtyped
-connection profileを追加しました。progress-aware streaming、generationでfenceされたexact Stop、
-Desktop再起動後のsettled history復元と次turn admission、terminal projection reconciliation、
-boundedなsemantic-prefix compactionにより、長時間のlocal-model taskも強化しています。restrictedな
-TEMP failureをcanonical projectionでも保持し、AutoReview Guardianには固定90秒ではなくturn開始時に
-captureしたrequest deadlineを適用します。
+v2.1.1はv2系の最終リリースです。MainとSide Chatそれぞれに独立した追加システムプロンプトを
+設定できるようにし、Settingsをglobal、session-scoped、Desktop固有のstateに沿って再編しました。
+Side Chatではownerに紐づくcontext、引用、session navigation、再起動後の継続性を強化しています。
+また、oMLXなどのOpenAI-compatible endpointを含む現行provider profileすべてに、tool-lessな
+AutoReview Guardianのexact transportを拡張し、実行file identity、MCP origin、provider診断、secret、
+Windows sandbox admissionのfail-closed境界を強化しました。
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -141,7 +140,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.0.1 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 packageはそのrelease用のclean source commitから作成します。`v<version>` tagが既に存在する場合、

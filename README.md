@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.0.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.1.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -84,15 +84,14 @@ moyAI is designed around those constraints:
 
 The current release is available here:
 
-[**moyAI v2.0.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1)
+[**moyAI v2.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1)
 
-v2.0.1 adds a tool-less Side Chat with persisted per-session settings, history, and drafts;
-completes first-run, global, and per-session settings workflows; and unifies provider discovery
-and generation under typed connection profiles. It also improves long-running local-model work
-with progress-aware streaming, exact generation-fenced Stop, settled-history restoration and
-next-turn admission after Desktop restart, terminal projection reconciliation, and bounded
-semantic-prefix compaction. The release also preserves restricted TEMP failures through canonical projection
-and gives AutoReview Guardian the turn-captured request deadline instead of a fixed 90-second limit.
+v2.1.1 is the final release in the v2 line. It adds independently configurable Main and Side Chat
+system prompts, reorganizes Settings around global, session-scoped, and Desktop-owned state, and
+strengthens owner-bound Side Chat context, quoting, navigation, and restart continuity. The release
+also extends exact tool-less AutoReview Guardian transport to every current provider profile,
+including OpenAI-compatible endpoints such as oMLX, and adds fail-closed hardening around executable
+identity, MCP origins, provider diagnostics, secrets, and Windows sandbox admission.
 
 The Windows release zip includes:
 
@@ -140,7 +139,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.0.1 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the

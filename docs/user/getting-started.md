@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-09-02 時点のcurrent development source向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、provider connection profileを含む。未リリースの開発機能を含むため、release packageを使う場合はそのversionの製品READMEを確認する。
+2026-09-05 時点のmoyAI v2.1.1向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、provider connection profileを含む。current development sourceには公開後の変更が含まれる場合があるため、release packageを使う場合はそのversionの製品READMEも確認する。
 
 ## 初回起動
 
