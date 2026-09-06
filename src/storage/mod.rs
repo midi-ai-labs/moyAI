@@ -141,6 +141,7 @@ impl StoragePaths {
 pub struct StoreBundle {
     store: SqliteStore,
     active_runs: ActiveRunRegistry,
+    device_network: Arc<std::sync::Mutex<Option<crate::device_network::WeakDeviceNetwork>>>,
 }
 
 impl StoreBundle {
@@ -148,7 +149,15 @@ impl StoreBundle {
         Self {
             store,
             active_runs: ActiveRunRegistry::default(),
+            device_network: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn attach_device_network(&self, network: crate::device_network::WeakDeviceNetwork) {
+        *self.device_network.lock().expect("device runtime poisoned") = Some(network);
+    }
+    pub(crate) fn device_network(&self) -> Option<crate::device_network::DeviceNetworkService> {
+        self.device_network.lock().ok()?.as_ref()?.upgrade()
     }
 
     pub fn active_runs(&self) -> &ActiveRunRegistry {
@@ -164,6 +173,10 @@ impl StoreBundle {
 
     pub fn session_repo(&self) -> SqliteSessionRepository {
         self.store.session_repo()
+    }
+
+    pub fn remote_job_store(&self) -> crate::remote_agent::store::RemoteJobStore {
+        self.store.remote_job_store()
     }
 
     pub fn project_repo(&self) -> SqliteProjectRepository {

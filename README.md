@@ -34,6 +34,37 @@
 
 ## What Is moyAI?
 
+This development branch targets **Desktop v3.0.0 / LYNX**. The **moyAI Hub** panel
+now includes Hub-managed device enrollment, receiving tasks, and choosing other devices.
+Import the shared Hub configuration, use a one-time enrollment code, then enable receiving
+or select an allowed peer. A new worker can start with Hub configuration before setting up
+a Direct model. The shared file contains the Hub URL and public CA trust; each device generates
+its own private key. On enrolled Desktop devices, receiving IP, port, TLS credentials and short-lived
+authorization are managed by the apps.
+This increment is implemented. On one Windows PC, the actual Hub/Desktop GUI and separate sender/receiver
+runtimes have verified shared-config setup, enrollment, temp receiving, directed permission, peer selection,
+named approval and CPU task results returned to the sender. This is a tested subset, not physical multi-PC
+acceptance. Older provisional builds do not include it.
+
+Hub administrators assign groups and directed permissions. Joining a Hub does not connect every device
+to every other device. Receivers choose a project or **temp**, execution permissions and model routing.
+The receiving agent performs the task locally and retains its canonical history; a temp CPU query
+uses the agent's permitted tools on that device. Authorized redelegation retains the original caller
+and task constraints. Receiving OFF blocks new work; existing jobs have separate status and stop controls.
+Startup and tray receiving are explicit preferences. See the [device-network guide](docs/hub-device-network-guide.md)
+and [design and acceptance status](docs/design/hub-device-network.md).
+
+The model tab retains independent Main / Side Chat model selection and review. The Hub route uses
+a companion Chat Completions gateway with capacity control and has no implicit Direct fallback.
+Direct settings remain available. The separate **MCPを配信** panel and manual peer connection form
+remain for manually configured connections. Read-only temp publishes `current_time`; agent temp
+executes tasks. Manual profiles retain their own token/TLS and lifecycle settings. See
+[Desktop MCP publishing](docs/design/mcp-publish-foundation.md) and [Hub integration](docs/hub-integration.md).
+Physical multi-Windows and three-device redelegation acceptance remain outstanding. Restoring delegation
+ancestry across a Hub restart, rotating Hub/Gateway server certificates during continuous operation,
+interactive remote approval and artifact transfer are not yet supported.
+The published v2.1.1 download below remains the released version.
+
 moyAI is a Rust-based coding agent built for environments where cloud-first developer tools are hard to adopt.
 
 It connects to an OpenAI-compatible local LLM server, reads and edits your workspace, runs shell commands, keeps session history, and presents the same agent core through a CLI, TUI, and Tauri Desktop app.

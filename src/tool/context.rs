@@ -249,6 +249,10 @@ pub struct RunMutationFence {
 }
 
 impl RunMutationFence {
+    pub(crate) fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
     pub fn new(
         repo: SqliteSessionRepository,
         session_id: SessionId,

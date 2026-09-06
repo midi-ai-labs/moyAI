@@ -1901,6 +1901,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms,
             session_token_usage: Default::default(),
+            active_turn_progress: None,
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,

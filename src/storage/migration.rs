@@ -124,6 +124,9 @@ const V60_PROVIDER_CONNECTION_PROFILES: &str =
     include_str!("../../migrations/V60__provider_connection_profiles.sql");
 const V61_SIDE_CHAT_SYSTEM_PROMPT: &str =
     include_str!("../../migrations/V61__side_chat_system_prompt.sql");
+const V62_REMOTE_AGENT_JOBS: &str = include_str!("../../migrations/V62__remote_agent_jobs.sql");
+const V63_DEVICE_OUTGOING_REFERENCES: &str =
+    include_str!("../../migrations/V63__device_outgoing_references.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -600,12 +603,78 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
     for _ in 0..=SIDE_CHAT_SYSTEM_PROMPT_VERSION {
         run(connection)?;
         if schema_migration_applied(connection, SIDE_CHAT_SYSTEM_PROMPT_VERSION)? {
-            return Ok(());
+            run_remote_agent_jobs(connection)?;
+            return run_device_outgoing_references(connection);
         }
     }
     Err(StorageError::Message(format!(
         "storage migration did not reach current endpoint V{SIDE_CHAT_SYSTEM_PROMPT_VERSION}"
     )))
+}
+
+fn run_remote_agent_jobs(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 62)? {
+            connection.execute_batch(V62_REMOTE_AGENT_JOBS)?;
+        }
+        if !schema_migration_has_exact_name(connection, 62, "remote_agent_jobs")? {
+            return Err(StorageError::Message(
+                "invalid remote job migration marker".into(),
+            ));
+        }
+        connection.prepare("SELECT id, principal_id, profile_id, request_key, request_hash, scope_json, parent_json, prompt_preview, session_id, admitted_turn_id, created_at_ms FROM remote_agent_jobs LIMIT 0")?;
+        connection.prepare("SELECT remote_temp_profile_id FROM projects LIMIT 0")?;
+        let owned_objects: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE (type = 'index' AND name IN ('remote_agent_jobs_profile_created', 'remote_agent_jobs_created')) OR (type = 'trigger' AND name IN ('remote_agent_jobs_immutable', 'remote_temp_project_purpose_immutable'))", [], |row| row.get(0))?;
+        if owned_objects != 4 {
+            return Err(StorageError::Message(
+                "remote job schema is incomplete".into(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn run_device_outgoing_references(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 63)? {
+            connection.execute_batch(V63_DEVICE_OUTGOING_REFERENCES)?;
+        }
+        if !schema_migration_has_exact_name(connection, 63, "device_outgoing_references")? {
+            return Err(StorageError::Message(
+                "invalid outgoing reference migration marker".into(),
+            ));
+        }
+        connection.prepare("SELECT id,session_id,turn_id,device_id,profile_id,root_task_id,request_key,prompt_hash,parent_grant_id,parent_job_id,payload_json,created_at_ms FROM device_outgoing_references LIMIT 0")?;
+        let objects:i64=connection.query_row("SELECT count(*) FROM sqlite_master WHERE (type='index' AND name IN ('device_outgoing_references_session_recent','device_outgoing_references_recent')) OR (type='trigger' AND name='device_outgoing_references_immutable')",[],|r|r.get(0))?;
+        if objects != 3 {
+            return Err(StorageError::Message(
+                "outgoing reference schema is incomplete".into(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn run_indexed_collaboration_mode_lookup(connection: &Connection) -> Result<(), StorageError> {

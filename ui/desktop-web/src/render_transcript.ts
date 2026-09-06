@@ -112,6 +112,7 @@ function renderHistoryRail(anchors: readonly TranscriptAnchor[]): string {
   return `
     <nav class="history-rail" aria-label="会話履歴">
       <div class="history-rail-markers" style="--history-marker-count: ${markers.length}">
+        <span class="history-rail-label" aria-hidden="true">履歴</span>
         ${markers.map((anchor) => `
           <button type="button" class="history-rail-marker history-kind-${escapeHtml(anchor.row.row_kind)}"
             data-action="jump-history-anchor" data-history-target="${escapeHtml(anchor.id)}"

@@ -18,16 +18,25 @@ impl SqliteProjectRepository {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
     }
-}
+    /// Internal temporary workspaces acquire their purpose atomically with project creation.
+    /// A normal upsert preserves purpose; it can never promote an ordinary project.
+    pub(crate) async fn upsert_remote_temp_project(
+        &self,
+        id: ProjectId,
+        root_path: &Utf8Path,
+        display_name: &str,
+        profile_id: ulid::Ulid,
+    ) -> Result<ProjectRecord, StorageError> {
+        self.upsert_project_with_purpose(id, root_path, display_name, "none", Some(profile_id))
+    }
 
-#[async_trait(?Send)]
-impl ProjectRepository for SqliteProjectRepository {
-    async fn upsert_project(
+    fn upsert_project_with_purpose(
         &self,
         id: ProjectId,
         root_path: &Utf8Path,
         display_name: &str,
         vcs_kind: &str,
+        remote_temp_profile_id: Option<ulid::Ulid>,
     ) -> Result<ProjectRecord, StorageError> {
         let now = SystemClock.now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
@@ -48,30 +57,36 @@ impl ProjectRepository for SqliteProjectRepository {
                 existing_id_for_root.expect("checked existing project id")
             )));
         }
-        let existing_root_for_id = transaction
+        let existing = transaction
             .query_row(
-                "SELECT root_path FROM projects WHERE id = ?1",
+                "SELECT root_path, remote_temp_profile_id FROM projects WHERE id = ?1",
                 params![id.to_string()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
-        if existing_root_for_id
-            .as_deref()
-            .is_some_and(|existing| existing != root_path.as_str())
-        {
-            return Err(StorageError::Message(format!(
-                "project {id} is already bound to root `{}`",
-                existing_root_for_id.expect("checked existing project root")
-            )));
+        if let Some((existing_root, existing_purpose)) = existing {
+            if existing_root != root_path.as_str() {
+                return Err(StorageError::Message(format!(
+                    "project {id} is already bound to root `{existing_root}`"
+                )));
+            }
+            if let Some(profile) = remote_temp_profile_id
+                && existing_purpose.as_deref() != Some(profile.to_string().as_str())
+            {
+                return Err(StorageError::Message(
+                    "ordinary or another receiver's project cannot become a remote temp workspace"
+                        .into(),
+                ));
+            }
         }
         transaction.execute(
-            "INSERT INTO projects (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO projects (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms, remote_temp_profile_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                  display_name=excluded.display_name,
                  vcs_kind=excluded.vcs_kind,
                  updated_at_ms=excluded.updated_at_ms",
-            params![id.to_string(), root_path.as_str(), display_name, vcs_kind, now, now],
+            params![id.to_string(), root_path.as_str(), display_name, vcs_kind, now, now, remote_temp_profile_id.map(|id| id.to_string())],
         )?;
         let project = transaction.query_row(
             "SELECT root_path, display_name, vcs_kind, created_at_ms, updated_at_ms
@@ -90,6 +105,19 @@ impl ProjectRepository for SqliteProjectRepository {
         )?;
         transaction.commit()?;
         Ok(project)
+    }
+}
+
+#[async_trait(?Send)]
+impl ProjectRepository for SqliteProjectRepository {
+    async fn upsert_project(
+        &self,
+        id: ProjectId,
+        root_path: &Utf8Path,
+        display_name: &str,
+        vcs_kind: &str,
+    ) -> Result<ProjectRecord, StorageError> {
+        self.upsert_project_with_purpose(id, root_path, display_name, vcs_kind, None)
     }
 
     async fn get_project(&self, id: ProjectId) -> Result<ProjectRecord, StorageError> {
@@ -122,6 +150,7 @@ impl ProjectRepository for SqliteProjectRepository {
                     COALESCE(MAX(sessions.updated_at_ms), projects.updated_at_ms) AS last_activity_ms
              FROM projects
              LEFT JOIN sessions ON sessions.project_id = projects.id
+             WHERE projects.remote_temp_profile_id IS NULL
              GROUP BY projects.id
              ORDER BY projects.created_at_ms ASC, lower(projects.display_name) ASC, lower(projects.root_path) ASC
              LIMIT ?1",
@@ -149,6 +178,20 @@ impl ProjectRepository for SqliteProjectRepository {
     async fn delete_project(&self, id: ProjectId) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_remote_job: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM remote_agent_jobs AS job
+                 INNER JOIN sessions AS session ON session.id = job.session_id
+                 WHERE session.project_id = ?1
+             )",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
+        if has_remote_job {
+            return Err(StorageError::Message(
+                "遠隔タスクの実行記録があるため、この中間版ではプロジェクトを削除できません".into(),
+            ));
+        }
         let active_session_id = mutation_blocker_for_project_in_connection(&tx, id)?;
         if let Some(active_session_id) = active_session_id {
             return Err(StorageError::Message(format!(

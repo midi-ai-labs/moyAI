@@ -8,6 +8,8 @@ pub mod async_ops;
 #[cfg(feature = "tauri-desktop")]
 pub mod composer_state;
 #[cfg(feature = "tauri-desktop")]
+pub(crate) mod mcp_peers;
+#[cfg(feature = "tauri-desktop")]
 pub mod models;
 #[cfg(feature = "tauri-desktop")]
 pub mod navigation;

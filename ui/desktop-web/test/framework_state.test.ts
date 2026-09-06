@@ -451,6 +451,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     about: {
       product_name: "moyAI",
       version: "test-version",
+      codename: "test-codename",
       license_identifier: "test-license",
       copyright_notice: "Copyright test notice",
     },
@@ -3132,6 +3133,18 @@ test("run admission polls for the Rust owner before the start command responds",
   assert.equal(runtimePollingRequired(false, true), true);
 });
 
+test("a Hub command starts ordinary polling before the Desktop snapshot advertises its connection", () => {
+  const idle = { status: "disconnected" as const, active_main: null, active_side_chat: null };
+  assert.equal(runtimePollingRequired(false, false, idle), false);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connecting" }), true);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connected" }), true);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "stale" }), false);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "error" }), false);
+  assert.equal(runtimePollingRequired(false, false, {
+    ...idle, active_side_chat: { turn_id: "side-turn", phase: "running", logical_model_id: "model" },
+  }), true);
+});
+
 test("workspace browser submits its local draft with the authoritative draft owner", async () => {
   const state = projection({ workspace_input: "D:/next-workspace" });
   let invocation: { name: string; args?: Record<string, unknown> } | null = null;
@@ -4753,6 +4766,7 @@ test("Help exposes a Rust-owned accessible About dialog", () => {
     about: {
       product_name: "moyAI Next",
       version: "9.8.7-test",
+      codename: "Test Codename",
       license_identifier: "License-ID",
       copyright_notice: "Copyright notice from the bundled license",
     },
@@ -4786,8 +4800,8 @@ test("settings renders one typed LLM response inactivity timeout with host-neutr
     }],
   }));
 
-  assert.match(html, /LLM応答無進捗タイムアウト/);
-  assert.match(html, /応答headerまでの待機と、応答中のSSE event間の最大無進捗時間です（ms）。進捗中の総所要時間は制限せず、hostへも送信しません。/);
+  assert.match(html, /応答の進捗を待つ時間（ms）/);
+  assert.match(html, /応答開始までと、受信中に進捗が止まった場合の待ち時間です。応答が続いている間の総時間は制限せず、モデル側の設定も変えません。/);
   assert.match(html, /data-config-key="model\.request_timeout_ms"[^>]+value="3600000"/);
   assert.doesNotMatch(html, /model\.stream_idle_timeout_ms/);
   assert.doesNotMatch(html, /settings-raw-value[^>]+model\.request_timeout_ms/);
@@ -4827,7 +4841,7 @@ test("Docling dependencies expose one visible toggle owner and disable connectio
   for (const key of ["docling.base_url", "docling.timeout_ms", "docling.api_key_env", "docling.headers_json"]) {
     assert.match(off, new RegExp(`data-config-key="${key.replace(".", "\\.")}"[^>]*aria-describedby="[^"]*docling-disabled-help[^"]*"[^>]*disabled`));
   }
-  assert.match(off, /<summary>Docling 接続ヘッダー（Advanced）<\/summary>/);
+  assert.match(off, /<summary>Doclingの接続ヘッダー（詳細）<\/summary>/);
 
   const on = renderOverlay(projection({ overlay: "config", config_fields: fields(true) }));
   assert.match(on, /id="docling-disabled-help"[^>]*hidden/);
@@ -5336,7 +5350,7 @@ test("every Settings field has unique connected help, validation, and explicit l
     html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*settings-control[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 23, "fourteen existing controls plus nine controls for eight Side fields");
+  assert.equal(controls.length, 27, "twenty-three config controls plus four remote peer connection fields");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];
@@ -5364,10 +5378,15 @@ test("every Settings field has unique connected help, validation, and explicit l
     .find((id) => id.startsWith("settings-config-help-"))!;
   const contextHelp = new RegExp(`<small id="${escapeRegExp(contextHelpId)}"[^>]*>([^<]+)</small>`)
     .exec(html)?.[1] ?? "";
-  assert.match(contextHelp, /設定キー: model\.context_window/);
-  assert.match(contextHelp, /形式: 整数/);
   assert.match(contextHelp, /範囲: 0以上4294967295以下/);
-  assert.match(contextHelp, /環境変数: MOYAI_CONTEXT_WINDOW/);
+  assert.doesNotMatch(contextHelp, /設定キー:|形式:|環境変数:/);
+  const technicalDetails = Array.from(html.matchAll(/(<details\b[^>]*class="settings-field-technical"[^>]*>)([\s\S]*?)<\/details>/g))
+    .find((match) => match[2].includes("設定キー: model.context_window。"));
+  assert.ok(technicalDetails, "technical metadata remains available without expanding the primary field help");
+  assert.doesNotMatch(technicalDetails[1], /\sopen(?:\s|>)/, "technical metadata is collapsed initially");
+  assert.match(technicalDetails[2], /形式: 整数/);
+  assert.match(technicalDetails[2], /環境変数: MOYAI_CONTEXT_WINDOW/);
+  assert.doesNotMatch(technicalDetails[2], /<(?:input|select|textarea)\b/, "collapsing metadata must not hide an editor");
   for (const key of [
     "model.temperature",
     "model.top_p",
@@ -5403,13 +5422,13 @@ test("every Settings field has unique connected help, validation, and explicit l
   ]) {
     assert.match(html, new RegExp(`data-config-key="${escapeRegExp(key)}"`));
   }
-  assert.match(html, /id="config-dialog-title">Settings</);
-  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Global Settings</);
-  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Session-scoped Settings</);
-  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Desktop Preferences</);
-  assert.match(html, /Side Chatを開くと、この時点のモデルとプロンプトを専用snapshotとして保持します。/);
+  assert.match(html, /id="config-dialog-title">設定</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">共通設定</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">チャットごとの設定</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">画面設定</);
+  assert.match(html, /サイドチャットは、開いた時点のモデルとプロンプトを保持します。/);
   assert.doesNotMatch(html, /data-action="configure-side-chat"/);
-  assert.match(html, /moyAI内の入力整理とAPI機能を設定します。sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
+  assert.match(html, /入力の整理と利用する機能を設定します。回答の長さや思考設定はモデルのホスト側で管理します。/);
   assert.match(html, /id="settings-validation"[^>]*role="status"[^>]*aria-live="polite"/);
   for (const section of ["provider", "side-chat", "permissions", "agents", "tools", "files", "advanced"]) {
     assert.match(

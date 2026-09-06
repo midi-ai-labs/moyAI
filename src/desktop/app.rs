@@ -1683,8 +1683,104 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn workspace_replacement_keeps_the_process_publish_owner_and_fixed_target() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (temp, project_root, mut controller) = empty_access_test_controller().await;
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "Published main".to_string(),
+                cwd: controller.app.workspace.cwd.clone(),
+                model: "unused-by-MCP".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        let target = crate::mcp_publish::PublishTarget::Project {
+            project_id: session.project_id,
+            workspace_root: session.cwd,
+        };
+        let publish = crate::mcp_publish::PublishService::new(
+            Utf8PathBuf::from_path_buf(temp.path().join("application-config/mcp-publish.json"))
+                .unwrap(),
+            controller.app.store.clone(),
+            controller.app.config.clone(),
+        );
+        let initial = publish.refresh().await.unwrap();
+        let saved = publish
+            .save(
+                None,
+                crate::mcp_publish::PublishDraft {
+                    label: "Fixed workspace read".to_string(),
+                    mode: crate::mcp_publish::PublishMode::ReadTools {},
+                    tls: None,
+                    bind: "127.0.0.1:7332".parse().unwrap(),
+                    target: target.clone(),
+                    tools: vec![crate::tool::ToolName::Read],
+                    max_concurrent_calls: 1,
+                    background: crate::mcp_publish::PublishBackgroundPolicy::StopWhenWindowCloses,
+                },
+                &initial.revision,
+                &initial.generation,
+            )
+            .await
+            .unwrap();
+        let profile_id = saved.profiles[0].profile.id;
+        controller.state.mcp_publish = Some(publish.clone());
+        assert!(controller.next_web_state().unwrap().mcp_publish.is_some());
+
+        let replacement_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("different-workspace")).unwrap();
+        std::fs::create_dir(&replacement_root).unwrap();
+        let replacement_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &replacement_root,
+            controller.app.process_runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let snapshot = load_snapshot_for_selection(&replacement_app, None)
+            .await
+            .unwrap();
+        assert!(controller.replace_workspace_from_load(WorkspaceLoadResult {
+            app: replacement_app,
+            snapshot
+        }));
+        assert_ne!(controller.app.workspace.root, project_root);
+        let projected = controller
+            .next_web_state()
+            .unwrap()
+            .mcp_publish
+            .expect("process publication remains visible after project switch");
+        assert_eq!(projected.profiles[0].profile.id, profile_id);
+        assert_eq!(projected.profiles[0].profile.target, target);
+
+        // A command on the original managed service must still update the current
+        // Desktop projection: copying configuration into a new owner is insufficient.
+        let receipt = publish
+            .issue_token(profile_id, &projected.revision, &projected.generation)
+            .await
+            .unwrap();
+        let current = controller.next_web_state().unwrap().mcp_publish.unwrap();
+        assert_eq!(current.revision, receipt.projection.revision);
+        assert!(current.profiles[0].credential_configured);
+        assert_eq!(current.profiles[0].profile.target, target);
+        assert!(publish.shutdown().await);
+    }
+
+    #[tokio::test]
     async fn stale_session_navigation_cannot_replace_a_newer_workspace_with_reused_request_id() {
-        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        let (temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller.state.hub_connection = Some(crate::hub::HubConnection::new(
+            crate::hub::HubSettingsStore::new(
+                Utf8PathBuf::from_path_buf(temp.path().join("hub-settings.json")).unwrap(),
+            ),
+        ));
         let session_id = SessionId::new();
         let stale_request_id = controller.state.begin_session_load(session_id);
         let stale_target = SessionLoadRequestTarget {
@@ -1733,6 +1829,7 @@ mod command_projection_owner_tests {
         assert_eq!(controller.app.workspace.cwd, newer_cwd);
         assert!(controller.state.navigation_loading());
         assert_eq!(controller.state.app_state.current_session_id, None);
+        assert!(controller.next_web_state().unwrap().hub.is_some());
     }
 
     #[tokio::test]
@@ -4217,7 +4314,19 @@ mod command_projection_owner_tests {
         );
         let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        let (temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller.state.hub_connection = Some(crate::hub::HubConnection::new(
+            crate::hub::HubSettingsStore::new(
+                Utf8PathBuf::from_path_buf(temp.path().join("hub-settings.json")).unwrap(),
+            ),
+        ));
+        let idle = controller
+            .next_web_state()
+            .expect("idle route availability");
+        let idle_hub = idle.hub.expect("Hub route settings");
+        assert_eq!(idle_hub.side_chat_mode, crate::hub::HubRouteMode::Direct);
+        assert!(idle_hub.can_change_side_chat_mode);
+        assert!(!controller.hub_context_active(crate::hub::HubReviewContext::SideChat));
         controller
             .configure_side_chat(
                 owner_session_id,
@@ -4300,6 +4409,20 @@ mod command_projection_owner_tests {
         controller.state.app_state.current_session_id = Some(other.id);
         controller.state.app_state.current_session_title = other.title;
 
+        let background = controller
+            .next_web_state()
+            .expect("background Side route availability");
+        assert_ne!(background.side_chat.status, "running");
+        let background_hub = background.hub.expect("Hub route settings");
+        assert!(controller.hub_context_active(crate::hub::HubReviewContext::SideChat));
+        assert_eq!(
+            background_hub.can_change_side_chat_mode,
+            !controller.hub_context_active(crate::hub::HubReviewContext::SideChat),
+            "a background Direct Side run closes the same mode gate used by the command"
+        );
+        assert!(background_hub.can_change_main_mode);
+        assert!(!controller.hub_context_active(crate::hub::HubReviewContext::Main));
+
         let cancel_error = controller
             .cancel_side_chat(owner_session_id, admitted.id, admitted.request_generation)
             .expect_err("stale owner must not stop an active side chat");
@@ -4368,6 +4491,16 @@ mod command_projection_owner_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let settled = controller
+            .next_web_state()
+            .expect("settled Side route availability");
+        assert!(!controller.hub_context_active(crate::hub::HubReviewContext::SideChat));
+        assert!(
+            settled
+                .hub
+                .expect("Hub route settings")
+                .can_change_side_chat_mode
+        );
         assert!(
             controller
                 .app
@@ -5341,6 +5474,7 @@ mod command_projection_owner_tests {
                 pending_turn_inputs: Vec::new(),
                 turn_elapsed_ms: Default::default(),
                 session_token_usage: Default::default(),
+                active_turn_progress: None,
                 latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,
@@ -9375,6 +9509,7 @@ impl DesktopSideChatRun {
 
 fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfile {
     SideChatRequestProfile {
+        hub_route: None,
         base_url: binding.base_url.clone(),
         model: binding.model.clone(),
         provider_profile: binding.provider_profile,
@@ -9689,6 +9824,9 @@ impl DesktopController {
         );
         projection.projection_revision = projection_revision_text(revision);
         if !self.side_chat_runs.is_empty() {
+            if let Some(hub) = &mut projection.hub {
+                hub.can_change_side_chat_mode = false;
+            }
             projection.async_polling_required = true;
             if !projection
                 .pending_async_operations
@@ -10065,6 +10203,14 @@ impl DesktopController {
         };
         let run_control = RunControl::new();
         let cancel = run_control.token();
+        let hub_route = self
+            .state
+            .hub_connection
+            .as_ref()
+            .map(|hub| hub.begin_turn(crate::hub::HubReviewContext::SideChat, cancel.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
         let worker_cancel = cancel.clone();
         let worker_run_control = run_control.clone();
         let store = self.app.store.clone();
@@ -10158,6 +10304,14 @@ impl DesktopController {
                     };
                     let run_generation = admitted.generation;
                     let mut profile = side_chat_request_profile(&admitted.binding);
+                    if let Some(route) = &hub_route {
+                        profile.base_url = route.hub_endpoint().into();
+                        profile.model = route.logical_model().into();
+                        profile.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+                        profile.api_key_env = None;
+                        profile.extra_headers.clear();
+                        profile.hub_route = Some(route.clone());
+                    }
                     profile.system_prompt = prepared.system_prompt.clone();
                     let admission_id = admitted.admission.admission_id;
                     if admission_ack_tx
@@ -10199,6 +10353,9 @@ impl DesktopController {
                         },
                     )
                     .await;
+                    if let Some(route) = &hub_route {
+                        route.finish().await;
+                    }
                     drop(active_run_lease);
                     drop(process_run_lease);
                     let _ = control_tx.send(RuntimeMessage::SideChatFinished {
@@ -10263,6 +10420,17 @@ impl DesktopController {
         );
         self.side_chat_errors.remove(&owner_session_id);
         start_result
+    }
+
+    pub(crate) fn hub_context_active(&self, context: crate::hub::HubReviewContext) -> bool {
+        match context {
+            crate::hub::HubReviewContext::Main => {
+                self.run_lifecycle.root_is_active()
+                    || self.current_agent_tree_active()
+                    || self.state.prompt_enhance_pending()
+            }
+            crate::hub::HubReviewContext::SideChat => !self.side_chat_runs.is_empty(),
+        }
     }
 
     pub(crate) fn cancel_side_chat(
@@ -11962,6 +12130,16 @@ impl DesktopController {
         raw_prompt: String,
         expected_active_turn: ActiveTurnExpectation,
     ) -> bool {
+        if self
+            .state
+            .hub_connection
+            .as_ref()
+            .is_some_and(|hub| hub.projection_now().main_mode == crate::hub::HubRouteMode::Hub)
+        {
+            self.state
+                .set_status_message("この送信先では依頼の整形は未対応です。");
+            return false;
+        }
         if !self.ensure_unscoped_prompt_review_action("prompt enhancement") {
             return false;
         }
@@ -12295,6 +12473,42 @@ impl DesktopController {
         self.state.cancel_docling_readiness_check();
         self.state.replace_global_config(config);
         self.state.refresh_startup_config_status();
+    }
+
+    pub(crate) fn save_device_network_config(
+        &mut self,
+        shared: &crate::device_network::SharedHubConfig,
+        finish_setup: bool,
+    ) -> Result<(), String> {
+        let path =
+            crate::config::loader::global_config_path().map_err(|_| "storage_error".to_string())?;
+        let config = crate::tui::config_editor::save_device_network_config(
+            &path,
+            &self.state.global_config().device_network,
+            shared,
+            |candidate| {
+                if finish_setup
+                    && super::startup::DesktopStartupState::begin(
+                        true,
+                        Some(path.clone()),
+                        &self.app.workspace.root,
+                        candidate,
+                    )
+                    .requires_initial_setup()
+                {
+                    return Err("initial_setup_incomplete".into());
+                }
+                Ok(())
+            },
+        )?;
+        self.app.config = config.clone();
+        self.adopt_global_config_without_network(config);
+        if finish_setup {
+            self.pending_initial_setup_config_import = None;
+            self.state.complete_initial_setup_after_persist();
+            self.state.show_hub_editor();
+        }
+        Ok(())
     }
 
     fn start_new_chat_with_global_access(&mut self) {
@@ -13836,6 +14050,19 @@ impl DesktopController {
         self.next_root_run_generation = next_generation;
         let image_paths = self.state.composer.image_attachment_paths.clone();
         let run_control = RunControl::new();
+        let hub_route = match self
+            .state
+            .hub_connection
+            .as_ref()
+            .map(|hub| hub.begin_turn(crate::hub::HubReviewContext::Main, run_control.token()))
+            .transpose()
+        {
+            Ok(route) => route.flatten(),
+            Err(error) => {
+                self.state.set_status_message(error.to_string());
+                return false;
+            }
+        };
         self.state.begin_agent_run();
         let request = RunRequest {
             prompt: prompt.clone(),
@@ -13871,7 +14098,10 @@ impl DesktopController {
             image_paths: self.state.composer.image_attachment_paths.clone(),
             prompt_review_to_cancel,
         });
-        let run_service = self.app.run_service.clone();
+        let run_service = hub_route.as_ref().map_or_else(
+            || self.app.run_service.clone(),
+            |route| Arc::new(self.app.run_service.with_hub_turn(route.clone())),
+        );
         let runtime_tx = self.runtime_tx.clone();
         let control_tx = self.control_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
@@ -13910,6 +14140,9 @@ impl DesktopController {
                             Err("run command completed without a terminal turn summary".to_string())
                         }
                     });
+                if let Some(route) = &hub_route {
+                    route.finish().await;
+                }
                 match &result {
                     Ok(summary) if !renderer.notified_terminal => {
                         let notification_body =
@@ -14320,7 +14553,13 @@ impl DesktopController {
                 .unmark_project_deleted(&self.app.workspace.root);
         }
         self.session_search_requests.clear();
+        let hub_connection = self.state.hub_connection.clone();
+        let mcp_publish = self.state.mcp_publish.clone();
+        let device_network = self.state.device_network.clone();
         self.state = DesktopState::new(loaded.snapshot, self.app.config.clone());
+        self.state.hub_connection = hub_connection;
+        self.state.mcp_publish = mcp_publish;
+        self.state.device_network = device_network;
         self.state.set_file_change_display_roots(
             &self.app.workspace.root,
             self.app.workspace.authority_root(),

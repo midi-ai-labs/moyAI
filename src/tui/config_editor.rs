@@ -223,6 +223,46 @@ fn save_access_mode(path: &Utf8Path, access_mode: AccessMode) -> Result<(), Stri
     write_access_mode(path, None, access_mode).map(|_| ())
 }
 
+/// Public Hub trust is imported independently of model settings, secrets and
+/// local workspace authority, under the same global config write lease.
+pub(crate) fn save_device_network_config(
+    path: &Utf8Path,
+    expected: &crate::device_network::SharedHubConfig,
+    shared: &crate::device_network::SharedHubConfig,
+    validate: impl FnOnce(&ResolvedConfig) -> Result<(), String>,
+) -> Result<ResolvedConfig, String> {
+    shared
+        .validate()
+        .map_err(|_| "invalid_configuration".to_string())?;
+    let _lease =
+        acquire_global_config_write_lease(path).map_err(|_| "storage_error".to_string())?;
+    let mut document = read_toml_document(path).map_err(|_| "settings_corrupt".to_string())?;
+    let current: crate::device_network::SharedHubConfig = document
+        .get("device_network")
+        .map(|value| value.clone().try_into())
+        .transpose()
+        .map_err(|_| "settings_corrupt".to_string())?
+        .unwrap_or_default();
+    if &current != expected {
+        return Err("connection_changed".into());
+    }
+    document.as_table_mut().ok_or("settings_corrupt")?.insert(
+        "device_network".into(),
+        toml::Value::try_from(shared).map_err(|_| "invalid_configuration".to_string())?,
+    );
+    let text = toml::to_string_pretty(&document).map_err(|_| "storage_error".to_string())?;
+    let resolved =
+        ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(path, &text)
+            .map_err(|_| "invalid_configuration".to_string())?
+            .resolved_config;
+    validate(&resolved)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| "storage_error".to_string())?;
+    }
+    persist_config_tempfile(path, &text).map_err(|_| "storage_error".to_string())?;
+    Ok(resolved)
+}
+
 fn compare_and_set_access_mode(
     path: &Utf8Path,
     expected: AccessMode,
@@ -484,6 +524,78 @@ mod tests {
             GlobalConfigAdoptionPolicy::StrictCurrentSchema,
         )
         .map(|(resolved_config, _)| resolved_config)
+    }
+
+    fn shared_hub_config() -> crate::device_network::SharedHubConfig {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        crate::device_network::SharedHubConfig {
+            hub_url: "https://127.0.0.1:8443".into(),
+            ca_certificate_pem: params.self_signed(&key).unwrap().pem(),
+        }
+    }
+
+    #[test]
+    fn device_network_import_preserves_local_settings_and_rejects_stale_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let original = "[model]\nmodel = 'local-choice'\n[permissions]\naccess_mode = 'default'\n[future_integration]\nlocal_secret = 'retain-this-locally'\n";
+        std::fs::write(&path, original).unwrap();
+        let shared = shared_hub_config();
+        let resolved =
+            super::save_device_network_config(&path, &Default::default(), &shared, |_| Ok(()))
+                .unwrap();
+        assert_eq!(resolved.device_network, shared);
+        assert_eq!(resolved.model.model, "local-choice");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            parsed["future_integration"]["local_secret"].as_str(),
+            Some("retain-this-locally")
+        );
+        assert_eq!(
+            parsed["permissions"]["access_mode"].as_str(),
+            Some("default")
+        );
+        assert_eq!(parsed["device_network"].as_table().unwrap().len(), 2);
+        assert_eq!(
+            super::save_device_network_config(
+                &path,
+                &Default::default(),
+                &shared_hub_config(),
+                |_| Ok(()),
+            )
+            .unwrap_err(),
+            "connection_changed"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    }
+
+    #[test]
+    fn device_network_import_validates_before_persisting_or_creating_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let shared = shared_hub_config();
+        assert_eq!(
+            super::save_device_network_config(&path, &Default::default(), &shared, |_| Err(
+                "initial_setup_incomplete".into()
+            ),)
+            .unwrap_err(),
+            "initial_setup_incomplete"
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, "[model]\nmodel = 'preserved'\n").unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut invalid = shared.clone();
+        invalid.hub_url = "http://127.0.0.1:8443".into();
+        assert_eq!(
+            super::save_device_network_config(&path, &Default::default(), &invalid, |_| Ok(()),)
+                .unwrap_err(),
+            "invalid_configuration"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        super::save_device_network_config(&path, &Default::default(), &shared, |_| Ok(())).unwrap();
     }
 
     #[test]

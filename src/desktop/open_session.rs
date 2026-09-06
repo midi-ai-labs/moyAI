@@ -68,6 +68,15 @@ impl OpenSessionView {
         self.read.active_turn_id
     }
 
+    pub fn active_turn_progress(
+        &self,
+    ) -> Option<&crate::session::model::CanonicalActiveTurnProgress> {
+        self.read
+            .active_turn_progress
+            .as_ref()
+            .filter(|progress| Some(progress.turn_id) == self.read.active_turn_id)
+    }
+
     pub fn latest_turn_id(&self) -> Option<crate::protocol::TurnId> {
         self.read.latest_turn_id
     }
@@ -158,12 +167,21 @@ impl OpenSessionView {
         {
             return false;
         }
+        if self.read.admission_revision > incoming.admission_revision
+            || (self.read.admission_revision == incoming.admission_revision
+                && self.read.active_turn_id.is_some()
+                && self.read.active_turn_id == incoming.active_turn_id
+                && self.read.active_turn_sequence_no > incoming.active_turn_sequence_no)
+        {
+            return true;
+        }
         self.read.session = incoming.session.clone();
         self.read.history = incoming.history.clone();
         self.read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
         self.read.latest_turn_id = incoming.latest_turn_id;
         self.read.active_turn_id = incoming.active_turn_id;
         self.read.active_turn_sequence_no = incoming.active_turn_sequence_no;
+        self.read.active_turn_progress = incoming.active_turn_progress.clone();
         self.read.admission_revision = incoming.admission_revision;
         self.read.turn_elapsed_ms.extend(
             incoming
@@ -616,6 +634,12 @@ fn canonical_metadata_is_newer(
     if incoming.admission_revision != existing.admission_revision {
         return incoming.admission_revision > existing.admission_revision;
     }
+    if incoming.active_turn_id.is_some()
+        && incoming.active_turn_id == existing.active_turn_id
+        && incoming.active_turn_sequence_no != existing.active_turn_sequence_no
+    {
+        return incoming.active_turn_sequence_no > existing.active_turn_sequence_no;
+    }
     if incoming.session.updated_at_ms != existing.session.updated_at_ms {
         return incoming.session.updated_at_ms > existing.session.updated_at_ms;
     }
@@ -694,6 +718,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
+            active_turn_progress: None,
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,

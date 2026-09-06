@@ -1,4 +1,8 @@
 import type { PermissionDecisionState } from "./decision_state.ts";
+import { createHubUiState, hubPresentation, type HubPresentation } from "./hub_state.ts";
+import { createDeviceNetworkUiState, deviceNetworkPresentation, type DeviceNetworkPresentation } from "./device_network_state.ts";
+import { createPublishUiState, publishPresentation, type PublishPresentation } from "./mcp_publish_state.ts";
+import { createMcpPeerState, mcpPeerPresentation, type McpPeerPresentation } from "./mcp_peer.ts";
 import type { LocalConfirmation } from "./render_overlays.ts";
 import type { DesktopViewState } from "./types.ts";
 import type {
@@ -30,6 +34,10 @@ import type { SideChatPendingQuote } from "./types.ts";
  * not belong in the render model.
  */
 export interface DesktopRenderLocalPresentation {
+  readonly hub: HubPresentation;
+  readonly deviceNetwork: DeviceNetworkPresentation;
+  readonly mcpPublish: PublishPresentation;
+  readonly mcpPeers: McpPeerPresentation;
   readonly artifactPane: {
     readonly collapsed: boolean;
     readonly mode: ArtifactPaneMode;
@@ -89,6 +97,10 @@ export interface DesktopRenderModel {
 
 export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLocalPresentation>
   = snapshotLocalPresentation({
+    hub: hubPresentation(createHubUiState()),
+    deviceNetwork: deviceNetworkPresentation(createDeviceNetworkUiState()),
+    mcpPublish: publishPresentation(createPublishUiState()),
+    mcpPeers: mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
       collapsed: false,
       mode: "output",
@@ -192,6 +204,10 @@ function snapshotLocalPresentation(
   const sessionSettings = local.sessionSettings
     ?? DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sessionSettings;
   const snapshot: DesktopRenderLocalPresentation = {
+    hub: local.hub ?? hubPresentation(createHubUiState()),
+    deviceNetwork: local.deviceNetwork ?? deviceNetworkPresentation(createDeviceNetworkUiState()),
+    mcpPublish: local.mcpPublish ?? publishPresentation(createPublishUiState()),
+    mcpPeers: local.mcpPeers ?? mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
       collapsed: local.artifactPane.collapsed,
       mode: local.artifactPane.mode,

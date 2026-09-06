@@ -393,6 +393,44 @@ impl AppState {
             },
         );
         self.pending_turn_inputs = read.pending_turn_inputs.clone();
+        if let Some(progress) = &read.active_turn_progress {
+            self.reconcile_active_turn_progress(read.session.id, progress, &read.turns.items);
+        }
+    }
+
+    pub(crate) fn reconcile_active_turn_progress(
+        &mut self,
+        session_id: SessionId,
+        progress: &crate::session::model::CanonicalActiveTurnProgress,
+        turn_items: &[TurnItem],
+    ) {
+        if self.current_session_id != Some(session_id)
+            || self.run_status != RunStatus::Running
+            || self
+                .active_turn_expectation
+                .active_turn_id()
+                .is_some_and(|turn_id| turn_id != progress.turn_id)
+        {
+            return;
+        }
+        for status in tool_statuses_from_turn_items_for_turn(turn_items, Some(progress.turn_id)) {
+            if let Some(existing) = self
+                .tool_statuses
+                .iter_mut()
+                .find(|existing| existing.tool_call_id == status.tool_call_id)
+            {
+                *existing = status;
+            } else {
+                self.tool_statuses.push(status);
+            }
+        }
+        self.progress.model_requests = progress.model_request_count;
+        self.progress.tool_calls_started = progress.tool_call_count;
+        self.progress.tool_calls_completed = progress.completed_tool_count;
+        self.progress.tool_calls_declined = progress.declined_tool_count;
+        self.progress.tool_calls_cancelled = progress.cancelled_tool_count;
+        self.progress.tool_calls_failed = progress.failed_tool_count;
+        self.progress.compactions = progress.compaction_count;
     }
 
     pub fn refresh_canonical_conversation(&mut self, read: &CanonicalSessionRead) -> bool {
@@ -1856,6 +1894,7 @@ mod tests {
             pending_turn_inputs,
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
+            active_turn_progress: None,
             latest_turn_id: active_turn_id,
             active_turn_id,
             active_turn_sequence_no: active_turn_id.map(|_| 1),

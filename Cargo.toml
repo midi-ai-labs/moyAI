@@ -1,6 +1,6 @@
 [package]
 name = "moyai"
-version = "2.1.1"
+version = "3.0.0"
 edition = "2024"
 build = "build.rs"
 license = "MIT"
@@ -28,6 +28,7 @@ required-features = ["tauri-desktop"]
 
 [dependencies]
 async-trait = "0.1.89"
+axum = { version = "0.8.6", features = ["multipart"] }
 base64 = "0.22.1"
 bytes = "1.10.1"
 camino = { version = "1.2.1", features = ["serde1"] }
@@ -44,6 +45,7 @@ globset = "0.4.16"
 httpdate = "1.0.3"
 ignore = "0.4.24"
 ratatui = "0.29.0"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 regex = "1.11.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 rfd = { version = "0.15.4", optional = true }
@@ -58,6 +60,7 @@ tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "time", "sync", "io-util"] }
 tokio-util = { version = "0.7.16", features = ["rt"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 toml = "0.8.23"
 tui-textarea = "0.7.0"
 ulid = { version = "1.2.1", features = ["serde"] }
@@ -87,7 +90,6 @@ libc = "0.2.184"
 
 [dev-dependencies]
 assert_cmd = "2.1.1"
-axum = { version = "0.8.6", features = ["multipart"] }
 
 [build-dependencies]
 tauri-build = { version = "2.5.1", optional = true }

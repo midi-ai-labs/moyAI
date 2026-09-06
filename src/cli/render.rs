@@ -779,6 +779,7 @@ pub fn cli_session_read_payload_preserves_metadata_pages_fixture_passes() -> boo
         },
         turn_elapsed_ms: Default::default(),
         session_token_usage: Default::default(),
+        active_turn_progress: None,
         pending_turn_inputs: Vec::new(),
         latest_turn_id: Some(active_turn_id),
         active_turn_id: Some(active_turn_id),

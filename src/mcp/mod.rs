@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -21,6 +22,25 @@ const MAX_MCP_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_MCP_REQUEST_HEADER_COUNT: usize = 64;
 const MAX_MCP_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const MAX_MCP_REQUEST_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+const STREAMABLE_PROTOCOL_VERSION: &str = "2025-11-25";
+
+#[derive(Clone, PartialEq, Eq)]
+struct NegotiatedSession {
+    id: Option<String>,
+}
+
+impl std::fmt::Debug for NegotiatedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NegotiatedSession { credential: [redacted] }")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectedEndpoint {
+    endpoint: String,
+    /// None preserves legacy endpoints that accept tools/list without initialization.
+    session: Option<NegotiatedSession>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
@@ -111,27 +131,73 @@ pub enum McpOperationResult {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpClient {
     config: McpConfig,
-    http: reqwest::Client,
-    resolved_endpoints: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    http: HashMap<String, Result<reqwest::Client, String>>,
+    connections: Arc<HashMap<String, tokio::sync::Mutex<Option<ConnectedEndpoint>>>>,
+    request_ids: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for McpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpClient")
+            .field("configured_servers", &self.config.servers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl McpClient {
     pub fn new(config: McpConfig) -> Self {
+        let connections = config
+            .servers
+            .iter()
+            .map(|server| (server.id.clone(), tokio::sync::Mutex::new(None)))
+            .collect();
+        let http = config
+            .servers
+            .iter()
+            .map(|server| {
+                let client = (|| {
+                    let mut builder =
+                        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+                    if let Some(pem) = &server.trusted_certificate_pem {
+                        if pem.len() > 65536 {
+                            return Err("MCP certificate size limit".into());
+                        }
+                        let cert = reqwest::Certificate::from_pem(pem.as_bytes())
+                            .map_err(|_| "invalid MCP trusted certificate".to_string())?;
+                        // Trust belongs to this peer alone. Other connections do not
+                        // inherit its certificate, and hostname validation stays on.
+                        builder = builder
+                            .tls_built_in_root_certs(false)
+                            .add_root_certificate(cert);
+                    }
+                    builder
+                        .build()
+                        .map_err(|_| "MCP HTTP client configuration failed".into())
+                })();
+                (server.id.clone(), client)
+            })
+            .collect();
         Self {
             config,
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("static no-redirect MCP HTTP client configuration"),
-            resolved_endpoints: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            http,
+            connections: Arc::new(connections),
+            request_ids: Arc::new(AtomicU64::new(1)),
         }
     }
 
     pub fn config(&self) -> &McpConfig {
         &self.config
+    }
+
+    pub(crate) fn with_runtime_http(mut self, server_id: &str, http: reqwest::Client) -> Self {
+        if self.http.contains_key(server_id) {
+            self.http.insert(server_id.to_string(), Ok(http));
+        }
+        self
     }
 
     pub async fn list_tools(
@@ -145,7 +211,7 @@ impl McpClient {
         let server = self.server(server_id)?;
         let deadline = mcp_operation_deadline(server)?;
 
-        let (endpoint, response) = self
+        let (connection, response) = self
             .resolve_endpoint_with_tools_list(server, deadline, &mut effect_checkpoint)
             .await?;
         let mut tools = parse_tools(&response)?;
@@ -167,7 +233,7 @@ impl McpClient {
         };
         Ok(McpOperationResult::ToolsListed {
             server_id: server.id.clone(),
-            endpoint,
+            endpoint: connection.endpoint,
             tools: filtered,
         })
     }
@@ -196,16 +262,14 @@ impl McpClient {
             )));
         }
 
-        let endpoint = if let Some(endpoint) = self
-            .resolved_endpoints
-            .lock()
+        let cached = tokio::time::timeout_at(deadline, self.connections[&server.id].lock())
             .await
-            .get(&server.id)
-            .cloned()
-        {
-            endpoint
+            .map_err(|_| mcp_deadline_error(server))?
+            .clone();
+        let connection = if let Some(connection) = cached {
+            connection
         } else {
-            let (endpoint, response) = self
+            let (connection, response) = self
                 .resolve_endpoint_with_tools_list(server, deadline, &mut effect_checkpoint)
                 .await?;
             let tools = parse_tools(&response)?;
@@ -215,16 +279,16 @@ impl McpClient {
                     server.id
                 )));
             }
-            endpoint
+            connection
         };
         // The effectful request has exactly one transport boundary. Endpoint
         // discovery is completed by a read-only tools/list call before this
         // point, so an ambiguous HTTP failure can never replay tools/call at a
         // fallback URL.
         let response = self
-            .post_json(
+            .post_wire(
                 server,
-                &endpoint,
+                &connection.endpoint,
                 json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -234,15 +298,25 @@ impl McpClient {
                         "arguments": arguments,
                     }
                 }),
+                connection.session.as_ref(),
                 deadline,
                 &mut effect_checkpoint,
             )
             .await?;
-        if let Some(error) = response.get("error") {
-            return Err(ToolError::Message(format!(
-                "mcp tools/call returned an error: {}",
-                serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
-            )));
+        if response.status == reqwest::StatusCode::NOT_FOUND && connection.session.is_some() {
+            let mut current =
+                tokio::time::timeout_at(deadline, self.connections[&server.id].lock())
+                    .await
+                    .map_err(|_| mcp_deadline_error(server))?;
+            if current.as_ref() == Some(&connection) {
+                *current = None;
+            }
+        }
+        let response = response.rpc_value(connection.session.is_some())?;
+        if response.get("error").is_some() {
+            return Err(ToolError::Message(
+                "mcp tools/call returned a protocol error".into(),
+            ));
         }
         let result = response
             .get("result")
@@ -250,7 +324,7 @@ impl McpClient {
             .ok_or_else(|| ToolError::Message("mcp response is missing `result`".to_string()))?;
         Ok(McpOperationResult::ToolCalled {
             server_id: server.id.clone(),
-            endpoint,
+            endpoint: connection.endpoint,
             tool_name: tool_name.to_string(),
             output_text: render_tool_call_output(&result),
             raw_result: result,
@@ -258,6 +332,18 @@ impl McpClient {
     }
 
     fn server(&self, server_id: &str) -> Result<&McpServerConfig, ToolError> {
+        if self
+            .config
+            .servers
+            .iter()
+            .filter(|server| server.id == server_id)
+            .count()
+            != 1
+        {
+            return Err(ToolError::Message(
+                "unknown or ambiguous MCP connection ID".into(),
+            ));
+        }
         let server = self
             .config
             .servers
@@ -272,6 +358,7 @@ impl McpClient {
         Ok(server)
     }
 
+    #[cfg(test)]
     async fn post_json(
         &self,
         server: &McpServerConfig,
@@ -280,9 +367,35 @@ impl McpClient {
         deadline: Instant,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<Value, ToolError> {
-        let prepared = prepare_mcp_request(server, endpoint, &payload)?;
+        self.post_wire(server, endpoint, payload, None, deadline, effect_checkpoint)
+            .await?
+            .rpc_value(false)
+    }
+
+    async fn post_wire(
+        &self,
+        server: &McpServerConfig,
+        endpoint: &str,
+        mut payload: Value,
+        session: Option<&NegotiatedSession>,
+        deadline: Instant,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
+    ) -> Result<McpHttpReply, ToolError> {
+        if payload.get("id").is_some() {
+            let id = self
+                .request_ids
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| ToolError::Message("mcp request identity exhausted".into()))?;
+            payload["id"] = json!(id);
+        }
+        let sent_id = payload.get("id").cloned();
+        let prepared = prepare_mcp_session_request(server, endpoint, &payload, session)?;
         let mut request = self
             .http
+            .get(&server.id)
+            .ok_or_else(|| ToolError::Message("MCP connection is unavailable".into()))?
+            .as_ref()
+            .map_err(|error| ToolError::Message(error.clone()))?
             .post(prepared.endpoint.clone())
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json");
@@ -305,6 +418,19 @@ impl McpClient {
                 .await
                 .map_err(|error| ToolError::Message(format!("mcp request failed: {error}")))?;
             let status = response.status();
+            let session_header = response.headers().get("mcp-session-id").map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 128
+                            && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                    })
+                    .map(str::to_owned)
+            });
+            let invalid_session_header = session_header.as_ref().is_some_and(Option::is_none)
+                || response.headers().get_all("mcp-session-id").iter().count() > 1;
             if response
                 .content_length()
                 .is_some_and(|length| length > MAX_MCP_RESPONSE_BYTES as u64)
@@ -325,19 +451,30 @@ impl McpClient {
             let body = String::from_utf8(body_bytes).map_err(|_| {
                 ToolError::Message("mcp response body is not valid UTF-8".to_string())
             })?;
-            if !status.is_success() {
-                let mut hint = String::new();
-                if body.to_ascii_lowercase().contains("invalid host header") {
-                    hint = " Configure `[mcp.servers[].headers]` if this server requires a specific Host header.".to_string();
+            let invalid_host = body.to_ascii_lowercase().contains("invalid host header");
+            // Remote error bodies and session IDs are never diagnostic text. They
+            // may echo credentials or tool input; only typed status reaches errors.
+            let value = if body.trim().is_empty() {
+                None
+            } else {
+                match parse_json_or_sse(&body) {
+                    Ok(value) => Some(value),
+                    Err(_) if !status.is_success() => None,
+                    Err(_) => {
+                        return Err(ToolError::Message(
+                            "failed to parse mcp response body".into(),
+                        ));
+                    }
                 }
-                return Err(ToolError::Message(format!(
-                    "mcp request to `{endpoint}` failed with HTTP {}: {}.{}",
-                    status.as_u16(),
-                    compact_body(&body),
-                    hint
-                )));
-            }
-            parse_json_or_sse(&body)
+            };
+            Ok(McpHttpReply {
+                status,
+                value,
+                sent_id,
+                session_id: session_header.flatten(),
+                invalid_session_header,
+                invalid_host,
+            })
         })
         .await
         .map_err(|_| mcp_deadline_error(server))?
@@ -348,7 +485,31 @@ impl McpClient {
         server: &McpServerConfig,
         deadline: Instant,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
-    ) -> Result<(String, Value), ToolError> {
+    ) -> Result<(ConnectedEndpoint, Value), ToolError> {
+        // One owner per configured server serializes discovery/initialization, but
+        // unrelated configured servers and already admitted tool calls stay independent.
+        let mut current = tokio::time::timeout_at(deadline, self.connections[&server.id].lock())
+            .await
+            .map_err(|_| mcp_deadline_error(server))?;
+        if let Some(connection) = current.clone() {
+            let reply = self
+                .post_wire(
+                    server,
+                    &connection.endpoint,
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+                    connection.session.as_ref(),
+                    deadline,
+                    effect_checkpoint,
+                )
+                .await?;
+            if reply.status == reqwest::StatusCode::NOT_FOUND && connection.session.is_some() {
+                *current = None;
+            } else {
+                let value = reply.rpc_value(connection.session.is_some())?;
+                parse_tools(&value)?;
+                return Ok((connection, value));
+            }
+        }
         let endpoints = endpoint_candidates(&server.base_url)?;
         if endpoints.is_empty() {
             return Err(ToolError::Message(
@@ -357,8 +518,8 @@ impl McpClient {
         }
         let mut last_error = None;
         for endpoint in endpoints {
-            match self
-                .post_json(
+            let discovered = self
+                .post_wire(
                     server,
                     &endpoint,
                     json!({
@@ -367,18 +528,55 @@ impl McpClient {
                         "method": "tools/list",
                         "params": {}
                     }),
+                    None,
                     deadline,
                     effect_checkpoint,
                 )
-                .await
-            {
-                Ok(response) => {
+                .await;
+            match discovered {
+                Ok(reply) => {
+                    let (connection, response) =
+                        if reply.status == reqwest::StatusCode::BAD_REQUEST {
+                            // Probe lifecycle only after a read-only request is refused.
+                            // Legacy successful tools/list never incurs an extra handshake.
+                            let session = match self
+                                .initialize(server, &endpoint, deadline, effect_checkpoint)
+                                .await
+                            {
+                                Ok(session) => session,
+                                Err(ToolError::RunInterrupted) => {
+                                    return Err(ToolError::RunInterrupted);
+                                }
+                                Err(error) => {
+                                    last_error = Some(error);
+                                    continue;
+                                }
+                            };
+                            let response = self.post_wire(server, &endpoint,
+                            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+                            Some(&session), deadline, effect_checkpoint).await?.rpc_value(true)?;
+                            (
+                                ConnectedEndpoint {
+                                    endpoint,
+                                    session: Some(session),
+                                },
+                                response,
+                            )
+                        } else if reply.status.is_success() {
+                            (
+                                ConnectedEndpoint {
+                                    endpoint,
+                                    session: None,
+                                },
+                                reply.rpc_value(false)?,
+                            )
+                        } else {
+                            last_error = Some(reply.rpc_value(false).unwrap_err());
+                            continue;
+                        };
                     parse_tools(&response)?;
-                    self.resolved_endpoints
-                        .lock()
-                        .await
-                        .insert(server.id.clone(), endpoint.clone());
-                    return Ok((endpoint, response));
+                    *current = Some(connection.clone());
+                    return Ok((connection, response));
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -387,6 +585,108 @@ impl McpClient {
             ToolError::Message("mcp request failed without a detailed error".to_string())
         }))
     }
+
+    async fn initialize(
+        &self,
+        server: &McpServerConfig,
+        endpoint: &str,
+        deadline: Instant,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
+    ) -> Result<NegotiatedSession, ToolError> {
+        let reply = self
+            .post_wire(
+                server,
+                endpoint,
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                        "protocolVersion":STREAMABLE_PROTOCOL_VERSION,"capabilities":{},
+                        "clientInfo":{"name":"moyAI Desktop","version":env!("CARGO_PKG_VERSION")}
+                    }
+                }),
+                None,
+                deadline,
+                effect_checkpoint,
+            )
+            .await?;
+        if reply.invalid_session_header {
+            return Err(ToolError::Message(
+                "mcp initialize returned an invalid session header".into(),
+            ));
+        }
+        let session = NegotiatedSession {
+            id: reply.session_id.clone(),
+        };
+        let value = reply.rpc_value(true)?;
+        let result = value
+            .get("result")
+            .ok_or_else(|| ToolError::Message("mcp initialize was rejected".into()))?;
+        if result.get("protocolVersion").and_then(Value::as_str)
+            != Some(STREAMABLE_PROTOCOL_VERSION)
+            || !result
+                .get("capabilities")
+                .and_then(|caps| caps.get("tools"))
+                .is_some_and(Value::is_object)
+            || !result.get("serverInfo").is_some_and(Value::is_object)
+        {
+            return Err(ToolError::Message(
+                "mcp initialize returned unsupported protocol or capabilities".into(),
+            ));
+        }
+        let acknowledged = self
+            .post_wire(
+                server,
+                endpoint,
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                Some(&session),
+                deadline,
+                effect_checkpoint,
+            )
+            .await?;
+        if acknowledged.status != reqwest::StatusCode::ACCEPTED || acknowledged.value.is_some() {
+            return Err(ToolError::Message(
+                "mcp initialized notification was not accepted".into(),
+            ));
+        }
+        Ok(session)
+    }
+}
+
+struct McpHttpReply {
+    status: reqwest::StatusCode,
+    value: Option<Value>,
+    sent_id: Option<Value>,
+    session_id: Option<String>,
+    invalid_session_header: bool,
+    invalid_host: bool,
+}
+
+impl McpHttpReply {
+    fn rpc_value(self, strict: bool) -> Result<Value, ToolError> {
+        if !self.status.is_success() {
+            let hint = if self.invalid_host {
+                " Configure `[mcp.servers[].headers]` if this server requires a specific Host header."
+            } else {
+                ""
+            };
+            return Err(ToolError::Message(format!(
+                "mcp request failed with HTTP {}.{hint}",
+                self.status.as_u16()
+            )));
+        }
+        let value = self
+            .value
+            .ok_or_else(|| ToolError::Message("mcp response body is empty".into()))?;
+        if strict
+            && (value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                || value.get("id") != self.sent_id.as_ref()
+                || value.get("result").is_some() == value.get("error").is_some())
+        {
+            return Err(ToolError::Message(
+                "mcp response does not match its request".into(),
+            ));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Debug)]
@@ -394,6 +694,34 @@ struct PreparedMcpRequest {
     endpoint: reqwest::Url,
     body: Vec<u8>,
     configured_headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+fn prepare_mcp_session_request(
+    server: &McpServerConfig,
+    endpoint: &str,
+    payload: &Value,
+    session: Option<&NegotiatedSession>,
+) -> Result<PreparedMcpRequest, ToolError> {
+    let Some(session) = session else {
+        return prepare_mcp_request(server, endpoint, payload);
+    };
+    let mut negotiated = server.clone();
+    negotiated.headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("mcp-session-id")
+            && !name.eq_ignore_ascii_case("mcp-protocol-version")
+    });
+    negotiated.headers.insert(
+        "MCP-Protocol-Version".into(),
+        STREAMABLE_PROTOCOL_VERSION.into(),
+    );
+    if let Some(id) = &session.id {
+        negotiated
+            .headers
+            .insert("MCP-Session-Id".into(), id.clone());
+    }
+    // Negotiated headers count toward the existing envelope/header budgets and
+    // cannot be overridden by stale, differently-cased configuration headers.
+    prepare_mcp_request(&negotiated, endpoint, payload)
 }
 
 fn mcp_operation_deadline(server: &McpServerConfig) -> Result<Instant, ToolError> {
@@ -467,11 +795,17 @@ fn prepare_mcp_request(
                 "mcp request header name `{visible_name}` is invalid"
             ))
         })?;
-        let value = HeaderValue::from_str(value).map_err(|_| {
+        let mut value = HeaderValue::from_str(value).map_err(|_| {
             ToolError::Message(format!(
                 "mcp request header `{visible_name}` has an invalid value"
             ))
         })?;
+        if matches!(
+            name.as_str(),
+            "authorization" | "proxy-authorization" | "mcp-session-id"
+        ) {
+            value.set_sensitive(true);
+        }
         header_bytes = header_bytes
             .checked_add(name.as_str().len())
             .and_then(|total| total.checked_add(value.as_bytes().len()))
@@ -593,18 +927,16 @@ fn parse_json_or_sse(body: &str) -> Result<Value, ToolError> {
         }
     }
 
-    Err(ToolError::Message(format!(
-        "failed to parse mcp response body: {}",
-        compact_body(body)
-    )))
+    Err(ToolError::Message(
+        "failed to parse mcp response body".into(),
+    ))
 }
 
 fn parse_tools(response: &Value) -> Result<Vec<McpToolDescriptor>, ToolError> {
-    if let Some(error) = response.get("error") {
-        return Err(ToolError::Message(format!(
-            "mcp tools/list returned an error: {}",
-            serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
-        )));
+    if response.get("error").is_some() {
+        return Err(ToolError::Message(
+            "mcp tools/list returned a protocol error".into(),
+        ));
     }
     let tools = response
         .get("result")
@@ -634,7 +966,7 @@ fn parse_tool_descriptor(index: usize, tool: &Value) -> Result<McpToolDescriptor
     let description = match tool.get("description") {
         Some(value) => Some(value.as_str().ok_or_else(|| {
             ToolError::Message(format!(
-                "mcp tools/list descriptor `{name}` has non-string `description`"
+                "mcp tools/list descriptor at index {index} has non-string `description`"
             ))
         })?),
         None => None,
@@ -645,9 +977,9 @@ fn parse_tool_descriptor(index: usize, tool: &Value) -> Result<McpToolDescriptor
         description: description.map(str::to_string),
         input_schema: tool.get("inputSchema").cloned(),
         annotations: match tool.get("annotations") {
-            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|_| {
                 ToolError::Message(format!(
-                    "mcp tools/list descriptor `{name}` has invalid `annotations`: {error}"
+                    "mcp tools/list descriptor at index {index} has invalid `annotations`"
                 ))
             })?),
             None => None,
@@ -696,20 +1028,6 @@ fn render_content_item(item: &Value) -> Option<String> {
                 format!("{uri}\n{text}")
             }),
         Some(_) | None => serde_json::to_string_pretty(item).ok(),
-    }
-}
-
-fn compact_body(body: &str) -> String {
-    let single_line = body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if single_line.len() <= 240 {
-        single_line
-    } else {
-        clip_text_with_ellipsis(&single_line, 243)
     }
 }
 
@@ -782,11 +1100,14 @@ mod tests {
         McpConfig {
             enabled: true,
             servers: vec![McpServerConfig {
+                display_name: None,
                 id: "fixture".to_string(),
                 enabled: true,
                 transport: crate::config::McpTransportKind::Http,
                 base_url: "http://mcp.invalid".to_string(),
                 timeout_ms: 2_000,
+                remote_agent: false,
+                trusted_certificate_pem: None,
                 tool_routes: vec![
                     crate::config::McpToolRouteConfig {
                         name: "inspect".to_string(),
@@ -800,6 +1121,97 @@ mod tests {
                 headers: BTreeMap::new(),
             }],
         }
+    }
+
+    #[test]
+    fn negotiated_headers_and_diagnostics_keep_session_and_response_secrets_private() {
+        const SECRET: &str = "session-and-response-secret";
+        let mut config = routed_config();
+        config.servers[0]
+            .headers
+            .insert("authorization".into(), SECRET.into());
+        config.servers[0]
+            .headers
+            .insert("mcp-session-id".into(), "stale-session".into());
+        config.servers[0]
+            .headers
+            .insert("mcp-protocol-version".into(), "stale-version".into());
+        let session = NegotiatedSession {
+            id: Some(SECRET.into()),
+        };
+        let request = prepare_mcp_session_request(
+            &config.servers[0],
+            "http://mcp.invalid",
+            &json!({}),
+            Some(&session),
+        )
+        .unwrap();
+        assert_eq!(
+            request
+                .configured_headers
+                .iter()
+                .filter(|(name, _)| name == "mcp-session-id")
+                .count(),
+            1
+        );
+        assert!(
+            request
+                .configured_headers
+                .iter()
+                .any(|(name, value)| name == "mcp-session-id" && value == SECRET)
+        );
+        assert!(!format!("{request:?}").contains(SECRET));
+        assert!(!format!("{session:?}").contains(SECRET));
+        assert!(!format!("{:?}", McpClient::new(config)).contains(SECRET));
+        assert!(
+            !parse_json_or_sse(SECRET)
+                .unwrap_err()
+                .to_string()
+                .contains(SECRET)
+        );
+        assert!(
+            !parse_tools(&json!({"error":{"message":SECRET}}))
+                .unwrap_err()
+                .to_string()
+                .contains(SECRET)
+        );
+        let mismatch = McpHttpReply {
+            status: reqwest::StatusCode::OK,
+            value: Some(json!({"jsonrpc":"2.0","id":SECRET,"result":{}})),
+            sent_id: Some(json!(1)),
+            session_id: None,
+            invalid_session_header: false,
+            invalid_host: false,
+        }
+        .rpc_value(true)
+        .unwrap_err();
+        assert!(!mismatch.to_string().contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn legacy_bad_request_root_can_still_fall_back_to_a_working_tools_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(|| async { StatusCode::BAD_REQUEST }))
+            .route(
+                "/mcp",
+                post(|| async {
+                    Json(json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"inspect"}]}}))
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = routed_config();
+        config.servers[0].base_url = format!("http://{address}");
+        let client = McpClient::new(config);
+        let result = client.list_tools("fixture", || Ok(())).await.unwrap();
+        assert!(
+            matches!(result, McpOperationResult::ToolsListed { tools, .. } if tools.len() == 1)
+        );
+        task.abort();
+        let _ = task.await;
     }
 
     #[test]
@@ -1032,11 +1444,14 @@ mod tests {
         let client = McpClient::new(McpConfig {
             enabled: true,
             servers: vec![McpServerConfig {
+                display_name: None,
                 id: "fixture".to_string(),
                 enabled: true,
                 transport: crate::config::McpTransportKind::Http,
                 base_url: format!("http://{source_address}/mcp"),
                 timeout_ms: 2_000,
+                remote_agent: false,
+                trusted_certificate_pem: None,
                 tool_routes: Vec::new(),
                 headers: BTreeMap::from([(
                     "Authorization".to_string(),
@@ -1126,11 +1541,14 @@ mod tests {
         let client = McpClient::new(McpConfig {
             enabled: true,
             servers: vec![McpServerConfig {
+                display_name: None,
                 id: "fixture".to_string(),
                 enabled: true,
                 transport: crate::config::McpTransportKind::Http,
                 base_url: format!("http://{address}"),
                 timeout_ms: 500,
+                remote_agent: false,
+                trusted_certificate_pem: None,
                 tool_routes: vec![crate::config::McpToolRouteConfig {
                     name: "change".to_string(),
                     effect: ToolEffectClass::Mutation,
@@ -1172,11 +1590,14 @@ mod tests {
         let client = McpClient::new(McpConfig {
             enabled: true,
             servers: vec![McpServerConfig {
+                display_name: None,
                 id: "fixture".to_string(),
                 enabled: true,
                 transport: crate::config::McpTransportKind::Http,
                 base_url: format!("http://{address}"),
                 timeout_ms: 2_000,
+                remote_agent: false,
+                trusted_certificate_pem: None,
                 tool_routes: Vec::new(),
                 headers: BTreeMap::new(),
             }],
@@ -1257,11 +1678,14 @@ mod tests {
         let client = McpClient::new(McpConfig {
             enabled: true,
             servers: vec![McpServerConfig {
+                display_name: None,
                 id: "fixture".to_string(),
                 enabled: true,
                 transport: crate::config::McpTransportKind::Http,
                 base_url: format!("http://{address}"),
                 timeout_ms: 2_000,
+                remote_agent: false,
+                trusted_certificate_pem: None,
                 tool_routes: vec![crate::config::McpToolRouteConfig {
                     name: "change".to_string(),
                     effect: ToolEffectClass::Mutation,

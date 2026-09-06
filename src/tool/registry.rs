@@ -5,6 +5,7 @@ use async_trait::async_trait;
 
 use crate::error::ToolError;
 use crate::tool::context::{ToolContext, ToolServices};
+use crate::tool::read_context::ReadToolContext;
 use crate::tool::{ToolEffectClass, ToolResult, ToolSpec};
 
 #[async_trait(?Send)]
@@ -15,6 +16,17 @@ pub trait Tool: Send + Sync {
         raw_arguments: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError>;
+
+    /// Only tools with a shared read implementation opt into session-free execution.
+    async fn execute_read(
+        &self,
+        _raw_arguments: serde_json::Value,
+        _ctx: ReadToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Message(
+            "This tool does not support published reads".into(),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -220,6 +232,24 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| self.unknown_tool_error(name))?;
         tool.execute(raw_arguments, ctx).await
+    }
+
+    pub(crate) async fn execute_published_read(
+        &self,
+        name: &str,
+        raw_arguments: serde_json::Value,
+        ctx: ReadToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| self.unknown_tool_error(name))?;
+        if tool.spec().effect != crate::tool::ToolEffectPolicy::read() {
+            return Err(ToolError::Message(
+                "Published tools must be static reads".into(),
+            ));
+        }
+        tool.execute_read(raw_arguments, ctx).await
     }
 }
 

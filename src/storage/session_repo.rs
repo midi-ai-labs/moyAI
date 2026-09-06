@@ -496,6 +496,7 @@ pub(crate) struct CanonicalSessionStorageSnapshot {
     pub active_turn_position: Option<(TurnId, i64)>,
     pub pending_turn_inputs: Vec<crate::session::PendingTurnInputProjection>,
     pub admission_revision: u64,
+    pub active_turn_progress: Option<crate::session::model::CanonicalActiveTurnProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +549,7 @@ struct TurnAdmissionRequest {
     expected_latest_turn_id: Option<Option<TurnId>>,
     expected_admission_revision: Option<u64>,
     root_continuation_predecessor_turn_id: Option<TurnId>,
+    expected_remote_job_id: Option<ulid::Ulid>,
 }
 
 impl TurnAdmissionRequest {
@@ -562,6 +564,7 @@ impl TurnAdmissionRequest {
             expected_latest_turn_id: None,
             expected_admission_revision: None,
             root_continuation_predecessor_turn_id: None,
+            expected_remote_job_id: None,
         }
     }
 
@@ -576,6 +579,7 @@ impl TurnAdmissionRequest {
             expected_latest_turn_id: None,
             expected_admission_revision: None,
             root_continuation_predecessor_turn_id: None,
+            expected_remote_job_id: None,
         }
     }
 
@@ -590,6 +594,7 @@ impl TurnAdmissionRequest {
             expected_latest_turn_id: None,
             expected_admission_revision: None,
             root_continuation_predecessor_turn_id: None,
+            expected_remote_job_id: None,
         }
     }
 
@@ -614,6 +619,7 @@ impl TurnAdmissionRequest {
             expected_latest_turn_id: Some(Some(expected_predecessor_turn_id)),
             expected_admission_revision: Some(expected_predecessor_revision),
             root_continuation_predecessor_turn_id: Some(expected_predecessor_turn_id),
+            expected_remote_job_id: None,
         }
     }
 
@@ -632,6 +638,7 @@ impl TurnAdmissionRequest {
             expected_latest_turn_id: None,
             expected_admission_revision: None,
             root_continuation_predecessor_turn_id: None,
+            expected_remote_job_id: None,
         }
     }
 
@@ -1048,17 +1055,17 @@ impl SqliteSessionRepository {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = session_record_from_connection(&transaction, session_id)?;
-        let is_child = transaction
+        let owned_session_kind = transaction
             .query_row(
-                "SELECT 1 FROM session_spawn_edges WHERE child_session_id = ?1",
+                "SELECT 'child agent session' FROM session_spawn_edges WHERE child_session_id = ?1
+                 UNION ALL SELECT 'remote job session' FROM remote_agent_jobs WHERE session_id = ?1",
                 params![session_id.to_string()],
-                |_| Ok(()),
+                |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .is_some();
-        if is_child {
+            .optional()?;
+        if let Some(owned_session_kind) = owned_session_kind {
             return Err(StorageError::Message(format!(
-                "session {session_id} is a child agent session; root access mode ownership was rejected"
+                "session {session_id} is a {owned_session_kind}; root access mode ownership was rejected"
             )));
         }
         if current.session_settings_revision != expected_session_settings_revision
@@ -1125,17 +1132,17 @@ impl SqliteSessionRepository {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = session_record_from_connection(&transaction, session_id)?;
-        let is_child = transaction
+        let owned_session_kind = transaction
             .query_row(
-                "SELECT 1 FROM session_spawn_edges WHERE child_session_id = ?1",
+                "SELECT 'child agent session' FROM session_spawn_edges WHERE child_session_id = ?1
+                 UNION ALL SELECT 'remote job session' FROM remote_agent_jobs WHERE session_id = ?1",
                 params![session_id.to_string()],
-                |_| Ok(()),
+                |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .is_some();
-        if is_child {
+            .optional()?;
+        if let Some(owned_session_kind) = owned_session_kind {
             return Err(StorageError::Message(format!(
-                "session {session_id} is a child agent session; root settings ownership was rejected"
+                "session {session_id} is a {owned_session_kind}; root settings ownership was rejected"
             )));
         }
         if current.session_settings_revision != expected_session_settings_revision {
@@ -1447,6 +1454,11 @@ impl SqliteSessionRepository {
         } else {
             None
         };
+        let active_turn_progress = active_turn_position
+            .map(|(turn_id, _)| {
+                active_turn_progress_in_connection(&transaction, session_id, turn_id)
+            })
+            .transpose()?;
         transaction.commit()?;
         Ok(CanonicalSessionStorageSnapshot {
             session,
@@ -1454,6 +1466,7 @@ impl SqliteSessionRepository {
             active_turn_position,
             pending_turn_inputs,
             admission_revision,
+            active_turn_progress,
         })
     }
 
@@ -1536,6 +1549,10 @@ impl SqliteSessionRepository {
                    SELECT 1 FROM side_chat_bindings
                    WHERE conversation_session_id = sessions.id
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_agent_jobs
+                   WHERE session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?2"
         );
@@ -1599,6 +1616,10 @@ impl SqliteSessionRepository {
                AND NOT EXISTS (
                    SELECT 1 FROM side_chat_bindings
                    WHERE conversation_session_id = sessions.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_agent_jobs
+                   WHERE session_id = sessions.id
                )
                AND (
                    lower(title) LIKE ?2 ESCAPE '\\'
@@ -3094,6 +3115,37 @@ impl SqliteSessionRepository {
         }
     }
 
+    pub(crate) async fn admit_remote_task(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        job_id: ulid::Ulid,
+        initial_user_turn: &UserTurn,
+    ) -> Result<Option<AdmittedTurnSnapshot>, StorageError> {
+        let mut request = TurnAdmissionRequest::preserve_goal_after_latest_turn(
+            turn_id,
+            Some(initial_user_turn),
+            None,
+            0,
+        );
+        request.expected_remote_job_id = Some(job_id);
+        match self
+            .admit_session_turn_request_at(
+                session_id,
+                request,
+                SystemClock::now_ms(),
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await?
+        {
+            ActiveGoalTurnAdmission::Admitted(snapshot) => Ok(Some(snapshot)),
+            ActiveGoalTurnAdmission::Unavailable => Ok(None),
+            ActiveGoalTurnAdmission::GoalInactive => {
+                unreachable!("remote job has no goal prerequisite")
+            }
+        }
+    }
+
     pub(crate) async fn admit_agent_triggered_turn(
         &self,
         session_id: SessionId,
@@ -3521,6 +3573,21 @@ impl SqliteSessionRepository {
             transaction.commit()?;
             return Ok((ActiveGoalTurnAdmission::Unavailable, None));
         };
+        let remote_job = transaction
+            .query_row(
+                "SELECT id, admitted_turn_id FROM remote_agent_jobs WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        match (remote_job, request.expected_remote_job_id) {
+            (None, None) => {}
+            (Some((id, None)), Some(expected)) if id == expected.to_string() => {}
+            _ => {
+                transaction.commit()?;
+                return Ok((ActiveGoalTurnAdmission::Unavailable, None));
+            }
+        }
         if exact_execution_interrupt_request_in_connection(&transaction, session_id)?.is_some() {
             transaction.commit()?;
             return Ok((ActiveGoalTurnAdmission::Unavailable, None));
@@ -3747,6 +3814,17 @@ impl SqliteSessionRepository {
             initial_user_history_item_id,
         };
         let committed = transaction_commit(&transaction)?;
+        if let Some(job_id) = request.expected_remote_job_id {
+            let changed = transaction.execute(
+                "UPDATE remote_agent_jobs SET admitted_turn_id = ?1 WHERE id = ?2 AND session_id = ?3 AND admitted_turn_id IS NULL",
+                params![request.turn_id.to_string(), job_id.to_string(), session_id.to_string()],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::Message(
+                    "remote job admission owner changed".into(),
+                ));
+            }
+        }
         transaction.commit()?;
         Ok((ActiveGoalTurnAdmission::Admitted(snapshot), Some(committed)))
     }
@@ -5961,6 +6039,10 @@ impl SessionRepository for SqliteSessionRepository {
                        SELECT 1 FROM side_chat_bindings
                        WHERE conversation_session_id = sessions.id
                    )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM remote_agent_jobs
+                       WHERE session_id = sessions.id
+                   )
                  ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
                  LIMIT 1",
                 params![project_id.to_string()],
@@ -6017,6 +6099,10 @@ impl SessionRepository for SqliteSessionRepository {
                    SELECT 1 FROM side_chat_bindings
                    WHERE conversation_session_id = sessions.id
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_agent_jobs
+                   WHERE session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?2"
         );
@@ -6057,6 +6143,10 @@ impl SessionRepository for SqliteSessionRepository {
                AND NOT EXISTS (
                    SELECT 1 FROM side_chat_bindings
                    WHERE conversation_session_id = sessions.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_agent_jobs
+                   WHERE session_id = sessions.id
                )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?1",
@@ -6112,6 +6202,10 @@ impl SessionRepository for SqliteSessionRepository {
                AND NOT EXISTS (
                    SELECT 1 FROM side_chat_bindings
                    WHERE conversation_session_id = sessions.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_agent_jobs
+                   WHERE session_id = sessions.id
                )
                AND (
                    lower(title) LIKE ?2 ESCAPE '\\'
@@ -6918,6 +7012,48 @@ struct CanonicalTurnSnapshot {
     failed_tool_count: usize,
     change_count: usize,
     unsettled_tool_calls: Vec<(ToolCallId, crate::tool::ToolName)>,
+}
+
+fn active_turn_progress_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<crate::session::model::CanonicalActiveTurnProgress, StorageError> {
+    // Aggregate canonical events inside the caller's read transaction. The UI's
+    // paged history and replayed wakeups never own or increment these counts.
+    connection.query_row(
+        "WITH events AS (
+             SELECT sequence_no, msg_json AS payload_json FROM protocol_runtime_events
+             WHERE session_id = ?1 AND turn_id = ?2
+         ), tool_states AS (
+             SELECT json_extract(payload_json, '$.envelope.status') AS status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY json_extract(payload_json, '$.envelope.call_id')
+                        ORDER BY sequence_no DESC
+                    ) AS latest
+             FROM events WHERE json_extract(payload_json, '$.kind') = 'tool_lifecycle'
+         )
+         SELECT
+             (SELECT COUNT(*) FROM events WHERE json_extract(payload_json, '$.kind') = 'model_request_prepared'),
+             COUNT(*),
+             COUNT(*) FILTER (WHERE status = 'completed'),
+             COUNT(*) FILTER (WHERE status = 'declined'),
+             COUNT(*) FILTER (WHERE status = 'cancelled'),
+             COUNT(*) FILTER (WHERE status = 'failed'),
+             (SELECT COUNT(*) FROM events WHERE json_extract(payload_json, '$.kind') = 'context_compacted')
+         FROM tool_states WHERE latest = 1",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| Ok(crate::session::model::CanonicalActiveTurnProgress {
+            turn_id,
+            model_request_count: row.get(0)?,
+            tool_call_count: row.get(1)?,
+            completed_tool_count: row.get(2)?,
+            declined_tool_count: row.get(3)?,
+            cancelled_tool_count: row.get(4)?,
+            failed_tool_count: row.get(5)?,
+            compaction_count: row.get(6)?,
+        }),
+    ).map_err(StorageError::from)
 }
 
 fn canonical_turn_snapshot_in_transaction(

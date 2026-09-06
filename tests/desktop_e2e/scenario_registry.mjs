@@ -1,4 +1,9 @@
 import { scenario as shellBaseline } from "./scenarios/shell_baseline.mjs";
+import { createShellAboutScenario } from "./scenarios/shell_about.mjs";
+import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
+import { createHubConnectionSettingsScenario } from "./scenarios/hub_connection_settings.mjs";
+import { createHubRuntimeLiveScenario } from "./scenarios/hub_runtime_live.mjs";
+import { createHubDeviceNetworkScenario } from "./scenarios/hub_device_network.mjs";
 import { createNativeDialogCancelScenario } from "./scenarios/native_dialog_cancel.mjs";
 import { createPointerKeyboardScenario } from "./scenarios/pointer_keyboard.mjs";
 import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_cancel.mjs";
@@ -32,11 +37,16 @@ import { createHistoryTerminalReconcileScenario } from "./scenarios/history_term
 
 const factories = new Map([
   [shellBaseline.id, () => shellBaseline],
+  ["shell.about", createShellAboutScenario],
+  ["shell.lynx", createShellLynxScenario],
+  ["hub.connection-settings", createHubConnectionSettingsScenario],
   ["agent.interrupt", createAgentInterruptScenario],
   ["history.restart-prepend", createHistoryRestartPrependScenario],
   ["history.terminal-reconcile", createHistoryTerminalReconcileScenario],
   ["input.pointer-keyboard", createPointerKeyboardScenario],
   ["manual.case5_2", createCase52Scenario],
+  ["manual.hub-runtime", createHubRuntimeLiveScenario],
+  ["manual.hub-device-network", createHubDeviceNetworkScenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
   ["manual.permission-guardian-openai-compatible", createPermissionGuardianOpenAiCompatibleScenario],
@@ -60,6 +70,8 @@ const factories = new Map([
   ["side-chat.session", createSideChatSessionScenario],
 ]);
 const configurableScenarios = new Set([
+  "manual.hub-device-network",
+  "manual.hub-runtime",
   "manual.case5_2",
   "manual.provider-openai-compatible",
   "manual.provider-lm-studio-thinking",

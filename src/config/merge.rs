@@ -400,6 +400,9 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
     if let Some(value) = patch.mcp {
         apply_mcp(&mut target.mcp, value);
     }
+    if let Some(value) = patch.device_network {
+        target.device_network = value;
+    }
     if let Some(value) = patch.tool_output {
         apply_tool_output(&mut target.tool_output, value);
     }

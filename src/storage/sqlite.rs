@@ -203,6 +203,10 @@ impl SqliteStore {
         SqliteSessionRepository::new(self.connection.clone())
     }
 
+    pub fn remote_job_store(&self) -> crate::remote_agent::store::RemoteJobStore {
+        crate::remote_agent::store::RemoteJobStore::new(self.connection.clone())
+    }
+
     pub fn project_repo(&self) -> SqliteProjectRepository {
         SqliteProjectRepository::new(self.connection.clone())
     }

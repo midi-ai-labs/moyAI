@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { createRefreshPromptFocusIntent } from "../src/main_prompt_continuity.ts";
+
 import {
   focusTargetEligible,
   PostRenderFocusArbiter,
@@ -140,6 +142,64 @@ function scheduleAndFlush(
   });
   scheduler.flush();
 }
+
+test("accepted pointer Refresh returns to the retained editor instead of restoring the Refresh snapshot", () => {
+  const environment = new MutableEnvironment();
+  const refresh = target("refresh", environment);
+  const prompt = target("prompt", environment);
+  environment.active = refresh;
+  const scheduler = new ManualScheduler();
+  const arbiter = new PostRenderFocusArbiter(scheduler, environment);
+  const results: FocusArbiterResult[] = [];
+  let settled = 0;
+
+  scheduleAndFlush(arbiter, scheduler, [
+    intent("focus-snapshot", "exact-restore", refresh),
+    createRefreshPromptFocusIntent({
+      prompt, resolvePrompt: () => prompt, refreshOwners: [refresh],
+      settle: () => { settled += 1; }, isCurrent: () => true,
+    }),
+  ], results);
+
+  assert.equal(environment.active, prompt);
+  assert.equal(prompt.focusCalls, 1);
+  assert.equal(refresh.focusCalls, 0);
+  assert.equal(settled, 1);
+  assert.deepEqual(results, [{ kind: "focused", source: "refresh-prompt" }]);
+});
+
+test("Refresh return preserves a later focus claim, stale owner, or replaced editor", () => {
+  for (const change of ["focus-claim", "stale-owner", "replaced-editor", "later-interaction"] as const) {
+    const environment = new MutableEnvironment();
+    const refresh = target("refresh", environment);
+    const prompt = target("prompt", environment);
+    const other = target("other", environment);
+    environment.active = change === "focus-claim" ? other : refresh;
+    const scheduler = new ManualScheduler();
+    const arbiter = new PostRenderFocusArbiter(scheduler, environment);
+    const results: FocusArbiterResult[] = [];
+    if (change === "later-interaction") environment.interactionEpoch = 2n;
+    let settled = 0;
+    const expectedKind = {
+      "focus-claim": "owned", "stale-owner": "stale-intent",
+      "replaced-editor": "unavailable", "later-interaction": "stale-interaction",
+    }[change];
+
+    scheduleAndFlush(arbiter, scheduler, [
+      intent("focus-snapshot", "exact-restore", refresh),
+      createRefreshPromptFocusIntent({
+        prompt, resolvePrompt: () => change === "replaced-editor" ? other : prompt,
+        refreshOwners: [refresh], settle: () => { settled += 1; },
+        isCurrent: () => change !== "stale-owner",
+      }),
+    ], results);
+
+    assert.equal(environment.active, change === "focus-claim" ? other : refresh, change);
+    assert.equal(prompt.focusCalls + refresh.focusCalls + other.focusCalls, 0, change);
+    assert.equal(settled, 0, change);
+    assert.deepEqual(results, [{ kind: expectedKind, source: "refresh-prompt" }], change);
+  }
+});
 
 test("explicit priority chooses one intent and performs at most one focus call", () => {
   const environment = new MutableEnvironment();

@@ -480,7 +480,13 @@ function terminalToolProjectionUsesTime(projection, time) {
     );
 }
 
-function liveCurrentTimeProjectionAccepted(surface) {
+function idleHubPollingAllowed(projection, options) {
+  return options?.allowIdleHubPolling === true && projection?.async_polling_required === true
+    && projection?.hub?.status === "connected"
+    && projection.hub.active_main === null && projection.hub.active_side_chat === null;
+}
+
+function liveCurrentTimeProjectionAccepted(surface, options) {
   const projection = surface?.projection;
   const summaries = completedWorkSummaries(projection);
   const time = currentTimeFromCompletedProjection(projection);
@@ -494,7 +500,7 @@ function liveCurrentTimeProjectionAccepted(surface) {
     && projection?.agent_tree_active === false
     && projection?.post_run_refresh_pending === false
     && projection?.background_mutation_pending === false
-    && projection?.async_polling_required === false
+    && (projection?.async_polling_required === false || idleHubPollingAllowed(projection, options))
     && Array.isArray(projection?.pending_async_operations)
     && projection.pending_async_operations.length === 0
     && projection?.overlay === "none"
@@ -539,13 +545,13 @@ function liveCurrentTimeDomAccepted(surface, time) {
     && surface.terminal_dom.visible_selected_activity_row_count === 0;
 }
 
-export function liveCurrentTimeTerminalAccepted(surface) {
-  if (!liveCurrentTimeProjectionAccepted(surface)) return false;
+export function liveCurrentTimeTerminalAccepted(surface, options = {}) {
+  if (!liveCurrentTimeProjectionAccepted(surface, options)) return false;
   const time = currentTimeFromCompletedProjection(surface.projection);
   return liveCurrentTimeDomAccepted(surface, time);
 }
 
-export function liveCurrentTimeTerminalDecision(surface) {
+export function liveCurrentTimeTerminalDecision(surface, options = {}) {
   if (surface && !surfaceErrorFree(surface)) return "fail";
   const projection = surface?.projection;
   const status = projection?.run_status_key;
@@ -553,12 +559,12 @@ export function liveCurrentTimeTerminalDecision(surface) {
   if (status === "completed") {
     const refreshPending = projection?.post_run_refresh_pending === true
       || projection?.background_mutation_pending === true
-      || projection?.async_polling_required === true
+      || (projection?.async_polling_required === true && !idleHubPollingAllowed(projection, options))
       || (Array.isArray(projection?.pending_async_operations)
         && projection.pending_async_operations.length > 0);
     if (refreshPending) return "pending";
-    if (!liveCurrentTimeProjectionAccepted(surface)) return "fail";
-    return liveCurrentTimeTerminalAccepted(surface) ? "pass" : "pending";
+    if (!liveCurrentTimeProjectionAccepted(surface, options)) return "fail";
+    return liveCurrentTimeTerminalAccepted(surface, options) ? "pass" : "pending";
   }
   return "pending";
 }

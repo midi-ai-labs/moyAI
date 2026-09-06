@@ -71,7 +71,9 @@ export function moveDialogFocus(
   for (let attempt = 0; attempt < targets.length; attempt += 1) {
     index = nextDialogFocusIndex(index, targets.length, backwards);
     const target = targets[index];
-    target?.focus({ preventScroll: true });
+    // Tab is an explicit navigation request. Let the browser reveal an offscreen control
+    // within its scroll containers; passive render restoration still preserves scroll.
+    target?.focus();
     if (target && target.ownerDocument.activeElement === target) return true;
   }
   return false;

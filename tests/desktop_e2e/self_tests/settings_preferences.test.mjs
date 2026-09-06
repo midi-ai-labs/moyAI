@@ -59,12 +59,12 @@ function projection(overrides = {}) {
 function cleanSurface(overrides = {}) {
   return {
     projection: projection(),
-    connection_shortcut: {
+    settings_entry: {
       count: 1,
       visible: true,
       enabled: true,
-      text: "接続設定",
-      title: "Settingsでglobal既定値を確認・変更",
+      text: "設定",
+      title: "設定",
     },
     settings: {
       dialog_count: 1,
@@ -89,13 +89,13 @@ function cleanSurface(overrides = {}) {
         groups: {
           count: 3,
           visible_count: 3,
-          texts: ["Global Settings", "Session-scoped Settings", "Desktop Preferences"],
+          texts: ["共通設定", "チャットごとの設定", "画面設定"],
         },
-        provider: { count: 1, visible: true, text: "Main Chat Settings" },
-        side_chat: { count: 1, visible: true, text: "Side Chat Settings" },
-        tools: { count: 1, visible: true, text: "Tools" },
-        session_overrides: { count: 1, visible: true, text: "Session Overrides" },
-        window: { count: 1, visible: true, text: "Window" },
+        provider: { count: 1, visible: true, text: "メインチャット" },
+        side_chat: { count: 1, visible: true, text: "サイドチャット" },
+        tools: { count: 1, visible: true, text: "ツール" },
+        session_overrides: { count: 1, visible: true, text: "現在のチャット" },
+        window: { count: 1, visible: true, text: "ウィンドウ" },
       },
     },
     close_confirmation: {

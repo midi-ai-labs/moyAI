@@ -17,7 +17,9 @@ function observeDesktopCommand(name: string, args: Record<string, unknown>): voi
   try {
     (observer as (observation: DesktopCommandObservation) => void)({
       name,
-      args: structuredClone(args),
+      args: structuredClone(name === "hub_connect" ? { ...args, token: "[redacted]" }
+        : name === "device_network_join" ? { ...args, code: "[redacted]" }
+        : name === "mcp_peer_add" ? { ...args, peer: { ...(args.peer as Record<string, unknown>), token: "[redacted]" } } : args),
     });
   } catch {
     // External diagnostics must never change command delivery.

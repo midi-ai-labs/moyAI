@@ -415,6 +415,24 @@ test("live provider smoke allows lookalike tokens and exact markers outside assi
   assert.equal(liveCurrentTimeTerminalDecision(accepted), "pass");
 });
 
+test("Hub live terminal permits idle connection polling only with an explicit route scope", () => {
+  const hub = { status: "connected", active_main: null, active_side_chat: null };
+  const surface = terminalSurface({ projection: { async_polling_required: true, hub } });
+  assert.equal(liveCurrentTimeTerminalDecision(surface), "pending");
+  assert.equal(liveCurrentTimeTerminalDecision(surface, { allowIdleHubPolling: true }), "pass");
+  for (const changed of [{ active_main: {} }, { active_side_chat: {} }, { status: "connecting" }]) {
+    assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({ projection: {
+      async_polling_required: true, hub: { ...hub, ...changed },
+    } }), { allowIdleHubPolling: true }), "pending");
+  }
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({ projection: {
+    async_polling_required: true, hub, pending_async_operations: [{}],
+  } }), { allowIdleHubPolling: true }), "pending");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({ projection: {
+    async_polling_required: true, hub, busy: true,
+  } }), { allowIdleHubPolling: true }), "fail");
+});
+
 test("live terminal helper classifies deterministic pass, pending, and product failure without network", () => {
   const accepted = terminalSurface();
   assert.equal(liveCurrentTimeTerminalAccepted(accepted), true);

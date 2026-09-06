@@ -83,8 +83,10 @@ test("the mixed-widget View popover is a dialog with ordinary actions and a nati
   assert.match(html, /<button data-action="refresh" data-titlebar-menu-action>/);
   assert.match(html, /<button data-action="show-provider" data-titlebar-menu-action>/);
   assert.match(html, /<button data-action="show-config" data-titlebar-menu-action>/);
+  assert.match(html, /<button data-action="show-hub" data-titlebar-menu-action>/);
+  assert.match(html, /<button data-action="show-mcp-publish" data-titlebar-menu-action>/);
   const viewActions = Array.from(html.matchAll(/<button[^>]*data-titlebar-menu-action[^>]*>/g), (match) => match[0]);
-  assert.equal(viewActions.length, 3);
+  assert.equal(viewActions.length, 5);
   for (const action of viewActions) assert.doesNotMatch(action, /tabindex=/);
   assert.match(html, /<input id="opacity-input" type="range"[^>]*aria-valuetext="85%"/);
   const tabOrder = ["data-action=\"refresh\"", "data-action=\"show-provider\"", "data-action=\"show-config\"", "id=\"opacity-input\""]
@@ -398,10 +400,10 @@ test("agent pane header keeps both action groups inside a narrow drawer", () => 
   );
 });
 
-test("responsive output drawer leaves the main composer controls pointer-visible", () => {
+test("responsive output and Side drawers reserve space for the main composer controls", () => {
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   const composerRule = css.match(
-    /\.app-frame:not\(\.artifact-collapsed\):not\(\.side-chat-open\) \.composer\s*\{([^}]*)\}/,
+    /\.app-frame:not\(\.artifact-collapsed\) \.composer\s*\{([^}]*)\}/,
   )?.[1];
 
   assert.match(css, /--responsive-pane-width:\s*min\(352px, calc\(100vw - 24px\)\)/);
@@ -413,7 +415,7 @@ test("responsive output drawer leaves the main composer controls pointer-visible
   );
   assert.match(
     css,
-    /\.app-frame:not\(\.artifact-collapsed\):not\(\.side-chat-open\) \.run-strip\s*\{[^}]*padding-right:\s*calc\(var\(--responsive-pane-width\) \+ 28px\)/,
+    /\.app-frame:not\(\.artifact-collapsed\) \.run-strip\s*\{[^}]*padding-right:\s*calc\(var\(--responsive-pane-width\) \+ 28px\)/,
   );
 });
 

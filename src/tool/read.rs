@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::error::ToolError;
 use crate::runtime::SystemClock;
 use crate::tool::context::ToolContext;
+use crate::tool::read_context::ReadToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
@@ -52,11 +53,19 @@ impl Tool for ReadTool {
     async fn execute(
         &self,
         raw_arguments: serde_json::Value,
-        mut ctx: ToolContext<'_>,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_read(raw_arguments, ReadToolContext::agent(ctx))
+            .await
+    }
+
+    async fn execute_read(
+        &self,
+        raw_arguments: serde_json::Value,
+        mut ctx: ReadToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ReadInput>(raw_arguments)?;
-        let resolved =
-            crate::tool::internal_output::resolve_path(&ctx, &input.path, AccessKind::Read).await?;
+        let resolved = ctx.resolve_path(&input.path, AccessKind::Read).await?;
         let permission = resolved.permission();
         ctx.confirm_if_needed(
             AccessKind::Read,
@@ -73,9 +82,9 @@ impl Tool for ReadTool {
                 requested: input.path.clone(),
                 absolute: permission.absolute.to_path_buf(),
                 basename: basename.to_string(),
-                suffix: exact_candidate_suffix(&input.path, permission.absolute, ctx.workspace),
+                suffix: exact_candidate_suffix(&input.path, permission.absolute, ctx.workspace()),
                 max_diagnostic_bytes: ctx
-                    .config
+                    .config()
                     .tool_output
                     .max_bytes
                     .min(MAX_MISSING_READ_DIAGNOSTIC_BYTES)
@@ -90,23 +99,25 @@ impl Tool for ReadTool {
                 let Some(request) = missing_read_request else {
                     return Err(error);
                 };
-                let (scan, candidate_kind) =
-                    match find_similar_sibling_file_candidates(ctx.workspace, &request.absolute) {
-                        Ok(scan) if !scan.paths.is_empty() => {
-                            (scan, MissingCandidateKind::SimilarSibling)
-                        }
-                        Ok(_) => {
-                            let Ok(scan) = find_exact_workspace_file_candidates(
-                                ctx.workspace,
-                                &request.basename,
-                                request.suffix.as_deref(),
-                            ) else {
-                                return Err(error);
-                            };
-                            (scan, MissingCandidateKind::Exact)
-                        }
-                        Err(_) => return Err(error),
-                    };
+                let (scan, candidate_kind) = match find_similar_sibling_file_candidates(
+                    ctx.workspace(),
+                    &request.absolute,
+                ) {
+                    Ok(scan) if !scan.paths.is_empty() => {
+                        (scan, MissingCandidateKind::SimilarSibling)
+                    }
+                    Ok(_) => {
+                        let Ok(scan) = find_exact_workspace_file_candidates(
+                            ctx.workspace(),
+                            &request.basename,
+                            request.suffix.as_deref(),
+                        ) else {
+                            return Err(error);
+                        };
+                        (scan, MissingCandidateKind::Exact)
+                    }
+                    Err(_) => return Err(error),
+                };
                 return Err(ToolError::Message(render_missing_read_diagnostic(
                     &request.requested,
                     &scan,
@@ -120,9 +131,9 @@ impl Tool for ReadTool {
         let size_bytes = metadata.len();
         let extension = normalized_extension(opened.absolute());
         let blocked_extensions =
-            normalized_extension_list(&ctx.config.file_guard.blocked_read_extensions);
+            normalized_extension_list(&ctx.config().file_guard.blocked_read_extensions);
         let structured_extensions =
-            normalized_extension_list(&ctx.config.file_guard.structured_document_extensions);
+            normalized_extension_list(&ctx.config().file_guard.structured_document_extensions);
 
         if blocked_extensions.iter().any(|value| value == &extension) {
             return Ok(read_blocked_result(
@@ -149,19 +160,19 @@ impl Tool for ReadTool {
             ));
         }
 
-        if size_bytes > ctx.config.file_guard.max_inline_read_bytes {
+        if size_bytes > ctx.config().file_guard.max_inline_read_bytes {
             return Ok(read_blocked_result(
                 opened.absolute(),
                 size_bytes,
                 "large_file",
                 json!({
-                    "max_inline_read_bytes": ctx.config.file_guard.max_inline_read_bytes,
+                    "max_inline_read_bytes": ctx.config().file_guard.max_inline_read_bytes,
                 }),
             ));
         }
 
         let (bytes, exceeded_limit) = opened.with_file(|file| {
-            read_up_to_limit(file, ctx.config.file_guard.max_inline_read_bytes)
+            read_up_to_limit(file, ctx.config().file_guard.max_inline_read_bytes)
         })?;
         if exceeded_limit {
             return Ok(read_blocked_result(
@@ -169,7 +180,7 @@ impl Tool for ReadTool {
                 size_bytes.max(bytes.len() as u64),
                 "large_file",
                 json!({
-                    "max_inline_read_bytes": ctx.config.file_guard.max_inline_read_bytes,
+                    "max_inline_read_bytes": ctx.config().file_guard.max_inline_read_bytes,
                     "size_is_lower_bound": true,
                 }),
             ));
@@ -197,8 +208,8 @@ impl Tool for ReadTool {
             &lines,
             offset,
             limit,
-            ctx.config.tool_output.max_lines,
-            ctx.config.tool_output.max_bytes,
+            ctx.config().tool_output.max_lines,
+            ctx.config().tool_output.max_bytes,
         )?;
 
         let baseline = edit_baseline_decision(
@@ -214,23 +225,30 @@ impl Tool for ReadTool {
             .ok()
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_millis() as i64);
-        record_edit_baseline_if_eligible(
-            &ctx.services.edit_safety,
-            ctx.session.session.id,
-            crate::edit::FileReadStamp {
-                path: opened.absolute().to_path_buf(),
-                read_at_ms: SystemClock::now_ms(),
-                mtime_ms,
-                size_bytes: Some(size_bytes),
-                content_sha256: Some(content_sha256),
-            },
-            baseline,
-        )?;
+        if let Some((safety, session_id)) = ctx.edit_baseline_owner() {
+            record_edit_baseline_if_eligible(
+                safety,
+                session_id,
+                crate::edit::FileReadStamp {
+                    path: opened.absolute().to_path_buf(),
+                    read_at_ms: SystemClock::now_ms(),
+                    mtime_ms,
+                    size_bytes: Some(size_bytes),
+                    content_sha256: Some(content_sha256),
+                },
+                baseline,
+            )?;
+        }
+        let baseline_metadata = if ctx.edit_baseline_owner().is_some() {
+            baseline.metadata()
+        } else {
+            json!({"recorded": false, "reason": "mcp_read_only_context"})
+        };
 
         let instruction_sources = find_instruction_sources(
             opened.inside_workspace(),
             opened.relative_to_root(),
-            ctx.workspace,
+            ctx.workspace(),
         )?;
         Ok(ToolResult {
             title: format!("Read {}", opened.absolute()),
@@ -245,7 +263,7 @@ impl Tool for ReadTool {
                 "truncated": page.has_more,
                 "truncation_kind": if page.has_more { Some("line_page") } else { None },
                 "next_offset": page.has_more.then(|| page.end_line.saturating_add(1)),
-                "edit_baseline": baseline.metadata(),
+                "edit_baseline": baseline_metadata,
                 "instruction_sources": instruction_sources,
             }),
             truncated_output_path: None,

@@ -1,4 +1,8 @@
 import { command } from "./api.ts";
+import { editHubField } from "./hub_state.ts";
+import { editDeviceNetworkField } from "./device_network_state.ts";
+import { editPublishField } from "./mcp_publish_state.ts";
+import { editMcpPeerField } from "./mcp_peer.ts";
 import {
   actionEnabledById,
   dispatchAction,
@@ -568,6 +572,15 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
   }
 }
 
+function actionPayloadValue(node: HTMLElement): string {
+  return node.dataset.agentPath
+    ?? node.dataset.historyTarget
+    ?? node.dataset.providerProfile
+    ?? node.dataset.mode
+    ?? node.dataset.value
+    ?? "";
+}
+
 function installDelegatedActionEvents(context: ActionContext): void {
   if (delegatedEventsInstalled) return;
   delegatedEventsInstalled = true;
@@ -624,6 +637,31 @@ function installDelegatedActionEvents(context: ActionContext): void {
     ) {
       return;
     }
+    if (target.dataset.mcpPublishField !== undefined) {
+      if (context.getViewState()?.overlay !== "mcp_publish") return;
+      editPublishField(context.uiState.mcpPublish, target.dataset.mcpPublishField, target.value, target instanceof HTMLInputElement && target.checked);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.mcpPeerField !== undefined) {
+      if (context.getViewState()?.overlay !== "config") return;
+      editMcpPeerField(context.uiState.mcpPeers, target.dataset.mcpPeerField, target.value);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.networkField !== undefined) {
+      if (context.getViewState()?.overlay !== "hub") return;
+      editDeviceNetworkField(context.uiState.deviceNetwork, target.dataset.networkField, target.value, target instanceof HTMLInputElement && target.checked);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.hubField !== undefined) {
+      if (context.getViewState()?.overlay !== "hub") return;
+      editHubField(context.uiState.hub, target.dataset.hubField ?? "", target.value, target instanceof HTMLInputElement && target.checked);
+      context.uiState.hub.error = "";
+      context.rerender();
+      return;
+    }
     if (target.matches(".session-settings-control")) {
       const currentState = context.getViewState();
       const currentTarget = currentState?.session_settings.target ?? null;
@@ -663,6 +701,15 @@ function installDelegatedActionEvents(context: ActionContext): void {
   };
   document.addEventListener("input", updateSettingsControl);
   document.addEventListener("change", updateSettingsControl);
+  document.addEventListener("focusout", (event) => {
+    if (event.target instanceof HTMLSelectElement && event.target.dataset.mcpPublishField === "target") {
+      queueMicrotask(() => { if (context.getViewState()?.overlay === "mcp_publish") context.rerender(); });
+    }
+    if (event.target instanceof Element && event.target.closest(".hub-modal")) {
+      // Apply a deferred passive model-list refresh only after the user leaves its controls.
+      queueMicrotask(() => { if (context.getViewState()?.overlay === "hub") context.rerender(); });
+    }
+  });
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
@@ -714,11 +761,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
       action,
     );
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath
-      ?? node.dataset.historyTarget
-      ?? node.dataset.providerProfile
-      ?? node.dataset.mode
-      ?? "";
+    const value = actionPayloadValue(node);
     const capturedSideChatQuote = action === "quote-selection-to-side-chat"
       ? sideChatPointerQuotes.get(node) ?? null
       : null;
@@ -781,7 +824,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     event.stopPropagation();
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
+    const value = actionPayloadValue(node);
     void dispatchAction(action, context, { index, value }).catch((error) => context.reportError(error));
   });
   document.addEventListener("pointerdown", (event) => {
@@ -1082,7 +1125,7 @@ function synchronizeActionButtonAvailability(
   const model = context.getRenderModel();
   const payload: ActionPayload = {
     index: Number(button.dataset.index ?? "-1"),
-    value: button.dataset.agentPath ?? button.dataset.historyTarget ?? button.dataset.mode ?? "",
+    value: actionPayloadValue(button),
   };
   button.disabled = !model || !actionEnabledById(action, model, payload);
   button.setAttribute("aria-disabled", String(button.disabled));

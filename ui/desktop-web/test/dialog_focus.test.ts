@@ -27,6 +27,7 @@ class FakeElement {
   disabled = false;
   layoutVisible = true;
   acceptsFocus = true;
+  offscreen = false;
   inactiveAncestor: InactiveAncestor | null = null;
 
   constructor(name: string, ownerDocument: FakeDocument) {
@@ -54,8 +55,11 @@ class FakeElement {
     return this.layoutVisible ? [{}] : [];
   }
 
-  focus(): void {
-    if (this.acceptsFocus) this.ownerDocument.activeElement = this;
+  focus(options?: { preventScroll?: boolean }): void {
+    if (this.acceptsFocus) {
+      this.ownerDocument.activeElement = this;
+      if (!options?.preventScroll) this.offscreen = false;
+    }
   }
 }
 
@@ -84,6 +88,22 @@ function asHtmlElement(value: FakeElement): HTMLElement {
 function asDialog(value: FakeDialog): HTMLElement {
   return value as unknown as HTMLElement;
 }
+
+test("explicit dialog Tab reveals offscreen controls while keeping focus inside the dialog", () => {
+  const document = new FakeDocument();
+  const first = new FakeElement("first", document);
+  const belowFold = new FakeElement("advanced-model-controls", document);
+  belowFold.offscreen = true;
+  const dialog = new FakeDialog(document, [first, belowFold]);
+  document.activeElement = first;
+  assert.equal(moveDialogFocus(asDialog(dialog), asHtmlElement(first), false), true);
+  assert.equal(document.activeElement, belowFold);
+  assert.equal(belowFold.offscreen, false);
+  first.offscreen = true;
+  assert.equal(moveDialogFocus(asDialog(dialog), asHtmlElement(belowFold), true), true);
+  assert.equal(document.activeElement, first);
+  assert.equal(first.offscreen, false);
+});
 
 test("dialog focus keeps a closed model disclosure summary in the Settings order", () => {
   const document = new FakeDocument();

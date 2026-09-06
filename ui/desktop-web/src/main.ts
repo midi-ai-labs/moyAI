@@ -1,5 +1,14 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
+import { acceptHubProjection, hubPresentation } from "./hub_state.ts";
+import { acceptDeviceNetworkProjection, deviceNetworkPresentation } from "./device_network_state.ts";
+import { synchronizeDeviceNetworkControls } from "./device_network_dom.ts";
+import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
+import { acceptPublishProjection, publishPresentation } from "./mcp_publish_state.ts";
+import { clearPublishSecret, synchronizePublishControlValues } from "./mcp_publish_dom.ts";
+import { refreshPublishJobs } from "./mcp_publish_actions.ts";
+import { clearMcpPeerToken, mcpPeerPresentation, refreshMcpPeers } from "./mcp_peer.ts";
+import { synchronizeHubControlValues } from "./hub_dom.ts";
 import { cancelRunCommand, interruptSessionCommand } from "./stop_contract";
 import { agentActivityRowsChanged, selectedAgentActivityChanged } from "./agent_activity";
 import {
@@ -127,7 +136,7 @@ import {
   type DesktopRenderModel,
 } from "./render_projection";
 import { isRegularModalOverlay, localModalIdentity, modalIdentity, modalIsOpen } from "./modal_state";
-import { autoRefreshAllowed, runtimePollingRequired } from "./polling_state";
+import { autoRefreshAllowed, createSnapshotRefresh, installRuntimePolling, runtimePollingRequired } from "./polling_state";
 import {
   reconcileTaskActivityAnimationEpoch,
   taskActivityAnimationDelay,
@@ -153,6 +162,7 @@ import {
   type SettledNewSessionFocusContinuation,
 } from "./session_interaction_state";
 import {
+  createRefreshPromptFocusIntent,
   refreshPromptFocusContinuationAccepted,
   retainConnectedMainPrompt,
   takePendingRefreshPromptFocus,
@@ -167,6 +177,8 @@ import {
 import {
   settingsActionFocusCandidates,
   settingsActionFocusStillTargets,
+  restoreSettingsActionViewport,
+  type SettingsActionFocusContinuation,
   settingsCloseTargetStillMatches,
   settingsRecoverableErrorOwnerIdentity,
   sameSettingsSurface,
@@ -215,13 +227,24 @@ import {
   rejectDraftMutation,
 } from "./view_state";
 import "./styles.css";
+import "./hub_surface.css";
+import "./device_network_surface.css";
+import "./mcp_publish_surface.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 const desktopWindow = getCurrentWindow();
 let currentState: DesktopWebState | null = null;
 let lastRenderedState: DesktopViewState | null = null;
 let lastRenderedModel: DesktopRenderModel | null = null;
-let polling = false;
+const refresh = createSnapshotRefresh(async () => {
+  try {
+    acceptState(await command<DesktopWebState>("desktop_state"), false);
+    await refreshPublishJobs(eventContext);
+    await refreshDeviceNetworkJobs(eventContext);
+  } catch (error) {
+    reportError(error);
+  }
+});
 let previousSessionKey = "";
 let lastRenderedLocalModalIdentity: string | null = null;
 let splashDismissed = false;
@@ -251,6 +274,7 @@ interface StateUpdate {
   sequence: number;
   draftSnapshot: DraftMutationSnapshot | null;
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null;
+  settingsAction: SettingsActionFocusContinuation | null;
 }
 
 const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, candidate) =>
@@ -293,7 +317,7 @@ const eventContext: ActionContext = {
   getRenderModel: () => currentState
     ? buildDesktopRenderModel(projectViewState(currentState, uiState))
     : null,
-  acceptProjection: (state: DesktopWebState, forceRender = true) => acceptState(state, forceRender),
+  acceptProjection: (state: DesktopWebState, forceRender = true, settingsAction) => acceptState(state, forceRender, null, false, null, null, settingsAction ?? null),
   waitForInteractionIdle: () => interactionLifecycle.whenIdle(),
   rerender: () => {
     if (currentState) acceptState(currentState, true);
@@ -324,31 +348,13 @@ installInteractionEventGate({
 installComposerFocusInteractionInvalidation();
 installWindowMaximizedSync();
 void refresh();
-window.setInterval(() => {
-  if (
+installRuntimePolling(window, document, () => Boolean(
     currentState
-    && runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending)
+    && (currentState.overlay === "mcp_publish" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, uiState.mcpPublish.projection))
     && shouldAutoRefresh(currentState)
-  ) {
-    void refresh();
-  }
-}, 600);
+), refresh);
 
 installGlobalKeyboardShortcuts(eventContext);
-
-async function refresh(): Promise<void> {
-  if (polling) {
-    return;
-  }
-  polling = true;
-  try {
-    acceptState(await command<DesktopWebState>("desktop_state"), false);
-  } catch (error) {
-    reportError(error);
-  } finally {
-    polling = false;
-  }
-}
 
 async function mutate(
   name: string,
@@ -779,6 +785,7 @@ function acceptState(
   scheduleNavigation = false,
   draftSnapshot: DraftMutationSnapshot | null = null,
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null = null,
+  settingsAction: SettingsActionFocusContinuation | null = null,
 ): void {
   const update: StateUpdate = {
     state,
@@ -788,6 +795,7 @@ function acceptState(
     sequence: nextStateSequence++,
     draftSnapshot,
     refreshPromptFocusContinuation,
+    settingsAction,
   };
   applyStateUpdate(update);
 }
@@ -819,6 +827,25 @@ function applyStateUpdate(update: StateUpdate): void {
     )
   ) return;
   const previousProjection = currentState;
+  if (update.state !== previousProjection && update.state.hub) {
+    acceptHubProjection(uiState.hub, update.state.hub);
+  }
+  if (update.state !== previousProjection && update.state.device_network) {
+    acceptDeviceNetworkProjection(uiState.deviceNetwork, update.state.device_network);
+  }
+  if (previousProjection?.overlay === "hub" && update.state.overlay !== "hub") ++uiState.deviceNetwork.jobsSerial;
+  if (update.state !== previousProjection && update.state.mcp_publish) {
+    acceptPublishProjection(uiState.mcpPublish, update.state.mcp_publish);
+  }
+  if (previousProjection?.overlay === "mcp_publish" && update.state.overlay !== "mcp_publish") {
+    clearPublishSecret();
+    ++uiState.mcpPublish.jobsSerial;
+  }
+  if (previousProjection?.overlay === "config" && update.state.overlay !== "config") {
+    clearMcpPeerToken();
+    ++uiState.mcpPeers.serial;
+    uiState.mcpPeers.pending = null;
+  }
   reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
   reconcileSettingsFlowState(update.state);
   reconcileAgentPaneState(uiState, update.state);
@@ -842,11 +869,13 @@ function applyStateUpdate(update: StateUpdate): void {
       update.mutationName,
       update.refreshPromptFocusContinuation,
       attachmentFocusDecision,
+      update.settingsAction,
     );
   }
   if (update.scheduleNavigation) {
     scheduleNavigationRefresh(update.state);
   }
+  if (previousProjection?.overlay !== "config" && update.state.overlay === "config") void refreshMcpPeers(eventContext);
 }
 
 function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
@@ -865,6 +894,10 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     text: uiState.configDraftBaselineValues.get(field.key) ?? field.value,
   }));
   return createDesktopRenderModel(state, {
+    hub: hubPresentation(uiState.hub),
+    deviceNetwork: deviceNetworkPresentation(uiState.deviceNetwork),
+    mcpPublish: publishPresentation(uiState.mcpPublish),
+    mcpPeers: mcpPeerPresentation(uiState.mcpPeers),
     artifactPane: {
       collapsed: uiState.artifactPaneCollapsed,
       mode: uiState.artifactPaneMode,
@@ -989,6 +1022,7 @@ function renderCommitted(
   mutationName: string | null,
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null,
   attachmentFocusDecision: AttachmentFocusDecision,
+  settingsAction: SettingsActionFocusContinuation | null,
 ): void {
   const state = model.view;
   const revealGeneration = ++threadEndRevealGeneration;
@@ -1328,11 +1362,18 @@ function renderCommitted(
       synchronizeRetainedSettingsSurface(
         currentSettingsModal,
         nextSettingsModal,
-        model.local.configMutationPending || model.local.sessionSettings.mutationPending,
-        state.overlay === "session_settings"
+        model.local.configMutationPending || model.local.sessionSettings.mutationPending
+          || (state.overlay === "hub" && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null))
+          || (state.overlay === "mcp_publish" && model.local.mcpPublish.pending !== null),
+        state.overlay === "hub" || state.overlay === "mcp_publish" ? false : state.overlay === "session_settings"
           ? !model.local.sessionSettings.dirty
           : !uiState.configDirty,
       );
+      if (state.overlay === "hub") {
+        synchronizeHubControlValues(currentSettingsModal, nextSettingsModal);
+        synchronizeDeviceNetworkControls(currentSettingsModal, nextSettingsModal);
+      }
+      if (state.overlay === "mcp_publish") synchronizePublishControlValues(currentSettingsModal, nextSettingsModal);
       retainedConnectedSettings = true;
     }
   }
@@ -1388,6 +1429,9 @@ function renderCommitted(
     restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
   }
   restoreScrollSnapshots(scrollSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
+  const acceptedSettingsAction = restoreSettingsActionViewport(
+    settingsAction, previous, state, (selector) => document.querySelector<HTMLElement>(selector),
+  ) ? settingsAction : null;
   if (
     agentExecutionPrependDecision.restoreViewport
     && agentExecutionPrependOwnerMatches(
@@ -1412,7 +1456,7 @@ function renderCommitted(
   );
   const focusSnapshotReserved = focusSnapshotIntent !== null;
   if (focusSnapshotIntent) postRenderFocusIntents.push(focusSnapshotIntent);
-  const settingsActionFocusContinuation = uiState.settingsActionFocusContinuation;
+  const settingsActionFocusContinuation = acceptedSettingsAction ?? uiState.settingsActionFocusContinuation;
   uiState.settingsActionFocusContinuation = null;
   const settingsActionModal = settingsActionFocusContinuation
     && settingsActionFocusStillTargets(settingsActionFocusContinuation, state)
@@ -1540,21 +1584,15 @@ function renderCommitted(
     const refreshFocusOwners = Array.from(
       document.querySelectorAll<HTMLElement>('[data-action="refresh"]'),
     );
-    postRenderFocusIntents.push({
-      source: "refresh-prompt",
-      priority: "operation-return",
-      claim: { kind: "yield-from", owners: refreshFocusOwners },
-      candidates: [{
-        resolve: () => {
-          const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
-          return prompt === previousPrompt ? prompt : null;
-        },
-        settle: (target) => {
-          if (promptSessionInteraction && target instanceof HTMLTextAreaElement) {
-            restoreSessionPromptInteraction(promptSessionInteraction, target);
-          }
-        },
-      }],
+    postRenderFocusIntents.push(createRefreshPromptFocusIntent({
+      prompt: previousPrompt,
+      resolvePrompt: () => document.querySelector<HTMLTextAreaElement>("#prompt"),
+      refreshOwners: refreshFocusOwners,
+      settle: (target) => {
+        if (promptSessionInteraction && target instanceof HTMLTextAreaElement) {
+          restoreSessionPromptInteraction(promptSessionInteraction, target);
+        }
+      },
       isCurrent: () => (
         lastRenderedState === settledState
         && uiState.refreshPromptFocusInteractionGeneration === settledContinuation.interactionGeneration
@@ -1562,7 +1600,7 @@ function renderCommitted(
         && previousPrompt.isConnected
         && !previousPrompt.disabled
       ),
-    });
+    }));
   }
   if (quickChatDeleteFocusDecision.focusTarget && !focusSnapshotReserved) {
     const settledState = state;

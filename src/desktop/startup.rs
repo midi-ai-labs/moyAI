@@ -213,6 +213,13 @@ impl DesktopStartupState {
     }
 
     fn provider_config_check(config: &ResolvedConfig) -> DesktopStartupCheck {
+        if config.device_network.configured() && config.device_network.validate().is_ok() {
+            return DesktopStartupCheck::pass(
+                "provider",
+                "Hub設定",
+                "Hubの共通設定を確認しました。端末連携から参加してください。モデルの接続はまだ確認していません。",
+            );
+        }
         let base_url = normalize_provider_base_url(&config.model.base_url);
         let model = config.model.model.trim();
         if base_url.is_empty() {
@@ -319,6 +326,27 @@ impl DesktopStartupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_hub_config_allows_enrollment_without_a_direct_provider() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url.clear();
+        config.model.model.clear();
+        config.docling.enabled = false;
+        config.device_network.hub_url = "https://127.0.0.1:9471".into();
+        config.device_network.ca_certificate_pem =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])
+                .unwrap()
+                .cert
+                .pem();
+        let state = DesktopStartupState::begin(true, None, Utf8Path::new("."), &config);
+        assert!(!state.requires_initial_setup());
+        assert_eq!(state.status, DesktopStartupStatus::Ready);
+        config.device_network.ca_certificate_pem = "invalid".into();
+        let invalid = DesktopStartupState::begin(true, None, Utf8Path::new("."), &config);
+        assert!(invalid.requires_initial_setup());
+        assert_eq!(invalid.status, DesktopStartupStatus::RequiresProvider);
+    }
 
     #[test]
     fn configured_startup_completes_from_local_values_only() {

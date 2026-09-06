@@ -1,4 +1,8 @@
 import type { LocalConfirmation } from "./render_overlays.ts";
+import { createHubUiState, type HubUiState } from "./hub_state.ts";
+import { createDeviceNetworkUiState, type DeviceNetworkUiState } from "./device_network_state.ts";
+import { createPublishUiState, type PublishUiState } from "./mcp_publish_state.ts";
+import { createMcpPeerState, type McpPeerState } from "./mcp_peer.ts";
 import { agentActivityRowIdentity } from "./agent_activity.ts";
 import {
   asyncTransactionIsCurrent,
@@ -229,6 +233,10 @@ export interface AgentExecutionRequest extends AgentExecutionTarget {
 }
 
 export interface UiLocalState {
+  hub: HubUiState;
+  deviceNetwork: DeviceNetworkUiState;
+  mcpPublish: PublishUiState;
+  mcpPeers: McpPeerState;
   drafts: UiDraftState;
   initialSetup: InitialSetupState;
   initialSetupAuxiliary: InitialSetupAuxiliaryState;
@@ -291,6 +299,10 @@ export interface UiLocalState {
 
 export function createUiLocalState(): UiLocalState {
   return {
+    hub: createHubUiState(),
+    deviceNetwork: createDeviceNetworkUiState(),
+    mcpPublish: createPublishUiState(),
+    mcpPeers: createMcpPeerState(),
     drafts: {
       initialized: false,
       composerOwner: "",

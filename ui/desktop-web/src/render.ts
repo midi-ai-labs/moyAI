@@ -10,6 +10,10 @@ import {
   type ActionPayload,
 } from "./actions.ts";
 import { icon } from "./icons.ts";
+import { renderMcpPeers } from "./mcp_peer.ts";
+import { renderHubOverlay } from "./hub_render.ts";
+import { renderPublishOverlay } from "./mcp_publish_render.ts";
+import { hubExecutionRoute } from "./hub_state.ts";
 import { transcriptAnchors, turnPageLoadPending } from "./history_navigation.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { renderEarlierHistoryTrigger, renderTranscriptRows } from "./render_transcript.ts";
@@ -450,6 +454,12 @@ function renderInitialSetupStartStep(
       </dl>
       <div class="initial-setup-choice-row">
         <div>
+          <strong>Hubでモデルを割り当てる構成で開始</strong>
+          <p>Hub管理者の共通設定ファイルを保存し、端末の参加へ進みます。このPCのモデル接続設定を先に入力する必要はありません。</p>
+          <button id="initial-setup-hub" data-action="initial-setup-hub">Hubの共通設定で始める</button>
+          <small class="settings-field-help">参加コードと、受付する場合の公開対象・実行権限は次の画面で確認します。</small>
+        </div>
+        <div>
           <strong>既定値から設定</strong>
           <p>次へ進み、Provider、Model、Permissions、Optional Toolsを順に確認します。</p>
         </div>
@@ -538,7 +548,7 @@ function renderInitialSetupModelStep(state: DesktopViewState): string {
           <div class="settings-field">
             <label for="initial-setup-model-manual">Model ID</label>
             <input id="initial-setup-model-manual" class="settings-control" data-main-provider-model-control data-config-index="${modelField.index}" data-config-key="model.model" value="${escapeHtml(currentModel)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}" />
-            ${renderConfigFieldHelp(modelField.field, "一覧にないModel IDも入力できます。")}
+            ${renderConfigFieldHelp(modelField.field, "一覧にないModel IDも入力できます。", true)}
           </div>
         </div>
       ` : renderMissingConfigField("model.model")}
@@ -783,7 +793,7 @@ export function renderTitlebar(maximized = false, applicationCommandsInert = fal
       <div class="titlebar-controls">
         <button type="button" data-window-control data-action="minimize-window" title="最小化" aria-label="最小化"><span class="window-control-icon minimize-icon" aria-hidden="true"></span></button>
         <button type="button" data-window-control data-action="toggle-maximize-window" title="${maximizeLabel}" aria-label="${maximizeLabel}" aria-pressed="${maximized}"><span class="window-control-icon maximize-icon ${maximized ? "restore" : ""}" aria-hidden="true"></span></button>
-        <button type="button" data-window-control data-action="close-window" title="閉じる" aria-label="閉じる"><span class="window-control-icon close-icon" aria-hidden="true"></span></button>
+        <button type="button" data-window-control data-action="close-window" title="トレイに格納します。完全終了は「ファイル」→「moyAIを終了」" aria-label="ウィンドウを閉じる（トレイに格納）"><span class="window-control-icon close-icon" aria-hidden="true"></span></button>
       </div>
     </header>
   `;
@@ -995,8 +1005,11 @@ export function renderSidebar(state: DesktopWebState): string {
         <button class="icon-button" data-action="show-shortcuts" title="ショートカット" aria-label="ショートカット">${icon("keyboard")}</button>
         <button class="icon-button" data-action="refresh" title="更新" aria-label="更新">${icon("refresh")}</button>
       </div>
-      <button class="rail-item" data-action="show-config" title="Settingsでglobal既定値を確認・変更">
-        <span class="rail-icon">${icon("plug")}</span><span>接続設定</span>
+      <button class="rail-item" data-action="show-hub" title="Hubに接続してモデルを確認">
+        <span class="rail-icon">${icon("plug")}</span><span>moyAI Hub</span>
+      </button>
+      <button class="rail-item" data-action="show-mcp-publish" title="ツールを公開し、他端末からのタスクを受け付ける">
+        <span class="rail-icon">${icon("plug")}</span><span>MCPを配信</span>
       </button>
       <div class="rail-section row-heading">
         <span>プロジェクト</span>
@@ -1028,7 +1041,11 @@ export function renderTopbar(
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
   const sessionSettingsAvailable = state.session_settings?.available === true
     && state.session_settings.target !== null;
-  const modelSettingsAction = sessionSettingsAvailable ? "show-session-settings" : "show-provider";
+  const hubRoute = hubExecutionRoute(state.hub, "main");
+  const statusMessage = state.status_code === "user_stopped"
+    ? "実行を停止しました。"
+    : state.status_message;
+  const modelSettingsAction = hubRoute ? "show-hub" : sessionSettingsAvailable ? "show-session-settings" : "show-provider";
   const accessSettingsAction = sessionSettingsAvailable ? "show-session-settings" : "toggle-access";
   const accessSettingsEnabled = sessionSettingsAvailable
     || state.config_draft.access_mode_mutation_enabled;
@@ -1036,9 +1053,9 @@ export function renderTopbar(
     <header class="topbar">
       <div class="title-row">
         <div class="title-copy">
-          <h1>${escapeHtml(state.selected_session_title)}</h1>
+          <h1>${escapeHtml(state.selected_session_index < 0 ? "新しいチャット" : state.selected_session_title)}</h1>
           <div class="status-line ${state.status_detail.trim().length > 0 ? "has-detail" : ""}">
-            <span>${escapeHtml(state.status_message)}</span>
+            <span>${escapeHtml(statusMessage)}</span>
             ${
               state.status_detail.trim().length > 0
                 ? `<details data-details-key="status-detail">
@@ -1048,11 +1065,12 @@ export function renderTopbar(
                 : ""
             }
           </div>
+          ${state.status_code === "user_stopped" && hubRoute ? '<p class="hub-stop-explanation">Hubはモデルの終了を確認するまで実行枠を保持します。</p>' : ""}
         </div>
         <div class="chips">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
-          <button data-action="${modelSettingsAction}" ${sessionSettingsAvailable ? 'data-session-settings-trigger="model"' : ""} title="${escapeHtml(sessionSettingsAvailable ? "このセッションのProvider / Model設定" : state.provider_label)}">
-            <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
+          <button data-action="${modelSettingsAction}" ${sessionSettingsAvailable && !hubRoute ? 'data-session-settings-trigger="model"' : ""} title="${escapeHtml(hubRoute ? "Hubの送信先とモデル選択を確認" : sessionSettingsAvailable ? "このセッションのProvider / Model設定" : state.provider_label)}">
+            <span>${escapeHtml(hubRoute?.modelLabel ?? state.model_label)}</span><small>${escapeHtml(hubRoute?.endpointLabel ?? state.provider_label)}</small>
           </button>
           <button data-action="${accessSettingsAction}" ${sessionSettingsAvailable ? 'data-session-settings-trigger="access"' : ""} title="${sessionSettingsAvailable ? "このセッションのAccess mode設定" : "権限モードを切り替え（承認を求める → 代理で承認 → フルアクセス）"}" aria-disabled="${String(!accessSettingsEnabled)}" ${accessSettingsEnabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
           <button class="icon-button" data-action="export-transcript" title="${exportTitle}" aria-label="${exportTitle}" ${exportDisabled ? "disabled" : ""}>${icon("download")}</button>
@@ -1067,16 +1085,14 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
   const activityBadge = renderTaskActivityBadge(state.task_activity_state);
   if (!activityBadge) return "";
   const canCancel = runCanBeCancelled(state);
-  const phase = state.run_phase.trim() || "running";
-  const step = state.run_active_step.trim() || state.status_message;
+  const step = hubExecutionRoute(state.hub, "main")?.phaseLabel || state.run_active_step.trim() || state.status_message;
   const toolLine = state.latest_tool_summary.trim() || "ツール待機中";
   return `
     <section class="run-strip${canCancel ? " has-stop" : ""}">
       ${activityBadge}
-      <span>${escapeHtml(phase)}</span>
       <span>${escapeHtml(step)}</span>
       <small>${escapeHtml(toolLine)}</small>
-      ${canCancel ? `<button class="icon-only danger" data-action="cancel-run" title="実行停止" aria-label="実行停止">${icon("square")}</button>` : ""}
+      ${canCancel ? `<button class="run-stop-button danger" data-action="cancel-run" title="Mainの実行を停止" aria-label="Mainを停止">${icon("square")}<span>Mainを停止</span></button>` : ""}
     </section>
   `;
 }
@@ -1179,20 +1195,13 @@ export function renderPendingTurnInputs(inputs: readonly PendingTurnInput[]): st
 }
 
 function renderEmptyThread(state: DesktopWebState): string {
-  const projectText =
-    state.selected_project_index >= 0
-      ? "このプロジェクトで最初のセッションを作成します"
-      : "通常チャットとして新しいセッションを作成します";
-  const llmText = state.model_label.trim().length > 0 ? `LLM: ${state.model_label}` : "LLM URL を設定してください";
   return `
     <div class="empty-thread">
+      <span class="empty-eyebrow">moyAI Desktop <b>LYNX</b></span>
       <h2>${state.selected_project_index >= 0 ? "このプロジェクトで何を作りますか？" : "何に取り組みますか？"}</h2>
-      <div class="empty-status">
-        ${state.selected_project_index >= 0 ? `<span>${escapeHtml(selectedProjectDisplayLabel(state))}</span>` : ""}
-        <span>${escapeHtml(projectText)}</span>
-        <span>${escapeHtml(llmText)}</span>
-        <span>${escapeHtml(displayAccessLabel(state.access_label))}</span>
-      </div>
+      <p>相談、調査、コードの作成。<br>下の入力欄から、やりたいことを伝えてください。</p>
+      ${state.selected_project_index >= 0 ? `<div class="empty-status"><span>${escapeHtml(selectedProjectDisplayLabel(state))}</span></div>` : ""}
+      ${state.model_label.trim().length === 0 ? '<p class="empty-setup-hint">上のモデル欄で接続先を設定できます。</p>' : ""}
     </div>
   `;
 }
@@ -1222,7 +1231,9 @@ export function renderComposer(
 ): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const sendTitle = composerSendTitle(state, state.draft_prompt);
-  const enhanceTitle = state.navigation_loading
+  const hubRoute = hubExecutionRoute(state.hub, "main");
+  const enhanceTitle = hubRoute ? "Hub利用中は依頼の整形に対応していません"
+    : state.navigation_loading
     ? "画面の切り替え完了後にEnhanceできます"
     : state.busy
       ? "実行中はEnhanceできません"
@@ -1244,14 +1255,15 @@ export function renderComposer(
       <div class="composer-actions">
         <button class="add-button icon-only" data-action="toggle-attachment-tray" title="画像添付" aria-label="画像添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("plus")}</button>
         <button class="icon-only" data-action="show-command-palette" title="検索 / コマンド" aria-label="検索 / コマンド">${icon("more")}</button>
-        <button class="icon-only" data-action="enhance-prompt" title="${enhanceTitle}" aria-label="${enhanceTitle}" ${state.enhance_enabled ? "" : "disabled"}>${icon("sparkles")}</button>
-        <button class="send icon-only" data-action="send" title="${sendTitle}" aria-label="${sendTitle}" ${state.can_submit ? "" : "disabled"}>${icon("send")}</button>
+        <button class="composer-text-action" data-action="enhance-prompt" title="${enhanceTitle}" aria-labelledby="enhance-prompt-label" ${state.enhance_enabled ? "" : "disabled"}>${icon("sparkles")}<span id="enhance-prompt-label">依頼を整える</span></button>
+        <button class="send composer-text-action" data-action="send" title="${sendTitle}" aria-label="${sendTitle}" ${state.can_submit ? "" : "disabled"}><span>送信</span>${icon("send")}</button>
       </div>
       <div class="composer-meta">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${state.selected_project_index >= 0 ? "プロジェクトで作業" : "プロジェクトを選択"}</button>
         ${renderTokenMeter(state)}
         ${renderSessionUsage(state)}
       </div>
+      ${hubRoute?.blockedReason ? `<p class="composer-route-notice" role="status">${escapeHtml(hubRoute.blockedReason)} <button data-action="show-hub">Hub設定を開く</button></p>` : ""}
     </section>
   `;
 }
@@ -1511,13 +1523,14 @@ function renderSideChatPane(
   local: Readonly<DesktopRenderLocalPresentation>,
 ): string {
   const side = state.side_chat;
+  const hubRoute = hubExecutionRoute(state.hub, "side_chat");
   const ownerSessionId = side.owner_session_id ?? state.draft_target.sessionId;
   const targetAvailable = ownerSessionId !== null && side.chat_id !== null;
   const statusLabel = sideChatStatusLabel(side.status);
   const phase = side.phase.trim();
   const statusDetail = side.deleting
     ? "削除処理中"
-    : phase && phase !== side.status ? `${statusLabel} · ${phase}` : statusLabel;
+    : hubRoute?.phaseLabel ?? (phase && phase !== side.status ? `${statusLabel} · ${phase}` : statusLabel);
   if (!side.configured) {
     return `
       <aside class="artifact-pane side-chat-pane" data-pane-mode="side-chat" aria-labelledby="side-chat-heading" aria-busy="${side.deleting}">
@@ -1529,8 +1542,9 @@ function renderSideChatPane(
         <div class="side-chat-setup" data-focus-key="artifact-pane-content" role="region" aria-label="サイドチャット設定案内" tabindex="0">
           <p>SettingsのGlobal Settings › Side Chat Settingsで、新しく作成するサイドチャットの既定値を設定します。</p>
           <p>開くと最新のglobal設定から専用snapshotを作成します。既存のサイドチャットは明示的に閉じるまで、そのモデルとプロンプト、履歴、下書きを維持します。</p>
+          ${hubRoute ? '<p>Hub利用時も、先にサイドチャットの会話設定が必要です。モデル・プロンプト・会話容量の設定を用意してください。送信先はHubで割り当てます。</p>' : ""}
           ${side.deleting ? renderSideChatDeletePending() : ""}
-          ${side.last_error.trim() ? `<p class="side-chat-error" role="alert">${escapeHtml(side.last_error)}</p>` : ""}
+          ${renderSideChatFeedback(side)}
           <button class="wide-send" data-action="show-config" ${!local.sideChat.operationsOpen || local.sideChat.mutationPending || side.deleting ? "disabled" : ""}>設定を開く</button>
         </div>
       </aside>
@@ -1565,12 +1579,13 @@ function renderSideChatPane(
         </div>
       </div>
       <div class="side-chat-meta">
-        <strong title="${escapeHtml(side.model)}">${escapeHtml(side.model || "モデル未設定")}</strong>
+        <strong title="${escapeHtml(hubRoute?.modelLabel ?? side.model)}">${escapeHtml(hubRoute?.modelLabel ?? (side.model || "モデル未設定"))}</strong>
         <span class="side-chat-status ${side.deleting ? "side-chat-status-deleting" : `side-chat-status-${escapeHtml(side.status)}`}" role="status">${escapeHtml(statusDetail)}</span>
-        <small title="${escapeHtml(side.base_url)}">${escapeHtml(side.base_url)}</small>
+        <small title="${escapeHtml(hubRoute?.endpointLabel ?? side.base_url)}">${escapeHtml(hubRoute?.endpointLabel ?? side.base_url)}</small>
       </div>
       ${renderSideChatContextMetadata(side)}
-      ${side.last_error.trim() ? `<p class="side-chat-error" role="alert">${escapeHtml(side.last_error)}</p>` : ""}
+      ${renderSideChatFeedback(side)}
+      ${hubRoute?.blockedReason ? `<p class="side-chat-route-notice" role="status">${escapeHtml(hubRoute.blockedReason)} <button data-action="show-hub">Hub設定を開く</button></p>` : ""}
       ${side.deleting ? renderSideChatDeletePending() : ""}
       <div class="side-chat-scroll" data-focus-key="artifact-pane-content" role="log" aria-label="サイドチャット履歴" tabindex="0">
         ${side.messages.length === 0
@@ -1583,12 +1598,22 @@ function renderSideChatPane(
         <textarea id="side-chat-prompt" aria-describedby="side-chat-context-description" placeholder="サイドチャットに質問" ${targetAvailable && local.sideChat.operationsOpen && !side.deleting && local.sideChat.deleteConfirmation === null ? "" : "disabled"}>${escapeHtml(local.sideChat.draft)}</textarea>
         <div class="side-chat-composer-actions">
           <small>${side.deleting ? "削除の完了を待っています" : "Ctrl+Enterで送信"}</small>
-          <button data-action="cancel-side-chat" ${canCancel ? "" : "disabled"}>${side.deleting ? "停止処理中" : side.status === "running" ? "停止" : "停止不可"}</button>
+          ${side.status === "running" && !side.deleting ? `<button class="run-stop-button danger" data-action="cancel-side-chat" ${canCancel ? "" : "disabled"}>${icon("square")}<span>Sideを停止</span></button>` : ""}
           <button class="send" data-action="send-side-chat" title="サイドチャットへ送信" aria-label="サイドチャットへ送信" ${canSend ? "" : "disabled"}>${icon("send")}</button>
         </div>
       </div>
     </aside>
   `;
+}
+
+function renderSideChatFeedback(side: DesktopWebState["side_chat"]): string {
+  if (!side.last_error.trim()) return "";
+  // last_error can also contain a later draft/storage failure, even on a stopped turn.
+  if (side.status === "cancelled" && side.last_error === "run stopped by user") {
+    return side.deleting ? ""
+      : '<p class="side-chat-notice" role="status">サイドチャットの実行を停止しました。</p>';
+  }
+  return `<p class="side-chat-error" role="alert">${escapeHtml(side.last_error)}</p>`;
 }
 
 function renderSideChatContextMetadata(side: DesktopWebState["side_chat"]): string {
@@ -1689,6 +1714,8 @@ export function renderOverlay(
 ): string {
   if (state.overlay === "provider") return renderProviderOverlay(state, local);
   if (state.overlay === "config") return renderConfigOverlay(state, local);
+  if (state.overlay === "hub") return renderHubOverlay(local.hub, local.deviceNetwork);
+  if (state.overlay === "mcp_publish") return renderPublishOverlay(local.mcpPublish);
   if (state.overlay === "session_settings") return renderSessionSettingsOverlay(state, local);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
   if (state.overlay === "prompt_review") return renderPromptReviewOverlay(state);
@@ -1728,6 +1755,7 @@ function renderAboutOverlay(state: DesktopViewState): string {
           <strong class="about-product">${escapeHtml(about.product_name)}</strong>
           <dl class="about-metadata">
             <div><dt>バージョン</dt><dd>${escapeHtml(about.version)}</dd></div>
+            <div><dt>コードネーム</dt><dd>${escapeHtml(about.codename)}</dd></div>
             <div><dt>ライセンス</dt><dd>${escapeHtml(about.license_identifier)}</dd></div>
           </dl>
           <p class="about-copyright">${escapeHtml(about.copyright_notice)}</p>
@@ -1999,26 +2027,30 @@ function renderSideChatSettings(
     <section id="settings-side-chat" class="settings-section" aria-labelledby="settings-side-chat-title" aria-describedby="side-chat-settings-help" aria-busy="${catalogLoading ? "true" : "false"}">
       <div class="settings-section-head">
         <div>
-          <h3 id="settings-side-chat-title">Side Chat Settings</h3>
-          <p id="side-chat-settings-help">新しく作成するtext-only・tool-less Side Chatのglobal既定値です。「UIセッションに適用」または「設定ファイルに保存」で反映します。Side Chatを開くと、この時点のモデルとプロンプトを専用snapshotとして保持します。既存のSide Chatには後からのglobal変更を混ぜず、明示的に閉じると履歴・下書き・snapshotだけを削除します。再度開くと最新の既定値を使用します。</p>
+          <h3 id="settings-side-chat-title">サイドチャット</h3>
+          <p id="side-chat-settings-help">新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません。既存の会話の設定は変わりません。</p>
         </div>
         <button data-action="load-side-chat-models" aria-controls="side-chat-model side-chat-model-catalog-status" aria-disabled="${local.sideChat.catalogLoadEnabled ? "false" : "true"}" ${local.sideChat.catalogLoadEnabled ? "" : "disabled"}>${catalogLoading ? "読込中…" : "モデル読込"}</button>
       </div>
+      <details class="settings-scope-details" data-details-key="side-chat-settings-scope">
+        <summary id="side-chat-settings-scope-toggle">既存の会話に新しい設定を使うには</summary>
+        <p>サイドチャットは、開いた時点のモデルとプロンプトを保持します。新しい設定を適用するには、上の適用または保存を押した後、サイドチャットを削除して開き直します。削除すると、その会話の履歴と下書きも失われます。</p>
+      </details>
       <div class="settings-grid-two">
-        ${renderConfigEnumField(state, "side_chat.provider_profile", "Connection type", PROVIDER_PROFILE_LABELS, { controlId: "side-chat-provider-profile" })}
-        ${renderConfigTextField(state, "side_chat.base_url", "LLM URL", "url", "Main Chatの接続設定から暗黙継承しません。", { controlId: "side-chat-base-url" })}
+        ${renderConfigEnumField(state, "side_chat.provider_profile", "接続方式", PROVIDER_PROFILE_LABELS, { controlId: "side-chat-provider-profile" })}
+        ${renderConfigTextField(state, "side_chat.base_url", "接続先URL", "url", "メインチャットとは別の接続先です。", { controlId: "side-chat-base-url" })}
         ${renderSideChatModelField(state, local.sideChat.catalog)}
         ${renderConfigMultilineField(
           state,
           "side_chat.system_prompt",
           "追加システムプロンプト（任意）",
-          `moyAI組み込みのSide Chatプロンプトは保持され、その後に追加されます。空欄は追加なしです。${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内で入力してください。`,
+          `組み込みの指示に追加します。空欄は追加なしです。${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内。`,
           { controlId: "side-chat-system-prompt" },
         )}
-        ${renderConfigTextField(state, "side_chat.context_window", "moyAI local context budget", "number", "Providerへは送信せず、Side Chatの入力整理にだけ使用します。")}
-        ${renderConfigTextField(state, "side_chat.request_timeout_ms", "応答無進捗タイムアウト", "number", "応答headerとSSE event間の最大無進捗時間です（ms）。")}
-        ${renderConfigTextField(state, "side_chat.connect_timeout_ms", "接続タイムアウト", "number", "Providerへの接続待機時間です（ms）。")}
-        ${renderConfigTextField(state, "side_chat.max_retries", "最大retry回数", "number")}
+        ${renderConfigTextField(state, "side_chat.context_window", "入力の整理上限（トークン）", "number", "サイドチャットの入力整理に使います。モデル側の設定は変えません。")}
+        ${renderConfigTextField(state, "side_chat.request_timeout_ms", "応答の進捗を待つ時間（ms）", "number", "応答開始までと、受信中に進捗が止まった場合の待ち時間です。")}
+        ${renderConfigTextField(state, "side_chat.connect_timeout_ms", "接続を待つ時間（ms）", "number", "モデルの接続先への待ち時間です。")}
+        ${renderConfigTextField(state, "side_chat.max_retries", "再試行の上限回数", "number")}
       </div>
       <p id="side-chat-model-catalog-status" class="side-chat-model-catalog-status ${local.sideChat.catalog.status === "error" ? "error" : ""}" data-settings-live-region="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(sideChatCatalogStatusText(local.sideChat.catalog))}</p>
     </section>
@@ -2045,7 +2077,7 @@ function renderConfigOverlay(
   local: Readonly<DesktopRenderLocalPresentation>,
 ): string {
   const setupRequired = startupSetupRequired(state);
-  const title = setupRequired ? "初期設定" : "Settings";
+  const title = setupRequired ? "初期設定" : "設定";
   const configValidation = validateConfigFieldValues(state.config_fields);
   const configCommitState = configCommitControlState(state.config_draft.commit_enabled, configValidation.ok);
   const configCommitAttributes = `${configCommitState.disabled ? "disabled " : ""}aria-disabled="${configCommitState.ariaDisabled}"`;
@@ -2058,7 +2090,7 @@ function renderConfigOverlay(
   const validationKind = configValidation.ok ? "ok" : "error";
   const validationText = configValidation.ok
     ? state.config_draft.dirty
-      ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+      ? "未保存の設定があります。適用、保存、または変更を破棄してから別画面の設定を変更できます。"
       : "入力形式は問題ありません。"
     : `${configValidation.invalidKey}: ${configValidation.message}`;
   return `
@@ -2067,7 +2099,7 @@ function renderConfigOverlay(
         <div class="settings-header">
           <div>
             <h2 id="config-dialog-title">${escapeHtml(title)}</h2>
-            <p>${setupRequired ? "起動に必要な設定を確認します。" : "Global Settings、Session Overrides、Desktop Preferencesを、保存先ごとに管理します。"}</p>
+            <p>${setupRequired ? "起動に必要な設定を確認します。" : "共通設定は、この起動中だけ適用するか、設定ファイルに保存できます。"}</p>
           </div>
           <div class="settings-header-actions">
             <span class="dirty-badge ${state.config_draft.dirty ? "visible" : ""}">変更あり</span>
@@ -2089,19 +2121,19 @@ function renderConfigOverlay(
         </div>
         <div class="settings-layout">
           <nav class="settings-nav" aria-label="設定カテゴリ">
-            <span class="settings-nav-group" role="heading" aria-level="3">Global Settings</span>
-            <a href="#settings-provider">Main Chat Settings</a>
-            <a class="settings-nav-subitem" href="#settings-model">Context &amp; capabilities</a>
-            <a href="#settings-side-chat">Side Chat Settings</a>
-            <a href="#settings-permissions">Permissions</a>
-            <a href="#settings-agents">Agents</a>
-            <a href="#settings-tools">Tools</a>
-            <a href="#settings-files">Files</a>
-            <a href="#settings-advanced">Advanced</a>
-            <span class="settings-nav-group" role="heading" aria-level="3">Session-scoped Settings</span>
-            <a href="#settings-session-scope">Session Overrides</a>
-            <span class="settings-nav-group" role="heading" aria-level="3">Desktop Preferences</span>
-            <a href="#settings-desktop">Window</a>
+            <span class="settings-nav-group" role="heading" aria-level="3">共通設定</span>
+            <a href="#settings-provider">メインチャット</a>
+            <a class="settings-nav-subitem" href="#settings-model">入力の上限・モデル機能</a>
+            <a href="#settings-side-chat">サイドチャット</a>
+            <a href="#settings-permissions">権限</a>
+            <a href="#settings-agents">エージェント</a>
+            <a href="#settings-tools">ツール</a>
+            <a href="#settings-files">ファイル</a>
+            <a href="#settings-advanced">詳細設定</a>
+            <span class="settings-nav-group" role="heading" aria-level="3">チャットごとの設定</span>
+            <a href="#settings-session-scope">現在のチャット</a>
+            <span class="settings-nav-group" role="heading" aria-level="3">画面設定</span>
+            <a href="#settings-desktop">ウィンドウ</a>
             <button data-action="open-global-config-folder">設定フォルダーを開く</button>
             <button data-action="open-user-data-folder">データフォルダーを開く</button>
           </nav>
@@ -2109,65 +2141,65 @@ function renderConfigOverlay(
             <section id="settings-provider" class="settings-section" aria-labelledby="settings-provider-title" aria-describedby="main-provider-settings-help" aria-busy="${state.provider_loading ? "true" : "false"}">
               <div class="settings-section-head">
                 <div>
-                  <h3 id="settings-provider-title">Main Chat Settings</h3>
-                  <p id="main-provider-settings-help">Main Chatのglobal既定値です。「UIセッションに適用」または「設定ファイルに保存」で反映します。現在のchatだけを変える場合はSession Settingsを使用します。</p>
+                  <h3 id="settings-provider-title">メインチャット</h3>
+                  <p id="main-provider-settings-help">メインチャットの共通の既定値です。いまの会話だけを変更する場合は「現在のチャット」を開いてください。</p>
                 </div>
                 <button data-action="show-provider" aria-controls="main-provider-model main-provider-model-catalog-status" title="Main Chatのモデル一覧と接続詳細を開く" ${state.config_draft.external_owner_mutation_open ? "" : "disabled"}>モデル読込・詳細設定</button>
               </div>
               <div class="settings-grid-two">
-                ${renderConfigTextField(state, "model.base_url", "LLM URL", "url", "モデル一覧はこのURLとConnection typeに紐付きます。")}
+                ${renderConfigTextField(state, "model.base_url", "接続先URL", "url", "このURLと接続方式に対応するモデルを使います。")}
                 ${renderMainProviderModelField(state)}
               </div>
               <p id="main-provider-model-catalog-status" class="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(mainProviderCatalogStatusText(state))}</p>
               <div class="settings-grid-two">
-                ${renderConfigEnumField(state, "model.provider_profile", "Connection type", PROVIDER_PROFILE_LABELS)}
+                ${renderConfigEnumField(state, "model.provider_profile", "接続方式", PROVIDER_PROFILE_LABELS)}
                 ${renderConfigTextField(
                   state,
                   "model.api_key_env",
-                  "API key environment variable (optional)",
+                  "APIキーの環境変数名（任意）",
                   "text",
-                  "API keyそのものではなく、moyAI起動時に設定済みの環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄です。",
+                  "キーの値ではなく、起動前に設定した環境変数名を入力します（例: OPENAI_API_KEY）。認証不要なら空欄です。",
                 )}
                 ${renderConfigMultilineField(
                   state,
                   "model.system_prompt",
                   "追加システムプロンプト（任意）",
-                  `moyAI組み込みのシステムプロンプトは保持され、その後に追加されます。空欄は追加なしです。${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内で入力してください。`,
+                  `組み込みの指示に追加します。空欄は追加なしです。${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内。`,
                 )}
               </div>
               <div id="settings-model" class="settings-subsection" aria-labelledby="settings-model-title" aria-describedby="settings-model-help">
-                <h4 id="settings-model-title">Context &amp; capabilities</h4>
-                <p id="settings-model-help">moyAI内の入力整理とAPI機能を設定します。sampling / thinking / 出力量はホスティング側の設定をそのまま使用します。</p>
+                <h4 id="settings-model-title">入力の上限・モデル機能</h4>
+                <p id="settings-model-help">入力の整理と利用する機能を設定します。回答の長さや思考設定はモデルのホスト側で管理します。</p>
                 <div class="settings-grid-two">
                   ${renderConfigTextField(
                     state,
                     "model.context_window",
-                    "moyAI local context budget",
+                    "入力の整理上限（トークン）",
                     "number",
-                    "Providerへは送信せず、moyAI内の入力整理にだけ使用します。",
+                    "moyAI内の入力整理に使います。モデル側の設定は変えません。",
                   )}
                   ${renderConfigTextField(
                     state,
                     "model.request_timeout_ms",
-                    "LLM応答無進捗タイムアウト",
+                    "応答の進捗を待つ時間（ms）",
                     "number",
-                    "応答headerまでの待機と、応答中のSSE event間の最大無進捗時間です（ms）。進捗中の総所要時間は制限せず、hostへも送信しません。",
+                    "応答開始までと、受信中に進捗が止まった場合の待ち時間です。応答が続いている間の総時間は制限せず、モデル側の設定も変えません。",
                   )}
                 </div>
                 <div class="settings-toggle-grid">
-                  ${renderConfigToggleField(state, "model.supports_tools", "Tools")}
-                  ${renderConfigToggleField(state, "model.supports_images", "Images")}
-                  ${renderConfigToggleField(state, "model.parallel_tool_calls", "Parallel tool calls")}
+                  ${renderConfigToggleField(state, "model.supports_tools", "ツール利用")}
+                  ${renderConfigToggleField(state, "model.supports_images", "画像入力")}
+                  ${renderConfigToggleField(state, "model.parallel_tool_calls", "ツールの並列呼び出し")}
                 </div>
               </div>
             </section>
             ${renderSideChatSettings(state, local)}
             <section id="settings-permissions" class="settings-section" aria-labelledby="settings-permissions-title" aria-describedby="settings-permissions-help">
               <div>
-                <h3 id="settings-permissions-title">Permissions</h3>
+                <h3 id="settings-permissions-title">権限</h3>
                 <p id="settings-permissions-help">ツール実行時の承認方法を設定します。</p>
               </div>
-              ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", {
+              ${renderConfigEnumField(state, "permissions.access_mode", "承認の方法", {
                 default: "承認を求める",
                 auto_review: "代理で承認",
                 full_access: "フルアクセス",
@@ -2176,40 +2208,40 @@ function renderConfigOverlay(
             <section id="settings-agents" class="settings-section" aria-labelledby="settings-agents-title" aria-describedby="settings-agents-help">
               <div class="settings-section-head">
                 <div>
-                  <h3 id="settings-agents-title">Agents</h3>
-                  <p id="settings-agents-help">通常のmoyAIセッションをSub Agentとして共有workspace上で実行します。変更は次回runから有効です。</p>
+                  <h3 id="settings-agents-title">エージェント</h3>
+                  <p id="settings-agents-help">サブエージェントと同じ作業場所を共有します。変更は次の実行から有効です。</p>
                 </div>
-                ${renderConfigToggleField(state, "multi_agent.enabled", "Multi-Agentを有効化")}
+                ${renderConfigToggleField(state, "multi_agent.enabled", "サブエージェントを使う")}
               </div>
               ${renderConfigEnumField(state, "multi_agent.mode", "起動モード", {
                 explicit_request_only: "明示依頼時のみ",
                 proactive: "必要に応じて自動",
               })}
               <div class="settings-grid-two">
-                ${renderConfigTextField(state, "multi_agent.max_concurrent_agents", "同時Agent数（root込み）", "number")}
-                ${renderConfigTextField(state, "multi_agent.max_concurrent_model_requests", "同時model request数", "number")}
+                ${renderConfigTextField(state, "multi_agent.max_concurrent_agents", "同時エージェント数（メインを含む）", "number")}
+                ${renderConfigTextField(state, "multi_agent.max_concurrent_model_requests", "モデルへの同時要求数", "number")}
               </div>
-              <p class="settings-hint">ローカルLLMではmodel requestを1本に保つ設定を推奨します。Agentごとのcontextと独立レビューは並列推論なしでも維持されます。</p>
+              <p class="settings-hint">ローカルLLMでは同時要求数1を推奨します。推論を順番に行っても、各エージェントの会話と独立したレビューを保てます。</p>
             </section>
             <section id="settings-tools" class="settings-section" aria-labelledby="settings-tools-title" aria-describedby="settings-tools-help">
               <div>
-                <h3 id="settings-tools-title">Tools</h3>
-                <p id="settings-tools-help">Shell、Docling、MCPの利用可否と接続情報を設定します。</p>
+                <h3 id="settings-tools-title">ツール</h3>
+                <p id="settings-tools-help">コマンド実行、文書変換、外部ツールの接続を設定します。</p>
               </div>
               <div class="settings-subsection">
                 <div class="settings-section-head compact">
                   <div>
-                    <h4>Shell</h4>
-                    <p>Windows の PowerShell / taskkill helper window 表示を制御します。</p>
+                    <h4>コマンド実行</h4>
+                    <p>Windowsでコマンドを実行するときの補助ウィンドウの表示を設定します。</p>
                   </div>
-                  ${renderConfigToggleField(state, "shell.hide_windows", "PowerShell window を隠す")}
+                  ${renderConfigToggleField(state, "shell.hide_windows", "補助ウィンドウを隠す")}
                 </div>
               </div>
               <div class="settings-subsection">
                 <div class="settings-section-head compact">
                   <div>
                     <h4>Docling</h4>
-                    <p>PDF / DOCX などの構造化 document 変換に使います。無効時は agent tool surface から外れます。</p>
+                    <p>PDF・Wordなどの文書を変換します。無効にすると、エージェントはこのツールを使用しません。</p>
                   </div>
                   <div class="settings-tool-actions">
                     ${renderConfigToggleField(state, "docling.enabled", "Docling を有効化")}
@@ -2219,12 +2251,12 @@ function renderConfigOverlay(
                 <p id="docling-disabled-help" class="settings-disabled-help" role="status" aria-live="polite" ${doclingEnabled ? "hidden" : ""}>Doclingがオフのため、接続設定は変更できません。「Docling を有効化」をオンにすると編集できます。</p>
                 <div class="settings-docling-dependent" data-docling-dependent aria-disabled="${String(!doclingEnabled)}">
                   <div class="settings-grid-two">
-                    ${renderConfigTextField(state, "docling.base_url", "Docling base URL", "url", "", doclingDependencyOptions)}
-                    ${renderConfigTextField(state, "docling.timeout_ms", "Timeout ms", "number", "", doclingDependencyOptions)}
-                    ${renderConfigTextField(state, "docling.api_key_env", "API key env", "text", "", doclingDependencyOptions)}
+                    ${renderConfigTextField(state, "docling.base_url", "Doclingの接続先URL", "url", "", doclingDependencyOptions)}
+                    ${renderConfigTextField(state, "docling.timeout_ms", "待ち時間の上限（ms）", "number", "", doclingDependencyOptions)}
+                    ${renderConfigTextField(state, "docling.api_key_env", "APIキーの環境変数名", "text", "", doclingDependencyOptions)}
                   </div>
                   <details class="settings-docling-advanced" data-details-key="settings-docling-advanced">
-                    <summary>Docling 接続ヘッダー（Advanced）</summary>
+                    <summary>Doclingの接続ヘッダー（詳細）</summary>
                     ${renderConfigJsonField(state, "docling.headers_json", "Headers JSON", doclingDependencyOptions)}
                   </details>
                 </div>
@@ -2234,36 +2266,37 @@ function renderConfigOverlay(
                 <div class="settings-section-head compact">
                   <div>
                     <h4>MCP</h4>
-                    <p>明示設定した HTTP MCP server だけを使います。</p>
+                    <p>ここで登録したHTTP接続のMCPサーバーを使います。</p>
                   </div>
                   ${renderConfigToggleField(state, "mcp.enabled", "有効")}
                 </div>
                 ${renderConfigJsonField(state, "mcp.servers_json", "MCP servers JSON")}
+                ${renderMcpPeers(local.mcpPeers, local.configMutationPending, state.config_draft.dirty)}
               </div>
             </section>
             <section id="settings-files" class="settings-section" aria-labelledby="settings-files-title" aria-describedby="settings-files-help">
               <div>
-                <h3 id="settings-files-title">Files</h3>
-                <p id="settings-files-help">workspace inspectionと大きなファイルの読取上限を設定します。</p>
+                <h3 id="settings-files-title">ファイル</h3>
+                <p id="settings-files-help">作業場所の調査範囲と、ファイルの読み取り上限を設定します。</p>
               </div>
               <div class="settings-grid-two">
-                ${renderConfigTextField(state, "inspection.default_max_depth", "Inspection depth", "number")}
-                ${renderConfigTextField(state, "inspection.default_max_entries_per_dir", "Entries per dir", "number")}
-                ${renderConfigTextField(state, "inspection.max_extensions_reported", "Extensions reported", "number")}
-                ${renderConfigTextField(state, "file_guard.max_inline_read_bytes", "Max inline read bytes", "number")}
-                ${renderConfigTextField(state, "file_guard.large_file_warning_bytes", "Large file warning bytes", "number")}
-                ${renderConfigTextField(state, "file_guard.blocked_read_extensions", "Blocked extensions")}
-                ${renderConfigTextField(state, "file_guard.structured_document_extensions", "Structured document extensions")}
+                ${renderConfigTextField(state, "inspection.default_max_depth", "フォルダーを調べる深さ", "number")}
+                ${renderConfigTextField(state, "inspection.default_max_entries_per_dir", "フォルダーごとの項目数", "number")}
+                ${renderConfigTextField(state, "inspection.max_extensions_reported", "報告する拡張子の種類数", "number")}
+                ${renderConfigTextField(state, "file_guard.max_inline_read_bytes", "直接読み取る上限（バイト）", "number")}
+                ${renderConfigTextField(state, "file_guard.large_file_warning_bytes", "大きなファイルの警告基準（バイト）", "number")}
+                ${renderConfigTextField(state, "file_guard.blocked_read_extensions", "読み取りを制限する拡張子")}
+                ${renderConfigTextField(state, "file_guard.structured_document_extensions", "文書として変換する拡張子")}
               </div>
-              ${renderConfigToggleField(state, "inspection.include_hidden_by_default", "Hidden files を inspection に含める")}
+              ${renderConfigToggleField(state, "inspection.include_hidden_by_default", "隠しファイルも調査する")}
             </section>
             <section id="settings-advanced" class="settings-section" aria-labelledby="settings-advanced-title" aria-describedby="settings-advanced-help">
               <div>
-                <h3 id="settings-advanced-title">Advanced</h3>
-                <p id="settings-advanced-help">専用controlを持たない設定値を、projected typeと制約を確認しながら編集します。</p>
+                <h3 id="settings-advanced-title">詳細設定</h3>
+                <p id="settings-advanced-help">その他の設定を直接編集します。各項目の入力形式と条件を確認してください。</p>
               </div>
               <details data-details-key="settings-advanced-fields">
-                <summary>Advanced raw fields</summary>
+                <summary>その他の設定項目を表示</summary>
                 <div class="settings-raw-grid">
                   ${state.config_fields
                     .map((field, index) => ({ field, index }))
@@ -2278,21 +2311,21 @@ function renderConfigOverlay(
             </section>
             <section id="settings-session-scope" class="settings-section settings-scope-card" aria-labelledby="settings-session-scope-title">
               <div>
-                <h3 id="settings-session-scope-title">Session Overrides</h3>
-                <p>現在のroot sessionだけに適用するProvider、Model、local context budget、Access modeを編集します。Global Settingsは変更しません。</p>
+                <h3 id="settings-session-scope-title">現在のチャット</h3>
+                <p>いまのメインチャットだけの接続先、モデル、入力上限、権限を変更します。共通設定は変わりません。</p>
               </div>
-              <button data-action="show-session-settings" ${state.session_settings.available && !state.config_draft.dirty && !local.configMutationPending ? "" : "disabled"}>Session Settingsを開く</button>
-              ${state.config_draft.dirty ? '<small class="settings-field-help">Global Settingsの変更を適用、保存、または破棄してから開いてください。</small>' : ""}
+              <button data-action="show-session-settings" ${state.session_settings.available && !state.config_draft.dirty && !local.configMutationPending ? "" : "disabled"}>このチャットの設定を開く</button>
+              ${state.config_draft.dirty ? '<small class="settings-field-help">共通設定の変更を適用、保存、または破棄してから開いてください。</small>' : ""}
             </section>
             <section id="settings-desktop" class="settings-section" aria-labelledby="settings-desktop-title">
               <div>
-                <h3 id="settings-desktop-title">Desktop Preferences</h3>
-                <p>このDesktop固有の表示設定です。global config.tomlとは別に保存されます。</p>
+                <h3 id="settings-desktop-title">画面設定</h3>
+                <p>このDesktopの表示設定です。共通の設定ファイルとは別に保存されます。</p>
               </div>
               <div class="settings-field">
                 <label for="opacity-input">ウィンドウ透過率</label>
                 <input id="opacity-input" class="desktop-preference-control" type="range" min="50" max="100" value="${state.window_opacity_percent}" aria-valuetext="${state.window_opacity_percent}%" />
-                <small class="settings-field-help">Desktopを再起動しても維持されます。TOML設定Importの対象ではありません。</small>
+                <small class="settings-field-help">再起動しても維持されます。設定ファイルの読み込みでは変更されません。</small>
               </div>
             </section>
           </div>
@@ -2350,7 +2383,7 @@ function configFieldDescriptionIds(
   ])].join(" ");
 }
 
-function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = ""): string {
+function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = "", includeTechnical = true): string {
   const typeLabel = {
     string: "文字列",
     boolean: "オン / オフ",
@@ -2361,8 +2394,7 @@ function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = ""): s
   }[field.value_type] ?? field.value_type;
   const parts = [
     explicitHelp.trim(),
-    `設定キー: ${field.key}。`,
-    `形式: ${typeLabel}。`,
+    ...(includeTechnical ? [`設定キー: ${field.key}。`, `形式: ${typeLabel}。`] : []),
   ].filter((part) => part.length > 0);
   if (field.min_value !== null && field.max_value !== null) {
     parts.push(`範囲: ${field.min_value}以上${field.max_value}以下。`);
@@ -2371,9 +2403,9 @@ function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = ""): s
   } else if (field.max_value !== null) {
     parts.push(`範囲: ${field.max_value}以下。`);
   }
-  if (field.options.length > 0) parts.push(`選択肢: ${field.options.join(" / ")}。`);
+  if (includeTechnical && field.options.length > 0) parts.push(`選択肢: ${field.options.join(" / ")}。`);
   if (field.required) parts.push("必須入力です。");
-  if (field.env_override) parts.push(`環境変数: ${field.env_override}。`);
+  if (includeTechnical && field.env_override) parts.push(`環境変数: ${field.env_override}。`);
   if (field.sensitive) {
     parts.push(field.configured
       ? "機密値は設定済みです。現在値は表示されず、空欄のまま保存すると保持されます。"
@@ -2382,8 +2414,16 @@ function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = ""): s
   return parts.join(" ");
 }
 
-function renderConfigFieldHelp(field: ConfigFieldProjection, explicitHelp = ""): string {
-  return `<small id="${configFieldHelpId(field.key)}" class="settings-field-help">${escapeHtml(configFieldHelpText(field, explicitHelp))}</small>`;
+function renderConfigFieldHelp(field: ConfigFieldProjection, explicitHelp = "", inlineTechnical = false): string {
+  const helpId = configFieldHelpId(field.key);
+  const help = configFieldHelpText(field, explicitHelp, inlineTechnical);
+  const guidance = `<small id="${helpId}" class="settings-field-help"${help ? "" : " hidden"}>${escapeHtml(help)}</small>`;
+  if (inlineTechnical) return guidance;
+  return `${guidance}
+    <details class="settings-field-technical" data-details-key="${helpId}-technical">
+      <summary id="${helpId}-technical-toggle" aria-label="${escapeHtml(field.key)} の技術詳細">技術詳細</summary>
+      <p>${escapeHtml(configFieldHelpText(field))}</p>
+    </details>`;
 }
 
 function sensitiveConfigInputAttributes(field: ConfigFieldProjection): string {
@@ -2430,10 +2470,10 @@ function renderConfigTextField(
   const controlId = options.controlId ?? configFieldControlId(found.field.key);
   return `
     <div class="settings-field">
-      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <label for="${controlId}">${escapeHtml(label)}${options.initialSetup ? renderEnvBadge(found.field) : ""}</label>
       <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode}${sensitiveConfigInputAttributes(found.field)} value="${escapeHtml(found.field.value)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"} />
       ${renderSensitiveConfigStatus(found.field)}
-      ${renderConfigFieldHelp(found.field, help)}
+      ${renderConfigFieldHelp(found.field, help, options.initialSetup)}
     </div>
   `;
 }
@@ -2457,7 +2497,7 @@ function renderMainProviderModelField(state: DesktopViewState): string {
   const describedBy = configFieldDescriptionIds(found.field, ["main-provider-model-catalog-status"]);
   return `
     <div class="settings-field main-provider-model-field">
-      <label for="main-provider-model">Model${renderEnvBadge(found.field)}</label>
+      <label for="main-provider-model">モデル</label>
       <select id="main-provider-model" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" aria-describedby="${describedBy}"${configFieldValidationAttribute(state, found.field)} ${controlsEnabled && options.length > 0 ? "" : "disabled"}>
         ${currentModel.length === 0 ? '<option value="" selected disabled>モデルを選択してください</option>' : ""}
         ${options.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === currentModel ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
@@ -2485,7 +2525,7 @@ function renderSideChatModelField(
   const invalid = configFieldValidationAttribute(state, found.field);
   return `
     <div class="settings-field side-chat-model-field">
-      <label for="side-chat-model">Model</label>
+      <label for="side-chat-model">モデル</label>
       <select id="side-chat-model" class="settings-control" data-side-chat-model-control data-config-index="${found.index}" data-config-key="side_chat.model" aria-describedby="${describedBy}"${invalid} ${controlsEnabled && options.length > 0 ? "" : "disabled"}>
         ${currentModel.length === 0 ? '<option value="" selected disabled>モデルを選択してください</option>' : ""}
         ${options.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === currentModel ? "selected" : ""}>${escapeHtml(sideChatModelOptionLabel(option))}</option>`).join("")}
@@ -2495,7 +2535,7 @@ function renderSideChatModelField(
         <label for="side-chat-model-manual">モデルID</label>
         <input id="side-chat-model-manual" class="settings-control" data-side-chat-model-control data-config-index="${found.index}" data-config-key="side_chat.model" value="${escapeHtml(found.field.value)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}"${invalid} ${controlsEnabled ? "" : "disabled"} />
       </details>
-      ${renderConfigFieldHelp(found.field, "モデル候補から選ぶか、一覧にないModel IDを直接入力できます。")}
+      ${renderConfigFieldHelp(found.field, "候補から選択するか、モデルIDを直接入力できます。")}
     </div>
   `;
 }
@@ -2585,10 +2625,10 @@ function renderConfigJsonField(
   const controlId = configFieldControlId(found.field.key);
   return `
     <div class="settings-field wide">
-      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <label for="${controlId}">${escapeHtml(label)}${options.initialSetup ? renderEnvBadge(found.field) : ""}</label>
       <textarea id="${controlId}" class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}"${sensitiveConfigInputAttributes(found.field)} aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
       ${renderSensitiveConfigStatus(found.field)}
-      ${renderConfigFieldHelp(found.field)}
+      ${renderConfigFieldHelp(found.field, "", options.initialSetup)}
     </div>
   `;
 }
@@ -2605,10 +2645,10 @@ function renderConfigMultilineField(
   const controlId = options.controlId ?? configFieldControlId(found.field.key);
   return `
     <div class="settings-field wide">
-      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <label for="${controlId}">${escapeHtml(label)}${options.initialSetup ? renderEnvBadge(found.field) : ""}</label>
       <textarea id="${controlId}" class="settings-control settings-system-prompt" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}"${sensitiveConfigInputAttributes(found.field)} aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
       ${renderSensitiveConfigStatus(found.field)}
-      ${renderConfigFieldHelp(found.field, help)}
+      ${renderConfigFieldHelp(found.field, help, options.initialSetup)}
     </div>
   `;
 }
@@ -2628,9 +2668,9 @@ function renderConfigToggleField(
       <label class="settings-toggle" for="${controlId}" data-config-key="${escapeHtml(key)}">
         <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="checkbox" ${checked} aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"} />
         <span class="toggle-ui"></span>
-        <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
+        <span>${escapeHtml(label)}${options.initialSetup ? renderEnvBadge(found.field) : ""}</span>
       </label>
-      ${renderConfigFieldHelp(found.field)}
+      ${renderConfigFieldHelp(found.field, "", options.initialSetup)}
     </div>
   `;
 }
@@ -2648,11 +2688,11 @@ function renderConfigEnumField(
   const controlId = renderOptions.controlId ?? configFieldControlId(found.field.key);
   return `
     <div class="settings-field wide">
-      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <label for="${controlId}">${escapeHtml(label)}${renderOptions.initialSetup ? renderEnvBadge(found.field) : ""}</label>
       <select id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(renderOptions.descriptionIds ?? [])], !renderOptions.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !renderOptions.disabled ? "" : "disabled"}>
         ${options.map((value) => `<option value="${escapeHtml(value)}" ${found.field.value === value ? "selected" : ""}>${escapeHtml(optionLabels[value] ?? value)}</option>`).join("")}
       </select>
-      ${renderConfigFieldHelp(found.field)}
+      ${renderConfigFieldHelp(found.field, "", renderOptions.initialSetup)}
     </div>
   `;
 }
@@ -2668,7 +2708,7 @@ function renderRawConfigField(
       <label for="${controlId}">${escapeHtml(field.key)}${renderEnvBadge(field)}</label>
       <textarea id="${controlId}" class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}"${sensitiveConfigInputAttributes(field)} aria-describedby="${configFieldDescriptionIds(field)}"${configFieldValidationAttribute(state, field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
       ${renderSensitiveConfigStatus(field)}
-      ${renderConfigFieldHelp(field)}
+      ${renderConfigFieldHelp(field, "", true)}
     </div>
   `;
 }

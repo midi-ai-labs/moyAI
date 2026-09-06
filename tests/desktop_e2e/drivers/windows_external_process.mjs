@@ -123,6 +123,22 @@ function parseWrapperEnvelopes(text) {
   return { owner: owners[0] ?? null, result: results[0] ?? null, values };
 }
 
+function acceptedOwner(envelope, wrapperPid, executable, supervisor) {
+  const owner = envelope?.owner, observedSupervisor = envelope?.supervisor;
+  return envelope?.wrapper_process_id === wrapperPid
+    && envelope?.job?.assigned_at_creation === true
+    && envelope?.job?.assigned_before_resume === true
+    && envelope?.job?.kill_on_close === true
+    && Number.isInteger(owner?.process_id) && owner.process_id > 0
+    && typeof owner?.process_start_time_utc_ticks === "string"
+    && DECIMAL_TICKS.test(owner.process_start_time_utc_ticks)
+    && pathEqual(owner?.executable_path ?? "", executable)
+    && owner?.parent_process_id === wrapperPid
+    && observedSupervisor?.process_id === supervisor.process_id
+    && observedSupervisor?.process_start_time_utc_ticks === supervisor.process_start_time_utc_ticks
+    && pathEqual(observedSupervisor?.executable_path ?? "", supervisor.executable_path);
+}
+
 async function fileIdentity(candidate) {
   const item = await stat(candidate);
   if (!item.isFile()) throw new Error(`external process output is not a file: ${candidate}`);
@@ -249,11 +265,13 @@ export async function runWindowsExternalProcess({
   label,
   powershell = "pwsh.exe",
   wrapperTimeoutMs = undefined,
+  onOwner = undefined,
 }) {
   if (process.platform !== "win32") {
     throw new WindowsExternalProcessError("windows-required", "Windows external-process Job ownership requires win32");
   }
   invariant(typeof label === "string" && LABEL.test(label), "external process label is invalid");
+  invariant(onOwner === undefined || typeof onOwner === "function", "external process onOwner must be a function");
   invariant(Number.isInteger(timeoutMs) && timeoutMs >= 1 && timeoutMs <= 86_400_000, "external process timeoutMs is invalid");
   invariant(Number.isInteger(cleanupTimeoutMs) && cleanupTimeoutMs >= 100 && cleanupTimeoutMs <= 60_000, "external process cleanupTimeoutMs is invalid");
   invariant(Number.isSafeInteger(maxOutputBytes) && maxOutputBytes >= 1024 && maxOutputBytes <= 1024 * 1024 * 1024, "external process maxOutputBytes is invalid");
@@ -353,6 +371,26 @@ export async function runWindowsExternalProcess({
     diagnosticOverflow = true;
     terminateWrapper("diagnostic-overflow");
   });
+  // Interactive companion apps need their exact owner before the Job settles.
+  // The same predicate remains authoritative for both the early notice and final result.
+  let ownerNotified = false;
+  let ownerObserverError = null;
+  if (onOwner) wrapper.stdout.on("data", () => {
+    if (ownerNotified || ownerObserverError || diagnosticOverflow) return;
+    const firstLine = stdout().text.split(/\r?\n/)[0];
+    if (!stdout().text.includes("\n")) return;
+    try {
+      const envelope = JSON.parse(firstLine);
+      if (!acceptedOwner(envelope, wrapper.pid, command.physical, supervisor)) {
+        throw new Error("interactive external-process owner identity was not exact");
+      }
+      ownerNotified = true;
+      onOwner(structuredClone(envelope));
+    } catch (error) {
+      ownerObserverError = errorMessage(error);
+      terminateWrapper("owner-observer-failed");
+    }
+  });
   let wrapperOutcome;
   try {
     wrapperOutcome = await new Promise((resolve, reject) => {
@@ -413,20 +451,7 @@ export async function runWindowsExternalProcess({
   catch (error) { envelopeError = error; }
   const ownerEnvelope = envelopes.owner;
   const owner = ownerEnvelope?.owner ?? null;
-  const observedSupervisor = ownerEnvelope?.supervisor ?? null;
-  const ownerAccepted = ownerEnvelope?.wrapper_process_id === wrapper.pid
-    && ownerEnvelope?.job?.assigned_at_creation === true
-    && ownerEnvelope?.job?.assigned_before_resume === true
-    && ownerEnvelope?.job?.kill_on_close === true
-    && Number.isInteger(owner?.process_id)
-    && owner.process_id > 0
-    && typeof owner?.process_start_time_utc_ticks === "string"
-    && DECIMAL_TICKS.test(owner.process_start_time_utc_ticks)
-    && pathEqual(owner?.executable_path ?? "", command.physical)
-    && owner?.parent_process_id === wrapper.pid
-    && observedSupervisor?.process_id === supervisor.process_id
-    && observedSupervisor?.process_start_time_utc_ticks === supervisor.process_start_time_utc_ticks
-    && pathEqual(observedSupervisor?.executable_path ?? "", supervisor.executable_path);
+  const ownerAccepted = acceptedOwner(ownerEnvelope, wrapper.pid, command.physical, supervisor);
   const rootAbsentAfterWrapperExit = ownerAccepted && wrapperOutcome.close_observed
     ? await waitForPidAbsent(owner.process_id)
     : null;
@@ -440,6 +465,7 @@ export async function runWindowsExternalProcess({
     termination_reason: wrapperTerminationReason,
     kill_attempts: wrapperKillAttempts,
     asynchronous_error: wrapperAsyncError,
+    owner_observer_error: ownerObserverError,
     close_observed: wrapperOutcome.close_observed,
     forced_bounded_return: wrapperOutcome.forced_bounded_return,
     elapsed_ms: Date.now() - started,
@@ -470,6 +496,9 @@ export async function runWindowsExternalProcess({
   }
   if (envelopeError !== null) {
     throw new WindowsExternalProcessError("external-wrapper-protocol", errorMessage(envelopeError), wrapperFailureEvidence);
+  }
+  if (ownerObserverError !== null || (onOwner && !ownerNotified)) {
+    throw new WindowsExternalProcessError("external-owner-observer", "External-process owner notification failed", wrapperFailureEvidence);
   }
   if (!ownerAccepted) {
     throw new WindowsExternalProcessError("external-owner-identity", "Windows external-process root identity was not exact", wrapperFailureEvidence);

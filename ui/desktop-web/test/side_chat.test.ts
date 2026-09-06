@@ -325,18 +325,18 @@ test("Settings owns the global Side Chat defaults and lifecycle explanation", ()
   assert.match(html, /href="#settings-side-chat"/);
   assert.match(html, /id="settings-side-chat"[^>]*aria-labelledby="settings-side-chat-title"/);
   assert.match(html, /id="side-chat-base-url"[^>]*value="http:\/\/side\.test\/v1\/path"/);
-  assert.match(html, /<label for="side-chat-model">Model<\/label>/);
+  assert.match(html, /<label for="side-chat-model">モデル<\/label>/);
   assert.match(html, /id="side-chat-model"[^>]*data-config-key="side_chat\.model"[^>]*aria-describedby="[^"]*side-chat-settings-help[^"]*settings-validation[^"]*side-chat-model-catalog-status[^"]*"/);
   assert.match(html, /<option value="gemma-settings" selected>gemma-settings（現在の設定）<\/option>/);
   assert.match(html, /一覧にないモデルIDを入力/);
   assert.match(html, /id="side-chat-model-manual"[^>]*value="gemma-settings"/);
   assert.match(html, /id="side-chat-system-prompt"[^>]*data-config-key="side_chat\.system_prompt"[^>]*>  concise answers  <\/textarea>/);
-  assert.match(html, /moyAI組み込みのSide Chatプロンプトは保持され、その後に追加されます/);
+  assert.match(html, /組み込みの指示に追加します/);
   assert.match(html, /16,384文字以内/);
   assert.match(html, /data-action="load-side-chat-models"[^>]*aria-controls="side-chat-model side-chat-model-catalog-status"/);
-  assert.match(html, /新しく作成するtext-only・tool-less Side Chatのglobal既定値/);
-  assert.match(html, /既存のSide Chatには後からのglobal変更を混ぜず/);
-  assert.match(html, /明示的に閉じると履歴・下書き・snapshotだけを削除/);
+  assert.match(html, /新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません/);
+  assert.match(html, /既存の会話の設定は変わりません/);
+  assert.match(html, /削除すると、その会話の履歴と下書きも失われます/);
 });
 
 test("Settings validates global Side Chat provider fields before save or catalog commands", () => {
@@ -450,21 +450,21 @@ test("Settings presents Main and Side LLM URL and native model selection consist
   const main = html.slice(mainStart, mainEnd);
   const side = html.slice(sideStart, sideEnd);
 
-  assert.match(main, /<h3 id="settings-provider-title">Main Chat Settings<\/h3>/);
-  assert.ok(main.indexOf("LLM URL") < main.indexOf('for="main-provider-model">Model'));
+  assert.match(main, /<h3 id="settings-provider-title">メインチャット<\/h3>/);
+  assert.ok(main.indexOf("接続先URL") < main.indexOf('for="main-provider-model">モデル'));
   assert.match(main, /<select id="main-provider-model"[^>]*data-config-key="model\.model"/);
   assert.match(main, /<option value="qwen-main" selected>Qwen Main（ロード済み）<\/option>/);
   assert.match(main, /<option value="qwen-main-alt" >Qwen Main Alt（未ロード）<\/option>/);
   assert.match(main, /data-action="show-provider"[^>]*aria-controls="main-provider-model main-provider-model-catalog-status"/);
-  assert.match(main, /Main Chatのglobal既定値/);
+  assert.match(main, /メインチャットの共通の既定値/);
   assert.match(main, /data-config-key="model\.system_prompt"[^>]*>Main instructions<\/textarea>/);
   assert.doesNotMatch(main, /Side instructions/);
   assert.doesNotMatch(main, /data-side-chat-setting/);
 
-  assert.match(side, /<h3 id="settings-side-chat-title">Side Chat Settings<\/h3>/);
-  assert.ok(side.indexOf("LLM URL") < side.indexOf('<label for="side-chat-model">Model'));
+  assert.match(side, /<h3 id="settings-side-chat-title">サイドチャット<\/h3>/);
+  assert.ok(side.indexOf("接続先URL") < side.indexOf('<label for="side-chat-model">モデル'));
   assert.match(side, /<select id="side-chat-model"/);
-  assert.match(side, /新しく作成するtext-only・tool-less Side Chatのglobal既定値/);
+  assert.match(side, /新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません/);
   assert.match(side, /data-config-key="side_chat\.system_prompt"[^>]*>Side instructions<\/textarea>/);
   assert.doesNotMatch(side, /Main instructions/);
   assert.doesNotMatch(side, /data-config-key="model\./);
@@ -1123,8 +1123,10 @@ test("Global Settings settlement blocks Side conversation controls without repla
   const pane = renderer.artifactPane(current);
   assert.match(pane, /data-action="request-delete-side-chat"[^>]*disabled/);
   assert.match(pane, /id="side-chat-prompt"[^>]*disabled/);
-  assert.match(pane, /data-action="cancel-side-chat"[^>]*disabled/);
+  assert.doesNotMatch(pane, /data-action="cancel-side-chat"/);
   assert.match(pane, /data-action="send-side-chat"[^>]*disabled/);
+  const runningPane = renderer.artifactPane(state({ status: "running", can_send: false, can_cancel: true }));
+  assert.match(runningPane, /data-action="cancel-side-chat"[^>]*disabled/);
 
   const confirmationRenderer = useSidePane({
     draft: "wait for Global Settings",
@@ -1145,12 +1147,53 @@ test("an unrelated Rust config-edit capability does not block independent Side C
   const pane = renderer.artifactPane(state({ can_send: true, can_cancel: true }));
   const prompt = pane.match(/<textarea id="side-chat-prompt"[^>]*>/)?.[0] ?? "";
   const send = pane.match(/<button class="send" data-action="send-side-chat"[^>]*>/)?.[0] ?? "";
-  const stop = pane.match(/<button data-action="cancel-side-chat"[^>]*>/)?.[0] ?? "";
   const remove = pane.match(/<button class="pin danger-pin"[^>]*>/)?.[0] ?? "";
-  for (const control of [prompt, send, stop, remove]) {
+  for (const control of [prompt, send, remove]) {
     assert.ok(control);
     assert.doesNotMatch(control, /disabled/);
   }
+  assert.doesNotMatch(pane, /data-action="cancel-side-chat"/);
+  const runningPane = renderer.artifactPane(state({ status: "running", can_send: false, can_cancel: true }));
+  const stop = runningPane.match(/<button\b[^>]*data-action="cancel-side-chat"[^>]*>/)?.[0] ?? "";
+  assert.ok(stop, "an active Side turn retains its Stop control independently of config-edit capability");
+  assert.doesNotMatch(stop, /disabled/);
+});
+
+test("Side stop feedback uses a neutral Japanese notice only for the typed canonical user stop", () => {
+  const renderer = useSidePane({ draft: "次の質問" });
+  for (const configured of [true, false]) {
+    const html = renderer.artifactPane(state({
+      configured, status: "cancelled", phase: "", last_error: "run stopped by user", can_cancel: false,
+    }));
+    const notice = html.match(/<p class="side-chat-notice"[^>]*>[^<]*<\/p>/)?.[0] ?? "";
+    assert.match(notice, /role="status">サイドチャットの実行を停止しました。<\/p>/);
+    assert.doesNotMatch(html, /run stopped by user|class="side-chat-error"|data-action="cancel-side-chat"/);
+  }
+});
+
+test("Side stop feedback preserves real errors and does not classify an error string alone as cancellation", () => {
+  const renderer = useSidePane();
+  for (const error of [
+    { status: "failed" as const, last_error: "run stopped by user" },
+    { status: "cancelled" as const, last_error: "draft save failed <storage>" },
+    { status: "cancelled" as const, deleting: true, last_error: "deletion failed <storage>" },
+  ]) {
+    const html = renderer.artifactPane(state(error));
+    assert.match(html, /class="side-chat-error" role="alert"/);
+    assert.doesNotMatch(html, /class="side-chat-notice"|サイドチャットの実行を停止しました/);
+    if (error.last_error.includes("<storage>")) assert.match(html, /&lt;storage&gt;/);
+  }
+});
+
+test("Side stop feedback gives pending deletion priority and adds no notice without a terminal error", () => {
+  const renderer = useSidePane();
+  const deleting = renderer.artifactPane(state({
+    deleting: true, status: "cancelled", last_error: "run stopped by user",
+  }));
+  assert.match(deleting, /サイドチャットを削除しています/);
+  assert.doesNotMatch(deleting, /class="side-chat-notice"|class="side-chat-error"|run stopped by user/);
+  const empty = renderer.artifactPane(state({ status: "cancelled", last_error: "" }));
+  assert.doesNotMatch(empty, /class="side-chat-notice"|class="side-chat-error"/);
 });
 
 test("configured side chat renders its transcript and exposes the modal delete owner", () => {
@@ -1218,7 +1261,7 @@ test("durable deletion pending is explicit and disables every side-chat mutation
   assert.match(html, /削除処理中/);
   assert.match(html, /data-action="request-delete-side-chat"[^>]*disabled/);
   assert.match(html, /id="side-chat-prompt"[^>]*disabled/);
-  assert.match(html, /data-action="cancel-side-chat"[^>]*disabled/);
+  assert.doesNotMatch(html, /data-action="cancel-side-chat"/);
   assert.match(html, /data-action="send-side-chat"[^>]*disabled/);
   assert.doesNotMatch(html, /role="alertdialog"/);
   assert.doesNotMatch(html, /data-action="confirm-delete-side-chat"/);

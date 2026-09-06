@@ -42,10 +42,6 @@ export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
   "lm_studio_chat_completions",
 ]);
 
-const SHOW_CONNECTION_SETTINGS = Object.freeze({
-  selector: 'aside.sidebar button.rail-item[data-action="show-config"][title="Settingsでglobal既定値を確認・変更"]',
-  identity: { tag: "BUTTON", action: "show-config" },
-});
 const PROVIDER_CONTEXT = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.context_window"]',
   identity: { tag: "INPUT", configKey: "model.context_window" },
@@ -249,7 +245,7 @@ export async function observeSettingsPreferencesSurface(cdp) {
     };
     const providerDialog = one('[role="dialog"][aria-labelledby="provider-dialog-title"]');
     const settingsDialog = one('[role="dialog"][aria-labelledby="config-dialog-title"]');
-    const connectionShortcut = one('aside.sidebar button.rail-item[data-action="show-config"]');
+    const settingsEntry = one('aside.sidebar button.settings[data-action="show-config"]');
     const settingsProviderLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-provider"]');
     const settingsSideChatLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]');
     const settingsToolsLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-tools"]');
@@ -267,12 +263,12 @@ export async function observeSettingsPreferencesSurface(cdp) {
         const selected = rows('button.nav-row[aria-current="page"][data-action="session"], button.nav-row[aria-current="page"][data-action="chat-session"]');
         return selected.map(identity);
       })(),
-      connection_shortcut: {
-        count: connectionShortcut.count,
-        visible: connectionShortcut.visible,
-        enabled: connectionShortcut.node instanceof HTMLButtonElement && !connectionShortcut.node.disabled,
-        text: connectionShortcut.node instanceof HTMLElement ? connectionShortcut.node.innerText.trim() : null,
-        title: connectionShortcut.node instanceof HTMLElement ? connectionShortcut.node.getAttribute('title') : null,
+      settings_entry: {
+        count: settingsEntry.count,
+        visible: settingsEntry.visible,
+        enabled: settingsEntry.node instanceof HTMLButtonElement && !settingsEntry.node.disabled,
+        text: settingsEntry.node instanceof HTMLElement ? settingsEntry.node.innerText.trim() : null,
+        title: settingsEntry.node instanceof HTMLElement ? settingsEntry.node.getAttribute('title') : null,
       },
       provider: {
         dialog_count: providerDialog.count,
@@ -372,11 +368,11 @@ export function shellReadyForSettingsDrag(surface, ledger) {
     && surface?.projection?.overlay === "none"
     && surface?.visible_dialog_count === 0
     && surface?.visible_backdrop_count === 0
-    && surface?.connection_shortcut?.count === 1
-    && surface.connection_shortcut.visible === true
-    && surface.connection_shortcut.enabled === true
-    && surface.connection_shortcut.text === "接続設定"
-    && surface.connection_shortcut.title === "Settingsでglobal既定値を確認・変更"
+    && surface?.settings_entry?.count === 1
+    && surface.settings_entry.visible === true
+    && surface.settings_entry.enabled === true
+    && surface.settings_entry.text === "設定"
+    && surface.settings_entry.title === "設定"
     && surface?.titlebar?.drag_count === 1
     && surface?.titlebar?.drag_visible === true
     && Number.isFinite(rect?.left)
@@ -458,25 +454,25 @@ export function preferencesReady(
     && surface.settings.navigation?.groups?.count === 3
     && surface.settings.navigation.groups.visible_count === 3
     && sameValue(surface.settings.navigation.groups.texts, [
-      "Global Settings",
-      "Session-scoped Settings",
-      "Desktop Preferences",
+      "共通設定",
+      "チャットごとの設定",
+      "画面設定",
     ])
     && surface.settings.navigation?.provider?.count === 1
     && surface.settings.navigation.provider.visible === true
-    && surface.settings.navigation.provider.text === "Main Chat Settings"
+    && surface.settings.navigation.provider.text === "メインチャット"
     && surface.settings.navigation?.side_chat?.count === 1
     && surface.settings.navigation.side_chat.visible === true
-    && surface.settings.navigation.side_chat.text === "Side Chat Settings"
+    && surface.settings.navigation.side_chat.text === "サイドチャット"
     && surface.settings.navigation?.tools?.count === 1
     && surface.settings.navigation.tools.visible === true
-    && surface.settings.navigation.tools.text === "Tools"
+    && surface.settings.navigation.tools.text === "ツール"
     && surface.settings.navigation?.session_overrides?.count === 1
     && surface.settings.navigation.session_overrides.visible === true
-    && surface.settings.navigation.session_overrides.text === "Session Overrides"
+    && surface.settings.navigation.session_overrides.text === "現在のチャット"
     && surface.settings.navigation?.window?.count === 1
     && surface.settings.navigation.window.visible === true
-    && surface.settings.navigation.window.text === "Window"
+    && surface.settings.navigation.window.text === "ウィンドウ"
     && surface?.close_confirmation?.count === 0
     && surface?.visible_dialog_count === 1
     && fieldValue(surface.projection, "model.context_window") === contextWindow
@@ -888,17 +884,17 @@ export function createSettingsPreferencesScenario() {
           command: dragCommand,
         }, { phase: "executing", owner: OWNER });
 
-        await trustedClick(firstInput, SHOW_CONNECTION_SETTINGS);
+        await trustedClick(firstInput, SHOW_SETTINGS);
         const providerOpened = await waitForProductStage({
-          label: "connection shortcut opened consolidated Preferences",
+          label: "Settings entry opened consolidated Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
           decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
             contextWindow: PROVIDER_CONTEXT_BEFORE,
             doclingEnabled: false,
             systemPrompt: "",
           })),
-          code: "settings-connection-shortcut-not-ready",
-          message: "the connection shortcut did not open consolidated Preferences in its exact offline state",
+          code: "settings-entry-not-ready",
+          message: "the Settings entry did not open consolidated Preferences in its exact offline state",
         });
         await trustedClick(firstInput, SETTINGS_PROVIDER);
         await waitForProductStage({

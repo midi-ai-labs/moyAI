@@ -432,6 +432,7 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             enabled: Some(config.mcp.enabled),
             servers: Some(config.mcp.servers.clone()),
         }),
+        device_network: Some(config.device_network.clone()),
         tool_output: Some(PartialToolOutputConfig {
             max_lines: Some(config.tool_output.max_lines),
             max_bytes: Some(config.tool_output.max_bytes),

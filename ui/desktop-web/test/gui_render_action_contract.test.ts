@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deviceUiFixture } from "./device_network_fixture.ts";
+import { deviceNetworkPresentation } from "../src/device_network_state.ts";
 
 import { ACTIONS, actionById, actionEnabledById } from "../src/actions.ts";
+import { acceptPublishProjection, createPublishUiState, newPublishProfile, publishPresentation } from "../src/mcp_publish_state.ts";
 import {
   renderArtifactPane,
   renderComposer,
@@ -260,6 +263,7 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
     about: {
       product_name: "moyAI",
       version: "test",
+      codename: "test-codename",
       license_identifier: "MIT",
       copyright_notice: "Copyright test",
     },
@@ -576,6 +580,17 @@ function defaultRenderLocal(overrides: {
 function representativeSurfaces(): RenderedSurface[] {
   const base = representativeState();
   const local = defaultRenderLocal();
+  const publish = createPublishUiState();
+  acceptPublishProjection(publish, { revision: "0", generation: "0", profiles: [], targets: [], error: null });
+  newPublishProfile(publish);
+  const receiving = structuredClone(publish.drafts.new);
+  publish.drafts["profile-a"] = receiving;
+  publish.selectedId = "profile-a";
+  publish.jobs = [{ job_id: "job-a", profile_id: "profile-a", parent: { peer_id: "WinA", task_id: "task-a", turn_id: "turn-a" },
+    prompt_preview: "Investigate workspace", session_id: "session-a", state: "running", model: "model-a", result: null, result_truncated: false, can_stop: true }];
+  local.mcpPublish = publishPresentation(publish);
+  local.deviceNetwork = deviceNetworkPresentation(deviceUiFixture());
+  local.mcpPeers = { ...local.mcpPeers, rows: [{ id: "WinB", base_url: "https://192.168.10.22/mcp", enabled: true, credential_configured: true, certificate_sha256: null }] };
   const surfaces: RenderedSurface[] = [
     { name: "startup", html: renderStartupSplash(base, 1_000, 500) },
     { name: "titlebar", html: renderTitlebar(true, false, "file_menu") },
@@ -593,6 +608,8 @@ function representativeSurfaces(): RenderedSurface[] {
   for (const overlay of [
     "provider",
     "config",
+    "hub",
+    "mcp_publish",
     "workspace",
     "prompt_review",
     "command_palette",
@@ -1374,6 +1391,7 @@ test("each primary GUI surface retains its required action routes", () => {
       "load-side-chat-models",
       "show-session-settings",
     ],
+    "overlay-hub": ["close-overlay", "hub-connect", "hub-refresh", "hub-disconnect", "hub-save-main", "hub-save-side"],
     "overlay-workspace": [
       "close-overlay",
       "switch-workspace",
@@ -1421,11 +1439,12 @@ test("each primary GUI surface retains its required action routes", () => {
   assert.deepEqual(missing, []);
 });
 
-test("the sidebar connection shortcut opens Settings instead of a duplicate provider editor", () => {
+test("the sidebar separates Hub preparation from ordinary Settings", () => {
   const html = renderSidebar(representativeState());
 
-  assert.match(html, /class="rail-item" data-action="show-config" title="Settingsでglobal既定値を確認・変更"/);
-  assert.match(html, />接続設定<\/span>/);
+  assert.match(html, /class="rail-item" data-action="show-hub"/);
+  assert.match(html, />moyAI Hub<\/span>/);
+  assert.match(html, /class="settings" data-action="show-config"/);
   assert.doesNotMatch(html, /class="rail-item" data-action="show-provider"/);
 });
 
@@ -1523,6 +1542,8 @@ test("production render button availability matches the shared action resolver",
     ...[
       "provider",
       "config",
+      "hub",
+      "mcp_publish",
       "workspace",
       "prompt_review",
       "command_palette",
@@ -1595,6 +1616,21 @@ test("dirty Settings close layers an inert retained dialog below the alertdialog
   assert.match(backdropTags[0], /\binert\b/);
   assert.match(backdropTags[0], /aria-hidden="true"/);
   for (const backdrop of backdropTags) assert.doesNotMatch(backdrop, /data-action=/);
+});
+
+test("Main and Side Stop are named visibly and an idle Side has no misleading Stop control", () => {
+  const running = representativeState();
+  assert.match(renderRunStatusStrip(running), />Mainを停止<\/span>/);
+  const local = defaultRenderLocal({ artifactPane: { mode: "side_chat" } });
+  assert.match(renderArtifactPane(running, local), />Sideを停止<\/span>/);
+  const completed = representativeState({
+    status_code: "user_stopped",
+    status_message: "run stopped by user",
+    side_chat: { ...running.side_chat, status: "completed", can_cancel: false, can_send: true },
+  });
+  assert.doesNotMatch(renderArtifactPane(completed, local), /data-action="cancel-side-chat"|停止不可/);
+  assert.match(renderTopbar(completed), /実行を停止しました/);
+  assert.doesNotMatch(renderTopbar(completed), /run stopped by user/);
 });
 
 test("activity remains visible while Stop is neither rendered nor activatable without its exact Rust target", () => {

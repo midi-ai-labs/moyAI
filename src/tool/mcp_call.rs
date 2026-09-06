@@ -27,14 +27,14 @@ impl Tool for McpCallTool {
         ToolSpec {
             name: ToolName::McpCall,
             effect: crate::tool::ToolEffectPolicy::McpCall,
-            description: "List tools from a configured MCP server, or call a specific MCP tool. Use this for explicit MCP workflows that are configured in the current environment.",
+            description: "Inspect tools and their input schemas from a configured MCP server, or call a tool. Configured moyAI remote-agent servers can execute tasks on other devices. Omit tool_name to inspect the server first.",
             input_schema: json!({
                 "type": "object",
                 "required": ["server_id"],
                 "properties": {
                     "server_id": { "type": "string" },
                     "tool_name": { "type": "string" },
-                    "arguments": {}
+                    "arguments": { "type": "object", "additionalProperties": true }
                 }
             }),
         }
@@ -47,16 +47,15 @@ impl Tool for McpCallTool {
     ) -> Result<ToolResult, ToolError> {
         let effect =
             crate::tool::ToolEffectPolicy::McpCall.resolve(&raw_arguments, &ctx.config.mcp);
-        let input = serde_json::from_value::<McpCallInput>(raw_arguments)?;
-        let summary = match input
-            .tool_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            Some(tool_name) => format!("Call MCP tool {}:{}", input.server_id, tool_name),
-            None => format!("List MCP tools from {}", input.server_id),
-        };
+        let mut input = serde_json::from_value::<McpCallInput>(raw_arguments)?;
+        prepare_remote_task_arguments(
+            &ctx.config.mcp,
+            &mut input,
+            std::env::var("COMPUTERNAME").ok().as_deref(),
+            &ctx.session.session.id.to_string(),
+            &ctx.run_mutation_fence.turn_id().to_string(),
+        )?;
+        let summary = mcp_permission_summary(ctx.services.mcp.config(), &input);
         let (details, guardian_evidence) =
             mcp_permission_material(ctx.services.mcp.config(), &input);
         let effect_admission = ctx
@@ -70,28 +69,51 @@ impl Tool for McpCallTool {
                 guardian_evidence,
             )
             .await?;
-        let operation = match input
-            .tool_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            Some(tool_name) => {
-                ctx.services
-                    .mcp
-                    .call_tool(
-                        &input.server_id,
-                        tool_name,
-                        input.arguments.unwrap_or(Value::Object(Default::default())),
-                        || effect_admission.admit(),
-                    )
-                    .await?
-            }
-            None => {
-                ctx.services
-                    .mcp
-                    .list_tools(&input.server_id, || effect_admission.admit())
-                    .await?
+        let network = ctx
+            .services
+            .store
+            .device_network()
+            .filter(|network| network.owns_server(&input.server_id));
+        let operation = if let Some(network) = network {
+            network
+                .execute_operation(
+                    ctx.session.session.id,
+                    ctx.run_mutation_fence.turn_id(),
+                    ctx.run_control.clone(),
+                    &input.server_id,
+                    input
+                        .tool_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty()),
+                    input.arguments.unwrap_or_else(|| json!({})),
+                    || effect_admission.admit(),
+                )
+                .await?
+        } else {
+            match input
+                .tool_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                Some(tool_name) => {
+                    ctx.services
+                        .mcp
+                        .call_tool(
+                            &input.server_id,
+                            tool_name,
+                            input.arguments.unwrap_or(Value::Object(Default::default())),
+                            || effect_admission.admit(),
+                        )
+                        .await?
+                }
+                None => {
+                    ctx.services
+                        .mcp
+                        .list_tools(&input.server_id, || effect_admission.admit())
+                        .await?
+                }
             }
         };
 
@@ -115,6 +137,11 @@ impl Tool for McpCallTool {
                             "- {} [{}]: {}",
                             tool.name, tool.effect, description
                         ));
+                        if let Some(schema) = &tool.input_schema {
+                            let schema =
+                                model_input_schema(&ctx.config.mcp, &server_id, &tool.name, schema);
+                            lines.push(format!("  Input schema: {schema}"));
+                        }
                     }
                     if visible_tools.len() < tools.len() {
                         lines.push(format!(
@@ -131,7 +158,10 @@ impl Tool for McpCallTool {
                     &ctx.services.storage_paths,
                 )?;
                 Ok(ToolResult {
-                    title: format!("Listed MCP tools from {server_id}"),
+                    title: format!(
+                        "「{}」のツール一覧を取得",
+                        mcp_server_label(ctx.services.mcp.config(), &server_id)
+                    ),
                     output_text: truncated.preview_text,
                     metadata: json!({
                         "server_id": server_id,
@@ -163,7 +193,10 @@ impl Tool for McpCallTool {
                     &ctx.services.storage_paths,
                 )?;
                 Ok(ToolResult {
-                    title: format!("Called MCP tool {server_id}:{tool_name}"),
+                    title: format!(
+                        "「{}」のツール「{tool_name}」を実行",
+                        mcp_server_label(ctx.services.mcp.config(), &server_id)
+                    ),
                     output_text: truncated.preview_text,
                     metadata: json!({
                         "server_id": server_id,
@@ -182,6 +215,92 @@ impl Tool for McpCallTool {
     }
 }
 
+fn configured_remote_agent(config: &crate::config::McpConfig, server_id: &str) -> bool {
+    config.enabled
+        && config
+            .servers
+            .iter()
+            .any(|server| server.id == server_id && server.enabled && server.remote_agent)
+}
+
+fn prepare_remote_task_arguments(
+    config: &crate::config::McpConfig,
+    input: &mut McpCallInput,
+    computer_name: Option<&str>,
+    task_id: &str,
+    turn_id: &str,
+) -> Result<(), ToolError> {
+    if input.tool_name.as_deref().map(str::trim) != Some("delegate_task")
+        || !configured_remote_agent(config, &input.server_id)
+    {
+        return Ok(());
+    }
+    let arguments = input.arguments.get_or_insert_with(|| json!({}));
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| ToolError::Message("remote task arguments must be an object".into()))?;
+    // Receiver protocol tokens are ASCII and bounded. The label is provenance,
+    // not authentication; a localized hostname must not prevent delegation.
+    let peer_id = computer_name
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+        })
+        .unwrap_or("moyAI");
+    // The paired profile owns receiver authority; the model cannot choose the
+    // local task/turn recorded as the parent of this delegation.
+    object.insert(
+        "parent".into(),
+        json!({ "peer_id": peer_id, "task_id": task_id, "turn_id": turn_id }),
+    );
+    Ok(())
+}
+
+fn model_input_schema(
+    config: &crate::config::McpConfig,
+    server_id: &str,
+    tool_name: &str,
+    wire_schema: &Value,
+) -> Value {
+    let mut schema = wire_schema.clone();
+    if tool_name == "delegate_task" && configured_remote_agent(config, server_id) {
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.remove("parent");
+        }
+        if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|field| field.as_str() != Some("parent"));
+        }
+    }
+    schema
+}
+
+fn mcp_server_label<'a>(config: &'a crate::config::McpConfig, server_id: &'a str) -> &'a str {
+    config
+        .servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .and_then(|server| server.display_name.as_deref())
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(server_id)
+}
+
+fn mcp_permission_summary(config: &crate::config::McpConfig, input: &McpCallInput) -> String {
+    let label = mcp_server_label(config, &input.server_id);
+    match input
+        .tool_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(tool_name) => format!("「{label}」のツール「{tool_name}」を実行"),
+        None => format!("「{label}」の利用できるツールを確認"),
+    }
+}
+
 fn mcp_permission_material(
     config: &crate::config::McpConfig,
     input: &McpCallInput,
@@ -194,7 +313,11 @@ fn mcp_permission_material(
     let (target, target_was_redacted) = configured_server
         .map(|server| redact_mcp_target_with_status(&server.base_url))
         .unwrap_or_else(|| ("[unconfigured server]".to_string(), true));
-    let mut details = vec![format!("Configured target: {target}")];
+    let mut details = vec![format!(
+        "接続先: {}\n接続先ID: {}\n設定URL: {target}",
+        mcp_server_label(config, &input.server_id),
+        input.server_id
+    )];
     let tool_name = input
         .tool_name
         .as_deref()
@@ -337,24 +460,253 @@ fn redact_mcp_value_with_status(value: &Value) -> (Value, bool) {
 mod tests {
     use serde_json::json;
 
-    use super::{mcp_permission_material, redact_mcp_target, redact_mcp_value};
+    use super::{
+        mcp_permission_material, mcp_permission_summary, model_input_schema,
+        prepare_remote_task_arguments, redact_mcp_target, redact_mcp_value,
+    };
     use crate::config::{McpConfig, McpServerConfig, McpTransportKind};
     use crate::tool::permission_guardian::{
         PermissionGuardianEvidence, PermissionGuardianEvidenceState,
     };
+    use crate::tool::registry::Tool;
 
     fn config() -> McpConfig {
         McpConfig {
             enabled: true,
             servers: vec![McpServerConfig {
+                display_name: None,
                 id: "fixture".to_string(),
                 enabled: true,
                 transport: McpTransportKind::Http,
                 base_url: "https://mcp.example.test/rpc".to_string(),
                 timeout_ms: 1_000,
+                remote_agent: false,
+                trusted_certificate_pem: None,
                 tool_routes: Vec::new(),
                 headers: Default::default(),
             }],
+        }
+    }
+
+    #[test]
+    fn named_mcp_permission_keeps_exact_target_and_guardian_evidence() {
+        let mut config = config();
+        let id = format!("hub-device-{}", "a".repeat(64));
+        config.servers[0].id = id.clone();
+        config.servers[0]
+            .headers
+            .insert("Authorization".into(), "Bearer hidden-token".into());
+        for tool_name in [None, Some("delegate_task")] {
+            let input = super::McpCallInput {
+                server_id: id.clone(),
+                tool_name: tool_name.map(str::to_string),
+                arguments: tool_name.map(|_| json!({"prompt":"CPU情報を確認"})),
+            };
+            let (_, original) = mcp_permission_material(&config, &input);
+            config.servers[0].display_name = Some("Win20-Worker (端末20)".into());
+            let summary = mcp_permission_summary(&config, &input);
+            assert!(summary.contains("Win20-Worker"));
+            assert!(!summary.contains(&id));
+            let (details, named) = mcp_permission_material(&config, &input);
+            assert!(details[0].contains("Win20-Worker"));
+            assert!(details[0].contains(&id));
+            assert!(details[0].contains(&config.servers[0].base_url));
+            assert!(!details.join("\n").contains("hidden-token"));
+            let (
+                PermissionGuardianEvidenceState::Complete(original),
+                PermissionGuardianEvidenceState::Complete(named),
+            ) = (original, named)
+            else {
+                panic!("expected complete evidence for the same configured endpoint");
+            };
+            assert_eq!(
+                original, named,
+                "a public label never changes authority or effect evidence"
+            );
+            assert_eq!(input.server_id, id);
+            config.servers[0].display_name = None;
+        }
+    }
+
+    #[test]
+    fn mcp_permission_without_a_public_label_uses_its_stable_id() {
+        let mut config = config();
+        let input = super::McpCallInput {
+            server_id: "fixture".into(),
+            tool_name: None,
+            arguments: None,
+        };
+        for label in [None, Some(" ")] {
+            config.servers[0].display_name = label.map(str::to_string);
+            assert!(mcp_permission_summary(&config, &input).contains("fixture"));
+        }
+        config.servers[0].display_name = Some("別の接続先".into());
+        let unknown = super::McpCallInput {
+            server_id: "unconfigured".into(),
+            ..input
+        };
+        assert!(mcp_permission_summary(&config, &unknown).contains("unconfigured"));
+        assert!(!mcp_permission_summary(&config, &unknown).contains("別の接続先"));
+    }
+
+    #[test]
+    fn mcp_call_advertises_object_arguments_while_allowing_server_specific_fields() {
+        let schema = super::McpCallTool.spec().input_schema;
+        assert_eq!(schema["properties"]["arguments"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["arguments"]["additionalProperties"],
+            true
+        );
+        assert_eq!(
+            schema["required"],
+            json!(["server_id"]),
+            "tools/list does not require arguments or a tool name"
+        );
+    }
+
+    #[test]
+    fn remote_delegation_overwrites_model_parent_with_the_current_task_and_turn() {
+        let mut config = config();
+        config.servers[0].remote_agent = true;
+        for tool_name in ["delegate_task", " delegate_task "] {
+            let mut input = super::McpCallInput {
+                server_id: "fixture".into(),
+                tool_name: Some(tool_name.into()),
+                arguments: Some(json!({
+                    "request_key": "retry-key",
+                    "prompt": "Investigate this project",
+                    "parent": {"peer_id":"fabricated","task_id":"wrong-task","turn_id":"wrong-turn"},
+                })),
+            };
+            prepare_remote_task_arguments(
+                &config,
+                &mut input,
+                Some("WinA-01"),
+                "canonical-task",
+                "canonical-turn",
+            )
+            .expect("prepare remote delegation");
+            let arguments = input.arguments.expect("arguments");
+            assert_eq!(
+                arguments["parent"],
+                json!({
+                    "peer_id":"WinA-01", "task_id":"canonical-task", "turn_id":"canonical-turn",
+                })
+            );
+            assert_eq!(arguments["request_key"], "retry-key");
+            assert_eq!(arguments["prompt"], "Investigate this project");
+        }
+    }
+
+    #[test]
+    fn remote_delegation_uses_a_protocol_safe_label_for_unicode_or_invalid_hostnames() {
+        let mut config = config();
+        config.servers[0].remote_agent = true;
+        let oversized = "a".repeat(129);
+        for computer_name in [
+            None,
+            Some(""),
+            Some("日本語端末"),
+            Some("Office PC"),
+            Some(oversized.as_str()),
+        ] {
+            let mut input = super::McpCallInput {
+                server_id: "fixture".into(),
+                tool_name: Some("delegate_task".into()),
+                arguments: Some(json!({"request_key":"key", "prompt":"task"})),
+            };
+            prepare_remote_task_arguments(&config, &mut input, computer_name, "task-id", "turn-id")
+                .expect("prepare localized host delegation");
+            assert_eq!(
+                input.arguments.as_ref().expect("arguments")["parent"],
+                json!({
+                    "peer_id":"moyAI", "task_id":"task-id", "turn_id":"turn-id",
+                })
+            );
+            let request: crate::remote_agent::RemoteTaskRequest =
+                serde_json::from_value(input.arguments.expect("arguments"))
+                    .expect("receiver request shape");
+            assert!(
+                request.validate(),
+                "receiver accepts the normalized provenance"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_model_schema_hides_injected_parent_without_changing_external_wire_schema() {
+        let wire_schema = json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{
+                "request_key":{"type":"string","maxLength":128},
+                "prompt":{"type":"string","maxLength":32768},
+                "parent":{"type":"object","required":["peer_id","task_id","turn_id"]},
+            },
+            "required":["request_key","parent","prompt"],
+        });
+        let mut config = config();
+        assert_eq!(
+            model_input_schema(&config, "fixture", "delegate_task", &wire_schema),
+            wire_schema,
+            "an ordinary MCP server may define its own parent argument"
+        );
+        config.servers[0].remote_agent = true;
+        let visible = model_input_schema(&config, "fixture", "delegate_task", &wire_schema);
+        assert_eq!(visible["required"], json!(["request_key", "prompt"]));
+        assert_eq!(
+            visible["properties"],
+            json!({
+                "request_key":{"type":"string","maxLength":128},
+                "prompt":{"type":"string","maxLength":32768},
+            })
+        );
+        assert_eq!(visible["additionalProperties"], false);
+        assert!(
+            wire_schema["properties"].get("parent").is_some(),
+            "the external descriptor is immutable"
+        );
+        assert_eq!(
+            model_input_schema(&config, "fixture", "task_status", &wire_schema),
+            wire_schema
+        );
+        assert_eq!(
+            model_input_schema(&config, "other-server", "delegate_task", &wire_schema),
+            wire_schema
+        );
+        config.servers[0].enabled = false;
+        assert_eq!(
+            model_input_schema(&config, "fixture", "delegate_task", &wire_schema),
+            wire_schema
+        );
+    }
+
+    #[test]
+    fn generic_mcp_arguments_are_unchanged_and_remote_non_object_arguments_are_rejected() {
+        let mut config = config();
+        let original = json!({"parent":{"external":"authority"},"custom":"value"});
+        let mut input = super::McpCallInput {
+            server_id: "fixture".into(),
+            tool_name: Some("delegate_task".into()),
+            arguments: Some(original.clone()),
+        };
+        prepare_remote_task_arguments(&config, &mut input, Some("WinA"), "task", "turn")
+            .expect("generic MCP arguments");
+        assert_eq!(input.arguments, Some(original));
+        config.servers[0].remote_agent = true;
+        for invalid in [
+            json!(["invalid"]),
+            json!(r#"{"request_key":"key","prompt":"task"}"#),
+        ] {
+            input.arguments = Some(invalid.clone());
+            assert!(
+                prepare_remote_task_arguments(&config, &mut input, Some("WinA"), "task", "turn")
+                    .is_err()
+            );
+            assert_eq!(
+                input.arguments,
+                Some(invalid),
+                "stringified JSON is not reinterpreted"
+            );
         }
     }
 

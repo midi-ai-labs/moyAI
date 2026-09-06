@@ -12,8 +12,16 @@ use tokio::sync::Mutex;
 use crate::app::App;
 use crate::cli::ReviewDecision;
 use crate::config::{ProviderEndpoint, ProviderProfile, ReasoningSummary, ResolvedConfig};
+use crate::device_network::{DeviceNetworkProjection, DeviceNetworkService, SharedHubConfig};
 use crate::error::AppRunError;
+use crate::hub::{
+    CatalogRevision, HubConnection, HubConnectionProjection, HubReviewContext, HubSelection,
+    HubSettingsStore,
+};
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
+use crate::mcp_publish::{
+    PublishDraft, PublishProfileId, PublishProjection, PublishService, PublishTokenReceipt,
+};
 use crate::protocol::TurnId;
 use crate::session::{ActiveTurnExpectation, SessionId, SessionSettingsPatch, SessionSpawnEdge};
 
@@ -94,6 +102,39 @@ macro_rules! desktop_command_manifest {
             show_project_menu,
             create_project_from_picker,
             show_config_editor,
+            show_hub_editor,
+            hub_projection,
+            hub_connect,
+            hub_refresh,
+            hub_save_review,
+            hub_disconnect,
+            hub_set_route_mode,
+            show_mcp_publish_editor,
+            mcp_publish_projection,
+            mcp_publish_save,
+            mcp_publish_delete,
+            mcp_publish_start,
+            mcp_publish_stop,
+            mcp_publish_issue_token,
+            mcp_publish_revoke_token,
+            mcp_publish_jobs,
+            mcp_publish_cancel_job,
+            mcp_publish_create_certificate,
+            mcp_publish_certificate,
+            device_network_projection,
+            device_network_import,
+            device_network_initial_setup_import,
+            device_network_join,
+            device_network_receiver,
+            device_network_select,
+            device_network_refresh,
+            device_network_leave,
+            device_network_jobs,
+            device_network_cancel,
+            mcp_peer_projection,
+            mcp_peer_add,
+            mcp_peer_remove,
+            mcp_peer_check,
             show_session_settings,
             show_provider_editor,
             show_workspace_picker,
@@ -329,21 +370,62 @@ unsafe extern "system" {
 }
 
 pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
-    let controller = DesktopController::new(app, args).await?;
+    let mut controller = DesktopController::new(app, args).await?;
+    let hub_path = crate::config::loader::global_config_path()
+        .map_err(|_| AppRunError::Message("failed to resolve Hub settings directory".into()))?
+        .with_file_name("hub-settings.json");
+    let hub_connection = HubConnection::new(HubSettingsStore::new(hub_path));
+    controller.state.hub_connection = Some(hub_connection.clone());
+    let publish_path = crate::config::loader::global_config_path()
+        .map_err(|_| {
+            AppRunError::Message("failed to resolve MCP publish settings directory".into())
+        })?
+        .with_file_name("mcp-publish.json");
+    let remote_jobs =
+        crate::remote_agent::RemoteJobService::new(controller.app.process_runtime.clone())
+            .map_err(|error| AppRunError::Message(error.to_string()))?;
+    let mcp_publish = PublishService::new(
+        publish_path,
+        controller.app.store.clone(),
+        controller.app.config.clone(),
+    )
+    .with_remote_jobs(remote_jobs.clone());
+    controller.state.mcp_publish = Some(mcp_publish.clone());
+    let network_directory = crate::config::loader::global_config_path()
+        .map_err(|_| AppRunError::Message("failed to resolve device settings directory".into()))?
+        .with_file_name("device-network");
+    let device_network = DeviceNetworkService::new(
+        network_directory,
+        controller.app.store.clone(),
+        controller.state.global_config().clone(),
+        remote_jobs.clone(),
+        mcp_publish.clone(),
+    );
+    device_network.attach_hub_connection(hub_connection.clone());
+    controller.state.device_network = Some(device_network.clone());
     let shared: SharedController = Arc::new(Mutex::new(controller));
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             restore_main_window(app);
         }))
         .manage(shared)
+        .manage(hub_connection)
+        .manage(mcp_publish)
+        .manage(remote_jobs)
+        .manage(device_network)
         .setup(|app| {
             install_tray(app.handle())?;
+            let network = app.state::<DeviceNetworkService>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = network.resume().await;
+            });
             Ok(())
         })
         .invoke_handler(desktop_command_manifest!(generate_desktop_invoke_handler))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                disconnect_hub(window.app_handle(), false);
                 let _ = window.hide();
             }
         })
@@ -387,7 +469,7 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open_moyai" => restore_main_window(app),
-            "quit_moyai" => app.exit(0),
+            "quit_moyai" => disconnect_hub(app, true),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -407,6 +489,12 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
+    if let Some(network) = app.try_state::<DeviceNetworkService>() {
+        network.window_shown();
+    }
+    if let Some(publish) = app.try_state::<PublishService>() {
+        publish.window_shown();
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -416,6 +504,7 @@ fn restore_main_window(app: &tauri::AppHandle) {
 
 #[tauri::command]
 fn hide_to_tray(app: tauri::AppHandle) {
+    disconnect_hub(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -454,7 +543,40 @@ fn toggle_maximize_window(window: tauri::WebviewWindow) -> Result<bool, String> 
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    disconnect_hub(&app, true);
+}
+
+fn disconnect_hub(app: &tauri::AppHandle, exit: bool) {
+    let connection = app.state::<HubConnection>().inner().clone();
+    let publish = app.state::<PublishService>().inner().clone();
+    let network = app.state::<DeviceNetworkService>().inner().clone();
+    let hidden_receiver = if exit {
+        network.begin_shutdown();
+        false
+    } else {
+        network.window_hide_requested()
+    };
+    let hidden_profiles = if exit {
+        publish.begin_shutdown();
+        Vec::new()
+    } else {
+        publish.window_hide_requested()
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        connection.shutdown().await;
+        if exit {
+            network.shutdown().await;
+            // Keep ownership until in-flight tools and listener tasks have settled.
+            while !publish.shutdown().await {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            app.exit(0);
+        } else {
+            network.finish_window_hide(hidden_receiver).await;
+            publish.finish_window_hide(hidden_profiles).await;
+        }
+    });
 }
 
 async fn mutate_controller<F>(
@@ -3124,6 +3246,583 @@ async fn show_config_editor(
         Ok(())
     })
     .await
+}
+
+#[tauri::command]
+async fn show_hub_editor(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "Hub connection editor")?;
+        controller.state.show_hub_editor();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn show_mcp_publish_editor(
+    controller: State<'_, SharedController>,
+    service: State<'_, PublishService>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let _ = service.refresh().await;
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "MCP publishing editor")?;
+        controller.state.show_mcp_publish_editor();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn mcp_publish_projection(
+    service: State<'_, PublishService>,
+) -> Result<PublishProjection, String> {
+    service.refresh().await
+}
+
+#[tauri::command]
+async fn mcp_publish_save(
+    service: State<'_, PublishService>,
+    profile_id: Option<PublishProfileId>,
+    draft: PublishDraft,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<PublishProjection, String> {
+    service
+        .save(profile_id, draft, &expected_revision, &expected_generation)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_delete(
+    service: State<'_, PublishService>,
+    profile_id: PublishProfileId,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<PublishProjection, String> {
+    service
+        .delete(profile_id, &expected_revision, &expected_generation)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_start(
+    controller: State<'_, SharedController>,
+    service: State<'_, PublishService>,
+    profile_id: PublishProfileId,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<PublishProjection, String> {
+    let config = controller.lock().await.state.global_config().clone();
+    service
+        .start_with_config(profile_id, &expected_revision, &expected_generation, config)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_stop(
+    service: State<'_, PublishService>,
+    profile_id: PublishProfileId,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<PublishProjection, String> {
+    service
+        .stop(profile_id, &expected_revision, &expected_generation)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_issue_token(
+    service: State<'_, PublishService>,
+    profile_id: PublishProfileId,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<PublishTokenReceipt, String> {
+    service
+        .issue_token(profile_id, &expected_revision, &expected_generation)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_revoke_token(
+    service: State<'_, PublishService>,
+    profile_id: PublishProfileId,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<PublishProjection, String> {
+    service
+        .revoke_token(profile_id, &expected_revision, &expected_generation)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_jobs(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+) -> Result<Vec<crate::remote_agent::RemoteJobRow>, String> {
+    jobs.rows_all().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_publish_cancel_job(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    profile_id: PublishProfileId,
+    job_id: ulid::Ulid,
+) -> Result<crate::remote_agent::RemoteJobRow, String> {
+    jobs.cancel_job(profile_id, job_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_publish_create_certificate(
+    service: State<'_, PublishService>,
+    id: PublishProfileId,
+    bind_ip: std::net::IpAddr,
+    revision: String,
+    generation: String,
+) -> Result<crate::mcp_publish::tls::PublishCertificateReceipt, String> {
+    service
+        .create_certificate(id, bind_ip, &revision, &generation)
+        .await
+}
+
+#[tauri::command]
+async fn mcp_publish_certificate(
+    service: State<'_, PublishService>,
+    id: PublishProfileId,
+    revision: String,
+    generation: String,
+) -> Result<crate::mcp_publish::tls::PublishCertificateReceipt, String> {
+    service.certificate(id, &revision, &generation).await
+}
+
+#[tauri::command]
+async fn mcp_peer_projection(
+    controller: State<'_, SharedController>,
+) -> Result<serde_json::Value, String> {
+    let controller = controller.lock().await;
+    serde_json::to_value(super::mcp_peers::projection(
+        controller.state.global_config(),
+    ))
+    .map_err(|_| "接続一覧を表示できません。".into())
+}
+
+#[tauri::command]
+async fn device_network_projection(
+    service: State<'_, DeviceNetworkService>,
+    publish: State<'_, PublishService>,
+) -> Result<DeviceNetworkProjection, String> {
+    let _ = publish.refresh().await;
+    Ok(service.projection_now())
+}
+
+#[tauri::command]
+async fn device_network_refresh(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<DeviceNetworkProjection, String> {
+    service.refresh().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_join(
+    service: State<'_, DeviceNetworkService>,
+    code: String,
+    confirmed: bool,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .join(code, confirmed, &expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_receiver(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    enabled: bool,
+    target: crate::mcp_publish::PublishTarget,
+    access_mode: crate::config::AccessMode,
+    model_mode: crate::hub::HubRouteMode,
+    confirmed: bool,
+    start_on_launch: bool,
+    keep_when_hidden: bool,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    let config = controller.lock().await.state.global_config().clone();
+    service.update_runtime_config(config);
+    service
+        .receiver(
+            enabled,
+            target,
+            access_mode,
+            model_mode,
+            confirmed,
+            start_on_launch,
+            keep_when_hidden,
+            &expected_revision,
+            &expected_generation,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_select(
+    service: State<'_, DeviceNetworkService>,
+    device_id: String,
+    profile_id: String,
+    enabled: bool,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .select(
+            device_id,
+            profile_id,
+            enabled,
+            &expected_revision,
+            &expected_generation,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_leave(
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .leave(&expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_jobs(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::DeviceNetworkJobs, String> {
+    service.jobs().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_cancel(
+    service: State<'_, DeviceNetworkService>,
+    reference_id: String,
+) -> Result<crate::device_network::DeviceDelegationRow, String> {
+    service
+        .cancel(&reference_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn pick_shared_hub_config(
+    start: camino::Utf8PathBuf,
+) -> Result<Option<SharedHubConfig>, String> {
+    tokio::task::spawn_blocking(move || {
+        let selected = DesktopController::pick_initial_setup_config_toml_dialog(&start)
+            .map_err(|_| "storage_error".to_string())?;
+        selected
+            .map(|path| {
+                let text = crate::config::loader::read_toml_utf8_bounded(&path)
+                    .map_err(|_| "invalid_configuration".to_string())?;
+                SharedHubConfig::import(&text).map_err(|error| error.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|_| "storage_error".to_string())?
+}
+
+#[tauri::command]
+async fn device_network_import(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    let (start, target) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
+            .map_err(|_| "connection_changed")?;
+        service
+            .check_target(&expected_revision, &expected_generation)
+            .map_err(|error| error.to_string())?;
+        let target = DesktopConfigMutationTarget {
+            workspace_path: controller.app.workspace.authority_root().to_string(),
+            session_id: controller
+                .state
+                .app_state
+                .current_session_id
+                .map(|id| id.to_string()),
+            config_generation: controller
+                .state
+                .provider_config
+                .config_generation
+                .to_string(),
+        };
+        (controller.app.workspace.root.clone(), target)
+    };
+    let loaded = pick_shared_hub_config(start).await;
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_config_mutation_target(&controller, &target).map_err(|_| "connection_changed")?;
+    ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
+        .map_err(|_| "connection_changed")?;
+    service
+        .check_target(&expected_revision, &expected_generation)
+        .map_err(|error| error.to_string())?;
+    let Some(shared) = loaded? else {
+        return Ok(service.projection_now());
+    };
+    let saved = shared.clone();
+    let mut persist_error = None;
+    let result = service
+        .configure_with_commit(shared, &expected_revision, &expected_generation, || {
+            controller
+                .save_device_network_config(&saved, false)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    if let Some(error) = persist_error {
+        return Err(error);
+    }
+    let result = result.map_err(|error| error.to_string())?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    Ok(result)
+}
+
+#[tauri::command]
+async fn device_network_initial_setup_import(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+    expected_config_target: DesktopConfigMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let before = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+            .and_then(|()| ensure_config_mutation_target(&controller, &expected_config_target))
+            .and_then(|()| ensure_config_draft_commit_admission(&controller))
+            .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+        service.projection_now()
+    };
+    let loaded = pick_shared_hub_config(camino::Utf8PathBuf::from(
+        &expected_setup_target.workspace_path,
+    ))
+    .await;
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+        .and_then(|()| ensure_config_mutation_target(&controller, &expected_config_target))
+        .and_then(|()| ensure_config_draft_commit_admission(&controller))
+        .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+    let Some(shared) = loaded.map_err(|error| {
+        command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+    })?
+    else {
+        return controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal);
+    };
+    let saved = shared.clone();
+    let mut persist_error = None;
+    let result = service
+        .configure_with_commit(shared, &before.revision, &before.generation, || {
+            controller
+                .save_device_network_config(&saved, true)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    let outcome = persist_error.map_or_else(
+        || result.map(|_| ()).map_err(|error| error.to_string()),
+        Err,
+    );
+    outcome.map_err(|error| {
+        command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+    })?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    service.enable_default_model_on_join();
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
+}
+
+#[tauri::command]
+async fn mcp_peer_add(
+    controller: State<'_, SharedController>,
+    peer: super::mcp_peers::McpPeerDraft,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<(DesktopWebState, bool), DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_config_mutation_target(&controller, &expected_target)
+        .and_then(|()| ensure_config_draft_commit_admission(&controller))
+        .map_err(|error| command_conflict_error(&mut controller, error))?;
+    let config =
+        super::mcp_peers::add(controller.state.global_config(), peer).map_err(|error| {
+            command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+        })?;
+    let servers = serde_json::to_string(&config.mcp.servers)
+        .map_err(|error| DesktopCommandError::internal(error.to_string()))?;
+    let saved = controller.save_global_config(vec![
+        ("mcp.enabled".into(), "true".into()),
+        ("mcp.servers_json".into(), servers),
+    ]);
+    controller.drain_runtime_messages();
+    Ok((
+        controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        saved,
+    ))
+}
+
+#[tauri::command]
+async fn mcp_peer_remove(
+    controller: State<'_, SharedController>,
+    id: String,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<(DesktopWebState, bool), DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_config_mutation_target(&controller, &expected_target)
+        .and_then(|()| ensure_config_draft_commit_admission(&controller))
+        .map_err(|error| command_conflict_error(&mut controller, error))?;
+    let config =
+        super::mcp_peers::remove(controller.state.global_config(), &id).map_err(|error| {
+            command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+        })?;
+    let servers = serde_json::to_string(&config.mcp.servers)
+        .map_err(|error| DesktopCommandError::internal(error.to_string()))?;
+    let saved = controller.save_global_config(vec![("mcp.servers_json".into(), servers)]);
+    controller.drain_runtime_messages();
+    Ok((
+        controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        saved,
+    ))
+}
+
+#[tauri::command]
+async fn mcp_peer_check(
+    controller: State<'_, SharedController>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let config = controller.lock().await.state.global_config().clone();
+    let result = super::mcp_peers::check(&config, &id).await?;
+    serde_json::to_value(result).map_err(|_| "接続結果を表示できません。".into())
+}
+
+#[tauri::command]
+async fn hub_projection(
+    connection: State<'_, HubConnection>,
+) -> Result<HubConnectionProjection, String> {
+    Ok(connection.projection().await)
+}
+
+#[tauri::command]
+async fn hub_connect(
+    connection: State<'_, HubConnection>,
+    endpoint: String,
+    token: String,
+    label: String,
+    expected_settings_revision: String,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .connect(
+            endpoint,
+            token,
+            label,
+            expected_settings_revision,
+            expected_connection_generation,
+        )
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_refresh(
+    connection: State<'_, HubConnection>,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .refresh(expected_connection_generation)
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_save_review(
+    connection: State<'_, HubConnection>,
+    context: HubReviewContext,
+    selection: HubSelection,
+    expected_hub_id: String,
+    expected_catalog_revision: CatalogRevision,
+    expected_settings_revision: String,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .save_review(
+            context,
+            selection,
+            expected_hub_id,
+            expected_catalog_revision,
+            expected_settings_revision,
+            expected_connection_generation,
+        )
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_disconnect(
+    connection: State<'_, HubConnection>,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .disconnect(expected_connection_generation)
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_set_route_mode(
+    controller: State<'_, SharedController>,
+    connection: State<'_, HubConnection>,
+    context: HubReviewContext,
+    mode: crate::hub::HubRouteMode,
+    expected_settings_revision: String,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if controller.hub_context_active(context) {
+        return Err("route_busy".into());
+    }
+    connection
+        .set_route_mode_now(
+            context,
+            mode,
+            expected_settings_revision,
+            expected_connection_generation,
+        )
+        .map_err(|error| error.code().to_string())
 }
 
 #[tauri::command]

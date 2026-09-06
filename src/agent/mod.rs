@@ -124,6 +124,16 @@ impl PromptBuilder {
         if let Some(instructions) = turn.mode.developer_instructions {
             sections.insert(1, instructions.trim().to_string());
         }
+        let config = turn.resolved_config().runtime_config();
+        if turn.policy.model.supports_tools && config.mcp.enabled {
+            let connections = mcp_connection_catalog(&config.mcp);
+            if !connections.is_empty() {
+                sections.push(include_str!("../../assets/prompts/mcp_clients.md").replace(
+                    "{{connections}}",
+                    &serde_json::to_string(&connections).expect("MCP catalog serialization"),
+                ));
+            }
+        }
         sections.join("\n\n")
     }
 
@@ -166,6 +176,53 @@ impl PromptBuilder {
                 content: mode_instructions.trim().to_string(),
             },
         ]
+    }
+}
+
+fn mcp_connection_catalog(config: &crate::config::McpConfig) -> Vec<serde_json::Value> {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .map(|server| {
+            let mut value =
+                serde_json::json!({"server_id":server.id,"remote_agent":server.remote_agent});
+            if let Some(name) = &server.display_name {
+                value["display_name"] = serde_json::Value::String(name.clone());
+            }
+            value
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod mcp_catalog_tests {
+    #[test]
+    fn model_catalog_maps_stable_peer_ids_to_public_names_without_credentials() {
+        let mut config = crate::config::ResolvedConfig::default().mcp;
+        let server = &mut config.servers[0];
+        server.enabled = true;
+        server.id = "hub-device-stable-id".into();
+        server.remote_agent = true;
+        server.display_name = Some("Win19 (端末19)".into());
+        server
+            .headers
+            .insert("Authorization".into(), "Bearer secret-fixture".into());
+        server.trusted_certificate_pem = Some("public-certificate".into());
+        let catalog = super::mcp_connection_catalog(&config);
+        assert_eq!(
+            catalog,
+            vec![
+                serde_json::json!({"server_id":"hub-device-stable-id","remote_agent":true,"display_name":"Win19 (端末19)"})
+            ]
+        );
+        config.servers[0].display_name = Some("Win20 renamed".into());
+        assert_eq!(
+            super::mcp_connection_catalog(&config)[0]["server_id"],
+            "hub-device-stable-id"
+        );
+        config.servers[0].enabled = false;
+        assert!(super::mcp_connection_catalog(&config).is_empty());
     }
 }
 
@@ -222,10 +279,11 @@ impl MailboxDeliveryPhase {
 #[derive(Clone)]
 pub struct AgentLoop {
     llm: Arc<dyn LlmClient>,
+    hub_route: Option<crate::hub::HubTurnRoute>,
     registry: ToolRegistry,
     store: StoreBundle,
     prompt_builder: PromptBuilder,
-    tool_services: ToolServices,
+    tool_services: Arc<Mutex<ToolServices>>,
     model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(test)]
     provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
@@ -234,6 +292,12 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    pub(crate) fn with_hub_turn(mut self, route: crate::hub::HubTurnRoute) -> Self {
+        self.llm = route.client();
+        self.hub_route = Some(route);
+        self
+    }
+
     pub fn new(
         llm: Arc<dyn LlmClient>,
         registry: ToolRegistry,
@@ -243,10 +307,11 @@ impl AgentLoop {
     ) -> Self {
         Self {
             llm,
+            hub_route: None,
             registry,
             store,
             prompt_builder,
-            tool_services,
+            tool_services: Arc::new(Mutex::new(tool_services)),
             model_request_gate: None,
             #[cfg(test)]
             provider_api_key_resolver: None,
@@ -295,6 +360,22 @@ impl AgentLoop {
         self
     }
 
+    fn tool_services_for_turn(
+        &self,
+        mcp_config: &crate::config::McpConfig,
+    ) -> Result<ToolServices, AgentError> {
+        let mut services = self
+            .tool_services
+            .lock()
+            .map_err(|_| AgentError::Message("tool services are unavailable".into()))?;
+        if services.mcp.config() != mcp_config {
+            services.mcp = Arc::new(crate::mcp::McpClient::new(mcp_config.clone()));
+        }
+        // Each admitted turn keeps its immutable client, including peer trust
+        // and credentials. Equal later configurations reuse its MCP sessions.
+        Ok(services.clone())
+    }
+
     pub async fn run(
         &self,
         mut request: AgentRunRequest,
@@ -302,6 +383,8 @@ impl AgentLoop {
         sink: &mut dyn RunEventSink,
     ) -> Result<RunSummary, AgentError> {
         ensure_admission_active(&self.store, &request).await?;
+        let tool_services =
+            self.tool_services_for_turn(&request.turn.resolved_config().runtime_config().mcp)?;
         let repo = self.store.session_repo();
         if let Some(item_id) = request.initial_user_history_item_id
             && !request.context.contains_user_turn_item(item_id)
@@ -374,8 +457,7 @@ impl AgentLoop {
                 }
                 let step_config = request.turn.resolved_config().runtime_config();
                 let step_registry = self.registry.with_config_overlays(step_config);
-                let skills = self
-                    .tool_services
+                let skills = tool_services
                     .skills
                     .snapshot_for_workspace(&request.session.workspace.root);
                 let mut step = step_context::StepContext::capture(
@@ -789,6 +871,7 @@ impl AgentLoop {
                         failed_tool_count,
                         change_count,
                         metrics: run_metrics(
+                            self.hub_route.as_ref(),
                             &request,
                             started_at,
                             model_request_count,
@@ -948,6 +1031,7 @@ impl AgentLoop {
                     let tool_output = self
                         .handle_tool_call(
                             tool_plan.router(),
+                            &tool_services,
                             &request,
                             call.clone(),
                             &prepared_request.world_state,
@@ -1117,6 +1201,7 @@ impl AgentLoop {
                     failed_tool_count,
                     change_count,
                     metrics: run_metrics(
+                        self.hub_route.as_ref(),
                         &request,
                         started_at,
                         model_request_count,
@@ -1852,6 +1937,7 @@ impl AgentLoop {
     async fn handle_tool_call(
         &self,
         registry: &ToolRegistry,
+        tool_services: &ToolServices,
         request: &AgentRunRequest,
         call: PreparedModelToolCall,
         trusted_world_state: &WorldState,
@@ -1935,7 +2021,7 @@ impl AgentLoop {
                 request.run_control.clone(),
             ),
             prompt,
-            services: &self.tool_services,
+            services: tool_services,
             agent: request.agent_context.as_ref(),
             permission_guardian: Some(&mut permission_guardian),
         };
@@ -2359,6 +2445,7 @@ impl AgentLoop {
                     failed_tool_count,
                     change_count,
                     metrics: run_metrics(
+                        self.hub_route.as_ref(),
                         request,
                         started_at,
                         model_request_count,
@@ -2393,6 +2480,7 @@ impl AgentLoop {
                     failed_tool_count,
                     change_count,
                     metrics: run_metrics(
+                        self.hub_route.as_ref(),
                         request,
                         started_at,
                         model_request_count,
@@ -3765,6 +3853,7 @@ fn run_summary_from_terminal(
 }
 
 fn run_metrics(
+    hub_route: Option<&crate::hub::HubTurnRoute>,
     request: &AgentRunRequest,
     started_at: Instant,
     model_request_count: usize,
@@ -3779,7 +3868,10 @@ fn run_metrics(
         tool_calls_by_name: tool_calls_by_name.clone(),
         failed_tool_calls_by_name: failed_tool_calls_by_name.clone(),
         config: Some(RunConfigSnapshot {
-            model: request.model_name().to_string(),
+            model: hub_route.map_or_else(
+                || request.model_name().to_string(),
+                crate::hub::HubTurnRoute::metrics_model,
+            ),
             base_url: request
                 .turn
                 .provider_target()
@@ -8713,6 +8805,152 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
+    async fn mcp_runtime_config_enables_a_peer_after_bootstrap() {
+        mcp_runtime_config_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_config_replaces_a_bootstrap_peer_endpoint() {
+        mcp_runtime_config_fixture(true).await;
+    }
+
+    async fn mcp_runtime_config_fixture(bootstrap_enabled: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = axum::Router::new().route("/mcp", axum::routing::post(
+            move |axum::Json(body): axum::Json<Value>| {
+                let observed = observed.clone();
+                async move {
+                    let id = body["id"].clone();
+                    axum::Json(match body["method"].as_str().unwrap() {
+                        "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"legacy fixture"}}),
+                        "tools/list" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{"name":"current_time","inputSchema":{"type":"object"}}]}}),
+                        "tools/call" => {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"peer time"}]}})
+                        },
+                        other => panic!("unexpected MCP method {other}"),
+                    })
+                }
+            }
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
+        config.mcp.enabled = true;
+        config.mcp.servers.truncate(1);
+        let peer = config.mcp.servers.first_mut().unwrap();
+        peer.id = "peer".into();
+        peer.enabled = true;
+        peer.base_url = endpoint;
+        peer.headers.clear();
+        peer.tool_routes.clear();
+        let mut bootstrap = config.mcp.clone();
+        bootstrap.enabled = bootstrap_enabled;
+        bootstrap.servers[0].base_url = "http://127.0.0.1:9/mcp".into();
+        let run = run_scripted_internal_with_prior_user_and_api_key_resolver(
+            config,
+            vec![
+                scripted_mcp_call("first", "peer", "current_time", serde_json::json!({})),
+                scripted_mcp_call("second", "peer", "current_time", serde_json::json!({})),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("peer verified".into())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ]
+            .into_iter()
+            .map(ScriptedOutcome::Response)
+            .collect(),
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            None,
+            false,
+            None,
+            None,
+            None,
+            false,
+            Some(bootstrap),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(run.summary.as_ref().unwrap().failed_tool_count(), 0);
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Completed,
+            ],
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_config_cache_reuses_sessions_and_keeps_active_turns_immutable() {
+        let config = ResolvedConfig::default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let paths = StoragePaths {
+            data_dir: root.clone(),
+            database_path: root.join("db.sqlite3"),
+            truncation_dir: root.join("output"),
+        };
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = StoreBundle::new(sqlite);
+        let services = test_tool_services(&config, &store, paths);
+        let agent = AgentLoop::new(
+            Arc::new(ScriptedClient {
+                outcomes: Mutex::new(Vec::new()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::builtin(services.clone()),
+            store,
+            PromptBuilder,
+            services,
+        );
+        let first = agent.tool_services_for_turn(&config.mcp).unwrap();
+        let same = agent.clone().tool_services_for_turn(&config.mcp).unwrap();
+        assert!(Arc::ptr_eq(&first.mcp, &same.mcp));
+        let mut changed = config.mcp.clone();
+        changed.enabled = true;
+        changed.servers[0].enabled = true;
+        changed.servers[0]
+            .headers
+            .insert("Authorization".into(), "Bearer fixture-token".into());
+        let next = agent.tool_services_for_turn(&changed).unwrap();
+        assert!(!Arc::ptr_eq(&first.mcp, &next.mcp));
+        assert_eq!(first.mcp.config(), &config.mcp);
+        assert_eq!(next.mcp.config(), &changed);
+        let same_next = agent.tool_services_for_turn(&changed).unwrap();
+        assert!(Arc::ptr_eq(&next.mcp, &same_next.mcp));
+        let mut disabled = changed.clone();
+        disabled.enabled = false;
+        disabled.servers.clear();
+        let revoked = agent.tool_services_for_turn(&disabled).unwrap();
+        assert!(!Arc::ptr_eq(&next.mcp, &revoked.mcp));
+        assert_eq!(next.mcp.config(), &changed);
+        assert_eq!(revoked.mcp.config(), &disabled);
+        assert!(
+            revoked
+                .mcp
+                .list_tools("peer", || Ok(()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
+    }
+
+    #[tokio::test]
     async fn auto_review_mcp_guardian_receives_full_arguments_beyond_human_preview() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
@@ -11376,6 +11614,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             Some(resolver),
             false,
+            None,
         )
         .await
     }
@@ -11465,6 +11704,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             None,
             true,
+            None,
         )
         .await
     }
@@ -11548,6 +11788,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             success_commit_interrupt,
             None,
             false,
+            None,
         )
         .await
     }
@@ -11566,6 +11807,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         success_commit_interrupt: Option<TurnInterruptionCause>,
         provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
         record_protocol_events: bool,
+        bootstrap_mcp: Option<crate::config::McpConfig>,
     ) -> Result<ScriptedRun, AgentError> {
         let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -11732,7 +11974,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 .expect("persist pending steer");
         }
         let interrupt_request_paths = storage_paths.clone();
-        let tool_services = test_tool_services(&config, &store, storage_paths);
+        let mut tool_services = test_tool_services(&config, &store, storage_paths);
+        if let Some(bootstrap_mcp) = bootstrap_mcp {
+            tool_services.mcp = Arc::new(crate::mcp::McpClient::new(bootstrap_mcp));
+        }
         let mut registry = ToolRegistry::builtin(tool_services.clone());
         if let Some(tool) = replacement_tool {
             registry.replace_tool_for_test(tool);

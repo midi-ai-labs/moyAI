@@ -100,6 +100,8 @@ pub enum DesktopOverlay {
     HelpMenu,
     ProjectMenu,
     ConfigEditor,
+    HubConnection,
+    McpPublish,
     SessionSettings,
     ProviderEditor,
     WorkspacePicker,
@@ -129,6 +131,9 @@ pub struct DesktopState {
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
     pub status_code: DesktopStatusCode,
+    pub(crate) hub_connection: Option<crate::hub::HubConnection>,
+    pub(crate) mcp_publish: Option<crate::mcp_publish::PublishService>,
+    pub(crate) device_network: Option<crate::device_network::DeviceNetworkService>,
     global_config: ResolvedConfig,
     file_change_storage_root: Option<camino::Utf8PathBuf>,
     file_change_display_root: Option<camino::Utf8PathBuf>,
@@ -178,6 +183,9 @@ impl DesktopState {
         let global_config = effective_config.clone();
         Self {
             snapshot,
+            hub_connection: None,
+            mcp_publish: None,
+            device_network: None,
             app_state: AppState::default(),
             open_session: None,
             composer,
@@ -1059,6 +1067,7 @@ impl DesktopState {
                 .load_turn_items_with_active_turn(&session, &turn_items, active_turn_id);
         }
         self.app_state.active_turn_expectation = active_turn_expectation;
+        self.reconcile_current_active_turn_progress();
         self.status_code = self
             .app_state
             .interruption_cause
@@ -1233,9 +1242,22 @@ impl DesktopState {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.open_session = Some(open_session);
+        self.reconcile_current_active_turn_progress();
         self.snapshot.replace_detail(detail);
         self.update_session_title_projection(session.id, &session.title);
         self.update_session_row_status(session.id, session.status);
+    }
+
+    fn reconcile_current_active_turn_progress(&mut self) {
+        if let Some(open_session) = &self.open_session
+            && let Some(progress) = open_session.active_turn_progress()
+        {
+            self.app_state.reconcile_active_turn_progress(
+                open_session.session_id(),
+                progress,
+                open_session.turn_items(),
+            );
+        }
     }
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
@@ -1661,6 +1683,24 @@ impl DesktopState {
         }
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ConfigEditor;
+        true
+    }
+
+    pub fn show_hub_editor(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::HubConnection;
+        true
+    }
+
+    pub fn show_mcp_publish_editor(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::McpPublish;
         true
     }
 
@@ -2452,6 +2492,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
+            active_turn_progress: None,
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -2599,6 +2640,219 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_live_refresh_projects_progress_beyond_history_page_and_replay() {
+        use crate::runtime::RunEventSink;
+        use crate::session::{ProjectRepository, SessionRepository};
+        struct NullSink;
+        impl RunEventSink for NullSink {
+            fn emit(
+                &mut self,
+                _: crate::session::RunEvent,
+            ) -> Result<(), crate::error::RuntimeError> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let paths = crate::storage::StoragePaths {
+            data_dir: root.clone(),
+            database_path: root.join("db.sqlite3"),
+            truncation_dir: root.join("output"),
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &root, "progress", "none")
+            .await
+            .unwrap();
+        let session = store
+            .session_repo()
+            .create_session(crate::session::NewSession {
+                project_id,
+                title: "progress".into(),
+                cwd: root,
+                model: "fixture".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        let turn_id = crate::protocol::TurnId::new();
+        let admitted = store
+            .session_repo()
+            .admit_session_turn(session.id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let service = crate::session::SessionService::new(store.clone());
+        let initial = service
+            .canonical_session_read(session.id, 0, 1, 0, 1)
+            .await
+            .unwrap();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&initial);
+        assert_eq!(state.app_state.progress.model_requests, 0);
+        let HistoryItemPayload::RequestDiagnostics { diagnostics } =
+            diagnostics_history_item(&session, None).payload
+        else {
+            unreachable!()
+        };
+        let mut null = NullSink;
+        let mut sink = crate::protocol::ProtocolRecordingSink::new(
+            store.protocol_event_store(),
+            Some(session.id),
+            turn_id,
+            &mut null,
+        )
+        .with_admission_id(admitted.admission_id);
+        for _ in 0..130 {
+            sink.emit(crate::session::RunEvent::ModelRequestPrepared {
+                session_id: session.id,
+                diagnostics: diagnostics.clone(),
+            })
+            .unwrap();
+        }
+        let call_id = crate::session::ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session.id,
+                admitted.admission_id,
+                turn_id,
+                crate::storage::session_repo::ModelResponseWrite {
+                    response_id: crate::protocol::ModelResponseId::new(),
+                    assistant_text: Some("remote work is running".into()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![crate::storage::session_repo::PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "remote-status".into(),
+                        tool_name: "mcp_call".into(),
+                        arguments_json: "{}".into(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let refreshed = service
+            .canonical_session_read(session.id, 0, 1, 0, 32)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.history.items.len(), 1);
+        assert!(refreshed.history.has_more);
+        assert!(refreshed.turns.items.iter().any(|item| matches!(&item.payload, TurnItemPayload::ToolStatus { call_id: id, .. } if *id == call_id)));
+        state.refresh_open_session_projection(&refreshed);
+        assert!(state.open_session.as_ref().unwrap().turn_items().iter().any(
+            |item| matches!(&item.payload, TurnItemPayload::AgentMessage { text } if text == "remote work is running")
+        ), "the canonical history was accepted before progress is checked");
+        assert_eq!(state.app_state.progress.model_requests, 130);
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+        assert!(
+            state
+                .selected_detail()
+                .tool_status_text
+                .contains("mcp_call")
+        );
+        state.refresh_open_session_projection(&refreshed);
+        assert_eq!(
+            state.app_state.progress.model_requests, 130,
+            "replayed canonical pages do not double count"
+        );
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+        state.refresh_open_session_projection(&initial);
+        assert_eq!(
+            state.app_state.progress.model_requests, 130,
+            "an older same-turn page cannot roll progress back"
+        );
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+
+        let live_response = crate::protocol::ModelResponseId::new();
+        state.apply_run_event(&crate::session::RunEvent::TextDelta {
+            response_id: live_response,
+            delta: "uncommitted live suffix".into(),
+        });
+        state.app_state.progress.current_phase = RunProgressPhase::StopRequested;
+        state.app_state.progress.active_step = "stop is settling".into();
+        store
+            .session_repo()
+            .complete_tool_call_with_protocol_bundle(
+                session.id,
+                admitted.admission_id,
+                call_id,
+                crate::tool::ToolName::McpCall,
+                "remote reply",
+                serde_json::json!({}),
+                "receiver result",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = service
+            .canonical_session_read(session.id, 0, 1, 2, 1)
+            .await
+            .unwrap();
+        state.refresh_open_session_projection(&completed);
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+        assert_eq!(
+            state.app_state.progress.tool_calls_completed, 1,
+            "latest lifecycle replaces pending without counting a second call"
+        );
+        assert_eq!(state.app_state.progress.model_requests, 130);
+        assert_eq!(
+            state.app_state.progress.current_phase,
+            RunProgressPhase::StopRequested
+        );
+        assert!(
+            state
+                .app_state
+                .transcript_entries
+                .iter()
+                .any(|entry| entry.body == "uncommitted live suffix")
+        );
+        state.refresh_open_session_projection(&refreshed);
+        assert_eq!(state.app_state.progress.tool_calls_completed, 1);
+
+        let mut reopened = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        reopened.load_open_session(&completed);
+        assert_eq!(reopened.app_state.progress.model_requests, 130);
+        assert_eq!(reopened.app_state.progress.tool_calls_started, 1);
+        assert_eq!(reopened.app_state.progress.tool_calls_completed, 1);
+        assert!(
+            !serde_json::to_string(&completed)
+                .unwrap()
+                .contains("active_turn_progress"),
+            "the process-local projection does not alter stored/exported contracts"
+        );
     }
 
     #[test]

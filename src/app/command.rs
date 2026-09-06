@@ -12,6 +12,10 @@ use crate::session::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunAdmissionKind {
     NewUserRun,
+    /// Receiver-owned root execution, bound to a durable authenticated job receipt.
+    RemoteTask {
+        job_id: ulid::Ulid,
+    },
     RootContinuation {
         predecessor_turn_id: TurnId,
         predecessor_revision: u64,

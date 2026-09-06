@@ -409,6 +409,7 @@ pub(crate) enum SideChatHistoryMessage {
 
 #[derive(Clone)]
 pub(crate) struct SideChatRequestProfile {
+    pub hub_route: Option<crate::hub::HubTurnRoute>,
     pub base_url: String,
     pub model: String,
     pub provider_profile: ProviderProfile,
@@ -608,7 +609,10 @@ pub(crate) async fn execute_admitted_canonical_side_chat(
             elapsed_ms: Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
             token_usage,
             config: Some(RunConfigSnapshot {
-                model: profile.model,
+                model: profile.hub_route.as_ref().map_or(
+                    profile.model.clone(),
+                    crate::hub::HubTurnRoute::metrics_model,
+                ),
                 base_url: profile.base_url,
                 access_mode: AccessMode::Default,
             }),
@@ -672,17 +676,22 @@ async fn run_admitted_side_chat(
     if cancel.is_cancelled() {
         return SideChatAttemptResult::interrupted(TurnInterruptionCause::UserStop, None, 0);
     }
-    let api_key = match crate::llm::resolve_api_key_from_env(profile.api_key_env.as_deref()) {
-        Ok(api_key) => api_key,
-        Err(error) => return SideChatAttemptResult::failed(error.to_string(), 0),
+    let client: std::sync::Arc<dyn LlmClient> = if let Some(route) = &profile.hub_route {
+        route.client()
+    } else {
+        let api_key = match crate::llm::resolve_api_key_from_env(profile.api_key_env.as_deref()) {
+            Ok(api_key) => api_key,
+            Err(error) => return SideChatAttemptResult::failed(error.to_string(), 0),
+        };
+        std::sync::Arc::new(crate::llm::OpenAiCompatClient::new(api_key))
     };
     if cancel.is_cancelled() {
         return SideChatAttemptResult::interrupted(TurnInterruptionCause::UserStop, None, 0);
     }
-    let client = crate::llm::OpenAiCompatClient::new(api_key);
-    let request = run_side_chat_request(&client, profile, history, cancel.clone(), |event| {
-        on_event(event);
-    });
+    let request =
+        run_side_chat_request(client.as_ref(), profile, history, cancel.clone(), |event| {
+            on_event(event);
+        });
     tokio::pin!(request);
     let mut heartbeat =
         tokio::time::interval(Duration::from_millis(RUN_ADMISSION_HEARTBEAT_INTERVAL_MS));
@@ -1564,6 +1573,7 @@ mod tests {
 
     fn profile() -> SideChatRequestProfile {
         SideChatRequestProfile {
+            hub_route: None,
             base_url: "http://provider.local:1234".to_string(),
             model: "google/gemma-4-12b-qat".to_string(),
             provider_profile: ProviderProfile::LmStudio,

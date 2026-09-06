@@ -23,6 +23,7 @@ enum WorkspaceRootMode {
     Discover,
     FixedToStart,
     Stored(Utf8PathBuf),
+    RemoteTemp(ulid::Ulid),
 }
 
 impl AppBootstrap {
@@ -147,7 +148,6 @@ impl AppBootstrap {
         .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn rebuild_for_directory_as_workspace_root_with_process_runtime_and_config(
         start_dir: &Utf8Path,
         process_runtime: AppProcessRuntime,
@@ -164,6 +164,64 @@ impl AppBootstrap {
         .await
     }
 
+    pub(crate) async fn rebuild_for_remote_temp_with_process_runtime_and_config(
+        start_dir: &Utf8Path,
+        process_runtime: AppProcessRuntime,
+        config: ResolvedConfig,
+        profile_id: ulid::Ulid,
+    ) -> Result<App, AppBootstrapError> {
+        Self::build_with_resolved_config(
+            start_dir,
+            process_runtime.store(),
+            WorkspaceRootMode::RemoteTemp(profile_id),
+            config,
+            Some(process_runtime),
+        )
+        .await
+    }
+
+    /// Create the process host once, including recovery of work left by a prior process.
+    pub(crate) async fn create_process_runtime(
+        store: StoreBundle,
+    ) -> Result<AppProcessRuntime, AppBootstrapError> {
+        let session_event_hub = SessionRuntimeEventHub::new(1024);
+        let runtime_event_projector = crate::protocol::CanonicalRuntimeEventProjector::new(
+            store.protocol_event_store(),
+            store.harness_run_store(),
+            session_event_hub.publisher(),
+        );
+        let session_service = crate::session::SessionService::new(store.clone())
+            .with_runtime_event_projector(runtime_event_projector);
+        session_service
+            .mark_stale_running_sessions(
+                "Application started without an active worker for this run; marking the prior run interrupted.",
+            )
+            .await
+            .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
+        if let Err(error) = session_service.reconcile_started_harness_terminals() {
+            // The canonical terminal is already durable and remains available
+            // for the next startup replay. Observer repair must not rewrite or
+            // reverse that semantic result.
+            eprintln!(
+                "warning: startup could not reconcile every committed terminal into the native harness: {error}"
+            );
+        }
+        store
+            .side_chat_repo()
+            .finalize_pending_deletions()
+            .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
+        let agent_runtime = Arc::new(crate::app::AgentRuntime::new(
+            store.clone(),
+            session_service.clone(),
+        ));
+        Ok(AppProcessRuntime::new(
+            store,
+            session_service,
+            session_event_hub,
+            agent_runtime,
+        ))
+    }
+
     async fn build_with_resolved_config(
         start_dir: &Utf8Path,
         store: StoreBundle,
@@ -171,9 +229,13 @@ impl AppBootstrap {
         config: ResolvedConfig,
         process_runtime: Option<AppProcessRuntime>,
     ) -> Result<App, AppBootstrapError> {
+        let remote_temp_profile = match &root_mode {
+            WorkspaceRootMode::RemoteTemp(id) => Some(*id),
+            _ => None,
+        };
         let workspace = match root_mode {
             WorkspaceRootMode::Discover => WorkspaceDiscovery::discover(start_dir, &config)?,
-            WorkspaceRootMode::FixedToStart => {
+            WorkspaceRootMode::FixedToStart | WorkspaceRootMode::RemoteTemp(_) => {
                 WorkspaceDiscovery::discover_fixed_root(start_dir, &config)?
             }
             WorkspaceRootMode::Stored(root) => {
@@ -181,58 +243,35 @@ impl AppBootstrap {
             }
         };
         let project_name = project_display_name(&workspace.root);
-        store
-            .project_repo()
-            .upsert_project(
-                workspace.project_id,
-                &workspace.root,
-                &project_name,
-                match workspace.vcs {
-                    crate::workspace::VcsKind::Git => "git",
-                    crate::workspace::VcsKind::None => "none",
-                },
-            )
-            .await?;
+        if let Some(profile_id) = remote_temp_profile {
+            store
+                .project_repo()
+                .upsert_remote_temp_project(
+                    workspace.project_id,
+                    &workspace.root,
+                    &project_name,
+                    profile_id,
+                )
+                .await?;
+        } else {
+            store
+                .project_repo()
+                .upsert_project(
+                    workspace.project_id,
+                    &workspace.root,
+                    &project_name,
+                    match workspace.vcs {
+                        crate::workspace::VcsKind::Git => "git",
+                        crate::workspace::VcsKind::None => "none",
+                    },
+                )
+                .await?;
+        }
 
         let process_runtime = if let Some(process_runtime) = process_runtime {
             process_runtime
         } else {
-            let session_event_hub = SessionRuntimeEventHub::new(1024);
-            let runtime_event_projector = crate::protocol::CanonicalRuntimeEventProjector::new(
-                store.protocol_event_store(),
-                store.harness_run_store(),
-                session_event_hub.publisher(),
-            );
-            let session_service = crate::session::SessionService::new(store.clone())
-                .with_runtime_event_projector(runtime_event_projector);
-            session_service
-                .mark_stale_running_sessions(
-                    "Application started without an active worker for this run; marking the prior run interrupted.",
-                )
-                .await
-                .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
-            if let Err(error) = session_service.reconcile_started_harness_terminals() {
-                // The canonical terminal is already durable and remains available
-                // for the next startup replay. Observer repair must not rewrite or
-                // reverse that semantic result.
-                eprintln!(
-                    "warning: startup could not reconcile every committed terminal into the native harness: {error}"
-                );
-            }
-            store
-                .side_chat_repo()
-                .finalize_pending_deletions()
-                .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
-            let agent_runtime = Arc::new(crate::app::AgentRuntime::new(
-                store.clone(),
-                session_service.clone(),
-            ));
-            AppProcessRuntime::new(
-                store.clone(),
-                session_service,
-                session_event_hub,
-                agent_runtime,
-            )
+            Self::create_process_runtime(store.clone()).await?
         };
         let session_event_hub = process_runtime.session_event_hub();
         let session_service = process_runtime.session_service();

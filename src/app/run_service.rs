@@ -252,6 +252,7 @@ pub struct RunService {
     agent_loop: AgentLoop,
     session_event_hub: SessionRuntimeEventHub,
     agent_runtime: Weak<crate::app::AgentRuntime>,
+    hub_route: Option<crate::hub::HubTurnRoute>,
 }
 
 impl RunService {
@@ -272,6 +273,7 @@ impl RunService {
             agent_loop,
             session_event_hub,
             agent_runtime: Arc::downgrade(&agent_runtime),
+            hub_route: None,
         }
     }
 
@@ -281,6 +283,13 @@ impl RunService {
                 "process runtime was shut down while this run service was still in use".to_string(),
             )
         })
+    }
+
+    pub(crate) fn with_hub_turn(&self, route: crate::hub::HubTurnRoute) -> Self {
+        let mut service = self.clone();
+        service.agent_loop = service.agent_loop.with_hub_turn(route.clone());
+        service.hub_route = Some(route);
+        service
     }
 
     pub fn agent_activity_records(
@@ -766,6 +775,17 @@ impl RunService {
         prompt: &mut dyn ConfirmationPrompt,
     ) -> Result<AppCommandOutcome, AppRunError> {
         if let Some((session_id, access)) = external_session_command_access(&command) {
+            if access != RetainedSessionAccess::RootVisibleRead
+                && self
+                    .store
+                    .remote_job_store()
+                    .job_id_for_session(session_id)?
+                    .is_some()
+            {
+                return Err(AppRunError::Message(
+                    "received jobs must be controlled through their remote job owner".into(),
+                ));
+            }
             self.ensure_retained_session_access(session_id, access, None)
                 .await?;
         }
@@ -942,8 +962,10 @@ impl RunService {
         prompt: &mut dyn ConfirmationPrompt,
     ) -> Result<AppCommandOutcome, AppRunError> {
         ensure_run_admission_contract(&request, None)?;
-        let allow_idle_goal_continuation = request.agent_context.is_none()
-            && allows_goal_idle_continuation_after_run(&request.prompt)?;
+        let allow_idle_goal_continuation =
+            !matches!(request.admission_kind, RunAdmissionKind::RemoteTask { .. })
+                && request.agent_context.is_none()
+                && allows_goal_idle_continuation_after_run(&request.prompt)?;
         let mut summary = match self
             .execute_single_run(request.clone(), renderer, prompt, None)
             .await?
@@ -1116,7 +1138,12 @@ impl RunService {
             .unwrap_or(false);
         let requires_active_goal =
             root_agent_execution.is_some() && !continuation_has_agent_updates;
-        let slash_goal_command = parse_goal_slash_command(&request.prompt)?;
+        let slash_goal_command =
+            if matches!(request.admission_kind, RunAdmissionKind::RemoteTask { .. }) {
+                None
+            } else {
+                parse_goal_slash_command(&request.prompt)?
+            };
         let selector = match (request.session_id, request.continue_last) {
             (Some(id), false) => SessionSelector::ById(id),
             (None, true) => SessionSelector::Latest,
@@ -1190,10 +1217,16 @@ impl RunService {
             && !request.prompt.trim().is_empty();
         let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
         let prepared = prepare_run_turn(&self.workspace, &request)?;
-        if !image_parts.is_empty() && !effective_config.model.supports_images {
+        let mut runtime_config = self
+            .hub_route
+            .as_ref()
+            .map_or(effective_config.clone(), |route| {
+                route.runtime_config(&effective_config)
+            });
+        if !image_parts.is_empty() && !runtime_config.model.supports_images {
             return Err(AppRunError::Message(format!(
                 "configured model `{}` does not advertise image support; choose a vision-capable model before sending images",
-                effective_config.model.model
+                runtime_config.model.model
             )));
         }
 
@@ -1217,6 +1250,14 @@ impl RunService {
         let collaboration_mode =
             resolve_session_collaboration_mode(&self.session_service, session_context.session.id)
                 .await?;
+        if let Some(network) = self.store.device_network() {
+            network
+                .augment_runtime_config(&mut runtime_config, session_context.session.id)
+                .await;
+        }
+        // Session defaults above retain Direct settings. This run's policy uses logical Hub
+        // identities; the allocated gateway target exists only inside each ChatRequest.
+        let effective_config = runtime_config;
         let mode = collaboration_mode;
         let turn_policy = Arc::new(ResolvedTurnPolicy::resolve(
             &mode,
@@ -1285,7 +1326,7 @@ impl RunService {
             .store
             .try_acquire_run_process_lease(session_context.session.id)?;
         let mut root_admission_guard = match request.admission_kind {
-            RunAdmissionKind::NewUserRun | RunAdmissionKind::RootContinuation { .. } => Some(
+            RunAdmissionKind::NewUserRun | RunAdmissionKind::RemoteTask { .. } | RunAdmissionKind::RootContinuation { .. } => Some(
                 root_scope_control
                     .begin_root_admission(session_context.session.id, protocol_turn_id)
                     .map_err(|error| {
@@ -1297,6 +1338,19 @@ impl RunService {
             RunAdmissionKind::AgentTrigger { .. } | RunAdmissionKind::OwnerResume { .. } => None,
         };
         let admission = match request.admission_kind {
+            RunAdmissionKind::RemoteTask { job_id } => {
+                self.store
+                    .session_repo()
+                    .admit_remote_task(
+                        session_context.session.id,
+                        protocol_turn_id,
+                        job_id,
+                        initial_user_turn.as_ref().ok_or_else(|| {
+                            AppRunError::Message("remote task omitted its initial input".into())
+                        })?,
+                    )
+                    .await?
+            }
             RunAdmissionKind::AgentTrigger { history_item_id } => {
                 self.store
                     .session_repo()
@@ -1423,7 +1477,9 @@ impl RunService {
         }
         let root_admission_owner = matches!(
             request.admission_kind,
-            RunAdmissionKind::NewUserRun | RunAdmissionKind::RootContinuation { .. }
+            RunAdmissionKind::NewUserRun
+                | RunAdmissionKind::RemoteTask { .. }
+                | RunAdmissionKind::RootContinuation { .. }
         )
         .then(|| root_scope_control.clone());
         let post_admission_control = turn_run_control
@@ -3299,21 +3355,46 @@ fn ensure_run_admission_contract(
     ensure_new_run_operation_kind(request.expected_active_turn)?;
     let supplied_context = request.agent_context.as_ref();
     let preclaimed_context = preclaimed_root_execution.map(|execution| &execution.context);
-    if !matches!(request.admission_kind, RunAdmissionKind::NewUserRun)
-        && (!request.prompt.is_empty()
-            || request.continue_last
-            || request.title.is_some()
-            || request.prompt_dispatch.is_some()
-            || request.editor_context.is_some()
-            || request.review_request.is_some()
-            || !request.image_paths.is_empty()
-            || request.session_access_mode_adoption.is_some())
+    if !matches!(
+        request.admission_kind,
+        RunAdmissionKind::NewUserRun | RunAdmissionKind::RemoteTask { .. }
+    ) && (!request.prompt.is_empty()
+        || request.continue_last
+        || request.title.is_some()
+        || request.prompt_dispatch.is_some()
+        || request.editor_context.is_some()
+        || request.review_request.is_some()
+        || !request.image_paths.is_empty()
+        || request.session_access_mode_adoption.is_some())
     {
         return Err(AppRunError::Message(
             "an internal run admission cannot carry a direct user mutation payload".to_string(),
         ));
     }
     match request.admission_kind {
+        RunAdmissionKind::RemoteTask { .. } => {
+            if supplied_context.is_some()
+                || preclaimed_context.is_some()
+                || request.session_id.is_none()
+                || request.prompt.trim().is_empty()
+                || request.continue_last
+                || request.title.is_some()
+                || request.prompt_dispatch.is_some()
+                || request.editor_context.is_some()
+                || request.review_request.is_some()
+                || !request.image_paths.is_empty()
+                || request.session_access_mode_adoption.is_some()
+                || request.expected_active_turn
+                    != (ActiveTurnExpectation::Idle {
+                        latest_turn_id: None,
+                        revision: 0,
+                    })
+            {
+                return Err(AppRunError::Message(
+                    "remote task requires its dedicated initial root admission".into(),
+                ));
+            }
+        }
         RunAdmissionKind::NewUserRun => {
             if supplied_context.is_some() || preclaimed_context.is_some() {
                 return Err(AppRunError::Message(

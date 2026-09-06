@@ -1,0 +1,60 @@
+.hub-modal.settings-modal { width: min(1080px, calc(100vw - 48px)); max-height: calc(100vh - 76px); display: flex; flex-direction: column; overflow: hidden; padding: 0; border-radius: 20px; background: var(--panel); }
+.hub-modal-header { display: flex; justify-content: space-between; gap: 24px; padding: 24px 28px 20px; border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+.hub-modal-header h2 { margin: 5px 0 8px; font-size: 25px; }
+.hub-modal-header p { margin: 0; color: var(--muted); font-size: 13px; }
+.hub-eyebrow { color: var(--accent); font-size: 10px; font-weight: 700; letter-spacing: .15em; }
+.hub-modal-body.settings-content { min-height: 0; display: block; overflow: auto; padding: 22px 28px; scroll-behavior: auto; }
+.hub-scope-note { margin: 0 0 20px; padding: 12px 16px; border: 1px solid #38577f; background: #1d304a; border-radius: 10px; color: #c8dcff; font-size: 12px; line-height: 1.7; }
+.hub-connection, .hub-channel { border: 1px solid var(--line); border-radius: 14px; background: var(--bg); padding: 20px; }
+.hub-section-heading, .hub-channel > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.hub-section-heading h3, .hub-channel h3 { margin: 0; font-size: 15px; }
+.hub-connection-status { font-size: 12px; color: var(--muted); }
+.hub-connection-status[data-status="connected"] { color: var(--ok); }
+.hub-connection-status[data-status="error"], .hub-connection-status[data-status="stale"] { color: var(--danger); }
+.hub-connection-fields { display: grid; grid-template-columns: 1.2fr .8fr; gap: 12px 18px; margin-top: 16px; }
+.hub-connection-fields .hub-field:last-child { grid-column: 1 / -1; }
+.hub-field { display: grid; gap: 7px; color: var(--text); font-size: 13px; margin: 13px 0 0; }
+.hub-field input, .hub-field select { width: 100%; min-width: 0; background: var(--panel); color: var(--text); padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.hub-modal :is(input, select, button, summary):focus-visible { outline: 3px solid #8bb7ff; outline-offset: 3px; }
+.hub-model-row:has(input:focus-visible) { background: #233b5c; box-shadow: inset 3px 0 #8bb7ff; }
+.hub-connection-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 17px 0 10px; }
+.hub-connection-actions button, .hub-channel > button, .hub-modal-footer button { padding: 10px 15px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
+.hub-modal .hub-primary { background: #326ce0; border-color: #4a85ff; color: #fff; font-weight: 600; }
+.hub-help { color: var(--muted); font-size: 12px; line-height: 1.8; margin: 10px 0; }
+.hub-identity { display: flex; flex-wrap: wrap; gap: 8px 20px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.hub-identity code { font-size: 11px; }
+.hub-channels { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 18px; margin-top: 22px; }
+.hub-review-status { color: #a6c7ff; font-size: 12px; text-align: right; }
+.hub-review-status small { display: block; margin-top: 4px; color: var(--quiet); font-size: 10px; }
+.hub-route-selector { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; }
+.hub-route-selector > span { color: var(--muted); font-size: 12px; margin-right: 4px; }
+.hub-route-selector button { min-height: 36px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
+.hub-route-selector button small { margin-left: 4px; font-size: 10px; }
+.hub-route-selector button[aria-pressed="true"] { border-color: #568cff; background: #24467b; color: #e9f1ff; opacity: 1; }
+.hub-route-status { display: grid; gap: 4px; margin-top: 10px; font-size: 12px; line-height: 1.7; }
+.hub-route-status strong { color: var(--text); font-weight: 500; }
+.hub-route-status span { color: var(--muted); }
+.composer-route-notice, .side-chat-route-notice { margin: 0; padding: 9px 13px; color: #e5ca91; background: #332e24; border-top: 1px solid #67583a; font-size: 11px; line-height: 1.7; }
+.composer-route-notice button, .side-chat-route-notice button { margin-left: 6px; color: #d5e3ff; text-decoration: underline; text-underline-offset: 3px; }
+.hub-model-list { border: 1px solid var(--line); border-radius: 9px; max-height: 240px; min-height: 76px; overflow: auto; margin-top: 12px; }
+.hub-model-row { display: flex; align-items: center; gap: 10px; padding: 12px; cursor: pointer; }
+.hub-model-row + .hub-model-row { border-top: 1px solid var(--line); }
+.hub-model-row input { flex: 0 0 auto; width: 17px; height: 17px; padding: 0; accent-color: #5287ef; }
+.hub-model-row > span:first-of-type { min-width: 0; flex: 1; }
+.hub-model-row strong, .hub-model-row small { display: block; overflow-wrap: anywhere; }
+.hub-model-row strong { font-size: 13px; }
+.hub-model-row small { font-size: 10px; color: var(--quiet); margin-top: 3px; }
+.hub-model-row.is-missing { color: var(--danger); }
+.hub-capability { color: var(--quiet); font-size: 10px; max-width: 85px; overflow-wrap: anywhere; }
+.hub-empty { margin: 16px; color: var(--quiet); font-size: 12px; line-height: 1.8; }
+.hub-advanced { margin-top: 15px; }
+.hub-advanced summary, .hub-history summary { color: var(--text); cursor: pointer; font-size: 13px; padding: 8px 4px; border-radius: 5px; }
+.hub-channel-feedback { min-height: 42px; color: var(--muted); font-size: 12px; line-height: 1.7; margin: 15px 0 8px; }
+.hub-channel > button { width: 100%; }
+.hub-feedback { margin-top: 14px; padding: 12px 15px; color: #ffd4d8; background: #402b39; border: 1px solid #835467; border-radius: 9px; font-size: 12px; line-height: 1.7; }
+.hub-history { margin-top: 20px; }
+.hub-history p { display: flex; gap: 18px; font-size: 11px; color: var(--muted); line-height: 1.7; }
+.hub-history strong { flex: 0 0 65px; color: var(--accent); }
+.hub-modal-footer { padding: 14px 28px; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-top: 1px solid var(--line); font-size: 11px; color: var(--quiet); flex: 0 0 auto; }
+@media (forced-colors: active) { .hub-modal :is(input, select, button, summary):focus-visible { outline-color: Highlight; } .hub-model-row:has(input:focus-visible) { outline: 2px solid Highlight; outline-offset: -2px; } }
+@media (max-width: 760px) { .hub-channels { grid-template-columns: minmax(0,1fr); } .hub-modal.settings-modal { width: calc(100vw - 24px); } .hub-modal-header, .hub-modal-body.settings-content { padding: 18px; } .hub-connection-fields { grid-template-columns: minmax(0,1fr); } .hub-modal-footer span { max-width: 70%; } }

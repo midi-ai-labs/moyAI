@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import path from "node:path";
 
 import { parseArguments, readScenarioConfig } from "../run_scenario.mjs";
 import { createScenario, scenarioIds } from "../scenario_registry.mjs";
@@ -30,11 +31,16 @@ const case52OpenAiOptions = Object.freeze({
 test("one registry binds every reusable scenario to the common runner contract", () => {
   assert.deepEqual(scenarioIds, [
     "shell.baseline",
+    "shell.about",
+    "shell.lynx",
+    "hub.connection-settings",
     "agent.interrupt",
     "history.restart-prepend",
     "history.terminal-reconcile",
     "input.pointer-keyboard",
     "manual.case5_2",
+    "manual.hub-runtime",
+    "manual.hub-device-network",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
     "manual.permission-guardian-openai-compatible",
@@ -58,7 +64,9 @@ test("one registry binds every reusable scenario to the common runner contract",
     "side-chat.session",
   ]);
   for (const id of scenarioIds) {
-    const options = id === "manual.case5_2"
+    const options = ["manual.hub-runtime", "manual.hub-device-network"].includes(id)
+      ? { ...liveProviderOptions, hub_binary: path.resolve("target/debug/moyai-hub.exe") }
+      : id === "manual.case5_2"
       ? case52Options
       : id === "manual.provider-openai-compatible"
         ? liveProviderOptions

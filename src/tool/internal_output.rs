@@ -41,6 +41,10 @@ pub(crate) struct InternalSearchFile {
 }
 
 impl ResolvedPath {
+    pub(crate) fn workspace(guarded: GuardedPath) -> Self {
+        Self(ResolvedPathKind::Normal(guarded))
+    }
+
     pub(crate) fn permission(&self) -> ResolvedPathPermission<'_> {
         let guarded = match &self.0 {
             ResolvedPathKind::Normal(guarded) => guarded,

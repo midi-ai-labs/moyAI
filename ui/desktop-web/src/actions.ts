@@ -1,4 +1,11 @@
 import { command } from "./api.ts";
+import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
+import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "./device_network_actions.ts";
+import { deviceCanJoin, deviceCanReceive, deviceCanSelect, deviceCanStopJob } from "./device_network_state.ts";
+import { hubCanSave, hubCanSetRouteMode } from "./hub_state.ts";
+import { addPublish, cancelPublishDelete, choosePublish, copyPublish, discardPublish, openPublish, operatePublish, refreshPublish, savePublish, publishCertificate, stopPublishJob } from "./mcp_publish_actions.ts";
+import { publishCanOperate, publishCanSave, publishDirty, publishEditor, publishRow, publishCanCreateCertificate, publishCanStopJob } from "./mcp_publish_state.ts";
+import { checkMcpPeer, mcpPeerDraftValid, mutateMcpPeer, refreshMcpPeers } from "./mcp_peer.ts";
 import { snapshotAgentInterruptTarget } from "./agent_interrupt_contract.ts";
 import { snapshotPromptReviewMutationTarget } from "./composer_target_contract.ts";
 import {
@@ -21,7 +28,7 @@ import {
   sessionRowActionAvailable,
 } from "./navigation_state.ts";
 import { rowMutationArgs } from "./row_target.ts";
-import { settingsCloseTargetStillMatches } from "./settings_surface.ts";
+import { settingsCloseTargetStillMatches, type SettingsActionFocusContinuation } from "./settings_surface.ts";
 import {
   advanceInitialSetupStep,
   beginInitialSetupFinish,
@@ -120,7 +127,7 @@ export interface ActionContext {
   getProjection: () => DesktopWebState | null;
   getViewState: () => DesktopViewState | null;
   getRenderModel: () => DesktopRenderModel | null;
-  acceptProjection: (state: DesktopWebState, render?: boolean) => void;
+  acceptProjection: (state: DesktopWebState, render?: boolean, settingsAction?: SettingsActionFocusContinuation) => void;
   waitForInteractionIdle: () => Promise<void>;
   rerender: () => void;
   mutate: (
@@ -400,6 +407,34 @@ async function loadInitialSetupConfigToml(
       current?.config_target ?? request.configTarget,
       context.uiState.configDraftRevision,
     );
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  }
+}
+
+async function startInitialSetupWithHub(state: DesktopViewState, context: ActionContext): Promise<void> {
+  const setupTarget = state.startup.setup_target;
+  if (!initialSetupNavigationEnabled(state, context) || !setupTarget || context.uiState.initialSetup.step !== "start") return;
+  const request = beginInitialSetupAuxiliaryRequest(context.uiState.initialSetupAuxiliary, "import",
+    setupTarget, state.config_target, context.uiState.configDraftRevision);
+  if (!request) return;
+  context.rerender();
+  try {
+    const next = await command<DesktopWebState>("device_network_initial_setup_import", {
+      expectedSetupTarget: request.setupTarget, expectedConfigTarget: request.configTarget,
+    });
+    const current = context.getViewState();
+    const accepted = finishInitialSetupAuxiliaryRequest(context.uiState.initialSetupAuxiliary, request,
+      current?.startup.setup_target ?? null, current?.config_target ?? request.configTarget, context.uiState.configDraftRevision);
+    if (accepted) {
+      context.uiState.hub.tab = "devices";
+      context.acceptProjection(next);
+    } else context.rerender();
+  } catch (error) {
+    const current = context.getViewState();
+    finishInitialSetupAuxiliaryRequest(context.uiState.initialSetupAuxiliary, request,
+      current?.startup.setup_target ?? null, current?.config_target ?? request.configTarget, context.uiState.configDraftRevision);
     if (context.recoverCommandConflict(error)) return;
     context.rerender();
     context.reportError(error);
@@ -1464,6 +1499,56 @@ const ACTION_DEFINITIONS = [
     enabled: always,
     run: (_state, context) => context.mutate("show_config_editor"),
   },
+  { id: "show-hub", label: "moyAI Hub", menu: "view", palette: true, enabled: always, run: (_state, context) => openHub(context) },
+  { id: "hub-tab-devices", label: "Hubの端末連携", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "devices") },
+  { id: "hub-tab-models", label: "Hubのモデル割当", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "models") },
+  { id: "device-network-import", label: "Hub共通設定を読み込む", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection), run: (_state, context) => importDeviceNetwork(context) },
+  { id: "device-network-refresh", label: "端末ネットワークを更新", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending, run: (_state, context) => refreshDeviceNetwork(context) },
+  { id: "device-network-join", label: "この端末でHubに参加", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanJoin(model.local.deviceNetwork), run: (_state, context) => joinDeviceNetwork(context) },
+  { id: "device-network-receiver-on", label: "端末の受付を開始・保存", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanReceive(model.local.deviceNetwork, true), run: (_state, context) => setDeviceReceiver(context, true) },
+  { id: "device-network-receiver-off", label: "端末の受付を停止", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanReceive(model.local.deviceNetwork, false), run: (_state, context) => setDeviceReceiver(context, false) },
+  { id: "device-network-select", label: "端末を利用先に選択", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanSelect(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => selectDevicePeer(context, payload.value) },
+  { id: "device-network-stop-job", label: "委任タスクを停止", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanStopJob(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => stopDeviceNetworkJob(context, payload.value) },
+  { id: "device-network-leave", label: "Hub接続を一時解除", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection?.can_leave && model.local.deviceNetwork.leaveConfirmed), run: (_state, context) => leaveDeviceNetwork(context) },
+  { id: "show-mcp-publish", label: "MCPを配信", menu: "view", palette: true, enabled: always, run: (_state, context) => openPublish(context) },
+  { id: "mcp-publish-refresh", label: "MCP配信の最新情報を取得", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending, run: (_state, context) => refreshPublish(context) },
+  { id: "mcp-publish-add", label: "配信プロファイルを追加", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(model.local.mcpPublish.projection && model.local.mcpPublish.projection.profiles.length < 32), run: (_state, context) => addPublish(context) },
+  { id: "mcp-publish-select", label: "配信プロファイルを選択", enabled: (state, payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(model.local.mcpPublish.drafts[payload.value]), run: (_state, context, payload) => choosePublish(context, payload.value) },
+  { id: "mcp-publish-save", label: "配信設定を保存", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanSave(model.local.mcpPublish), run: (_state, context) => savePublish(context) },
+  { id: "mcp-publish-discard", label: "配信設定の変更を破棄", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishEditor(model.local.mcpPublish) && publishDirty(publishEditor(model.local.mcpPublish)!)), run: (_state, context) => discardPublish(context) },
+  { id: "mcp-publish-start", label: "MCP配信を開始", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "start"), run: (_state, context) => operatePublish(context, "start") },
+  { id: "mcp-publish-stop", label: "MCP配信を停止", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "stop"), run: (_state, context) => operatePublish(context, "stop") },
+  { id: "mcp-publish-delete", label: "配信プロファイルを削除", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "delete"), run: (_state, context) => operatePublish(context, "delete") },
+  { id: "mcp-publish-cancel-delete", label: "配信プロファイルの削除をキャンセル", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending, run: (_state, context) => cancelPublishDelete(context) },
+  { id: "mcp-publish-issue-token", label: "MCP接続用トークンを発行", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "issue_token"), run: (_state, context) => operatePublish(context, "issue_token") },
+  { id: "mcp-publish-revoke-token", label: "MCP接続用トークンを失効", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "revoke_token"), run: (_state, context) => operatePublish(context, "revoke_token") },
+  { id: "mcp-publish-copy-token", label: "MCP接続用トークンをコピー", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishRow(model.local.mcpPublish)?.credential_configured), run: (_state, context) => copyPublish(context, false) },
+  { id: "mcp-publish-copy-config", label: "MCP接続側設定例をコピー", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishRow(model.local.mcpPublish)?.endpoint && publishRow(model.local.mcpPublish)?.credential_configured), run: (_state, context) => copyPublish(context, true) },
+  { id: "mcp-publish-create-certificate", label: "配信用TLS証明書を作成", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanCreateCertificate(model.local.mcpPublish), run: (_state, context) => publishCertificate(context, true) },
+  { id: "mcp-publish-copy-certificate", label: "配信用の公開証明書をコピー", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishRow(model.local.mcpPublish)?.profile.tls), run: (_state, context) => publishCertificate(context, false) },
+  { id: "mcp-publish-stop-job", label: "受け付けたタスクを停止", enabled: (state, payload, model) => state.overlay === "mcp_publish" && publishCanStopJob(model.local.mcpPublish, payload.value), run: (_state, context, payload) => stopPublishJob(context, payload.value) },
+  { id: "mcp-peer-refresh", label: "登録済みmoyAI端末を更新", enabled: (state, _payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending, run: (_state, context) => refreshMcpPeers(context) },
+  { id: "mcp-peer-add", label: "moyAI端末の接続を保存", enabled: (state, _payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && !state.config_draft.dirty && mcpPeerDraftValid(model.local.mcpPeers), run: (_state, context) => mutateMcpPeer(context) },
+  { id: "mcp-peer-remove", label: "moyAI端末の接続を削除", enabled: (state, payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && !state.config_draft.dirty && model.local.mcpPeers.rows.some((row) => row.id === payload.value), run: (_state, context, payload) => mutateMcpPeer(context, payload.value) },
+  { id: "mcp-peer-check", label: "moyAI端末への接続を確認", enabled: (state, payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && model.local.mcpPeers.rows.some((row) => row.id === payload.value), run: (_state, context, payload) => checkMcpPeer(context, payload.value) },
+  {
+    id: "hub-connect", label: "Hubに接続",
+    enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending
+      && model.local.hub.projection !== null && ["disconnected", "error"].includes(model.local.hub.projection.status),
+    run: (_state, context) => connectHub(context),
+  },
+  { id: "hub-refresh", label: "Hubの最新情報を取得", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending, run: (_state, context) => refreshHub(context) },
+  {
+    id: "hub-disconnect", label: "Hubとの接続を解除",
+    enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && model.local.hub.projection !== null && model.local.hub.projection.status !== "disconnected",
+    run: (_state, context) => disconnectHub(context),
+  },
+  { id: "hub-save-main", label: "MainのHubモデル選択を保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
+  { id: "hub-save-side", label: "SideのHubモデル選択を保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
+  { id: "hub-main-direct", label: "Mainを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "direct"), run: (_state, context) => setHubRouteMode(context, "main", "direct") },
+  { id: "hub-main-hub", label: "MainをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "hub"), run: (_state, context) => setHubRouteMode(context, "main", "hub") },
+  { id: "hub-side-direct", label: "Sideを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "direct"), run: (_state, context) => setHubRouteMode(context, "side_chat", "direct") },
+  { id: "hub-side-hub", label: "SideをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "hub"), run: (_state, context) => setHubRouteMode(context, "side_chat", "hub") },
   {
     id: "show-session-settings",
     label: "このセッションの設定",
@@ -2271,6 +2356,8 @@ const ACTION_DEFINITIONS = [
     id: "close-overlay",
     label: "画面を閉じる",
     enabled: (state, _payload, model) => !startupSetupRequired(state)
+      && (state.overlay !== "hub" || (!model.local.hub.pending && !model.local.deviceNetwork.pending))
+      && (state.overlay !== "mcp_publish" || !model.local.mcpPublish.pending)
       && (state.overlay !== "config" || !model.local.configMutationPending)
       && (state.overlay !== "session_settings" || !model.local.sessionSettings.mutationPending)
       && (state.overlay !== "prompt_review"
@@ -2311,6 +2398,15 @@ const ACTION_DEFINITIONS = [
       : importConfigToml(state, context),
   },
   {
+    id: "initial-setup-hub",
+    label: "Hubの共通設定で始める",
+    enabled: (state, _payload, model) => startupSetupRequired(state) && state.overlay === "initial_setup"
+      && state.startup.setup_target !== null && model.local.initialSetup.step === "start"
+      && !model.local.initialSetup.finishPending && model.local.initialSetup.auxiliaryPendingKind === null
+      && !model.local.configMutationPending,
+    run: startInitialSetupWithHub,
+  },
+  {
     id: "insert-command",
     label: "コマンドを挿入",
     enabled: (state, payload) => state.command_rows[payload.index] !== undefined,
@@ -2323,7 +2419,8 @@ const ACTION_DEFINITIONS = [
     enabled: always,
     run: async (_state, context) => context.setWindowMaximized(await command<boolean>("toggle_maximize_window")),
   },
-  { id: "close-window", label: "閉じる", enabled: always, run: (_state, context) => command("hide_to_tray").catch(() => context.desktopWindow.hide()) },
+  { id: "close-window", label: "ウィンドウを閉じる（トレイに格納）", enabled: always, run: (_state, context) => command("hide_to_tray").catch(() => context.desktopWindow.hide()) },
+  { id: "exit-app", label: "moyAIを終了", menu: "file", palette: true, enabled: always, run: () => command("exit_app") },
 ] satisfies readonly ActionSourceDefinition[];
 
 export type ActionId = typeof ACTION_DEFINITIONS[number]["id"];

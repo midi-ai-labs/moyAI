@@ -1,3 +1,7 @@
+import type { HubProjection } from "./hub_state.ts";
+import type { DeviceNetworkProjection } from "./device_network_state.ts";
+import type { PublishProjection } from "./mcp_publish_state.ts";
+
 export type RowId = string;
 
 export interface TranscriptRow {
@@ -321,6 +325,7 @@ export interface PlanProjection {
 export interface DesktopAboutProjection {
   product_name: string;
   version: string;
+  codename: string;
   license_identifier: string;
   copyright_notice: string;
 }
@@ -397,6 +402,9 @@ export type ComposerSubmitMode = "new_request" | "steer" | "blocked";
 export type TaskActivityState = "idle" | "running" | "finalizing" | "attention";
 
 export interface DesktopWebState {
+  hub: HubProjection | null;
+  device_network: DeviceNetworkProjection | null;
+  mcp_publish: PublishProjection | null;
   projection_revision: string;
   workspace_path: string;
   provider_label: string;

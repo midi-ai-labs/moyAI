@@ -4,6 +4,7 @@ use serde_json::json;
 use crate::context::current_time::CurrentTimeSnapshot;
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::read_context::ReadToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
 
@@ -29,27 +30,42 @@ impl Tool for CurrentTimeTool {
         raw_arguments: serde_json::Value,
         _ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        if !raw_arguments.is_null()
-            && !raw_arguments
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty)
-        {
-            return Err(ToolError::Message(
-                "current_time takes no arguments".to_string(),
-            ));
-        }
-        let snapshot = CurrentTimeSnapshot::now();
-        Ok(ToolResult {
-            title: "Current time".to_string(),
-            output_text: format!(
-                "local: {}\nutc: {}\ntimezone: {}\nunix_ms: {}",
-                snapshot.local, snapshot.utc, snapshot.timezone, snapshot.unix_ms
-            ),
-            metadata: json!(snapshot),
-            truncated_output_path: None,
-            recorded_changes: Vec::new(),
-            change_summaries: Vec::new(),
-            _internal_file_lease: None,
-        })
+        execute_current_time(raw_arguments)
     }
+
+    async fn execute_read(
+        &self,
+        raw_arguments: serde_json::Value,
+        _ctx: ReadToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        execute_current_time(raw_arguments)
+    }
+}
+
+/// Clock reads need no session, workspace or storage authority.
+pub(crate) fn execute_current_time(
+    raw_arguments: serde_json::Value,
+) -> Result<ToolResult, ToolError> {
+    if !raw_arguments.is_null()
+        && !raw_arguments
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        return Err(ToolError::Message(
+            "current_time takes no arguments".to_string(),
+        ));
+    }
+    let snapshot = CurrentTimeSnapshot::now();
+    Ok(ToolResult {
+        title: "Current time".to_string(),
+        output_text: format!(
+            "local: {}\nutc: {}\ntimezone: {}\nunix_ms: {}",
+            snapshot.local, snapshot.utc, snapshot.timezone, snapshot.unix_ms
+        ),
+        metadata: json!(snapshot),
+        truncated_output_path: None,
+        recorded_changes: Vec::new(),
+        change_summaries: Vec::new(),
+        _internal_file_lease: None,
+    })
 }

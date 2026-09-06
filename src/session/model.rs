@@ -803,6 +803,21 @@ pub struct CanonicalSessionRead {
     pub active_turn_sequence_no: Option<i64>,
     #[serde(default)]
     pub admission_revision: u64,
+    /// Read-only aggregate from the same SQLite snapshot, independent of page limits.
+    #[serde(skip)]
+    pub active_turn_progress: Option<CanonicalActiveTurnProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalActiveTurnProgress {
+    pub turn_id: TurnId,
+    pub model_request_count: usize,
+    pub tool_call_count: usize,
+    pub completed_tool_count: usize,
+    pub declined_tool_count: usize,
+    pub cancelled_tool_count: usize,
+    pub failed_tool_count: usize,
+    pub compaction_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

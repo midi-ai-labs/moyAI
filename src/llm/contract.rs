@@ -232,6 +232,16 @@ impl ChatRequest {
         self.api_key = api_key;
     }
 
+    /// Replaces the complete ephemeral transport identity and clears Direct credentials.
+    pub(crate) fn route_through_hub(&mut self, provider: ProviderTarget, token: String) {
+        self.model.name = provider.model().to_string();
+        self.model.provider_profile = provider.profile();
+        self.provider = provider;
+        self.api_key = Some(token);
+        self.extra_headers.clear();
+        self.extra_body = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_provider_target(&mut self, provider: ProviderTarget) {
         self.provider = provider;

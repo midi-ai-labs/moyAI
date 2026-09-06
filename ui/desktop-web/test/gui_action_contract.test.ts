@@ -12,7 +12,13 @@ import {
 import {
   overlayDismissAction,
   shouldDispatchDelegatedKeyboardAction,
+  wireEvents,
 } from "../src/events.ts";
+import {
+  acceptPublishProjection, editPublishField, newPublishProfile, publishEditor,
+  publishPresentation, selectPublishProfile, type PublishProfileRow,
+} from "../src/mcp_publish_state.ts";
+import { renderPublishOverlay } from "../src/mcp_publish_render.ts";
 import { InteractionLifecycle, type InteractionEnd } from "../src/interaction_lifecycle.ts";
 import {
   dispatchNewSessionMutation,
@@ -268,10 +274,10 @@ const EXACT_DELIVERY_ACTION_IDS = [
     "insert-command",
   ] as const;
 
-test("the single GUI action registry owns all 97 actions without duplicates", () => {
+test("the single GUI action registry owns all 140 actions without duplicates", () => {
   const actionIds = ACTIONS.map((action) => action.id);
 
-  assert.equal(actionIds.length, 97);
+  assert.equal(actionIds.length, 140);
   assert.deepEqual(ACTION_IDS, actionIds);
   assert.equal(new Set(actionIds).size, actionIds.length);
   assert.equal(ACTION_BY_ID.size, actionIds.length);
@@ -279,6 +285,138 @@ test("the single GUI action registry owns all 97 actions without duplicates", ()
     assert.equal(actionById(id)?.id, id, id);
   }
   assert.equal(actionById("not-a-gui-action"), undefined);
+});
+
+test("rendered MCP profile and explicit close clicks preserve drafts while background clicks are ignored", async () => {
+  const current = state({ overlay: "mcp_publish",
+    draft_target: { ...state().draft_target, sessionId: null },
+    side_chat: { owner_session_id: null, chat_id: null } as DesktopViewState["side_chat"],
+  });
+  const calls: MutationCall[] = [];
+  const actionContext = context(current, calls);
+  const local = actionContext.uiState.mcpPublish;
+  const target = { kind: "project", project_id: "project-a", workspace_root: "C:/workspace" } as const;
+  const profiles: PublishProfileRow[] = ["profile-a", "profile-b"].map((id) => ({
+    profile: { id, label: id, bind: "127.0.0.1:7332", target, tools: ["read"], max_concurrent_calls: 1,
+      mode: { kind: "read_tools" }, tls: null,
+      background: "stop_when_window_closes", enabled: false, transport: "streamable_http", authentication: { kind: "unpaired" } },
+    status: "stopped", status_message: null, endpoint: null, active_calls: 0, connected_sessions: 0,
+    recent_calls: [], credential_configured: false, can_edit: true, can_delete: true,
+    can_start: false, can_stop: false, can_issue_token: true, can_revoke_token: false,
+  }));
+  acceptPublishProjection(local, { revision: "1", generation: "1", profiles,
+    targets: [{ target, label: "Workspace / Root chat" }], error: null });
+  newPublishProfile(local);
+  editPublishField(local, "label", "未保存の新規設定");
+  selectPublishProfile(local, "profile-a");
+  editPublishField(local, "label", "編集中の既存設定");
+  actionContext.getRenderModel = () => createDesktopRenderModel(current, {
+    ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION, mcpPublish: publishPresentation(local),
+  });
+  const errors: unknown[] = [];
+  actionContext.reportError = (error) => { errors.push(error); };
+
+  class ClickElement extends EventTarget {
+    dataset: Record<string, string>;
+    parent: ClickElement | null;
+    classList = { contains: (_name: string) => false };
+    constructor(dataset: Record<string, string> = {}, parent: ClickElement | null = null) {
+      super(); this.dataset = dataset; this.parent = parent;
+    }
+    closest(selector: string): ClickElement | null {
+      return selector === "[data-action]"
+        ? this.dataset.action ? this : this.parent?.closest(selector) ?? null : null;
+    }
+    hasAttribute(name: string): boolean { return name === "data-action" && this.dataset.action !== undefined; }
+  }
+  class ClickButton extends ClickElement { disabled = false; }
+  const token = { value: "displayed-one-time-token" };
+  const documentTarget = Object.assign(new EventTarget(), {
+    querySelector: (selector: string) => selector === "#mcp-publish-token" ? token : null,
+    querySelectorAll: (_selector: string) => [],
+  });
+  const globals: Record<string, unknown> = {
+    window: new EventTarget(), document: documentTarget, Element: ClickElement, HTMLButtonElement: ClickButton,
+  };
+  const previous = new Map(Object.keys(globals).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  for (const [name, value] of Object.entries(globals)) Object.defineProperty(globalThis, name, { configurable: true, value });
+  try {
+    wireEvents(current, actionContext);
+    const clickRendered = async (rendered: string, detail: number) => {
+      const dataset = Object.fromEntries([...rendered.matchAll(/data-([a-z-]+)="([^"]*)"/g)]
+        .map((match) => [match[1].replace(/-([a-z])/g, (_whole, letter: string) => letter.toUpperCase()), match[2]]));
+      const node = rendered.startsWith("<button") ? new ClickButton(dataset) : new ClickElement(dataset);
+      if (node instanceof ClickButton) node.disabled = /\sdisabled(?:\s|>)/.test(rendered);
+      const event = new Event("click", { cancelable: true, bubbles: true });
+      Object.defineProperties(event, { target: { value: new ClickElement({}, node) }, detail: { value: detail } });
+      documentTarget.dispatchEvent(event);
+      await Promise.resolve();
+      assert.deepEqual(errors, []);
+    };
+    const clickProfile = async (id: string, detail: number) => {
+      const markup = renderPublishOverlay(publishPresentation(local));
+      const rendered = [...markup.matchAll(/<button\b[^>]*>/g)].map((match) => match[0])
+        .find((tag) => tag.includes('data-action="mcp-publish-select"') && tag.includes(`data-value="${id}"`));
+      assert.ok(rendered, `the ${id} profile is rendered`);
+      await clickRendered(rendered, detail);
+    };
+    const backdrop = renderPublishOverlay(publishPresentation(local)).match(/^<div\b[^>]*>/)![0];
+    await clickRendered(backdrop, 1);
+    assert.deepEqual(calls, [], "background clicks must not reach the native close command");
+    assert.equal(publishEditor(local)!.value.label, "編集中の既存設定");
+    assert.equal(token.value, "displayed-one-time-token", "background clicks also leave the displayed credential intact");
+    await clickProfile("profile-b", 1);
+    assert.equal(local.selectedId, "profile-b", "pointer clicks must reach the requested saved profile");
+    assert.equal(token.value, "");
+    await clickProfile("new", 0);
+    assert.equal(local.selectedId, "new", "the native keyboard click must reopen the unsaved profile");
+    assert.equal(publishEditor(local)!.value.label, "未保存の新規設定");
+    await clickProfile("profile-a", 1);
+    assert.equal(local.selectedId, "profile-a");
+    assert.equal(publishEditor(local)!.value.label, "編集中の既存設定");
+    local.pending = "save";
+    await clickProfile("profile-b", 1);
+    assert.equal(local.selectedId, "profile-a", "a pending save still locks profile switching");
+    assert.deepEqual(calls, [], "profile selection is a local interaction, not a persistence command");
+    local.pending = null;
+    const closeButtons = [...renderPublishOverlay(publishPresentation(local)).matchAll(/<button\b[^>]*data-action="close-overlay"[^>]*>/g)];
+    assert.equal(closeButtons.length, 2, "the header X and footer Close stay explicit exits");
+    for (const [closeButton] of closeButtons) {
+      await clickRendered(closeButton, 1);
+      current.overlay = "none";
+      assert.equal(publishEditor(local)!.value.label, "編集中の既存設定");
+      assert.equal(local.drafts.new.value.label, "未保存の新規設定");
+      current.overlay = "mcp_publish";
+      acceptPublishProjection(local, local.projection!);
+      assert.equal(publishEditor(local)!.value.label, "編集中の既存設定", "reopening cannot discard a dirty editor");
+    }
+    assert.deepEqual(calls, [{ name: "close_overlay", args: undefined }, { name: "close_overlay", args: undefined }]);
+  } finally {
+    for (const [name, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+  }
+});
+
+test("File Exit uses the existing application exit boundary while window Close retains tray behavior", async () => {
+  const nativeCalls: string[] = [];
+  const current = state();
+  const actionContext = context(current, []);
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async (name: string) => { nativeCalls.push(name); } } },
+  });
+  try {
+    assert.equal(actionById("exit-app")?.menu, "file");
+    await dispatchGuiAction("close-window", -1, "", current, actionContext);
+    await dispatchGuiAction("exit-app", -1, "", current, actionContext);
+    assert.deepEqual(nativeCalls, ["hide_to_tray", "exit_app"]);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
 });
 
 test("delivery-sensitive GUI actions preserve their exact native boundaries", async () => {
@@ -1151,6 +1289,40 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
     else delete (globalThis as Record<string, unknown>).window;
   }
+});
+
+test("Initial Setup Hub import uses both native owners once and preserves draft on cancellation or stale settlement", async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  try {
+    for (const outcome of ["joined-flow", "cancel", "stale"] as const) {
+      const setupTarget = { workspacePath: "C:/workspace", globalConfigPath: "C:/config/config.toml", setupGeneration: "3" };
+      const wizard = state({ overlay: "initial_setup", startup: { ...state().startup, action_overlay: "initial_setup",
+        initial_setup_required: true, initial_setup_reason: "config_missing", setup_target: setupTarget } });
+      const actionContext = context(wizard, []);
+      actionContext.uiState.configDraftValues.set("model.model", "kept-draft");
+      const accepted: unknown[] = [];
+      actionContext.acceptProjection = next => { accepted.push(next); };
+      const calls: MutationCall[] = [];
+      let release!: (value: unknown) => void;
+      const response = new Promise(resolve => { release = resolve; });
+      Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: { getItem: () => null }, __TAURI_INTERNALS__: {
+        invoke: async (name: string, args: Record<string, unknown>) => { calls.push({ name, args }); return response; },
+      } } });
+      const first = dispatchGuiAction("initial-setup-hub", -1, "", wizard, actionContext);
+      await dispatchGuiAction("initial-setup-hub", -1, "", wizard, actionContext);
+      await dispatchGuiAction("initial-setup-next", -1, "", wizard, actionContext);
+      assert.equal(actionContext.uiState.initialSetup.step, "start");
+      assert.deepEqual(calls, [{ name: "device_network_initial_setup_import", args: { expectedSetupTarget: setupTarget, expectedConfigTarget: wizard.config_target } }]);
+      if (outcome === "stale") actionContext.uiState.configDraftRevision += 1n;
+      const next = outcome === "cancel" ? wizard : { ...wizard, overlay: "hub", startup: { ...wizard.startup, initial_setup_required: false } };
+      release(next);
+      await first;
+      assert.equal(actionContext.uiState.initialSetupAuxiliary.active, null);
+      assert.equal(actionContext.uiState.configDraftValues.get("model.model"), "kept-draft");
+      assert.deepEqual(accepted, outcome === "stale" ? [] : [next]);
+      if (outcome !== "stale") assert.equal(actionContext.uiState.hub.tab, "devices");
+    }
+  } finally { if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else delete (globalThis as Record<string, unknown>).window; }
 });
 
 test("Initial Setup Docling check sends the complete draft and admits only its endpoint result", async () => {

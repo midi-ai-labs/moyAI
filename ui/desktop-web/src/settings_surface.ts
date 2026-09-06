@@ -2,11 +2,33 @@ import { sameConfigMutationTarget } from "./config_mutation.ts";
 import type { FocusTargetCandidate } from "./focus_arbiter.ts";
 import type { InitialSetupStep } from "./initial_setup_state.ts";
 import type { ConfigMutationTarget, DesktopViewState, DesktopWebState } from "./types.ts";
+import { restoreScrollPosition } from "./scroll_state.ts";
 
 export interface SettingsActionFocusContinuation {
   target: ConfigMutationTarget;
   primaryAction: string;
   fallbackAction: string | null;
+  viewport?: { sourceTarget: ConfigMutationTarget; scrollLeft: number; scrollTop: number };
+}
+
+/** A successful exact-target mutation may carry its viewport across its own config revision. */
+export function restoreSettingsActionViewport(
+  continuation: SettingsActionFocusContinuation | null,
+  previous: DesktopViewState | null,
+  state: DesktopViewState,
+  query: (selector: string) => HTMLElement | null,
+): boolean {
+  const viewport = continuation?.viewport;
+  if (!continuation || !viewport || !previous || !settingsActionFocusStillTargets(continuation, state)
+    || previous.overlay !== "config" || previous.confirmation_visible
+    || viewport.sourceTarget.workspacePath !== continuation.target.workspacePath
+    || viewport.sourceTarget.sessionId !== continuation.target.sessionId
+    || (!sameConfigMutationTarget(viewport.sourceTarget, previous.config_target)
+      && !sameConfigMutationTarget(continuation.target, previous.config_target))) return false;
+  const content = query(".settings-modal .settings-content");
+  if (!content) return false;
+  restoreScrollPosition(content, viewport.scrollLeft, viewport.scrollTop);
+  return true;
 }
 
 const SETTINGS_SECTION_FRAGMENT = /^#(settings-[A-Za-z0-9_-]+)$/;
@@ -112,6 +134,8 @@ export function settingsSurfaceIdentity(
   initialSetupStep?: InitialSetupStep,
 ): string | null {
   if (!state || state.confirmation_visible) return null;
+  if (state.overlay === "hub") return "hub:application";
+  if (state.overlay === "mcp_publish") return "mcp-publish:application";
   if (state.overlay === "initial_setup") {
     const target = state.startup.setup_target;
     if (!state.startup.initial_setup_required || target === null || initialSetupStep === undefined) {
@@ -228,7 +252,8 @@ export function synchronizeRetainedSettingsSurface(
     current.hidden = next.hidden;
     synchronizeRetainedAvailabilityAnnotation(current, next, "aria-busy");
     synchronizeRetainedAvailabilityAnnotation(current, next, "aria-haspopup");
-    if (synchronizeValues) {
+    synchronizeRetainedAvailabilityAnnotation(current, next, "aria-pressed");
+    if (synchronizeValues && !current.hasAttribute("data-settings-dom-value")) {
       synchronizeRetainedControlValue(current, next);
       synchronizeRetainedAvailabilityAnnotation(current, next, "aria-invalid");
     }
@@ -278,7 +303,7 @@ function synchronizeRetainedPassiveRegions(
   });
 }
 
-function synchronizeRetainedControlValue(
+export function synchronizeRetainedControlValue(
   current: SettingsSurfaceControl,
   next: SettingsSurfaceControl,
 ): void {

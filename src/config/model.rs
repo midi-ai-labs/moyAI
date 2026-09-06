@@ -573,10 +573,12 @@ pub struct McpToolRouteConfig {
     pub effect: crate::tool::ToolEffectClass,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub enabled: bool,
     pub transport: McpTransportKind,
     pub base_url: String,
@@ -584,6 +586,12 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub tool_routes: Vec<McpToolRouteConfig>,
     pub headers: BTreeMap<String, String>,
+    /// Explicit moyAI task delegation endpoint; credentials remain local.
+    #[serde(default)]
+    pub remote_agent: bool,
+    /// A public certificate explicitly received from the configured peer.
+    #[serde(default)]
+    pub trusted_certificate_pem: Option<String>,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -597,11 +605,16 @@ impl std::fmt::Debug for McpServerConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("tool_routes", &self.tool_routes)
             .field("header_count", &self.headers.len())
+            .field("remote_agent", &self.remote_agent)
+            .field(
+                "custom_certificate",
+                &self.trusted_certificate_pem.is_some(),
+            )
             .finish()
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpConfig {
     pub enabled: bool,
     pub servers: Vec<McpServerConfig>,
@@ -636,6 +649,8 @@ pub struct ResolvedConfig {
     pub file_guard: FileGuardConfig,
     pub docling: DoclingConfig,
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub device_network: crate::device_network::SharedHubConfig,
     pub tool_output: ToolOutputConfig,
     pub logging: LoggingConfig,
 }
@@ -721,7 +736,29 @@ impl ResolvedConfig {
         if !self.mcp.enabled {
             return Ok(());
         }
+        if self.mcp.servers.len() > 32 {
+            return Err("at most 32 MCP connections are supported".into());
+        }
+        let mut server_ids = std::collections::HashSet::new();
         for (index, server) in self.mcp.servers.iter_mut().enumerate() {
+            if server
+                .display_name
+                .as_ref()
+                .is_some_and(|label| label.len() > 512 || label.chars().any(char::is_control))
+            {
+                return Err(format!(
+                    "config field `mcp.servers[{index}].display_name` is invalid"
+                ));
+            }
+            if server.id.trim().is_empty()
+                || server.id.len() > 128
+                || server.id.chars().any(char::is_control)
+                || !server_ids.insert(server.id.clone())
+            {
+                return Err(format!(
+                    "config field `mcp.servers[{index}].id` must be nonempty and unique"
+                ));
+            }
             if !server.enabled {
                 continue;
             }
@@ -732,6 +769,30 @@ impl ResolvedConfig {
             }
             server.base_url = canonical_mcp_base_url(&server.base_url)
                 .map_err(|error| format!("config field `mcp.servers[{index}].base_url` {error}"))?;
+            if let Some(pem) = &server.trusted_certificate_pem {
+                if !server.base_url.starts_with("https://")
+                    || pem.len() > 65536
+                    || !valid_mcp_certificate(pem)
+                {
+                    return Err(format!(
+                        "config field `mcp.servers[{index}].trusted_certificate_pem` requires HTTPS and a valid certificate"
+                    ));
+                }
+            }
+            if server.remote_agent && !server.base_url.starts_with("https://") {
+                let url = reqwest::Url::parse(&server.base_url)
+                    .map_err(|_| "invalid remote agent URL")?;
+                let local = url.host_str().is_some_and(|host| {
+                    host == "localhost"
+                        || host
+                            .trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                });
+                if !local {
+                    return Err("remote agent connections require HTTPS outside loopback".into());
+                }
+            }
         }
         Ok(())
     }
@@ -818,6 +879,10 @@ pub(crate) fn canonical_docling_base_url(raw: &str) -> Result<String, String> {
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(if path.is_empty() { "/" } else { &path });
     Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn valid_mcp_certificate(pem: &str) -> bool {
+    crate::mcp_publish::tls::public_certificate(pem).is_ok()
 }
 
 pub(crate) fn canonical_mcp_base_url(raw: &str) -> Result<String, String> {
@@ -1014,6 +1079,7 @@ impl Default for ResolvedConfig {
             mcp: McpConfig {
                 enabled: false,
                 servers: vec![McpServerConfig {
+                    display_name: None,
                     id: "docling".to_string(),
                     enabled: false,
                     transport: McpTransportKind::Http,
@@ -1021,8 +1087,11 @@ impl Default for ResolvedConfig {
                     timeout_ms: 120_000,
                     tool_routes: Vec::new(),
                     headers: BTreeMap::new(),
+                    remote_agent: false,
+                    trusted_certificate_pem: None,
                 }],
             },
+            device_network: crate::device_network::SharedHubConfig::default(),
             tool_output: ToolOutputConfig {
                 max_lines: 2_000,
                 max_bytes: 50 * 1024,
@@ -1052,12 +1121,13 @@ pub struct PartialResolvedConfig {
     pub file_guard: Option<PartialFileGuardConfig>,
     pub docling: Option<PartialDoclingConfig>,
     pub mcp: Option<PartialMcpConfig>,
+    pub device_network: Option<crate::device_network::SharedHubConfig>,
     pub tool_output: Option<PartialToolOutputConfig>,
     pub logging: Option<PartialLoggingConfig>,
 }
 
 impl PartialResolvedConfig {
-    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 15] = [
+    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 16] = [
         "model",
         "side_chat",
         "session",
@@ -1071,6 +1141,7 @@ impl PartialResolvedConfig {
         "file_guard",
         "docling",
         "mcp",
+        "device_network",
         "tool_output",
         "logging",
     ];
@@ -1397,6 +1468,7 @@ mod config_contract_tests {
             file_guard: Some(Default::default()),
             docling: Some(Default::default()),
             mcp: Some(Default::default()),
+            device_network: Some(Default::default()),
             tool_output: Some(Default::default()),
             logging: Some(Default::default()),
         };
@@ -1765,6 +1837,77 @@ headers = {}
             .normalize_and_validate_mcp_runtime()
             .expect_err("zero MCP operation deadline must fail closed");
         assert!(error.contains("mcp.servers[0].timeout_ms"));
+    }
+
+    #[test]
+    fn mcp_peer_identity_is_unique_even_when_one_duplicate_is_disabled() {
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        let mut peer = config.mcp.servers[0].clone();
+        peer.enabled = true;
+        peer.base_url = "http://127.0.0.1:8123/mcp".into();
+        config.mcp.servers.push(peer);
+        assert!(config.normalize_and_validate_mcp_runtime().is_err());
+        config.mcp.servers[1].id = "WinB".into();
+        config.normalize_and_validate_mcp_runtime().unwrap();
+        let second = config.mcp.servers[1].clone();
+        for index in 2..33 {
+            let mut peer = second.clone();
+            peer.id = format!("peer-{index}");
+            config.mcp.servers.push(peer);
+        }
+        assert!(config.normalize_and_validate_mcp_runtime().is_err());
+    }
+
+    #[test]
+    fn remote_agent_lan_requires_tls_without_restricting_legacy_http_tools() {
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        for url in [
+            "http://127.0.0.1:8123/mcp",
+            "http://[::1]:8123/mcp",
+            "https://192.0.2.2:8123/mcp",
+        ] {
+            config.mcp.servers[0].base_url = url.into();
+            config.normalize_and_validate_mcp_runtime().unwrap();
+        }
+        config.mcp.servers[0].base_url = "http://192.0.2.2:8123/mcp".into();
+        assert!(config.normalize_and_validate_mcp_runtime().is_err());
+        config.mcp.servers[0].remote_agent = false;
+        config.normalize_and_validate_mcp_runtime().unwrap();
+        config.mcp.servers[0].base_url = "https://192.0.2.2:8123/mcp".into();
+        config.mcp.servers[0].trusted_certificate_pem = Some("not-a-certificate-secret".into());
+        let error = config.normalize_and_validate_mcp_runtime().unwrap_err();
+        assert!(!error.contains("not-a-certificate-secret"));
+    }
+
+    #[test]
+    fn mcp_public_certificate_trust_accepts_one_certificate_without_private_material() {
+        let pair = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let certificate = pair.cert.pem();
+        let key = pair.signing_key.serialize_pem();
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].base_url = "https://127.0.0.1:7332/mcp".into();
+        for remote_agent in [false, true] {
+            config.mcp.servers[0].remote_agent = remote_agent;
+            config.mcp.servers[0].trusted_certificate_pem = Some(format!("\n{certificate}\n"));
+            config.normalize_and_validate_mcp_runtime().unwrap();
+            for invalid in [
+                format!("{certificate}\n{key}"),
+                format!("{key}\n{certificate}"),
+                format!("{certificate}\n{certificate}"),
+                "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----".into(),
+            ] {
+                config.mcp.servers[0].trusted_certificate_pem = Some(invalid);
+                let error = config.normalize_and_validate_mcp_runtime().unwrap_err();
+                assert!(!error.contains("PRIVATE KEY"));
+                assert!(!error.contains(&key));
+            }
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::tool::PermissionRequest;
 use crate::tui::state::{PromptReviewPhase, RunStatus, ToolStatusView, tool_action_label};
 
 const MOYAI_PRODUCT_NAME: &str = "moyAI";
+const MOYAI_DESKTOP_CODENAME: &str = "LYNX";
 const BUNDLED_LICENSE_TEXT: &str = include_str!("../../LICENSE");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,6 +513,7 @@ fn task_activity_state(
 pub struct DesktopAboutProjection {
     pub product_name: String,
     pub version: String,
+    pub codename: String,
     pub license_identifier: String,
     pub copyright_notice: String,
 }
@@ -581,6 +583,12 @@ pub struct DesktopRunMutationTargetProjection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
+    #[serde(skip_deserializing)]
+    pub hub: Option<crate::hub::HubConnectionProjection>,
+    #[serde(skip_deserializing)]
+    pub mcp_publish: Option<crate::mcp_publish::PublishProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_network: Option<crate::device_network::DeviceNetworkProjection>,
     pub projection_revision: String,
     pub workspace_path: String,
     pub provider_label: String,
@@ -765,6 +773,34 @@ pub(crate) fn desktop_web_state_with_permission(
 ) -> DesktopWebState {
     let state_busy = state.is_busy();
     let root_run_active = runtime.root_run_active();
+    let mut hub = state
+        .hub_connection
+        .as_ref()
+        .map(crate::hub::HubConnection::projection_now);
+    if let Some(hub) = &mut hub {
+        hub.can_change_main_mode &=
+            !root_run_active && !runtime.agent_tree_active && !state.prompt_enhance_pending();
+        hub.can_change_side_chat_mode &= runtime.side_chat.status != "running";
+    }
+    let main_hub = hub
+        .as_ref()
+        .is_some_and(|hub| hub.main_mode == crate::hub::HubRouteMode::Hub);
+    let main_route_ready = hub.as_ref().is_none_or(|hub| {
+        hub.main_mode == crate::hub::HubRouteMode::Direct || hub.can_enable_main_hub
+    });
+    let mut side_chat = runtime.side_chat.clone();
+    if let Some(hub) = &hub {
+        side_chat.can_send &= hub.side_chat_mode == crate::hub::HubRouteMode::Direct
+            || (hub.can_enable_side_chat_hub && hub.active_side_chat.is_none());
+    }
+    let hub_polling = hub.as_ref().is_some_and(|hub| {
+        matches!(
+            hub.status,
+            crate::hub::HubConnectionStatus::Connecting
+                | crate::hub::HubConnectionStatus::Connected
+        ) || hub.active_main.is_some()
+            || hub.active_side_chat.is_some()
+    });
     let busy = state_busy || root_run_active;
     let task_activity_state = task_activity_state(runtime, busy, pending_permission.is_some());
     let stop_target = stop_mutation_target_projection(
@@ -933,6 +969,15 @@ pub(crate) fn desktop_web_state_with_permission(
         access_mode_mutation_open,
     );
     DesktopWebState {
+        hub,
+        mcp_publish: state
+            .mcp_publish
+            .as_ref()
+            .map(crate::mcp_publish::PublishService::projection_now),
+        device_network: state
+            .device_network
+            .as_ref()
+            .map(crate::device_network::DeviceNetworkService::projection_now),
         projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state
@@ -1056,7 +1101,7 @@ pub(crate) fn desktop_web_state_with_permission(
             .map(|path| path.to_string())
             .collect(),
         composer_submit_mode,
-        can_submit: composer_admission_open,
+        can_submit: composer_admission_open && (root_run_active || main_route_ready),
         can_cancel_run: stop_target.is_some() && (busy || pending_permission.is_some()),
         run_target: DesktopRunMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
@@ -1076,6 +1121,15 @@ pub(crate) fn desktop_web_state_with_permission(
         busy,
         task_activity_state,
         async_polling_required: state.async_polling_required()
+            || hub_polling
+            || state
+                .mcp_publish
+                .as_ref()
+                .is_some_and(crate::mcp_publish::PublishService::polling_required)
+            || state
+                .device_network
+                .as_ref()
+                .is_some_and(crate::device_network::DeviceNetworkService::polling_required)
             || root_run_active
             || runtime.agent_tree_active
             || runtime.root_run_finalizing
@@ -1094,7 +1148,7 @@ pub(crate) fn desktop_web_state_with_permission(
         background_mutation_pending: state.background_mutation_pending(),
         overlay: overlay_key(state.view.overlay).to_string(),
         about: about_projection(),
-        side_chat: runtime.side_chat.clone(),
+        side_chat,
         project_rows: state.snapshot.project_rows.clone(),
         selected_project_index: state.selected_project_index(),
         session_rows,
@@ -1214,7 +1268,9 @@ pub(crate) fn desktop_web_state_with_permission(
             && new_request_admission_open
             && prompt_review_owner_is_current,
         history_export_enabled: state.can_export_history() && !root_run_active,
-        enhance_enabled: new_request_admission_open && state.app_state.prompt_review.is_none(),
+        enhance_enabled: !main_hub
+            && new_request_admission_open
+            && state.app_state.prompt_review.is_none(),
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
     }
@@ -1492,6 +1548,8 @@ fn overlay_key(overlay: DesktopOverlay) -> &'static str {
         DesktopOverlay::HelpMenu => "help_menu",
         DesktopOverlay::ProjectMenu => "project_menu",
         DesktopOverlay::ConfigEditor => "config",
+        DesktopOverlay::HubConnection => "hub",
+        DesktopOverlay::McpPublish => "mcp_publish",
         DesktopOverlay::SessionSettings => "session_settings",
         DesktopOverlay::ProviderEditor => "provider",
         DesktopOverlay::WorkspacePicker => "workspace",
@@ -1510,6 +1568,7 @@ fn about_projection() -> DesktopAboutProjection {
     DesktopAboutProjection {
         product_name: MOYAI_PRODUCT_NAME.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        codename: MOYAI_DESKTOP_CODENAME.to_string(),
         license_identifier: env!("CARGO_PKG_LICENSE").to_string(),
         copyright_notice: copyright_notice.to_string(),
     }
@@ -2872,6 +2931,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: std::collections::HashMap::new(),
             session_token_usage: Default::default(),
+            active_turn_progress: None,
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,

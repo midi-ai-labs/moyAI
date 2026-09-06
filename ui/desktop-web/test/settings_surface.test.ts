@@ -16,6 +16,7 @@ import {
   settingsSurfaceIdentity,
   shouldRetainConnectedSettingsSurface,
   synchronizeRetainedSettingsSurface,
+  restoreSettingsActionViewport,
 } from "../src/settings_surface.ts";
 import type { DesktopViewState } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
@@ -502,6 +503,7 @@ test("retained Settings availability synchronization preserves browser-owned dra
   const currentClose = new FakeControl("BUTTON", {
     "data-action": "close-overlay",
     "aria-haspopup": "false",
+    "aria-pressed": "false",
   });
   const currentReadiness = new FakeLiveRegion("docling-readiness");
   const currentFocusedRegion = new FakeLiveRegion("focused-status");
@@ -534,6 +536,7 @@ test("retained Settings availability synchronization preserves browser-owned dra
   const nextClose = new FakeControl("BUTTON", {
     "data-action": "close-overlay",
     "aria-haspopup": "alertdialog",
+    "aria-pressed": "true",
   });
   const nextReadiness = new FakeLiveRegion("docling-readiness");
   const nextFocusedRegion = new FakeLiveRegion("focused-status");
@@ -566,6 +569,7 @@ test("retained Settings availability synchronization preserves browser-owned dra
   assert.equal(currentError.replacedWith, null, "focused error details remain browser-owned during a poll");
   assert.equal(currentSave.getAttribute("aria-busy"), "true", "an admitted Wizard action exposes busy state");
   assert.equal(currentClose.getAttribute("aria-haspopup"), "alertdialog", "dirty close announces its guard");
+  assert.equal(currentClose.getAttribute("aria-pressed"), "true", "saved route selection follows the fresh projection on retained buttons");
 
   nextSave.setAttribute("aria-busy", "false");
   nextClose.setAttribute("aria-haspopup", "false");
@@ -613,6 +617,10 @@ test("retained Settings availability synchronization preserves browser-owned dra
     [2, 5],
     "an equal canonical poll preserves browser selection",
   );
+  currentInput.setAttribute("data-settings-dom-value", "");
+  currentInput.value = "one-shot-secret";
+  synchronizeRetainedSettingsSurface(current as unknown as HTMLElement, next as unknown as HTMLElement, false, true);
+  assert.equal(currentInput.value, "one-shot-secret", "a DOM-only secret survives an otherwise clean Settings poll");
 });
 
 test("a focused provider model select applies the newest catalog exactly once on blur", () => {
@@ -707,6 +715,36 @@ test("settings scroll restoration is instant and same-overlay polls do not refoc
   assert.equal(overlayPrimaryFocusRequired("config", "config:owner-b", "config:owner-a", false, false), true);
   assert.equal(overlayPrimaryFocusRequired("config", "config:owner-a", "config:owner-a", true, false), true);
   assert.equal(overlayPrimaryFocusRequired("config", "config:owner-a", "config:owner-a", false, true), false);
+});
+
+test("accepted Settings mutation restores its Tools viewport across only its own revision", () => {
+  const previous = settingsState();
+  const settled = settingsState({ config_target: { ...previous.config_target, configGeneration: "8" } });
+  const continuation = {
+    target: settled.config_target, primaryAction: "mcp-peer-refresh", fallbackAction: "close-overlay",
+    viewport: { sourceTarget: previous.config_target, scrollLeft: 12, scrollTop: 880 },
+  };
+  let position: ScrollToOptions | null = null;
+  const content = { style: { scrollBehavior: "smooth" }, scrollTo: (next: ScrollToOptions) => { position = next; } } as unknown as HTMLElement;
+  const query = (selector: string) => selector === ".settings-modal .settings-content" ? content : null;
+  assert.equal(restoreSettingsActionViewport(continuation, previous, settled, query), true);
+  assert.deepEqual(position, { left: 12, top: 880, behavior: "auto" });
+  assert.equal(restoreSettingsActionViewport(continuation, settled, settled, query), true, "the same accepted receipt may already be visible from a poll");
+  assert.equal(sameSettingsSurface(previous, settled), false, "canonical Settings DOM ownership still follows the new revision");
+  for (const [from, to] of [
+    [previous, settingsState({ config_target: { ...settled.config_target, configGeneration: "9" } })],
+    [settingsState({ config_target: { ...previous.config_target, configGeneration: "6" } }), settled],
+    [previous, settingsState({ config_target: { ...settled.config_target, sessionId: "other-session" } })],
+    [previous, settingsState({ config_target: { ...settled.config_target, workspacePath: "C:/other" } })],
+    [settingsState({ overlay: "none" }), settled],
+    [previous, settingsState({ overlay: "none" })],
+    [previous, settingsState({ confirmation_visible: true })],
+  ]) {
+    position = null;
+    assert.equal(restoreSettingsActionViewport(continuation, from, to, query), false);
+    assert.equal(position, null, "an unrelated owner must not be scrolled by a successful old receipt");
+  }
+  assert.equal(restoreSettingsActionViewport(null, previous, settled, query), false, "ordinary external snapshots carry no accepted mutation continuation");
 });
 
 test("settings action target fence and selector fallback chain resolve without focusing", () => {

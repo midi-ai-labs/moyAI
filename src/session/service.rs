@@ -1658,6 +1658,7 @@ fn canonical_session_snapshot_from_storage(
         active_turn_position,
         pending_turn_inputs,
         admission_revision,
+        active_turn_progress,
     } = snapshot;
     let CanonicalProtocolSnapshot {
         fence,
@@ -1695,6 +1696,7 @@ fn canonical_session_snapshot_from_storage(
             active_turn_id: active_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_sequence_no: active_turn_position.map(|(_, sequence_no)| sequence_no),
             admission_revision,
+            active_turn_progress,
         },
         fence: CanonicalSessionFence {
             append_position: fence.append_position,

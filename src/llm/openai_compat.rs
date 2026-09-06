@@ -50,6 +50,7 @@ const PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES: usize = 48;
 #[derive(Clone)]
 pub struct OpenAiCompatClient {
     api_key: Option<String>,
+    runtime_http: Option<reqwest::Client>,
 }
 
 struct StartedResponse {
@@ -58,7 +59,16 @@ struct StartedResponse {
 
 impl OpenAiCompatClient {
     pub fn new(api_key: Option<String>) -> Self {
-        Self { api_key }
+        Self {
+            api_key,
+            runtime_http: None,
+        }
+    }
+    /// Private transport supplied by the authenticated Hub route owner. It is
+    /// not a provider setting and never enters a persisted request/configuration.
+    pub(crate) fn with_runtime_http(mut self, http: reqwest::Client) -> Self {
+        self.runtime_http = Some(http);
+        self
     }
 }
 
@@ -430,7 +440,10 @@ impl OpenAiCompatClient {
         } else {
             client_builder
         };
-        let client = client_builder.build()?;
+        let client = match &self.runtime_http {
+            Some(http) => http.clone(),
+            None => client_builder.build()?,
+        };
         let endpoint_url = request
             .provider_target()
             .endpoint()
