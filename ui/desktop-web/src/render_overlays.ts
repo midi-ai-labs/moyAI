@@ -47,6 +47,7 @@ export function renderConfirmation(
   const details = confirmation.details.length > 0 ? confirmation.details.join("\n") : "なし";
   const agentPath = state.confirmation?.agent_path?.trim() ?? "";
   const agentTaskName = state.confirmation?.agent_task_name?.trim() ?? "";
+  const remote = state.confirmation?.remote;
   const requestId = state.confirmation_id ?? "unknown";
   const currentDecision = decisionState?.requestId === requestId
     ? decisionState
@@ -55,31 +56,35 @@ export function renderConfirmation(
   const status = currentDecision.phase === "submitting"
     ? currentDecision.decision === "approved"
       ? "承認を反映しています。"
+      : currentDecision.decision === "denied"
+        ? "拒否を反映しています。"
       : currentDecision.decision === "abort"
         ? "現在のタスクを停止しています。"
         : "実行停止を要求しています。"
     : currentDecision.phase === "failed"
       ? currentDecision.error
-      : "実行しない場合、現在のタスクを停止し、次の指示を待ちます。";
+      : remote ? "許可はこの操作に適用します。操作を拒否する場合は「許可しない」、タスク全体を止める場合は「タスクを停止」を選んでください。"
+        : "実行しない場合、現在のタスクを停止し、次の指示を待ちます。";
   const abortLabel = pending && currentDecision.decision === "abort"
     ? "停止しています…"
-    : "実行せず、指示を変更する";
+    : remote ? "タスクを停止" : "実行せず、指示を変更する";
   const approveLabel = pending && currentDecision.decision === "approved"
     ? "承認しています…"
-    : "実行する";
+    : remote ? "この操作を許可" : "実行する";
   const stopLabel = pending && currentDecision.decision === "stop"
     ? "停止しています…"
     : "実行停止";
-  const stopAction = runCanBeCancelled(state)
+  const stopAction = !remote && runCanBeCancelled(state)
     ? `<button class="danger-button" data-action="cancel-run" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:stop" title="現在のタスクへ実行停止を要求" ${pending ? "disabled" : ""}>${stopLabel}</button>`
     : "";
   return `
     <div class="modal-backdrop">
       <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1" data-permission-id="${escapeHtml(requestId)}" ${pending ? 'aria-busy="true"' : ""}>
-        <h2 id="permission-title">確認が必要です</h2>
+        <h2 id="permission-title">${remote ? "受入タスクの操作を確認" : "確認が必要です"}</h2>
         <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
         <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
         <dl class="confirm-details">
+          ${remote ? `<dt>依頼元</dt><dd>${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd>${escapeHtml(remote.target_label)}</dd><dt>受入タスク</dt><dd>${escapeHtml(remote.job_id)}</dd>` : ""}
           ${agentPath ? `<dt>要求元</dt><dd>${renderPermissionAgentIdentity(agentPath, agentTaskName)}</dd>` : ""}
           <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
           <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
@@ -87,7 +92,8 @@ export function renderConfirmation(
         </dl>
         <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1" data-focus-key="permission:${escapeHtml(requestId)}:status">${escapeHtml(status)}</div>
         <div class="modal-actions">
-          <button data-action="abort-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:abort" ${pending ? "disabled" : "autofocus"}>${abortLabel}</button>
+          ${remote ? `<button data-action="deny-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:deny" ${pending ? "disabled" : "autofocus"}>${pending && currentDecision.decision === "denied" ? "拒否しています…" : "許可しない"}</button>` : ""}
+          <button data-action="abort-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:abort" ${pending ? "disabled" : remote ? "" : "autofocus"}>${abortLabel}</button>
           ${stopAction}
           <button class="send wide-send" data-action="approve-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:approve" ${pending ? "disabled" : ""}>${approveLabel}</button>
         </div>

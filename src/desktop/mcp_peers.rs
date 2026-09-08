@@ -83,6 +83,7 @@ pub(crate) fn add(config: &ResolvedConfig, peer: McpPeerDraft) -> Result<Resolve
         tool_routes: [
             ("delegate_task", ToolEffectClass::Mutation),
             ("task_status", ToolEffectClass::Read),
+            ("task_artifacts", ToolEffectClass::Read),
             ("cancel_task", ToolEffectClass::Mutation),
         ]
         .into_iter()
@@ -243,6 +244,7 @@ mod tests {
             vec![
                 ("delegate_task", ToolEffectClass::Mutation),
                 ("task_status", ToolEffectClass::Read),
+                ("task_artifacts", ToolEffectClass::Read),
                 ("cancel_task", ToolEffectClass::Mutation)
             ]
         );

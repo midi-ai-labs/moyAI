@@ -74,6 +74,8 @@ pub struct HubConnectionProjection {
     pub hub_id: Option<String>,
     pub catalog: Option<HubCatalog>,
     pub main_review: Option<ReviewedHubSelection>,
+    #[serde(default)]
+    pub recommended_main_selection: Option<HubSelection>,
     pub side_chat_review: Option<ReviewedHubSelection>,
     pub main_confirmation: HubReviewConfirmation,
     pub side_chat_confirmation: HubReviewConfirmation,
@@ -95,6 +97,7 @@ struct ConnectionState {
     status: HubConnectionStatus,
     client: Option<RegisteredHubClient>,
     catalog: Option<HubCatalog>,
+    recommendation: Option<ReviewedHubSelection>,
     // These are remote acknowledgements for the current registration, not extra durable truth.
     confirmed: [Option<ReviewedHubSelection>; 2],
     cancellation: CancellationToken,
@@ -194,6 +197,17 @@ impl ConnectionState {
             hub_id: self.settings.hub_id.clone(),
             catalog: self.catalog.clone(),
             main_review: self.settings.main_review.clone(),
+            recommended_main_selection: self
+                .recommendation
+                .as_ref()
+                .filter(|review| {
+                    self.status == HubConnectionStatus::Connected
+                        && self
+                            .catalog
+                            .as_ref()
+                            .is_some_and(|catalog| review.check_admission(catalog).is_ok())
+                })
+                .map(|review| review.selection.clone()),
             side_chat_review: self.settings.side_chat_review.clone(),
             main_confirmation: self.confirmation(HubReviewContext::Main),
             side_chat_confirmation: self.confirmation(HubReviewContext::SideChat),
@@ -216,7 +230,7 @@ impl ConnectionState {
 struct ConnectionInner {
     state: std::sync::Mutex<ConnectionState>,
     store: Option<HubSettingsStore>,
-    network_http: std::sync::Mutex<Option<reqwest::Client>>,
+    network_http: std::sync::Mutex<Option<crate::device_network::ManagedHubHttp>>,
     // A later save in the same context must not reach Hub before an earlier request completes.
     reviews: [Mutex<()>; 2],
 }
@@ -257,6 +271,7 @@ impl HubConnection {
                     },
                     client: None,
                     catalog: None,
+                    recommendation: None,
                     confirmed: [None, None],
                     cancellation: CancellationToken::new(),
                     error: storage_error,
@@ -281,7 +296,7 @@ impl HubConnection {
     /// Its reviewed Hub default is runtime-only and never overwrites Main/Side.
     pub(crate) async fn device_worker_route(
         endpoint: &str,
-        http: reqwest::Client,
+        http: crate::device_network::ManagedHubHttp,
         cancel: CancellationToken,
     ) -> Result<HubTurnRoute, HubError> {
         let (client, selection) =
@@ -326,6 +341,7 @@ impl HubConnection {
                     status: HubConnectionStatus::Connected,
                     client: Some(client),
                     catalog: Some(catalog),
+                    recommendation: None,
                     confirmed: [Some(review), None],
                     cancellation: cancellation.clone(),
                     error: None,
@@ -348,7 +364,7 @@ impl HubConnection {
     pub(crate) async fn connect_device(
         &self,
         endpoint: &str,
-        http: reqwest::Client,
+        http: crate::device_network::ManagedHubHttp,
         use_default: bool,
     ) -> Result<(), HubError> {
         let endpoint = validated_endpoint(endpoint)?.to_string();
@@ -382,6 +398,16 @@ impl HubConnection {
             proposed.endpoint = endpoint;
             proposed.hub_id = Some(catalog.hub_id.clone());
             let mut confirmed = [None, None];
+            let recommendation = default
+                .map(|selection| {
+                    ReviewedHubSelection::review(
+                        &catalog,
+                        &catalog.hub_id,
+                        catalog.revision,
+                        selection,
+                    )
+                })
+                .transpose()?;
             for context in [HubReviewContext::Main, HubReviewContext::SideChat] {
                 let review = context.review(&proposed).clone();
                 if let Some(review) =
@@ -392,13 +418,7 @@ impl HubConnection {
                 }
             }
             if use_default && proposed.main_review.is_none() {
-                if let Some(default) = default {
-                    let review = ReviewedHubSelection::review(
-                        &catalog,
-                        &catalog.hub_id,
-                        catalog.revision,
-                        default,
-                    )?;
+                if let Some(review) = recommendation.clone() {
                     client.review(HubReviewContext::Main, &review).await?;
                     proposed.main_review = Some(review.clone());
                     proposed.main_mode = HubRouteMode::Hub;
@@ -413,6 +433,7 @@ impl HubConnection {
                 state.settings = self.persisted_store()?.save(&proposed)?;
             }
             state.catalog = Some(catalog);
+            state.recommendation = recommendation;
             state.client = Some(client.clone());
             state.confirmed = confirmed;
             state.status = HubConnectionStatus::Connected;

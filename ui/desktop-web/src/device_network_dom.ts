@@ -21,7 +21,6 @@ export function synchronizeDeviceNetworkControls(current: HTMLElement, next: HTM
     }
   }
   for (const nextControl of next.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-network-field]")) {
-    if (nextControl.dataset.networkField === "code") continue;
     const control = current.querySelector<HTMLInputElement | HTMLSelectElement>(`#${CSS.escape(nextControl.id)}`);
     if (control && control !== current.ownerDocument.activeElement) synchronizeRetainedControlValue(control, nextControl);
   }

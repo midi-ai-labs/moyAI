@@ -292,6 +292,23 @@ impl RunService {
         service
     }
 
+    /// A received immutable input copy belongs only to this run. Its owner keeps
+    /// the directory alive until execution settles; it grants no write authority.
+    pub(crate) fn with_remote_input_root(&self, root: &camino::Utf8Path) -> Self {
+        let mut service = self.clone();
+        service
+            .workspace
+            .path_policy
+            .additional_read_roots
+            .push(root.to_owned());
+        service
+            .config
+            .permissions
+            .additional_read_roots
+            .push(root.to_owned());
+        service
+    }
+
     pub fn agent_activity_records(
         &self,
         root_session_id: crate::session::SessionId,

@@ -127,6 +127,9 @@ const V61_SIDE_CHAT_SYSTEM_PROMPT: &str =
 const V62_REMOTE_AGENT_JOBS: &str = include_str!("../../migrations/V62__remote_agent_jobs.sql");
 const V63_DEVICE_OUTGOING_REFERENCES: &str =
     include_str!("../../migrations/V63__device_outgoing_references.sql");
+const V64_REMOTE_NETWORK_RECEIPTS: &str =
+    include_str!("../../migrations/V64__remote_network_receipts.sql");
+const V65_REMOTE_ARTIFACTS: &str = include_str!("../../migrations/V65__remote_artifacts.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -604,12 +607,83 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
         run(connection)?;
         if schema_migration_applied(connection, SIDE_CHAT_SYSTEM_PROMPT_VERSION)? {
             run_remote_agent_jobs(connection)?;
-            return run_device_outgoing_references(connection);
+            run_device_outgoing_references(connection)?;
+            run_remote_network_receipts(connection)?;
+            return run_remote_artifacts(connection);
         }
     }
     Err(StorageError::Message(format!(
         "storage migration did not reach current endpoint V{SIDE_CHAT_SYSTEM_PROMPT_VERSION}"
     )))
+}
+
+fn run_remote_artifacts(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 65)? {
+            connection.execute_batch(V65_REMOTE_ARTIFACTS)?;
+        }
+        if !schema_migration_has_exact_name(connection, 65, "remote_artifacts")? {
+            return Err(StorageError::Message(
+                "invalid remote artifact migration marker".into(),
+            ));
+        }
+        connection.prepare("SELECT job_id,payload_json FROM remote_job_inputs LIMIT 0")?;
+        connection
+            .prepare("SELECT job_id,version,payload_json FROM remote_job_artifacts LIMIT 0")?;
+        connection.prepare(
+            "SELECT reference_id,job_id,version,payload_json FROM device_artifact_cache LIMIT 0",
+        )?;
+        let objects: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('remote_job_inputs_immutable','remote_job_artifacts_immutable','device_artifact_cache_immutable')", [], |row| row.get(0))?;
+        if objects != 3 {
+            return Err(StorageError::Message(
+                "remote artifact schema is incomplete".into(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn run_remote_network_receipts(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 64)? {
+            connection.execute_batch(V64_REMOTE_NETWORK_RECEIPTS)?;
+        }
+        if !schema_migration_has_exact_name(connection, 64, "remote_network_receipts")? {
+            return Err(StorageError::Message(
+                "invalid remote network receipt migration marker".into(),
+            ));
+        }
+        connection.prepare("SELECT job_id,grant_id,settlement_delivered,last_attempt_ms FROM remote_network_receipts LIMIT 0")?;
+        let objects: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE (type='index' AND name='remote_network_receipts_pending') OR (type='trigger' AND name='remote_network_receipts_immutable')", [], |row| row.get(0))?;
+        if objects != 2 {
+            return Err(StorageError::Message(
+                "remote network receipt schema is incomplete".into(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn run_remote_agent_jobs(connection: &Connection) -> Result<(), StorageError> {

@@ -22,6 +22,7 @@
 .device-network-peer { display: flex; align-items: flex-start; gap: 20px; padding: 16px; }
 .device-network-peer + .device-network-peer { border-top: 1px solid var(--line); }
 .device-network-peer > div { flex: 1; min-width: 0; }
+.device-network-peer > .device-network-peer-actions { flex: 0 0 auto; display: grid; gap: 10px; max-width: 180px; }
 .device-network-peer strong, .device-network-peer span { display: block; overflow-wrap: anywhere; }
 .device-network-peer strong { font-size: 15px; }
 .device-network-peer > div > span { color: var(--muted); font-size: 13px; margin-top: 5px; }
@@ -32,5 +33,15 @@
 .device-network-job strong { font-size: 14px; overflow-wrap: anywhere; }
 .device-network-job button { margin-top: 12px; }
 .device-network-path { color: #b5d0ff; font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.device-network-diagnostic-stages { display: grid; gap: 10px; margin: 12px 0; padding-left: 22px; font-size: 13px; }
+.device-network-diagnostic-stages li { padding: 5px 0; overflow-wrap: anywhere; }
+.device-network-diagnostic-stages strong span { color: var(--muted); font-weight: 400; }
+.device-network-diagnostic-stages li[data-status="pass"] strong span { color: var(--ok); }
+.device-network-diagnostic-stages li[data-status="fail"] strong span { color: #eac37a; }
+.device-network-diagnostic-stages p { margin: 5px 0; line-height: 1.7; }
+.device-network-diagnostic-hint { color: var(--quiet); white-space: pre-wrap; }
 .device-network-job details .hub-help { max-height: 220px; overflow: auto; white-space: pre-wrap; }
+.device-network-artifact-files { display: grid; gap: 10px; list-style: none; padding: 0; margin: 14px 0; }
+.device-network-artifact-files li { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; overflow-wrap: anywhere; }
+.device-network-artifact-files span { color: var(--muted); font-size: 12px; }
 @media (max-width: 760px) { .device-network-fields { grid-template-columns: minmax(0, 1fr); } .hub-tabs { padding: 12px 18px; } }

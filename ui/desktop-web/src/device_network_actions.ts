@@ -16,9 +16,10 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     if (!current()) return;
     const accepted = acceptDeviceNetworkProjection(local, projection, { savedReceiver: pending === "receiver" && args.enabled === true, reviewLatest: pending === "refresh" });
     if (!accepted) return;
-    if (pending === "join" && projection.enrollment === "active") {
-      const code = document.querySelector<HTMLInputElement>("#device-network-code"); if (code) code.value = "";
-      local.joinConfirmed = false; local.notice = "Hubに参加しました。公開対象と権限を確認すると、この端末でも受付を開始できます。";
+    if ((pending === "import" || pending === "join") && projection.enrollment === "pending") {
+      local.notice = "参加申請を送信しました。Hub管理者の承認を待っています。承認後は自動で接続します。";
+    } else if ((pending === "import" || pending === "join") && projection.enrollment === "active") {
+      local.notice = "Hubに接続しました。「モデル割当」を確認してください。この端末の受付は、公開対象と権限を確認してから開始します。";
     } else if (pending === "receiver") local.notice = projection.receiver.enabled ? "受付設定を保存しました。稼働状態を確認してください。" : "受付をOFFにしました。実行中タスクの停止完了は経路の状態を確認してください。";
     else if (pending === "select") local.notice = "利用先の選択を保存しました。次の依頼から適用されます。";
     else if (pending === "leave") {
@@ -50,9 +51,7 @@ export async function importDeviceNetwork(context: ActionContext): Promise<void>
 export async function joinDeviceNetwork(context: ActionContext): Promise<void> {
   const local = context.uiState.deviceNetwork;
   if (!deviceCanJoin(local) || !local.projection) return;
-  const code = document.querySelector<HTMLInputElement>("#device-network-code")?.value ?? "";
-  if (!code.trim()) { local.error = "Hub管理者から受け取った参加コードを入力してください。"; context.rerender(); return; }
-  await request(context, "join", "device_network_join", { code, confirmed: true, ...deviceNetworkTarget(local.projection) });
+  await request(context, "join", "device_network_request_join", { ...deviceNetworkTarget(local.projection) });
 }
 export async function setDeviceReceiver(context: ActionContext, enabled: boolean): Promise<void> {
   const local = context.uiState.deviceNetwork;
@@ -63,6 +62,8 @@ export async function setDeviceReceiver(context: ActionContext, enabled: boolean
     modelMode: enabled ? local.modelMode : receiver.model_mode, confirmed: enabled && deviceReceiverConfirmed(local),
     startOnLaunch: enabled ? local.startOnLaunch : receiver.start_on_launch,
     keepWhenHidden: enabled ? local.keepWhenHidden : receiver.keep_when_hidden,
+    bindIp: enabled ? local.bindIp.trim() || null : receiver.bind_ip,
+    port: enabled ? local.port.trim() ? Number(local.port.trim()) : null : receiver.port,
     ...(enabled ? local.draftTarget! : deviceNetworkTarget(local.projection)),
   });
 }
@@ -86,6 +87,10 @@ export async function refreshDeviceNetworkJobs(context: ActionContext): Promise<
     const jobs = await command<DeviceNetworkJobs>("device_network_jobs");
     if (serial !== local.jobsSerial || context.getViewState()?.overlay !== "hub") return;
     local.jobs = jobs; local.jobsError = "";
+    const references = new Set(jobs.outgoing.map(row => row.reference_id));
+    for (const entries of [local.artifacts, local.artifactErrors, local.artifactNotices]) {
+      for (const reference of Object.keys(entries)) if (!references.has(reference)) delete entries[reference];
+    }
   } catch {
     if (serial !== local.jobsSerial || context.getViewState()?.overlay !== "hub") return;
     local.jobsError = "経路と停止状況を取得できません。表示は最後に確認した状態です。";

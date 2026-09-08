@@ -1,14 +1,16 @@
 # Desktop MCP 配信
 
-この文書は手動のnamed profileと互換接続のownerを記述する。Hubが端末登録・TLS・有向許可を管理する新しい受付/委任の手順は [Hub端末連携](hub-device-network.md) と [利用ガイド](../hub-device-network-guide.md) を参照する。managed受付は同じRemoteJobServiceを使うが、手動token・待受設定とは別のDeviceNetworkServiceが所有する。以下のDirect限定・outbound MCP無効は手動agent profileの境界であり、managed経路のHubモデル割当と認可された再委任を禁止するものではない。新経路の試験は進行中。
+この文書は手動のnamed profileと互換接続のownerを記述する。Hubが端末登録・TLS・有向許可を管理する受付/委任の手順は [Hub端末連携](hub-device-network.md) と [利用ガイド](../hub-device-network-guide.md) を参照する。managed受付は同じRemoteJobServiceを使うが、手動token・待受設定とは別のDeviceNetworkServiceが所有する。以下のDirect限定・outbound MCP無効は手動agent profileの境界であり、managed経路のHubモデル割当と認可された再委任を禁止するものではない。共通runtimeへ追加した対話承認・版付き成果物等の統合・実画面検証は進行中。
 
 2026-09-06。`REC-DESKTOP-MCP-PUBLISH-01` の開発実装。Desktop の「MCPを配信」は、読み取りツールの公開と、この端末のエージェントによるタスク受付を明示的に選ぶ。配信profileは、呼び出し側の接続先 HTTP MCP client 設定と独立している。従来の認証付きloopback・read 6種はWindows実GUIとHTTPで確認済み。schema 3、agent mode、TLS、接続先端末の登録、受入ジョブの実行を今回追加し、同一PCの分離された2役でtempへの実委任・結果返却・個別停止を確認した。物理Windows 2台での受入、公開済みrelease、全受入完了を意味しない。
 
 自然言語の作業をWinB/Cのエージェントへ委任する②は、固定read toolの公開とは別の採用要件である。複数端末を使うWinA司令塔の設計と後続範囲は [複数端末へのエージェント委任](remote-agent-delegation.md) を参照する。読み取りモードのtempは `current_time` のみ、agent modeのtempは受入側に専用の一時作業フォルダを作るため、両者の権限を混同しない。
 
-## 読み取り配信の使い方
+## 保存済みの手動配信を管理する
 
-1. サイドバーまたは表示メニューの **MCPを配信** を開く。公開するプロジェクトは、Desktopでフォルダを開いて登録しておく。チャットの作成・送信は不要。
+2026-09-08以降、標準入口は **MCP履歴** に置き換える。新規の端末受付は **moyAI Hub → 端末連携** から設定する。保存済みの手動配信プロファイルがある場合だけ **MCP履歴 → 旧配信設定の管理** を表示し、既存の設定・停止・資格管理を維持する。以下はその互換画面の手順であり、新しいHub連携の初期設定手順ではない。指示／実行記録とMarkdown保存は [MCP履歴](../mcp-history-guide.md) を参照する。
+
+1. 保存済みprofileがある場合、**MCP履歴 → 旧配信設定の管理** を開く。公開するプロジェクトは、Desktopでフォルダを開いて登録しておく。チャットの作成・送信は不要。
 2. **プロファイルを追加** し、公開モードの **読み取りツールを公開**、表示名、公開するプロジェクト、待受アドレスとポート、公開ツール、同時実行上限、ウィンドウを閉じたときの動作を選ぶ。既定の同一PC向け設定はTLSなしのloopback。フォルダを必要としない問い合わせには **temp** を選ぶ。読み取りモードのtempはフォルダを公開せず、`current_time` のみ選択できる。プロジェクトは自動選択しない。追加操作では編集領域の先頭へ戻り、表示名と公開先の入力欄を表示する。
 3. **設定を保存** する。保存だけでは配信は始まらない。新規の既定は `127.0.0.1:7332`、同時実行 1、公開ツールなし、ウィンドウを閉じたとき停止。開始には公開ツールを1つ以上選ぶ。
 4. **トークンを発行・再発行** する。平文はこの操作の結果として一度だけ渡される。同じ画面でコピーし、必要な接続側アプリへ渡す。再発行すると以前のトークンは失効する。
@@ -44,9 +46,11 @@ profile JSONはschema 3。schema 1・2を読み込み互換とし、旧profile�
 
 ## エージェント受付の中間実装
 
-受入側WinBで **エージェントとしてタスクを受付** を選び、projectまたはtempと実行権限を保存する。read tool選択とは別で、公開する高水準MCPは `delegate_task`、`task_status`、`cancel_task` の3種。呼び出し側が個々のshellや編集ツールを直接指定する公開APIではない。profileの開始時に受入側のグローバルMain Direct設定をcaptureし、そのモデル・providerで通常のagent loopを実行する。モデルの接続先と作業を実行する端末は別であり、呼び出し側のprovider設定・権限・会話を引き継がない。
+受入側WinBで **エージェントとしてタスクを受付** を選び、projectまたはtempと実行権限を保存する。read tool選択とは別で、公開する高水準MCPは `delegate_task`、`task_status`、`cancel_task` と、終端jobの成果物版を読む `task_artifacts`。呼び出し側が個々のshellや編集ツールを直接指定する公開APIではない。手動profileの開始時に受入側のグローバルMain Direct設定をcaptureし、そのモデル・providerで通常のagent loopを実行する。モデルの接続先と作業を実行する端末は別であり、呼び出し側のprovider設定・権限・会話を引き継がない。
 
-projectは受入側で登録したフォルダとidentityを照合し、tempは受付の開始時に専用一時フォルダを作る。ジョブごとに受入側の新しいroot sessionとcanonical historyを使用する。追加のread/write rootsは空にし、設定・DB・保存された全profileの秘密鍵をprotected pathsへ含める。受入側profileの `default` / `auto_review` / `full_access` を既存permission ownerへ渡すが、追加のhuman承認が必要な操作は拒否する。対話承認画面は未実装。remote subagentsと受入ジョブからのoutbound MCPは無効で、再委任しない。
+projectは受入側で登録したフォルダとidentityを照合し、tempは受付の開始時に専用一時フォルダを作る。ジョブごとに受入側の新しいroot sessionとcanonical historyを使用する。追加のread/write rootsは空にし、設定・DB・保存された全profileの秘密鍵をprotected pathsへ含める。受入側profileの `default` / `auto_review` / `full_access` を既存permission ownerへ渡す。人間の承認が必要な場合は受入Desktopで待機し、呼び出し側へ `awaiting_approval` を返す。承認画面はjob/profile/confirmationを照合し、**この操作を許可**、**許可しない**、**タスクを停止**を区別する。遠隔タスクの承認はEscapeや背景クリックでは決定しない。手動profileではremote subagentsと受入ジョブからのoutbound MCPを無効にし、再委任しない。
+
+`delegate_task.inputs` は版とSHA-256を明示したUTF-8の参照用入力で、受入workspaceと別の読み取り専用コピーとして扱う。`task_artifacts` は終端jobのcanonical FileChangeを版に固定して返す。双方とも最大8件・各64 KiB・合計256 KiBで、一般のシェル生成ファイルやフォルダ全体を暗黙同期しない。Hub管理の委任欄には成果物の確認と書き出しを用意し、Windowsでは選択した場所の新規フォルダへ確認済み版を保存する。既存Projectへの自動適用・削除・上書きは行わず、非Windowsの書き出しは未対応として拒否する。
 
 WinAは設定画面の **moyAI端末へタスクを委任** で接続名・URL・token・必要な公開証明書を登録し、**接続を確認** で実際のMCP一覧を取得する。接続を保存しただけで受入側は起動しない。保存内容は既存のMCP client設定へ追加し、`delegate_task` / `cancel_task` をMutation、`task_status` をReadとして明示する。既存の別MCP設定は保持し、複数の接続名を登録できる。呼び出し側ではtokenを認証headerとして設定ファイルに保存し、通常の画面へ再表示しない。受入側のhashのみ保存する規則とは別である。
 
@@ -76,7 +80,7 @@ TLSなしはloopbackだけでlistenする。別端末に公開する場合は、
 - `credentials.rs` / `tls.rs` / `transport.rs`: verifier、証明書、認証、version / session、HTTP / HTTPS listen、取消、bounded observation。
 - `dispatch.rs`: project / legacy targetのfilesystem identity、tempのフォルダ非公開、registry bridge。`src/tool/read_context.rs` と既存read toolは通常のチャット実行と配信向けの読み取り本体を共有し、配信側には会話・承認・編集baseline・内部出力ファイルの権限を渡さない。
 - `service.rs` と `src/desktop/tauri_app.rs`: profile CRUD、開始時config capture、mode変更とtoken失効、window lifecycle、typed projection。
-- `src/remote_agent/runtime.rs` / `store.rs`、`migrations/V62__remote_agent_jobs.sql`: 受入scope、永続要求キー、jobとsessionの対応、通常RunServiceでの実行・状態・個別停止。`src/app/run_service.rs` がremote admissionとcanonical turnの接続を所有する。
+- `src/remote_agent/runtime.rs` / `store.rs`、`migrations/V62__remote_agent_jobs.sql`: 受入scope、永続要求キー、jobとsessionの対応、通常RunServiceでの実行・状態・個別停止。`approval.rs` はjobに束縛した承認、`artifacts.rs` とV65 migrationは版付き入力・終端の成果物を所有する。`src/app/run_service.rs` がremote admissionとcanonical turnの接続を所有する。
 - `src/app/bootstrap.rs`: remote tempの専用project用途を作成時に保持し、通常のチャット用projectと区別する。
 - `src/desktop/mcp_peers.rs`、`src/config/model.rs`、`src/mcp/mod.rs`: WinAの接続先編集・検証、明示effect route、peer単位の証明書信頼とMCP呼び出し。
 - `src/tool/mcp_call.rs`、`assets/prompts/mcp_clients.md`: WinAの端末候補と入力schema、実行中のcanonical task/turn参照の付与。`src/agent/mod.rs` はcapture済みturn設定と実際のMCP clientを揃える。
@@ -87,4 +91,4 @@ TLSなしはloopbackだけでlistenする。別端末に公開する場合は、
 
 プロジェクト/temp対応では、チャットなしのプロジェクト選択・保存・ファイル読み取り、tempの保存・時刻取得とファイル拒否、背景クリック無視、閉じ直した下書きの保持、固定フッター、再起動後の対象・ツール復元と自動開始なしをWindows実Tauriで確認した。実操作で見つかった新規追加時のスクロール位置も修正し、最終ビルドで入力欄の先頭への移動と保存を再確認した。今回の実施ケースと合否は `project_sandbox/lynx-mcp-project-temp-20260906/RESULTS.md` を参照する。
 
-今回のschema 3 / agent / TLS / peer追加は、同一PCで委任側・受入側のcanonical sessionを分け、実GUIの登録・TLS接続と、実oMLXによるtempのCPU/端末名調査・結果返却・進捗表示・実shellの個別停止を確認した。上記read配信の既存PASSをエージェント受付の合否へ流用せず、実施範囲は `project_sandbox/lynx-remote-agent-intermediate-20260906/RESULTS.md` に記録する。物理Windows 2台のWinA→WinB受入は未実施で、複数端末N台への運用受入、親タスクからの一括cancel、対話承認、Hub経由worker model routing、成果物転送、per-client pairing / revoke、OS service、自動起動は後続。readモードへwrite / shellを追加したものではなく、全MCP clientとの互換性も未保証。
+schema 3 / agent / TLS / peer追加は、同一PCで委任側・受入側のcanonical sessionを分け、実GUIの登録・TLS接続と、実oMLXによるtempのCPU/端末名調査・結果返却・進捗表示・実shellの個別停止を確認した。上記read配信の既存PASSをエージェント受付の合否へ流用せず、実施範囲は `project_sandbox/lynx-remote-agent-intermediate-20260906/RESULTS.md` に記録する。追加した対話承認と成果物のWindows書き出しは統合・実画面検証中。物理Windows 2台・N台の運用受入、手動profileのper-client pairing / revoke・親一括cancel・Hubモデル利用、OS serviceは後続である。Hub管理経路で実装した端末認証・モデル割当・親停止・明示的な受付再開設定は [Hub端末連携](hub-device-network.md) に集約する。readモードへwrite / shellを追加したものではなく、全MCP clientとの互換性も未保証。

@@ -2,7 +2,7 @@
 
 2026-09-07。REC-HUB-CONTROL-PLANE-01、REC-HUB-CATALOG-REVISION-01、REC-DESKTOP-HUB-ROUTING-01、REC-DESKTOP-MCP-PUBLISH-01 の開発設計。
 
-追加中のHub管理端末連携は [端末連携設計](design/hub-device-network.md) と [操作手順](hub-device-network-guide.md) を正とする。永続端末ID・共通CA・端末固有鍵・相互TLS・方向付き利用許可・制約付き再委任を追加し、下記の共有tokenを使うloopback接続は手動互換経路として維持する。新規実装の結合・実GUI試験は進行中で、以下の旧incrementの合格記録を新経路の合格証拠に流用しない。
+Hub管理端末連携は [端末連携設計](design/hub-device-network.md) と [操作手順](hub-device-network-guide.md) を正とする。標準の初期設定は共通configの読込から自動参加申請し、Hubの接続端末一覧で管理者が許可すると自動接続する。名前・参加コードの入力は不要とする。永続端末ID・共通CA・端末固有鍵・相互TLS・方向付き利用許可・制約付き再委任を扱い、下記の共有tokenを使うloopback接続は手動互換経路として維持する。新しい初期設定・許可・停止・再許可とHub経由の実モデル応答は同一Windowsの実画面で確認した。未確認の追加操作と物理複数Windowsの受入は端末連携設計の実装状況で区別し、以下の旧incrementの合格記録を新経路の合格証拠に流用しない。
 
 **状態: 同一PCのHub / Desktop推論連携とDesktop MCPのread配信を実装・確認し、MCPには明示的なagent mode・Project/temp実行・TLS・接続先登録を追加した。委任の同一PC実GUI確認はUC-06に記載し、最終表示修正も実GUIで確認済み。物理Windows 2台の受入は未実施。全4項目は引き続きPartialであり、完成仕様・出荷済み機能を意味しない。** この文書はユースケース、責任分界、実装順と受入条件を定める。厳密な型・保存形式は各repositoryのsourceとpassing testsを正とし、実操作の合否はtask-local evidenceで区別する。
 
@@ -35,7 +35,7 @@ Hub経由の依頼の整形と並列サブエージェント実行は未対応�
 | REC-HUB-CONTROL-PLANE-01 | Partial: 管理GUI、登録・状態確認、端末presence、割当core、同一PC gateway | 多端末・LAN運用、停止不確定時の運用設計、GPU memory制約、公平queue |
 | REC-HUB-CATALOG-REVISION-01 | Partial: 永続revision、公開catalog、Main / Side別reviewとrequest gate | 詳細差分UI、複数端末と更新時の実運用matrix |
 | REC-DESKTOP-HUB-ROUTING-01 | Partial: 接続・確認・送信先選択、ephemeral request target、Main / Side連携 | Hubだけでの新規Side会話設定、非Chat Completions経路、並列子agent、多端末回帰 |
-| REC-DESKTOP-MCP-PUBLISH-01 | Partial: schema 3、named profile GUI、read / agent mode、Project/temp、token verifier、TLS・session型Streamable HTTP、停止・失効・背景lifecycle。同一PCのGUI/実推論・個別停止と最終表示修正を確認済み | 物理2WindowsのLAN受入、per-client pairing、read modeへのwrite公開、remote対話承認、未確認client・操作の受入 |
+| REC-DESKTOP-MCP-PUBLISH-01 | Partial: schema 3、named profile GUI、read / agent mode、Project/temp、token verifier、TLS・session型Streamable HTTP、停止・失効・背景lifecycle。同一PCのGUI/実推論・個別停止を確認済み。対話承認・版付き成果物を追加し、新操作の統合・実画面検証中 | 物理2WindowsのLAN受入、手動profileのper-client pairing、read modeへのwrite公開、未確認client・操作の受入 |
 
 旧手動経路はloopback・明示開始・終了時停止を維持する。新しい端末連携はIPv4のTLS待受を明示開始する。HubのOS service登録、自動起動、tray常駐は未対応で、物理別PCからの接続試験も未実施。
 
@@ -104,7 +104,9 @@ Hub経由では、実行中generationを元のrequest ownerで終了させ、**�
 
 既存の接続先MCP client設定とは別の **MCPを配信** 画面でnamed profileを作り、公開モードとProject/tempを明示する。**設定を保存**、**トークンを発行・再発行**、**配信を開始**は別操作で、暗黙にlistenしない。既定はTLSなしのloopback。別端末に公開する設定では具体的なIPとTLSを使い、接続側へ公開証明書とtokenを渡す。受入側はprofile単位のhash verifierだけを保存し、平文tokenは発行直後だけ表示する。
 
-読み取りモードは既存のread 6種と権限境界を維持し、tempでは時刻だけを公開する。agent modeは受入側のProjectまたは専用tempで通常のRunServiceを実行し、開始時のグローバルMain Direct設定と受入側が選んだ権限を使う。受入側subagents・outbound MCP、追加のhuman承認、親タスクからの遠隔一括停止は未対応。モード・権限を変更して保存すると旧tokenを失効させ、既存のread credentialを自動昇格させない。
+読み取りモードは既存のread 6種と権限境界を維持し、tempでは時刻だけを公開する。手動agent profileは受入側のProjectまたは専用tempで通常のRunServiceを実行し、開始時のグローバルMain Direct設定と受入側が選んだ権限を使う。手動経路の受入側subagents・outbound MCP・親タスクからの遠隔一括停止は未対応。対話承認は共通の受入job ownerに実装し、受入Desktopで操作許可・操作拒否・タスク停止を選び、依頼元へ承認待ちを返す。モード・権限を変更して保存すると旧tokenを失効させ、既存のread credentialを自動昇格させない。
+
+Hub管理の受付/委任では、モデル割当、認可された再委任と親停止を別のDeviceNetworkServiceが所有する。終端jobの成果物版は委任欄で確認し、Windowsでは選択した場所の新規フォルダへ書き出せる。元のProjectへは自動適用せず、非Windowsの書き出しは未対応として拒否する。入力・成果物の上限と公開範囲は [Hub端末連携](design/hub-device-network.md) に集約する。追加した対話承認・診断・成果物書き出し等の統合・実画面検証は進行中であり、以前のGUI合格を新操作へ流用しない。
 
 既定はwindow close/hide時停止、明示したprofileだけがトレイ格納中も継続し、再起動後は手動開始する。厳密なtarget・認証・protocol・停止の契約と操作手順は [Desktop MCP配信](design/mcp-publish-foundation.md)、委任元の接続設定と段階別受入は [複数端末への委任](design/remote-agent-delegation.md) に集約する。
 

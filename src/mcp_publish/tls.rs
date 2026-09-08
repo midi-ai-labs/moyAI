@@ -215,6 +215,14 @@ pub(crate) fn managed_hub_http(
     identity: Option<(&str, &str)>,
     ca_certificate_pem: &str,
 ) -> io::Result<reqwest::Client> {
+    managed_hub_http_from(identity, ca_certificate_pem, None)
+}
+
+pub(crate) fn managed_hub_http_from(
+    identity: Option<(&str, &str)>,
+    ca_certificate_pem: &str,
+    local_ip: Option<std::net::Ipv4Addr>,
+) -> io::Result<reqwest::Client> {
     // Control calls and inference keep their existing per-operation deadlines;
     // a client-wide timeout must not truncate an otherwise healthy model stream.
     let mut roots = rustls::RootCertStore::empty();
@@ -249,6 +257,7 @@ pub(crate) fn managed_hub_http(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(4))
+        .local_address(local_ip.map(std::net::IpAddr::V4))
         .use_preconfigured_tls(config)
         .build()
         .map_err(|_| io::Error::other("managed Hub client could not be created"))

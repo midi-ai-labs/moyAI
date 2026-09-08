@@ -30,6 +30,7 @@ export interface HubProjection {
   hub_id: string | null;
   catalog: HubCatalog | null;
   main_review: HubReview | null;
+  recommended_main_selection?: HubSelection | null;
   side_chat_review: HubReview | null;
   main_confirmation: "unconfirmed" | "confirmed" | "review_required";
   side_chat_confirmation: "unconfirmed" | "confirmed" | "review_required";
@@ -314,6 +315,17 @@ export function hubDraftTargetIsCurrent(state: HubPresentation, context: HubCont
     && target.expectedConnectionGeneration === current.expectedConnectionGeneration
     && target.expectedHubId === current.expectedHubId
     && target.expectedCatalogRevision === current.expectedCatalogRevision);
+}
+export function hubCanUseRecommendation(state: HubPresentation): boolean {
+  return !state.pending && state.projection?.status === "connected" && !state.projection.active_main
+    && Boolean(state.projection.recommended_main_selection && hubReviewTarget(state.projection));
+}
+export function useHubRecommendation(state: HubUiState): void {
+  if (!hubCanUseRecommendation(state) || !state.projection?.recommended_main_selection) return;
+  const selection = structuredClone(state.projection.recommended_main_selection);
+  state.drafts.main = { selection, affinityText: String(selection.affinity_turns), capabilitiesText: selection.required_capabilities.join(", "),
+    dirty: true, target: hubReviewTarget(state.projection) };
+  state.error = ""; state.errorContext = null;
 }
 export function editHubField(state: HubUiState, field: string, value: string, checked: boolean): void {
   if (state.pending) return;

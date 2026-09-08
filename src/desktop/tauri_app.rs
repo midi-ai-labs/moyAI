@@ -44,6 +44,9 @@ use super::web_model::{
 
 type SharedController = Arc<Mutex<DesktopController>>;
 
+#[derive(Default)]
+struct McpHistoryExportGate(Mutex<()>);
+
 // Keep the wire-visible Desktop command registry in one place. The handler
 // and its contract tests consume this same identifier list, so a renamed or
 // unannotated command fails at compile time instead of becoming a runtime-only
@@ -110,6 +113,11 @@ macro_rules! desktop_command_manifest {
             hub_disconnect,
             hub_set_route_mode,
             show_mcp_publish_editor,
+            show_mcp_history,
+            mcp_history_list,
+            mcp_history_detail,
+            mcp_history_export,
+            mcp_history_stop,
             mcp_publish_projection,
             mcp_publish_save,
             mcp_publish_delete,
@@ -125,11 +133,15 @@ macro_rules! desktop_command_manifest {
             device_network_import,
             device_network_initial_setup_import,
             device_network_join,
+            device_network_request_join,
             device_network_receiver,
             device_network_select,
             device_network_refresh,
             device_network_leave,
             device_network_jobs,
+            device_network_diagnose,
+            device_network_artifacts,
+            device_network_export_artifacts,
             device_network_cancel,
             mcp_peer_projection,
             mcp_peer_add,
@@ -412,6 +424,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .manage(hub_connection)
         .manage(mcp_publish)
         .manage(remote_jobs)
+        .manage(McpHistoryExportGate::default())
         .manage(device_network)
         .setup(|app| {
             install_tray(app.handle())?;
@@ -3282,6 +3295,140 @@ async fn mcp_publish_projection(
 }
 
 #[tauri::command]
+async fn show_mcp_history(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "MCP history")?;
+        if !controller.state.show_mcp_history() {
+            return Err(rejected_action(
+                controller,
+                "MCP history could not be opened",
+            ));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn mcp_history_list(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    offset: usize,
+    anchor: Option<String>,
+) -> Result<crate::remote_agent::McpHistoryPage, String> {
+    jobs.history_page(direction, offset, 20, anchor.as_deref())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_history_detail(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    id: String,
+) -> Result<crate::remote_agent::McpHistoryDetail, String> {
+    jobs.history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_history_export(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    gate: State<'_, McpHistoryExportGate>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let _pending = gate
+        .0
+        .try_lock()
+        .map_err(|_| "MCP履歴の保存先を選択中です。".to_string())?;
+    // Capture this exact task before opening the native dialog. A selection or
+    // runtime update cannot replace the document being saved while it is open.
+    let detail = jobs
+        .history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let direction_name = match direction {
+        crate::remote_agent::McpHistoryDirection::Instruction => "instruction",
+        crate::remote_agent::McpHistoryDirection::Execution => "execution",
+    };
+    let file_name = format!("mcp-{direction_name}-{}.md", detail.row.id);
+    let selected = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("MCP履歴をMarkdownで保存")
+            .add_filter("Markdown", &["md"])
+            .set_file_name(file_name)
+            .save_file()
+    })
+    .await
+    .map_err(|_| "保存先を選択できません。".to_string())?;
+    let Some(selected) = selected else {
+        return Ok(serde_json::json!({"path":null}));
+    };
+    let destination = camino::Utf8PathBuf::from_path_buf(selected)
+        .map_err(|_| "保存先のパスをUTF-8で読み取れません。".to_string())?;
+    // Do not change the filename after the native overwrite confirmation.
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        return Err("保存先には拡張子 .md のファイル名を指定してください。".into());
+    }
+    let receipt = serde_json::json!({"path":destination});
+    tokio::task::spawn_blocking(move || {
+        super::app::write_markdown_export_atomic(&destination, &detail.markdown)
+    })
+    .await
+    .map_err(|_| "MCP履歴を保存できません。".to_string())??;
+    Ok(receipt)
+}
+
+#[tauri::command]
+async fn mcp_history_stop(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    service: State<'_, DeviceNetworkService>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    id: String,
+) -> Result<crate::remote_agent::McpHistoryDetail, String> {
+    let detail = jobs
+        .history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !detail.row.can_stop {
+        return Err("この履歴のタスクは現在停止できません。".into());
+    }
+    match direction {
+        crate::remote_agent::McpHistoryDirection::Instruction => {
+            service
+                .cancel(&id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        crate::remote_agent::McpHistoryDirection::Execution => {
+            let profile = detail
+                .row
+                .profile_id
+                .parse::<ulid::Ulid>()
+                .map_err(|_| "実行履歴の公開対象を確認できません。".to_string())?;
+            let job = detail
+                .row
+                .id
+                .parse::<ulid::Ulid>()
+                .map_err(|_| "実行履歴のタスクを確認できません。".to_string())?;
+            jobs.cancel_job(PublishProfileId(profile), job)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    jobs.history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn mcp_publish_save(
     service: State<'_, PublishService>,
     profile_id: Option<PublishProfileId>,
@@ -3439,6 +3586,95 @@ async fn device_network_join(
 }
 
 #[tauri::command]
+async fn device_network_request_join(
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .request_join(&expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_diagnose(
+    service: State<'_, DeviceNetworkService>,
+    scope: crate::device_network::DiagnosticScope,
+    device_id: Option<String>,
+    profile_id: Option<String>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<crate::device_network::DeviceDiagnostic, String> {
+    service
+        .diagnose(
+            scope,
+            device_id,
+            profile_id,
+            &expected_revision,
+            &expected_generation,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_artifacts(
+    service: State<'_, DeviceNetworkService>,
+    reference_id: String,
+    version: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let manifest = service
+        .artifacts(&reference_id, version.as_deref())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"reference_id":reference_id,"manifest":manifest}))
+}
+
+#[tauri::command]
+async fn device_network_export_artifacts(
+    service: State<'_, DeviceNetworkService>,
+    reference_id: String,
+    version: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let manifest = service
+        .cached_artifact_manifest(&reference_id, &version)
+        .map_err(|error| error.to_string())?;
+    let selected = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("成果物を書き出す親フォルダを選択")
+            .pick_folder()
+    })
+    .await
+    .map_err(|_| "保存先を選択できません。".to_string())?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let parent = camino::Utf8PathBuf::from_path_buf(selected)
+        .map_err(|_| "保存先のパスをUTF-8で読み取れません。".to_string())?;
+    let current = service
+        .cached_artifact_manifest(&reference_id, &version)
+        .map_err(|error| error.to_string())?;
+    if current != manifest {
+        return Err("artifacts_unavailable".into());
+    }
+    let directory = parent.join(format!(
+        "moyai-{}-{}",
+        manifest.job_id,
+        &manifest.version[..12]
+    ));
+    let destination = directory.clone();
+    let service = service.inner().clone();
+    let receipt = serde_json::json!({"reference_id":reference_id,"job_id":manifest.job_id,"version":version,"directory":directory});
+    tokio::task::spawn_blocking(move || {
+        service.export_artifacts(&reference_id, &version, &destination)
+    })
+    .await
+    .map_err(|_| "成果物の書き出しを完了できません。".to_string())??;
+    Ok(Some(receipt))
+}
+
+#[tauri::command]
 async fn device_network_receiver(
     controller: State<'_, SharedController>,
     service: State<'_, DeviceNetworkService>,
@@ -3449,13 +3685,15 @@ async fn device_network_receiver(
     confirmed: bool,
     start_on_launch: bool,
     keep_when_hidden: bool,
+    bind_ip: Option<std::net::Ipv4Addr>,
+    port: Option<u16>,
     expected_revision: String,
     expected_generation: String,
 ) -> Result<DeviceNetworkProjection, String> {
     let config = controller.lock().await.state.global_config().clone();
     service.update_runtime_config(config);
     service
-        .receiver(
+        .receiver_with_bind(
             enabled,
             target,
             access_mode,
@@ -3463,6 +3701,7 @@ async fn device_network_receiver(
             confirmed,
             start_on_launch,
             keep_when_hidden,
+            crate::device_network::ReceiverBindSettings { bind_ip, port },
             &expected_revision,
             &expected_generation,
         )
@@ -3598,7 +3837,11 @@ async fn device_network_import(
     }
     let result = result.map_err(|error| error.to_string())?;
     service.update_runtime_config(controller.state.global_config().clone());
-    Ok(result)
+    drop(controller);
+    service
+        .request_join(&result.revision, &result.generation)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -3608,6 +3851,7 @@ async fn device_network_initial_setup_import(
     expected_setup_target: DesktopInitialSetupMutationTarget,
     expected_config_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let shared_controller = controller.inner().clone();
     let before = {
         let mut controller = controller.lock().await;
         controller.drain_runtime_messages();
@@ -3656,6 +3900,12 @@ async fn device_network_initial_setup_import(
     })?;
     service.update_runtime_config(controller.state.global_config().clone());
     service.enable_default_model_on_join();
+    let target = service.projection_now();
+    drop(controller);
+    let _ = service
+        .request_join(&target.revision, &target.generation)
+        .await;
+    let mut controller = shared_controller.lock().await;
     controller
         .next_web_state()
         .map_err(DesktopCommandError::internal)
@@ -5393,7 +5643,48 @@ async fn answer_permission(
     controller: State<'_, SharedController>,
     decision: ReviewDecision,
     confirmation_id: String,
+    remote_job_id: Option<String>,
+    remote_profile_id: Option<String>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    if remote_job_id.is_some() || remote_profile_id.is_some() {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let target = remote_job_id
+            .as_deref()
+            .and_then(|job| job.parse::<ulid::Ulid>().ok())
+            .zip(
+                remote_profile_id
+                    .as_deref()
+                    .and_then(|profile| profile.parse::<ulid::Ulid>().ok()),
+            )
+            .zip(confirmation_id.parse::<ulid::Ulid>().ok());
+        let resolved = target.is_some_and(|((job, profile), id)| {
+            controller
+                .state
+                .device_network
+                .as_ref()
+                .is_some_and(|network| {
+                    network.remote_jobs().answer_approval(
+                        id,
+                        job,
+                        crate::mcp_publish::PublishProfileId(profile),
+                        decision,
+                    )
+                })
+        });
+        return if resolved {
+            controller
+                .next_web_state()
+                .map_err(DesktopCommandError::internal)
+        } else {
+            Err(command_conflict_error(
+                &mut controller,
+                DesktopCommandConflict::new(
+                    "the receiver permission confirmation is no longer current",
+                ),
+            ))
+        };
+    }
     let confirmation_id = parse_permission_confirmation_id(&confirmation_id)
         .map_err(DesktopCommandError::internal)?;
     let mut controller = controller.lock().await;

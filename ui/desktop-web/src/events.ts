@@ -219,7 +219,7 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         trapDialogFocus(event);
       } else if (event.key === "Escape" && currentState.confirmation_visible) {
         event.preventDefault();
-        if (permissionDecisionForEscape(currentState.confirmation_visible, event.repeat) === "abort") {
+        if (permissionDecisionForEscape(currentState.confirmation_visible, event.repeat, Boolean(currentState.confirmation?.remote)) === "abort") {
           void dispatchAction("abort-permission", context, { index: -1, value: "" });
         }
       } else if (event.key === "Escape" && context.uiState.pendingLocalConfirmation) {

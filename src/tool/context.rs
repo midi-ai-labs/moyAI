@@ -480,7 +480,8 @@ impl<'a> ToolContext<'a> {
 
         let outcome = self
             .prompt
-            .confirm_with_control(&request, &self.run_control)
+            .confirm_with_control_async(&request, &self.run_control)
+            .await
             .map_err(|error| {
                 let message = format!("failed to prompt for permission: {error}");
                 self.run_control.fail(message.clone());

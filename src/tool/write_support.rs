@@ -16,6 +16,95 @@ const PRESERVED_CONFLICT_RESTORE_LABEL: &str = "; restore failed: ";
 const STAGED_CLEANUP_FAILURE_LABEL: &str = "; staged-file cleanup also failed: ";
 const STAGED_IDENTITY_FAILURE_LABEL: &str = "; stable identity verification failed: ";
 
+/// Creates an entirely new export tree through pinned directory handles. Every
+/// entry uses create-new semantics; no existing directory or file is adopted.
+pub(crate) fn create_new_text_tree(
+    guarded: &GuardedPath,
+    files: &[(String, String)],
+) -> Result<(), EditError> {
+    create_new_text_tree_with_observer(guarded, files, || {})
+}
+
+fn create_new_text_tree_with_observer(
+    guarded: &GuardedPath,
+    files: &[(String, String)],
+    after_parent_open: impl FnOnce(),
+) -> Result<(), EditError> {
+    let parent_path = guarded
+        .absolute
+        .parent()
+        .ok_or_else(|| EditError::Message("export path has no parent".into()))?;
+    let name = guarded
+        .absolute
+        .file_name()
+        .ok_or_else(|| EditError::Message("export path has no name".into()))?;
+    let parent = StableWriteParent::open(parent_path, guarded)?;
+    after_parent_open();
+    PathGuard::revalidate(guarded).map_err(|error| EditError::Message(error.to_string()))?;
+    PathGuard::validate_open_parent(guarded, &parent.file)
+        .map_err(|error| EditError::Message(error.to_string()))?;
+    let root = create_relative_directory(&parent, name)?;
+    let result = (|| {
+        let mut directories = std::collections::BTreeMap::new();
+        directories.insert(
+            String::new(),
+            StableWriteParent {
+                path: guarded.absolute.clone(),
+                file: root,
+            },
+        );
+        for (path, text) in files {
+            let components: Vec<_> = path.split('/').collect();
+            if components.iter().any(|part| {
+                part.is_empty() || matches!(*part, "." | "..") || part.contains(['\\', ':', '\0'])
+            }) {
+                return Err(EditError::Message(
+                    "export entries require relative path components".into(),
+                ));
+            }
+            let mut key = String::new();
+            for component in &components[..components.len() - 1] {
+                let next = if key.is_empty() {
+                    component.to_string()
+                } else {
+                    format!("{key}/{component}")
+                };
+                #[cfg(windows)]
+                let next = next.to_lowercase();
+                if !directories.contains_key(&next) {
+                    let parent = &directories[&key];
+                    let directory = create_relative_directory(parent, component)?;
+                    let path = parent.path.join(component);
+                    directories.insert(
+                        next.clone(),
+                        StableWriteParent {
+                            path,
+                            file: directory,
+                        },
+                    );
+                }
+                key = next;
+            }
+            let mut file = create_relative_file(
+                &directories[&key],
+                components.last().expect("one component"),
+            )?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        Ok::<_, EditError>(())
+    })();
+    result.map_err(|error| EditError::PartialCommit {
+        path: guarded.absolute.clone(),
+        preserved_path: guarded.absolute.clone(),
+        reason: bounded_preserved_failure_reason(
+            "new export directory was created; completed files were retained",
+            ": ",
+            &error.to_string(),
+        ),
+    })
+}
+
 #[cfg(unix)]
 const UNIX_FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
 #[cfg(unix)]
@@ -803,6 +892,20 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Result<File> {
+    create_relative_windows_object(parent, name, false)
+}
+
+#[cfg(windows)]
+fn create_relative_directory(parent: &StableWriteParent, name: &str) -> std::io::Result<File> {
+    create_relative_windows_object(parent, name, true)
+}
+
+#[cfg(windows)]
+fn create_relative_windows_object(
+    parent: &StableWriteParent,
+    name: &str,
+    directory: bool,
+) -> std::io::Result<File> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
@@ -812,6 +915,7 @@ fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Resu
     const FILE_CREATE: u32 = 2;
     const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
     const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
     if name.is_empty()
@@ -879,7 +983,13 @@ fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Resu
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ,
             FILE_CREATE,
-            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT
+                | (if directory {
+                    FILE_DIRECTORY_FILE
+                } else {
+                    FILE_NON_DIRECTORY_FILE
+                })
+                | FILE_OPEN_REPARSE_POINT,
             std::ptr::null(),
             0,
         )
@@ -902,6 +1012,16 @@ fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Resu
     }
     // SAFETY: NtCreateFile returned a unique owned handle and ownership transfers once to File.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(not(windows))]
+fn create_relative_directory(_parent: &StableWriteParent, _name: &str) -> std::io::Result<File> {
+    // mkdirat followed by openat cannot prove that the opened inode is the one
+    // just created. Fail closed rather than adopt a raced replacement directory.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "new directory export currently requires Windows stable directory creation",
+    ))
 }
 
 #[cfg(unix)]
@@ -1469,6 +1589,126 @@ mod tests {
         )
         .expect("test workspace");
         PathGuard::require_path(&workspace, path, AccessKind::Edit).expect("guarded target")
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn new_export_tree_unsupported_platform_has_no_filesystem_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("export")).unwrap();
+        let error =
+            super::create_new_text_tree(&guarded_path(&path), &[("a.txt".into(), "data".into())])
+                .unwrap_err();
+        assert!(
+            matches!(error,EditError::Io(error) if error.kind()==std::io::ErrorKind::Unsupported)
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_tree_never_adopts_existing_files_and_reports_partial_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let target = root.join("export");
+        let guarded = guarded_path(&target);
+        super::create_new_text_tree(&guarded, &[("nested/a.txt".into(), "first".into())]).unwrap();
+        assert!(
+            super::create_new_text_tree(&guarded, &[("nested/a.txt".into(), "overwrite".into())])
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("nested/a.txt")).unwrap(),
+            "first"
+        );
+        let partial = root.join("partial");
+        let error = super::create_new_text_tree(
+            &guarded_path(&partial),
+            &[
+                ("a.txt".into(), "one".into()),
+                ("a.txt".into(), "two".into()),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error,EditError::PartialCommit{preserved_path,..} if preserved_path==partial)
+        );
+        assert_eq!(
+            std::fs::read_to_string(partial.join("a.txt")).unwrap(),
+            "one"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_tree_reuses_case_varying_shared_parent_without_changing_file_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("export")).unwrap();
+        super::create_new_text_tree(
+            &guarded_path(&root),
+            &[
+                ("Dir/a.txt".into(), "first".into()),
+                ("dir/B.txt".into(), "second".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("Dir/a.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/B.txt")).unwrap(),
+            "second"
+        );
+        let names = std::fs::read_dir(root.join("Dir"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["a.txt".to_owned(), "B.txt".to_owned()])
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_tree_pins_parent_before_any_content_is_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("selected")).unwrap();
+        let moved = Utf8PathBuf::from_path_buf(temp.path().join("moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let guarded = guarded_path(&root.join("export"));
+        let result = super::create_new_text_tree_with_observer(
+            &guarded,
+            &[("a.txt".into(), "safe".into())],
+            || {
+                let rename = std::fs::rename(&root, &moved);
+                #[cfg(windows)]
+                assert!(
+                    rename.is_err(),
+                    "open parent disallows namespace replacement"
+                );
+                #[cfg(unix)]
+                {
+                    rename.unwrap();
+                    std::os::unix::fs::symlink(&moved, &root).unwrap();
+                }
+            },
+        );
+        #[cfg(windows)]
+        {
+            result.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("export/a.txt")).unwrap(),
+                "safe"
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert!(result.is_err());
+            assert!(!moved.join("export").exists());
+        }
     }
 
     #[test]

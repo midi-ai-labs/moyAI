@@ -102,6 +102,7 @@ pub enum DesktopOverlay {
     ConfigEditor,
     HubConnection,
     McpPublish,
+    McpHistory,
     SessionSettings,
     ProviderEditor,
     WorkspacePicker,
@@ -1701,6 +1702,15 @@ impl DesktopState {
         }
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::McpPublish;
+        true
+    }
+
+    pub fn show_mcp_history(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::McpHistory;
         true
     }
 
@@ -4269,6 +4279,23 @@ mod tests {
     }
 
     #[test]
+    fn mcp_history_navigation_preserves_the_local_chat_and_draft() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let session_id = SessionId::new();
+        state.app_state.current_session_id = Some(session_id);
+        state.composer.draft_prompt = "編集中の指示 😀".into();
+        let generation = state.composer.owner_generation();
+        let run_status = state.app_state.run_status;
+        assert!(state.show_mcp_history());
+        assert_eq!(state.view.overlay, DesktopOverlay::McpHistory);
+        state.hide_overlay();
+        assert_eq!(state.app_state.current_session_id, Some(session_id));
+        assert_eq!(state.composer.draft_prompt, "編集中の指示 😀");
+        assert_eq!(state.composer.owner_generation(), generation);
+        assert_eq!(state.app_state.run_status, run_status);
+    }
+
+    #[test]
     fn command_palette_selection_returns_canonical_text_without_editing_the_draft() {
         let mut initial_snapshot = snapshot(Vec::new(), 0);
         initial_snapshot.command_rows.push(DesktopCommandRow {
@@ -4801,6 +4828,7 @@ mod tests {
         let original_workspace_input = state.workspace_input.clone();
 
         assert!(!state.show_config_editor());
+        assert!(!state.show_mcp_history());
         assert!(!state.show_provider_editor());
         assert!(!state.show_workspace_picker("C:/other"));
         assert!(!state.show_file_menu());

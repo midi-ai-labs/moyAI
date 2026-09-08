@@ -15,6 +15,25 @@ pub struct SelectedPeer {
     pub profile_id: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiverBindSettings {
+    pub bind_ip: Option<std::net::Ipv4Addr>,
+    pub port: Option<u16>,
+}
+impl ReceiverBindSettings {
+    pub(crate) fn validate(&self) -> Result<(), DeviceError> {
+        if self.port == Some(0)
+            || self
+                .bind_ip
+                .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
+        {
+            return Err(DeviceError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiverSettings {
@@ -28,6 +47,18 @@ pub struct ReceiverSettings {
     pub start_on_launch: bool,
     #[serde(default)]
     pub keep_when_hidden: bool,
+    #[serde(default)]
+    pub bind_ip: Option<std::net::Ipv4Addr>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+impl ReceiverSettings {
+    pub fn bind(&self) -> ReceiverBindSettings {
+        ReceiverBindSettings {
+            bind_ip: self.bind_ip,
+            port: self.port,
+        }
+    }
 }
 impl Default for ReceiverSettings {
     fn default() -> Self {
@@ -40,6 +71,8 @@ impl Default for ReceiverSettings {
             enabled: false,
             start_on_launch: false,
             keep_when_hidden: false,
+            bind_ip: None,
+            port: None,
         }
     }
 }
@@ -109,6 +142,7 @@ impl DeviceSettings {
                 .is_some_and(|value| canonical_revision(value).is_none())
             || matches!(self.receiver.target, PublishTarget::LegacySession { .. })
             || (self.receiver.enabled && !self.receiver.confirmed)
+            || self.receiver.bind().validate().is_err()
         {
             return Err(DeviceError::SettingsCorrupt);
         }
@@ -207,16 +241,58 @@ mod tests {
         let receiver = prior["receiver"].as_object_mut().unwrap();
         receiver.remove("start_on_launch");
         receiver.remove("keep_when_hidden");
+        receiver.remove("bind_ip");
+        receiver.remove("port");
         std::fs::write(&path, serde_json::to_vec(&prior).unwrap()).unwrap();
         let loaded = store.load().unwrap();
         assert!(!loaded.receiver.start_on_launch);
         assert!(!loaded.receiver.keep_when_hidden);
+        assert_eq!(loaded.receiver.bind(), ReceiverBindSettings::default());
         assert!(!loaded.receiver.confirmed);
         assert!(!loaded.receiver.enabled);
         assert_eq!(loaded.receiver.model_mode, crate::hub::HubRouteMode::Hub);
         assert_eq!(loaded.receiver.target, PublishTarget::Temp {});
         let saved = store.save(&loaded).unwrap();
         assert_eq!(store.load().unwrap().receiver, saved.receiver);
+    }
+
+    #[test]
+    fn receiver_bind_round_trip_preserves_explicit_values_and_rejects_non_listener_addresses() {
+        let (_dir, path, store) = store_fixture();
+        let mut settings = store.load().unwrap();
+        settings.receiver.bind_ip = Some(std::net::Ipv4Addr::LOCALHOST);
+        settings.receiver.port = Some(7333);
+        let saved = store.save(&settings).unwrap();
+        assert_eq!(store.load().unwrap().receiver.bind(), saved.receiver.bind());
+        assert!(!saved.receiver.enabled);
+        let bytes = std::fs::read(&path).unwrap();
+        for bind in [
+            ReceiverBindSettings {
+                bind_ip: Some(std::net::Ipv4Addr::UNSPECIFIED),
+                port: None,
+            },
+            ReceiverBindSettings {
+                bind_ip: Some(std::net::Ipv4Addr::BROADCAST),
+                port: None,
+            },
+            ReceiverBindSettings {
+                bind_ip: Some(std::net::Ipv4Addr::new(224, 0, 0, 1)),
+                port: None,
+            },
+            ReceiverBindSettings {
+                bind_ip: None,
+                port: Some(0),
+            },
+        ] {
+            let mut invalid = saved.clone();
+            invalid.receiver.bind_ip = bind.bind_ip;
+            invalid.receiver.port = bind.port;
+            assert!(matches!(
+                store.save(&invalid),
+                Err(DeviceError::SettingsCorrupt)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

@@ -63,8 +63,40 @@ pub(super) struct ManagedReceiver {
     server: PublishHttpServer,
     dispatcher: Arc<dyn PublishToolDispatcher>,
     scope_id: String,
-    pub ip: Ipv4Addr,
     endpoint: String,
+    certificate_sha256: String,
+}
+
+async fn start_listener(
+    ip: Ipv4Addr,
+    port: Option<u16>,
+    dispatcher: Arc<dyn PublishToolDispatcher>,
+    tls: tokio_rustls::TlsAcceptor,
+    auth: Arc<dyn DeviceRequestAuthenticator>,
+) -> Result<PublishHttpServer, DeviceError> {
+    let result = PublishHttpServer::start_managed(
+        SocketAddr::from((ip, port.unwrap_or(7332))),
+        dispatcher.clone(),
+        4,
+        tls.clone(),
+        auth.clone(),
+    )
+    .await;
+    match result {
+        Ok(server) => Ok(server),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && port.is_none() => {
+            PublishHttpServer::start_managed(SocketAddr::from((ip, 0)), dispatcher, 4, tls, auth)
+                .await
+                .map_err(|_| DeviceError::Unavailable)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(DeviceError::ReceiverPortInUse)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            Err(DeviceError::ReceiverAddressUnavailable)
+        }
+        Err(_) => Err(DeviceError::Unavailable),
+    }
 }
 
 struct ReceiverAuthentication {
@@ -126,6 +158,10 @@ impl DeviceNetworkService {
         result
     }
     async fn start_receiver_inner(&self) -> Result<(), DeviceError> {
+        self.refresh_certificate().await?;
+        if self.receiver_certificate_changed().await {
+            self.restart_receiver_certificate().await?;
+        }
         let client = self.client()?;
         let settings = self.inner.state.lock().unwrap().settings.clone();
         if !settings.receiver.enabled || !settings.receiver.confirmed {
@@ -182,7 +218,7 @@ impl DeviceNetworkService {
     ) -> Result<ManagedReceiver, DeviceError> {
         let client = self.client()?;
         let ip = client.route_ip().await?;
-        let (certificate, identity, ca) = {
+        let (certificate, identity, ca, port, certificate_sha256) = {
             let state = self.inner.state.lock().unwrap();
             (
                 state
@@ -192,8 +228,17 @@ impl DeviceNetworkService {
                     .ok_or(DeviceError::InvalidIdentity)?,
                 state.identity.clone().ok_or(DeviceError::InvalidIdentity)?,
                 state.shared.ca_certificate_pem.clone(),
+                state.settings.receiver.port,
+                state
+                    .settings
+                    .certificate_sha256
+                    .clone()
+                    .ok_or(DeviceError::InvalidIdentity)?,
             )
         };
+        if !super::identity::certificate_covers_ip(&certificate, ip)? {
+            return Err(DeviceError::InvalidIdentity);
+        }
         let tls = crate::mcp_publish::tls::load_mtls_acceptor(
             &certificate,
             identity.private_key_pem(),
@@ -203,37 +248,15 @@ impl DeviceNetworkService {
         let auth = Arc::new(ReceiverAuthentication {
             network: self.downgrade(),
         });
-        let server = match PublishHttpServer::start_managed(
-            SocketAddr::from((ip, 7332)),
-            dispatcher.clone(),
-            4,
-            tls.clone(),
-            auth.clone(),
-        )
-        .await
-        {
-            Ok(server) => server,
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                PublishHttpServer::start_managed(
-                    SocketAddr::from((ip, 0)),
-                    dispatcher.clone(),
-                    4,
-                    tls,
-                    auth,
-                )
-                .await
-                .map_err(|_| DeviceError::Unavailable)?
-            }
-            Err(_) => return Err(DeviceError::Unavailable),
-        };
+        let server = start_listener(ip, port, dispatcher.clone(), tls, auth).await?;
         let endpoint = server.endpoint();
         self.inner.state.lock().unwrap().receiver_endpoint = Some(endpoint.clone());
         Ok(ManagedReceiver {
             server,
             dispatcher,
             scope_id,
-            ip,
             endpoint,
+            certificate_sha256,
         })
     }
 
@@ -245,17 +268,21 @@ impl DeviceNetworkService {
         let Some(receiver) = owner.as_ref() else {
             return Ok(());
         };
-        let (id, target, enabled) = {
+        let (id, target, enabled, certificate) = {
             let state = self.inner.state.lock().unwrap();
             (
                 state.settings.receiver.profile_id,
                 state.settings.receiver.target.clone(),
                 state.receiver_requested
+                    && state.status == "active"
                     && !state.closing
                     && (!state.hidden || state.settings.receiver.keep_when_hidden),
+                state.settings.certificate_sha256.clone(),
             )
         };
-        if !receiver.server.snapshot().accepting {
+        if !receiver.server.snapshot().accepting
+            || certificate.as_deref() != Some(&receiver.certificate_sha256)
+        {
             return Err(DeviceError::Unavailable);
         }
         let name = published_target_name(&self.inner.store, &target).await?;
@@ -271,6 +298,7 @@ impl DeviceNetworkService {
         let mut state = self.inner.state.lock().unwrap();
         // Local OFF/close may win while the Hub acknowledgement is in flight.
         let accepted = enabled
+            && state.status == "active"
             && state.receiver_requested
             && !state.closing
             && (!state.hidden || state.settings.receiver.keep_when_hidden);
@@ -346,6 +374,20 @@ impl DeviceNetworkService {
         self.announce_receiver_with(&self.client()?).await
     }
 
+    pub(super) async fn receiver_certificate_changed(&self) -> bool {
+        let owner = self.inner.receiver.lock().await;
+        owner.as_ref().is_some_and(|receiver| {
+            self.inner
+                .state
+                .lock()
+                .unwrap()
+                .settings
+                .certificate_sha256
+                .as_deref()
+                != Some(receiver.certificate_sha256.as_str())
+        })
+    }
+
     pub(crate) async fn receiver_model_route(
         &self,
         cancel: CancellationToken,
@@ -383,6 +425,92 @@ mod tests {
     use super::*;
     use crate::storage::{SqliteStore, StoragePaths};
     use camino::Utf8PathBuf;
+
+    struct InactiveDispatcher;
+    #[async_trait]
+    impl PublishToolDispatcher for InactiveDispatcher {
+        fn tool_descriptors(&self) -> Vec<serde_json::Value> {
+            vec![]
+        }
+        async fn call(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: CancellationToken,
+        ) -> Result<serde_json::Value, PublishCallError> {
+            Err(PublishCallError::Unavailable)
+        }
+    }
+    struct DenyAuthentication;
+    #[async_trait]
+    impl DeviceRequestAuthenticator for DenyAuthentication {
+        async fn authenticate(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<VerifiedGrant, PublishCallError> {
+            Err(PublishCallError::Unavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_receiver_port_conflicts_never_fall_back_but_auto_ports_can_coexist() {
+        let pair = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let tls = crate::mcp_publish::tls::load_mtls_acceptor(
+            &pair.cert.pem(),
+            &pair.signing_key.serialize_pem(),
+            &pair.cert.pem(),
+        )
+        .unwrap();
+        let dispatcher: Arc<dyn PublishToolDispatcher> = Arc::new(InactiveDispatcher);
+        let auth: Arc<dyn DeviceRequestAuthenticator> = Arc::new(DenyAuthentication);
+        let mut first = start_listener(
+            Ipv4Addr::LOCALHOST,
+            None,
+            dispatcher.clone(),
+            tls.clone(),
+            auth.clone(),
+        )
+        .await
+        .unwrap();
+        let port = reqwest::Url::parse(&first.endpoint())
+            .unwrap()
+            .port()
+            .unwrap();
+        assert!(matches!(
+            start_listener(
+                Ipv4Addr::LOCALHOST,
+                Some(port),
+                dispatcher.clone(),
+                tls.clone(),
+                auth.clone()
+            )
+            .await,
+            Err(DeviceError::ReceiverPortInUse)
+        ));
+        let mut second = start_listener(
+            Ipv4Addr::LOCALHOST,
+            None,
+            dispatcher.clone(),
+            tls.clone(),
+            auth.clone(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first.endpoint(), second.endpoint());
+        assert!(first.snapshot().accepting);
+        assert!(first.stop().await);
+        let mut fixed = start_listener(Ipv4Addr::LOCALHOST, Some(port), dispatcher, tls, auth)
+            .await
+            .unwrap();
+        assert_eq!(
+            reqwest::Url::parse(&fixed.endpoint()).unwrap().port(),
+            Some(port)
+        );
+        assert!(fixed.stop().await);
+        assert!(second.stop().await);
+    }
 
     #[tokio::test]
     async fn published_target_names_follow_the_registered_project_without_exposing_its_path() {

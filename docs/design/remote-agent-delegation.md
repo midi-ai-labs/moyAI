@@ -1,8 +1,8 @@
 # 複数端末へのエージェント委任
 
-2026-09-06。`REC-DESKTOP-REMOTE-ORCHESTRATION-01` の採用要件と設計方針。**WinA→WinBの中間実装と同一PCでの動作確認を実施。物理2端末の中間受入は未実施**。本書の最終要件すべてが実装済みであるとは扱わない。既存の固定読み取り配信は [MCP配信](mcp-publish-foundation.md) と current code / tests を正とする。
+2026-09-07。`REC-DESKTOP-REMOTE-ORCHESTRATION-01` の採用要件と設計方針。**WinA→WinBの中間実装と同一PCでの動作確認を実施。物理2端末の中間受入は未実施**。追加した対話承認・診断・成果物書き出し等の統合・実画面検証は進行中で、本書の最終要件すべてが実装済み・受入済みであるとは扱わない。既存の固定読み取り配信は [MCP配信](mcp-publish-foundation.md) と current code / tests を正とする。
 
-第1〜6節はWinA＋WinB/WinC以降を含む最終要件、第7節は中間実装のcurrent owner、第8節は段階別の受入条件である。中間版は受入側のGlobal Main Direct設定を開始時にcaptureし、Bのローカル子agent・outbound MCP、対話承認、Aの親停止からの遠隔一括停止には対応しない。同一PCで委任側・受入側のcanonical sessionを分け、実GUI・実oMLXでtempへのCPU/端末名調査、結果返却、進捗表示、実shellの個別停止を確認した。物理Windows 2台の受入は未実施である。確認範囲と残条件は `project_sandbox/lynx-remote-agent-intermediate-20260906/RESULTS.md` を参照する。
+第1〜6節はWinA＋WinB/WinC以降を含む最終要件、第7節はcurrent owner、第8節は段階別の受入条件である。手動MCP経路は受入側のGlobal Main Direct設定を開始時にcaptureし、Bのローカル子agent・outbound MCPとAの親停止からの遠隔一括停止には対応しない。追加した [Hub管理経路](hub-device-network.md) はHubの受入モデル割当、認可された再委任、親に属する遠隔作業の停止と確認を所有する。受入側の対話承認は両経路で同じjob ownerを使う。同一PCで確認した実GUI・実oMLXのtempへのCPU/端末名調査、結果返却、進捗表示、実shellの個別停止は `project_sandbox/lynx-remote-agent-intermediate-20260906/RESULTS.md` を参照し、今回追加した操作の受入とは区別する。
 
 ## 1. 採用する利用形態
 
@@ -30,7 +30,7 @@ WinA自身の作業は既存ローカル実行を使い、自分へのMCP配信�
 | 委任の親子対応、遠隔作業への参照、最後に確認した進捗と結果 | WinAの委任記録。遠隔端末の履歴正本をローカル子セッションとして複製しない |
 | モデル登録、モデルの割当・待機・revision管理 | moyAI Hub。エージェントの司令塔とは別の責務 |
 
-当初の委任構成ではWinAがWinB・WinC…への委任を所有する。実行端末内のローカル子エージェントは既存の権限と上限に従う。追加採用した [Hub端末連携](hub-device-network.md) では、Hubが元の依頼元・直前の実行端末・次の宛先・範囲を確認した場合だけWinBからWinCへの再委任を認める。単なる接続許可の推移や、切断時の別端末への自動移送は認めない。第7節の中間実装では再委任が無効であることと、新たな採用要件を区別する。
+当初の委任構成ではWinAがWinB・WinC…への委任を所有する。実行端末内のローカル子エージェントは既存の権限と上限に従う。追加した [Hub端末連携](hub-device-network.md) では、Hubが元の依頼元・直前の実行端末・次の宛先・範囲を確認した場合だけWinBからWinCへの再委任を認める。単なる接続許可の推移や、切断時の別端末への自動移送は認めない。手動MCP経路の再委任無効と、Hub管理経路の制約付き再委任を区別する。物理3台の経路受入は未実施である。
 
 「ユーザーが入力する端末」「作業が実行される端末」「推論モデルをホストする端末」を別々に識別する。Hub接続の有無と端末間委任の有無を独立に設定でき、モデルを共有するだけで他端末への作業権限が生じることはない。
 
@@ -81,13 +81,16 @@ WinAの全体停止では、その親に属する委任先へ停止を要求し�
 
 - `src/config/model.rs` の `McpConfig.servers`、`src/mcp/mod.rs`、`src/desktop/mcp_peers.rs` が複数接続先・一意ID・端末ごとのTLS信頼・資格情報を所有する。Settingsの端末追加・確認・削除から設定する。上限は32接続であり、受入側の作業枠とは別である。
 - `src/mcp_publish/` はschema 3で `read_tools` と `agent` を明示的に分け、TLS待受・公開証明書生成・認証・開始/停止を所有する。旧schemaの移行は読み取り権限を維持する。agent profileは一つの公開Project/tempと受入権限を持ち、profile IDをpaired callerのprincipalとする。同じtokenを複数人に共有して個別認証したとは扱わない。
-- `src/remote_agent/runtime.rs` が `delegate_task` / `task_status` / `cancel_task` を既存RunServiceへ接続する。`store.rs` とV62 migrationが専用canonical root sessionへの参照、要求キー、親参照、admissionしたturnを保存する。HTTP sessionと作業寿命を分離し、再照会だけで再実行しない。受入枠はprofileごとに1作業、process全体16作業とする。
+- `src/remote_agent/runtime.rs` が `delegate_task` / `task_status` / `cancel_task` を既存RunServiceへ接続し、`task_artifacts` で終端jobの版付き成果物を返す。`store.rs` とV62 migrationが専用canonical root sessionへの参照、要求キー、親参照、admissionしたturnを保存する。HTTP sessionと作業寿命を分離し、再照会だけで再実行しない。受入枠はprofileごとに1作業、process全体16作業とする。
 - `src/app/run_service.rs`、`src/app/bootstrap.rs`、`src/session/`、`src/storage/` が受入端末の既存実行・権限・終端の正本である。遠隔作業は通常の人間用チャット探索から除外し、通常turnとして続行したり、受理済みのroot設定を変更したりできない。
-- `src/tool/mcp_call.rs` と `assets/prompts/mcp_clients.md` がWinAのモデルへ登録端末・入力schemaを提示する。`delegate_task` の親task/turnはモデル入力を採用せず実行中のcanonical参照を付与する。WinAは通常のtool call/result履歴で受付と確定結果を保持し、専用の遠隔作業ツリー表示・親全体停止は後続とする。
+- `src/tool/mcp_call.rs` と `assets/prompts/mcp_clients.md` がWinAのモデルへ登録端末・入力schemaを提示する。`delegate_task` の親task/turnはモデル入力を採用せず実行中のcanonical参照を付与する。手動MCP経路は通常のtool call/result履歴と個別停止を使う。Hub管理経路の `src/device_network/outgoing.rs` は保存済み遠隔参照、経路表示、親停止の通知と停止確認を所有する。
 - `src/app/agent_runtime.rs` の子agentは同じ端末・project・storageを前提とする。遠隔session IDをローカル子のIDへ代入せず、WinAは委任参照を持ち、B/Cは実行履歴の正本を持つ。既存のローカル並列作業は維持する。
-- Desktopの受入作業欄は状態・親参照・結果preview・個別停止を表示する。`task_status` はprofileに属する `job_id` または `request_key` の片方で照会する。現段階は状態snapshotと最大64 KiBの結果であり、cursorによるイベント取得や成果物転送は未実装。Hubのmodel control planeへ作業本文や承認ownerを移さない。
+- Desktopの受入作業欄は状態・親参照・結果preview・個別停止を表示する。`task_status` はprofileに属する `job_id` または `request_key` の片方で照会する。状態snapshotと最大64 KiBの結果を返し、cursorによるイベント取得は未実装。`src/remote_agent/approval.rs` は受入job/profile/confirmationに束縛した対話承認と `awaiting_approval` を所有し、既存Desktopの承認画面で操作許可・操作拒否・タスク停止を区別する。Hubのmodel control planeへ作業本文や承認ownerを移さない。
+- `src/remote_agent/artifacts.rs` とV65 migrationは、明示したUTF-8入力と終端jobのcanonical FileChange由来の成果物版を扱う。最大8件・各64 KiB・合計256 KiBで、一般のシェル出力やフォルダ全体は同期しない。Hub管理の委任欄は成果物の一覧と版を確認してから、Windowsのnative pickerで選んだ場所の新規フォルダへ書き出す。元のProjectへの自動適用・削除・既存ファイルの上書きは行わない。非Windowsではこの書き出しを未対応として拒否し、安全な新規フォルダ生成を通常のpath操作で代替しない。
 
-受入一覧の継続監視には残差がある。現在は最近64件の一覧のため、履歴が増えた場合に稼働中の古い作業を必ず残す投影が必要になる。また、結果の開閉欄など一覧内にfocusがある間は既存の操作保護が一覧全体の表示更新を保留する。N台の監視受入までに、操作中の対象を保ちながら他の行を更新することと、稼働中の作業を履歴上限から除外することを確認する。現時点の同時多数作業のGUI合格は主張しない。
+独立した「MCP履歴」は `src/remote_agent/history.rs` が所有する。指示側の保存済みHub管理参照と実行側の全profileの受入jobを、追加記録を混ぜないanchor付きで20件ずつ表示し、各jobに束縛したcanonical履歴の詳細とMarkdown保存を提供する。受入OFF・再起動後も閲覧できる。指示側は最後の観測結果、実行側は自身の実行状態を表示し、実行終了だけでは指示側の結果受信を保証しない。既存の端末連携内にある最近64件の受入欄は概要として残る。N台の稼働作業を一括監視する専用投影は別の課題であり、今回のページングを同時多数作業の監視合格とは扱わない。
+
+Hub管理者は選択した端末へ明示的な読取要求を出し、同じ履歴のスナップショットを参照・Markdown保存できる。認証済み端末が既存のHub接続で要求を取得し、対象端末・照会IDに束縛した結果を返す。履歴の正本、実行権限、承認ownerは端末に置き、Hubは全端末の本文を自動収集しない。取得済みスナップショットは期限付きでメモリ保持し、現在状態と区別する。契約の正本は `moyAI-Hub/src/network/history.rs` とHubの `docs/mcp-history.md`。
 
 ## 8. 受入条件
 
@@ -97,7 +100,7 @@ WinAの全体停止では、その親に属する委任先へ停止を要求し�
 
 中間では、公開設定と接続設定のGUI、受入側の明示した権限、実ツールの往復、作業IDによる状態/結果取得と個別停止、応答喪失後の同一要求の照会、既存read設定の互換性を確認する。同一PCの分離fixtureによる2役の検証と、別端末によるLAN・認証・ファイル所在の検証を区別する。
 
-最初の実装では受入側のGlobal Main Directモデルを開始時にcaptureし、既存RunServiceで専用rootを実行する。受入側のローカル子agent・他端末への再委任は無効とする。追加の人間承認が必要な操作は明示的に拒否し、受入側で選択した代理承認/フルアクセスをWinAが変更することはできない。受入側対話承認UI、Hubによる受入モデル割当、親停止の複数端末への一括配信、成果物転送は後続の実装範囲として区別する。
+手動MCP経路では受入側のGlobal Main Directモデルを開始時にcaptureし、既存RunServiceで専用rootを実行する。受入側のローカル子agentとoutbound MCPは無効とする。Hub管理経路は受入モデルのHub割当・認可された再委任・親に属する停止を追加している。対話承認と版付き入力・成果物は共通の受入runtimeへ実装したが、受入側で選択した権限をWinAが変更することはできない。追加した承認UI・診断・証明書更新・Windowsの成果物書き出しの統合・実画面受入は進行中である。
 
 受理済み記録は再照会・二重実行防止に必要なため、遠隔作業の履歴があるプロジェクトの削除は、この中間版では理由を表示して拒否する。記録の保持期限と削除後の照会契約は後続で設計する。通常のプロジェクト削除は維持する。
 
@@ -116,4 +119,4 @@ WinAの全体停止では、その親に属する委任先へ停止を要求し�
 9. 実Tauriを直接操作し、複数端末の登録、公開設定、委任中の進捗/承認/停止、対象切替中のdraft保持、stale応答、再接続を確認する。buildや起動だけをGUI合格にしない。
 10. 旧read profile・資格情報・Project/tempの互換性を保ち、再起動や移行だけではagent権限やLAN待受を有効化しない。
 
-中間版のjob保存形式、admission transaction、認証/証明書の導入操作、Directモデル設定のcapture、個別停止は上記current ownerで実装する。成果物転送、Hubによる受入モデル割当、親全体の停止対象は後続の設計範囲とする。本書は独自plannerや巨大task graphの導入を要求しない。中間受入と最終受入はそれぞれ実施した証拠で判定する。
+job保存形式、admission transaction、認証/証明書の導入操作、手動経路のDirectモデルcaptureと個別停止は上記current ownerを正とする。Hub管理経路のモデル割当・再委任・親停止、共通の対話承認と版付き成果物は実装済みの範囲と統合検証中の操作を [Hub端末連携](hub-device-network.md) に集約する。物理2Windows・3台以降の受入と成果物の元Projectへの適用は未完了である。本書は独自plannerや巨大task graphの導入を要求しない。中間受入と最終受入はそれぞれ実施した証拠で判定する。

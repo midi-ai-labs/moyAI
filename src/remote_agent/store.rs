@@ -27,6 +27,8 @@ pub struct RemoteTaskRequest {
     pub request_key: String,
     pub parent: RemoteJobParent,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<super::artifacts::RemoteInputFile>,
 }
 
 impl RemoteTaskRequest {
@@ -47,6 +49,7 @@ impl RemoteTaskRequest {
         }) && !self.prompt.trim().is_empty()
             && self.prompt.len() <= MAX_REMOTE_PROMPT_BYTES
             && !self.prompt.contains('\0')
+            && super::artifacts::validate_inputs(&self.inputs).is_ok()
     }
 
     pub(crate) fn fingerprint(&self, scope_json: &str) -> Result<String, StorageError> {
@@ -155,7 +158,7 @@ impl StoredDeviceReference {
         }
         Ok(encoded)
     }
-    fn decode(text: &str) -> Result<Self, StorageError> {
+    pub(super) fn decode(text: &str) -> Result<Self, StorageError> {
         if text.len() > 128 * 1024 {
             return Err(invalid_reference());
         }
@@ -167,10 +170,43 @@ impl StoredDeviceReference {
 
 #[derive(Clone)]
 pub struct RemoteJobStore {
-    connection: Arc<Mutex<Connection>>,
+    pub(super) connection: Arc<Mutex<Connection>>,
 }
 
 impl RemoteJobStore {
+    pub(crate) fn pending_network_receipts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(StoredRemoteJob, String)>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare("SELECT job_id,grant_id FROM remote_network_receipts WHERE settlement_delivered=0 ORDER BY last_attempt_ms,job_id LIMIT ?1")?;
+        let receipts = statement
+            .query_map(params![limit.min(64) as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        receipts
+            .into_iter()
+            .map(|(id, grant)| {
+                Ok((
+                    query_job(&connection, "id=?1", params![id])?.ok_or_else(invalid_record)?,
+                    grant,
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn network_receipt_attempt(
+        &self,
+        job: Ulid,
+        grant: &str,
+        delivered: bool,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute("UPDATE remote_network_receipts SET last_attempt_ms=?3,settlement_delivered=MAX(settlement_delivered,?4) WHERE job_id=?1 AND grant_id=?2", params![job.to_string(), grant, SystemClock::now_ms().max(0), i64::from(delivered)])?;
+        Ok(())
+    }
+
     pub(crate) fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
     }
@@ -403,6 +439,18 @@ impl RemoteJobStore {
         scope_json: &str,
         draft: &NewSession,
     ) -> Result<(StoredRemoteJob, bool), StorageError> {
+        self.accept_with_network(principal, profile_id, request, scope_json, draft, None)
+    }
+
+    pub(crate) fn accept_with_network(
+        &self,
+        principal: &str,
+        profile_id: Ulid,
+        request: &RemoteTaskRequest,
+        scope_json: &str,
+        draft: &NewSession,
+        grant_id: Option<&str>,
+    ) -> Result<(StoredRemoteJob, bool), StorageError> {
         if !request.validate() {
             return Err(StorageError::Message("invalid remote request".into()));
         }
@@ -429,6 +477,21 @@ impl RemoteJobStore {
         transaction.execute("INSERT INTO remote_agent_jobs (id, principal_id, profile_id, request_key, request_hash, scope_json, parent_json, prompt_preview, session_id, created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![id.to_string(), principal, profile_id.to_string(), request.request_key, hash, scope_json,
                 serde_json::to_string(&request.parent)?, request.prompt.chars().take(256).collect::<String>(), session_id.to_string(), now])?;
+        if let Some(grant) = grant_id {
+            if !crate::device_network::stable_id(grant) {
+                return Err(invalid_record());
+            }
+            transaction.execute(
+                "INSERT INTO remote_network_receipts(job_id,grant_id) VALUES(?1,?2)",
+                params![id.to_string(), grant],
+            )?;
+        }
+        if !request.inputs.is_empty() {
+            transaction.execute(
+                "INSERT INTO remote_job_inputs(job_id,payload_json) VALUES(?1,?2)",
+                params![id.to_string(), serde_json::to_string(&request.inputs)?],
+            )?;
+        }
         let job =
             query_job(&transaction, "id = ?1", params![id.to_string()])?.expect("inserted job");
         transaction.commit()?;
@@ -436,7 +499,7 @@ impl RemoteJobStore {
     }
 }
 
-fn query_job(
+pub(super) fn query_job(
     connection: &Connection,
     predicate: &str,
     parameters: impl rusqlite::Params,

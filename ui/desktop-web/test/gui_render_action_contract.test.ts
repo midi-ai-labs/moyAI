@@ -589,7 +589,13 @@ function representativeSurfaces(): RenderedSurface[] {
   publish.jobs = [{ job_id: "job-a", profile_id: "profile-a", parent: { peer_id: "WinA", task_id: "task-a", turn_id: "turn-a" },
     prompt_preview: "Investigate workspace", session_id: "session-a", state: "running", model: "model-a", result: null, result_truncated: false, can_stop: true }];
   local.mcpPublish = publishPresentation(publish);
+  local.mcpHistory = { ...local.mcpHistory, loaded: true, rows: [{ id: "ref-a", direction: "instruction",
+    created_at_ms: 1_700_000_000_000, updated_at_ms: null, title: "Investigate WinB", peer_label: "WinB", target_label: "temp",
+    state: "running", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
+    root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: true, state_source: "last_observed", result_received: false }] };
   local.deviceNetwork = deviceNetworkPresentation(deviceUiFixture());
+  local.deviceNetwork.jobs.outgoing[0].state = "completed";
+  local.deviceNetwork.jobs.outgoing[0].can_stop = false;
   local.mcpPeers = { ...local.mcpPeers, rows: [{ id: "WinB", base_url: "https://192.168.10.22/mcp", enabled: true, credential_configured: true, certificate_sha256: null }] };
   const surfaces: RenderedSurface[] = [
     { name: "startup", html: renderStartupSplash(base, 1_000, 500) },
@@ -603,6 +609,9 @@ function representativeSurfaces(): RenderedSurface[] {
     { name: "plan", html: renderPlanProjection(base) },
     { name: "artifact-output", html: renderArtifactPane(base, local) },
     { name: "permission", html: renderConfirmation(base) },
+    { name: "receiver-permission", html: renderConfirmation({ ...base, confirmation: { ...base.confirmation!, remote: {
+      job_id: "job-b", profile_id: "profile-b", session_id: "session-b", requester_label: "WinA", target_label: "Temp",
+    } } }) },
   ];
 
   for (const overlay of [
@@ -610,6 +619,7 @@ function representativeSurfaces(): RenderedSurface[] {
     "config",
     "hub",
     "mcp_publish",
+    "mcp_history",
     "workspace",
     "prompt_review",
     "command_palette",
@@ -871,7 +881,9 @@ function actionButtons(html: string): Array<{
       index: Number(attribute(tag, "data-index") ?? "-1"),
       value: attribute(tag, "data-agent-path")
         ?? attribute(tag, "data-history-target")
+        ?? attribute(tag, "data-provider-profile")
         ?? attribute(tag, "data-mode")
+        ?? attribute(tag, "data-value")
         ?? "",
       disabled: /\sdisabled(?:\s|>)/i.test(tag),
     }];
@@ -1392,6 +1404,7 @@ test("each primary GUI surface retains its required action routes", () => {
       "show-session-settings",
     ],
     "overlay-hub": ["close-overlay", "hub-connect", "hub-refresh", "hub-disconnect", "hub-save-main", "hub-save-side"],
+    "overlay-mcp_history": ["close-overlay", "mcp-history-direction", "mcp-history-refresh", "mcp-history-export", "mcp-history-stop"],
     "overlay-workspace": [
       "close-overlay",
       "switch-workspace",
@@ -1444,6 +1457,8 @@ test("the sidebar separates Hub preparation from ordinary Settings", () => {
 
   assert.match(html, /class="rail-item" data-action="show-hub"/);
   assert.match(html, />moyAI Hub<\/span>/);
+  assert.match(html, /class="rail-item" data-action="show-mcp-history"/);
+  assert.doesNotMatch(html, /data-action="show-mcp-publish"/);
   assert.match(html, /class="settings" data-action="show-config"/);
   assert.doesNotMatch(html, /class="rail-item" data-action="show-provider"/);
 });
@@ -1544,6 +1559,7 @@ test("production render button availability matches the shared action resolver",
       "config",
       "hub",
       "mcp_publish",
+      "mcp_history",
       "workspace",
       "prompt_review",
       "command_palette",
@@ -1631,6 +1647,22 @@ test("Main and Side Stop are named visibly and an idle Side has no misleading St
   assert.doesNotMatch(renderArtifactPane(completed, local), /data-action="cancel-side-chat"|停止不可/);
   assert.match(renderTopbar(completed), /実行を停止しました/);
   assert.doesNotMatch(renderTopbar(completed), /run stopped by user/);
+});
+
+test("production MCP history keeps both direction buttons and a saved task selectable", () => {
+  const state = representativeState({ confirmation_visible: false, overlay: "mcp_history" });
+  const local = defaultRenderLocal();
+  local.mcpHistory = { ...local.mcpHistory, loaded: true, rows: [{ id: "history-row-a", direction: "instruction",
+    created_at_ms: 1_700_000_000_000, updated_at_ms: null, title: "WinBのCPU使用率", peer_label: "WinB", target_label: "temp",
+    state: "completed", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
+    root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: false, state_source: "last_observed", result_received: true }] };
+  const html = renderDesktopMarkup(createDesktopRenderModel(state, local), { backgroundInert: false, taskActivityDelay: "0ms" });
+  for (const id of ["mcp-history-instruction", "mcp-history-execution", "mcp-history-row-history-row-a"]) {
+    const tag = html.match(new RegExp(`<button\\b[^>]*id="${id}"[^>]*>`))?.[0];
+    assert.ok(tag, `${id} is visible`);
+    assert.doesNotMatch(tag, /\sdisabled(?:\s|>)/, `${id} must remain usable after the final action-availability pass`);
+    assert.match(tag, /aria-disabled="false"/);
+  }
 });
 
 test("activity remains visible while Stop is neither rendered nor activatable without its exact Rust target", () => {

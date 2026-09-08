@@ -19,7 +19,7 @@ function callStatus(value: string): string {
   return ({ running: "実行中", completed: "完了", failed: "失敗", cancelled: "停止" } as Record<string, string>)[value] ?? "状態不明";
 }
 const jobStatus: Record<PublishJob["state"], string> = {
-  accepted: "受付済み", running: "実行中", cancelling: "停止を要求中", completed: "完了", failed: "失敗", interrupted: "停止済み",
+  accepted: "受付済み", running: "実行中", awaiting_approval: "この端末で承認待ち", cancelling: "停止を要求中", completed: "完了", failed: "失敗", interrupted: "停止済み",
 };
 function noJobResult(state: PublishJob["state"]): string {
   if (state === "interrupted") return "タスクは停止しました。返却された結果はありません。";
@@ -74,7 +74,7 @@ export function renderPublishOverlay(input?: PublishPresentation): string {
   return `<div class="modal-backdrop">
     <section class="modal settings-modal mcp-publish-modal" data-modal="mcp_publish" data-surface="mcp_publish" data-profile-id="${escapeHtml(local.selectedId ?? "")}" data-credential-id="${escapeHtml(credentialId)}" role="dialog" aria-modal="true" aria-labelledby="mcp-publish-title" aria-describedby="mcp-publish-scope" tabindex="-1">
       <header class="mcp-publish-header"><div><span class="mcp-publish-eyebrow">LYNX · WORKSPACE SHARING</span>
-        <h2 id="mcp-publish-title">MCPを配信</h2><p id="mcp-publish-scope">読み取りツールを公開するか、この端末でエージェントのタスクを受け付けます。接続先MCPサーバーの設定とは別の機能です。</p></div>
+        <h2 id="mcp-publish-title">旧配信設定の管理</h2><p id="mcp-publish-scope">保存済みの手動配信設定を管理します。Hub経由の受付と証明書の自動設定は「moyAI Hub」の端末連携から操作してください。</p></div>
         <button class="icon-button" data-action="close-overlay" aria-label="閉じる" title="閉じる">${icon("x")}</button></header>
       <div class="mcp-publish-body">
         <aside class="mcp-publish-sidebar" aria-label="配信プロファイル">

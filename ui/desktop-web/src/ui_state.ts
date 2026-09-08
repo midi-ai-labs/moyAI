@@ -2,6 +2,7 @@ import type { LocalConfirmation } from "./render_overlays.ts";
 import { createHubUiState, type HubUiState } from "./hub_state.ts";
 import { createDeviceNetworkUiState, type DeviceNetworkUiState } from "./device_network_state.ts";
 import { createPublishUiState, type PublishUiState } from "./mcp_publish_state.ts";
+import { createMcpHistoryUiState, type McpHistoryUiState } from "./mcp_history_state.ts";
 import { createMcpPeerState, type McpPeerState } from "./mcp_peer.ts";
 import { agentActivityRowIdentity } from "./agent_activity.ts";
 import {
@@ -236,6 +237,7 @@ export interface UiLocalState {
   hub: HubUiState;
   deviceNetwork: DeviceNetworkUiState;
   mcpPublish: PublishUiState;
+  mcpHistory: McpHistoryUiState;
   mcpPeers: McpPeerState;
   drafts: UiDraftState;
   initialSetup: InitialSetupState;
@@ -302,6 +304,7 @@ export function createUiLocalState(): UiLocalState {
     hub: createHubUiState(),
     deviceNetwork: createDeviceNetworkUiState(),
     mcpPublish: createPublishUiState(),
+    mcpHistory: createMcpHistoryUiState(),
     mcpPeers: createMcpPeerState(),
     drafts: {
       initialized: false,

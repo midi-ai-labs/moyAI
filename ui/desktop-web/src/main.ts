@@ -7,6 +7,9 @@ import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
 import { acceptPublishProjection, publishPresentation } from "./mcp_publish_state.ts";
 import { clearPublishSecret, synchronizePublishControlValues } from "./mcp_publish_dom.ts";
 import { refreshPublishJobs } from "./mcp_publish_actions.ts";
+import { refreshMcpHistory } from "./mcp_history_actions.ts";
+import { invalidateMcpHistory, mcpHistoryPresentation } from "./mcp_history_state.ts";
+import { synchronizeMcpHistorySurface } from "./mcp_history_dom.ts";
 import { clearMcpPeerToken, mcpPeerPresentation, refreshMcpPeers } from "./mcp_peer.ts";
 import { synchronizeHubControlValues } from "./hub_dom.ts";
 import { cancelRunCommand, interruptSessionCommand } from "./stop_contract";
@@ -197,6 +200,7 @@ import {
 } from "./side_chat_focus_continuation";
 import {
   beginPermissionDecision,
+  permissionDecisionCommandTarget,
   beginPermissionStop,
   failPermissionDecision,
   finishLocalDecision,
@@ -230,6 +234,7 @@ import "./styles.css";
 import "./hub_surface.css";
 import "./device_network_surface.css";
 import "./mcp_publish_surface.css";
+import "./mcp_history_surface.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 const desktopWindow = getCurrentWindow();
@@ -241,6 +246,7 @@ const refresh = createSnapshotRefresh(async () => {
     acceptState(await command<DesktopWebState>("desktop_state"), false);
     await refreshPublishJobs(eventContext);
     await refreshDeviceNetworkJobs(eventContext);
+    await refreshMcpHistory(eventContext);
   } catch (error) {
     reportError(error);
   }
@@ -350,7 +356,7 @@ installWindowMaximizedSync();
 void refresh();
 installRuntimePolling(window, document, () => Boolean(
     currentState
-    && (currentState.overlay === "mcp_publish" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, uiState.mcpPublish.projection))
+    && (currentState.overlay === "mcp_history" || currentState.overlay === "mcp_publish" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, uiState.mcpPublish.projection))
     && shouldAutoRefresh(currentState)
 ), refresh);
 
@@ -841,6 +847,7 @@ function applyStateUpdate(update: StateUpdate): void {
     clearPublishSecret();
     ++uiState.mcpPublish.jobsSerial;
   }
+  if (previousProjection?.overlay === "mcp_history" && update.state.overlay !== "mcp_history") invalidateMcpHistory(uiState.mcpHistory);
   if (previousProjection?.overlay === "config" && update.state.overlay !== "config") {
     clearMcpPeerToken();
     ++uiState.mcpPeers.serial;
@@ -897,6 +904,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     hub: hubPresentation(uiState.hub),
     deviceNetwork: deviceNetworkPresentation(uiState.deviceNetwork),
     mcpPublish: publishPresentation(uiState.mcpPublish),
+    mcpHistory: mcpHistoryPresentation(uiState.mcpHistory),
     mcpPeers: mcpPeerPresentation(uiState.mcpPeers),
     artifactPane: {
       collapsed: uiState.artifactPaneCollapsed,
@@ -1359,7 +1367,8 @@ function renderCommitted(
       if (currentStatus && nextStatus && !currentStatus.contains(document.activeElement)) {
         currentStatus.replaceWith(nextStatus);
       }
-      synchronizeRetainedSettingsSurface(
+      if (state.overlay === "mcp_history") synchronizeMcpHistorySurface(currentSettingsModal, nextSettingsModal);
+      else synchronizeRetainedSettingsSurface(
         currentSettingsModal,
         nextSettingsModal,
         model.local.configMutationPending || model.local.sessionSettings.mutationPending
@@ -2320,13 +2329,13 @@ async function submitPermissionDecision(decision: PermissionReviewDecision): Pro
   const confirmationId = currentState?.confirmation_visible
     ? currentState.confirmation_id
     : null;
-  const submission = beginPermissionDecision(uiState, confirmationId, decision);
+  const submission = beginPermissionDecision(uiState, confirmationId, decision, currentState?.confirmation?.remote ?? null);
   if (submission === null) return;
   if (currentState) acceptState(currentState, true);
   try {
     const state = await command<DesktopWebState>("answer_permission", {
       decision,
-      confirmationId: submission.requestId,
+      ...permissionDecisionCommandTarget(submission),
     });
     let settlementApplied = false;
     if (

@@ -136,6 +136,7 @@ export function settingsSurfaceIdentity(
   if (!state || state.confirmation_visible) return null;
   if (state.overlay === "hub") return "hub:application";
   if (state.overlay === "mcp_publish") return "mcp-publish:application";
+  if (state.overlay === "mcp_history") return "mcp-history:application";
   if (state.overlay === "initial_setup") {
     const target = state.startup.setup_target;
     if (!state.startup.initial_setup_required || target === null || initialSetupStep === undefined) {

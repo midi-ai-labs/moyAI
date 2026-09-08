@@ -84,7 +84,8 @@ test("the mixed-widget View popover is a dialog with ordinary actions and a nati
   assert.match(html, /<button data-action="show-provider" data-titlebar-menu-action>/);
   assert.match(html, /<button data-action="show-config" data-titlebar-menu-action>/);
   assert.match(html, /<button data-action="show-hub" data-titlebar-menu-action>/);
-  assert.match(html, /<button data-action="show-mcp-publish" data-titlebar-menu-action>/);
+  assert.match(html, /<button data-action="show-mcp-history" data-titlebar-menu-action>/);
+  assert.doesNotMatch(html, /data-action="show-mcp-publish"/);
   const viewActions = Array.from(html.matchAll(/<button[^>]*data-titlebar-menu-action[^>]*>/g), (match) => match[0]);
   assert.equal(viewActions.length, 5);
   for (const action of viewActions) assert.doesNotMatch(action, /tabindex=/);

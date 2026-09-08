@@ -18,14 +18,12 @@ use crate::app::{
     App, AppBootstrap, AppCommand, AppProcessRuntime, RunAdmissionKind, RunConfigInput, RunRequest,
     RunService,
 };
-use crate::cli::{
-    ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, SharedConfirmationPrompt,
-};
+use crate::cli::{EventRenderer, OutputMode, SharedConfirmationPrompt};
 use crate::config::ResolvedConfig;
-use crate::error::{CliPromptError, CliRenderError};
+use crate::error::CliRenderError;
 use crate::mcp_publish::dispatch::{PublishCallError, PublishToolDispatcher, TargetSnapshot};
 use crate::mcp_publish::{PublishMode, PublishProfile, PublishProfileId, PublishTarget};
-use crate::protocol::{ContentPart, HistoryItem, ReviewDecision, ToolApprovalDecision};
+use crate::protocol::{ContentPart, HistoryItem, ReviewDecision};
 use crate::runtime::{LocalTaskExecutor, OwnedTaskHandle, RunControl};
 use crate::session::{
     ActiveTurnExpectation, NewSession, SessionId, SessionProviderConnection, SessionRepository,
@@ -34,14 +32,13 @@ use crate::session::{
 
 const MAX_ACTIVE_JOBS: usize = 16;
 const MAX_RESULT_BYTES: usize = 64 * 1024;
-const INTERACTIVE_APPROVAL_UNAVAILABLE: &str =
-    "受入側の対話承認は未対応です。受入側で明示した権限を確認してください。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteJobState {
     Accepted,
     Running,
+    AwaitingApproval,
     Cancelling,
     Completed,
     Failed,
@@ -80,6 +77,7 @@ struct ServiceInner {
     process: AppProcessRuntime,
     executor: LocalTaskExecutor,
     state: Mutex<RuntimeState>,
+    approvals: super::approval::ReceiverApprovals,
 }
 
 #[derive(Default)]
@@ -115,6 +113,10 @@ impl RuntimeState {
 }
 
 impl RemoteJobService {
+    pub(super) fn history_store(&self) -> crate::storage::StoreBundle {
+        self.inner.process.store()
+    }
+
     pub(crate) fn new(process: AppProcessRuntime) -> Result<Self, PublishCallError> {
         Ok(Self {
             inner: Arc::new(ServiceInner {
@@ -122,8 +124,107 @@ impl RemoteJobService {
                 executor: LocalTaskExecutor::new("moyai-remote-job-runtime")
                     .map_err(|_| PublishCallError::Unavailable)?,
                 state: Mutex::new(RuntimeState::default()),
+                approvals: super::approval::ReceiverApprovals::default(),
             }),
         })
+    }
+
+    pub(crate) fn pending_approval(&self) -> Option<super::approval::RemoteApproval> {
+        self.inner.approvals.pending()
+    }
+
+    pub(crate) fn answer_approval(
+        &self,
+        id: Ulid,
+        job: Ulid,
+        profile: PublishProfileId,
+        decision: ReviewDecision,
+    ) -> bool {
+        self.inner.approvals.answer(id, job, profile, decision)
+    }
+
+    pub(crate) fn has_active_jobs(&self) -> bool {
+        self.inner.state.lock().is_ok_and(|mut state| {
+            state.reap();
+            !state.workers.is_empty()
+        })
+    }
+
+    /// Delivery retries never resume a local turn. They only reconcile the receiver's
+    /// durable job mapping/terminal with Hub after a lost response or Hub restart.
+    pub(crate) async fn reconcile_network_receipts(
+        &self,
+        network: crate::device_network::DeviceNetworkService,
+    ) {
+        let _ = self
+            .submit(move |service| async move {
+                let receipts = service
+                    .inner
+                    .process
+                    .store()
+                    .remote_job_store()
+                    .pending_network_receipts(8)
+                    .map_err(|_| PublishCallError::Unavailable)?;
+                for (job, grant_id) in receipts {
+                    let _ = service
+                        .reconcile_network_receipt(&network, job, &grant_id)
+                        .await;
+                }
+                Ok(())
+            })
+            .await;
+    }
+
+    async fn reconcile_network_receipt(
+        &self,
+        network: &crate::device_network::DeviceNetworkService,
+        job: StoredRemoteJob,
+        grant_id: &str,
+    ) -> Result<(), PublishCallError> {
+        let id = job.id;
+        let row = self.row(job.clone()).await?;
+        let state = match row.state {
+            RemoteJobState::Completed => Some("completed"),
+            RemoteJobState::Failed => Some("failed"),
+            RemoteJobState::Interrupted => Some("cancelled"),
+            _ => None,
+        };
+        let delivered = if let Some(state) = state {
+            let value: Value =
+                serde_json::from_str(&job.scope_json).map_err(|_| PublishCallError::Unavailable)?;
+            let claims = serde_json::from_value(
+                value
+                    .get("network")
+                    .cloned()
+                    .ok_or(PublishCallError::InvalidTarget)?,
+            )
+            .map_err(|_| PublishCallError::InvalidTarget)?;
+            let authority = crate::device_network::VerifiedGrant {
+                grant_id: grant_id.into(),
+                claims,
+            };
+            // Covers a lost accepted response without ever admitting or replaying execution.
+            network
+                .settle_incoming_job(grant_id, &id.to_string(), state)
+                .await
+                .is_ok()
+                || (network
+                    .acknowledge_incoming_job(&authority, &id.to_string())
+                    .await
+                    .is_ok()
+                    && network
+                        .settle_incoming_job(grant_id, &id.to_string(), state)
+                        .await
+                        .is_ok())
+        } else {
+            false
+        };
+        self.inner
+            .process
+            .store()
+            .remote_job_store()
+            .network_receipt_attempt(id, grant_id, delivered)
+            .map_err(|_| PublishCallError::Unavailable)
     }
 
     /// `config` is the receiver's configuration. It is never supplied by the network caller.
@@ -260,7 +361,7 @@ impl RemoteJobService {
 
     // The closure constructs local futures on the existing !Send executor. Transport callers
     // remain Send without changing the tool/storage traits or adding an alternate agent loop.
-    async fn submit<F, Fut, T>(&self, operation: F) -> Result<T, PublishCallError>
+    pub(super) async fn submit<F, Fut, T>(&self, operation: F) -> Result<T, PublishCallError>
     where
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, PublishCallError>> + 'static,
@@ -570,12 +671,15 @@ impl RemoteJobService {
                     )),
                 };
                 let (job, created) = store
-                    .accept(
+                    .accept_with_network(
                         &principal,
                         scope.profile.id.0,
                         &request,
                         &scope_json,
                         &draft,
+                        authority
+                            .as_ref()
+                            .map(|authority| authority.grant_id.as_str()),
                     )
                     .map_err(|_| PublishCallError::InvalidArguments)?;
                 if created {
@@ -587,6 +691,25 @@ impl RemoteJobService {
                         network.capture_inbound(session_id, job.id, authority.clone());
                     }
                     let worker_run_service = run_service.clone();
+                    let worker_network = network.clone();
+                    let worker_authority = authority.clone();
+                    let worker_service = self.clone();
+                    let worker_job = job.clone();
+                    let receiver_prompt =
+                        self.inner
+                            .approvals
+                            .prompt(super::approval::RemoteApprovalContext {
+                                job_id: id,
+                                profile_id: scope.profile.id,
+                                session_id,
+                                requester_label: Some(request.parent.peer_id.clone()),
+                                target_label: scope
+                                    .profile
+                                    .target
+                                    .workspace_root()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| "temp".into()),
+                            });
                     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
                     let handle = self
                         .inner
@@ -597,8 +720,51 @@ impl RemoteJobService {
                             {
                                 return;
                             }
+                            if let (Some(network), Some(authority)) =
+                                (&worker_network, &worker_authority)
+                            {
+                                if network
+                                    .acknowledge_incoming_job(authority, &id.to_string())
+                                    .await
+                                    .is_err()
+                                    || worker_control.is_cancelled()
+                                    || worker_scope.admission_closed.is_cancelled()
+                                {
+                                    if let Some(route) = route {
+                                        route.finish().await;
+                                    }
+                                    return;
+                                }
+                            }
+                            let inputs = match super::artifacts::stage_inputs(
+                                &worker_scope.app.store.remote_job_store(),
+                                &worker_job,
+                            ) {
+                                Ok(inputs) => inputs,
+                                Err(_) => {
+                                    if let Some(route) = route {
+                                        route.finish().await;
+                                    }
+                                    return;
+                                }
+                            };
+                            let worker_run_service = if let Some(inputs) = &inputs {
+                                run_config
+                                    .permissions
+                                    .additional_read_roots
+                                    .push(inputs.root.clone());
+                                let context = include_str!("../../assets/prompts/remote_inputs.md")
+                                    .replace("{{inputs}}", &inputs.context());
+                                run_config.model.system_prompt = format!(
+                                    "{}\n\n{context}",
+                                    run_config.model.system_prompt.trim_end()
+                                );
+                                Arc::new(worker_run_service.with_remote_input_root(&inputs.root))
+                            } else {
+                                worker_run_service
+                            };
                             let mut prompt = SharedConfirmationPrompt::new_with_root_control(
-                                ReceiverConfirmation,
+                                receiver_prompt,
                                 worker_control.clone(),
                             );
                             let run = RunRequest {
@@ -627,8 +793,35 @@ impl RemoteJobService {
                             let _ = worker_run_service
                                 .execute(AppCommand::Run(run), &mut RemoteRenderer, &mut prompt)
                                 .await;
+                            // Freeze only canonical changes for this exact admitted turn.
+                            // A failed capture remains unavailable; it is never reported as
+                            // an empty successful artifact or retried against a later workspace.
+                            if let Ok(Some(current)) = worker_scope
+                                .app
+                                .store
+                                .remote_job_store()
+                                .get(&worker_job.principal_id, worker_job.id)
+                            {
+                                let _ = super::artifacts::capture_outputs(
+                                    &worker_scope.app.store,
+                                    &current,
+                                    &worker_scope.app.workspace,
+                                );
+                            }
+                            drop(inputs);
                             if let Some(route) = route {
                                 route.finish().await;
+                            }
+                            if let (Some(network), Some(authority)) =
+                                (&worker_network, &worker_authority)
+                            {
+                                let _ = worker_service
+                                    .reconcile_network_receipt(
+                                        network,
+                                        worker_job,
+                                        &authority.grant_id,
+                                    )
+                                    .await;
                             }
                         })
                         .map_err(|_| PublishCallError::Unavailable)?;
@@ -649,7 +842,7 @@ impl RemoteJobService {
         self.row(job).await
     }
 
-    async fn row(&self, job: StoredRemoteJob) -> Result<RemoteJobRow, PublishCallError> {
+    pub(super) async fn row(&self, job: StoredRemoteJob) -> Result<RemoteJobRow, PublishCallError> {
         // Re-read the mapping after worker start: its admitted turn commits with history.
         let store = self.inner.process.store();
         let job = store
@@ -698,6 +891,8 @@ impl RemoteJobService {
                 SessionStatus::Cancelled => RemoteJobState::Interrupted,
                 _ => RemoteJobState::Failed,
             }
+        } else if active && self.inner.approvals.waiting(job.id) {
+            RemoteJobState::AwaitingApproval
         } else if active && job.admitted_turn_id.is_some() {
             RemoteJobState::Running
         } else if active {
@@ -724,9 +919,9 @@ impl RemoteJobService {
                 });
             }
             if result.is_none() && state == RemoteJobState::Failed {
-                result = Some(format!(
-                    "受入側の実行が失敗しました。{INTERACTIVE_APPROVAL_UNAVAILABLE}"
-                ));
+                result = Some(
+                    "受入側の実行が失敗しました。受入端末の作業履歴を確認してください。".into(),
+                );
             }
         }
         let result_truncated = result
@@ -772,6 +967,47 @@ struct RemoteDispatcher {
     scope: Arc<ProfileScope>,
 }
 
+impl RemoteDispatcher {
+    async fn artifacts(
+        &self,
+        arguments: Value,
+        authority: Option<crate::device_network::VerifiedGrant>,
+    ) -> Result<Value, PublishCallError> {
+        let request: ArtifactsRequest =
+            serde_json::from_value(arguments).map_err(|_| PublishCallError::InvalidArguments)?;
+        let scope = self.scope.clone();
+        let value = self
+            .service
+            .submit(move |service| async move {
+                let principal = authority
+                    .as_ref()
+                    .map(network_principal)
+                    .unwrap_or_else(|| scope.profile.id.0.to_string());
+                let store = service.inner.process.store().remote_job_store();
+                let job = store
+                    .get(&principal, request.job_id)
+                    .map_err(|_| PublishCallError::Unavailable)?
+                    .ok_or(PublishCallError::InvalidTarget)?;
+                if job.profile_id != scope.profile.id.0
+                    || authority
+                        .as_ref()
+                        .is_some_and(|authority| !authorized_job(&job, authority))
+                {
+                    return Err(PublishCallError::InvalidTarget);
+                }
+                let bundle = store
+                    .artifact_bundle(job.id, request.version.as_deref())
+                    .map_err(|_| PublishCallError::Unavailable)?
+                    .ok_or(PublishCallError::Unavailable)?;
+                serde_json::to_value(bundle).map_err(|_| PublishCallError::Unavailable)
+            })
+            .await?;
+        Ok(
+            json!({"content":[{"type":"text","text":"The verified file bundle is in structuredContent."}],"structuredContent":value,"isError":false}),
+        )
+    }
+}
+
 fn network_principal(authority: &crate::device_network::VerifiedGrant) -> String {
     use sha2::{Digest, Sha256};
     let claims = authority.claims();
@@ -809,14 +1045,24 @@ struct CancelRequest {
     job_id: Ulid,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactsRequest {
+    job_id: Ulid,
+    version: Option<String>,
+}
+
 #[async_trait]
 impl PublishToolDispatcher for RemoteDispatcher {
     fn tool_descriptors(&self) -> Vec<Value> {
-        vec![
+        let mut descriptors = vec![
             json!({"name":"delegate_task","description":"Delegate a natural-language task to this receiver's configured project or temp workspace. Returns a durable job promptly. Use the same request_key after uncertain delivery; never automatically create a replacement job.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"request_key":{"type":"string","maxLength":128},"parent":{"type":"object","additionalProperties":false,"properties":{"peer_id":{"type":"string"},"task_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["peer_id","task_id","turn_id"]},"prompt":{"type":"string","maxLength":32768}},"required":["request_key","parent","prompt"]}}),
             json!({"name":"task_status","description":"Read this principal's accepted remote job. Supply exactly one of job_id or request_key. A disconnected caller does not imply a stopped job.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"job_id":{"type":"string"},"request_key":{"type":"string"}},"oneOf":[{"required":["job_id"]},{"required":["request_key"]}]},"annotations":{"readOnlyHint":true}}),
             json!({"name":"cancel_task","description":"Request cancellation of one accepted job; stopping is confirmed only when its real execution settles.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"job_id":{"type":"string"}},"required":["job_id"]}}),
-        ]
+            json!({"name":"task_artifacts","description":"Read the frozen file versions produced by one settled job. No files are installed or overwritten by this read. Unavailable means no verified snapshot exists.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"job_id":{"type":"string"},"version":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["job_id"]},"annotations":{"readOnlyHint":true}}),
+        ];
+        descriptors[0]["inputSchema"]["properties"]["inputs"] = json!({"type":"array","maxItems":8,"description":"Optional UTF-8 input file versions, at most 64 KiB per file and 256 KiB total. They remain read-only reference copies, separate from the receiver workspace.","items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","description":"Portable relative file path"},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"text":{"type":"string"}},"required":["path","sha256","text"]}});
+        descriptors
     }
 
     async fn call(
@@ -833,6 +1079,9 @@ impl PublishToolDispatcher for RemoteDispatcher {
         }
         if self.scope.admission_closed.is_cancelled() {
             return Err(PublishCallError::Unavailable);
+        }
+        if name == "task_artifacts" {
+            return self.artifacts(arguments, None).await;
         }
         let scope = self.scope.clone();
         let name = name.to_string();
@@ -901,6 +1150,9 @@ impl PublishToolDispatcher for RemoteDispatcher {
         {
             return Err(PublishCallError::Unavailable);
         }
+        if name == "task_artifacts" {
+            return self.artifacts(arguments, Some(authority)).await;
+        }
         let scope = self.scope.clone();
         let name = name.to_owned();
         let row = self
@@ -967,31 +1219,6 @@ impl PublishToolDispatcher for RemoteDispatcher {
         Ok(
             json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false}),
         )
-    }
-}
-
-struct ReceiverConfirmation;
-impl ConfirmationPrompt for ReceiverConfirmation {
-    fn confirm(
-        &mut self,
-        _: &crate::tool::PermissionRequest,
-    ) -> Result<ReviewDecision, CliPromptError> {
-        Ok(ReviewDecision::Denied)
-    }
-    fn confirm_with_control(
-        &mut self,
-        _: &crate::tool::PermissionRequest,
-        control: &RunControl,
-    ) -> Result<ConfirmationOutcome, CliPromptError> {
-        if control.is_cancelled() {
-            Ok(ConfirmationOutcome::Interrupted)
-        } else {
-            Ok(ConfirmationOutcome::Resolved(
-                ToolApprovalDecision::Denied {
-                    reason: INTERACTIVE_APPROVAL_UNAVAILABLE.into(),
-                },
-            ))
-        }
     }
 }
 

@@ -89,6 +89,7 @@ pub(super) enum PreparedRequest {
 #[derive(Clone)]
 pub struct HubCatalogClient {
     http: reqwest::Client,
+    managed_http: Option<crate::device_network::ManagedHubHttp>,
     catalog_url: reqwest::Url,
     authorization: HeaderValue,
     deadline: Duration,
@@ -108,7 +109,7 @@ impl std::fmt::Debug for HubCatalogClient {
 impl HubCatalogClient {
     pub(super) async fn device_session(
         endpoint: &str,
-        http: reqwest::Client,
+        http: crate::device_network::ManagedHubHttp,
     ) -> Result<(RegisteredHubClient, Option<super::HubSelection>), HubError> {
         #[derive(Deserialize)]
         struct Receipt {
@@ -123,7 +124,9 @@ impl HubCatalogClient {
         let mut url = validated_endpoint(endpoint)?;
         url.set_path("/v1/network/model-session");
         let receipt: Receipt = tokio::time::timeout(Duration::from_secs(10), async {
-            let response = http
+            let lease = http.acquire().await;
+            let response = lease
+                .http
                 .post(url)
                 .json(&serde_json::json!({}))
                 .send()
@@ -153,7 +156,8 @@ impl HubCatalogClient {
             return Err(HubError::InvalidCatalog);
         }
         let mut connection = Self::new(endpoint, &receipt.client_token, 10000)?;
-        connection.http = http;
+        connection.http = http.snapshot();
+        connection.managed_http = Some(http);
         let selection = receipt.default_selection;
         if let Some(selection) = &selection {
             selection.validate_shape()?;
@@ -193,6 +197,7 @@ impl HubCatalogClient {
             .map_err(|_| HubError::InvalidConnection)?;
         Ok(Self {
             http,
+            managed_http: None,
             catalog_url: url,
             authorization,
             deadline,
@@ -205,11 +210,34 @@ impl HubCatalogClient {
         path: &str,
         body: &impl Serialize,
     ) -> Result<T, HubError> {
+        tokio::time::timeout(self.deadline, async {
+            let lease = match &self.managed_http {
+                Some(http) => Some(http.acquire().await),
+                None => None,
+            };
+            self.post_with_http(
+                path,
+                body,
+                lease
+                    .as_ref()
+                    .map(|lease| &lease.http)
+                    .unwrap_or(&self.http),
+            )
+            .await
+        })
+        .await
+        .map_err(|_| HubError::Deadline)?
+    }
+    async fn post_with_http<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+        http: &reqwest::Client,
+    ) -> Result<T, HubError> {
         let mut url = self.catalog_url.clone();
         url.set_path(path);
         tokio::time::timeout(self.deadline, async {
-            let response = self
-                .http
+            let response = http
                 .post(url)
                 .header(AUTHORIZATION, self.authorization.clone())
                 .json(body)
@@ -298,8 +326,15 @@ impl HubCatalogClient {
             // Serialize observations across clones so a slow response cannot replace a newer
             // accepted catalog. Waiting for this owner is covered by the same total deadline.
             let mut observed = self.observed.lock().await;
-            let response = self
-                .http
+            let lease = match &self.managed_http {
+                Some(http) => Some(http.acquire().await),
+                None => None,
+            };
+            let http = lease
+                .as_ref()
+                .map(|lease| &lease.http)
+                .unwrap_or(&self.http);
+            let response = http
                 .get(self.catalog_url.clone())
                 .header(AUTHORIZATION, self.authorization.clone())
                 .header(reqwest::header::ACCEPT, "application/json")
@@ -443,6 +478,89 @@ mod tests {
     use super::*;
     use axum::{Router, routing::get};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn device_model_session_and_turn_survive_http_identity_rotation_without_replay() {
+        use axum::{Json, http::HeaderMap, routing::post};
+        use serde_json::{Value, json};
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let registration_calls = calls.clone();
+        let prepare_calls = calls.clone();
+        let app = Router::new()
+            .route("/v1/network/model-session", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let calls = registration_calls.clone(); async move {
+                    calls.lock().unwrap().push((headers["x-device-identity"].to_str().unwrap().into(), body));
+                    Json(json!({"id":"stable-model-client","client_token":"model-token-01234567890123456789012345","hub_id":"hub","revision":"1","heartbeat_interval_ms":1000,"identity_scope":"device_session","default_selection":null}))
+                }
+            }))
+            .route("/v1/requests/prepare", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let calls = prepare_calls.clone(); async move {
+                    assert_eq!(headers["authorization"], "Bearer model-token-01234567890123456789012345");
+                    calls.lock().unwrap().push((headers["x-device-identity"].to_str().unwrap().into(), body));
+                    Json(json!({"state":"waiting","reason":"busy","retry_after_ms":1000}))
+                }
+            }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let http = |epoch: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-device-identity", HeaderValue::from_static(epoch));
+            reqwest::Client::builder()
+                .no_proxy()
+                .default_headers(headers)
+                .build()
+                .unwrap()
+        };
+        let transport = crate::device_network::ManagedHubHttp::new(http("old"));
+        let (client, _) = HubCatalogClient::device_session(&endpoint, transport.clone())
+            .await
+            .unwrap();
+        let review = ReviewedHubSelection {
+            hub_id: "hub".into(),
+            reviewed_revision: CatalogRevision(1),
+            selection: super::super::HubSelection {
+                allowed_model_ids: ["logical".into()].into(),
+                preferred_model_id: "logical".into(),
+                required_capabilities: ["tools".into()].into(),
+                wait_policy: super::super::HubWaitPolicy::WaitForPreferred,
+                affinity_turns: 1,
+            },
+        };
+        client
+            .prepare(HubReviewContext::Main, "same-turn", "request-1", &review)
+            .await
+            .unwrap();
+        let rotation = transport.try_rotate().unwrap();
+        rotation.replace(http("new"));
+        drop(rotation);
+        client
+            .prepare(HubReviewContext::Main, "same-turn", "request-2", &review)
+            .await
+            .unwrap();
+        server.abort();
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            3,
+            "rotation must not register another session or replay a model request"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(epoch, _)| epoch.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old", "old", "new"]
+        );
+        for (_, request) in &calls[1..] {
+            assert_eq!(request["id"], "stable-model-client");
+            assert_eq!(request["turn_id"], "same-turn");
+        }
+        assert_eq!(calls[1].1["request_id"], "request-1");
+        assert_eq!(calls[2].1["request_id"], "request-2");
+    }
 
     #[test]
     fn accepts_the_management_servers_exact_token_alphabet_and_length_range() {

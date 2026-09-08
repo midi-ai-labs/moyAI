@@ -1,5 +1,6 @@
-export type PermissionReviewDecision = "approved" | "abort";
+export type PermissionReviewDecision = "approved" | "denied" | "abort";
 export type PermissionModalAction = PermissionReviewDecision | "stop";
+export interface RemotePermissionTarget { job_id: string; profile_id: string }
 
 export type PermissionDecisionState =
   | { phase: "ready"; requestId: string }
@@ -15,13 +16,15 @@ export interface PermissionDecisionSubmission {
   requestId: string;
   submissionId: number;
   decision: PermissionModalAction;
+  remote?: RemotePermissionTarget;
 }
 
 export function permissionDecisionForEscape(
   confirmationVisible: boolean,
   repeat: boolean,
+  remote = false,
 ): PermissionReviewDecision | null {
-  return confirmationVisible && !repeat ? "abort" : null;
+  return confirmationVisible && !repeat && !remote ? "abort" : null;
 }
 
 export interface PermissionDecisionOwner {
@@ -38,8 +41,10 @@ export function beginPermissionDecision(
   owner: PermissionDecisionOwner,
   confirmationId: string | null,
   decision: PermissionReviewDecision,
+  remote: RemotePermissionTarget | null = null,
 ): PermissionDecisionSubmission | null {
-  return beginPermissionSubmission(owner, confirmationId, decision);
+  if (decision === "denied" && !remote) return null;
+  return beginPermissionSubmission(owner, confirmationId, decision, remote);
 }
 
 export function beginPermissionStop(
@@ -53,6 +58,7 @@ function beginPermissionSubmission(
   owner: PermissionDecisionOwner,
   confirmationId: string | null,
   decision: PermissionModalAction,
+  remote: RemotePermissionTarget | null = null,
 ): PermissionDecisionSubmission | null {
   if (confirmationId === null) return null;
   reconcilePermissionDecision(owner, confirmationId);
@@ -61,6 +67,7 @@ function beginPermissionSubmission(
     requestId: confirmationId,
     submissionId: owner.nextPermissionSubmissionId++,
     decision,
+    ...(remote ? { remote: { job_id: remote.job_id, profile_id: remote.profile_id } } : {}),
   };
   owner.permissionDecision = { phase: "submitting", ...submission };
   return submission;
@@ -119,7 +126,14 @@ export function permissionDecisionShouldFocusComposer(
   settlementApplied: boolean,
   confirmationVisible: boolean,
 ): boolean {
-  return settlementApplied && submission.decision === "abort" && !confirmationVisible;
+  return settlementApplied && !submission.remote && submission.decision === "abort" && !confirmationVisible;
+}
+
+export function permissionDecisionCommandTarget(submission: PermissionDecisionSubmission): {
+  confirmationId: string; remoteJobId?: string; remoteProfileId?: string;
+} {
+  return { confirmationId: submission.requestId,
+    ...(submission.remote ? { remoteJobId: submission.remote.job_id, remoteProfileId: submission.remote.profile_id } : {}) };
 }
 
 export function permissionDecisionResponseAccepted(

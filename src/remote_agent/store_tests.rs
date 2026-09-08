@@ -5,6 +5,208 @@ use crate::session::{ProjectId, ProjectRepository, SessionRepository, SessionSet
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use camino::Utf8PathBuf;
 
+#[tokio::test]
+async fn remote_artifact_outgoing_cache_is_terminal_exact_and_immutable_after_reopen() {
+    use crate::remote_agent::artifacts::{
+        ArtifactBundle, ArtifactFile, ArtifactManifest, RemoteInputFile,
+    };
+    let (_temp, store, draft) = fixture().await;
+    let session = store.session_repo().create_session(draft).await.unwrap();
+    let jobs = store.remote_job_store();
+    let mut row = device_reference(session.id, TurnId::new(), "artifact-cache");
+    row.job_id = Some(Ulid::new().to_string());
+    jobs.accept_device_reference(&row).unwrap();
+    let files = vec![ArtifactFile {
+        path: "result.txt".into(),
+        kind: crate::session::ChangeKind::Add,
+        from_path: None,
+        base_sha256: None,
+        sha256: Some(format!("{:x}", Sha256::digest(b"v1"))),
+        byte_length: 2,
+    }];
+    let version = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(row.job_id.as_ref().unwrap(), &files)).unwrap())
+    );
+    let bundle = ArtifactBundle {
+        manifest: ArtifactManifest {
+            job_id: row.job_id.clone().unwrap(),
+            version: version.clone(),
+            files,
+        },
+        files: vec![RemoteInputFile {
+            path: "result.txt".into(),
+            sha256: format!("{:x}", Sha256::digest(b"v1")),
+            text: "v1".into(),
+        }],
+    };
+    assert!(
+        jobs.cache_artifacts(row.id, &bundle).is_err(),
+        "running job cannot freeze an output version"
+    );
+    row.state = "completed".into();
+    jobs.update_device_reference(&row).unwrap();
+    jobs.cache_artifacts(row.id, &bundle).unwrap();
+    jobs.cache_artifacts(row.id, &bundle).unwrap();
+    let mut changed = bundle.clone();
+    changed.files[0].text = "v2".into();
+    changed.files[0].sha256 = format!("{:x}", Sha256::digest(b"v2"));
+    changed.manifest.files[0].sha256 = Some(changed.files[0].sha256.clone());
+    changed.manifest.version = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(&changed.manifest.job_id, &changed.manifest.files)).unwrap()
+        )
+    );
+    assert!(jobs.cache_artifacts(row.id, &changed).is_err());
+    let reopened = SqliteStore::open(store.paths()).unwrap();
+    reopened.migrate().unwrap();
+    let read = reopened
+        .remote_job_store()
+        .cached_artifacts(row.id, row.job_id.as_deref().unwrap(), Some(&version))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.files[0].text, "v1");
+    assert!(
+        jobs.cached_artifacts(row.id, "different-job", None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        jobs.cached_artifacts(Ulid::new(), row.job_id.as_deref().unwrap(), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        jobs.cached_artifacts(
+            row.id,
+            row.job_id.as_deref().unwrap(),
+            Some(&"0".repeat(64))
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn remote_network_receipt_migration_preserves_jobs_and_retries_exact_delivery_after_reopen() {
+    let (_temp, store, draft) = fixture().await;
+    let jobs = store.remote_job_store();
+    let profile = Ulid::new();
+    let (legacy, _) = jobs
+        .accept(
+            "principal",
+            profile,
+            &request("legacy-receipt"),
+            "{}",
+            &draft,
+        )
+        .unwrap();
+    {
+        let connection = jobs.connection.lock().unwrap();
+        connection.execute_batch("DROP TABLE remote_network_receipts; DELETE FROM moyai_schema_migrations WHERE version=64;").unwrap();
+        crate::storage::migration::run_to_current(&connection).unwrap();
+    }
+    assert_eq!(
+        jobs.get("principal", legacy.id)
+            .unwrap()
+            .unwrap()
+            .session_id,
+        legacy.session_id
+    );
+    assert!(jobs.pending_network_receipts(8).unwrap().is_empty());
+    let (first, created) = jobs
+        .accept_with_network(
+            "principal",
+            profile,
+            &request("new-receipt"),
+            "{}",
+            &draft,
+            Some("durable-grant-one"),
+        )
+        .unwrap();
+    assert!(created);
+    let replay = jobs
+        .accept_with_network(
+            "principal",
+            profile,
+            &request("new-receipt"),
+            "{}",
+            &draft,
+            Some("durable-grant-one"),
+        )
+        .unwrap();
+    assert!(!replay.1);
+    assert_eq!(replay.0.id, first.id);
+    let pending = jobs.pending_network_receipts(8).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0.id, first.id);
+    assert_eq!(pending[0].1, "durable-grant-one");
+    jobs.network_receipt_attempt(first.id, "wrong-grant", true)
+        .unwrap();
+    assert_eq!(jobs.pending_network_receipts(8).unwrap().len(), 1);
+    jobs.network_receipt_attempt(first.id, "durable-grant-one", false)
+        .unwrap();
+    let reopened = SqliteStore::open(store.paths()).unwrap();
+    reopened.migrate().unwrap();
+    assert_eq!(
+        reopened
+            .remote_job_store()
+            .pending_network_receipts(8)
+            .unwrap()[0]
+            .0
+            .id,
+        first.id
+    );
+    assert!(
+        jobs.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE remote_network_receipts SET grant_id='wrong' WHERE job_id=?1",
+                params![first.id.to_string()]
+            )
+            .is_err()
+    );
+    jobs.network_receipt_attempt(first.id, "durable-grant-one", true)
+        .unwrap();
+    jobs.network_receipt_attempt(first.id, "durable-grant-one", false)
+        .unwrap();
+    assert!(jobs.pending_network_receipts(8).unwrap().is_empty());
+    assert_eq!(
+        jobs.get("principal", first.id)
+            .unwrap()
+            .unwrap()
+            .admitted_turn_id,
+        None
+    );
+}
+
+#[tokio::test]
+async fn remote_network_receipt_failure_rolls_back_job_and_session_creation() {
+    let (_temp, store, draft) = fixture().await;
+    let jobs = store.remote_job_store();
+    let profile = Ulid::new();
+    let before = jobs.recent_all(64).unwrap().len();
+    assert!(
+        jobs.accept_with_network(
+            "principal",
+            profile,
+            &request("invalid-receipt"),
+            "{}",
+            &draft,
+            Some("invalid grant")
+        )
+        .is_err()
+    );
+    assert_eq!(jobs.recent_all(64).unwrap().len(), before);
+    assert!(jobs.pending_network_receipts(8).unwrap().is_empty());
+    assert!(
+        jobs.find_request("principal", "invalid-receipt")
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn device_reference(session_id: SessionId, turn_id: TurnId, key: &str) -> StoredDeviceReference {
     StoredDeviceReference {
         id: Ulid::new(),
@@ -396,6 +598,7 @@ fn request(key: &str) -> RemoteTaskRequest {
             turn_id: "parent-turn".into(),
         },
         prompt: "この端末で時刻を確認してください。".into(),
+        inputs: vec![],
     }
 }
 

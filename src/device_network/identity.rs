@@ -9,6 +9,15 @@ use sha2::{Digest, Sha256};
 
 use super::DeviceError;
 
+pub(super) fn certificate_covers_ip(pem: &str, ip: Ipv4Addr) -> Result<bool, DeviceError> {
+    use tokio_rustls::rustls::{client::verify_server_name, server::ParsedCertificate};
+    let certificate = crate::mcp_publish::tls::public_certificate(pem)
+        .map_err(|_| DeviceError::InvalidIdentity)?;
+    let parsed =
+        ParsedCertificate::try_from(&certificate).map_err(|_| DeviceError::InvalidIdentity)?;
+    Ok(verify_server_name(&parsed, &std::net::IpAddr::V4(ip).into()).is_ok())
+}
+
 /// Private material is serialized only by this local store, never by a DTO.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +59,38 @@ impl DeviceIdentity {
     }
     pub(crate) fn private_key_pem(&self) -> &str {
         &self.private_key_pem
+    }
+    pub(super) fn join_proof(
+        &self,
+        ip: Ipv4Addr,
+        hub_id: &str,
+        request_id: &str,
+        challenge: &str,
+    ) -> Result<String, DeviceError> {
+        if ![hub_id, request_id, challenge]
+            .iter()
+            .all(|value| super::stable_id(value))
+        {
+            return Err(DeviceError::InvalidResponse);
+        }
+        let mut params = rcgen::CertificateParams::new(vec![ip.to_string()])
+            .map_err(|_| DeviceError::InvalidIdentity)?;
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("moyAI join {hub_id} {request_id} {challenge}"),
+        );
+        params
+            .serialize_request(&self.key()?)
+            .and_then(|csr| csr.pem())
+            .map_err(|_| DeviceError::InvalidIdentity)
+    }
+    pub(super) fn public_key_sha256(&self) -> Result<String, DeviceError> {
+        use rcgen::PublicKeyData;
+        use sha2::{Digest, Sha256};
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(self.key()?.subject_public_key_info())
+        ))
     }
     #[cfg(test)]
     fn fingerprint(&self) -> String {
@@ -128,6 +169,22 @@ impl DeviceIdentityStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_scope_uses_the_signed_ip_san_instead_of_a_listener_or_common_name() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.2".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        let cert = params.self_signed(&key).unwrap();
+        assert!(certificate_covers_ip(&cert.pem(), Ipv4Addr::new(127, 0, 0, 2)).unwrap());
+        assert!(!certificate_covers_ip(&cert.pem(), Ipv4Addr::LOCALHOST).unwrap());
+        assert_eq!(
+            certificate_covers_ip("not a certificate", Ipv4Addr::LOCALHOST),
+            Err(DeviceError::InvalidIdentity)
+        );
+    }
 
     #[test]
     fn invalid_future_unknown_and_oversized_identity_files_never_rotate_the_key() {

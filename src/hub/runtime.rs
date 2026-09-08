@@ -450,8 +450,25 @@ impl LlmClient for HubRoutedClient {
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(request.provider_target().deadlines().request_timeout_ms);
         self.route.phase("waiting", None);
-        let prepared = loop {
+        let network_http = self
+            .route
+            .inner
+            .connection
+            .inner
+            .network_http
+            .lock()
+            .unwrap()
+            .clone();
+        let (prepared, transport_lease) = loop {
             self.route.ensure_current()?;
+            let lease = match &network_http {
+                Some(http) => Some(tokio::select! {
+                    _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
+                    _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Message("Hub allocation wait timed out".into())),
+                    lease = http.acquire() => lease,
+                }),
+                None => None,
+            };
             let result = tokio::select! {
                 _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
                 _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Message("Hub allocation wait timed out".into())),
@@ -462,6 +479,8 @@ impl LlmClient for HubRoutedClient {
                     reason,
                     retry_after_ms,
                 } => {
+                    // No permit exists while waiting. Let identity renewal run between polls.
+                    drop(lease);
                     if !matches!(
                         reason.as_str(),
                         "busy"
@@ -479,7 +498,7 @@ impl LlmClient for HubRoutedClient {
                         _ = tokio::time::sleep(Duration::from_millis(retry_after_ms)) => {}
                     }
                 }
-                ready => break ready,
+                ready => break (ready, lease),
             }
         };
         let PreparedRequest::Ready {
@@ -525,15 +544,6 @@ impl LlmClient for HubRoutedClient {
         }
         let url = reqwest::Url::parse(&gateway_base_url)
             .map_err(|_| LlmError::Message("Hub gateway target is invalid".into()))?;
-        let network_http = self
-            .route
-            .inner
-            .connection
-            .inner
-            .network_http
-            .lock()
-            .unwrap()
-            .clone();
         let transport_allowed = if network_http.is_some() {
             let hub = reqwest::Url::parse(self.route.hub_endpoint())
                 .map_err(|_| LlmError::Message("Hub gateway target is invalid".into()))?;
@@ -585,11 +595,13 @@ impl LlmClient for HubRoutedClient {
             inner: sink,
             endpoint: self.route.hub_endpoint(),
         };
-        let gateway = match &network_http {
-            Some(http) => crate::llm::OpenAiCompatClient::new(None).with_runtime_http(http.clone()),
+        let gateway = match &transport_lease {
+            Some(lease) => {
+                crate::llm::OpenAiCompatClient::new(None).with_runtime_http(lease.http.clone())
+            }
             None => crate::llm::OpenAiCompatClient::new(None),
         };
-        gateway
+        let result = gateway
             .stream_chat(request, cancel, &mut trace)
             .await
             .map_err(|error| {
@@ -599,6 +611,8 @@ impl LlmClient for HubRoutedClient {
                 } else {
                     public_route_error(error, self.route.hub_endpoint())
                 }
-            })
+            });
+        drop(transport_lease);
+        result
     }
 }

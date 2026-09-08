@@ -5,12 +5,13 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 
-use super::{DeviceError, DeviceIdentity, SharedHubConfig, stable_id};
+use super::{DeviceError, DeviceIdentity, ManagedHubHttp, SharedHubConfig, stable_id};
 
 #[derive(Clone)]
 pub(crate) struct DeviceClient {
-    http: reqwest::Client,
+    http: ManagedHubHttp,
     endpoint: reqwest::Url,
+    local_ip: Option<Ipv4Addr>,
     pub(crate) device_id: String,
 }
 impl std::fmt::Debug for DeviceClient {
@@ -29,6 +30,43 @@ pub(crate) struct EnrollmentReceipt {
     pub ca_certificate_pem: String,
     pub certificate_sha256: String,
     pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct JoinRequestReceipt {
+    pub hub_id: String,
+    pub request_id: String,
+    pub challenge: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct JoinStatusReceipt {
+    pub hub_id: String,
+    pub request_id: String,
+    pub status: JoinStatus,
+    pub certificate: Option<EnrollmentReceipt>,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum JoinStatus {
+    #[default]
+    Pending,
+    Approved,
+    Stopped,
+    Revoked,
+    Expired,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeviceAdmission {
+    #[default]
+    Allowed,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -131,6 +169,8 @@ pub(crate) struct SelfStatus {
     pub certificate_sha256: String,
     pub expires_at_ms: u64,
     #[serde(default)]
+    pub admission: DeviceAdmission,
+    #[serde(default)]
     pub cancelled_lineages: Vec<CancelledLineage>,
 }
 #[derive(Deserialize)]
@@ -146,20 +186,43 @@ impl DeviceClient {
         identity: Option<(&DeviceIdentity, &str)>,
         device_id: String,
     ) -> Result<Self, DeviceError> {
+        Self::new_from(config, identity, device_id, None)
+    }
+    pub(crate) fn new_from(
+        config: &SharedHubConfig,
+        identity: Option<(&DeviceIdentity, &str)>,
+        device_id: String,
+        local_ip: Option<Ipv4Addr>,
+    ) -> Result<Self, DeviceError> {
         let endpoint = config.validate()?;
-        let http = crate::mcp_publish::tls::managed_hub_http(
+        let http = crate::mcp_publish::tls::managed_hub_http_from(
             identity.map(|(key, certificate)| (certificate, key.private_key_pem())),
             &config.ca_certificate_pem,
+            local_ip,
         )
         .map_err(|_| DeviceError::InvalidConfiguration)?;
         Ok(Self {
-            http,
+            http: ManagedHubHttp::new(http),
             endpoint,
             device_id,
+            local_ip,
         })
     }
-    pub(crate) fn http(&self) -> reqwest::Client {
+    pub(crate) fn http(&self) -> ManagedHubHttp {
         self.http.clone()
+    }
+    pub(crate) fn local_ip(&self) -> Option<Ipv4Addr> {
+        self.local_ip
+    }
+    pub(crate) fn use_transport(&mut self, http: ManagedHubHttp) {
+        self.http = http;
+    }
+    /// Use only while the caller retains a lease for this exact HTTP identity.
+    pub(crate) fn detached_http(&self, http: reqwest::Client) -> Self {
+        Self {
+            http: ManagedHubHttp::new(http),
+            ..self.clone()
+        }
     }
     pub(crate) fn endpoint(&self) -> String {
         self.endpoint.as_str().trim_end_matches('/').to_string()
@@ -185,9 +248,10 @@ impl DeviceClient {
             let SocketAddr::V4(address) = address else {
                 continue;
             };
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .await
-                .map_err(|_| DeviceError::Unavailable)?;
+            let socket =
+                tokio::net::UdpSocket::bind((self.local_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), 0))
+                    .await
+                    .map_err(|_| DeviceError::ReceiverAddressUnavailable)?;
             socket
                 .connect(address)
                 .await
@@ -211,9 +275,10 @@ impl DeviceClient {
         let mut url = self.endpoint.clone();
         url.set_path(path);
         tokio::time::timeout(Duration::from_secs(10), async {
+            let http = self.http.acquire().await;
             let request = match body {
-                Some(body) => self.http.post(url).json(body),
-                None => self.http.get(url),
+                Some(body) => http.http.post(url).json(body),
+                None => http.http.get(url),
             };
             let response = request.send().await.map_err(|_| DeviceError::Unavailable)?;
             let status = response.status();
@@ -246,8 +311,12 @@ impl DeviceClient {
                 return Err(match code.as_str() {
                     "enrollment_denied" => DeviceError::EnrollmentDenied,
                     "device_revoked" | "unauthorized" => DeviceError::Revoked,
+                    "device_stopped" => DeviceError::Stopped,
+                    "join_superseded" => DeviceError::JoinSuperseded,
                     "policy_denied" => DeviceError::PolicyDenied,
                     "grant_denied" => DeviceError::GrantDenied,
+                    "authority_retired" => DeviceError::AuthorityRetired,
+                    "recovery_required" => DeviceError::RecoveryRequired,
                     _ => DeviceError::Unavailable,
                 });
             }
@@ -267,9 +336,86 @@ impl DeviceClient {
         )
         .await
     }
+    pub(super) async fn request_join(
+        &self,
+        label: &str,
+        csr_pem: &str,
+    ) -> Result<JoinRequestReceipt, DeviceError> {
+        self.request(
+            "/v1/network/join/request",
+            Some(&json!({"label":label,"csr_pem":csr_pem})),
+        )
+        .await
+    }
+    pub(super) async fn join_status(
+        &self,
+        request_id: &str,
+        proof_csr_pem: &str,
+    ) -> Result<JoinStatusReceipt, DeviceError> {
+        self.request(
+            "/v1/network/join/status",
+            Some(&json!({"request_id":request_id,"proof_csr_pem":proof_csr_pem})),
+        )
+        .await
+    }
     pub(crate) async fn renew(&self, csr_pem: &str) -> Result<EnrollmentReceipt, DeviceError> {
         self.request("/v1/network/renew", Some(&json!({"csr_pem":csr_pem})))
             .await
+    }
+    pub(crate) async fn acknowledge_job(
+        &self,
+        grant_id: &str,
+        job_id: &str,
+    ) -> Result<(), DeviceError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Receipt {
+            accepted: bool,
+            grant_id: String,
+            job_id: String,
+        }
+        let receipt: Receipt = self
+            .request(
+                "/v1/network/jobs/accepted",
+                Some(&json!({"grant_id":grant_id,"job_id":job_id})),
+            )
+            .await?;
+        if !receipt.accepted || receipt.grant_id != grant_id || receipt.job_id != job_id {
+            return Err(DeviceError::InvalidResponse);
+        }
+        Ok(())
+    }
+    pub(crate) async fn settle_job(
+        &self,
+        grant_id: &str,
+        job_id: &str,
+        state: &str,
+    ) -> Result<(), DeviceError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Receipt {
+            settled: bool,
+            grant_id: String,
+            job_id: String,
+            state: String,
+        }
+        if !matches!(state, "completed" | "failed" | "cancelled") {
+            return Err(DeviceError::InvalidConfiguration);
+        }
+        let receipt: Receipt = self
+            .request(
+                "/v1/network/jobs/settled",
+                Some(&json!({"grant_id":grant_id,"job_id":job_id,"state":state})),
+            )
+            .await?;
+        if !receipt.settled
+            || receipt.grant_id != grant_id
+            || receipt.job_id != job_id
+            || receipt.state != state
+        {
+            return Err(DeviceError::InvalidResponse);
+        }
+        Ok(())
     }
     pub(crate) async fn self_status(&self) -> Result<SelfStatus, DeviceError> {
         self.request("/v1/network/self", None).await

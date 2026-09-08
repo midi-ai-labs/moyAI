@@ -9823,6 +9823,27 @@ impl DesktopController {
                 .map(|pending| (pending.confirmation_id, &pending.request)),
         );
         projection.projection_revision = projection_revision_text(revision);
+        if let Some(network) = &self.state.device_network {
+            let jobs = network.remote_jobs();
+            if !projection.confirmation_visible
+                && let Some(pending) = jobs.pending_approval()
+            {
+                projection.confirmation_visible = true;
+                projection.confirmation_id = Some(pending.confirmation_id.to_string());
+                projection.confirmation_text =
+                    super::web_model::format_permission_confirmation_text(&pending.request);
+                let mut permission =
+                    super::web_model::DesktopPermissionProjection::from(&pending.request);
+                permission.remote = Some(pending.context);
+                projection.confirmation = Some(permission);
+            }
+            if jobs.has_active_jobs() {
+                projection.async_polling_required = true;
+                projection
+                    .pending_async_operations
+                    .push("remote_job".into());
+            }
+        }
         if !self.side_chat_runs.is_empty() {
             if let Some(hub) = &mut projection.hub {
                 hub.can_change_side_chat_mode = false;
@@ -18242,7 +18263,7 @@ fn normalize_markdown_export_path(path: Utf8PathBuf) -> Utf8PathBuf {
     }
 }
 
-fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> Result<(), String> {
+pub(super) fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> Result<(), String> {
     let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) else {
         return Err(format!(
             "markdown export path must have a parent directory: {path}"

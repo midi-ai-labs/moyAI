@@ -36,15 +36,17 @@
 
 This development branch targets **Desktop v3.0.0 / LYNX**. The **moyAI Hub** panel
 now includes Hub-managed device enrollment, receiving tasks, and choosing other devices.
-Import the shared Hub configuration, use a one-time enrollment code, then enable receiving
-or select an allowed peer. A new worker can start with Hub configuration before setting up
+Import the shared Hub configuration to request enrollment automatically. After the Hub administrator
+approves the device, it connects without an enrollment code; enable receiving or select an allowed peer.
+A new worker can start with Hub configuration before setting up
 a Direct model. The shared file contains the Hub URL and public CA trust; each device generates
 its own private key. On enrolled Desktop devices, receiving IP, port, TLS credentials and short-lived
 authorization are managed by the apps.
-This increment is implemented. On one Windows PC, the actual Hub/Desktop GUI and separate sender/receiver
-runtimes have verified shared-config setup, enrollment, temp receiving, directed permission, peer selection,
-named approval and CPU task results returned to the sender. This is a tested subset, not physical multi-PC
-acceptance. Older provisional builds do not include it.
+Earlier verification on one Windows PC covered the actual Hub/Desktop GUI and separate sender/receiver
+runtimes for shared-config setup, enrollment, temp receiving, directed permission, peer selection,
+named approval and CPU task results returned to the sender. The current MCP history screens and Markdown
+export have also been checked in the actual Windows GUI. Physical multi-PC acceptance and verification of
+the additional approval, diagnostics and artifact operations remain outstanding; see the build's release notes.
 
 Hub administrators assign groups and directed permissions. Joining a Hub does not connect every device
 to every other device. Receivers choose a project or **temp**, execution permissions and model routing.
@@ -56,13 +58,17 @@ and [design and acceptance status](docs/design/hub-device-network.md).
 
 The model tab retains independent Main / Side Chat model selection and review. The Hub route uses
 a companion Chat Completions gateway with capacity control and has no implicit Direct fallback.
-Direct settings remain available. The separate **MCPを配信** panel and manual peer connection form
-remain for manually configured connections. Read-only temp publishes `current_time`; agent temp
-executes tasks. Manual profiles retain their own token/TLS and lifecycle settings. See
+Direct settings remain available. **MCP履歴** provides **MCP指示** and **MCP実行** views of locally saved
+delegation records, results and errors, with Markdown export. A compatible Hub can also retrieve and save
+device history snapshots; update both Hub and Desktop. See the [MCP history guide](docs/mcp-history-guide.md).
+Existing manual publishing profiles remain accessible through **旧配信設定の管理** in the history screen,
+and the manual peer connection form remains available. These profiles retain their own token/TLS and
+lifecycle settings. See
 [Desktop MCP publishing](docs/design/mcp-publish-foundation.md) and [Hub integration](docs/hub-integration.md).
-Physical multi-Windows and three-device redelegation acceptance remain outstanding. Restoring delegation
-ancestry across a Hub restart, rotating Hub/Gateway server certificates during continuous operation,
-interactive remote approval and artifact transfer are not yet supported.
+The implementation includes delegation recovery after a Hub restart, certificate renewal, approval on
+the receiving device, explicit versioned inputs and bounded UTF-8 artifact export to a new folder on Windows.
+Physical multi-Windows and three-device redelegation acceptance remain outstanding. Automatic application
+of artifacts to the original project, OS service operation and automatic rollout of a replacement CA remain unsupported.
 The published v2.1.1 download below remains the released version.
 
 moyAI is a Rust-based coding agent built for environments where cloud-first developer tools are hard to adopt.

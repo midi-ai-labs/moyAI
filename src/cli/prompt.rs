@@ -58,6 +58,18 @@ pub trait ConfirmationPrompt {
             ReviewDecision::Abort => ConfirmationOutcome::AbortRequested,
         })
     }
+
+    /// Async tool execution can yield while a surface-owned broker waits for the user.
+    /// Legacy direct prompts retain their synchronous implementation by default.
+    fn confirm_with_control_async<'a>(
+        &'a mut self,
+        request: &'a PermissionRequest,
+        control: &'a RunControl,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ConfirmationOutcome, CliPromptError>> + 'a>,
+    > {
+        Box::pin(async move { self.confirm_with_control(request, control) })
+    }
 }
 
 /// A cloneable, serialized permission channel shared by a root run and its child agents.
@@ -80,11 +92,11 @@ struct ConfirmationTicket {
     request: PermissionRequest,
     control: RunControl,
     abort_origin: Arc<AtomicBool>,
-    response: mpsc::SyncSender<Result<ConfirmationOutcome, CliPromptError>>,
+    response: tokio::sync::oneshot::Sender<Result<ConfirmationOutcome, CliPromptError>>,
 }
 
 struct PendingConfirmation {
-    response: mpsc::Receiver<Result<ConfirmationOutcome, CliPromptError>>,
+    response: tokio::sync::oneshot::Receiver<Result<ConfirmationOutcome, CliPromptError>>,
     abort_origin: Arc<AtomicBool>,
 }
 
@@ -148,7 +160,7 @@ impl SharedConfirmationPrompt {
         request: &PermissionRequest,
         control: RunControl,
     ) -> Result<PendingConfirmation, CliPromptError> {
-        let (response, receiver) = mpsc::sync_channel(1);
+        let (response, receiver) = tokio::sync::oneshot::channel();
         let abort_origin = Arc::new(AtomicBool::new(false));
         self.inner
             .tickets
@@ -198,15 +210,32 @@ impl ConfirmationPrompt for SharedConfirmationPrompt {
         }
         self.enqueue(request, control.clone())?.wait(control)
     }
+
+    fn confirm_with_control_async<'a>(
+        &'a mut self,
+        request: &'a PermissionRequest,
+        control: &'a RunControl,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ConfirmationOutcome, CliPromptError>> + 'a>,
+    > {
+        Box::pin(async move {
+            if control.is_cancelled() {
+                return Ok(ConfirmationOutcome::Interrupted);
+            }
+            self.enqueue(request, control.clone())?
+                .wait_async(control)
+                .await
+        })
+    }
 }
 
 impl PendingConfirmation {
-    fn wait(self, control: &RunControl) -> Result<ConfirmationOutcome, CliPromptError> {
+    fn wait(mut self, control: &RunControl) -> Result<ConfirmationOutcome, CliPromptError> {
         loop {
             if control.is_cancelled() && !self.abort_origin.load(Ordering::Acquire) {
                 return Ok(ConfirmationOutcome::Interrupted);
             }
-            match self.response.recv_timeout(Duration::from_millis(25)) {
+            match self.response.try_recv() {
                 Ok(Ok(ConfirmationOutcome::Aborted))
                     if self.abort_origin.load(Ordering::Acquire) =>
                 {
@@ -218,8 +247,10 @@ impl PendingConfirmation {
                     }
                     return result;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     if control.is_cancelled() && !self.abort_origin.load(Ordering::Acquire) {
                         return Ok(ConfirmationOutcome::Interrupted);
                     }
@@ -227,6 +258,44 @@ impl PendingConfirmation {
                         "permission prompt broker stopped before answering".to_string(),
                     ));
                 }
+            }
+        }
+    }
+
+    async fn wait_async(
+        mut self,
+        control: &RunControl,
+    ) -> Result<ConfirmationOutcome, CliPromptError> {
+        if control.is_cancelled() && !self.abort_origin.load(Ordering::Acquire) {
+            return Ok(ConfirmationOutcome::Interrupted);
+        }
+        let cancellation = control.token();
+        let response = tokio::select! {
+            response=&mut self.response=>response,
+            _=cancellation.cancelled(), if !self.abort_origin.load(Ordering::Acquire)=>{
+                // The requesting ticket publishes its origin before waking cancellation.
+                // Its own Abort must wait for the broker's classified receipt, exactly as sync wait.
+                if self.abort_origin.load(Ordering::Acquire) { self.response.await } else { return Ok(ConfirmationOutcome::Interrupted); }
+            }
+        };
+        match response {
+            Ok(Ok(ConfirmationOutcome::Aborted)) if self.abort_origin.load(Ordering::Acquire) => {
+                Ok(ConfirmationOutcome::Aborted)
+            }
+            Ok(result) => {
+                if control.is_cancelled() {
+                    Ok(ConfirmationOutcome::Interrupted)
+                } else {
+                    result
+                }
+            }
+            Err(_) => {
+                if control.is_cancelled() && !self.abort_origin.load(Ordering::Acquire) {
+                    return Ok(ConfirmationOutcome::Interrupted);
+                }
+                Err(CliPromptError::Message(
+                    "permission prompt broker stopped before answering".into(),
+                ))
             }
         }
     }
@@ -754,6 +823,59 @@ mod tests {
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_broker_wait_yields_to_status_and_stop_on_the_same_executor() {
+        let (mut broker, entered, release, _) = broker_fixture();
+        let control = RunControl::new();
+        let request = permission("async waiting");
+        let waiting = broker.confirm_with_control_async(&request, &control);
+        let status_and_stop = async {
+            loop {
+                match entered.try_recv() {
+                    Ok(summary) => {
+                        assert_eq!(summary, "async waiting");
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    Err(error) => panic!("broker unavailable: {error}"),
+                }
+            }
+            // This future represents another status/Stop operation on the same local executor.
+            control.interrupt(TurnInterruptionCause::UserStop);
+            release.send(()).unwrap();
+            "status remained available"
+        };
+        let (outcome, status) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(waiting, status_and_stop)
+        })
+        .await
+        .expect("confirmation cannot occupy the current-thread executor");
+        assert_eq!(outcome.unwrap(), ConfirmationOutcome::Interrupted);
+        assert_eq!(status, "status remained available");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_requesting_ticket_waits_for_its_abort_receipt_after_cancellation() {
+        let control = RunControl::new();
+        let origin = Arc::new(AtomicBool::new(true));
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        let pending = PendingConfirmation {
+            response: receiver,
+            abort_origin: origin,
+        };
+        control.interrupt(TurnInterruptionCause::ApprovalAborted);
+        let waiting = pending.wait_async(&control);
+        tokio::pin!(waiting);
+        tokio::select! {
+            outcome=&mut waiting=>panic!("Abort owner returned before broker receipt: {outcome:?}"),
+            _=tokio::task::yield_now()=>{},
+        }
+        response.send(Ok(ConfirmationOutcome::Aborted)).unwrap();
+        assert_eq!(waiting.await.unwrap(), ConfirmationOutcome::Aborted);
+    }
+
     #[test]
     fn broker_rejects_tickets_beyond_its_bounded_queue() {
         let (broker, entered, release, _) = broker_fixture();
@@ -943,7 +1065,7 @@ mod tests {
     fn requesting_ticket_observes_abort_origin_before_the_cancellation_wake() {
         let control = RunControl::new();
         let abort_origin = Arc::new(AtomicBool::new(false));
-        let (response, receiver) = mpsc::sync_channel(1);
+        let (response, receiver) = tokio::sync::oneshot::channel();
         let pending = PendingConfirmation {
             response: receiver,
             abort_origin: Arc::clone(&abort_origin),

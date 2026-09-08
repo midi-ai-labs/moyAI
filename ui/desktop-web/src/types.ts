@@ -128,6 +128,7 @@ export interface PermissionProjection {
   risks: string[];
   agent_path?: string | null;
   agent_task_name?: string | null;
+  remote?: { job_id: string; profile_id: string; session_id: string; requester_label: string | null; target_label: string } | null;
 }
 
 export interface StartupCheckProjection {

@@ -10,12 +10,15 @@ import { createHubUiState } from "../src/hub_state.ts";
 import { synchronizeRetainedSettingsSurface } from "../src/settings_surface.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
 
-test("join consent is separate from the explicit receiver grant and never selects peers automatically", () => {
+test("approval enrollment never grants reception or selects peers automatically", () => {
   const local = createDeviceNetworkUiState();
   acceptDeviceNetworkProjection(local, deviceProjection({ device_id: null, enrollment: "not_enrolled", can_join: true }));
-  assert.equal(deviceCanJoin(local), false);
-  editDeviceNetworkField(local, "join_confirmed", "", true);
   assert.equal(deviceCanJoin(local), true);
+  acceptDeviceNetworkProjection(local, deviceProjection({ device_id: null, enrollment: "pending", can_join: false, request_id: "request-a" }));
+  assert.equal(deviceCanJoin(local), false);
+  const pendingHtml = renderDeviceNetwork(local);
+  assert.match(pendingHtml, /Hub管理者の承認待ち/);
+  assert.doesNotMatch(pendingHtml, /id="device-network-code"|id="device-network-join-confirmed"/);
   assert.equal(deviceCanReceive(local, true), false);
   acceptDeviceNetworkProjection(local, deviceProjection());
   assert.deepEqual(local.target, { kind: "temp" });
@@ -79,6 +82,35 @@ test("saved receiver consent permits same-authority restart and never grants cha
   assert.equal(deviceCanReceive(local, true), false);
 });
 
+test("receiver address drafts survive polling and invalid fixed settings block ON without blocking OFF", () => {
+  const local = deviceUiFixture();
+  local.projection!.receiver.confirmed = true;
+  local.projection!.receiver.enabled = true;
+  editDeviceNetworkField(local, "bind_ip", "192.168.10.22", false);
+  editDeviceNetworkField(local, "port", "7443", false);
+  assert.equal(deviceCanReceive(local, true), true);
+  const newer = deviceProjection({ revision: "4", generation: "8" });
+  newer.receiver = { ...newer.receiver, confirmed: true, enabled: true, bind_ip: "10.0.0.8", port: 7332 };
+  acceptDeviceNetworkProjection(local, newer);
+  assert.equal(local.bindIp, "192.168.10.22");
+  assert.equal(local.port, "7443");
+  assert.equal(deviceCanReceive(local, true), false);
+  acceptDeviceNetworkProjection(local, newer, { reviewLatest: true });
+  assert.equal(deviceCanReceive(local, true), true);
+  for (const ip of ["0.0.0.0", "224.0.0.1", "255.255.255.255", "192.168.1.999", "192.168.1", "localhost"]) {
+    editDeviceNetworkField(local, "bind_ip", ip, false);
+    assert.equal(deviceCanReceive(local, true), false, ip);
+    assert.equal(deviceCanReceive(local, false), true);
+  }
+  editDeviceNetworkField(local, "bind_ip", "", false);
+  for (const port of ["0", "65536", "1.5", "abc"]) {
+    editDeviceNetworkField(local, "port", port, false);
+    assert.equal(deviceCanReceive(local, true), false, port);
+  }
+  editDeviceNetworkField(local, "port", "", false);
+  assert.equal(deviceCanReceive(local, true), true);
+});
+
 test("device and publication identity gate selection; a disconnected selected peer can still be disabled", () => {
   const local = deviceUiFixture();
   const peer = local.projection!.peers[0];
@@ -128,7 +160,7 @@ test("successful participation feedback is a notice while local and projected fa
   local.notice = "Hubに参加しました。公開対象と権限を確認してください。";
   assert.match(feedback()[1], /data-error="false"/);
   assert.equal(feedback()[2], local.notice);
-  local.error = "参加コードを確認してください。";
+  local.error = "Hubの参加申請の状態を確認してください。";
   assert.match(feedback()[1], /data-error="true"/);
   assert.equal(feedback()[2], local.error);
   local.error = "";
@@ -187,6 +219,33 @@ test("joined devices use the model owner with manual connection folded; leaving 
   assert.doesNotMatch(revoked.match(/<details class="device-network-leave"[^>]*>/)![0], /\bhidden\b/);
 });
 
+test("pending approval updates the connected model help through retained settings without replacing the receiver draft", () => {
+  function retainedHelp(html: string) {
+    const match = html.match(/<p id="hub-scope-help"([^>]*)>([^<]*)<\/p>/)!;
+    const attributes = new Map([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(item => [item[1], item[2]]));
+    const region = {
+      textContent: match[2], dataset: { settingsPassive: attributes.get("data-settings-passive") },
+      hasAttribute: (name: string) => attributes.has(name),
+      replaceWith(next: { textContent: string }) { region.textContent = next.textContent; },
+    };
+    return { region, setAttribute() {}, querySelector: () => null,
+      querySelectorAll: (selector: string) => selector === "[data-settings-passive]" && region.dataset.settingsPassive ? [region] : [] };
+  }
+  const local = deviceUiFixture();
+  acceptDeviceNetworkProjection(local, deviceProjection({ enrollment: "pending", device_id: null }));
+  editDeviceNetworkField(local, "target", "project:project-a", false);
+  const draft = structuredClone(local.target);
+  const hub = createHubUiState();
+  const current = retainedHelp(renderHubOverlay(hub, deviceNetworkPresentation(local)));
+  assert.match(current.region.textContent, /手動接続は同じPC/);
+  acceptDeviceNetworkProjection(local, deviceProjection({ generation: "8" }));
+  const next = retainedHelp(renderHubOverlay(hub, deviceNetworkPresentation(local)));
+  synchronizeRetainedSettingsSurface(current as unknown as HTMLElement, next as unknown as HTMLElement, false);
+  assert.match(current.region.textContent, /端末連携で参加したHubからモデルを取得/);
+  assert.doesNotMatch(current.region.textContent, /手動接続は同じPC/);
+  assert.deepEqual(local.target, draft);
+});
+
 test("a newly inserted job cannot apply its Stop availability to the retained previous job button", () => {
   function controls(html: string) {
     return [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map(match => {
@@ -210,4 +269,20 @@ test("a newly inserted job cannot apply its Stop availability to the retained pr
   local.jobs.outgoing[1].can_stop = false;
   synchronizeRetainedSettingsSurface(modal(current), modal(controls(renderDeviceNetworkJobs(local))), false);
   assert.equal(original.disabled, true, "the same exact job's later completion closes its Stop control");
+});
+
+test("administrator stop and credential revocation stay distinct while pending approval preserves receiver drafts", () => {
+  const local = deviceUiFixture();
+  editDeviceNetworkField(local,"target","project:project-a",false);
+  const target = structuredClone(local.target);
+  acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"stopped",error:"device_stopped",generation:"8"}));
+  assert.match(renderDeviceNetwork(local),/Hub管理者による利用停止中/);
+  assert.equal(deviceCanReceive(local,true),false);
+  acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"revoked",error:"device_revoked",generation:"9"}));
+  assert.match(renderDeviceNetwork(local),/端末の認証が失効しています/);
+  assert.deepEqual(local.target,target);
+  acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"active",generation:"10"}));
+  assert.match(local.notice,/承認され、接続しました/);
+  assert.deepEqual(local.target,target);
+  assert.equal(local.receiverConfirmed,false);
 });

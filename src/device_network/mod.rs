@@ -4,6 +4,9 @@
 //! runtime grants and receiver authority are never model configuration.
 
 mod client;
+mod diagnostics;
+pub use diagnostics::{DeviceDiagnostic, DiagnosticScope};
+mod http;
 mod identity;
 mod outgoing;
 mod receiver;
@@ -11,11 +14,15 @@ mod service;
 mod settings;
 pub(crate) use client::{DeviceClient, DeviceGrant, DirectoryPeer};
 pub use client::{GrantClaims, VerifiedGrant};
+pub(crate) use http::ManagedHubHttp;
 pub(crate) use identity::{DeviceIdentity, DeviceIdentityStore};
 pub use outgoing::{DeviceDelegationRow, DeviceNetworkJobs};
+pub(crate) use outgoing::{canonical_key as history_request_key, server_id as history_server_id};
 pub(crate) use service::WeakDeviceNetwork;
 pub use service::{DeviceNetworkProjection, DeviceNetworkService};
-pub use settings::{DeviceSettings, DeviceSettingsStore, ReceiverSettings, SelectedPeer};
+pub use settings::{
+    DeviceSettings, DeviceSettingsStore, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -94,14 +101,28 @@ pub enum DeviceError {
     EnrollmentDenied,
     #[error("device_revoked")]
     Revoked,
+    #[error("device_stopped")]
+    Stopped,
+    #[error("join_superseded")]
+    JoinSuperseded,
     #[error("policy_denied")]
     PolicyDenied,
     #[error("grant_denied")]
     GrantDenied,
+    #[error("authority_retired")]
+    AuthorityRetired,
+    #[error("recovery_required")]
+    RecoveryRequired,
+    #[error("artifacts_unavailable")]
+    ArtifactsUnavailable,
     #[error("invalid_response")]
     InvalidResponse,
     #[error("receiver_busy")]
     ReceiverBusy,
+    #[error("receiver_port_in_use")]
+    ReceiverPortInUse,
+    #[error("receiver_address_unavailable")]
+    ReceiverAddressUnavailable,
     #[error("confirmation_required")]
     ConfirmationRequired,
 }

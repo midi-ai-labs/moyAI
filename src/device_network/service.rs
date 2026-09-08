@@ -10,13 +10,18 @@ use tokio_util::sync::CancellationToken;
 use super::client::EnrollmentReceipt;
 use super::{
     DeviceClient, DeviceError, DeviceIdentity, DeviceIdentityStore, DeviceSettings,
-    DeviceSettingsStore, DirectoryPeer, ReceiverSettings, SelectedPeer, SharedHubConfig,
-    canonical_revision,
+    DeviceSettingsStore, DirectoryPeer, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
+    SharedHubConfig, canonical_revision,
 };
 use crate::config::{AccessMode, ResolvedConfig};
 use crate::mcp_publish::{PublishService, PublishTarget};
 use crate::remote_agent::RemoteJobService;
 use crate::storage::StoreBundle;
+
+mod enrollment;
+#[cfg(test)]
+mod enrollment_tests;
+mod history;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceTargetChoice {
@@ -28,7 +33,7 @@ pub struct DeviceTargetChoice {
 mod lifecycle_tests {
     use super::*;
     use crate::storage::{SqliteStore, StoragePaths};
-    async fn fixture() -> (tempfile::TempDir, DeviceNetworkService) {
+    pub(super) async fn fixture() -> (tempfile::TempDir, DeviceNetworkService) {
         let temp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
         let workspace = root.join("workspace");
@@ -242,7 +247,58 @@ mod lifecycle_tests {
             .unwrap();
         assert!(!off.receiver.enabled);
     }
+
+    #[tokio::test]
+    async fn changed_certificate_ip_requires_renewal_after_restart_without_a_listener() {
+        let (_temp, service) = fixture().await;
+        let identity = service.inner.identity.load_or_create().unwrap();
+        let key = rcgen::KeyPair::from_pem(identity.private_key_pem()).unwrap();
+        let old = rcgen::CertificateParams::new(vec!["127.0.0.2".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let shared = SharedHubConfig {
+            hub_url: format!("https://{address}"),
+            ca_certificate_pem: old.pem(),
+        };
+        let client = DeviceClient::new(
+            &shared,
+            Some((&identity, &old.pem())),
+            "device-fixture".into(),
+        )
+        .unwrap();
+        {
+            let mut state = service.inner.state.lock().unwrap();
+            state.settings.device_id = Some("device-fixture".into());
+            state.settings.certificate_pem = Some(old.pem());
+            state.settings.expires_at_ms = Some(
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 30 * 86400 * 1000)
+                    .to_string(),
+            );
+            state.shared = shared;
+            state.identity = Some(identity);
+            state.client = Some(client);
+        }
+        assert!(service.inner.receiver.lock().await.is_none());
+        assert_eq!(
+            service.renew_if_needed().await,
+            Err(DeviceError::Unavailable),
+            "a changed SAN must attempt renewal even without a listener; an unreachable Hub must keep reception closed"
+        );
+        assert!(service.inner.receiver.lock().await.is_none());
+        assert!(!service.projection_now().receiver.enabled);
+    }
 }
+#[cfg(test)]
+#[path = "service/renewal_tests.rs"]
+mod renewal_tests;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicePeerProjection {
     pub device_id: String,
@@ -265,6 +321,8 @@ pub struct DeviceReceiverProjection {
     pub model_mode: crate::hub::HubRouteMode,
     pub start_on_launch: bool,
     pub keep_when_hidden: bool,
+    pub bind_ip: Option<Ipv4Addr>,
+    pub port: Option<u16>,
     pub confirmed: bool,
     pub endpoint: Option<String>,
     pub can_change: bool,
@@ -278,6 +336,8 @@ pub struct DeviceNetworkProjection {
     pub device_id: Option<String>,
     pub display_name: String,
     pub local_hostname: String,
+    pub request_id: Option<String>,
+    pub local_ipv4: Option<String>,
     pub enrollment: String,
     pub receiver: DeviceReceiverProjection,
     pub targets: Vec<DeviceTargetChoice>,
@@ -326,6 +386,7 @@ pub(super) struct DeviceState {
     pub status: &'static str,
     pub client: Option<DeviceClient>,
     pub identity: Option<DeviceIdentity>,
+    pending_join: Option<enrollment::PendingJoin>,
     pub peers: Vec<DirectoryPeer>,
     pub receiver_status: &'static str,
     pub receiver_endpoint: Option<String>,
@@ -357,6 +418,48 @@ impl std::fmt::Debug for DeviceNetworkService {
 }
 
 impl DeviceNetworkService {
+    pub(crate) fn remote_jobs(&self) -> RemoteJobService {
+        self.inner.jobs.clone()
+    }
+    pub(crate) async fn acknowledge_incoming_job(
+        &self,
+        authority: &super::VerifiedGrant,
+        job_id: &str,
+    ) -> Result<(), DeviceError> {
+        {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            if state.closing
+                || state.settings.device_id.as_ref() != Some(&authority.claims().audience_device_id)
+                || state.settings.hub_id.as_ref() != Some(&authority.claims().hub_id)
+            {
+                return Err(DeviceError::GrantDenied);
+            }
+        }
+        self.client()?
+            .acknowledge_job(&authority.grant_id, job_id)
+            .await
+    }
+    pub(crate) async fn settle_incoming_job(
+        &self,
+        grant_id: &str,
+        job_id: &str,
+        state: &str,
+    ) -> Result<(), DeviceError> {
+        // Settlement is allowed during local shutdown; Hub still validates the exact audience.
+        let client = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .client
+            .clone()
+            .ok_or(DeviceError::Unavailable)?;
+        client.settle_job(grant_id, job_id, state).await
+    }
     pub(crate) fn execution_identity(
         &self,
         authority: &super::VerifiedGrant,
@@ -420,14 +523,29 @@ impl DeviceNetworkService {
             Err(error) => (DeviceSettings::default(), Some(error)),
         };
         let identity = identity_store.load();
-        let error = error.or(identity.as_ref().err().copied());
+        let pending = if settings.device_id.is_none() {
+            enrollment::PendingJoin::load(
+                &directory,
+                &config.device_network,
+                identity.as_ref().ok().and_then(Option::as_ref),
+            )
+        } else {
+            Ok(None)
+        };
+        let error = error
+            .or(identity.as_ref().err().copied())
+            .or(pending.as_ref().err().copied());
         let shared = config.device_network.clone();
         let status = if error.is_some() {
             "error"
         } else if !shared.configured() {
             "unconfigured"
         } else if settings.device_id.is_none() {
-            "not_enrolled"
+            pending
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map_or("not_enrolled", enrollment::PendingJoin::status)
         } else {
             "disconnected"
         };
@@ -438,6 +556,7 @@ impl DeviceNetworkService {
             status,
             client: None,
             identity: identity.ok().flatten(),
+            pending_join: pending.ok().flatten(),
             peers: vec![],
             receiver_status: "stopped",
             receiver_endpoint: None,
@@ -567,8 +686,15 @@ impl DeviceNetworkService {
             hub_url: state.shared.hub_url.clone(),
             device_id: state.settings.device_id.clone(),
             display_name: state.settings.label.clone(),
-            local_hostname: std::env::var("COMPUTERNAME")
-                .unwrap_or_else(|_| "moyAI Desktop".into()),
+            local_hostname: enrollment::local_device_label(),
+            request_id: state
+                .pending_join
+                .as_ref()
+                .map(|pending| pending.receipt.request_id.clone()),
+            local_ipv4: state
+                .pending_join
+                .as_ref()
+                .map(|pending| pending.ip.to_string()),
             enrollment: state.status.into(),
             receiver: DeviceReceiverProjection {
                 profile_id: receiver.profile_id.0.to_string(),
@@ -579,6 +705,8 @@ impl DeviceNetworkService {
                 model_mode: receiver.model_mode,
                 start_on_launch: receiver.start_on_launch,
                 keep_when_hidden: receiver.keep_when_hidden,
+                bind_ip: receiver.bind_ip,
+                port: receiver.port,
                 confirmed: receiver.confirmed,
                 endpoint: state.receiver_endpoint.clone(),
                 can_change: !state.closing && state.receiver_status != "starting",
@@ -604,7 +732,8 @@ impl DeviceNetworkService {
             can_join: !state.closing
                 && state.shared.configured()
                 && state.settings.device_id.is_none()
-                && state.status != "pending",
+                && !matches!(state.status, "pending" | "revoked" | "stopped")
+                && state.error != Some(DeviceError::JoinSuperseded),
             can_leave: !state.closing
                 && state.status != "pending"
                 && state.settings.device_id.is_some(),
@@ -625,7 +754,7 @@ impl DeviceNetworkService {
             .state
             .lock()
             .map_err(|_| DeviceError::Unavailable)?;
-        if state.closing || state.status != "active" {
+        if state.closing || !matches!(state.status, "active" | "stopped") {
             return Err(DeviceError::Unavailable);
         }
         state.client.clone().ok_or(DeviceError::Unavailable)
@@ -672,6 +801,9 @@ impl DeviceNetworkService {
             return Err(DeviceError::ConnectionChanged);
         }
         commit()?;
+        if state.shared != shared {
+            state.pending_join = None;
+        }
         state.shared = shared;
         state.generation += 1;
         state.status = if state.settings.device_id.is_some() {
@@ -713,11 +845,15 @@ impl DeviceNetworkService {
             (state.shared.clone(), identity)
         };
         let result = async {
-            let client = DeviceClient::new(&shared, None, String::new())?;
+            let bind_ip = self.inner.state.lock().unwrap().settings.receiver.bind_ip;
+            let client = DeviceClient::new_from(&shared, None, String::new(), bind_ip)?;
             let ip = client.route_ip().await?;
             let csr = self.stable_csr(&identity, ip)?;
             let receipt = client.enroll(code.trim(), &csr).await?;
-            self.adopt_receipt(receipt, &shared, &identity, generation)?;
+            if !super::identity::certificate_covers_ip(&receipt.certificate_pem, ip)? {
+                return Err(DeviceError::InvalidResponse);
+            }
+            self.adopt_receipt(receipt, &shared, &identity, generation, None)?;
             Ok::<(), DeviceError>(())
         }
         .await;
@@ -781,7 +917,8 @@ impl DeviceNetworkService {
         shared: &SharedHubConfig,
         identity: &DeviceIdentity,
         generation: &str,
-    ) -> Result<(), DeviceError> {
+        transport: Option<super::ManagedHubHttp>,
+    ) -> Result<reqwest::Client, DeviceError> {
         use sha2::{Digest, Sha256};
         use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
         let supplied = CertificateDer::from_pem_slice(receipt.ca_certificate_pem.as_bytes())
@@ -801,11 +938,24 @@ impl DeviceNetworkService {
             &shared.ca_certificate_pem,
         )
         .map_err(|_| DeviceError::InvalidIdentity)?;
-        let client = DeviceClient::new(
+        let bind_ip = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .settings
+            .receiver
+            .bind_ip;
+        let mut client = DeviceClient::new_from(
             shared,
             Some((identity, &receipt.certificate_pem)),
             receipt.device_id.clone(),
+            bind_ip,
         )?;
+        let http = client.http().snapshot();
+        if let Some(transport) = transport {
+            client.use_transport(transport);
+        }
         let mut state = self
             .inner
             .state
@@ -838,7 +988,7 @@ impl DeviceNetworkService {
         state.status = "active";
         state.error = None;
         state.generation += 1;
-        Ok(())
+        Ok(http)
     }
     pub async fn resume(&self) -> Result<DeviceNetworkProjection, DeviceError> {
         self.resume_with_startup(true).await
@@ -847,6 +997,19 @@ impl DeviceNetworkService {
         &self,
         startup: bool,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let join = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            !state.closing && state.settings.device_id.is_none() && state.shared.configured()
+        };
+        if join {
+            let result = self.refresh_join(None).await;
+            self.start_heartbeat();
+            return result;
+        }
         let _lane = self.inner.lane.lock().await;
         {
             let mut state = self
@@ -869,12 +1032,22 @@ impl DeviceNetworkService {
                 .certificate_pem
                 .as_deref()
                 .ok_or(DeviceError::InvalidIdentity)?;
-            state.client = Some(DeviceClient::new(
+            state.client = Some(DeviceClient::new_from(
                 &state.shared,
                 Some((identity, certificate)),
                 device_id,
+                state.settings.receiver.bind_ip,
             )?);
             state.status = "active";
+        }
+        if let Err(error) = self.refresh_certificate().await {
+            let mut state = self.inner.state.lock().unwrap();
+            state.status = "error";
+            state.error = Some(error);
+            drop(state);
+            drop(_lane);
+            self.start_heartbeat();
+            return Ok(self.projection_now());
         }
         drop(_lane);
         let result = self.refresh_connected().await;
@@ -897,6 +1070,19 @@ impl DeviceNetworkService {
         self.projection_now()
     }
     pub async fn refresh(&self) -> Result<DeviceNetworkProjection, DeviceError> {
+        let join = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            !state.closing && state.settings.device_id.is_none() && state.shared.configured()
+        };
+        if join {
+            let result = self.refresh_join(None).await;
+            self.start_heartbeat();
+            return result;
+        }
         let reconnect = {
             let state = self
                 .inner
@@ -927,6 +1113,12 @@ impl DeviceNetworkService {
         let result = async {
             client.presence().await?;
             let own = client.self_status().await?;
+            if own.admission == super::client::DeviceAdmission::Stopped {
+                if own.device_id != client.device_id || Some(&own.hub_id) != hub_id.as_ref() {
+                    return Err(DeviceError::InvalidResponse);
+                }
+                return Ok((Vec::new(), own));
+            }
             let directory = client.directory(None).await?;
             if own.device_id != client.device_id
                 || Some(&own.hub_id) != hub_id.as_ref()
@@ -976,8 +1168,19 @@ impl DeviceNetworkService {
                         state.settings = self.inner.settings.save(&settings)?;
                     }
                     state.peers = peers;
-                    state.status = "active";
-                    state.error = None;
+                    let stopped = own.admission == super::client::DeviceAdmission::Stopped;
+                    state.status = if stopped { "stopped" } else { "active" };
+                    state.error = if stopped {
+                        Some(DeviceError::Stopped)
+                    } else {
+                        None
+                    };
+                    if stopped {
+                        state.receiver_status = "paused";
+                        self.inner
+                            .jobs
+                            .set_network_accepting(state.settings.receiver.profile_id, false);
+                    }
                 }
                 Err(error) => {
                     state.status = if error == DeviceError::Revoked {
@@ -997,6 +1200,7 @@ impl DeviceNetworkService {
                 }
             }
         }
+        let active = self.inner.state.lock().unwrap().status == "active";
         if accepted {
             if let Err(error) = self.announce_receiver_with(&client).await {
                 let mut state = self.inner.state.lock().unwrap();
@@ -1006,7 +1210,10 @@ impl DeviceNetworkService {
                     .jobs
                     .set_network_accepting(state.settings.receiver.profile_id, false);
             }
-            self.adopt_model_session(false).await;
+            if active {
+                self.adopt_model_session(false).await;
+            }
+            self.serve_history_requests(&client, generation).await;
         }
         Ok(self.projection_now())
     }
@@ -1060,6 +1267,42 @@ impl DeviceNetworkService {
         revision: &str,
         generation: &str,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let bind = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .settings
+            .receiver
+            .bind();
+        self.receiver_with_bind(
+            enabled,
+            target,
+            access_mode,
+            model_mode,
+            confirmed,
+            start_on_launch,
+            keep_when_hidden,
+            bind,
+            revision,
+            generation,
+        )
+        .await
+    }
+    pub async fn receiver_with_bind(
+        &self,
+        enabled: bool,
+        target: PublishTarget,
+        access_mode: AccessMode,
+        model_mode: crate::hub::HubRouteMode,
+        confirmed: bool,
+        start_on_launch: bool,
+        keep_when_hidden: bool,
+        bind: ReceiverBindSettings,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        bind.validate()?;
         let _lane = self.inner.lane.lock().await;
         let old = {
             let state = self
@@ -1080,9 +1323,16 @@ impl DeviceNetworkService {
         if enabled {
             self.client()?;
         }
+        if let Some(ip) = bind.bind_ip {
+            let socket = tokio::net::UdpSocket::bind((ip, 0))
+                .await
+                .map_err(|_| DeviceError::ReceiverAddressUnavailable)?;
+            drop(socket);
+        }
         if old.receiver.target != target
             || old.receiver.access_mode != access_mode
             || old.receiver.model_mode != model_mode
+            || old.receiver.bind() != bind
         {
             if self.inner.jobs.has_active_profile(old.receiver.profile_id) {
                 return Err(DeviceError::ReceiverBusy);
@@ -1091,7 +1341,9 @@ impl DeviceNetworkService {
             if self.inner.receiver.lock().await.is_some() {
                 return Err(DeviceError::ReceiverBusy);
             }
-            self.inner.jobs.cancel_profile(old.receiver.profile_id);
+            if !same_authority {
+                self.inner.jobs.cancel_profile(old.receiver.profile_id);
+            }
         }
         crate::mcp_publish::dispatch::validate_target(
             &self.inner.store,
@@ -1110,6 +1362,8 @@ impl DeviceNetworkService {
             confirmed,
             start_on_launch,
             keep_when_hidden,
+            bind_ip: bind.bind_ip,
+            port: bind.port,
         };
         let saved = self.inner.settings.save(&next)?;
         {
@@ -1138,29 +1392,74 @@ impl DeviceNetworkService {
         let weak = self.downgrade();
         tokio::spawn(async move {
             loop {
-                tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(10)) => {} }
+                let delay = weak
+                    .upgrade()
+                    .map(|service| {
+                        let state = service.inner.state.lock().unwrap();
+                        if state.status == "pending" && state.error.is_none() {
+                            2
+                        } else {
+                            10
+                        }
+                    })
+                    .unwrap_or(10);
+                tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(delay)) => {} }
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
                 if service.inner.state.lock().unwrap().generation != generation {
                     break;
                 }
-                let _ = service.refresh_connected().await;
+                let pending = {
+                    let state = service.inner.state.lock().unwrap();
+                    state.settings.device_id.is_none()
+                        && state.shared.configured()
+                        && state.status != "revoked"
+                };
+                if pending {
+                    let _ = service.refresh_join(None).await;
+                } else {
+                    let _ = service.refresh_connected().await;
+                }
                 let _ = service.renew_if_needed().await;
                 service.poll_outgoing().await;
+                service
+                    .inner
+                    .jobs
+                    .reconcile_network_receipts(service.clone())
+                    .await;
             }
         });
     }
     async fn renew_if_needed(&self) -> Result<(), DeviceError> {
         let _lane = self.inner.lane.lock().await;
-        let (client, identity, shared, generation, expiry) = {
+        let renewed = match self.refresh_certificate().await {
+            Ok(renewed) => renewed,
+            Err(DeviceError::ReceiverBusy) => return Ok(()),
+            Err(error) => {
+                self.inner.state.lock().unwrap().error = Some(error);
+                return Err(error);
+            }
+        };
+        if renewed || self.receiver_certificate_changed().await {
+            if let Err(error) = self.restart_receiver_certificate().await {
+                self.inner.state.lock().unwrap().error = Some(error);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    /// Called under the device command lane. The signed leaf, not a live listener,
+    /// decides whether a changed route needs enrollment renewal.
+    pub(super) async fn refresh_certificate(&self) -> Result<bool, DeviceError> {
+        let (client, identity, shared, generation, expiry, certificate, bind_ip) = {
             let state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| DeviceError::Unavailable)?;
             let Some(client) = state.client.clone() else {
-                return Ok(());
+                return Ok(false);
             };
             (
                 client,
@@ -1173,30 +1472,52 @@ impl DeviceNetworkService {
                     .as_deref()
                     .and_then(canonical_revision)
                     .unwrap_or(0),
+                state
+                    .settings
+                    .certificate_pem
+                    .clone()
+                    .ok_or(DeviceError::InvalidIdentity)?,
+                state.settings.receiver.bind_ip,
             )
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let ip = client.route_ip().await?;
-        let changed_ip = self
-            .inner
-            .receiver
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|receiver| receiver.ip != ip);
-        if expiry > now.saturating_add(7 * 86400 * 1000) && !changed_ip {
-            return Ok(());
+        let candidate = DeviceClient::new_from(
+            &shared,
+            Some((&identity, &certificate)),
+            client.device_id.clone(),
+            bind_ip,
+        )?;
+        let ip = candidate.route_ip().await?;
+        let changed_ip = !super::identity::certificate_covers_ip(&certificate, ip)?;
+        let renew = expiry <= now.saturating_add(7 * 86400 * 1000) || changed_ip;
+        if !renew && client.local_ip() == bind_ip {
+            return Ok(false);
         }
-        let csr = self.stable_csr(&identity, ip)?;
-        let receipt = client.renew(&csr).await?;
-        self.adopt_receipt(receipt, &shared, &identity, &generation)?;
-        self.restart_receiver_certificate().await?;
-        self.adopt_model_session(true).await;
-        self.start_heartbeat();
-        Ok(())
+        let http = client.http();
+        let rotation = http.try_rotate().ok_or(DeviceError::ReceiverBusy)?;
+        if renew {
+            let csr = self.stable_csr(&identity, ip)?;
+            let receipt = candidate.renew(&csr).await?;
+            if !super::identity::certificate_covers_ip(&receipt.certificate_pem, ip)? {
+                return Err(DeviceError::InvalidResponse);
+            }
+            let fresh = self.adopt_receipt(receipt, &shared, &identity, &generation, Some(http))?;
+            rotation.replace(fresh);
+        } else {
+            let fresh = candidate.http().snapshot();
+            let mut candidate = candidate;
+            candidate.use_transport(http);
+            self.inner.state.lock().unwrap().client = Some(candidate);
+            rotation.replace(fresh);
+        }
+        drop(rotation);
+        if renew {
+            self.start_heartbeat();
+        }
+        Ok(renew)
     }
     pub fn begin_shutdown(&self) {
         let mut state = self

@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ActionContext } from "../src/actions.ts";
-import { DESKTOP_COMMAND_OBSERVER_SYMBOL } from "../src/api.ts";
-import { joinDeviceNetwork, loadDeviceNetwork, refreshDeviceNetworkJobs, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "../src/device_network_actions.ts";
+import { importDeviceNetwork, joinDeviceNetwork, loadDeviceNetwork, refreshDeviceNetworkJobs, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "../src/device_network_actions.ts";
 import { acceptDeviceNetworkProjection, devicePeerKey, editDeviceNetworkField, type DeviceNetworkProjection } from "../src/device_network_state.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
 
@@ -29,40 +28,33 @@ async function withContext(invoke: (name: string, args: Record<string, unknown>)
   finally { globals.forEach((key, index) => { if (originals[index]) Object.defineProperty(globalThis, key, originals[index]!); else delete (globalThis as Record<string, unknown>)[key]; }); }
 }
 
-test("one-use join code stays only in the DOM and command delivery; diagnostics redact it", async () => {
+test("public configuration import starts approval enrollment without caller name, code or receiver authority", async () => {
   const calls: { name: string; args: Record<string, unknown> }[] = [];
-  const observations: unknown[] = [];
-  const observer = Symbol.for(DESKTOP_COMMAND_OBSERVER_SYMBOL);
-  const previous = Object.getOwnPropertyDescriptor(globalThis, observer);
-  Object.defineProperty(globalThis, observer, { configurable: true, value: (value: unknown) => observations.push(value) });
-  try {
-    await withContext(async (name, args) => { calls.push({ name, args }); return deviceProjection({ revision: "4", generation: "8" }); }, async ({ context, local, code }) => {
-      acceptDeviceNetworkProjection(local, deviceProjection({ device_id: null, enrollment: "not_enrolled", can_join: true }));
-      await joinDeviceNetwork(context);
-      assert.equal(calls.length, 0);
-      editDeviceNetworkField(local, "join_confirmed", "", true);
-      await joinDeviceNetwork(context);
-      assert.equal(calls[0].name, "device_network_join");
-      assert.deepEqual(calls[0].args, { code: "one-use-private-code", confirmed: true, expectedRevision: "3", expectedGeneration: "7" });
-      assert.equal(code.value, "");
-      assert.doesNotMatch(JSON.stringify(local), /one-use-private-code/);
-      assert.doesNotMatch(JSON.stringify(observations), /one-use-private-code/);
-      assert.match(JSON.stringify(observations), /\[redacted\]/);
-    });
-  } finally { if (previous) Object.defineProperty(globalThis, observer, previous); else delete (globalThis as Record<PropertyKey, unknown>)[observer]; }
+  await withContext(async (name, args) => {
+    calls.push({ name, args });
+    return deviceProjection({ device_id: null, enrollment: "pending", can_join: false, request_id: "request-a", local_ipv4: "192.168.2.10", generation: "8" });
+  }, async ({ context, local }) => {
+    acceptDeviceNetworkProjection(local, deviceProjection({ device_id: null, enrollment: "unconfigured", can_join: false }));
+    await importDeviceNetwork(context);
+    assert.deepEqual(calls, [{name:"device_network_import", args:{expectedRevision:"3",expectedGeneration:"7"}}]);
+    assert.equal(local.projection?.enrollment, "pending");
+    assert.match(local.notice, /承認を待っています/);
+    assert.equal(local.receiverConfirmed, false);
+    assert.equal(local.projection?.receiver.enabled, false);
+    assert.equal(local.projection?.peers.some(peer => peer.selected), false);
+  });
 });
 
-test("failed join keeps the input and pending lane until fresh owner settlement, then corrected code can retry", async () => {
+test("failed enrollment retry preserves the command lane and retries only the latest owner without a code", async () => {
   const recovery = deferred<DeviceNetworkProjection>();
-  const calls: Record<string, unknown>[] = [];
+  const calls: {name:string;args:Record<string,unknown>}[] = [];
   await withContext(async (name, args) => {
     if (name === "device_network_projection") return recovery.promise;
-    calls.push(args);
-    if (args.code === "one-use-private-code") throw "enrollment_denied";
-    return deviceProjection({ revision: "4", generation: "9" });
-  }, async ({ context, local, code }) => {
+    calls.push({name,args});
+    if (calls.length === 1) throw "enrollment_denied";
+    return deviceProjection({ revision: "4", generation: "9", device_id:null, enrollment:"pending", can_join:false });
+  }, async ({ context, local }) => {
     acceptDeviceNetworkProjection(local, deviceProjection({ device_id: null, enrollment: "not_enrolled", can_join: true }));
-    local.joinConfirmed = true;
     const first = joinDeviceNetwork(context);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(local.pending, "join");
@@ -71,12 +63,10 @@ test("failed join keeps the input and pending lane until fresh owner settlement,
     recovery.resolve(deviceProjection({ device_id: null, enrollment: "error", can_join: true, generation: "8" }));
     await first;
     assert.equal(local.pending, null);
-    assert.match(local.error, /参加コード/);
-    assert.equal(code.value, "one-use-private-code");
-    code.value = "corrected-code";
+    assert.match(local.error, /参加申請/);
     await joinDeviceNetwork(context);
-    assert.equal(calls[1].expectedGeneration, "8");
-    assert.equal(local.projection?.enrollment, "active");
+    assert.deepEqual(calls[1], {name:"device_network_request_join",args:{expectedRevision:"3",expectedGeneration:"8"}});
+    assert.equal(local.projection?.enrollment, "pending");
   });
 });
 
@@ -87,6 +77,8 @@ test("stale load completion cannot replace a newer owner or its receiver draft",
     ++local.requestSerial; local.pending = null;
     acceptDeviceNetworkProjection(local, deviceProjection({ revision: "9", generation: "11" }));
     editDeviceNetworkField(local, "access", "full_access", false);
+    editDeviceNetworkField(local, "bind_ip", "192.168.2.22", false);
+    editDeviceNetworkField(local, "port", "invalid draft", false);
     editDeviceNetworkField(local, "search", "Win20", false);
     view.overlay = "none";
     old.resolve(deviceProjection());
@@ -104,13 +96,45 @@ test("receiver OFF sends the persisted grant and retains edited authority rather
     local.projection!.receiver.enabled = true;
     editDeviceNetworkField(local, "target", "project:project-a", false);
     editDeviceNetworkField(local, "access", "full_access", false);
+    editDeviceNetworkField(local, "bind_ip", "192.168.2.22", false);
+    editDeviceNetworkField(local, "port", "invalid draft", false);
     const draft = structuredClone(local.target);
     await setDeviceReceiver(context, false);
     assert.deepEqual(calls, [{ name: "device_network_receiver", args: { enabled: false, target: { kind: "temp" }, accessMode: "default",
-      modelMode: "hub", confirmed: false, startOnLaunch: false, keepWhenHidden: false, expectedRevision: "3", expectedGeneration: "7" } }]);
+      modelMode: "hub", confirmed: false, startOnLaunch: false, keepWhenHidden: false, bindIp: null, port: null, expectedRevision: "3", expectedGeneration: "7" } }]);
     assert.deepEqual(local.target, draft);
     assert.equal(local.accessMode, "full_access");
     assert.equal(local.dirty, true);
+    assert.equal(local.bindIp, "192.168.2.22");
+    assert.equal(local.port, "invalid draft");
+  });
+});
+
+test("receiver ON delivers fixed address and port with the reviewed owner; automatic settings remain null", async () => {
+  const calls: Record<string, unknown>[] = [];
+  await withContext(async (_name, args) => {
+    calls.push(args);
+    const projection = deviceProjection({ revision: String(3 + calls.length), generation: String(7 + calls.length) });
+    projection.receiver = { ...projection.receiver, confirmed: true, enabled: true,
+      bind_ip: args.bindIp as string | null, port: args.port as number | null };
+    return projection;
+  }, async ({ context, local }) => {
+    local.projection!.receiver.confirmed = true;
+    editDeviceNetworkField(local, "bind_ip", " 192.168.2.22 ", false);
+    editDeviceNetworkField(local, "port", "7443", false);
+    await setDeviceReceiver(context, true);
+    assert.equal(calls[0].bindIp, "192.168.2.22");
+    assert.equal(calls[0].port, 7443);
+    assert.equal(calls[0].expectedRevision, "3");
+    assert.equal(calls[0].expectedGeneration, "7");
+    assert.equal(local.bindIp, "192.168.2.22");
+    assert.equal(local.port, "7443");
+    editDeviceNetworkField(local, "bind_ip", "", false);
+    editDeviceNetworkField(local, "port", "", false);
+    await setDeviceReceiver(context, true);
+    assert.equal(calls[1].bindIp, null);
+    assert.equal(calls[1].port, null);
+    assert.equal(local.port, "");
   });
 });
 

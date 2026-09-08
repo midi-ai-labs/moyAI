@@ -13,6 +13,7 @@ import { icon } from "./icons.ts";
 import { renderMcpPeers } from "./mcp_peer.ts";
 import { renderHubOverlay } from "./hub_render.ts";
 import { renderPublishOverlay } from "./mcp_publish_render.ts";
+import { renderMcpHistoryOverlay } from "./mcp_history_render.ts";
 import { hubExecutionRoute } from "./hub_state.ts";
 import { transcriptAnchors, turnPageLoadPending } from "./history_navigation.ts";
 import { renderMarkdown } from "./markdown.ts";
@@ -244,7 +245,9 @@ function applyActionAvailabilityToButtons(html: string, model: DesktopRenderMode
       index: Number(htmlAttribute(tag, "data-index") ?? "-1"),
       value: htmlAttribute(tag, "data-agent-path")
         ?? htmlAttribute(tag, "data-history-target")
+        ?? htmlAttribute(tag, "data-provider-profile")
         ?? htmlAttribute(tag, "data-mode")
+        ?? htmlAttribute(tag, "data-value")
         ?? "",
     };
     const enabled = actionEnabledById(action, model, payload);
@@ -457,7 +460,7 @@ function renderInitialSetupStartStep(
           <strong>Hubでモデルを割り当てる構成で開始</strong>
           <p>Hub管理者の共通設定ファイルを保存し、端末の参加へ進みます。このPCのモデル接続設定を先に入力する必要はありません。</p>
           <button id="initial-setup-hub" data-action="initial-setup-hub">Hubの共通設定で始める</button>
-          <small class="settings-field-help">参加コードと、受付する場合の公開対象・実行権限は次の画面で確認します。</small>
+          <small class="settings-field-help">共通設定の読み込み後、この端末の参加を自動で申請し、Hub管理者の承認を待ちます。受付する場合の公開対象・実行権限は次の画面で確認します。</small>
         </div>
         <div>
           <strong>既定値から設定</strong>
@@ -1008,8 +1011,8 @@ export function renderSidebar(state: DesktopWebState): string {
       <button class="rail-item" data-action="show-hub" title="Hubに接続してモデルを確認">
         <span class="rail-icon">${icon("plug")}</span><span>moyAI Hub</span>
       </button>
-      <button class="rail-item" data-action="show-mcp-publish" title="ツールを公開し、他端末からのタスクを受け付ける">
-        <span class="rail-icon">${icon("plug")}</span><span>MCPを配信</span>
+      <button class="rail-item" data-action="show-mcp-history" title="他端末への指示と、この端末での実行履歴を確認">
+        <span class="rail-icon">${icon("archive")}</span><span>MCP履歴</span>
       </button>
       <div class="rail-section row-heading">
         <span>プロジェクト</span>
@@ -1716,6 +1719,7 @@ export function renderOverlay(
   if (state.overlay === "config") return renderConfigOverlay(state, local);
   if (state.overlay === "hub") return renderHubOverlay(local.hub, local.deviceNetwork);
   if (state.overlay === "mcp_publish") return renderPublishOverlay(local.mcpPublish);
+  if (state.overlay === "mcp_history") return renderMcpHistoryOverlay(local.mcpHistory, Boolean(local.mcpPublish.projection?.profiles.length));
   if (state.overlay === "session_settings") return renderSessionSettingsOverlay(state, local);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
   if (state.overlay === "prompt_review") return renderPromptReviewOverlay(state);

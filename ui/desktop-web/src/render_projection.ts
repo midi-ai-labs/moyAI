@@ -2,6 +2,7 @@ import type { PermissionDecisionState } from "./decision_state.ts";
 import { createHubUiState, hubPresentation, type HubPresentation } from "./hub_state.ts";
 import { createDeviceNetworkUiState, deviceNetworkPresentation, type DeviceNetworkPresentation } from "./device_network_state.ts";
 import { createPublishUiState, publishPresentation, type PublishPresentation } from "./mcp_publish_state.ts";
+import { createMcpHistoryUiState, mcpHistoryPresentation, type McpHistoryPresentation } from "./mcp_history_state.ts";
 import { createMcpPeerState, mcpPeerPresentation, type McpPeerPresentation } from "./mcp_peer.ts";
 import type { LocalConfirmation } from "./render_overlays.ts";
 import type { DesktopViewState } from "./types.ts";
@@ -37,6 +38,7 @@ export interface DesktopRenderLocalPresentation {
   readonly hub: HubPresentation;
   readonly deviceNetwork: DeviceNetworkPresentation;
   readonly mcpPublish: PublishPresentation;
+  readonly mcpHistory: McpHistoryPresentation;
   readonly mcpPeers: McpPeerPresentation;
   readonly artifactPane: {
     readonly collapsed: boolean;
@@ -100,6 +102,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
     hub: hubPresentation(createHubUiState()),
     deviceNetwork: deviceNetworkPresentation(createDeviceNetworkUiState()),
     mcpPublish: publishPresentation(createPublishUiState()),
+    mcpHistory: mcpHistoryPresentation(createMcpHistoryUiState()),
     mcpPeers: mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
       collapsed: false,
@@ -207,6 +210,7 @@ function snapshotLocalPresentation(
     hub: local.hub ?? hubPresentation(createHubUiState()),
     deviceNetwork: local.deviceNetwork ?? deviceNetworkPresentation(createDeviceNetworkUiState()),
     mcpPublish: local.mcpPublish ?? publishPresentation(createPublishUiState()),
+    mcpHistory: local.mcpHistory ?? mcpHistoryPresentation(createMcpHistoryUiState()),
     mcpPeers: local.mcpPeers ?? mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
       collapsed: local.artifactPane.collapsed,

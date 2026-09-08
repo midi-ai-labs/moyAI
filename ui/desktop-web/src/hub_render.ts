@@ -3,7 +3,7 @@ import { escapeHtml } from "./utils.ts";
 import { renderDeviceNetwork } from "./device_network_render.ts";
 import type { DeviceNetworkPresentation } from "./device_network_state.ts";
 import {
-  createHubUiState, hubActiveRoute, hubCanSave, hubCanSetRouteMode, hubDraftHasChanges,
+  createHubUiState, hubActiveRoute, hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, hubDraftHasChanges,
   hubErrorText, hubRouteMode, hubRouteModeBlocker, hubSaveFeedback,
   type HubContext, type HubPresentation,
 } from "./hub_state.ts";
@@ -49,6 +49,7 @@ function channelMarkup(local: HubPresentation, context: HubContext): string {
       <strong>${escapeHtml(routeStatus)}</strong><span>${escapeHtml(routeBlocker ?? "切り替えは次の依頼から適用します。Hub利用時に直接接続へ自動では切り替えません。")}</span>
     </div>
     <p class="hub-help">利用候補に含めるモデルを選びます。${context === "main" ? "Main" : "Side"}の選択は独立して保存されます。</p>
+    ${context === "main" ? `<button data-action="hub-main-recommendation" ${hubCanUseRecommendation(local) ? "" : "disabled"}>Hubの推奨候補を選ぶ</button><p class="hub-help">候補を選んで確認・保存し、「Hubを利用」で送信先を切り替えます。直接接続の設定は保持します。</p>` : ""}
     <div class="hub-model-list" data-settings-passive="hub-${context}-models" data-settings-preserve-focused-region>
       ${candidates.length ? candidates.map((model) => `<label class="hub-model-row ${missing.includes(model.id) ? "is-missing" : ""}">
         <input type="checkbox" class="settings-control" data-hub-field="${context}:model:${escapeHtml(model.id)}" id="hub-${context}-model-${escapeHtml(model.id)}" ${draft.selection.allowed_model_ids.includes(model.id) ? "checked" : ""} ${enabled ? "" : "disabled"} />
@@ -84,7 +85,7 @@ export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetwor
     <div class="hub-modal-body settings-content">
       <div id="hub-panel-devices" data-hub-panel="devices" ${local.tab === "devices" ? "" : "hidden"}>${renderDeviceNetwork(network)}</div>
       <div id="hub-panel-models" data-hub-panel="models" ${local.tab === "models" ? "" : "hidden"}>
-      <p id="hub-scope-help" class="hub-scope-note">${managed ? "端末連携で参加したHubからモデルを取得します。" : "Hubを使う場合は、接続してモデルを取得します。手動接続は同じPCのHub向けです。"} 利用モデルを確認・保存し、Main・Sideそれぞれの送信先を切り替えます。Chat Completions対応モデルを利用します。Hub利用中の依頼の整形・Mainの並列サブエージェント実行は未対応です。</p>
+      <p id="hub-scope-help" class="hub-scope-note" data-settings-passive="hub-scope-help">${managed ? "端末連携で参加したHubからモデルを取得します。" : "Hubを使う場合は、接続してモデルを取得します。手動接続は同じPCのHub向けです。"} 利用モデルを確認・保存し、Main・Sideそれぞれの送信先を切り替えます。Chat Completions対応モデルを利用します。Hub利用中の依頼の整形・Mainの並列サブエージェント実行は未対応です。</p>
       <div class="hub-identity" data-settings-passive="hub-model-connection" role="status">モデル接続: ${statusText[status]}${projection?.catalog ? ` · 登録 ${projection.catalog.models.length} モデル · 更新 ${escapeHtml(projection.catalog.revision)}` : ""}${error ? `<p>${escapeHtml(error)}</p>` : ""}</div>
       <details id="hub-manual-connection" data-details-key="hub-manual-connection"><summary>手動のHub接続（既存構成との互換用）</summary>
       <section class="hub-connection" aria-labelledby="hub-connection-title"><div class="hub-section-heading"><h3 id="hub-connection-title">Hubに接続</h3><span class="hub-connection-status" data-settings-passive="hub-connection-status" data-status="${status}">${statusText[status]}</span></div>
@@ -94,7 +95,7 @@ export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetwor
         <div class="hub-connection-actions"><button class="hub-primary" data-action="hub-connect" aria-describedby="hub-connection-feedback" ${projection && !locked ? "" : "disabled"}>${local.pending === "connect" ? "接続しています…" : "Hubに接続"}</button>
         <button data-action="hub-refresh" ${local.pending ? "disabled" : ""}>${local.pending === "refresh" ? "取得しています…" : "最新情報を取得"}</button><button data-action="hub-disconnect" ${projection && status !== "disconnected" && !local.pending ? "" : "disabled"}>接続を解除</button></div>
         <div id="hub-connection-feedback" class="hub-feedback" data-settings-passive="hub-error" role="status" aria-live="polite" ${error ? "" : "hidden"}>${escapeHtml(error)}</div>
-        <p class="hub-help">この開発版は同じPCのHubに接続します。トークンは保存しません。Desktopのウィンドウを閉じると接続を解除し、次回はトークンを入力して再接続します。</p>
+        <p class="hub-help">この手動接続は同じPCのHub向けです。トークンは保存しません。Desktopのウィンドウを閉じると接続を解除し、次回はトークンを入力して再接続します。</p>
         <div class="hub-identity" data-settings-passive="hub-identity">${projection?.hub_id ? `<span>Hub <code>${escapeHtml(projection.hub_id)}</code></span><span>バージョン ${escapeHtml(projection.catalog?.software_version ?? "—")} · 更新番号 ${escapeHtml(projection.catalog?.revision ?? "—")}</span>` : "接続するとHubの識別情報を表示します。"}</div>
       </section>
       </details>

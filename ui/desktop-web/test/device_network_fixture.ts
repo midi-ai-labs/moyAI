@@ -6,14 +6,14 @@ export function deviceProjection(overrides: Partial<DeviceNetworkProjection> = {
     display_name: "Win00", local_hostname: "DESKTOP-00", enrollment: "active",
     receiver: { profile_id: "receiver-00", enabled: false, status: "stopped", target: { kind: "temp" },
       access_mode: "default", model_mode: "hub", start_on_launch: false, keep_when_hidden: false,
-      endpoint: null, can_change: true, confirmed: false, reason: null },
+      bind_ip: null, port: null, endpoint: null, can_change: true, confirmed: false, reason: null },
     targets: [{ target: { kind: "temp" }, label: "Temp（一時作業用）" },
       { target: { kind: "project", project_id: "project-a", workspace_root: "C:/work/project-a" }, label: "プロジェクトA" }],
     peers: [{ device_id: "device-19", profile_id: "receiver-19", display_name: "Win19", name: "Temp受付",
       selected: false, online: true, receiving: true, can_use: true, reason: null },
     { device_id: "device-20", profile_id: "receiver-20", display_name: "Win20", name: "開発受付",
       selected: false, online: true, receiving: true, can_use: true, reason: null }],
-    can_join: false, can_leave: true, error: null, ...overrides,
+    request_id: null, local_ipv4: null, can_join: false, can_leave: true, error: null, ...overrides,
   };
 }
 export function deviceUiFixture() {

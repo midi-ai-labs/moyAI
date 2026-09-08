@@ -10,12 +10,40 @@ import {
   finishLocalDecision,
   finishPermissionDecision,
   permissionDecisionForEscape,
+  permissionDecisionCommandTarget,
   permissionDecisionResponseAccepted,
   permissionDecisionShouldFocusComposer,
   reconcilePermissionDecision,
   recoverPermissionDecisionFromConflict,
   type PermissionDecisionState,
 } from "../src/decision_state.ts";
+
+test("remote approval captures its exact job and ignores Escape, duplicate submission and stale completion", () => {
+  const owner = { permissionDecision: null as PermissionDecisionState | null, nextPermissionSubmissionId: 1 };
+  const remote = { job_id: "job-a", profile_id: "profile-a" };
+  const first = beginPermissionDecision(owner, "remote-request-a", "denied", remote);
+  assert.ok(first);
+  remote.job_id = "job-b";
+  assert.deepEqual(permissionDecisionCommandTarget(first), {
+    confirmationId: "remote-request-a", remoteJobId: "job-a", remoteProfileId: "profile-a",
+  });
+  assert.equal(beginPermissionDecision(owner, "remote-request-a", "approved", remote), null);
+  assert.equal(permissionDecisionForEscape(true, false, true), null);
+  assert.equal(permissionDecisionForEscape(true, false), "abort");
+  reconcilePermissionDecision(owner, "remote-request-b");
+  const second = beginPermissionDecision(owner, "remote-request-b", "abort", remote);
+  assert.ok(second);
+  assert.equal(finishPermissionDecision(owner, first), false);
+  assert.equal(failPermissionDecision(owner, first, "old error"), false);
+  assert.equal(permissionDecisionShouldFocusComposer(second, true, false), false);
+  assert.equal(owner.permissionDecision?.requestId, "remote-request-b");
+  reconcilePermissionDecision(owner, "local-request");
+  assert.equal(beginPermissionDecision(owner, "local-request", "denied"), null);
+  const local = beginPermissionDecision(owner, "local-request", "abort");
+  assert.ok(local);
+  assert.deepEqual(permissionDecisionCommandTarget(local), { confirmationId: "local-request" });
+  assert.equal(permissionDecisionShouldFocusComposer(local, true, false), true);
+});
 
 test("permission decision dispatches once while pending and recovers after failure", () => {
   const owner = {

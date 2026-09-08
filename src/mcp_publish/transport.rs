@@ -400,10 +400,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// HTTP header or a model-supplied permission claim.
 fn authorization_action(method: &str, params: &Value) -> &'static str {
     match method {
-        "initialize" | "notifications/initialized" | "ping" | "tools/list" => "observe",
+        "initialize" | "notifications/initialized" | "ping" | "tools/list" => "inspect",
         "notifications/cancelled" => "cancel",
         "tools/call" => match params.get("name").and_then(Value::as_str) {
-            Some("task_status") => "observe",
+            Some("task_status" | "task_artifacts") => "observe",
             Some("cancel_task") => "cancel",
             _ => "execute",
         },
@@ -473,18 +473,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         .map(|value| value.0.clone())
         .unwrap_or_default();
     let nonpost_authority = if parts.method != Method::POST {
-        match authorize(
-            &shared,
-            &parts.headers,
-            &peer,
-            if parts.method == Method::DELETE {
-                "cancel"
-            } else {
-                "observe"
-            },
-        )
-        .await
-        {
+        match authorize(&shared, &parts.headers, &peer, "inspect").await {
             Ok(authority) => authority,
             Err(response) => return response,
         }

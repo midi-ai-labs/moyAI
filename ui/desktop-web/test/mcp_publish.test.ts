@@ -353,7 +353,8 @@ test("runtime capabilities and dirty state gate start while Stop and revoke rema
 test("publication rendering exposes independent save/start, typed status and bounded read tools without secret values", () => {
   const local = state();
   const markup = renderPublishOverlay(publishPresentation(local));
-  assert.match(markup, /接続先MCPサーバーの設定とは別/);
+  assert.match(markup, /旧配信設定の管理/);
+  assert.match(markup, /証明書の自動設定は「moyAI Hub」の端末連携/);
   assert.match(markup, />設定を保存<\/button>/);
   assert.match(markup, />配信を開始<\/button>/);
   assert.match(markup, /停止中/);

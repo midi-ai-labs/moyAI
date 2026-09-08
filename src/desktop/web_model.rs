@@ -30,6 +30,27 @@ pub struct DesktopPermissionProjection {
     pub agent_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_task_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::remote_agent::approval::RemoteApprovalContext>,
+}
+
+impl From<&PermissionRequest> for DesktopPermissionProjection {
+    fn from(permission: &PermissionRequest) -> Self {
+        Self {
+            summary: permission.summary.clone(),
+            details: permission.details.clone(),
+            targets: permission.targets.iter().map(ToString::to_string).collect(),
+            outside_workspace: permission.outside_workspace,
+            risks: permission
+                .risks
+                .iter()
+                .map(|risk| risk.label().to_string())
+                .collect(),
+            agent_path: permission.agent_path.clone(),
+            agent_task_name: permission.agent_task_name.clone(),
+            remote: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1069,19 +1090,7 @@ pub(crate) fn desktop_web_state_with_permission(
         confirmation_visible: pending_permission.is_some(),
         confirmation_id: pending_permission.map(|(id, _)| id.to_string()),
         confirmation_text,
-        confirmation: pending_permission.map(|(_, permission)| DesktopPermissionProjection {
-            summary: permission.summary.clone(),
-            details: permission.details.clone(),
-            targets: permission.targets.iter().map(ToString::to_string).collect(),
-            outside_workspace: permission.outside_workspace,
-            risks: permission
-                .risks
-                .iter()
-                .map(|risk| risk.label().to_string())
-                .collect(),
-            agent_path: permission.agent_path.clone(),
-            agent_task_name: permission.agent_task_name.clone(),
-        }),
+        confirmation: pending_permission.map(|(_, permission)| permission.into()),
         startup,
         composer_commit_generation: runtime.composer_commit_generation.to_string(),
         draft_prompt: state.composer.draft_prompt.clone(),
@@ -1550,6 +1559,7 @@ fn overlay_key(overlay: DesktopOverlay) -> &'static str {
         DesktopOverlay::ConfigEditor => "config",
         DesktopOverlay::HubConnection => "hub",
         DesktopOverlay::McpPublish => "mcp_publish",
+        DesktopOverlay::McpHistory => "mcp_history",
         DesktopOverlay::SessionSettings => "session_settings",
         DesktopOverlay::ProviderEditor => "provider",
         DesktopOverlay::WorkspacePicker => "workspace",
@@ -1829,7 +1839,7 @@ fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String,
     }
 }
 
-fn format_permission_confirmation_text(permission: &PermissionRequest) -> String {
+pub(crate) fn format_permission_confirmation_text(permission: &PermissionRequest) -> String {
     let targets = if permission.targets.is_empty() {
         "(なし)".to_string()
     } else {

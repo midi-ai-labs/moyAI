@@ -5,6 +5,7 @@ import { renderHubOverlay } from "../src/hub_render.ts";
 import {
   acceptHubProjection, createHubUiState, editHubField, hubCanSave,
   hubCanSetRouteMode, hubDraftHasChanges, hubDraftTargetIsCurrent, hubExecutionRoute, hubRouteModeBlocker, hubSaveFeedback, hubSelectionError, hubSelectionFromDraft,
+  hubCanUseRecommendation, useHubRecommendation,
   type HubProjection,
 } from "../src/hub_state.ts";
 
@@ -26,6 +27,26 @@ function projection(overrides: Partial<HubProjection> = {}): HubProjection {
     ...overrides,
   };
 }
+
+test("a managed Hub recommendation changes only the explicitly selected draft until review and route commands", () => {
+  const local = createHubUiState();
+  const recommended = { allowed_model_ids:["model-a"], preferred_model_id:"model-a", required_capabilities:["tools"], wait_policy:"allow_selected_fallback" as const, affinity_turns:3 };
+  acceptHubProjection(local, projection({recommended_main_selection:recommended}));
+  assert.equal(local.projection!.main_mode,"direct");
+  assert.equal(local.projection!.main_review,null);
+  assert.deepEqual(local.drafts.main.selection.allowed_model_ids,[]);
+  assert.equal(hubCanUseRecommendation(local),true);
+  useHubRecommendation(local);
+  assert.deepEqual(local.drafts.main.selection,recommended);
+  assert.equal(local.drafts.main.dirty,true);
+  assert.equal(hubCanSave(local,"main"),true);
+  assert.equal(hubCanSetRouteMode(local,"main","hub"),false);
+  assert.equal(local.projection!.main_mode,"direct");
+  assert.equal(local.projection!.side_chat_review,null);
+  acceptHubProjection(local,projection({status:"stale",recommended_main_selection:null,connection_generation:"2"}));
+  assert.equal(hubCanUseRecommendation(local),false);
+  assert.deepEqual(local.drafts.main.selection,recommended);
+});
 
 test("Hub route controls require independent confirmation and retain explicit Direct recovery", () => {
   const state = createHubUiState();

@@ -50,7 +50,7 @@ export interface PublishJob {
   job_id: string; profile_id: string;
   parent: { peer_id: string; task_id: string; turn_id: string };
   prompt_preview: string; session_id: string;
-  state: "accepted" | "running" | "cancelling" | "completed" | "failed" | "interrupted";
+  state: "accepted" | "running" | "awaiting_approval" | "cancelling" | "completed" | "failed" | "interrupted";
   model: string; result: string | null; result_truncated: boolean; can_stop: boolean;
 }
 export interface PublishEditor {

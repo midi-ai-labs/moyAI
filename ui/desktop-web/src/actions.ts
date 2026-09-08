@@ -2,9 +2,13 @@ import { command } from "./api.ts";
 import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
 import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "./device_network_actions.ts";
 import { deviceCanJoin, deviceCanReceive, deviceCanSelect, deviceCanStopJob } from "./device_network_state.ts";
-import { hubCanSave, hubCanSetRouteMode } from "./hub_state.ts";
+import { deviceCanDiagnose, diagnoseDeviceNetwork } from "./device_network_diagnostics.ts";
+import { deviceCanInspectArtifacts, deviceCanExportArtifacts, inspectDeviceArtifacts, exportDeviceArtifacts } from "./device_network_artifacts.ts";
+import { hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, useHubRecommendation } from "./hub_state.ts";
 import { addPublish, cancelPublishDelete, choosePublish, copyPublish, discardPublish, openPublish, operatePublish, refreshPublish, savePublish, publishCertificate, stopPublishJob } from "./mcp_publish_actions.ts";
 import { publishCanOperate, publishCanSave, publishDirty, publishEditor, publishRow, publishCanCreateCertificate, publishCanStopJob } from "./mcp_publish_state.ts";
+import { openMcpHistory, reloadMcpHistory, selectMcpHistoryDirection, selectMcpHistory, pageMcpHistory, operateMcpHistory } from "./mcp_history_actions.ts";
+import { selectedMcpHistoryRow } from "./mcp_history_state.ts";
 import { checkMcpPeer, mcpPeerDraftValid, mutateMcpPeer, refreshMcpPeers } from "./mcp_peer.ts";
 import { snapshotAgentInterruptTarget } from "./agent_interrupt_contract.ts";
 import { snapshotPromptReviewMutationTarget } from "./composer_target_contract.ts";
@@ -1504,13 +1508,26 @@ const ACTION_DEFINITIONS = [
   { id: "hub-tab-models", label: "Hubのモデル割当", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "models") },
   { id: "device-network-import", label: "Hub共通設定を読み込む", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection), run: (_state, context) => importDeviceNetwork(context) },
   { id: "device-network-refresh", label: "端末ネットワークを更新", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending, run: (_state, context) => refreshDeviceNetwork(context) },
-  { id: "device-network-join", label: "この端末でHubに参加", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanJoin(model.local.deviceNetwork), run: (_state, context) => joinDeviceNetwork(context) },
+  { id: "device-network-diagnose-hub", label: "Hubへの接続を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "hub"), run: (_state, context) => diagnoseDeviceNetwork(context, "hub") },
+  { id: "device-network-diagnose-receiver", label: "保存済みの受付を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "receiver"), run: (_state, context) => diagnoseDeviceNetwork(context, "receiver") },
+  { id: "device-network-diagnose-peer", label: "この端末への接続を診断", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "peer", payload.value), run: (_state, context, payload) => diagnoseDeviceNetwork(context, "peer", payload.value) },
+  { id: "device-network-join", label: "参加申請を再試行", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanJoin(model.local.deviceNetwork), run: (_state, context) => joinDeviceNetwork(context) },
   { id: "device-network-receiver-on", label: "端末の受付を開始・保存", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanReceive(model.local.deviceNetwork, true), run: (_state, context) => setDeviceReceiver(context, true) },
   { id: "device-network-receiver-off", label: "端末の受付を停止", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanReceive(model.local.deviceNetwork, false), run: (_state, context) => setDeviceReceiver(context, false) },
   { id: "device-network-select", label: "端末を利用先に選択", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanSelect(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => selectDevicePeer(context, payload.value) },
   { id: "device-network-stop-job", label: "委任タスクを停止", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanStopJob(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => stopDeviceNetworkJob(context, payload.value) },
+  { id: "device-network-artifacts", label: "委任タスクの成果物を確認", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanInspectArtifacts(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => inspectDeviceArtifacts(context, payload.value) },
+  { id: "device-network-export-artifacts", label: "委任タスクの成果物を書き出す", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanExportArtifacts(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => exportDeviceArtifacts(context, payload.value) },
   { id: "device-network-leave", label: "Hub接続を一時解除", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection?.can_leave && model.local.deviceNetwork.leaveConfirmed), run: (_state, context) => leaveDeviceNetwork(context) },
-  { id: "show-mcp-publish", label: "MCPを配信", menu: "view", palette: true, enabled: always, run: (_state, context) => openPublish(context) },
+  { id: "show-mcp-history", label: "MCP履歴", menu: "view", palette: true, enabled: always, run: (_state, context) => openMcpHistory(context) },
+  { id: "mcp-history-direction", label: "MCP履歴の種類を選択", enabled: (state, payload) => state.overlay === "mcp_history" && (payload.value === "instruction" || payload.value === "execution"), run: (_state, context, payload) => selectMcpHistoryDirection(context, payload.value) },
+  { id: "mcp-history-select", label: "MCP履歴の詳細を表示", enabled: (state, payload, model) => state.overlay === "mcp_history" && model.local.mcpHistory.rows.some(row => row.id === payload.value && row.direction === model.local.mcpHistory.direction), run: (_state, context, payload) => selectMcpHistory(context, payload.value) },
+  { id: "mcp-history-refresh", label: "MCP履歴を更新", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && !model.local.mcpHistory.detailPending && model.local.mcpHistory.operation !== "stop", run: (_state, context) => reloadMcpHistory(context) },
+  { id: "mcp-history-next", label: "MCP履歴の次のページ", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && model.local.mcpHistory.nextOffset !== null, run: (_state, context) => pageMcpHistory(context, true) },
+  { id: "mcp-history-previous", label: "MCP履歴の前のページ", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && model.local.mcpHistory.previousOffsets.length > 0, run: (_state, context) => pageMcpHistory(context, false) },
+  { id: "mcp-history-export", label: "MCP履歴をMarkdownで保存", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)), run: (_state, context) => operateMcpHistory(context, "export") },
+  { id: "mcp-history-stop", label: "MCPタスクの停止を要求", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)?.can_stop), run: (_state, context) => operateMcpHistory(context, "stop") },
+  { id: "show-mcp-publish", label: "旧配信設定の管理", enabled: (_state, _payload, model) => Boolean(model.local.mcpPublish.projection?.profiles.length), run: (_state, context) => openPublish(context) },
   { id: "mcp-publish-refresh", label: "MCP配信の最新情報を取得", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending, run: (_state, context) => refreshPublish(context) },
   { id: "mcp-publish-add", label: "配信プロファイルを追加", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(model.local.mcpPublish.projection && model.local.mcpPublish.projection.profiles.length < 32), run: (_state, context) => addPublish(context) },
   { id: "mcp-publish-select", label: "配信プロファイルを選択", enabled: (state, payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(model.local.mcpPublish.drafts[payload.value]), run: (_state, context, payload) => choosePublish(context, payload.value) },
@@ -1544,6 +1561,7 @@ const ACTION_DEFINITIONS = [
     run: (_state, context) => disconnectHub(context),
   },
   { id: "hub-save-main", label: "MainのHubモデル選択を保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
+  { id: "hub-main-recommendation", label: "Hubの推奨候補を選ぶ", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanUseRecommendation(model.local.hub), run: (_state, context) => { useHubRecommendation(context.uiState.hub); context.rerender(); } },
   { id: "hub-save-side", label: "SideのHubモデル選択を保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
   { id: "hub-main-direct", label: "Mainを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "direct"), run: (_state, context) => setHubRouteMode(context, "main", "direct") },
   { id: "hub-main-hub", label: "MainをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "hub"), run: (_state, context) => setHubRouteMode(context, "main", "hub") },
@@ -2114,6 +2132,7 @@ const ACTION_DEFINITIONS = [
   { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
   { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },
   { id: "approve-permission", label: "確認した操作を実行", enabled: (state, _payload, model) => state.confirmation_visible && model.local.modal.permissionDecision?.phase !== "submitting", run: (_state, context) => context.submitPermissionDecision("approved") },
+  { id: "deny-permission", label: "確認した操作を許可しない", enabled: (state, _payload, model) => state.confirmation_visible && Boolean(state.confirmation?.remote) && model.local.modal.permissionDecision?.phase !== "submitting", run: (_state, context) => context.submitPermissionDecision("denied") },
   { id: "abort-permission", label: "操作を実行せず指示を変更", enabled: (state, _payload, model) => state.confirmation_visible && model.local.modal.permissionDecision?.phase !== "submitting", run: (_state, context) => context.submitPermissionDecision("abort") },
   {
     id: "toggle-attachment-tray",

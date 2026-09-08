@@ -54,9 +54,171 @@ impl OutgoingOwner {
         }
     }
 }
-fn server_id(peer: &DirectoryPeer) -> String {
+pub(crate) fn server_id(peer: &DirectoryPeer) -> String {
     let digest = Sha256::digest(format!("{}\n{}", peer.device_id, peer.profile_id));
     format!("hub-device-{:x}", digest)
+}
+fn input_request_hash(
+    prompt: &str,
+    inputs: &[crate::remote_agent::artifacts::RemoteInputFile],
+) -> Result<String, DeviceError> {
+    if inputs.is_empty() {
+        return Ok(format!("{:x}", Sha256::digest(prompt.as_bytes())));
+    }
+    let bytes =
+        serde_json::to_vec(&(prompt, inputs)).map_err(|_| DeviceError::InvalidConfiguration)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+impl DeviceNetworkService {
+    pub fn cached_artifact_manifest(
+        &self,
+        reference_id: &str,
+        version: &str,
+    ) -> Result<crate::remote_agent::artifacts::ArtifactManifest, DeviceError> {
+        let id = reference_id
+            .parse::<Ulid>()
+            .map_err(|_| DeviceError::InvalidConfiguration)?;
+        let store = self.inner.outgoing.store.remote_job_store();
+        let row = store
+            .device_reference(id)
+            .map_err(|_| DeviceError::Storage)?
+            .ok_or(DeviceError::ArtifactsUnavailable)?;
+        if !terminal(&row.state) {
+            return Err(DeviceError::ArtifactsUnavailable);
+        }
+        let job = row
+            .job_id
+            .as_deref()
+            .ok_or(DeviceError::ArtifactsUnavailable)?;
+        store
+            .cached_artifacts(id, job, Some(version))
+            .map_err(|_| DeviceError::ArtifactsUnavailable)?
+            .map(|bundle| bundle.manifest)
+            .ok_or(DeviceError::ArtifactsUnavailable)
+    }
+    /// Fetch exactly one settled job version into the app-owned immutable cache.
+    /// A cached version remains available when the peer is OFF or its Hub authority retires.
+    pub async fn artifacts(
+        &self,
+        reference_id: &str,
+        version: Option<&str>,
+    ) -> Result<crate::remote_agent::artifacts::ArtifactManifest, DeviceError> {
+        let id = reference_id
+            .parse::<Ulid>()
+            .map_err(|_| DeviceError::InvalidConfiguration)?;
+        let _lane = self.inner.outgoing.lane.lock().await;
+        let store = self.inner.outgoing.store.remote_job_store();
+        let row = store
+            .device_reference(id)
+            .map_err(|_| DeviceError::Storage)?
+            .ok_or(DeviceError::ArtifactsUnavailable)?;
+        if !terminal(&row.state) {
+            return Err(DeviceError::ArtifactsUnavailable);
+        }
+        let job = row
+            .job_id
+            .as_deref()
+            .ok_or(DeviceError::ArtifactsUnavailable)?;
+        if let Some(bundle) = store
+            .cached_artifacts(id, job, version)
+            .map_err(|_| DeviceError::ArtifactsUnavailable)?
+        {
+            return Ok(bundle.manifest);
+        }
+        let client = self.client()?;
+        let http = client.http();
+        let _identity = http.acquire().await;
+        let grant = client
+            .grant(
+                &row.peer,
+                &row.root_task_id,
+                &row.request_key,
+                row.parent_grant_id
+                    .as_deref()
+                    .zip(row.parent_job_id.as_deref()),
+                "observe",
+            )
+            .await?;
+        self.validate_grant(&grant, &row.peer, &row.root_task_id, &row.request_key)?;
+        if row
+            .claims
+            .as_ref()
+            .is_some_and(|claims| claims != &grant.claims)
+        {
+            return Err(DeviceError::GrantDenied);
+        }
+        let operation = self
+            .peer_operation(
+                &grant,
+                Some("task_artifacts"),
+                json!({"job_id":job,"version":version}),
+                || Ok(()),
+            )
+            .await
+            .map_err(|_| DeviceError::ArtifactsUnavailable)?;
+        let McpOperationResult::ToolCalled { raw_result, .. } = operation else {
+            return Err(DeviceError::InvalidResponse);
+        };
+        if raw_result.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Err(DeviceError::ArtifactsUnavailable);
+        }
+        let data = raw_result
+            .get("structuredContent")
+            .cloned()
+            .or_else(|| {
+                raw_result
+                    .get("content")?
+                    .as_array()?
+                    .iter()
+                    .find_map(|part| {
+                        serde_json::from_str::<Value>(part.get("text")?.as_str()?).ok()
+                    })
+            })
+            .ok_or(DeviceError::InvalidResponse)?;
+        let bundle: crate::remote_agent::artifacts::ArtifactBundle =
+            serde_json::from_value(data).map_err(|_| DeviceError::InvalidResponse)?;
+        bundle
+            .validate()
+            .map_err(|_| DeviceError::InvalidResponse)?;
+        if bundle.manifest.job_id != job || version.is_some_and(|v| v != bundle.manifest.version) {
+            return Err(DeviceError::InvalidResponse);
+        }
+        store
+            .cache_artifacts(id, &bundle)
+            .map_err(|_| DeviceError::Storage)?;
+        Ok(bundle.manifest)
+    }
+
+    /// Export only the already-reviewed cache version. This method performs no network I/O.
+    pub fn export_artifacts(
+        &self,
+        reference_id: &str,
+        version: &str,
+        new_directory: &camino::Utf8Path,
+    ) -> Result<(), String> {
+        let id = reference_id
+            .parse::<Ulid>()
+            .map_err(|_| DeviceError::InvalidConfiguration.to_string())?;
+        let store = self.inner.outgoing.store.remote_job_store();
+        let row = store
+            .device_reference(id)
+            .map_err(|_| DeviceError::Storage.to_string())?
+            .ok_or_else(|| DeviceError::ArtifactsUnavailable.to_string())?;
+        let job = row
+            .job_id
+            .as_deref()
+            .ok_or_else(|| DeviceError::ArtifactsUnavailable.to_string())?;
+        if !terminal(&row.state) {
+            return Err(DeviceError::ArtifactsUnavailable.to_string());
+        }
+        let bundle = store
+            .cached_artifacts(id, job, Some(version))
+            .map_err(|_| DeviceError::ArtifactsUnavailable.to_string())?
+            .ok_or_else(|| DeviceError::ArtifactsUnavailable.to_string())?;
+        crate::remote_agent::artifacts::export_bundle(&bundle, new_directory)
+            .map_err(|error| error.to_string())
+    }
 }
 fn server_config(peer: &DirectoryPeer) -> McpServerConfig {
     McpServerConfig {
@@ -67,6 +229,10 @@ fn server_config(peer: &DirectoryPeer) -> McpServerConfig {
         base_url: peer.endpoint.clone(),
         timeout_ms: 30000,
         tool_routes: vec![
+            McpToolRouteConfig {
+                name: "task_artifacts".into(),
+                effect: ToolEffectClass::Read,
+            },
             McpToolRouteConfig {
                 name: "delegate_task".into(),
                 effect: ToolEffectClass::Destructive,
@@ -189,7 +355,7 @@ impl DeviceNetworkService {
         id.starts_with("hub-device-")
     }
 
-    fn peer_http(&self, peer: &DirectoryPeer) -> Result<reqwest::Client, DeviceError> {
+    pub(super) fn peer_http(&self, peer: &DirectoryPeer) -> Result<reqwest::Client, DeviceError> {
         let state = self
             .inner
             .state
@@ -211,7 +377,7 @@ impl DeviceNetworkService {
         )
         .map_err(|_| DeviceError::InvalidIdentity)
     }
-    async fn peer_operation(
+    pub(super) async fn peer_operation(
         &self,
         grant: &DeviceGrant,
         name: Option<&str>,
@@ -289,6 +455,54 @@ impl DeviceNetworkService {
         if !self.owns_server(id) {
             return Err(safe_error(DeviceError::PolicyDenied));
         }
+        if name == Some("task_artifacts") {
+            let job = arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| safe_error(DeviceError::InvalidConfiguration))?;
+            let row = self
+                .inner
+                .outgoing
+                .store
+                .remote_job_store()
+                .find_device_reference(session, None, Some(job))
+                .map_err(|_| safe_error(DeviceError::Storage))?
+                .filter(|row| server_id(&row.peer) == id)
+                .ok_or_else(|| safe_error(DeviceError::GrantDenied))?;
+            let version = arguments
+                .get("version")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| safe_error(DeviceError::InvalidConfiguration))
+                })
+                .transpose()?;
+            checkpoint()?;
+            let manifest = self
+                .artifacts(&row.id.to_string(), version)
+                .await
+                .map_err(safe_error)?;
+            checkpoint()?;
+            let bundle = self
+                .inner
+                .outgoing
+                .store
+                .remote_job_store()
+                .cached_artifacts(row.id, job, Some(&manifest.version))
+                .map_err(|_| safe_error(DeviceError::Storage))?
+                .ok_or_else(|| safe_error(DeviceError::ArtifactsUnavailable))?;
+            let data = serde_json::to_value(bundle)
+                .map_err(|_| safe_error(DeviceError::InvalidResponse))?;
+            return Ok(McpOperationResult::ToolCalled {
+                server_id: id.into(),
+                endpoint: row.peer.endpoint,
+                tool_name: "task_artifacts".into(),
+                output_text: serde_json::to_string(&data)
+                    .map_err(|_| safe_error(DeviceError::InvalidResponse))?,
+                raw_result: json!({"structuredContent":data,"content":[],"isError":false}),
+            });
+        }
         if matches!(name, Some("task_status" | "cancel_task")) {
             let _lane = self.inner.outgoing.lane.lock().await;
             let key = arguments
@@ -333,20 +547,26 @@ impl DeviceNetworkService {
         let parent_grant = inbound.as_ref().map(|(_, grant)| grant.grant_id.clone());
         let parent_job = inbound.as_ref().map(|(job, _)| job.to_string());
         let client = self.client().map_err(safe_error)?;
+        // A grant and its MCP request must use the same actor certificate. Renewal
+        // may happen between operations, never between grant issuance and dispatch.
+        let http = client.http();
+        let _identity = http.acquire().await;
         if name.is_none() {
-            let key = canonical_key(session, turn, "tools-list");
             let grant = client
-                .grant(
-                    &peer,
-                    &root,
-                    &key,
+                .inspect_peer(
+                    &peer.device_id,
+                    &peer.profile_id,
                     parent_grant.as_deref().zip(parent_job.as_deref()),
-                    "execute",
                 )
                 .await
                 .map_err(safe_error)?;
-            self.validate_grant(&grant, &peer, &root, &key)
-                .map_err(safe_error)?;
+            self.validate_grant(
+                &grant,
+                &peer,
+                &grant.claims.root_task_id,
+                &grant.claims.request_key,
+            )
+            .map_err(safe_error)?;
             return self
                 .peer_operation(&grant, None, json!({}), checkpoint)
                 .await;
@@ -365,6 +585,16 @@ impl DeviceNetworkService {
             .filter(|prompt| !prompt.trim().is_empty() && prompt.len() <= 32768)
             .ok_or_else(|| safe_error(DeviceError::InvalidConfiguration))?;
         let key = canonical_key(session, turn, raw_key);
+        let inputs: Vec<crate::remote_agent::artifacts::RemoteInputFile> = object
+            .get("inputs")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| safe_error(DeviceError::InvalidConfiguration))?
+            .unwrap_or_default();
+        crate::remote_agent::artifacts::validate_inputs(&inputs)
+            .map_err(|_| safe_error(DeviceError::InvalidConfiguration))?;
+        let prompt_hash = input_request_hash(prompt, &inputs).map_err(safe_error)?;
         let _lane = self.inner.outgoing.lane.lock().await;
         let proposed = StoredDeviceReference {
             id: Ulid::new(),
@@ -374,7 +604,7 @@ impl DeviceNetworkService {
             profile_id: peer.profile_id.clone(),
             root_task_id: root.clone(),
             request_key: key.clone(),
-            prompt_hash: format!("{:x}", Sha256::digest(prompt.as_bytes())),
+            prompt_hash,
             parent_grant_id: parent_grant,
             parent_job_id: parent_job,
             peer: peer.clone(),
@@ -438,7 +668,11 @@ impl DeviceNetworkService {
             .update_device_reference(&row)
             .map_err(|_| safe_error(DeviceError::Storage))?;
         self.watch_control(session, turn, control);
-        let args = json!({"request_key":key,"prompt":prompt,"parent":{"peer_id":grant.claims.actor_device_id,"task_id":root,"turn_id":turn.to_string()}});
+        let mut args = json!({"request_key":key,"prompt":prompt,"parent":{"peer_id":grant.claims.actor_device_id,"task_id":root,"turn_id":turn.to_string()}});
+        if !inputs.is_empty() {
+            args["inputs"] = serde_json::to_value(&inputs)
+                .map_err(|_| safe_error(DeviceError::InvalidConfiguration))?;
+        }
         let operation = self
             .peer_operation(&grant, Some("delegate_task"), args, checkpoint)
             .await;
@@ -500,6 +734,7 @@ impl DeviceNetworkService {
                         *state,
                         "accepted"
                             | "running"
+                            | "awaiting_approval"
                             | "cancelling"
                             | "completed"
                             | "failed"
@@ -586,6 +821,8 @@ impl DeviceNetworkService {
                 .ok_or_else(|| safe_error(DeviceError::Unavailable))?
         };
         // Existing references use their immutable audience and lineage, even after directory removal.
+        let http = client.http();
+        let _identity = http.acquire().await;
         let grant = match client
             .grant(
                 &row.peer,
@@ -871,7 +1108,7 @@ impl DeviceNetworkService {
         }
     }
 }
-fn canonical_key(session: SessionId, turn: TurnId, key: &str) -> String {
+pub(crate) fn canonical_key(session: SessionId, turn: TurnId, key: &str) -> String {
     format!("{:x}", Sha256::digest(format!("{session}\n{turn}\n{key}")))
 }
 

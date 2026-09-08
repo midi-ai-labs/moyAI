@@ -4,6 +4,121 @@ use crate::mcp_publish::PublishAuthentication;
 use crate::session::ProjectRepository;
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[path = "artifact_runtime_tests.rs"]
+mod artifact_runtime_tests;
+#[path = "network_fixture.rs"]
+mod network_fixture;
+
+#[tokio::test]
+async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop() {
+    for decision in [
+        ReviewDecision::Approved,
+        ReviewDecision::Denied,
+        ReviewDecision::Abort,
+    ] {
+        let (_temp, mut app, profile) = fixture("http://127.0.0.1:1/v1").await;
+        let outside = app
+            .workspace
+            .root
+            .parent()
+            .unwrap()
+            .join("receiver-reviewed.txt");
+        // PathGuard correctly rejects arbitrary external patch paths before review.
+        // A shell operation with an explicit, justified elevation exercises human review.
+        let command = if cfg!(windows) {
+            format!(
+                "[System.IO.File]::WriteAllText('{}', 'receiver approved content')",
+                outside.as_str().replace('\'', "''")
+            )
+        } else {
+            format!(
+                "printf %s 'receiver approved content' > '{}'",
+                outside.as_str().replace('\'', "'\\''")
+            )
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+            let command = command.clone(); let count = count.clone();
+            async move {
+                let (delta, finish) = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (json!({"role":"assistant","tool_calls":[{"index":0,"id":"reviewed-edit","type":"function","function":{"name":"shell","arguments":json!({"command":command,"sandbox_permissions":"require_escalated","justification":"Create the explicit fixture file outside the receiver workspace only after receiver approval."}).to_string()}}]}), "tool_calls")
+                } else { (json!({"role":"assistant","content":"Receiver request processed"}), "stop") };
+                let chunk = json!({"id":"fixture","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let end = json!({"id":"fixture","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":finish}]});
+                ([("content-type", "text/event-stream")], format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n"))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        app.config.model.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
+        let dispatcher = jobs
+            .dispatcher(profile.clone(), app.config.clone(), vec![])
+            .await
+            .unwrap();
+        let accepted = call(&dispatcher, "delegate_task", task("reviewed-request")).await;
+        let id = accepted["job_id"].as_str().unwrap();
+        let pending = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(pending) = jobs.pending_approval() {
+                    return pending;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pending.context.job_id.to_string(), id);
+        assert_eq!(pending.context.profile_id, profile.id);
+        assert_eq!(
+            call(&dispatcher, "task_status", json!({"job_id":id})).await["state"],
+            "awaiting_approval"
+        );
+        assert!(!outside.exists(), "permission precedes the actual write");
+        assert!(!jobs.answer_approval(
+            pending.confirmation_id,
+            Ulid::new(),
+            profile.id,
+            ReviewDecision::Approved
+        ));
+        assert!(jobs.answer_approval(
+            pending.confirmation_id,
+            pending.context.job_id,
+            profile.id,
+            decision
+        ));
+        let finished = terminal(&dispatcher, id).await;
+        if decision == ReviewDecision::Approved {
+            assert_eq!(
+                std::fs::read_to_string(&outside).unwrap(),
+                "receiver approved content"
+            );
+        } else {
+            assert!(!outside.exists());
+        }
+        assert_eq!(
+            finished["state"],
+            if decision == ReviewDecision::Abort {
+                "interrupted"
+            } else {
+                "completed"
+            },
+            "{finished}"
+        );
+        assert!(!jobs.answer_approval(
+            pending.confirmation_id,
+            pending.context.job_id,
+            profile.id,
+            ReviewDecision::Approved
+        ));
+        assert!(jobs.drain_profile(profile.id, Duration::from_secs(3)).await);
+        assert!(jobs.pending_approval().is_none());
+        server.abort();
+    }
+}
 
 async fn fixture(endpoint: &str) -> (tempfile::TempDir, App, PublishProfile) {
     let temp = tempfile::tempdir().unwrap();
@@ -58,6 +173,7 @@ async fn managed_fixture(
     RemoteJobService,
     Arc<dyn PublishToolDispatcher>,
     crate::device_network::VerifiedGrant,
+    network_fixture::ReceiptPeer,
 ) {
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let path = app.store.paths().data_dir.parent().unwrap().join("config");
@@ -66,7 +182,6 @@ async fn managed_fixture(
         app.store.clone(),
         app.config.clone(),
     );
-    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut settings = crate::device_network::DeviceSettings::default();
     settings.hub_id = Some("hub".into());
     settings.device_id = Some("device-b".into());
@@ -75,20 +190,22 @@ async fn managed_fixture(
     } else {
         "Win20-Worker".into()
     };
-    settings.certificate_pem = Some(certificate.cert.pem());
-    settings.certificate_sha256 = Some("a".repeat(64));
-    settings.expires_at_ms = Some("123456".into());
     settings.receiver.profile_id = profile.id;
+    let (shared, receipt_peer) =
+        network_fixture::receipt_peer(&path.join("device"), &mut settings).await;
     crate::device_network::DeviceSettingsStore::new(path.join("device/device.json"))
         .save(&settings)
         .unwrap();
+    let mut config = app.config.clone();
+    config.device_network = shared;
     let network = crate::device_network::DeviceNetworkService::new(
         path.join("device"),
         app.store.clone(),
-        app.config.clone(),
+        config,
         jobs.clone(),
         publish,
     );
+    assert_eq!(network.resume().await.unwrap().enrollment, "active");
     let target = network.projection_now();
     network
         .receiver(
@@ -130,7 +247,7 @@ async fn managed_fixture(
             device_path: vec!["device-a".into(), "device-b".into()],
         },
     };
-    (network, jobs, dispatcher, authority)
+    (network, jobs, dispatcher, authority, receipt_peer)
 }
 
 #[tokio::test]
@@ -139,7 +256,8 @@ async fn managed_job_uses_verified_identity_and_rotation_replays_the_same_job() 
     let (endpoint, count, _, server) = provider_recording(false, Some(requests.clone())).await;
     let (_temp, mut app, profile) = fixture(&endpoint).await;
     app.config.model.system_prompt = "Preserve the receiver's configured instructions.".into();
-    let (network, jobs, dispatcher, authority) = managed_fixture(&app, &profile).await;
+    let (network, jobs, dispatcher, authority, _receipt_peer) =
+        managed_fixture(&app, &profile).await;
     let receiver = network.projection_now();
     assert_ne!(
         Some(receiver.display_name.as_str()),
@@ -280,7 +398,8 @@ async fn managed_job_uses_verified_identity_and_rotation_replays_the_same_job() 
 async fn managed_off_preserves_exact_job_control_and_rejects_other_lineage() {
     let (endpoint, _, release, server) = provider(true).await;
     let (_temp, app, profile) = fixture(&endpoint).await;
-    let (_network, jobs, dispatcher, authority) = managed_fixture(&app, &profile).await;
+    let (_network, jobs, dispatcher, authority, _receipt_peer) =
+        managed_fixture(&app, &profile).await;
     let accepted = dispatcher
         .call_authorized(
             "delegate_task",
