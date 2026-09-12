@@ -19,11 +19,10 @@ use crate::hub::{
     HubSettingsStore,
 };
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
-use crate::mcp_publish::{
-    PublishDraft, PublishProfileId, PublishProjection, PublishService, PublishTokenReceipt,
-};
+use crate::mcp_publish::{PublishProfileId, PublishService};
 use crate::protocol::TurnId;
 use crate::session::{ActiveTurnExpectation, SessionId, SessionSettingsPatch, SessionSpawnEdge};
+use crate::tool::shell::ManagedShells;
 
 use super::app::{
     DesktopController, PendingPermissionResolution, RootSessionSettingsApplyError,
@@ -59,6 +58,7 @@ macro_rules! desktop_command_manifest {
             submit_prompt,
             cancel_run,
             ensure_side_chat,
+            capture_side_chat_direct_provider,
             load_side_chat_models,
             save_side_chat_draft,
             submit_side_chat,
@@ -112,23 +112,12 @@ macro_rules! desktop_command_manifest {
             hub_save_review,
             hub_disconnect,
             hub_set_route_mode,
-            show_mcp_publish_editor,
             show_mcp_history,
             mcp_history_list,
             mcp_history_detail,
             mcp_history_export,
             mcp_history_stop,
-            mcp_publish_projection,
-            mcp_publish_save,
-            mcp_publish_delete,
-            mcp_publish_start,
-            mcp_publish_stop,
-            mcp_publish_issue_token,
-            mcp_publish_revoke_token,
-            mcp_publish_jobs,
-            mcp_publish_cancel_job,
-            mcp_publish_create_certificate,
-            mcp_publish_certificate,
+            remote_job_cancel,
             device_network_projection,
             device_network_import,
             device_network_initial_setup_import,
@@ -415,8 +404,9 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
     );
     device_network.attach_hub_connection(hub_connection.clone());
     controller.state.device_network = Some(device_network.clone());
+    let managed_shells = controller.app.process_runtime.managed_shells();
     let shared: SharedController = Arc::new(Mutex::new(controller));
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             restore_main_window(app);
         }))
@@ -426,6 +416,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .manage(remote_jobs)
         .manage(McpHistoryExportGate::default())
         .manage(device_network)
+        .manage(managed_shells.clone())
         .setup(|app| {
             install_tray(app.handle())?;
             let network = app.state::<DeviceNetworkService>().inner().clone();
@@ -442,8 +433,9 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
+        .run(tauri::generate_context!());
+    managed_shells.shutdown().await;
+    result.map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
 }
 
 #[tauri::command]
@@ -563,7 +555,9 @@ fn disconnect_hub(app: &tauri::AppHandle, exit: bool) {
     let connection = app.state::<HubConnection>().inner().clone();
     let publish = app.state::<PublishService>().inner().clone();
     let network = app.state::<DeviceNetworkService>().inner().clone();
+    let managed_shells = app.state::<ManagedShells>().inner().clone();
     let hidden_receiver = if exit {
+        managed_shells.begin_shutdown();
         network.begin_shutdown();
         false
     } else {
@@ -584,6 +578,7 @@ fn disconnect_hub(app: &tauri::AppHandle, exit: bool) {
             while !publish.shutdown().await {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            managed_shells.shutdown().await;
             app.exit(0);
         } else {
             network.finish_window_hide(hidden_receiver).await;
@@ -1634,6 +1629,45 @@ async fn ensure_side_chat(
         )?;
         controller
             .ensure_side_chat(owner_session_id)
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn capture_side_chat_direct_provider(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    side_chat_id: String,
+    expected_generation: String,
+    expected_draft_revision: String,
+    expected_config_generation: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat owner: {error}"))
+        })?;
+        validate_side_chat_config_owner(
+            owner_session_id,
+            &expected_config_generation,
+            controller.state.app_state.current_session_id,
+            controller.state.provider_config.config_generation,
+        )?;
+        let side_chat_id = side_chat_id
+            .parse::<crate::storage::SideChatId>()
+            .map_err(|error| {
+                DesktopCommandConflict::new(format!("invalid side chat id: {error}"))
+            })?;
+        let expected_generation = parse_canonical_owner_generation(&expected_generation)?;
+        let expected_draft_revision = parse_canonical_owner_generation(&expected_draft_revision)?;
+        controller
+            .capture_side_chat_direct_provider(
+                owner_session_id,
+                side_chat_id,
+                expected_generation,
+                expected_draft_revision,
+            )
             .map_err(DesktopCommandConflict::new)
     })
     .await
@@ -3274,27 +3308,6 @@ async fn show_hub_editor(
 }
 
 #[tauri::command]
-async fn show_mcp_publish_editor(
-    controller: State<'_, SharedController>,
-    service: State<'_, PublishService>,
-) -> Result<DesktopWebState, DesktopCommandError> {
-    let _ = service.refresh().await;
-    mutate_controller_checked(controller, |controller| {
-        ensure_unscoped_prompt_review_action(controller, "MCP publishing editor")?;
-        controller.state.show_mcp_publish_editor();
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn mcp_publish_projection(
-    service: State<'_, PublishService>,
-) -> Result<PublishProjection, String> {
-    service.refresh().await
-}
-
-#[tauri::command]
 async fn show_mcp_history(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
@@ -3429,89 +3442,7 @@ async fn mcp_history_stop(
 }
 
 #[tauri::command]
-async fn mcp_publish_save(
-    service: State<'_, PublishService>,
-    profile_id: Option<PublishProfileId>,
-    draft: PublishDraft,
-    expected_revision: String,
-    expected_generation: String,
-) -> Result<PublishProjection, String> {
-    service
-        .save(profile_id, draft, &expected_revision, &expected_generation)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_delete(
-    service: State<'_, PublishService>,
-    profile_id: PublishProfileId,
-    expected_revision: String,
-    expected_generation: String,
-) -> Result<PublishProjection, String> {
-    service
-        .delete(profile_id, &expected_revision, &expected_generation)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_start(
-    controller: State<'_, SharedController>,
-    service: State<'_, PublishService>,
-    profile_id: PublishProfileId,
-    expected_revision: String,
-    expected_generation: String,
-) -> Result<PublishProjection, String> {
-    let config = controller.lock().await.state.global_config().clone();
-    service
-        .start_with_config(profile_id, &expected_revision, &expected_generation, config)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_stop(
-    service: State<'_, PublishService>,
-    profile_id: PublishProfileId,
-    expected_revision: String,
-    expected_generation: String,
-) -> Result<PublishProjection, String> {
-    service
-        .stop(profile_id, &expected_revision, &expected_generation)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_issue_token(
-    service: State<'_, PublishService>,
-    profile_id: PublishProfileId,
-    expected_revision: String,
-    expected_generation: String,
-) -> Result<PublishTokenReceipt, String> {
-    service
-        .issue_token(profile_id, &expected_revision, &expected_generation)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_revoke_token(
-    service: State<'_, PublishService>,
-    profile_id: PublishProfileId,
-    expected_revision: String,
-    expected_generation: String,
-) -> Result<PublishProjection, String> {
-    service
-        .revoke_token(profile_id, &expected_revision, &expected_generation)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_jobs(
-    jobs: State<'_, crate::remote_agent::RemoteJobService>,
-) -> Result<Vec<crate::remote_agent::RemoteJobRow>, String> {
-    jobs.rows_all().await.map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn mcp_publish_cancel_job(
+async fn remote_job_cancel(
     jobs: State<'_, crate::remote_agent::RemoteJobService>,
     profile_id: PublishProfileId,
     job_id: ulid::Ulid,
@@ -3519,29 +3450,6 @@ async fn mcp_publish_cancel_job(
     jobs.cancel_job(profile_id, job_id)
         .await
         .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn mcp_publish_create_certificate(
-    service: State<'_, PublishService>,
-    id: PublishProfileId,
-    bind_ip: std::net::IpAddr,
-    revision: String,
-    generation: String,
-) -> Result<crate::mcp_publish::tls::PublishCertificateReceipt, String> {
-    service
-        .create_certificate(id, bind_ip, &revision, &generation)
-        .await
-}
-
-#[tauri::command]
-async fn mcp_publish_certificate(
-    service: State<'_, PublishService>,
-    id: PublishProfileId,
-    revision: String,
-    generation: String,
-) -> Result<crate::mcp_publish::tls::PublishCertificateReceipt, String> {
-    service.certificate(id, &revision, &generation).await
 }
 
 #[tauri::command]
@@ -3922,10 +3830,10 @@ async fn mcp_peer_add(
     ensure_config_mutation_target(&controller, &expected_target)
         .and_then(|()| ensure_config_draft_commit_admission(&controller))
         .map_err(|error| command_conflict_error(&mut controller, error))?;
-    let config =
-        super::mcp_peers::add(controller.state.global_config(), peer).map_err(|error| {
-            command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
-        })?;
+    // Invalid form values do not invalidate the UI owner or require a replacement
+    // projection. Keep the editable draft and report the failure in its form.
+    let config = super::mcp_peers::add(controller.state.global_config(), peer)
+        .map_err(DesktopCommandError::internal)?;
     let servers = serde_json::to_string(&config.mcp.servers)
         .map_err(|error| DesktopCommandError::internal(error.to_string()))?;
     let saved = controller.save_global_config(vec![
@@ -3952,10 +3860,8 @@ async fn mcp_peer_remove(
     ensure_config_mutation_target(&controller, &expected_target)
         .and_then(|()| ensure_config_draft_commit_admission(&controller))
         .map_err(|error| command_conflict_error(&mut controller, error))?;
-    let config =
-        super::mcp_peers::remove(controller.state.global_config(), &id).map_err(|error| {
-            command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
-        })?;
+    let config = super::mcp_peers::remove(controller.state.global_config(), &id)
+        .map_err(DesktopCommandError::internal)?;
     let servers = serde_json::to_string(&config.mcp.servers)
         .map_err(|error| DesktopCommandError::internal(error.to_string()))?;
     let saved = controller.save_global_config(vec![("mcp.servers_json".into(), servers)]);
@@ -4200,7 +4106,7 @@ async fn browse_workspace(
         return Err(command_conflict_error(&mut controller, conflict));
     }
     if let Some(path) = selected {
-        controller.state.set_workspace_input(path.to_string());
+        controller.state.show_workspace_picker(path.as_str());
     }
     controller
         .next_web_state()
@@ -5791,6 +5697,23 @@ mod tests {
             frontend_name_set, backend_names,
             "frontend invoke guard and Tauri handler command names drifted"
         );
+    }
+
+    #[test]
+    fn retired_manual_publish_commands_cannot_be_invoked_but_remote_stop_and_history_remain() {
+        assert!(!DESKTOP_COMMAND_WIRE_NAMES.iter().any(|name| {
+            *name == "show_mcp_publish_editor" || name.starts_with("mcp_publish_")
+        }));
+        for name in [
+            "remote_job_cancel",
+            "device_network_receiver",
+            "mcp_history_list",
+            "mcp_history_detail",
+            "mcp_history_export",
+            "mcp_history_stop",
+        ] {
+            assert!(DESKTOP_COMMAND_WIRE_NAMES.contains(&name), "{name}");
+        }
     }
 
     #[test]

@@ -21,6 +21,14 @@ export interface HubSelection {
   affinity_turns: number;
 }
 export interface HubReview { hub_id: string; reviewed_revision: string; selection: HubSelection }
+export interface HubCatalogComparison {
+  status: "first_review" | "baseline_unavailable" | "current_unavailable" | "compared" | "invalid";
+  reviewed_revision: string | null;
+  current_revision: string | null;
+  software_before: string | null;
+  software_after: string | null;
+  models: { id: string; before: HubModel | null; after: HubModel | null }[];
+}
 export interface HubProjection {
   settings_revision: string;
   connection_generation: string;
@@ -32,6 +40,8 @@ export interface HubProjection {
   main_review: HubReview | null;
   recommended_main_selection?: HubSelection | null;
   side_chat_review: HubReview | null;
+  main_catalog_comparison?: HubCatalogComparison;
+  side_chat_catalog_comparison?: HubCatalogComparison;
   main_confirmation: "unconfirmed" | "confirmed" | "review_required";
   side_chat_confirmation: "unconfirmed" | "confirmed" | "review_required";
   main_mode: HubRouteMode;
@@ -372,6 +382,7 @@ export function hubErrorText(code: string | null | undefined): string {
     capability_mismatch: "選択モデルが必要な機能を満たしていません。",
     invalid_selection: "利用候補・優先モデル・継続ターン数を確認してください。",
     route_busy: "このチャットの待機・実行が終了してから送信先を切り替えてください。",
+    delegated_execution_unsupported: "このHubは子エージェントの独立実行に未対応です。Hubを更新してください。",
     gateway_unavailable: "Hubの実行ゲートウェイを利用できません。Hubの管理画面で起動状態を確認してください。",
   };
   return code ? messages[code] ?? "Hubの操作を完了できませんでした。接続状態を確認して再度お試しください。" : "";

@@ -5,7 +5,8 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
-    CatalogRevision, HubCatalog, HubError, HubReviewContext, ReviewedHubSelection, valid_id,
+    CatalogRevision, HubCatalog, HubError, HubRequestPurpose, HubReviewContext,
+    ReviewedHubSelection, valid_id,
 };
 use crate::config::ProviderEndpoint;
 
@@ -40,6 +41,8 @@ pub(super) struct RegisteredHubClient {
     pub hub_id: String,
     pub registered_revision: CatalogRevision,
     pub heartbeat_interval_ms: u64,
+    supports_turn_heartbeat: bool,
+    pub supports_delegated_execution: bool,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +52,10 @@ struct Registration {
     hub_id: String,
     revision: CatalogRevision,
     heartbeat_interval_ms: u64,
+    #[serde(default)]
+    supports_turn_heartbeat: bool,
+    #[serde(default)]
+    supports_delegated_execution: bool,
     identity_scope: String,
 }
 
@@ -118,6 +125,10 @@ impl HubCatalogClient {
             hub_id: String,
             revision: CatalogRevision,
             heartbeat_interval_ms: u64,
+            #[serde(default)]
+            supports_turn_heartbeat: bool,
+            #[serde(default)]
+            supports_delegated_execution: bool,
             identity_scope: String,
             default_selection: Option<super::HubSelection>,
         }
@@ -169,6 +180,9 @@ impl HubCatalogClient {
                 hub_id: receipt.hub_id,
                 registered_revision: receipt.revision,
                 heartbeat_interval_ms: receipt.heartbeat_interval_ms,
+                supports_turn_heartbeat: receipt.supports_turn_heartbeat,
+                supports_delegated_execution: receipt.supports_delegated_execution
+                    && receipt.supports_turn_heartbeat,
             },
             selection,
         ))
@@ -280,6 +294,11 @@ impl HubCatalogClient {
                         Some("model_removed") => HubError::ModelRemoved,
                         Some("capability_mismatch") => HubError::CapabilityMismatch,
                         Some("active_turn") => HubError::RouteBusy,
+                        Some("lease_expired") => HubError::LeaseExpired,
+                        Some("permit_expired") => HubError::PermitExpired,
+                        Some("turn_closed") => HubError::TurnClosed,
+                        Some("stale_client") => HubError::StaleClient,
+                        Some("selection_required") => HubError::ReviewRequired,
                         Some(
                             "gateway_unavailable" | "gateway_quarantined" | "upstream_uncertain",
                         ) => HubError::GatewayUnavailable,
@@ -318,6 +337,9 @@ impl HubCatalogClient {
             hub_id: registration.hub_id,
             registered_revision: registration.revision,
             heartbeat_interval_ms: registration.heartbeat_interval_ms,
+            supports_turn_heartbeat: registration.supports_turn_heartbeat,
+            supports_delegated_execution: registration.supports_delegated_execution
+                && registration.supports_turn_heartbeat,
         })
     }
 
@@ -384,36 +406,46 @@ impl RegisteredHubClient {
     pub async fn prepare(
         &self,
         context: HubReviewContext,
+        purpose: HubRequestPurpose,
         turn_id: &str,
         request_id: &str,
         review: &ReviewedHubSelection,
     ) -> Result<PreparedRequest, HubError> {
-        self.connection
-            .post(
-                "/v1/requests/prepare",
-                &serde_json::json!({
-                    "id":self.id, "context":context, "turn_id":turn_id, "request_id":request_id,
-                    "expected_hub_id":review.hub_id, "reviewed_revision":review.reviewed_revision,
-                }),
-            )
-            .await
+        let mut body = serde_json::json!({
+            "id":self.id, "context":context, "turn_id":turn_id, "request_id":request_id,
+            "expected_hub_id":review.hub_id, "reviewed_revision":review.reviewed_revision,
+        });
+        // Omission keeps ordinary turns compatible with older Hub releases.
+        // Preparation is explicit and cannot silently count as a user turn there.
+        if purpose != HubRequestPurpose::UserTurn {
+            body["purpose"] = serde_json::json!(purpose);
+        }
+        if purpose == HubRequestPurpose::Delegated {
+            if !self.supports_delegated_execution {
+                return Err(HubError::DelegatedExecutionUnsupported);
+            }
+            body["delegated_selection"] = serde_json::json!(review.selection);
+        }
+        self.connection.post("/v1/requests/prepare", &body).await
     }
 
-    pub async fn close_turn(&self, context: HubReviewContext, turn_id: &str, cancelled: bool) {
+    pub async fn close_turn(
+        &self,
+        context: HubReviewContext,
+        turn_id: &str,
+        cancelled: bool,
+        delegated: bool,
+    ) {
         let path = if cancelled {
             "/v1/turns/cancel"
         } else {
             "/v1/turns/finish"
         };
-        let _: Result<serde_json::Value, _> = self
-            .connection
-            .post(
-                path,
-                &serde_json::json!({
-                    "id":self.id,"context":context,"turn_id":turn_id,
-                }),
-            )
-            .await;
+        let mut body = serde_json::json!({"id":self.id,"context":context,"turn_id":turn_id});
+        if delegated {
+            body["delegated"] = serde_json::json!(true);
+        }
+        let _: Result<serde_json::Value, _> = self.connection.post(path, &body).await;
     }
     pub async fn catalog(&self) -> Result<HubCatalog, HubError> {
         let catalog = self.connection.catalog().await?;
@@ -426,14 +458,27 @@ impl RegisteredHubClient {
         Ok(catalog)
     }
 
-    pub async fn heartbeat(&self, activity: &'static str) -> Result<CatalogRevision, HubError> {
-        let heartbeat: Heartbeat = self
-            .connection
-            .post(
-                "/v1/clients/heartbeat",
-                &serde_json::json!({"id":self.id,"activity":activity}),
-            )
-            .await?;
+    pub async fn heartbeat(
+        &self,
+        activity: &'static str,
+        active_turns: &[(HubReviewContext, String, bool)],
+    ) -> Result<CatalogRevision, HubError> {
+        let mut body = serde_json::json!({"id":self.id,"activity":activity});
+        if self.supports_turn_heartbeat {
+            body["active_turns"] = serde_json::json!(
+                active_turns
+                    .iter()
+                    .map(|(context, turn_id, delegated)| {
+                        let mut turn = serde_json::json!({"context":context,"turn_id":turn_id});
+                        if *delegated {
+                            turn["delegated"] = serde_json::json!(true);
+                        }
+                        turn
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        let heartbeat: Heartbeat = self.connection.post("/v1/clients/heartbeat", &body).await?;
         if heartbeat.id != self.id {
             return Err(HubError::InvalidCatalog);
         }
@@ -478,6 +523,96 @@ mod tests {
     use super::*;
     use axum::{Router, routing::get};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn route_failures_preserve_safe_typed_codes_without_response_material() {
+        use axum::{Json, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route("/failure", post(|Json(body): Json<Value>| async move {
+            (StatusCode::CONFLICT, Json(json!({"error":body["code"],"detail":"private-response-secret","endpoint":"https://private.example/token"})))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HubCatalogClient::new(&endpoint, "test-token-01234567890123456789012345", 1000)
+                .unwrap();
+        for (code, expected) in [
+            ("lease_expired", HubError::LeaseExpired),
+            ("permit_expired", HubError::PermitExpired),
+            ("turn_closed", HubError::TurnClosed),
+            ("stale_client", HubError::StaleClient),
+            ("review_required", HubError::ReviewRequired),
+            ("unrecognized-private-error", HubError::Unavailable),
+        ] {
+            let result = client
+                .post::<Value>("/failure", &json!({"code":code}))
+                .await;
+            assert_eq!(result.unwrap_err(), expected);
+            let public = crate::error::LlmError::Hub(expected).public_message();
+            assert!(public.contains(expected.code()));
+            assert!(!public.contains("malformed"));
+            assert!(!public.contains("private"));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn active_turn_heartbeat_is_negotiated_without_breaking_legacy_hubs() {
+        use axum::{Json, routing::post};
+        use serde_json::{Value, json};
+        for supported in [false, true] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let received = calls.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new()
+                .route("/v1/clients/register", post(move || async move {
+                    let mut value = json!({"id":"client","client_token":"test-token-01234567890123456789012345","hub_id":"hub","revision":"1","heartbeat_interval_ms":1000,"identity_scope":"server_session"});
+                    if supported { value["supports_turn_heartbeat"] = json!(true); }
+                    Json(value)
+                }))
+                .route("/v1/clients/heartbeat", post(move |Json(body): Json<Value>| {
+                    let calls = received.clone(); async move {
+                        calls.lock().unwrap().push(body.clone());
+                        Json(json!({"id":body["id"],"revision":"1"}))
+                    }
+                }));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client =
+                HubCatalogClient::new(&endpoint, "test-token-01234567890123456789012345", 1000)
+                    .unwrap()
+                    .register("Desktop")
+                    .await
+                    .unwrap();
+            client
+                .heartbeat(
+                    "waiting",
+                    &[
+                        (HubReviewContext::Main, "main-turn".into(), false),
+                        (HubReviewContext::SideChat, "side-turn".into(), false),
+                    ],
+                )
+                .await
+                .unwrap();
+            client.heartbeat("idle", &[]).await.unwrap();
+            let bodies = calls.lock().unwrap();
+            if supported {
+                assert_eq!(
+                    bodies[0]["active_turns"],
+                    json!([{"context":"main","turn_id":"main-turn"},{"context":"side_chat","turn_id":"side-turn"}])
+                );
+                assert_eq!(bodies[1]["active_turns"], json!([]));
+            } else {
+                assert!(bodies.iter().all(|body| body.get("active_turns").is_none()));
+            }
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn device_model_session_and_turn_survive_http_identity_rotation_without_replay() {
@@ -530,14 +665,26 @@ mod tests {
             },
         };
         client
-            .prepare(HubReviewContext::Main, "same-turn", "request-1", &review)
+            .prepare(
+                HubReviewContext::Main,
+                HubRequestPurpose::UserTurn,
+                "same-turn",
+                "request-1",
+                &review,
+            )
             .await
             .unwrap();
         let rotation = transport.try_rotate().unwrap();
         rotation.replace(http("new"));
         drop(rotation);
         client
-            .prepare(HubReviewContext::Main, "same-turn", "request-2", &review)
+            .prepare(
+                HubReviewContext::Main,
+                HubRequestPurpose::UserTurn,
+                "same-turn",
+                "request-2",
+                &review,
+            )
             .await
             .unwrap();
         server.abort();

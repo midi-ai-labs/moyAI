@@ -23,7 +23,18 @@ pub async fn enhance_prompt(
     let runtime_config = turn_config.runtime_config();
     let api_key = resolve_api_key_from_env(runtime_config.model.api_key_env.as_deref())?;
     let client = OpenAiCompatClient::new(api_key);
-    let request = prompt_enhance_request(&turn_config, raw_prompt)?;
+    enhance_prompt_with_client(&turn_config, &client, raw_prompt, cancellation).await
+}
+
+/// Uses an already selected runtime client. Hub callers supply their captured
+/// route client so catalog review and per-request permits remain authoritative.
+pub(crate) async fn enhance_prompt_with_client(
+    turn_config: &ResolvedTurnConfig,
+    client: &dyn LlmClient,
+    raw_prompt: &str,
+    cancellation: CancellationToken,
+) -> Result<String, LlmError> {
+    let request = prompt_enhance_request(turn_config, raw_prompt)?;
     let mut sink = PromptEnhanceSink::default();
     let summary = client.stream_chat(request, cancellation, &mut sink).await?;
     crate::llm::validate_toolless_text_response("prompt enhancer", &summary, sink.saw_tool_call)?;
@@ -137,6 +148,69 @@ mod tests {
     use crate::session::repository::ProjectRepository;
     use crate::session::{SessionSelector, SessionStartRequest};
     use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    struct CapturedClient {
+        output: &'static str,
+        finish: crate::session::FinishReason,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LlmClient for CapturedClient {
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+            _cancel: CancellationToken,
+            sink: &mut dyn LlmEventSink,
+        ) -> Result<crate::llm::LlmResponseSummary, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.model.name, "reviewed-logical-model");
+            assert!(request.tools.is_empty());
+            assert_eq!(request.extra_headers().len(), 0);
+            sink.push(LlmEvent::TextDelta(self.output.to_string()))?;
+            Ok(crate::llm::LlmResponseSummary {
+                finish_reason: self.finish,
+                usage: None,
+                response_id: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_client_enhances_without_direct_probe_and_preserves_terminal_validation() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://unreachable.invalid:9471".to_string();
+        config.model.model = "reviewed-logical-model".to_string();
+        config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        let turn_config = ResolvedTurnConfig::from_effective(&config).expect("runtime target");
+        for (output, finish, succeeds) in [
+            (
+                "  clarified request  ",
+                crate::session::FinishReason::Stop,
+                true,
+            ),
+            ("", crate::session::FinishReason::Stop, false),
+            ("partial", crate::session::FinishReason::Length, false),
+        ] {
+            let client = CapturedClient {
+                output,
+                finish,
+                calls: AtomicUsize::new(0),
+            };
+            let result = enhance_prompt_with_client(
+                &turn_config,
+                &client,
+                "user request",
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.is_ok(), succeeds);
+            if succeeds {
+                assert_eq!(result.unwrap(), "clarified request");
+            }
+        }
+    }
 
     async fn idle_session_fixture() -> (
         tempfile::TempDir,

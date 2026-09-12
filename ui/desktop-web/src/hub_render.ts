@@ -1,6 +1,7 @@
 import { icon } from "./icons.ts";
 import { escapeHtml } from "./utils.ts";
 import { renderDeviceNetwork } from "./device_network_render.ts";
+import { renderHubCatalogComparison } from "./hub_catalog_render.ts";
 import type { DeviceNetworkPresentation } from "./device_network_state.ts";
 import {
   createHubUiState, hubActiveRoute, hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, hubDraftHasChanges,
@@ -48,7 +49,8 @@ function channelMarkup(local: HubPresentation, context: HubContext): string {
     <div id="hub-${context}-route-status" class="hub-route-status" data-settings-passive="hub-${context}-route-status" role="status">
       <strong>${escapeHtml(routeStatus)}</strong><span>${escapeHtml(routeBlocker ?? "切り替えは次の依頼から適用します。Hub利用時に直接接続へ自動では切り替えません。")}</span>
     </div>
-    <p class="hub-help">利用候補に含めるモデルを選びます。${context === "main" ? "Main" : "Side"}の選択は独立して保存されます。</p>
+    <div data-settings-passive="hub-${context}-catalog-comparison">${renderHubCatalogComparison(context === "main" ? projection?.main_catalog_comparison : projection?.side_chat_catalog_comparison, context)}</div>
+    <p class="hub-help">利用候補に含めるモデルを選びます。${context === "main" ? "Main" : "Side"}の選択と比較元は独立して保存されます。</p>
     ${context === "main" ? `<button data-action="hub-main-recommendation" ${hubCanUseRecommendation(local) ? "" : "disabled"}>Hubの推奨候補を選ぶ</button><p class="hub-help">候補を選んで確認・保存し、「Hubを利用」で送信先を切り替えます。直接接続の設定は保持します。</p>` : ""}
     <div class="hub-model-list" data-settings-passive="hub-${context}-models" data-settings-preserve-focused-region>
       ${candidates.length ? candidates.map((model) => `<label class="hub-model-row ${missing.includes(model.id) ? "is-missing" : ""}">
@@ -85,7 +87,7 @@ export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetwor
     <div class="hub-modal-body settings-content">
       <div id="hub-panel-devices" data-hub-panel="devices" ${local.tab === "devices" ? "" : "hidden"}>${renderDeviceNetwork(network)}</div>
       <div id="hub-panel-models" data-hub-panel="models" ${local.tab === "models" ? "" : "hidden"}>
-      <p id="hub-scope-help" class="hub-scope-note" data-settings-passive="hub-scope-help">${managed ? "端末連携で参加したHubからモデルを取得します。" : "Hubを使う場合は、接続してモデルを取得します。手動接続は同じPCのHub向けです。"} 利用モデルを確認・保存し、Main・Sideそれぞれの送信先を切り替えます。Chat Completions対応モデルを利用します。Hub利用中の依頼の整形・Mainの並列サブエージェント実行は未対応です。</p>
+      <p id="hub-scope-help" class="hub-scope-note" data-settings-passive="hub-scope-help">${managed ? "端末連携で参加したHubからモデルを取得します。" : "Hubを使う場合は、接続してモデルを取得します。手動接続は同じPCのHub向けです。"} 利用モデルを確認・保存し、Main・Sideそれぞれの送信先を切り替えます。Chat Completions / Responses対応モデルを利用します。「依頼を整える」はMainで選択したモデルを使います。子エージェントも同じ確認済みモデル選択を使い、実行枠と停止は独立します。旧Hubでは更新を案内します。</p>
       <div class="hub-identity" data-settings-passive="hub-model-connection" role="status">モデル接続: ${statusText[status]}${projection?.catalog ? ` · 登録 ${projection.catalog.models.length} モデル · 更新 ${escapeHtml(projection.catalog.revision)}` : ""}${error ? `<p>${escapeHtml(error)}</p>` : ""}</div>
       <details id="hub-manual-connection" data-details-key="hub-manual-connection"><summary>手動のHub接続（既存構成との互換用）</summary>
       <section class="hub-connection" aria-labelledby="hub-connection-title"><div class="hub-section-heading"><h3 id="hub-connection-title">Hubに接続</h3><span class="hub-connection-status" data-settings-passive="hub-connection-status" data-status="${status}">${statusText[status]}</span></div>

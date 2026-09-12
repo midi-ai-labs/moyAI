@@ -260,6 +260,16 @@ pub struct DesktopSideChatProjection {
     pub messages: Vec<DesktopSideChatMessageProjection>,
     pub can_send: bool,
     pub can_cancel: bool,
+    pub direct_provider_capture: Option<DesktopSideChatDirectCaptureProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopSideChatDirectCaptureProjection {
+    pub base_url: String,
+    pub model: String,
+    pub provider_profile: String,
+    pub enabled: bool,
+    pub reason: String,
 }
 
 impl std::fmt::Debug for DesktopSideChatProjection {
@@ -318,6 +328,7 @@ impl Default for DesktopSideChatProjection {
             messages: Vec::new(),
             can_send: false,
             can_cancel: false,
+            direct_provider_capture: None,
         }
     }
 }
@@ -608,6 +619,8 @@ pub struct DesktopWebState {
     pub hub: Option<crate::hub::HubConnectionProjection>,
     #[serde(skip_deserializing)]
     pub mcp_publish: Option<crate::mcp_publish::PublishProjection>,
+    #[serde(default)]
+    pub mcp_activity: Option<crate::remote_agent::RemoteActivityProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_network: Option<crate::device_network::DeviceNetworkProjection>,
     pub projection_revision: String,
@@ -803,12 +816,11 @@ pub(crate) fn desktop_web_state_with_permission(
             !root_run_active && !runtime.agent_tree_active && !state.prompt_enhance_pending();
         hub.can_change_side_chat_mode &= runtime.side_chat.status != "running";
     }
-    let main_hub = hub
-        .as_ref()
-        .is_some_and(|hub| hub.main_mode == crate::hub::HubRouteMode::Hub);
     let main_route_ready = hub.as_ref().is_none_or(|hub| {
         hub.main_mode == crate::hub::HubRouteMode::Direct || hub.can_enable_main_hub
     });
+    let main_enhance_route_ready =
+        main_route_ready && hub.as_ref().is_none_or(|hub| hub.active_main.is_none());
     let mut side_chat = runtime.side_chat.clone();
     if let Some(hub) = &hub {
         side_chat.can_send &= hub.side_chat_mode == crate::hub::HubRouteMode::Direct
@@ -999,6 +1011,10 @@ pub(crate) fn desktop_web_state_with_permission(
             .device_network
             .as_ref()
             .map(crate::device_network::DeviceNetworkService::projection_now),
+        mcp_activity: state
+            .mcp_publish
+            .as_ref()
+            .and_then(crate::mcp_publish::PublishService::remote_activity_now),
         projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state
@@ -1277,7 +1293,7 @@ pub(crate) fn desktop_web_state_with_permission(
             && new_request_admission_open
             && prompt_review_owner_is_current,
         history_export_enabled: state.can_export_history() && !root_run_active,
-        enhance_enabled: !main_hub
+        enhance_enabled: main_enhance_route_ready
             && new_request_admission_open
             && state.app_state.prompt_review.is_none(),
         image_input_enabled,
@@ -1558,7 +1574,6 @@ fn overlay_key(overlay: DesktopOverlay) -> &'static str {
         DesktopOverlay::ProjectMenu => "project_menu",
         DesktopOverlay::ConfigEditor => "config",
         DesktopOverlay::HubConnection => "hub",
-        DesktopOverlay::McpPublish => "mcp_publish",
         DesktopOverlay::McpHistory => "mcp_history",
         DesktopOverlay::SessionSettings => "session_settings",
         DesktopOverlay::ProviderEditor => "provider",
@@ -1767,6 +1782,12 @@ fn trim_trailing_decimal(value: String) -> String {
 
 fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String, String) {
     match code {
+        DesktopStatusCode::GoalControl => {
+            return (
+                "Goal の状態を確認しました。".to_string(),
+                message.to_string(),
+            );
+        }
         DesktopStatusCode::ProviderTransport => {
             return (
                 "LLMに接続できません。LLM URL とモデル設定を確認してください。".to_string(),
@@ -2038,6 +2059,12 @@ mod tests {
     #[test]
     fn typed_status_code_selects_specialized_guidance_without_message_inference() {
         let message = "opaque diagnostic";
+        let (goal, goal_detail) = display_status_projection(
+            DesktopStatusCode::GoalControl,
+            "Goal: 一時停止\nlong objective",
+        );
+        assert_eq!(goal, "Goal の状態を確認しました。");
+        assert_eq!(goal_detail, "Goal: 一時停止\nlong objective");
         let (provider, provider_detail) =
             display_status_projection(DesktopStatusCode::ProviderTransport, message);
         assert!(provider.contains("LLMに接続できません"));

@@ -955,8 +955,12 @@ select:focus-visible,
   --composer-reserve: 188px;
 }
 
-.run-strip {
+.run-activity-stack {
   grid-row: 2;
+  min-width: 0;
+}
+
+.run-strip {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) minmax(0, auto);
   gap: 10px;
@@ -978,6 +982,36 @@ select:focus-visible,
 
 .run-strip small {
   color: var(--muted);
+}
+
+.mcp-run-strip {
+  background: color-mix(in srgb, #ef7184 6%, var(--panel));
+}
+
+.mcp-activity-badge {
+  border-color: rgb(242 123 143 / 72%);
+  background: rgb(149 49 68 / 28%);
+  color: #ffe4e9;
+  --task-activity-delay: var(--mcp-activity-delay, 0ms);
+}
+
+.mcp-activity-badge .task-activity-indicator[data-task-activity="running"] {
+  border-color: rgb(240 108 133 / 48%);
+  border-top-color: #ffe4e9;
+  border-right-color: #f27b8f;
+  background: rgb(184 52 78 / 34%);
+  box-shadow: 0 0 0 2px rgb(242 123 143 / 14%), 0 0 9px rgb(242 123 143 / 30%);
+}
+
+.mcp-activity-badge .task-activity-indicator[data-task-activity="running"]::after {
+  background: #fff3f6;
+  box-shadow: 0 0 5px rgb(255 160 180 / 88%);
+}
+
+.mcp-run-strip > button {
+  min-height: 30px;
+  padding: 4px 10px;
+  white-space: nowrap;
 }
 
 .run-stop-button {
@@ -1155,6 +1189,17 @@ select:focus-visible,
 .thread:focus-visible {
   outline: 2px solid rgba(141, 185, 255, 0.9);
   outline-offset: -2px;
+}
+
+.message:focus,
+.message:has(> .message-body > details > summary:focus) {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+@media (forced-colors: active) {
+  .message:focus,
+  .message:has(> .message-body > details > summary:focus) { outline-color: Highlight; }
 }
 
 .thread:has(.history-rail) {
@@ -4413,6 +4458,57 @@ pre {
   width: min(560px, calc(100vw - 44px));
 }
 
+.modal.permission-confirmation {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
+}
+
+.permission-header,
+.permission-footer {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.permission-context.confirm-details {
+  margin-top: 0;
+}
+
+.permission-context dd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.permission-review-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-right: 8px;
+}
+
+.permission-review-body:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.permission-footer .permission-decision-status {
+  margin-top: 0;
+}
+
+.permission-footer .modal-actions {
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.permission-footer .modal-actions button {
+  max-width: 100%;
+  white-space: normal;
+}
+
 .confirm-summary {
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -4912,6 +5008,12 @@ pre {
   background: #315f9f;
 }
 
+.initial-setup-actions .send {
+  width: auto;
+  min-width: 80px;
+  white-space: nowrap;
+}
+
 .modal.settings-modal.session-settings-modal {
   grid-template-rows: auto minmax(0, 1fr) auto;
   width: min(720px, calc(100vw - 44px));
@@ -4943,6 +5045,10 @@ pre {
   border-color: #565b63;
   background: #272a2f;
   color: #bbc3cf;
+}
+
+.inherited-badge[hidden] {
+  display: none;
 }
 
 .session-settings-lock {
@@ -5050,6 +5156,11 @@ pre {
     background: rgb(44 112 214 / 38%);
   }
 
+  .mcp-activity-badge .task-activity-indicator[data-task-activity="running"] {
+    border-color: #f27b8f;
+    background: rgb(184 52 78 / 34%);
+  }
+
   .task-activity-indicator[data-task-activity="finalizing"] {
     border-width: 3px;
     border-style: double;
@@ -5065,6 +5176,21 @@ pre {
 }
 
 @media (forced-colors: active) {
+  .mcp-activity-badge,
+  .mcp-activity-badge .task-activity-indicator[data-task-activity="running"] {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    box-shadow: none;
+  }
+  .mcp-activity-badge .task-activity-indicator[data-task-activity="running"] {
+    border-top-color: Highlight;
+    border-right-color: Highlight;
+  }
+  .mcp-activity-badge .task-activity-indicator[data-task-activity="running"]::after {
+    background: Highlight;
+    box-shadow: none;
+  }
   .task-activity-badge {
     forced-color-adjust: none;
     border-color: CanvasText;

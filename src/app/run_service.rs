@@ -292,6 +292,27 @@ impl RunService {
         service
     }
 
+    pub(crate) fn with_delegated_hub_execution(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<(Self, Option<crate::hub::HubExecutionGuard>), crate::hub::HubError> {
+        match &self.hub_route {
+            Some(factory) => {
+                let route = factory.fork_delegated(cancel)?;
+                let guard = route.execution_guard();
+                Ok((self.with_hub_turn(route), Some(guard)))
+            }
+            None => Ok((self.clone(), None)),
+        }
+    }
+
+    /// Preserve the receiver's cancellation authority for commands that can outlive a turn.
+    pub(crate) fn with_managed_shell_lifetime(&self, lifetime: CancellationToken) -> Self {
+        let mut service = self.clone();
+        service.agent_loop = service.agent_loop.with_managed_shell_lifetime(lifetime);
+        service
+    }
+
     /// A received immutable input copy belongs only to this run. Its owner keeps
     /// the directory alive until execution settles; it grants no write authority.
     pub(crate) fn with_remote_input_root(&self, root: &camino::Utf8Path) -> Self {
@@ -1685,6 +1706,9 @@ impl RunService {
             });
         };
         request.run_control = admitted_run_control;
+        if let Some(route) = &self.hub_route {
+            route.bind_run_control(request.run_control.token());
+        }
         let heartbeat_stop = CancellationToken::new();
         let heartbeat_repo = self.store.session_repo();
         let heartbeat_admission_id = admission_id.clone();
@@ -4379,6 +4403,7 @@ mod tests {
             truncator: crate::tool::truncate::ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         };
         let agent_loop = crate::agent::AgentLoop::new(
             Arc::new(UnreachableLlm),

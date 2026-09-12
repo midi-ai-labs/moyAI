@@ -89,6 +89,32 @@ test("peer save and remove attach Tools viewport continuity only to their accept
   }
 });
 
+test("failed peer mutations retain the error and draft until deliberate editing or refresh", async () => {
+  for (const remove of [false, true]) for (const outcome of ["rejected", "unsuccessful-receipt"]) {
+    const calls: string[] = [];
+    await fixture(async (name) => {
+      calls.push(name);
+      if (name === "mcp_peer_projection") return { rows: [] };
+      if (outcome === "rejected") throw new Error("fixture validation rejection");
+      return [{ overlay: "config", config_target: { workspacePath: "C:/workspace", sessionId: "session-a", configGeneration: "7" } }, false];
+    }, async (context, token) => {
+      const local = context.uiState.mcpPeers;
+      editMcpPeerField(local, "id", "WinB");
+      editMcpPeerField(local, "base_url", "http://127.0.0.1:7332/mcp");
+      if (remove) local.rows = [{ id: "WinB", base_url: local.baseUrl, enabled: true, credential_configured: true, certificate_sha256: null }];
+      await mutateMcpPeer(context, remove ? "WinB" : undefined);
+      assert.notEqual(local.error, "", `${remove}/${outcome}: settled failure must remain visible`);
+      assert.equal(local.pending, null);
+      assert.equal(context.uiState.activeConfigMutationGeneration, null);
+      assert.equal(local.id, "WinB");
+      assert.equal(token.value, "private-bearer");
+      assert.deepEqual(calls, [remove ? "mcp_peer_remove" : "mcp_peer_add"]);
+      editMcpPeerField(local, "id", "WinC");
+      assert.equal(local.error, "");
+    });
+  }
+});
+
 test("late peer receipt after Settings close and reopen cannot restore the old owner", async () => {
   let resolve!: (value: unknown) => void;
   const response = new Promise((done) => { resolve = done; });

@@ -228,7 +228,7 @@ function case52Stage5TerminalDomMatches(surface) {
     && surface.side.prompt_enabled === true
     && surface.side.send_visible === true
     && surface.side.send_enabled === false
-    && surface.side.stop_visible === true
+    && surface.side.stop_visible === false
     && surface.side.stop_enabled === false
     && surface.side.pending_count === 0
     && displayedMessagesMatch(surface.side.messages, side.messages)

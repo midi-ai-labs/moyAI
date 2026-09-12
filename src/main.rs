@@ -170,6 +170,13 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     let app = AppBootstrap::build(&command)
         .await
         .map_err(|error| (3, error.to_string()))?;
+    let shutdown_owner = app.clone();
+    let result = run_loaded_command(command, app).await;
+    shutdown_owner.shutdown_managed_shells().await;
+    result
+}
+
+async fn run_loaded_command(command: CliCommand, app: moyai::app::App) -> Result<(), (u8, String)> {
     if let CliCommand::Tui(args) = command.clone() {
         tui::run(app, args)
             .await

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import path from "node:path";
 
 import { parseArguments, readScenarioConfig } from "../run_scenario.mjs";
 import { createScenario, scenarioIds } from "../scenario_registry.mjs";
@@ -33,20 +32,48 @@ test("one registry binds every reusable scenario to the common runner contract",
     "shell.baseline",
     "shell.about",
     "shell.lynx",
+    "shell.managed-lifecycle",
     "hub.connection-settings",
+    "hub.browser-enrollment",
+    "hub.join-retry-controls",
+    "hub.receiver-settings-controls",
+    "hub.outgoing-controls",
     "agent.interrupt",
     "history.restart-prepend",
     "history.terminal-reconcile",
     "input.pointer-keyboard",
+    "input.command-palette-insertion",
+    "mcp.receiver-live",
+    "mcp.receiver-stop",
+    "mcp.history-pagination",
+    "mcp.receiver-approve",
+    "mcp.receiver-deny",
+    "mcp.receiver-abort",
     "manual.case5_2",
-    "manual.hub-runtime",
-    "manual.hub-device-network",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
     "manual.permission-guardian-openai-compatible",
     "manual.permission-temp-escalation-lm-studio",
     "native-dialog.cancel",
+    "navigation.session-management",
+    "navigation.workspace-controls",
+    "navigation.modal-keyboard-controls",
+    "navigation.running-controls",
+    "navigation.external-rejoin",
+    "navigation.external-sidebar-stop",
+    "navigation.external-palette-rejoin",
+    "main.steer-controls",
+    "history.rail-controls",
+    "main.goal-query",
+    "prompt-review.entries-enhanced",
+    "navigation.shortcut-row-controls",
+    "main.palette-run-controls",
+    "output.history-navigation",
     "prompt-review.cancel",
+    "prompt-review.raw-interaction",
+    "review.uncommitted-controls",
+    "prompt-review.submit-raw",
+    "prompt-review.submit-enhanced",
     "permission.restart-guardian",
     "permission.restart-guardian-chat",
     "permission.temp-escalation",
@@ -56,17 +83,27 @@ test("one registry binds every reusable scenario to the common runner contract",
     "provider.restart",
     "settings.docling-readiness",
     "settings.initial-setup",
+    "settings.initial-setup-hub",
     "settings.preferences",
+    "settings.preferences-config",
     "settings.session",
+    "settings.field-controls",
+    "settings.additional-controls",
+    "settings.initial-additional-controls",
+    "settings.session-discard-close",
+    "settings.temporary-apply-controls",
+    "settings.initial-field-controls",
+    "settings.session-field-controls",
+    "settings.mcp-peer-controls",
+    "navigation.menu-entry-controls",
+    "navigation.palette-entry-controls",
     "run.next-turn",
     "run.stop",
     "side-chat.quote",
     "side-chat.session",
   ]);
   for (const id of scenarioIds) {
-    const options = ["manual.hub-runtime", "manual.hub-device-network"].includes(id)
-      ? { ...liveProviderOptions, hub_binary: path.resolve("target/debug/moyai-hub.exe") }
-      : id === "manual.case5_2"
+    const options = id === "manual.case5_2"
       ? case52Options
       : id === "manual.provider-openai-compatible"
         ? liveProviderOptions
@@ -89,7 +126,10 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.notEqual(createScenario("settings.docling-readiness"), createScenario("settings.docling-readiness"));
   assert.notEqual(createScenario("settings.initial-setup"), createScenario("settings.initial-setup"));
   assert.notEqual(createScenario("settings.preferences"), createScenario("settings.preferences"));
+  assert.notEqual(createScenario("settings.preferences-config"), createScenario("settings.preferences-config"));
   assert.notEqual(createScenario("settings.session"), createScenario("settings.session"));
+  assert.notEqual(createScenario("navigation.session-management"), createScenario("navigation.session-management"));
+  assert.notEqual(createScenario("input.command-palette-insertion"), createScenario("input.command-palette-insertion"));
   assert.notEqual(createScenario("prompt-review.cancel"), createScenario("prompt-review.cancel"));
   assert.notEqual(
     createScenario("permission.restart-guardian"),

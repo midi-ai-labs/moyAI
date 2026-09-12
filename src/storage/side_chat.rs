@@ -80,8 +80,27 @@ impl SideChatContextScope {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideChatRouteKind {
+    #[default]
+    Direct,
+    Hub,
+}
+
+impl SideChatRouteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Hub => "hub",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SideChatProviderTarget {
+    #[serde(default)]
+    pub route_kind: SideChatRouteKind,
     pub base_url: String,
     pub model: String,
     pub provider_profile: ProviderProfile,
@@ -99,6 +118,7 @@ impl TryFrom<&SideChatConfig> for SideChatProviderTarget {
 
     fn try_from(config: &SideChatConfig) -> Result<Self, Self::Error> {
         Self {
+            route_kind: SideChatRouteKind::Direct,
             base_url: config.base_url.clone(),
             model: config.model.clone(),
             provider_profile: config.provider_profile,
@@ -168,6 +188,7 @@ impl Debug for SideChatProviderTarget {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SideChatBinding {
+    pub route_kind: SideChatRouteKind,
     pub id: SideChatId,
     pub owner_session_id: SessionId,
     pub conversation_session_id: SessionId,
@@ -197,6 +218,7 @@ pub struct SideChatBinding {
 impl SideChatBinding {
     pub fn provider_target(&self) -> SideChatProviderTarget {
         SideChatProviderTarget {
+            route_kind: self.route_kind,
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             provider_profile: self.provider_profile,
@@ -451,10 +473,10 @@ impl SqliteSideChatRepository {
                      supports_images, supports_tools, supports_reasoning,
                      persisted_draft, draft_revision, request_generation,
                      delete_requested_at_ms, context_scope,
-                     created_at_ms, updated_at_ms
+                     created_at_ms, updated_at_ms, provider_route_kind
                  ) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, '', 0, 0, NULL, ?16, ?17, ?17
+                     ?13, ?14, ?15, '', 0, 0, NULL, ?16, ?17, ?17, ?18
                  )",
                 params![
                     side_chat_id.to_string(),
@@ -474,6 +496,7 @@ impl SqliteSideChatRepository {
                     false,
                     SideChatContextScope::General.as_str(),
                     now_ms,
+                    target.route_kind.as_str(),
                 ],
             )?;
             side_chat_id
@@ -493,6 +516,65 @@ impl SqliteSideChatRepository {
     ) -> Result<Option<SideChatBinding>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         binding_for_owner(&connection, owner_session_id)
+    }
+
+    /// Captures the first Direct target for a Hub-origin conversation. The
+    /// canonical session/history and existing Side policy remain the same owner.
+    pub fn capture_direct_provider(
+        &self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+        expected_draft_revision: u64,
+        direct: &SideChatConfig,
+    ) -> Result<SideChatBinding, StorageError> {
+        let direct = SideChatProviderTarget::try_from(direct)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = binding_for_owner(&transaction, owner_session_id)?
+            .ok_or_else(|| StorageError::Message("side chat no longer exists".into()))?;
+        if existing.id != side_chat_id
+            || existing.request_generation != expected_generation
+            || existing.draft_revision != expected_draft_revision
+            || existing.route_kind != SideChatRouteKind::Hub
+        {
+            return Err(StorageError::Message(
+                "side chat Direct capture target changed".into(),
+            ));
+        }
+        ensure_delete_not_requested(&existing)?;
+        ensure_conversation_not_running(&transaction, existing.conversation_session_id)?;
+        let now_ms = SystemClock.now_ms();
+        let provider_json = serde_json::to_string(&serde_json::json!({
+            "profile": direct.provider_profile, "api_key_env": null, "extra_headers": {},
+        }))?;
+        transaction.execute(
+            "UPDATE sessions SET model_name=?2, base_url=?3, provider_connection_json=?4,
+             updated_at_ms=MAX(updated_at_ms,?5) WHERE id=?1",
+            params![
+                existing.conversation_session_id.to_string(),
+                direct.model,
+                direct.base_url,
+                provider_json,
+                now_ms
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE side_chat_bindings SET model=?2,base_url=?3,provider_profile=?4,
+             provider_route_kind='direct',updated_at_ms=MAX(updated_at_ms,?5)
+             WHERE id=?1 AND provider_route_kind='hub' AND request_generation=?6 AND draft_revision=?7",
+            params![existing.id.to_string(), direct.model, direct.base_url, direct.provider_profile.as_str(), now_ms,
+                sqlite_u64(expected_generation, "side chat generation")?, sqlite_u64(expected_draft_revision, "side chat draft revision")?],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::Message(
+                "side chat Direct capture target changed".into(),
+            ));
+        }
+        let binding = binding_for_owner(&transaction, owner_session_id)?
+            .ok_or_else(|| StorageError::Message("side chat no longer exists".into()))?;
+        transaction.commit()?;
+        Ok(binding)
     }
 
     pub fn get_by_conversation(
@@ -1018,6 +1100,7 @@ type BindingColumns = (
     String,
     i64,
     i64,
+    String,
 );
 
 fn binding_columns(row: &Row<'_>) -> rusqlite::Result<BindingColumns> {
@@ -1044,6 +1127,7 @@ fn binding_columns(row: &Row<'_>) -> rusqlite::Result<BindingColumns> {
         row.get(19)?,
         row.get(20)?,
         row.get(21)?,
+        row.get(22)?,
     ))
 }
 
@@ -1054,7 +1138,7 @@ const BINDING_SELECT: &str = "SELECT id, owner_session_id, conversation_session_
             supports_images, supports_tools, supports_reasoning,
             persisted_draft, draft_revision, request_generation,
             delete_requested_at_ms, context_scope,
-            created_at_ms, updated_at_ms
+            created_at_ms, updated_at_ms, provider_route_kind
      FROM side_chat_bindings";
 
 fn binding_for_owner(
@@ -1081,6 +1165,15 @@ fn binding_for_conversation(
 
 fn decode_binding(raw: BindingColumns) -> Result<SideChatBinding, StorageError> {
     Ok(SideChatBinding {
+        route_kind: match raw.22.as_str() {
+            "direct" => SideChatRouteKind::Direct,
+            "hub" => SideChatRouteKind::Hub,
+            _ => {
+                return Err(StorageError::Message(
+                    "side chat has an invalid route kind".into(),
+                ));
+            }
+        },
         id: raw.0.parse().map_err(|error| {
             StorageError::Message(format!(
                 "side chat binding has invalid id `{}`: {error}",
@@ -1408,6 +1501,7 @@ mod tests {
 
     fn target(model: &str) -> SideChatProviderTarget {
         SideChatProviderTarget {
+            route_kind: SideChatRouteKind::Direct,
             base_url: "http://localhost:1234/v1/".to_string(),
             model: model.to_string(),
             provider_profile: ProviderProfile::LmStudioChatCompletions,
@@ -1437,6 +1531,7 @@ mod tests {
         assert_eq!(
             SideChatProviderTarget::try_from(&config).expect("side target"),
             SideChatProviderTarget {
+                route_kind: SideChatRouteKind::Direct,
                 base_url: "http://localhost:8080/v1".to_string(),
                 model: "side-model".to_string(),
                 provider_profile: ProviderProfile::OpenAiCompatible,
@@ -1448,6 +1543,212 @@ mod tests {
                 supports_images: false,
                 supports_tools: false,
             }
+        );
+    }
+
+    #[test]
+    fn v65_side_chat_migrates_as_direct_and_reopens_without_reconfiguration() {
+        let (store, repo, owner) = fixture();
+        let binding = repo
+            .ensure(owner, target("legacy-model"))
+            .expect("legacy binding");
+        repo.update_draft(owner, binding.id, 0, "keep draft")
+            .expect("draft");
+        let binding = repo.get_by_owner(owner).unwrap().unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            // Remove only the forward addition to reproduce the released V65 shape.
+            connection
+                .execute_batch(
+                    "DROP TRIGGER validate_side_chat_route_kind_before_update;
+                ALTER TABLE side_chat_bindings DROP COLUMN provider_route_kind;
+                DELETE FROM moyai_schema_migrations WHERE version=66;",
+                )
+                .expect("V65 fixture");
+        }
+        store.migrate().expect("forward migration");
+        let reopened = SqliteStore::open(store.paths()).expect("reopen");
+        reopened.migrate().expect("current schema remains valid");
+        assert_eq!(
+            reopened.side_chat_repo().get_by_owner(owner).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_side_chat_captures_direct_once_preserving_canonical_history_and_draft() {
+        let (store, repo, owner) = fixture();
+        let mut hub_target = target("logical-hub-model");
+        hub_target.route_kind = SideChatRouteKind::Hub;
+        hub_target.base_url = "https://hub.test:9471".into();
+        hub_target.system_prompt = "existing side policy".into();
+        let binding = repo.ensure(owner, hub_target).expect("Hub origin");
+        let turn_id = TurnId::new();
+        let admitted = repo
+            .claim_and_admit_request(
+                owner,
+                binding.id,
+                0,
+                0,
+                binding.provider_target(),
+                turn_id,
+                &user_turn(turn_id, "previous Hub question"),
+            )
+            .await
+            .expect("previous turn");
+        let direct = SideChatConfig {
+            base_url: "http://direct.test:1234/v1".into(),
+            model: "direct-model".into(),
+            system_prompt: "must not overwrite policy".into(),
+            ..SideChatConfig::default()
+        };
+        let running = repo.get_by_owner(owner).unwrap().unwrap();
+        assert!(
+            repo.capture_direct_provider(
+                owner,
+                binding.id,
+                running.request_generation,
+                running.draft_revision,
+                &direct
+            )
+            .is_err(),
+            "active turn rejects before mutation"
+        );
+        assert_eq!(repo.get_by_owner(owner).unwrap(), Some(running));
+        let terminal = RunEvent::TurnTerminal {
+            session_id: binding.conversation_session_id,
+            terminal: Box::new(DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        };
+        store
+            .session_repo()
+            .terminalize_admitted_turn_with_protocol_event(
+                binding.conversation_session_id,
+                admitted.admission.admission_id,
+                &terminal,
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("finish old turn");
+        let draft = repo.get_by_owner(owner).unwrap().unwrap();
+        repo.update_draft(
+            owner,
+            binding.id,
+            draft.draft_revision,
+            "unsent next question",
+        )
+        .expect("retain draft");
+        let before = repo.get_by_owner(owner).unwrap().unwrap();
+        let previous_messages = repo
+            .conversation_projection(owner)
+            .unwrap()
+            .unwrap()
+            .messages;
+        let history_payloads = || {
+            let connection = repo.connection.lock().unwrap();
+            let mut statement = connection.prepare("SELECT payload_json FROM protocol_history_items WHERE session_id=?1 ORDER BY id").unwrap();
+            statement
+                .query_map([binding.conversation_session_id.to_string()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let previous_history = history_payloads();
+        for (wrong_owner, wrong_id, wrong_generation, wrong_revision) in [
+            (
+                SessionId::new(),
+                binding.id,
+                before.request_generation,
+                before.draft_revision,
+            ),
+            (
+                owner,
+                SideChatId::new(),
+                before.request_generation,
+                before.draft_revision,
+            ),
+            (
+                owner,
+                binding.id,
+                before.request_generation + 1,
+                before.draft_revision,
+            ),
+            (
+                owner,
+                binding.id,
+                before.request_generation,
+                before.draft_revision + 1,
+            ),
+        ] {
+            assert!(
+                repo.capture_direct_provider(
+                    wrong_owner,
+                    wrong_id,
+                    wrong_generation,
+                    wrong_revision,
+                    &direct
+                )
+                .is_err()
+            );
+            assert_eq!(repo.get_by_owner(owner).unwrap(), Some(before.clone()));
+        }
+        let applied = repo
+            .capture_direct_provider(
+                owner,
+                binding.id,
+                before.request_generation,
+                before.draft_revision,
+                &direct,
+            )
+            .expect("explicit first Direct target");
+        assert_eq!(applied.route_kind, SideChatRouteKind::Direct);
+        assert_eq!(applied.id, before.id);
+        assert_eq!(
+            applied.conversation_session_id,
+            before.conversation_session_id
+        );
+        assert_eq!(applied.model, "direct-model");
+        assert_eq!(applied.base_url, "http://direct.test:1234/v1");
+        assert_eq!(applied.system_prompt, before.system_prompt);
+        assert_eq!(applied.context_window, before.context_window);
+        assert_eq!(applied.persisted_draft, before.persisted_draft);
+        assert_eq!(applied.draft_revision, before.draft_revision);
+        assert_eq!(applied.request_generation, before.request_generation);
+        assert_eq!(
+            repo.conversation_projection(owner)
+                .unwrap()
+                .unwrap()
+                .messages,
+            previous_messages
+        );
+        assert_eq!(history_payloads(), previous_history);
+        assert!(
+            repo.capture_direct_provider(
+                owner,
+                applied.id,
+                applied.request_generation,
+                applied.draft_revision,
+                &direct
+            )
+            .is_err(),
+            "Direct target remains immutable"
+        );
+        assert_eq!(repo.get_by_owner(owner).unwrap(), Some(applied.clone()));
+        let reopened = SqliteStore::open(store.paths()).expect("reopen");
+        reopened.migrate().expect("current schema");
+        assert_eq!(
+            reopened.side_chat_repo().get_by_owner(owner).unwrap(),
+            Some(applied)
         );
     }
 

@@ -18,7 +18,7 @@ use crate::tool::process::ManagedProcess;
 use crate::tool::process::{ProcessTerminationStep, process_tree_termination_plan};
 use crate::tool::registry::Tool;
 use crate::tool::sandbox_process::{
-    SandboxedProcessRequest, captured_process_environment, execute_workspace_write,
+    SandboxedProcessRequest, captured_process_environment, execute_workspace_write_observed,
 };
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
@@ -58,7 +58,7 @@ pub struct ShellTool;
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         let description = if cfg!(windows) {
-            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial, including a Windows child-created protected-DACL temp path; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner; current edit baselines are retained and revalidated per path against current contents before the next whole-file write."
+            include_str!("../../assets/prompts/shell_powershell.md")
         } else {
             "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner; current edit baselines are retained and revalidated per path against current contents before the next whole-file write."
         };
@@ -348,7 +348,8 @@ fn format_shell_output_for_display(
     .join("\n\n")
 }
 
-struct CommandOutput {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CommandOutput {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
@@ -475,6 +476,49 @@ async fn execute_shell_command_with_resolved_programs(
     environment: std::collections::HashMap<String, String>,
     programs: Vec<ResolvedExecutable>,
 ) -> Result<CommandOutput, ToolError> {
+    execute_shell_command_observed(
+        shell,
+        workdir,
+        command_text,
+        timeout_ms,
+        max_output_bytes,
+        cancel,
+        sandbox_plan,
+        family,
+        environment,
+        programs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_shell_command_observed(
+    shell: &crate::config::ShellConfig,
+    workdir: &Utf8Path,
+    command_text: &str,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+    cancel: CancellationToken,
+    sandbox_plan: &ProcessSandboxPlan,
+    family: ShellFamily,
+    environment: std::collections::HashMap<String, String>,
+    programs: Vec<ResolvedExecutable>,
+    started: Option<crate::tool::sandbox_process::ProcessStarted>,
+) -> Result<CommandOutput, ToolError> {
+    if cancel.is_cancelled() {
+        return Ok(CommandOutput {
+            stdout: String::new(),
+            stderr: "command cancelled before start".into(),
+            exit_code: None,
+            timed_out: false,
+            cancelled: true,
+            effect_started: false,
+            cleanup_failed: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+    }
     let arguments = match family {
         ShellFamily::PowerShell => vec![
             "-NoProfile".to_string(),
@@ -498,7 +542,7 @@ async fn execute_shell_command_with_resolved_programs(
             let mut argv = Vec::with_capacity(arguments.len() + 1);
             argv.push(program.path().to_string());
             argv.extend(arguments.iter().cloned());
-            match execute_workspace_write(
+            match execute_workspace_write_observed(
                 profile.clone(),
                 SandboxedProcessRequest {
                     executable: program.clone(),
@@ -511,6 +555,7 @@ async fn execute_shell_command_with_resolved_programs(
                     hide_window: shell.hide_windows,
                     cancel: cancel.clone(),
                 },
+                started.clone(),
             )
             .await
             {
@@ -578,6 +623,9 @@ async fn execute_shell_command_with_resolved_programs(
     }
     let mut process = process
         .ok_or_else(|| ToolError::Message("no shell program candidate could be launched".into()))?;
+    if let Some(started) = started {
+        started(process.id());
+    }
     let wait_outcome = tokio::select! {
         _ = cancel.cancelled() => ShellWaitOutcome::Cancelled,
         result = timeout(Duration::from_millis(timeout_ms), process.wait()) => match result {
@@ -631,6 +679,9 @@ async fn execute_shell_command_with_resolved_programs(
     })
 }
 
+mod managed;
+pub use managed::{ManagedShells, ShellStartTool, ShellStatusTool, ShellStopTool};
+
 fn resolve_shell_programs(
     shell: &crate::config::ShellConfig,
     family: ShellFamily,
@@ -665,7 +716,7 @@ fn resolve_shell_executables(
         resolve_program_candidates(&programs, workdir, environment)
     } else {
         resolve_program_candidates_with(&programs, |program| {
-            ResolvedExecutable::resolve_from_captured_search_path(
+            ResolvedExecutable::discover_shell_from_captured_search_path(
                 program,
                 environment,
                 workspace_root,
@@ -1610,6 +1661,7 @@ fn command_mentions_configured_instruction_target(
 
 #[cfg(test)]
 mod tests {
+    mod managed_tests;
     use camino::Utf8PathBuf;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
@@ -1695,6 +1747,7 @@ mod tests {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         };
         ShellToolFixture {
             _temp: temp,
@@ -2289,6 +2342,171 @@ mod tests {
             crate::workspace::PathGuard::stable_identity_key(explicit[0].path()),
             crate::workspace::PathGuard::stable_identity_key(&workspace_candidate)
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn implicit_windows_shell_skips_reparse_candidates_but_explicit_override_rejects_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = root.join("workspace");
+        let aliases = root.join("aliases");
+        let trusted = root.join("trusted");
+        for directory in [&workspace, &aliases, &trusted] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        let trusted_candidate = trusted.join("pwsh.exe");
+        std::fs::write(&trusted_candidate, b"regular executable fixture")
+            .expect("fixture executable");
+        let alias = aliases.join("pwsh.exe");
+        std::os::windows::fs::symlink_file(&trusted_candidate, &alias)
+            .expect("shell reparse fixture");
+        let search_path = std::env::join_paths([aliases.as_std_path(), trusted.as_std_path()])
+            .expect("search path")
+            .to_string_lossy()
+            .into_owned();
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), search_path),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        let mut shell = ResolvedConfig::default().shell;
+
+        let implicit = super::resolve_shell_executables(
+            &shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workspace,
+            &workspace,
+        )
+        .expect("regular shell after alias");
+        assert_eq!(implicit.len(), 1);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(implicit[0].path()),
+            crate::workspace::PathGuard::stable_identity_key(&trusted_candidate)
+        );
+        implicit[0].revalidate().expect("stable selected identity");
+        drop(implicit);
+
+        for program in [Utf8PathBuf::from("pwsh"), alias] {
+            shell.program = Some(program);
+            let error = super::resolve_shell_executables(
+                &shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+                &workspace,
+                &workspace,
+            )
+            .expect_err("explicit alias must be rejected");
+            assert!(error.to_string().contains("reparse point"));
+        }
+        assert!(
+            crate::tool::executable::ResolvedExecutable::resolve_from_captured_search_path(
+                "pwsh",
+                &environment,
+                &workspace,
+            )
+            .is_err(),
+            "formatter discovery must remain strict"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn implicit_windows_shell_falls_back_from_an_alias_only_program_to_powershell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = root.join("workspace");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let regular = bin.join("powershell.exe");
+        std::fs::write(&regular, b"regular fallback fixture").expect("executable");
+        std::os::windows::fs::symlink_file(&regular, bin.join("pwsh.exe")).expect("alias fixture");
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), bin.to_string()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        let programs = super::resolve_shell_executables(
+            &ResolvedConfig::default().shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workspace,
+            &workspace,
+        )
+        .expect("fallback shell");
+        assert_eq!(programs.len(), 1);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(programs[0].path()),
+            crate::workspace::PathGuard::stable_identity_key(&regular)
+        );
+        drop(programs);
+        std::fs::remove_file(&regular).expect("remove regular fallback");
+        assert!(
+            super::resolve_shell_executables(
+                &ResolvedConfig::default().shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+                &workspace,
+                &workspace,
+            )
+            .is_err(),
+            "alias-only discovery must not launch an alias"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn implicit_windows_shell_does_not_skip_a_non_reparse_directory_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = root.join("workspace");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(bin.join("pwsh.exe")).expect("non-file candidate");
+        std::fs::write(bin.join("powershell.exe"), b"fallback must not be selected")
+            .expect("regular fallback");
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), bin.to_string()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+
+        assert!(
+            super::resolve_shell_executables(
+                &ResolvedConfig::default().shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+                &workspace,
+                &workspace,
+            )
+            .is_err(),
+            "a non-reparse non-file must not permit fallback"
+        );
+    }
+
+    #[test]
+    fn shell_candidate_admission_failure_does_not_try_another_program() {
+        for error in [
+            crate::tool::executable::ExecutableIdentityError::InvalidPath {
+                program: "pwsh".to_string(),
+                reason: "identity unavailable".to_string(),
+            },
+            crate::tool::executable::ExecutableIdentityError::Unavailable {
+                program: "pwsh".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+        ] {
+            let mut error = Some(error);
+            let mut attempts = Vec::new();
+            let result = super::resolve_program_candidates_with(
+                &["pwsh".to_string(), "powershell".to_string()],
+                |program| {
+                    attempts.push(program.to_string());
+                    Err(error.take().expect("no fallback after admission failure"))
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, ["pwsh"]);
+        }
     }
 
     #[test]
@@ -3092,6 +3310,54 @@ mod tests {
             )
         ));
         assert!(!marker.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_machine_name_inheritance_respects_explicit_exclusion_in_both_profiles() {
+        let expected = std::env::var("COMPUTERNAME").expect("Windows machine environment");
+        assert!(!expected.is_empty());
+        std::fs::create_dir_all("target").expect("target directory");
+        let temp = tempfile::Builder::new()
+            .prefix("moyai-shell-environment-")
+            .tempdir_in("target")
+            .expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let plans = [
+            crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+                crate::config::AccessMode::Default,
+                &workspace,
+            )
+            .expect("workspace process profile"),
+            crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+        ];
+        for plan in &plans {
+            for inherit in [true, false] {
+                let mut shell = config.shell.clone();
+                if !inherit {
+                    shell
+                        .env_allowlist
+                        .retain(|name| !name.eq_ignore_ascii_case("COMPUTERNAME"));
+                }
+                let output = super::execute_shell_command(
+                    &shell,
+                    &root,
+                    "[Console]::Out.Write([Environment]::GetEnvironmentVariable('COMPUTERNAME'))",
+                    30_000,
+                    2_048,
+                    CancellationToken::new(),
+                    plan,
+                )
+                .await
+                .expect("shell environment execution");
+                assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
+                assert_eq!(output.stdout, if inherit { expected.as_str() } else { "" });
+                assert!(output.stderr.is_empty(), "{}", output.stderr);
+                assert!(!output.cleanup_failed);
+            }
+        }
     }
 
     #[cfg(windows)]

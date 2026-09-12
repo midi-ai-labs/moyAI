@@ -12,6 +12,7 @@ import {
   pinResolvedThreadToEnd,
   rejectPendingHistoryPrepend,
   restoreViewportAnchor,
+  revealHistoryAnchor,
   runCompletionEdge,
   shouldRevealThreadEnd,
   syncResolvedInactiveThreadViewport,
@@ -21,6 +22,24 @@ import {
   type HistoryPrependProjection,
 } from "../src/history_navigation.ts";
 import type { TranscriptRow } from "../src/types.ts";
+
+test("history detail navigation reveals the existing disclosure and focuses it even when already open", () => {
+  const focused: unknown[] = [];
+  const summary = { focus: (options: unknown) => focused.push(options) };
+  const details = { open: false, querySelector: () => summary };
+  const target = { querySelector: () => details } as unknown as HTMLElement;
+  revealHistoryAnchor(target);
+  assert.equal(details.open, true);
+  revealHistoryAnchor(target);
+  assert.deepEqual(focused, [{ preventScroll: true }, { preventScroll: true }]);
+});
+
+test("history rows without a disclosure receive focus without creating a second detail view", () => {
+  let focused = false;
+  const target = { querySelector: () => null, focus: () => { focused = true; } } as unknown as HTMLElement;
+  revealHistoryAnchor(target);
+  assert.equal(focused, true);
+});
 
 test("an active run-tail owner reveals through a transient raw geometry gap", () => {
   assert.equal(shouldRevealThreadEnd({

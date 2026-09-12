@@ -12,9 +12,9 @@ function stillVisible(context: ActionContext, request: McpHistoryRequest): boole
   return context.getViewState()?.overlay === "mcp_history" && local.direction === request.direction
     && local.offset === request.offset && (request.id === null || local.selectedId === request.id);
 }
-export async function openMcpHistory(context: ActionContext): Promise<void> {
+export async function openMcpHistory(context: ActionContext, direction?: McpHistoryDirection): Promise<void> {
   const local = context.uiState.mcpHistory;
-  resetHistoryPage(local, local.direction, 0, [], null);
+  resetHistoryPage(local, direction ?? local.direction, 0, [], null);
   await context.mutate("show_mcp_history");
   await refreshMcpHistory(context, true);
 }

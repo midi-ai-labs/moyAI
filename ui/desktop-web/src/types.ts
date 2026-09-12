@@ -1,6 +1,7 @@
 import type { HubProjection } from "./hub_state.ts";
 import type { DeviceNetworkProjection } from "./device_network_state.ts";
 import type { PublishProjection } from "./mcp_publish_state.ts";
+import type { McpActivityProjection } from "./mcp_activity.ts";
 
 export type RowId = string;
 
@@ -293,6 +294,7 @@ export interface DoclingReadinessProjection {
 
 export type DesktopStatusCode =
   | "plain"
+  | "goal_control"
   | "provider_transport"
   | "model_unavailable"
   | "image_unsupported"
@@ -376,6 +378,7 @@ export interface SideChatCatalogResult {
 }
 
 export interface SideChatProjection {
+  direct_provider_capture?: { base_url: string; model: string; provider_profile: string; enabled: boolean; reason: string } | null;
   configured: boolean;
   deleting: boolean;
   chat_id: string | null;
@@ -406,6 +409,7 @@ export interface DesktopWebState {
   hub: HubProjection | null;
   device_network: DeviceNetworkProjection | null;
   mcp_publish: PublishProjection | null;
+  mcp_activity?: McpActivityProjection | null;
   projection_revision: string;
   workspace_path: string;
   provider_label: string;

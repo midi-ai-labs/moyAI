@@ -29,7 +29,7 @@ pub use side_chat::{
     MAX_SIDE_CHAT_DRAFT_BYTES, MAX_SIDE_CHAT_PROJECTION_MESSAGES, SideChatAdmittedRequest,
     SideChatBinding, SideChatContextScope, SideChatConversationMessage,
     SideChatConversationProjection, SideChatConversationRole, SideChatDraftUpdate, SideChatId,
-    SideChatProviderTarget, SqliteSideChatRepository,
+    SideChatProviderTarget, SideChatRouteKind, SqliteSideChatRepository,
 };
 pub use sqlite::{SqliteStore, StorageMaintenanceReport};
 

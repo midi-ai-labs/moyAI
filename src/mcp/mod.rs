@@ -200,6 +200,82 @@ impl McpClient {
         self
     }
 
+    /// A request-scoped credential view shares only the negotiated connection
+    /// and request-ID owner. Concurrent operations cannot replace each other's
+    /// authorization, and the cached client need not retain a bearer token.
+    pub(crate) fn with_runtime_authorization(
+        &self,
+        server_id: &str,
+        bearer: &str,
+    ) -> Result<Self, ToolError> {
+        self.server(server_id)?;
+        let authorization = format!("Bearer {bearer}");
+        HeaderValue::from_str(&authorization)
+            .map_err(|_| ToolError::Message("invalid MCP authorization header".into()))?;
+        let mut client = self.clone();
+        let server = client
+            .config
+            .servers
+            .iter_mut()
+            .find(|s| s.id == server_id)
+            .unwrap();
+        server
+            .headers
+            .retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        server.headers.insert("Authorization".into(), authorization);
+        Ok(client)
+    }
+
+    /// Release one negotiated session without retrying any tool operation.
+    /// Local ownership is retired even if the receiver has already restarted
+    /// or no longer accepts the current credential. The caller supplies fresh
+    /// operation-scoped authorization before requesting this cleanup.
+    pub(crate) async fn close_session(
+        &self,
+        server_id: &str,
+        mut checkpoint: impl FnMut() -> Result<(), ToolError>,
+    ) -> Result<(), ToolError> {
+        let server = self.server(server_id)?;
+        let deadline = mcp_operation_deadline(server)?.min(Instant::now() + Duration::from_secs(3));
+        let mut current = tokio::time::timeout_at(deadline, self.connections[server_id].lock())
+            .await
+            .map_err(|_| mcp_deadline_error(server))?;
+        let Some(connection) = current.take() else {
+            return Ok(());
+        };
+        let Some(session) = connection.session.filter(|s| s.id.is_some()) else {
+            return Ok(());
+        };
+        let prepared =
+            prepare_mcp_session_request(server, &connection.endpoint, &json!({}), Some(&session))?;
+        let http = self
+            .http
+            .get(server_id)
+            .ok_or_else(|| ToolError::Message("MCP connection is unavailable".into()))?
+            .as_ref()
+            .map_err(|error| ToolError::Message(error.clone()))?;
+        let mut request = http.delete(prepared.endpoint);
+        for (name, value) in prepared.configured_headers {
+            request = request.header(name, value);
+        }
+        checkpoint()?;
+        let response = tokio::time::timeout_at(deadline, request.send())
+            .await
+            .map_err(|_| mcp_deadline_error(server))?
+            .map_err(|_| ToolError::Message("MCP session cleanup failed".into()))?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND
+        ) {
+            Ok(())
+        } else {
+            Err(ToolError::Message(format!(
+                "MCP session cleanup returned HTTP {}",
+                response.status().as_u16()
+            )))
+        }
+    }
+
     pub async fn list_tools(
         &self,
         server_id: &str,
@@ -1121,6 +1197,44 @@ mod tests {
                 headers: BTreeMap::new(),
             }],
         }
+    }
+
+    #[test]
+    fn runtime_authorization_is_request_scoped_and_keeps_one_connection_owner() {
+        let mut config = routed_config();
+        config.servers[0]
+            .headers
+            .insert("authorization".into(), "Bearer old-configured-value".into());
+        let base = McpClient::new(config);
+        let first = base
+            .with_runtime_authorization("fixture", "first-runtime-token")
+            .unwrap();
+        let second = base
+            .with_runtime_authorization("fixture", "second-runtime-token")
+            .unwrap();
+        assert!(Arc::ptr_eq(&base.connections, &first.connections));
+        assert!(Arc::ptr_eq(&base.request_ids, &second.request_ids));
+        assert_eq!(
+            base.config.servers[0].headers["authorization"],
+            "Bearer old-configured-value"
+        );
+        assert_eq!(
+            first.config.servers[0].headers["Authorization"],
+            "Bearer first-runtime-token"
+        );
+        assert_eq!(
+            second.config.servers[0].headers["Authorization"],
+            "Bearer second-runtime-token"
+        );
+        assert_eq!(first.config.servers[0].headers.len(), 1);
+        assert!(
+            base.with_runtime_authorization("fixture", "secret\r\ninvalid")
+                .unwrap_err()
+                .to_string()
+                .find("secret")
+                .is_none()
+        );
+        assert!(!format!("{first:?}").contains("first-runtime-token"));
     }
 
     #[test]

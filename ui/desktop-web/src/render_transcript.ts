@@ -166,7 +166,7 @@ function renderTranscriptRow(
     ? sideChatQuoteSourceKind(row)
     : null;
   return `
-    <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
+    <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
       ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
@@ -191,7 +191,7 @@ function renderFileChanges(
     ? `<div class="markdown-body">${renderMarkdown(row.body)}</div>`
     : renderFileChangeTable(row.file_changes);
   return `
-    <article class="message file_changes" data-history-anchor="${escapeHtml(anchorId)}"
+    <article class="message file_changes" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
       ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
@@ -270,7 +270,7 @@ function renderWorkSummary(
     options,
   );
   return `
-    <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
+    <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}>
       <div class="message-body">
         <details data-details-key="work-summary:${escapeHtml(detailsId)}" ${open}>

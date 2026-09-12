@@ -4,6 +4,7 @@ import type { ActionContext } from "../src/actions.ts";
 import { importDeviceNetwork, joinDeviceNetwork, loadDeviceNetwork, refreshDeviceNetworkJobs, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "../src/device_network_actions.ts";
 import { acceptDeviceNetworkProjection, devicePeerKey, editDeviceNetworkField, type DeviceNetworkProjection } from "../src/device_network_state.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
+import { renderDeviceNetwork } from "../src/device_network_render.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -162,6 +163,45 @@ test("selection uses both device and profile identity and refuses unauthorized a
     peer.selected = true; local.projection!.enrollment = "disconnected";
     await selectDevicePeer(context, devicePeerKey(peer));
     assert.deepEqual(calls[0], { deviceId: "device-19", profileId: "receiver-19", enabled: false, expectedRevision: "3", expectedGeneration: "7" });
+  });
+});
+
+test("peer switch keeps its saved checked state while saving and blocks repeated activation", async () => {
+  const saved = deferred<DeviceNetworkProjection>();
+  let calls = 0;
+  await withContext(async () => { calls++; return saved.promise; }, async ({ context, local }) => {
+    const key = devicePeerKey(local.projection!.peers[0]);
+    const selection = selectDevicePeer(context, key);
+    assert.equal(local.pending, "select");
+    assert.equal(local.selectionKey, key);
+    assert.equal(local.projection!.peers[0].selected, false);
+    assert.match(renderDeviceNetwork(local), /role="switch"[^>]*aria-checked="false"[^>]*aria-busy="true"[^>]*disabled/);
+    await selectDevicePeer(context, key);
+    assert.equal(calls, 1);
+    const next = deviceProjection({ revision: "4", generation: "8" }); next.peers[0].selected = true;
+    saved.resolve(next); await selection;
+    assert.equal(local.pending, null);
+    assert.match(renderDeviceNetwork(local), /role="switch"[^>]*aria-checked="true"[^>]*aria-busy="false"/);
+    assert.match(local.notice, /利用をONで保存/);
+  });
+});
+
+test("failed peer save recovers the actual selection, preserves receiver drafts, and allows retry", async () => {
+  await withContext(async name => {
+    if (name === "device_network_select") throw "storage_error";
+    return deviceProjection({ generation: "8" });
+  }, async ({ context, local }) => {
+    editDeviceNetworkField(local, "bind_ip", "192.168.2.22", false);
+    const key = devicePeerKey(local.projection!.peers[0]);
+    await selectDevicePeer(context, key);
+    const html = renderDeviceNetwork(local);
+    assert.equal(local.pending, null);
+    assert.equal(local.projection!.peers[0].selected, false);
+    assert.equal(local.bindIp, "192.168.2.22");
+    const button = html.match(/<button[^>]*role="switch"[^>]*>/)![0];
+    assert.match(button, /aria-checked="false"/);
+    assert.doesNotMatch(button, /disabled/);
+    assert.match(html, /利用先に選択していません。端末設定を保存できませんでした/);
   });
 });
 

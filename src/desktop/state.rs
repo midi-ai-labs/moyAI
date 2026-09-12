@@ -31,6 +31,7 @@ pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
 #[serde(rename_all = "snake_case")]
 pub enum DesktopStatusCode {
     Plain,
+    GoalControl,
     ProviderTransport,
     ModelUnavailable,
     ImageUnsupported,
@@ -101,7 +102,6 @@ pub enum DesktopOverlay {
     ProjectMenu,
     ConfigEditor,
     HubConnection,
-    McpPublish,
     McpHistory,
     SessionSettings,
     ProviderEditor,
@@ -150,6 +150,7 @@ fn root_session_settings_match(
         && current.cwd == persisted.cwd
         && current.model == persisted.model
         && current.base_url == persisted.base_url
+        && current.provider_connection == persisted.provider_connection
         && current.access_mode == persisted.access_mode
         && current.model_parameters.context_window == persisted.model_parameters.context_window
         && current.session_settings_revision == persisted.session_settings_revision
@@ -169,6 +170,9 @@ fn merge_root_session_settings(
     let mut merged = current.clone();
     merged.model.clone_from(&persisted.model);
     merged.base_url.clone_from(&persisted.base_url);
+    merged
+        .provider_connection
+        .clone_from(&persisted.provider_connection);
     merged.access_mode = persisted.access_mode;
     merged
         .model_parameters
@@ -1696,15 +1700,6 @@ impl DesktopState {
         true
     }
 
-    pub fn show_mcp_publish_editor(&mut self) -> bool {
-        if !self.begin_unscoped_overlay_transition() {
-            return false;
-        }
-        self.view.startup_overlay_forced = false;
-        self.view.overlay = DesktopOverlay::McpPublish;
-        true
-    }
-
     pub fn show_mcp_history(&mut self) -> bool {
         if !self.begin_unscoped_overlay_transition() {
             return false;
@@ -1740,14 +1735,11 @@ impl DesktopState {
         self.provider_config.provider_context_window_input =
             self.global_config.model.context_window.to_string();
         self.provider_config.provider_selected_model_id_input = global_config.model.model.clone();
-        self.provider_config.provider_models = ensure_current_model(
-            self.provider_config.provider_models.clone(),
-            &global_config.model.model,
-        );
-        self.provider_config.provider_model_infos = ensure_current_model_info(
-            self.provider_config.provider_model_infos.clone(),
-            &global_config,
-        );
+        if self.provider_config.provider_loaded_base_url.is_none() {
+            self.provider_config.provider_models = initial_provider_models(&global_config);
+            self.provider_config.provider_model_infos =
+                initial_provider_model_infos(&global_config);
+        }
         self.provider_config.provider_selected_index = self
             .provider_config
             .provider_models
@@ -1917,10 +1909,9 @@ impl DesktopState {
         let normalized_base_url =
             normalize_provider_base_url(&self.provider_config.provider_base_url_input);
         let models = infos.iter().map(|info| info.id.clone()).collect::<Vec<_>>();
-        self.provider_config.provider_models =
-            ensure_current_model(models, &self.provider_config.effective_config.model.model);
-        self.provider_config.provider_model_infos =
-            ensure_current_model_infos(infos, &self.provider_config.effective_config);
+        // A server catalog is evidence for this endpoint, not a list of saved defaults.
+        self.provider_config.provider_models = models;
+        self.provider_config.provider_model_infos = infos;
         let desired_model_id = self
             .provider_config
             .provider_selected_model_id_input
@@ -2106,7 +2097,7 @@ impl DesktopState {
             }
         }
         if lines.is_empty() {
-            "一致する項目はありません。".to_string()
+            "一致するプロジェクト・チャット・履歴・成果物・コマンドはありません。".to_string()
         } else {
             lines.into_iter().take(24).collect::<Vec<_>>().join("\n")
         }
@@ -2350,14 +2341,6 @@ pub(crate) fn ensure_current_model_infos(
     }
     infos
 }
-
-fn ensure_current_model_info(
-    infos: Vec<ProviderModelInfo>,
-    config: &ResolvedConfig,
-) -> Vec<ProviderModelInfo> {
-    ensure_current_model_infos(infos, config)
-}
-
 fn provider_info_from_config(config: &ResolvedConfig) -> ProviderModelInfo {
     ProviderModelInfo {
         id: config.model.model.clone(),
@@ -3856,6 +3839,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_catalog_never_invents_saved_models_for_another_endpoint() {
+        let mut config = ResolvedConfig::default();
+        config.model.model = "saved-only".to_string();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+        let mut info = provider_info_from_config(&config);
+        info.id = "server-model".to_string();
+        info.source = "provider_catalog".to_string();
+        state.begin_provider_model_load(config.model.base_url.clone());
+        state.finish_provider_model_load(vec![info]);
+        assert_eq!(state.provider_config.provider_models, vec!["server-model"]);
+        assert_eq!(state.provider_config.provider_selected_index, -1);
+        assert_eq!(state.provider_config.provider_model_infos.len(), 1);
+        state.reset_effective_config(config);
+        assert_eq!(state.provider_config.provider_models, vec!["server-model"]);
+        assert!(state.show_provider_editor());
+        assert_eq!(state.provider_config.provider_models, vec!["server-model"]);
+    }
+
+    #[test]
     fn provider_editor_projects_the_global_owner_when_root_effective_settings_differ() {
         let mut global = ResolvedConfig::default();
         global.model.base_url = "http://127.0.0.1:1234".to_string();
@@ -3921,6 +3923,12 @@ mod tests {
         persisted.cwd = Utf8PathBuf::from("C:/workspace/stale-root");
         persisted.model = "saved-model".to_string();
         persisted.base_url = "http://saved-provider".to_string();
+        let mut provider_config = ResolvedConfig::default();
+        provider_config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        provider_config.model.api_key_env = Some("TEST_PROVIDER_KEY".to_string());
+        persisted.provider_connection = Some(
+            crate::session::SessionProviderConnection::from_model_config(&provider_config.model),
+        );
         persisted.access_mode = AccessMode::FullAccess;
         persisted.model_parameters.context_window = Some(65_536);
         persisted.session_settings_revision = 8;
@@ -3962,10 +3970,15 @@ mod tests {
         assert_eq!(projected.completed_at_ms, current.completed_at_ms);
         assert_eq!(projected.model, persisted.model);
         assert_eq!(projected.base_url, persisted.base_url);
+        assert_eq!(projected.provider_connection, persisted.provider_connection);
         assert_eq!(projected.access_mode, persisted.access_mode);
         assert_eq!(projected.model_parameters, persisted.model_parameters);
         assert_eq!(projected.session_settings_revision, 8);
         assert!(state.persisted_root_session_settings_are_projected(&persisted));
+
+        let mut connection_conflict = persisted.clone();
+        connection_conflict.provider_connection = None;
+        assert!(!state.persisted_root_session_settings_are_projected(&connection_conflict));
 
         let mut runtime_newer = projected.clone();
         runtime_newer.title = "runtime title after settings CAS".to_string();

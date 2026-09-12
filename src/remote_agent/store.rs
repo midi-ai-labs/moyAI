@@ -416,6 +416,18 @@ impl RemoteJobStore {
             .transpose()
     }
 
+    pub(crate) fn job_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredRemoteJob>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        query_job(
+            &connection,
+            "session_id = ?1",
+            params![session_id.to_string()],
+        )
+    }
+
     pub fn recent_all(&self, limit: usize) -> Result<Vec<StoredRemoteJob>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(

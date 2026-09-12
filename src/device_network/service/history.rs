@@ -5,10 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{DeviceClient, DeviceError, DeviceNetworkService};
-use crate::remote_agent::{McpHistoryDetail, McpHistoryDirection, RemoteJobService};
+use crate::remote_agent::{McpHistoryDirection, RemoteJobService};
 use crate::runtime::SystemClock;
 
-const HUB_MARKDOWN_BYTES: usize = 64 * 1024;
 const HUB_RESPONSE_BYTES: usize = 512 * 1024;
 
 #[derive(Deserialize)]
@@ -101,12 +100,9 @@ impl DeviceNetworkService {
 async fn history_response(jobs: &RemoteJobService, query: &HistoryRequest) -> Value {
     let response = match query.id.as_deref() {
         Some(id) => jobs
-            .history_detail(query.direction, id)
+            .history_detail_for_hub(query.direction, id)
             .await
-            .map(|mut detail| {
-                cap_hub_detail(&mut detail);
-                serde_json::to_value(detail)
-            }),
+            .map(serde_json::to_value),
         None => jobs
             .history_page(query.direction, query.offset, 20, query.anchor.as_deref())
             .await
@@ -123,20 +119,6 @@ async fn history_response(jobs: &RemoteJobService, query: &HistoryRequest) -> Va
     } else {
         body
     }
-}
-
-fn cap_hub_detail(detail: &mut McpHistoryDetail) {
-    if detail.markdown.len() <= HUB_MARKDOWN_BYTES {
-        return;
-    }
-    const NOTICE: &str = "\n\n> Hub表示の転送上限により本文を省略しました。端末のMCP履歴からMarkdownを保存して確認してください。\n";
-    let mut end = HUB_MARKDOWN_BYTES.saturating_sub(NOTICE.len());
-    while !detail.markdown.is_char_boundary(end) {
-        end -= 1;
-    }
-    detail.markdown.truncate(end);
-    detail.markdown.push_str(NOTICE);
-    detail.truncated = true;
 }
 
 #[cfg(test)]
@@ -179,38 +161,5 @@ mod tests {
         let missing = history_response(&service.inner.jobs, &request).await;
         assert!(missing["response"].is_null());
         assert!(missing["error"].is_string());
-    }
-
-    #[test]
-    fn remote_markdown_limit_preserves_unicode_and_marks_snapshot_partial() {
-        use crate::remote_agent::McpHistoryRow;
-        let mut detail = McpHistoryDetail {
-            row: McpHistoryRow {
-                id: ulid::Ulid::new().to_string(),
-                direction: McpHistoryDirection::Execution,
-                created_at_ms: 1,
-                updated_at_ms: None,
-                title: "検証".into(),
-                peer_label: "WinA".into(),
-                target_label: "temp".into(),
-                state: "completed".into(),
-                stop_status: "none".into(),
-                state_source: "local_runtime".into(),
-                result_received: false,
-                session_id: String::new(),
-                profile_id: String::new(),
-                job_id: None,
-                root_task_id: String::new(),
-                device_path: vec![],
-                can_stop: false,
-            },
-            markdown: "日本語😀\"\n".repeat(12000),
-            truncated: false,
-        };
-        cap_hub_detail(&mut detail);
-        assert!(detail.truncated);
-        assert!(detail.markdown.len() <= HUB_MARKDOWN_BYTES);
-        assert!(detail.markdown.contains("Hub表示の転送上限"));
-        assert!(serde_json::to_vec(&detail).unwrap().len() < HUB_RESPONSE_BYTES);
     }
 }

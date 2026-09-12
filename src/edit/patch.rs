@@ -153,9 +153,13 @@ impl PatchParser {
         hunks: &[PatchChunk],
         include_target_diagnostics: bool,
     ) -> Result<String, PatchError> {
-        let original_lines = original
-            .lines()
-            .map(|line| line.to_string())
+        let source_lines = original
+            .split_inclusive('\n')
+            .map(TextLine::from_source)
+            .collect::<Vec<_>>();
+        let original_lines = source_lines
+            .iter()
+            .map(|line| line.content.clone())
             .collect::<Vec<_>>();
         let mut replacements = Vec::new();
         let mut line_index = 0usize;
@@ -172,7 +176,14 @@ impl PatchParser {
             let old_segment = old_segment_for_hunk(hunk);
             let new_segment = new_segment_for_hunk(hunk);
             if old_segment.is_empty() {
-                replacements.push((original_lines.len(), 0, new_segment));
+                let replacement = replacement_lines(
+                    &source_lines,
+                    original_lines.len(),
+                    0,
+                    new_segment.len(),
+                    hunk,
+                );
+                replacements.push((original_lines.len(), 0, replacement));
                 continue;
             }
 
@@ -186,16 +197,156 @@ impl PatchParser {
                 original.ends_with('\n'),
                 include_target_diagnostics,
             )?;
+            let replacement = replacement_lines(
+                &source_lines,
+                start,
+                matched_old_len,
+                replacement.len(),
+                hunk,
+            );
             replacements.push((start, matched_old_len, replacement));
             line_index = start + matched_old_len;
         }
 
         replacements.sort_by_key(|(start, _, _)| *start);
-        let mut output = original_lines;
+        let append_separator = nearby_line_ending(&source_lines, source_lines.len());
+        let mut output = source_lines;
         for (start, old_len, replacement) in replacements.into_iter().rev() {
             output.splice(start..start + old_len, replacement);
         }
-        Ok(output.join("\n"))
+        let mut text = String::new();
+        for (index, line) in output.iter().enumerate() {
+            text.push_str(&line.content);
+            // Appending to an unterminated last source line requires a separator,
+            // but an unchanged file ending never acquires one incidentally.
+            text.push_str(if line.ending.is_empty() && index + 1 < output.len() {
+                append_separator
+            } else {
+                line.ending
+            });
+        }
+        Ok(text)
+    }
+}
+
+#[derive(Clone)]
+struct TextLine {
+    content: String,
+    ending: &'static str,
+}
+
+impl TextLine {
+    fn from_source(raw: &str) -> Self {
+        let (content, ending) = if let Some(content) = raw.strip_suffix("\r\n") {
+            (content, "\r\n")
+        } else if let Some(content) = raw.strip_suffix('\n') {
+            (content, "\n")
+        } else {
+            (raw, "")
+        };
+        Self {
+            content: content.to_owned(),
+            ending,
+        }
+    }
+}
+
+fn nearby_line_ending(source: &[TextLine], start: usize) -> &'static str {
+    source[start..]
+        .iter()
+        .find(|line| !line.ending.is_empty())
+        .or_else(|| {
+            source[..start]
+                .iter()
+                .rev()
+                .find(|line| !line.ending.is_empty())
+        })
+        .map_or("\n", |line| line.ending)
+}
+
+/// Context is matched permissively but copied from the real source. Only explicit
+/// deletion/insertion groups replace bytes, including in mixed-newline files.
+fn replacement_lines(
+    source: &[TextLine],
+    start: usize,
+    old_len: usize,
+    new_len: usize,
+    hunk: &PatchChunk,
+) -> Vec<TextLine> {
+    let mut result = Vec::new();
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    let mut deleted = 0;
+    let mut inserted = Vec::new();
+    for line in &hunk.lines {
+        match line {
+            PatchLine::Context(content) => {
+                append_changed_lines(
+                    &mut result,
+                    source,
+                    start + old_cursor - deleted,
+                    deleted,
+                    std::mem::take(&mut inserted),
+                );
+                deleted = 0;
+                if old_cursor < old_len && new_cursor < new_len {
+                    result.push(source[start + old_cursor].clone());
+                } else if new_cursor < new_len {
+                    inserted.push(content.clone());
+                }
+                // The matcher may have removed a trailing empty sentinel from
+                // either segment. It is not an additional physical source line.
+                old_cursor = (old_cursor + 1).min(old_len);
+                new_cursor = (new_cursor + 1).min(new_len);
+            }
+            PatchLine::Delete(_) => {
+                if old_cursor < old_len {
+                    old_cursor += 1;
+                    deleted += 1;
+                }
+            }
+            PatchLine::Insert(content) => {
+                if new_cursor < new_len {
+                    inserted.push(content.clone());
+                    new_cursor += 1;
+                }
+            }
+        }
+    }
+    append_changed_lines(
+        &mut result,
+        source,
+        start + old_cursor - deleted,
+        deleted,
+        inserted,
+    );
+    result
+}
+
+fn append_changed_lines(
+    output: &mut Vec<TextLine>,
+    source: &[TextLine],
+    start: usize,
+    deleted: usize,
+    inserted: Vec<String>,
+) {
+    let fallback = nearby_line_ending(source, start);
+    let count = inserted.len();
+    for (index, content) in inserted.into_iter().enumerate() {
+        let ending = if index + 1 == count
+            && start + deleted == source.len()
+            && source.last().is_none_or(|line| line.ending.is_empty())
+        {
+            ""
+        } else {
+            source
+                .get(start + index)
+                .filter(|_| index < deleted)
+                .map(|line| line.ending)
+                .filter(|ending| !ending.is_empty())
+                .unwrap_or(fallback)
+        };
+        output.push(TextLine { content, ending });
     }
 }
 
@@ -991,7 +1142,85 @@ mod tests {
         assert_eq!(
             PatchParser::apply_to_text("head\nold\n", hunks)
                 .expect("trailing sentinel should be dropped for EOF matching"),
-            "head\n\nnew"
+            "head\n\nnew\n"
+        );
+    }
+
+    #[test]
+    fn targeted_hunks_preserve_mixed_endings_and_actual_fuzzy_context() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n head\n context\n-old\n+new\n@@\n anchor\n-before\n+after\n*** End Patch",
+        ).expect("patch");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update");
+        };
+        let original = "head\r\ncontext  \nold\r\nuntouched\nanchor\r\nbefore\nlast";
+        assert_eq!(
+            PatchParser::apply_to_text(original, hunks).expect("mixed patch"),
+            "head\r\ncontext  \nnew\r\nuntouched\nanchor\r\nafter\nlast"
+        );
+    }
+
+    #[test]
+    fn targeted_hunks_preserve_eof_shape_and_append_separators() {
+        let replace = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n+more\n*** End of File\n*** End Patch",
+        ).expect("patch");
+        let super::PatchOperation::Update { hunks, .. } = &replace[0] else {
+            panic!("expected update");
+        };
+        for (original, expected) in [
+            ("head\r\nold", "head\r\nnew\r\nmore"),
+            ("head\r\nold\n", "head\r\nnew\nmore\n"),
+            ("old\r\n", "new\r\nmore\r\n"),
+        ] {
+            assert_eq!(
+                PatchParser::apply_to_text(original, hunks).unwrap(),
+                expected
+            );
+        }
+        let append = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n+first\n@@\n+second\n*** End Patch",
+        )
+        .expect("append patch");
+        let super::PatchOperation::Update { hunks, .. } = &append[0] else {
+            panic!("expected update");
+        };
+        for (original, expected) in [
+            ("head\r\ntail", "head\r\ntail\r\nfirst\r\nsecond"),
+            ("head\r\ntail\n", "head\r\ntail\nfirst\nsecond\n"),
+            ("", "first\nsecond"),
+        ] {
+            assert_eq!(
+                PatchParser::apply_to_text(original, hunks).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_lines_keeps_untouched_terminators_and_noop_keeps_all_bytes() {
+        let remove = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n head\n-old\n tail\n*** End Patch",
+        )
+        .expect("delete hunk");
+        let super::PatchOperation::Update { hunks, .. } = &remove[0] else {
+            panic!("expected update");
+        };
+        assert_eq!(
+            PatchParser::apply_to_text("head\r\nold\ntail", hunks).unwrap(),
+            "head\r\ntail"
+        );
+        let same = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n*** Move to: moved.txt\n@@\n head\n-old\n+old\n tail\n*** End Patch",
+        ).expect("same content move");
+        let super::PatchOperation::Update { hunks, .. } = &same[0] else {
+            panic!("expected update");
+        };
+        let original = "head\r\nold\ntail\r\n";
+        assert_eq!(
+            PatchParser::apply_to_text(original, hunks).unwrap(),
+            original
         );
     }
 

@@ -130,6 +130,8 @@ const V63_DEVICE_OUTGOING_REFERENCES: &str =
 const V64_REMOTE_NETWORK_RECEIPTS: &str =
     include_str!("../../migrations/V64__remote_network_receipts.sql");
 const V65_REMOTE_ARTIFACTS: &str = include_str!("../../migrations/V65__remote_artifacts.sql");
+const V66_SIDE_CHAT_ROUTE_KIND: &str =
+    include_str!("../../migrations/V66__side_chat_route_kind.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -609,12 +611,49 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
             run_remote_agent_jobs(connection)?;
             run_device_outgoing_references(connection)?;
             run_remote_network_receipts(connection)?;
-            return run_remote_artifacts(connection);
+            run_remote_artifacts(connection)?;
+            return run_side_chat_route_kind(connection);
         }
     }
     Err(StorageError::Message(format!(
         "storage migration did not reach current endpoint V{SIDE_CHAT_SYSTEM_PROMPT_VERSION}"
     )))
+}
+
+fn run_side_chat_route_kind(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 66)? {
+            connection.execute_batch(V66_SIDE_CHAT_ROUTE_KIND)?;
+        }
+        if !schema_migration_has_exact_name(connection, 66, "side_chat_route_kind")? {
+            return Err(StorageError::Message(
+                "invalid side chat route migration marker".into(),
+            ));
+        }
+        connection.prepare("SELECT provider_route_kind FROM side_chat_bindings LIMIT 0")?;
+        let objects: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='validate_side_chat_route_kind_before_update'",
+            [], |row| row.get(0),
+        )?;
+        if objects != 1 {
+            return Err(StorageError::Message(
+                "side chat route schema is incomplete".into(),
+            ));
+        }
+        validate_side_chat_system_prompt_schema(connection)?;
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn run_remote_artifacts(connection: &Connection) -> Result<(), StorageError> {
@@ -2628,6 +2667,16 @@ fn validate_side_chat_system_prompt_schema(connection: &Connection) -> Result<()
     }
 
     let expected_connection = canonical_side_chat_system_prompt_connection()?;
+    // V66 extends this same table. Keep the exact released V61 baseline for
+    // older stores, and compare the full forward schema once V66 is recorded.
+    if schema_migration_applied(connection, 66)? {
+        if !schema_migration_has_exact_name(connection, 66, "side_chat_route_kind")? {
+            return Err(StorageError::Message(
+                "invalid side chat route migration marker".into(),
+            ));
+        }
+        expected_connection.execute_batch(V66_SIDE_CHAT_ROUTE_KIND)?;
+    }
     let expected_side_chats =
         normalized_schema_objects_for_table(&expected_connection, "side_chat_bindings")?;
     let observed_side_chats =
@@ -18161,6 +18210,22 @@ mod tests {
                 "unexpected V61 data audit error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn v66_reopen_keeps_exact_side_schema_validation_and_rejects_route_trigger_tampering() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_to_current(&connection).expect("current schema");
+        run_to_current(&connection).expect("exact forward schema reopens");
+        connection
+            .execute_batch("DROP TRIGGER validate_side_chat_route_kind_before_update")
+            .unwrap();
+        assert!(
+            run_to_current(&connection)
+                .expect_err("missing route guard must not be accepted")
+                .to_string()
+                .contains("canonical system-prompt schema")
+        );
     }
 
     #[test]

@@ -197,7 +197,7 @@ function controlTokenLeaks(surface) {
 function currentTimeFromToolStatus(projection) {
   if (typeof projection?.tool_status_text !== "string") return null;
   const match = projection.tool_status_text.match(
-    /^ツール:\r?\n- Current time \[completed\] local: ([^\r\n]+)\r?\nutc: ([^\r\n]+)\r?\ntimezone: ([^\r\n]+)\r?\nunix_ms: ([0-9]+)$/u,
+    /^ツール: 1件中1件を表示（要確認を優先・新しい順）\r?\n- \[完了\] Current time: local: (\S+) utc: (\S+) timezone: (\S+) unix_ms: ([0-9]+)$/u,
   );
   if (match === null
     || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/u.test(match[1])
@@ -222,7 +222,7 @@ function currentTimeFromCompletedSummary(value) {
 
 function exactCurrentTimeProjection(projection) {
   return currentTimeFromToolStatus(projection) !== null
-    && projection?.latest_tool_summary === "ツール:"
+    && projection?.latest_tool_summary === "完了: 時刻の確認"
     && typeof projection?.progress_text === "string"
     && projection.progress_text.includes(TOOL_PROGRESS);
 }
@@ -285,6 +285,7 @@ export function chatToolContinuationHeldFailures(sample) {
     || workSummaryTurnId(runningSummaries[0]?.stable_history_identity) !== owner?.turnId
     || surface?.running_summaries?.length !== 1
     || surface?.completed_summaries?.length !== 0) failures.push("held-work-summary-not-running");
+  if (!exactCurrentTimeProjection(projection)) failures.push("held-tool-projection-mismatch");
   if (controlTokenLeaks(surface).length > 0) failures.push("chat-template-control-token-visible");
   return [...new Set(failures)];
 }
@@ -337,7 +338,8 @@ export function chatToolContinuationTerminalFailures(sample, heldTime = null) {
   if (!isDeepStrictEqual(users.map((row) => row.body), [SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT])
     || !canonicalUlid(users[0]?.stable_history_identity)) failures.push("terminal-user-not-canonical");
   if (!isDeepStrictEqual(assistants.map((row) => row.body), [SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE])
-    || (assistants[0]?.stable_history_identity ?? null) !== null) {
+    || !canonicalUlid(assistants[0]?.stable_history_identity)
+    || assistants[0]?.stable_history_identity === users[0]?.stable_history_identity) {
     failures.push("terminal-assistant-not-exact");
   }
   if (errors.length !== 0 || surface?.errors?.length !== 0) failures.push("terminal-error-present");
@@ -357,6 +359,7 @@ export function chatToolContinuationTerminalFailures(sample, heldTime = null) {
 
   const expectedUserIdentity = users[0]?.stable_history_identity ?? null;
   const expectedSummaryIdentity = completedSummaries[0]?.stable_history_identity ?? null;
+  const expectedAssistantIdentity = assistants[0]?.stable_history_identity ?? null;
   if (surface?.thread_count !== 1
     || surface?.users?.length !== 1
     || surface.users[0].visible !== true
@@ -365,7 +368,7 @@ export function chatToolContinuationTerminalFailures(sample, heldTime = null) {
     || surface?.assistants?.length !== 1
     || surface.assistants[0].visible !== true
     || surface.assistants[0].text !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE
-    || surface.assistants[0].history_identity !== null
+    || surface.assistants[0].history_identity !== expectedAssistantIdentity
     || surface?.completed_summaries?.length !== 1
     || surface.completed_summaries[0].visible !== true
     || surface.completed_summaries[0].history_identity !== expectedSummaryIdentity

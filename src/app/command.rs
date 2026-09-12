@@ -44,6 +44,7 @@ struct AppProcessRuntimeInner {
     session_service: crate::session::SessionService,
     session_event_hub: SessionRuntimeEventHub,
     agent_runtime: std::sync::Arc<crate::app::AgentRuntime>,
+    managed_shells: crate::tool::shell::ManagedShells,
 }
 
 impl AppProcessRuntime {
@@ -59,6 +60,7 @@ impl AppProcessRuntime {
                 session_service,
                 session_event_hub,
                 agent_runtime,
+                managed_shells: Default::default(),
             }),
         }
     }
@@ -77,6 +79,10 @@ impl AppProcessRuntime {
 
     pub(crate) fn agent_runtime(&self) -> std::sync::Arc<crate::app::AgentRuntime> {
         std::sync::Arc::clone(&self.inner.agent_runtime)
+    }
+
+    pub(crate) fn managed_shells(&self) -> crate::tool::shell::ManagedShells {
+        self.inner.managed_shells.clone()
     }
 
     #[cfg(test)]
@@ -106,6 +112,11 @@ pub struct App {
 impl App {
     pub fn resolved_run_session_id(&self) -> Option<SessionId> {
         self.resolved_run_session_id
+    }
+
+    /// Drain process-owned commands before the application's runtime exits.
+    pub async fn shutdown_managed_shells(&self) {
+        self.process_runtime.managed_shells().shutdown().await;
     }
 
     pub fn subscribe_session_runtime_events(

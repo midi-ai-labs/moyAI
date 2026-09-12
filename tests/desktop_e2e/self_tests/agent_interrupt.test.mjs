@@ -437,7 +437,7 @@ test("agent interrupt scenario enables only the bounded multi-agent provider sur
   const scenario = createAgentInterruptScenario();
   assert.equal(scenario.id, "agent.interrupt");
   assert.equal(scenario.productOracle, "pass");
-  assert.equal(scenario.manualGate, "not_required");
+  assert.equal(scenario.manualGate, "pending");
   assert.equal(scenario.databaseRequired, true);
   for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {
     assert.equal(typeof scenario[method], "function", method);

@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 param(
   [Parameter(Mandatory)]
-  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "SelectFile", "CapturePng", "CloseCleanup")]
+  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "OpenFilePath", "SelectFile", "CapturePng", "CloseCleanup")]
   [string]$Action,
   [string]$ExecutionRoot,
   [string]$OwnerPath,
@@ -17,6 +17,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 Add-Type -TypeDefinition @'
 using System;
@@ -136,6 +137,27 @@ namespace Moyai.DesktopE2e {
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr state);
 
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetParent(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        public static extern int GetDlgCtrlID(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr SendTextTimeout(IntPtr hwnd, uint message, UIntPtr wParam, string text,
+            uint flags, uint timeout, out UIntPtr result);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr ReadTextTimeout(IntPtr hwnd, uint message, UIntPtr wParam, StringBuilder text,
+            uint flags, uint timeout, out UIntPtr result);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", SetLastError = true)]
+        private static extern IntPtr SendControlTimeout(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr value,
+            uint flags, uint timeout, out UIntPtr result);
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 
@@ -247,6 +269,28 @@ namespace Moyai.DesktopE2e {
             }, IntPtr.Zero);
             if (!completed) throw new Win32Exception(Marshal.GetLastWin32Error(), "EnumWindows failed");
             return windows.ToArray();
+        }
+
+        // Exact native control input, not OS physical keyboard/IME evidence. No mutation retry.
+        public static void SetFileNameOnce(IntPtr edit, string path) {
+            UIntPtr result;
+            if (SendTextTimeout(edit, 0x000C, UIntPtr.Zero, path, 0x0002, 5000, out result) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "WM_SETTEXT delivery ambiguous; do not retry");
+            if (result == UIntPtr.Zero) throw new InvalidOperationException("WM_SETTEXT was not accepted");
+        }
+
+        public static string ReadFileName(IntPtr edit) {
+            var text = new StringBuilder(32768);
+            UIntPtr result;
+            if (ReadTextTimeout(edit, 0x000D, (UIntPtr)text.Capacity, text, 0x0002, 5000, out result) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "WM_GETTEXT did not return");
+            return text.ToString();
+        }
+
+        public static void ClickOpenOnce(IntPtr button) {
+            UIntPtr result;
+            if (SendControlTimeout(button, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 0x0002, 5000, out result) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "BM_CLICK delivery ambiguous; do not retry");
         }
 
         public static uint WindowThreadProcessId(IntPtr hwnd, out uint processId) {
@@ -622,6 +666,48 @@ function Resolve-ExactCandidate {
     throw "Exact candidate window class identity changed"
   }
   return [ordered]@{ handle = $handle; row = $row }
+}
+
+function Resolve-ExactDialogControl {
+  param(
+    [Parameter(Mandatory)][object]$Candidate,
+    [Parameter(Mandatory)][IntPtr]$ParentHandle,
+    [Parameter(Mandatory)][int]$ControlId,
+    [Parameter(Mandatory)][string]$ClassName
+  )
+  $handle = [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgItem($ParentHandle, $ControlId)
+  if ($handle -eq [IntPtr]::Zero) { throw "Exact native file control is absent: $ClassName/$ControlId" }
+  $row = Get-WindowRow -Handle $handle -OwnerProcessId ([int]$Candidate.row.process_id)
+  if ($null -eq $row -or -not $row.enabled -or $row.thread_id -ne $Candidate.row.thread_id -or
+      $row.root_hwnd -ne $Candidate.row.hwnd -or $row.class_name -cne $ClassName -or
+      $row.rect.width -le 0 -or $row.rect.height -le 0 -or
+      [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($handle) -ne $ParentHandle -or
+      [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgCtrlID($handle) -ne $ControlId) {
+    throw "Exact native file control identity or interaction state changed: $ClassName/$ControlId"
+  }
+  # Do not retain arbitrary control text in evidence. The readback is compared only to the intended path.
+  $row.Remove('title')
+  $row.parent_hwnd = Format-WindowHandle $ParentHandle
+  $row.control_id = $ControlId
+  return [ordered]@{ handle = $handle; row = $row }
+}
+
+function Resolve-ExactOpenFileControls {
+  param([Parameter(Mandatory)][object]$Candidate)
+  if ($Candidate.row.class_name -cne '#32770') { throw "OpenFilePath requires an exact native file dialog" }
+  # Windows common file-dialog hierarchy observed in the live native picker. A different hierarchy fails closed.
+  $comboEx = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1148 -ClassName 'ComboBoxEx32'
+  $combo = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $comboEx.handle -ControlId 1148 -ClassName 'ComboBox'
+  $edit = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $combo.handle -ControlId 1148 -ClassName 'Edit'
+  $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1 -ClassName 'Button'
+  return [ordered]@{ combo_ex = $comboEx; combo = $combo; edit = $edit; button = $button }
+}
+
+function Assert-SameOpenFileControls {
+  param([Parameter(Mandatory)][object]$Before, [Parameter(Mandatory)][object]$After)
+  foreach ($name in @('combo_ex', 'combo', 'edit', 'button')) {
+    if ($Before[$name].handle -ne $After[$name].handle) { throw "Native file-dialog control HWND changed before input: $name" }
+  }
 }
 
 function Resolve-ExactUiaWindowClose {
@@ -1142,6 +1228,47 @@ switch ($Action) {
       input = "Windows UI Automation WindowPattern.Close()"
       cleanup_only = $false
       representative_input = $true
+    })
+  }
+  "OpenFilePath" {
+    if ([string]::IsNullOrWhiteSpace($SelectedPath) -or -not [IO.Path]::IsPathFullyQualified($SelectedPath) -or
+        $SelectedPath.IndexOf([char]0) -ge 0 -or $SelectedPath.Length -ge 32768) {
+      throw "OpenFilePath requires a bounded absolute path without NUL"
+    }
+    $resolvedSelectedPath = [IO.Path]::GetFullPath($SelectedPath)
+    if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Leaf)) { throw "OpenFilePath requires an existing file" }
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    $controls = Resolve-ExactOpenFileControls -Candidate $candidate
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $beforeSet = Resolve-ExactOpenFileControls -Candidate $candidate
+    Assert-SameOpenFileControls -Before $controls -After $beforeSet
+    [Moyai.DesktopE2e.NativeWindowInterop]::SetFileNameOnce($beforeSet.edit.handle, $resolvedSelectedPath)
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $beforeRead = Resolve-ExactOpenFileControls -Candidate $candidate
+    Assert-SameOpenFileControls -Before $controls -After $beforeRead
+    $readback = [Moyai.DesktopE2e.NativeWindowInterop]::ReadFileName($beforeRead.edit.handle)
+    if (-not $readback.Equals($resolvedSelectedPath, [StringComparison]::Ordinal)) {
+      throw "Native filename input did not match its intended absolute path; Open was not clicked"
+    }
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $beforeClick = Resolve-ExactOpenFileControls -Candidate $candidate
+    Assert-SameOpenFileControls -Before $controls -After $beforeClick
+    [Moyai.DesktopE2e.NativeWindowInterop]::ClickOpenOnce($beforeClick.button.handle)
+    Write-Result ([ordered]@{
+      window = $candidate.row
+      selected_path = $resolvedSelectedPath
+      delivery_verified = $true
+      filename_set_count = 1
+      filename_readback_verified = $true
+      open_click_count = 1
+      open_call_returned = $true
+      controls = [ordered]@{ combo_ex = $controls.combo_ex.row; combo = $controls.combo.row; edit = $controls.edit.row; button = $controls.button.row }
+      foreground_required = $false
+      input = 'native-control: WM_SETTEXT -> WM_GETTEXT exact readback -> BM_CLICK'
+      os_keyboard_ime_evidence = $false
+      cleanup_only = $false
+      representative_input = $true
+      retry_count = 0
     })
   }
   "SelectFile" {

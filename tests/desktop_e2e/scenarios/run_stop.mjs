@@ -29,7 +29,7 @@ const SEND = Object.freeze({
   identity: { tag: "BUTTON", action: "send" },
 });
 const STOP = Object.freeze({
-  selector: 'section.run-strip button[data-action="cancel-run"][aria-label="実行停止"]',
+  selector: 'section.run-strip button[data-action="cancel-run"]',
   identity: { tag: "BUTTON", action: "cancel-run" },
 });
 
@@ -246,6 +246,9 @@ export function runStopInFlightFailures(sample) {
     || surface?.stop_button?.visible !== true
     || surface?.stop_button?.enabled !== true) {
     failures.push("semantic-stop-not-interactable");
+  }
+  if (surface?.stop_button?.aria_label !== "Mainを停止" || surface?.stop_button?.text !== "Mainを停止") {
+    failures.push("main-stop-label-mismatch");
   }
   const taskActivity = surface?.task_activity;
   if (taskActivity?.total_count !== 2
@@ -511,7 +514,7 @@ async function observeRunStopSurface(cdp) {
       };
     };
     const stopButtons = Array.from(document.querySelectorAll(
-      'section.run-strip button[data-action="cancel-run"][aria-label="実行停止"]'
+      ${JSON.stringify(STOP.selector)}
     ));
     const stop = stopButtons.length === 1 ? stopButtons[0] : null;
     const prompt = document.querySelector('section.composer textarea#prompt');
@@ -546,6 +549,8 @@ async function observeRunStopSurface(cdp) {
         count: stopButtons.length,
         visible: visible(stop),
         enabled: enabled(stop),
+        aria_label: stop?.getAttribute('aria-label') ?? null,
+        text: stop?.textContent?.trim() ?? '',
       },
       task_activity: {
         total_count: allTaskIndicators.length,
@@ -739,14 +744,20 @@ export function createRunStopScenario() {
           typed_projection_revision: typed.value.projection.projection_revision,
         }, { phase: "executing", owner: OWNER });
 
+        let firstHeldRecorded = false;
         const inFlight = await waitForProductStage({
           label: "one held provider request and exact Turn Stop owner",
           timeoutMs: 45_000,
-          sample: async () => ({
-            surface: await observeRunStopSurface(cdp),
-            ledger: provider.requestLedger,
-            provider: provider.resourceObservation(),
-          }),
+          sample: async () => {
+            const sample = { surface: await observeRunStopSurface(cdp), ledger: provider.requestLedger,
+              provider: provider.resourceObservation() };
+            if (!firstHeldRecorded && exactHeldRunStopLedger(sample.ledger)) {
+              firstHeldRecorded = true;
+              await sink.record("run-stop-first-held-observation", { sample, failures: runStopInFlightFailures(sample) },
+                { phase: "executing", owner: OWNER });
+            }
+            return sample;
+          },
           decide: inFlightDecision,
           code: "run-stop-in-flight-contract-mismatch",
           message: "the submitted run did not settle to one held provider request with an exact Turn Stop target",

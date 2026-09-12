@@ -264,18 +264,30 @@ impl PublishService {
         }
     }
 
+    pub(crate) fn remote_activity_now(
+        &self,
+    ) -> Option<crate::remote_agent::RemoteActivityProjection> {
+        self.remote_jobs
+            .as_ref()
+            .map(crate::remote_agent::RemoteJobService::activity_now)
+    }
+
     pub fn polling_required(&self) -> bool {
-        self.state
-            .lock()
-            .expect("publish state mutex poisoned")
-            .runtimes
-            .values()
-            .any(|runtime| {
-                matches!(
-                    runtime.status,
-                    PublishStatus::Starting | PublishStatus::Running | PublishStatus::Stopping
-                )
-            })
+        self.remote_jobs
+            .as_ref()
+            .is_some_and(crate::remote_agent::RemoteJobService::has_active_jobs)
+            || self
+                .state
+                .lock()
+                .expect("publish state mutex poisoned")
+                .runtimes
+                .values()
+                .any(|runtime| {
+                    matches!(
+                        runtime.status,
+                        PublishStatus::Starting | PublishStatus::Running | PublishStatus::Stopping
+                    )
+                })
     }
 
     pub async fn refresh(&self) -> Result<PublishProjection, String> {

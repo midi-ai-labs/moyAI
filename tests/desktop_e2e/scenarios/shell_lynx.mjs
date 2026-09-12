@@ -64,6 +64,7 @@ async function observeSurface(cdp) {
       rendered_run_target: renderedRunTarget, run_target_parse_error: runTargetParseError,
       conversation: measure(one('.conversation')), topbar: measure(one('.topbar')),
       thread: measure(thread), composer: measure(composer), run_strip: measure(one('.run-strip')),
+      run_stack: measure(one('.run-activity-stack')),
       hero: measure(one('.empty-thread h2')),
       prompt: { ...measure(prompt), value: prompt?.value ?? null, active: document.activeElement === prompt,
         disabled: prompt?.disabled ?? null,
@@ -91,16 +92,22 @@ function fits(rect, width, height) {
 /** Geometry is relative to the live viewport and measured composer, not screenshot pixels. */
 export function lynxLayoutFailures(surface, { running = false, empty = false } = {}) {
   const failures = [];
-  const { viewport, conversation, topbar, thread, composer, run_strip: strip } = surface ?? {};
+  const { viewport, conversation, topbar, thread, composer, run_strip: strip, run_stack: stack } = surface ?? {};
   if (!viewport || !conversation || !topbar || !thread || !composer) return ["missing-layout-owner"];
   if ([conversation, topbar, thread, composer].some((rect) =>
     [rect.left, rect.top, rect.right, rect.bottom, rect.width, rect.height].some((value) => !Number.isFinite(value)))) return ["invalid-layout-measurement"];
   if (thread.row !== "3") failures.push("thread-not-in-stretch-row");
   if (Math.abs(thread.bottom - conversation.bottom) > 2 || thread.height < conversation.height * 0.5) failures.push("thread-viewport-collapsed");
-  const preceding = running ? strip : topbar;
+  const preceding = running ? stack : topbar;
   if (!preceding || Math.abs(thread.top - preceding.bottom) > 2) failures.push("thread-detached-from-header");
-  if (running && (strip?.row !== "2" || surface.stop?.center_hit !== true)) failures.push("running-stop-occluded");
-  if (!running && strip !== null) failures.push("unexpected-running-strip");
+  if (running && (!stack?.visible || !strip?.visible || Math.abs(stack.top - topbar.bottom) > 2
+    || strip.top < stack.top - 1 || strip.bottom > stack.bottom + 1
+    || strip.left < stack.left - 1 || strip.right > stack.right + 1)) failures.push("running-strip-detached");
+  if (running && (!fits(surface.stop, viewport.width, viewport.height) || surface.stop?.center_hit !== true
+    || surface.stop.top < strip?.top - 1 || surface.stop.bottom > strip?.bottom + 1
+    || surface.stop.left < strip?.left - 1 || surface.stop.right > strip?.right + 1)) failures.push("running-stop-occluded");
+  // The empty stack is a stable grid owner; after Stop it remains at zero height.
+  if (!running && (strip !== null || stack?.visible === true || stack?.height > 0)) failures.push("unexpected-running-strip");
   if (!fits(composer, viewport.width, viewport.height)) failures.push("composer-outside-viewport");
   if (thread.padding_bottom < composer.height + 16) failures.push("composer-reserve-too-small");
   if (surface.prompt?.center_hit !== true || surface.send?.center_hit !== true) failures.push("composer-controls-occluded");

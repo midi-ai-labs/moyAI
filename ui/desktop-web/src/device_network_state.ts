@@ -60,6 +60,7 @@ export interface DeviceNetworkJobs { incoming: DeviceIncomingJob[]; outgoing: De
 export interface DeviceNetworkUiState {
   projection: DeviceNetworkProjection | null;
   pending: "load" | "import" | "join" | "receiver" | "select" | "refresh" | "leave" | "cancel_job" | null;
+  selectionKey: string | null;
   requestSerial: number;
   search: string;
   receiverConfirmed: boolean;
@@ -90,7 +91,7 @@ export interface DeviceNetworkUiState {
 }
 export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial">;
 export function createDeviceNetworkUiState(): DeviceNetworkUiState {
-  return { projection: null, pending: null, requestSerial: 0, search: "",
+  return { projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
     receiverConfirmed: false, target: { kind: "temp" }, accessMode: "default", modelMode: "hub",
     dirty: false, draftTarget: null, leaveConfirmed: false, error: "", notice: "", startOnLaunch: false, keepWhenHidden: false,
     bindIp: "", port: "",
@@ -232,6 +233,7 @@ export function deviceNetworkError(error: unknown): string {
     unconfigured: "Hubの共通設定ファイルを読み込んでください。",
     invalid_config: "共通設定を読み込めませんでした。Hubが出力した設定ファイルを確認してください。",
     enrollment_denied: "参加申請を送信できません。Hub管理者に申請状況と接続を確認してください。",
+    device_name_conflict: "同じ端末名が既に登録されています。Hub管理者に既存登録の名前変更または不要登録の削除を依頼し、参加申請を再試行してください。",
     device_stopped: "Hub管理者がこの端末の利用を停止しています。再許可されると自動で接続状態を更新します。",
     join_superseded: "この参加申請の証明書は更新済みです。既存の端末設定を確認してください。別の端末として自動登録はしません。",
     device_revoked: "この端末の認証はHubで失効しています。管理者へ確認してください。",

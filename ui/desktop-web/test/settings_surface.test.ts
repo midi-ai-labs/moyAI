@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { focusOverlayPrimary, handleSettingsNavigationClick } from "../src/events.ts";
 import { PostRenderFocusArbiter } from "../src/focus_arbiter.ts";
+import { InteractionLifecycle } from "../src/interaction_lifecycle.ts";
 import { overlayPrimaryFocusRequired } from "../src/modal_state.ts";
 import { restoreScrollPosition } from "../src/scroll_state.ts";
 import {
@@ -18,8 +19,10 @@ import {
   synchronizeRetainedSettingsSurface,
   restoreSettingsActionViewport,
 } from "../src/settings_surface.ts";
-import type { DesktopViewState } from "../src/types.ts";
+import type { DesktopViewState, DesktopWebState } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
+import { beginConfigMutation, finishConfigMutation } from "../src/config_mutation.ts";
+import { activeConfigDraftProjection } from "../src/view_state.ts";
 
 function settingsState(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
   return {
@@ -95,7 +98,7 @@ test("a slow new-session command keeps File, Command Palette, and Shortcuts focu
   }
 });
 
-test("pointer and keyboard Settings navigation focus the target editor without changing its draft", () => {
+test("Settings category navigation survives a deferred dirty-field render with focus and draft intact", () => {
   class FakeElement {
     readonly ownerDocument: typeof fakeDocument;
     readonly name: string;
@@ -108,6 +111,11 @@ test("pointer and keyboard Settings navigation focus the target editor without c
     selectionEnd = 0;
     scrollOptions: ScrollIntoViewOptions | null = null;
     focusOptions: FocusOptions | null = null;
+    style = { scrollBehavior: "smooth" };
+    scrollLeft = 0;
+    scrollTop = 0;
+    sectionTop = 600;
+    pendingScrollTop: number | null = null;
 
     constructor(name: string) {
       this.name = name;
@@ -148,6 +156,28 @@ test("pointer and keyboard Settings navigation focus the target editor without c
 
     scrollIntoView(options: ScrollIntoViewOptions): void {
       this.scrollOptions = options;
+      const content = this.parent;
+      assert.equal(content?.name, "content");
+      if (!content) return;
+      if (options.behavior === "instant" || content.style.scrollBehavior === "auto") {
+        content.scrollTop = this.sectionTop;
+        content.pendingScrollTop = null;
+      } else {
+        // CSS smooth scrolling begins after the click callback, not in scrollIntoView.
+        content.pendingScrollTop = this.sectionTop;
+      }
+    }
+
+    scrollTo(options: ScrollToOptions): void {
+      assert.equal(this.style.scrollBehavior, "auto");
+      this.pendingScrollTop = null;
+      this.scrollLeft = options.left ?? this.scrollLeft;
+      this.scrollTop = options.top ?? this.scrollTop;
+    }
+
+    finishSmoothScroll(): void {
+      if (this.pendingScrollTop !== null) this.scrollTop = this.pendingScrollTop;
+      this.pendingScrollTop = null;
     }
 
     focus(options: FocusOptions): void {
@@ -194,16 +224,41 @@ test("pointer and keyboard Settings navigation focus the target editor without c
       writable: true,
       value: FakeElement,
     });
-    for (const detail of [1, 0]) {
+    for (const { detail, dirty } of [
+      { detail: 1, dirty: false },
+      { detail: 1, dirty: true },
+      { detail: 0, dirty: true },
+    ]) {
+      const lifecycle = new InteractionLifecycle<string>(() => true);
+      if (detail === 1) lifecycle.beginPointer(1);
+      else lifecycle.beginKey("Enter");
+      // A changed model field commits on blur while the category pointer is active.
+      // The connected Settings render is deferred until after the category click.
+      if (dirty) assert.equal(lifecycle.defer("dirty-field-render", true, true), true);
+      content.scrollTop = 120;
+      content.pendingScrollTop = null;
       let prevented = false;
       const event = {
         detail,
         target: anchor,
         preventDefault: () => { prevented = true; },
       } as unknown as MouseEvent;
-      assert.equal(handleSettingsNavigationClick(event, settingsState()), true);
+      const state = settingsState();
+      state.config_draft.dirty = dirty;
+      assert.equal(handleSettingsNavigationClick(event, state), true);
       assert.equal(prevented, true, detail === 0 ? "keyboard-generated click" : "pointer click");
+      const release = detail === 1 ? lifecycle.capturePointerEnd(1)?.() : lifecycle.captureKeyEnd("Enter")?.();
+      assert.equal(release?.renderCurrent, dirty);
+      if (release?.renderCurrent) {
+        // renderCommitted captures and restores the connected Settings viewport.
+        restoreScrollPosition(content, content.scrollLeft, content.scrollTop);
+      }
+      content.finishSmoothScroll();
+      assert.equal(content.scrollTop, section.sectionTop, `category is visible after ${dirty ? "dirty" : "clean"} navigation`);
+      assert.equal(content.pendingScrollTop, null, "no animation can be interrupted by the next projection");
       assert.equal(fakeDocument.activeElement, editor);
+      assert.equal(editor.value, "http://side.example/v1");
+      assert.deepEqual([editor.selectionStart, editor.selectionEnd], [7, 11]);
     }
     const subsection = new FakeElement("subsection");
     const subsectionEditor = new FakeElement("editor");
@@ -216,7 +271,7 @@ test("pointer and keyboard Settings navigation focus the target editor without c
       preventDefault: () => {},
     } as unknown as MouseEvent, settingsState()), true);
     assert.equal(fakeDocument.activeElement, subsectionEditor);
-    assert.deepEqual(section.scrollOptions, { block: "start", inline: "nearest" });
+    assert.deepEqual(section.scrollOptions, { behavior: "instant", block: "start", inline: "nearest" });
     assert.deepEqual(editor.focusOptions, { preventScroll: true });
     assert.equal(editor.value, "http://side.example/v1");
     assert.deepEqual([editor.selectionStart, editor.selectionEnd], [7, 11]);
@@ -299,6 +354,27 @@ test("settings surface preserves the live subtree only for the same exact owner 
     side_chat: { ...configured.side_chat, deleting: true, can_send: false },
   })), true, "runtime Side Chat deletion does not replace Global Settings controls");
   assert.equal(settingsSurfaceIdentity(settingsState({ confirmation_visible: true })), null);
+});
+
+test("a rejected config mutation keeps the same Settings DOM owner while edit availability locks and unlocks", () => {
+  const initial = settingsState();
+  const projection = { ...initial, config_draft_capabilities: {
+    clean: initial.config_draft, dirty: initial.config_draft,
+  } } as unknown as DesktopWebState;
+  const ui = createUiLocalState();
+  const view = () => ({ ...initial, config_draft: activeConfigDraftProjection(projection, ui) });
+  const before = view();
+  const request = beginConfigMutation(ui, projection.config_target);
+  const pending = view();
+  assert.equal(before.config_draft.edit_enabled, true);
+  assert.equal(pending.config_draft.edit_enabled, false);
+  assert.equal(shouldRetainConnectedSettingsSurface(before, pending, null, null), true,
+    "a temporary availability change must not replace the entered token, focus, details or scroll owner");
+  assert.equal(finishConfigMutation(ui, request, false, request.target, projection.config_target), true);
+  const rejected = view();
+  assert.equal(rejected.config_draft.edit_enabled, true);
+  assert.equal(shouldRetainConnectedSettingsSurface(pending, rejected, null, null), true);
+  assert.equal(settingsRecoverableErrorOwnerIdentity(before), settingsRecoverableErrorOwnerIdentity(rejected));
 });
 
 test("initial setup retains one connected step only for the same exact setup owner", () => {
@@ -443,13 +519,17 @@ test("retained Settings availability synchronization preserves browser-owned dra
     readonly dataset: { settingsPassive: string };
     readonly ownerDocument = { activeElement: null as FakePassiveRegion | null };
     replacedWith: FakePassiveRegion | null = null;
+    readonly textContent: string;
 
-    constructor(identity: string) {
+    constructor(identity: string, textContent: string) {
       super();
       this.dataset = { settingsPassive: identity };
+      this.textContent = textContent;
     }
 
     contains(target: unknown): boolean { return target === this; }
+    querySelectorAll(): [] { return []; }
+    isEqualNode(next: FakePassiveRegion): boolean { return this.textContent === next.textContent; }
     replaceWith(next: FakePassiveRegion): void { this.replacedWith = next; }
   }
 
@@ -484,6 +564,8 @@ test("retained Settings availability synchronization preserves browser-owned dra
       if (selector === "#docling-disabled-help") return this.help as T;
       return null;
     }
+
+    contains(node: FakePassiveRegion): boolean { return this.passiveRegions.includes(node); }
   }
 
   const currentInput = new FakeControl("INPUT", { id: "docling-url" });
@@ -508,9 +590,9 @@ test("retained Settings availability synchronization preserves browser-owned dra
   const currentReadiness = new FakeLiveRegion("docling-readiness");
   const currentFocusedRegion = new FakeLiveRegion("focused-status");
   currentFocusedRegion.ownerDocument.activeElement = currentFocusedRegion;
-  const currentPassive = new FakePassiveRegion("session-inheritance-help");
-  const currentDirtyBadge = new FakePassiveRegion("session-settings-dirty-badge");
-  const currentError = new FakePassiveRegion("session-settings-recoverable-error");
+  const currentPassive = new FakePassiveRegion("session-inheritance-help", "Inherited from Global");
+  const currentDirtyBadge = new FakePassiveRegion("session-settings-dirty-badge", "Saved");
+  const currentError = new FakePassiveRegion("session-settings-recoverable-error", "Earlier error");
   currentError.setAttribute("data-settings-preserve-focused-region", "");
   currentError.ownerDocument.activeElement = currentError;
   const current = new FakeModal(
@@ -540,9 +622,9 @@ test("retained Settings availability synchronization preserves browser-owned dra
   });
   const nextReadiness = new FakeLiveRegion("docling-readiness");
   const nextFocusedRegion = new FakeLiveRegion("focused-status");
-  const nextPassive = new FakePassiveRegion("session-inheritance-help");
-  const nextDirtyBadge = new FakePassiveRegion("session-settings-dirty-badge");
-  const nextError = new FakePassiveRegion("session-settings-recoverable-error");
+  const nextPassive = new FakePassiveRegion("session-inheritance-help", "Override selected");
+  const nextDirtyBadge = new FakePassiveRegion("session-settings-dirty-badge", "Unsaved changes");
+  const nextError = new FakePassiveRegion("session-settings-recoverable-error", "Latest error");
   const next = new FakeModal(
     [nextInput, nextToggle, nextSave, nextClose],
     [nextReadiness, nextFocusedRegion],

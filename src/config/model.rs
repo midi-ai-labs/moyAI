@@ -948,6 +948,7 @@ impl Default for ResolvedConfig {
                 "ComSpec".to_string(),
                 "USERPROFILE".to_string(),
                 "USERNAME".to_string(),
+                "COMPUTERNAME".to_string(),
                 "LOCALAPPDATA".to_string(),
                 "APPDATA".to_string(),
                 "HOMEDRIVE".to_string(),

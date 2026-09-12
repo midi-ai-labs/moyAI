@@ -297,6 +297,7 @@ async fn saved_enabled_intent_does_not_open_a_listener_on_restart() {
     let running = fixture.start(id).await;
     let endpoint = row(&running, id).endpoint.clone().unwrap();
     assert!(fixture.service.shutdown().await);
+    let retained_settings = std::fs::read(&fixture.path).unwrap();
     let restarted = PublishService::new(
         fixture.path.clone(),
         fixture.store.clone(),
@@ -307,6 +308,8 @@ async fn saved_enabled_intent_does_not_open_a_listener_on_restart() {
     assert!(row(&state, id).endpoint.is_none());
     assert!(row(&state, id).credential_configured);
     assert!(!restarted.polling_required());
+    restarted.refresh().await.unwrap();
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), retained_settings);
     assert!(
         fixture
             .post(&endpoint, &receipt.token, None, initialize())

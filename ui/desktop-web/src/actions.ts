@@ -5,8 +5,6 @@ import { deviceCanJoin, deviceCanReceive, deviceCanSelect, deviceCanStopJob } fr
 import { deviceCanDiagnose, diagnoseDeviceNetwork } from "./device_network_diagnostics.ts";
 import { deviceCanInspectArtifacts, deviceCanExportArtifacts, inspectDeviceArtifacts, exportDeviceArtifacts } from "./device_network_artifacts.ts";
 import { hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, useHubRecommendation } from "./hub_state.ts";
-import { addPublish, cancelPublishDelete, choosePublish, copyPublish, discardPublish, openPublish, operatePublish, refreshPublish, savePublish, publishCertificate, stopPublishJob } from "./mcp_publish_actions.ts";
-import { publishCanOperate, publishCanSave, publishDirty, publishEditor, publishRow, publishCanCreateCertificate, publishCanStopJob } from "./mcp_publish_state.ts";
 import { openMcpHistory, reloadMcpHistory, selectMcpHistoryDirection, selectMcpHistory, pageMcpHistory, operateMcpHistory } from "./mcp_history_actions.ts";
 import { selectedMcpHistoryRow } from "./mcp_history_state.ts";
 import { checkMcpPeer, mcpPeerDraftValid, mutateMcpPeer, refreshMcpPeers } from "./mcp_peer.ts";
@@ -1279,6 +1277,9 @@ async function persistSideChatDraftLoop(
   context: ActionContext,
 ): Promise<void> {
   while (sideChatDraftIsDirty(draft)) {
+    // Keep the save owner while IME/keyboard input is active, then read the confirmed draft
+    // and revalidate its target. Composition candidates must not become durable edits.
+    await context.waitForInteractionIdle();
     const currentBeforeSave = context.getProjection();
     if (
       !currentBeforeSave
@@ -1301,6 +1302,9 @@ async function persistSideChatDraftLoop(
       quote,
     });
 
+    // A successful mutation may still be deferred by a new input interaction. Do not release
+    // single-flight or reuse its CAS revision until that receipt reaches getProjection().
+    await context.waitForInteractionIdle();
     const current = context.getProjection();
     const sameTarget = current?.side_chat.owner_session_id === ownerSessionId
       && current.side_chat.chat_id === chatId;
@@ -1492,7 +1496,7 @@ const ACTION_DEFINITIONS = [
     label: "LLM / Provider 設定",
     menu: "view",
     palette: true,
-    enabled: always,
+    enabled: (state) => state.config_draft.external_owner_mutation_open,
     run: (_state, context) => context.mutate("show_provider_editor"),
   },
   {
@@ -1520,6 +1524,7 @@ const ACTION_DEFINITIONS = [
   { id: "device-network-export-artifacts", label: "委任タスクの成果物を書き出す", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanExportArtifacts(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => exportDeviceArtifacts(context, payload.value) },
   { id: "device-network-leave", label: "Hub接続を一時解除", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection?.can_leave && model.local.deviceNetwork.leaveConfirmed), run: (_state, context) => leaveDeviceNetwork(context) },
   { id: "show-mcp-history", label: "MCP履歴", menu: "view", palette: true, enabled: always, run: (_state, context) => openMcpHistory(context) },
+  { id: "show-mcp-execution-history", label: "MCP実行履歴", enabled: always, run: (_state, context) => openMcpHistory(context, "execution") },
   { id: "mcp-history-direction", label: "MCP履歴の種類を選択", enabled: (state, payload) => state.overlay === "mcp_history" && (payload.value === "instruction" || payload.value === "execution"), run: (_state, context, payload) => selectMcpHistoryDirection(context, payload.value) },
   { id: "mcp-history-select", label: "MCP履歴の詳細を表示", enabled: (state, payload, model) => state.overlay === "mcp_history" && model.local.mcpHistory.rows.some(row => row.id === payload.value && row.direction === model.local.mcpHistory.direction), run: (_state, context, payload) => selectMcpHistory(context, payload.value) },
   { id: "mcp-history-refresh", label: "MCP履歴を更新", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && !model.local.mcpHistory.detailPending && model.local.mcpHistory.operation !== "stop", run: (_state, context) => reloadMcpHistory(context) },
@@ -1527,23 +1532,6 @@ const ACTION_DEFINITIONS = [
   { id: "mcp-history-previous", label: "MCP履歴の前のページ", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && model.local.mcpHistory.previousOffsets.length > 0, run: (_state, context) => pageMcpHistory(context, false) },
   { id: "mcp-history-export", label: "MCP履歴をMarkdownで保存", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)), run: (_state, context) => operateMcpHistory(context, "export") },
   { id: "mcp-history-stop", label: "MCPタスクの停止を要求", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)?.can_stop), run: (_state, context) => operateMcpHistory(context, "stop") },
-  { id: "show-mcp-publish", label: "旧配信設定の管理", enabled: (_state, _payload, model) => Boolean(model.local.mcpPublish.projection?.profiles.length), run: (_state, context) => openPublish(context) },
-  { id: "mcp-publish-refresh", label: "MCP配信の最新情報を取得", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending, run: (_state, context) => refreshPublish(context) },
-  { id: "mcp-publish-add", label: "配信プロファイルを追加", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(model.local.mcpPublish.projection && model.local.mcpPublish.projection.profiles.length < 32), run: (_state, context) => addPublish(context) },
-  { id: "mcp-publish-select", label: "配信プロファイルを選択", enabled: (state, payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(model.local.mcpPublish.drafts[payload.value]), run: (_state, context, payload) => choosePublish(context, payload.value) },
-  { id: "mcp-publish-save", label: "配信設定を保存", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanSave(model.local.mcpPublish), run: (_state, context) => savePublish(context) },
-  { id: "mcp-publish-discard", label: "配信設定の変更を破棄", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishEditor(model.local.mcpPublish) && publishDirty(publishEditor(model.local.mcpPublish)!)), run: (_state, context) => discardPublish(context) },
-  { id: "mcp-publish-start", label: "MCP配信を開始", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "start"), run: (_state, context) => operatePublish(context, "start") },
-  { id: "mcp-publish-stop", label: "MCP配信を停止", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "stop"), run: (_state, context) => operatePublish(context, "stop") },
-  { id: "mcp-publish-delete", label: "配信プロファイルを削除", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "delete"), run: (_state, context) => operatePublish(context, "delete") },
-  { id: "mcp-publish-cancel-delete", label: "配信プロファイルの削除をキャンセル", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending, run: (_state, context) => cancelPublishDelete(context) },
-  { id: "mcp-publish-issue-token", label: "MCP接続用トークンを発行", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "issue_token"), run: (_state, context) => operatePublish(context, "issue_token") },
-  { id: "mcp-publish-revoke-token", label: "MCP接続用トークンを失効", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanOperate(model.local.mcpPublish, "revoke_token"), run: (_state, context) => operatePublish(context, "revoke_token") },
-  { id: "mcp-publish-copy-token", label: "MCP接続用トークンをコピー", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishRow(model.local.mcpPublish)?.credential_configured), run: (_state, context) => copyPublish(context, false) },
-  { id: "mcp-publish-copy-config", label: "MCP接続側設定例をコピー", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishRow(model.local.mcpPublish)?.endpoint && publishRow(model.local.mcpPublish)?.credential_configured), run: (_state, context) => copyPublish(context, true) },
-  { id: "mcp-publish-create-certificate", label: "配信用TLS証明書を作成", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && publishCanCreateCertificate(model.local.mcpPublish), run: (_state, context) => publishCertificate(context, true) },
-  { id: "mcp-publish-copy-certificate", label: "配信用の公開証明書をコピー", enabled: (state, _payload, model) => state.overlay === "mcp_publish" && !model.local.mcpPublish.pending && Boolean(publishRow(model.local.mcpPublish)?.profile.tls), run: (_state, context) => publishCertificate(context, false) },
-  { id: "mcp-publish-stop-job", label: "受け付けたタスクを停止", enabled: (state, payload, model) => state.overlay === "mcp_publish" && publishCanStopJob(model.local.mcpPublish, payload.value), run: (_state, context, payload) => stopPublishJob(context, payload.value) },
   { id: "mcp-peer-refresh", label: "登録済みmoyAI端末を更新", enabled: (state, _payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending, run: (_state, context) => refreshMcpPeers(context) },
   { id: "mcp-peer-add", label: "moyAI端末の接続を保存", enabled: (state, _payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && !state.config_draft.dirty && mcpPeerDraftValid(model.local.mcpPeers), run: (_state, context) => mutateMcpPeer(context) },
   { id: "mcp-peer-remove", label: "moyAI端末の接続を削除", enabled: (state, payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && !state.config_draft.dirty && model.local.mcpPeers.rows.some((row) => row.id === payload.value), run: (_state, context, payload) => mutateMcpPeer(context, payload.value) },
@@ -1856,6 +1844,29 @@ const ACTION_DEFINITIONS = [
     run: (state, context) => showSideChatPane(state, context),
   },
   {
+    id: "capture-side-chat-direct-provider",
+    label: "この会話にDirect設定を適用",
+    enabled: (state, _payload, model) => Boolean(state.side_chat.direct_provider_capture?.enabled)
+      && model.local.sideChat.operationsOpen && !model.local.sideChat.mutationPending,
+    run: async (state, context) => {
+      const side = state.side_chat;
+      const ownerSessionId = sideChatOwnerSessionId(state);
+      if (!ownerSessionId || !side.chat_id || !side.direct_provider_capture?.enabled
+        || sideChatMutationPending(context.uiState, ownerSessionId)) return;
+      context.uiState.sideChatMutations.set(ownerSessionId, { kind: "capture", chatId: side.chat_id, generation: side.generation });
+      context.rerender();
+      try {
+        await context.mutate("capture_side_chat_direct_provider", {
+          ownerSessionId, sideChatId: side.chat_id, expectedGeneration: side.generation,
+          expectedDraftRevision: side.draft_revision, expectedConfigGeneration: state.config_target.configGeneration,
+        });
+      } finally {
+        context.uiState.sideChatMutations.delete(ownerSessionId);
+        context.rerender();
+      }
+    },
+  },
+  {
     id: "quote-selection-to-side-chat",
     label: "選択範囲をSide Chatで引用",
     enabled: (state, _payload, model) => !state.side_chat.deleting
@@ -2011,7 +2022,7 @@ const ACTION_DEFINITIONS = [
         : providerCapabilities(state).canLoadProviderModels
     ) && !model.local.configMutationPending,
     run: (state, context) => {
-      if (state.overlay === "initial_setup") {
+      if (state.overlay === "initial_setup" || state.overlay === "config") {
         synchronizeInitialSetupProviderDraft(state, context.uiState);
       }
       const request = beginProviderCatalogRequest(context.uiState, state);
@@ -2376,7 +2387,6 @@ const ACTION_DEFINITIONS = [
     label: "画面を閉じる",
     enabled: (state, _payload, model) => !startupSetupRequired(state)
       && (state.overlay !== "hub" || (!model.local.hub.pending && !model.local.deviceNetwork.pending))
-      && (state.overlay !== "mcp_publish" || !model.local.mcpPublish.pending)
       && (state.overlay !== "config" || !model.local.configMutationPending)
       && (state.overlay !== "session_settings" || !model.local.sessionSettings.mutationPending)
       && (state.overlay !== "prompt_review"

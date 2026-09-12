@@ -312,6 +312,7 @@ impl DeviceClient {
                     "enrollment_denied" => DeviceError::EnrollmentDenied,
                     "device_revoked" | "unauthorized" => DeviceError::Revoked,
                     "device_stopped" => DeviceError::Stopped,
+                    "device_name_conflict" => DeviceError::DeviceNameConflict,
                     "join_superseded" => DeviceError::JoinSuperseded,
                     "policy_denied" => DeviceError::PolicyDenied,
                     "grant_denied" => DeviceError::GrantDenied,

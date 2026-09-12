@@ -6,7 +6,7 @@ import { renderComposer, renderOverlay, renderTitlebar, synchronizeTitlebarMenuS
 import type { DesktopViewState } from "../src/types.ts";
 
 function viewState(fields: Record<string, unknown>): DesktopViewState {
-  return fields as unknown as DesktopViewState;
+  return { status_message: "", config_draft: { external_owner_mutation_open: true }, ...fields } as unknown as DesktopViewState;
 }
 
 function elementWith(html: string, attribute: string, value: string): string {
@@ -203,6 +203,29 @@ test("composer and overlay text entry controls have stable explicit labels", () 
   assert.match(review, /<textarea id="review-draft"/);
   assert.match(palette, /<label class="sr-only" for="local-search">アクション、セッション、コマンドを検索<\/label>/);
   assert.match(palette, /<input id="local-search"/);
+});
+
+test("palette command candidates match the query and retain their original mutation indices", () => {
+  const rows = [
+    { name: "build-local", path: "C:/fixture/commands/build.md" },
+    { name: "review-local", path: "C:/fixture/資料/review.md" },
+  ];
+  const palette = (query: string) => renderOverlay(viewState({
+    overlay: "command_palette", local_search_text: query, local_search_results_text: "",
+    command_rows: rows, session_rows: [], config_draft: { dirty: false },
+  }));
+  const byName = palette(" REVIEW-LOCAL ");
+  assert.doesNotMatch(byName, /<span>\/build-local<\/span>/);
+  assert.match(byName, /data-action="insert-command" data-index="1"/);
+  assert.match(byName, /<span>\/review-local<\/span>/);
+  assert.doesNotMatch(byName, /実行できるアクションはありません/);
+  const byPath = palette("資料");
+  assert.doesNotMatch(byPath, /<span>\/build-local<\/span>/);
+  assert.match(byPath, /data-action="insert-command" data-index="1"/);
+  const noMatch = palette("no-matching-command-99283");
+  assert.doesNotMatch(noMatch, /data-action="insert-command"/);
+  assert.match(noMatch, /実行できるアクションはありません/);
+  assert.deepEqual(rows.map(row => row.name), ["build-local", "review-local"]);
 });
 
 test("quiet text meets normal-text contrast and reduced-motion disables continuous effects", () => {

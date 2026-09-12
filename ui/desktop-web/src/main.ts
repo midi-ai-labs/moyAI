@@ -4,12 +4,10 @@ import { acceptHubProjection, hubPresentation } from "./hub_state.ts";
 import { acceptDeviceNetworkProjection, deviceNetworkPresentation } from "./device_network_state.ts";
 import { synchronizeDeviceNetworkControls } from "./device_network_dom.ts";
 import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
-import { acceptPublishProjection, publishPresentation } from "./mcp_publish_state.ts";
-import { clearPublishSecret, synchronizePublishControlValues } from "./mcp_publish_dom.ts";
-import { refreshPublishJobs } from "./mcp_publish_actions.ts";
 import { refreshMcpHistory } from "./mcp_history_actions.ts";
 import { invalidateMcpHistory, mcpHistoryPresentation } from "./mcp_history_state.ts";
 import { synchronizeMcpHistorySurface } from "./mcp_history_dom.ts";
+import { mcpActivityPresentation } from "./mcp_activity.ts";
 import { clearMcpPeerToken, mcpPeerPresentation, refreshMcpPeers } from "./mcp_peer.ts";
 import { synchronizeHubControlValues } from "./hub_dom.ts";
 import { cancelRunCommand, interruptSessionCommand } from "./stop_contract";
@@ -54,6 +52,7 @@ import {
   syncResolvedInactiveThreadViewport,
   ThreadTailFollowAffinity,
   type PendingHistoryPrepend,
+  revealHistoryAnchor,
 } from "./history_navigation";
 import { commandConflictState, commandInternalState } from "./command_error";
 import type { ActionContext } from "./actions";
@@ -233,7 +232,6 @@ import {
 import "./styles.css";
 import "./hub_surface.css";
 import "./device_network_surface.css";
-import "./mcp_publish_surface.css";
 import "./mcp_history_surface.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -244,7 +242,6 @@ let lastRenderedModel: DesktopRenderModel | null = null;
 const refresh = createSnapshotRefresh(async () => {
   try {
     acceptState(await command<DesktopWebState>("desktop_state"), false);
-    await refreshPublishJobs(eventContext);
     await refreshDeviceNetworkJobs(eventContext);
     await refreshMcpHistory(eventContext);
   } catch (error) {
@@ -356,7 +353,7 @@ installWindowMaximizedSync();
 void refresh();
 installRuntimePolling(window, document, () => Boolean(
     currentState
-    && (currentState.overlay === "mcp_history" || currentState.overlay === "mcp_publish" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, uiState.mcpPublish.projection))
+    && (currentState.overlay === "mcp_history" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
     && shouldAutoRefresh(currentState)
 ), refresh);
 
@@ -756,6 +753,7 @@ function jumpToHistoryAnchor(anchorId: string): void {
   );
   if (!thread || !target) return;
   noteUserThreadScrollAway();
+  revealHistoryAnchor(target);
   const top = thread.scrollTop
     + target.getBoundingClientRect().top
     - thread.getBoundingClientRect().top
@@ -840,13 +838,6 @@ function applyStateUpdate(update: StateUpdate): void {
     acceptDeviceNetworkProjection(uiState.deviceNetwork, update.state.device_network);
   }
   if (previousProjection?.overlay === "hub" && update.state.overlay !== "hub") ++uiState.deviceNetwork.jobsSerial;
-  if (update.state !== previousProjection && update.state.mcp_publish) {
-    acceptPublishProjection(uiState.mcpPublish, update.state.mcp_publish);
-  }
-  if (previousProjection?.overlay === "mcp_publish" && update.state.overlay !== "mcp_publish") {
-    clearPublishSecret();
-    ++uiState.mcpPublish.jobsSerial;
-  }
   if (previousProjection?.overlay === "mcp_history" && update.state.overlay !== "mcp_history") invalidateMcpHistory(uiState.mcpHistory);
   if (previousProjection?.overlay === "config" && update.state.overlay !== "config") {
     clearMcpPeerToken();
@@ -903,7 +894,6 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
   return createDesktopRenderModel(state, {
     hub: hubPresentation(uiState.hub),
     deviceNetwork: deviceNetworkPresentation(uiState.deviceNetwork),
-    mcpPublish: publishPresentation(uiState.mcpPublish),
     mcpHistory: mcpHistoryPresentation(uiState.mcpHistory),
     mcpPeers: mcpPeerPresentation(uiState.mcpPeers),
     artifactPane: {
@@ -1068,6 +1058,13 @@ function renderCommitted(
     uiState.taskActivityAnimationEpoch,
     renderNowMs,
   );
+  uiState.mcpActivityAnimationEpoch = reconcileTaskActivityAnimationEpoch(
+    uiState.mcpActivityAnimationEpoch,
+    { activityState: mcpActivityPresentation(state.mcp_activity)?.state ?? "idle",
+      workspacePath: "mcp-receiver", sessionId: null, runtimeOwnerToken: "root:1",
+      runStartMutationPending: false, nowMs: renderNowMs },
+  );
+  const mcpActivityDelay = taskActivityAnimationDelay(uiState.mcpActivityAnimationEpoch, renderNowMs);
   const previous = lastRenderedState;
   const runFocusDecision = reconcileMainRunFocusContinuation(
     uiState.mainRunFocusContinuation,
@@ -1328,6 +1325,7 @@ function renderCommitted(
   const renderedMarkup = renderDesktopMarkup(model, {
     backgroundInert,
     taskActivityDelay,
+    mcpActivityDelay,
   });
   let retainedConnectedSettings = false;
   let retainedConnectedPrompt = false;
@@ -1372,9 +1370,8 @@ function renderCommitted(
         currentSettingsModal,
         nextSettingsModal,
         model.local.configMutationPending || model.local.sessionSettings.mutationPending
-          || (state.overlay === "hub" && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null))
-          || (state.overlay === "mcp_publish" && model.local.mcpPublish.pending !== null),
-        state.overlay === "hub" || state.overlay === "mcp_publish" ? false : state.overlay === "session_settings"
+          || (state.overlay === "hub" && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null)),
+        state.overlay === "hub" ? false : state.overlay === "session_settings"
           ? !model.local.sessionSettings.dirty
           : !uiState.configDirty,
       );
@@ -1382,7 +1379,6 @@ function renderCommitted(
         synchronizeHubControlValues(currentSettingsModal, nextSettingsModal);
         synchronizeDeviceNetworkControls(currentSettingsModal, nextSettingsModal);
       }
-      if (state.overlay === "mcp_publish") synchronizePublishControlValues(currentSettingsModal, nextSettingsModal);
       retainedConnectedSettings = true;
     }
   }

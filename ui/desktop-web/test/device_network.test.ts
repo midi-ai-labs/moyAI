@@ -226,9 +226,12 @@ test("pending approval updates the connected model help through retained setting
     const region = {
       textContent: match[2], dataset: { settingsPassive: attributes.get("data-settings-passive") },
       hasAttribute: (name: string) => attributes.has(name),
+      querySelectorAll: () => [],
+      isEqualNode: (next: { textContent: string }) => region.textContent === next.textContent,
       replaceWith(next: { textContent: string }) { region.textContent = next.textContent; },
     };
     return { region, setAttribute() {}, querySelector: () => null,
+      contains: (node: unknown) => node === region,
       querySelectorAll: (selector: string) => selector === "[data-settings-passive]" && region.dataset.settingsPassive ? [region] : [] };
   }
   const local = deviceUiFixture();

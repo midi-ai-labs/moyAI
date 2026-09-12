@@ -285,6 +285,7 @@ impl AppBootstrap {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: process_runtime.managed_shells(),
         };
         let registry = ToolRegistry::core_agent_for_config(&config);
         let llm = Arc::new(OpenAiCompatClient::new(None));

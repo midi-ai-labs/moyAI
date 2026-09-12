@@ -9,9 +9,11 @@ pub use diagnostics::{DeviceDiagnostic, DiagnosticScope};
 mod http;
 mod identity;
 mod outgoing;
+mod peer_connections;
 mod receiver;
 mod service;
 mod settings;
+mod wait;
 pub(crate) use client::{DeviceClient, DeviceGrant, DirectoryPeer};
 pub use client::{GrantClaims, VerifiedGrant};
 pub(crate) use http::ManagedHubHttp;
@@ -23,6 +25,7 @@ pub use service::{DeviceNetworkProjection, DeviceNetworkService};
 pub use settings::{
     DeviceSettings, DeviceSettingsStore, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
 };
+pub(crate) use wait::DeviceWaitResult;
 
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +106,8 @@ pub enum DeviceError {
     Revoked,
     #[error("device_stopped")]
     Stopped,
+    #[error("device_name_conflict")]
+    DeviceNameConflict,
     #[error("join_superseded")]
     JoinSuperseded,
     #[error("policy_denied")]

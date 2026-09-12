@@ -20,6 +20,24 @@ const EDGE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 256 * 1024;
 const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MARKDOWN_BYTES: usize = 1024 * 1024;
+pub(crate) const HUB_MARKDOWN_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailView {
+    Desktop,
+    HubRecent,
+}
+
+impl DetailView {
+    fn orders(self) -> [&'static str; 2] {
+        match self {
+            Self::Desktop => ["ASC", "DESC"],
+            Self::HubRecent => ["DESC", "ASC"],
+        }
+    }
+}
+
+mod recent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +144,26 @@ impl RemoteJobService {
         direction: McpHistoryDirection,
         id: &str,
     ) -> Result<McpHistoryDetail, PublishCallError> {
+        self.history_detail_view(direction, id, DetailView::Desktop)
+            .await
+    }
+
+    /// Keep the existing wire shape while prioritizing recent, exact-target evidence.
+    pub(crate) async fn history_detail_for_hub(
+        &self,
+        direction: McpHistoryDirection,
+        id: &str,
+    ) -> Result<McpHistoryDetail, PublishCallError> {
+        self.history_detail_view(direction, id, DetailView::HubRecent)
+            .await
+    }
+
+    async fn history_detail_view(
+        &self,
+        direction: McpHistoryDirection,
+        id: &str,
+        view: DetailView,
+    ) -> Result<McpHistoryDetail, PublishCallError> {
         let id = id
             .parse::<Ulid>()
             .map_err(|_| PublishCallError::InvalidArguments)?;
@@ -143,6 +181,7 @@ impl RemoteJobService {
                             reference.session_id,
                             Some(reference.turn_id),
                             Some(&reference),
+                            view,
                         )
                         .map_err(unavailable)?;
                     (row, evidence, reference.result)
@@ -154,14 +193,17 @@ impl RemoteJobService {
                         .ok_or(PublishCallError::InvalidTarget)?;
                     let row = service.execution_history_row(&job).await?;
                     let evidence = store
-                        .history_evidence(job.session_id, job.admitted_turn_id, None)
+                        .history_evidence(job.session_id, job.admitted_turn_id, None, view)
                         .map_err(unavailable)?;
                     // Final assistant messages and the terminal are already in exact-turn history.
                     (row, evidence, None)
                 }
             };
             row.updated_at_ms = evidence.last_observed_at_ms.or(row.updated_at_ms);
-            let (markdown, truncated) = render_detail(&row, &evidence, result.as_deref());
+            let (markdown, truncated) = match view {
+                DetailView::Desktop => render_detail(&row, &evidence, result.as_deref()),
+                DetailView::HubRecent => recent::render(&row, &evidence, result.as_deref()),
+            };
             Ok(McpHistoryDetail {
                 row,
                 markdown,
@@ -297,6 +339,7 @@ fn target_label(scope: &str) -> String {
 struct Evidence {
     history: Vec<EvidenceItem>,
     progress: Vec<EvidenceItem>,
+    waits: Vec<WaitEvidence>,
     last_observed_at_ms: Option<i64>,
     truncated: bool,
 }
@@ -304,6 +347,14 @@ struct EvidenceItem {
     sequence: i64,
     at_ms: Option<i64>,
     payload: Option<String>,
+}
+
+struct WaitEvidence {
+    sequence: i64,
+    at_ms: i64,
+    turn_id: String,
+    is_output: bool,
+    text: String,
 }
 
 struct HistoryAnchor {
@@ -431,6 +482,7 @@ impl RemoteJobStore {
         session: SessionId,
         turn: Option<TurnId>,
         reference: Option<&StoredDeviceReference>,
+        view: DetailView,
     ) -> Result<Evidence, StorageError> {
         let Some(turn) = turn else {
             return Ok(Evidence::default());
@@ -438,6 +490,9 @@ impl RemoteJobStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut evidence = Evidence::default();
         let mut remaining = MAX_READ_BYTES;
+        if view == DetailView::HubRecent {
+            remaining = MAX_READ_BYTES / 8;
+        }
         let call_ids = if let Some(reference) = reference {
             let candidates = evidence_edges(
                 &connection,
@@ -448,6 +503,7 @@ impl RemoteJobStore {
                 "[]",
                 &mut remaining,
                 &mut evidence.truncated,
+                view,
             )?;
             candidates
                 .iter()
@@ -480,6 +536,9 @@ impl RemoteJobStore {
         } else {
             "1=1"
         };
+        if view == DetailView::HubRecent {
+            remaining = MAX_READ_BYTES / 2;
+        }
         evidence.history = evidence_edges(
             &connection,
             session,
@@ -489,12 +548,16 @@ impl RemoteJobStore {
             &call_ids_json,
             &mut remaining,
             &mut evidence.truncated,
+            view,
         )?;
         let progress_filter = if reference.is_some() {
             "json_extract(payload_json,'$.call_id') IN (SELECT value FROM json_each(?3))"
         } else {
             "json_extract(payload_json,'$.kind') IN ('plan','tool_status','approval_request','warning','error','terminal','durable_feedback')"
         };
+        if view == DetailView::HubRecent {
+            remaining = MAX_READ_BYTES / 8;
+        }
         evidence.progress = evidence_edges(
             &connection,
             session,
@@ -504,7 +567,20 @@ impl RemoteJobStore {
             &call_ids_json,
             &mut remaining,
             &mut evidence.truncated,
+            view,
         )?;
+        if let Some(reference) = reference {
+            if view == DetailView::HubRecent {
+                remaining = MAX_READ_BYTES / 4;
+            }
+            evidence.waits = wait_evidence(
+                &connection,
+                reference,
+                &mut remaining,
+                &mut evidence.truncated,
+                view,
+            )?;
+        }
         evidence.last_observed_at_ms = evidence
             .history
             .iter()
@@ -519,8 +595,258 @@ impl RemoteJobStore {
                         })
             })
             .filter_map(|item| item.at_ms)
+            .chain(
+                evidence
+                    .waits
+                    .iter()
+                    .filter(|item| item.is_output)
+                    .map(|item| item.at_ms),
+            )
             .max();
         Ok(evidence)
+    }
+}
+
+/// A later local turn can observe an earlier delegated job. Read only exact
+/// wait call identities from the same session, and project their multi-job
+/// payloads before rendering: sibling results never enter this export.
+fn wait_evidence(
+    connection: &rusqlite::Connection,
+    reference: &StoredDeviceReference,
+    remaining: &mut usize,
+    truncated: &mut bool,
+    view: DetailView,
+) -> Result<Vec<WaitEvidence>, StorageError> {
+    let Some(job_id) = reference.job_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let base = "FROM protocol_history_items WHERE session_id=?1 AND scope_kind='turn'
+        AND json_extract(payload_json,'$.kind')='tool_call'
+        AND json_extract(payload_json,'$.tool_name')='wait_remote_tasks'
+        AND EXISTS (SELECT 1 FROM json_each(CASE
+            WHEN json_valid(json_extract(payload_json,'$.arguments_json'))
+            THEN CASE WHEN json_type(json_extract(payload_json,'$.arguments_json'),'$.job_ids')='array'
+                THEN json_extract(json_extract(payload_json,'$.arguments_json'),'$.job_ids') ELSE '[]' END
+            ELSE '[]' END) requested WHERE requested.type='text' AND requested.value=?2)";
+    let count: i64 = connection.query_row(
+        &format!("SELECT COUNT(*) {base}"),
+        params![reference.session_id.to_string(), job_id],
+        |row| row.get(0),
+    )?;
+    // Each selected call has at most one output. Bound their combined edges to
+    // the same record budget as other history; do not join every session row
+    // back to every candidate call in a long-running conversation.
+    let call_edge = EDGE_ITEMS / 2;
+    *truncated |= count > (call_edge * 2) as i64;
+    let mut items = BTreeMap::new();
+    let mut calls = Vec::new();
+    // A large call must not consume the entire budget before its latest output.
+    let call_budget = *remaining / 4;
+    let mut call_remaining = call_budget;
+    for order in view.orders() {
+        let mut statement = connection.prepare(&format!(
+            "SELECT id,sequence_no,created_at_ms,turn_id,
+            CASE WHEN length(CAST(payload_json AS BLOB))<=?3 THEN payload_json ELSE NULL END,
+            json_extract(payload_json,'$.call_id') {base}
+            ORDER BY created_at_ms {order},turn_id {order},sequence_no {order},id {order} LIMIT ?4"
+        ))?;
+        let mut rows = statement.query(params![
+            reference.session_id.to_string(),
+            job_id,
+            MAX_ITEM_BYTES as i64,
+            call_edge as i64
+        ])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let sequence: i64 = row.get(1)?;
+            let at_ms: i64 = row.get(2)?;
+            let turn_id: String = row.get(3)?;
+            let key = (at_ms, turn_id.clone(), sequence, id);
+            if items.contains_key(&key) {
+                continue;
+            }
+            let call_id: String = row.get(5)?;
+            calls.push((turn_id.clone(), call_id));
+            items.insert(
+                key,
+                WaitEvidence {
+                    sequence,
+                    at_ms,
+                    turn_id,
+                    is_output: false,
+                    text: bounded_wait_text(
+                        row.get(4)?,
+                        reference,
+                        if view == DetailView::HubRecent {
+                            &mut call_remaining
+                        } else {
+                            &mut *remaining
+                        },
+                        truncated,
+                    ),
+                },
+            );
+        }
+    }
+    if view == DetailView::HubRecent {
+        *remaining = remaining.saturating_sub(call_budget - call_remaining);
+    }
+    // scope_kind keeps this lookup on the current session/turn index. Only
+    // the bounded selected identities are searched, including later turns.
+    let mut output_statement = connection.prepare(
+        "SELECT id,sequence_no,created_at_ms,
+        CASE WHEN length(CAST(payload_json AS BLOB))<=?4 THEN payload_json ELSE NULL END
+        FROM protocol_history_items WHERE session_id=?1 AND turn_id=?2 AND scope_kind='turn'
+        AND json_extract(payload_json,'$.kind')='tool_output'
+        AND json_extract(payload_json,'$.call_id')=?3 ORDER BY sequence_no DESC LIMIT 2",
+    )?;
+    for (turn_id, call_id) in calls {
+        let mut rows = output_statement.query(params![
+            reference.session_id.to_string(),
+            turn_id,
+            call_id,
+            MAX_ITEM_BYTES as i64
+        ])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let sequence: i64 = row.get(1)?;
+            let at_ms: i64 = row.get(2)?;
+            let text = bounded_wait_text(row.get(3)?, reference, remaining, truncated);
+            items.insert(
+                (at_ms, turn_id.clone(), sequence, id),
+                WaitEvidence {
+                    sequence,
+                    at_ms,
+                    turn_id,
+                    is_output: true,
+                    text,
+                },
+            );
+        }
+        *truncated |= rows.next()?.is_some();
+    }
+    Ok(items.into_values().collect())
+}
+
+fn bounded_wait_text(
+    mut payload: Option<String>,
+    reference: &StoredDeviceReference,
+    remaining: &mut usize,
+    truncated: &mut bool,
+) -> String {
+    if payload.as_ref().is_some_and(|text| text.len() > *remaining) {
+        payload = None;
+    }
+    *remaining = remaining.saturating_sub(payload.as_ref().map_or(0, String::len));
+    let decoded = payload
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<HistoryItemPayload>(text).ok());
+    *truncated |= decoded.as_ref().is_some_and(|payload| matches!(payload,
+        HistoryItemPayload::ToolOutput { metadata, .. } if wait_metadata(metadata).get("truncated").and_then(Value::as_bool) == Some(true)));
+    let projected = decoded.and_then(|payload| project_wait_payload(payload, reference));
+    *truncated |= projected.is_none();
+    projected.unwrap_or_else(|| "待機記録はサイズ上限または形式不一致により省略しました。結果本文を別の記録から補っていません。".into())
+}
+
+fn wait_metadata(metadata: &Value) -> &Value {
+    metadata
+        .get("tool_metadata")
+        .filter(|value| value.is_object())
+        .unwrap_or(metadata)
+}
+
+fn project_wait_payload(
+    payload: HistoryItemPayload,
+    reference: &StoredDeviceReference,
+) -> Option<String> {
+    let job_id = reference.job_id.as_deref()?;
+    match payload {
+        HistoryItemPayload::ToolCall {
+            call_id,
+            arguments_json,
+            ..
+        } => {
+            let arguments: Value = serde_json::from_str(&arguments_json).ok()?;
+            let requested = arguments.get("job_ids")?.as_array()?;
+            if !requested.iter().any(|value| value.as_str() == Some(job_id)) {
+                return None;
+            }
+            let mut projected = serde_json::json!({"job_ids":[job_id]});
+            if let Some(timeout) = arguments.get("timeout_ms").and_then(Value::as_u64) {
+                projected["timeout_ms"] = timeout.into();
+            }
+            Some(format!(
+                "ツール呼び出し: wait_remote_tasks\n呼び出しID: {call_id}\n{}",
+                serde_json::to_string_pretty(&projected).ok()?
+            ))
+        }
+        HistoryItemPayload::ToolOutput {
+            call_id,
+            status,
+            output_text,
+            metadata,
+            success,
+            ..
+        } => {
+            let output = serde_json::from_str::<Value>(&output_text).ok();
+            let metadata = wait_metadata(&metadata);
+            let exact_row = |value: &Value| {
+                let matching = value
+                    .get("jobs")?
+                    .as_array()?
+                    .iter()
+                    .filter(|row| {
+                        row.get("job_id").and_then(Value::as_str) == Some(job_id)
+                            && row.get("reference_id").and_then(Value::as_str)
+                                == Some(reference.id.to_string().as_str())
+                            && row.get("device_id").and_then(Value::as_str)
+                                == Some(reference.device_id.as_str())
+                            && row.get("profile_id").and_then(Value::as_str)
+                                == Some(reference.profile_id.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                (matching.len() == 1).then(|| matching[0].clone())
+            };
+            let recorded_row = output.as_ref().and_then(exact_row);
+            let state_row = recorded_row.clone().or_else(|| exact_row(metadata));
+            let mut projected =
+                serde_json::json!({"job_id":job_id,"reference_id":reference.id.to_string()});
+            for field in ["interrupted", "timed_out"] {
+                if let Some(value) = output
+                    .as_ref()
+                    .and_then(|value| value.get(field))
+                    .or_else(|| metadata.get(field))
+                    .and_then(Value::as_bool)
+                {
+                    projected[field] = value.into();
+                }
+            }
+            if let Some(row) = state_row {
+                for field in ["device_id", "profile_id", "state", "stop_status"] {
+                    if let Some(value) = row.get(field).and_then(Value::as_str) {
+                        projected[field] = value.into();
+                    }
+                }
+            }
+            let result = recorded_row
+                .as_ref()
+                .and_then(|row| row.get("result"))
+                .and_then(Value::as_str);
+            projected["result_body_recorded"] = result.is_some().into();
+            if let Some(result) = result {
+                projected["result"] = result.into();
+            }
+            let omission = if output.is_none() {
+                "\n待機応答の本文は省略または形式不一致のため、保存済みの対象情報だけを表示します。"
+            } else {
+                ""
+            };
+            Some(format!(
+                "ツール結果: wait_remote_tasks\n呼び出しID: {call_id}\n状態: {status:?}\n成功: {success:?}\n{}\nこの委任の対象だけを表示しています。結果本文は、この待機応答に保存されている場合だけ表示します。{omission}",
+                serde_json::to_string_pretty(&projected).ok()?
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -566,6 +892,7 @@ fn evidence_edges(
     calls: &str,
     remaining: &mut usize,
     truncated: &mut bool,
+    view: DetailView,
 ) -> Result<Vec<EvidenceItem>, StorageError> {
     let timestamp = if table == "protocol_history_items" {
         "created_at_ms"
@@ -582,7 +909,7 @@ fn evidence_edges(
     )?;
     *truncated |= count > (EDGE_ITEMS * 2) as i64;
     let mut items = BTreeMap::new();
-    for order in ["ASC", "DESC"] {
+    for order in view.orders() {
         let mut statement = connection.prepare(&format!("SELECT sequence_no,{timestamp},CASE WHEN length(CAST(payload_json AS BLOB))<=?4 THEN payload_json ELSE NULL END {base} ORDER BY sequence_no {order} LIMIT ?5"))?;
         let mut rows = statement.query(params![
             session.to_string(),
@@ -682,6 +1009,20 @@ fn render_detail(row: &McpHistoryRow, evidence: &Evidence, result: Option<&str>)
             .map(public_history_text)
             .unwrap_or_else(|| "この記録はサイズ上限または形式不一致により省略しました。".into());
         append_block(&mut output, &heading, &text, &mut truncated);
+    }
+    if !evidence.waits.is_empty() {
+        output.push_str("## 待機による状態・結果の取得\n\n同じローカルセッションの待機記録から、この委任の対象だけを表示します。ほかのジョブや端末の応答は含みません。元の保存データは変更していません。\n\n");
+        for item in &evidence.waits {
+            append_block(
+                &mut output,
+                &format!(
+                    "待機記録 {} / Unix ms {} / ターン {}",
+                    item.sequence, item.at_ms, item.turn_id
+                ),
+                &item.text,
+                &mut truncated,
+            );
+        }
     }
     output.push_str("## 進行・承認・停止の記録\n\n");
     for item in &evidence.progress {

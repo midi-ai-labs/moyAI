@@ -71,7 +71,17 @@ pub enum SandboxExecutionError {
 
 pub(crate) async fn execute_workspace_write(
     profile: WorkspaceWriteSandboxProfile,
+    request: SandboxedProcessRequest,
+) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
+    execute_workspace_write_observed(profile, request, None).await
+}
+
+pub(crate) type ProcessStarted = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
+
+pub(crate) async fn execute_workspace_write_observed(
+    profile: WorkspaceWriteSandboxProfile,
     mut request: SandboxedProcessRequest,
+    started: Option<ProcessStarted>,
 ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
     let Some(program) = request.argv.first_mut() else {
         return Err(SandboxExecutionError::InvalidProfile(
@@ -81,13 +91,13 @@ pub(crate) async fn execute_workspace_write(
     *program = request.executable.path().to_string();
     #[cfg(windows)]
     {
-        return tokio::task::spawn_blocking(move || windows::execute(profile, request))
+        return tokio::task::spawn_blocking(move || windows::execute(profile, request, started))
             .await
             .map_err(|error| SandboxExecutionError::Worker(error.to_string()))?;
     }
     #[cfg(not(windows))]
     {
-        let _ = (profile, request);
+        let _ = (profile, request, started);
         Err(SandboxExecutionError::UnsupportedPlatform)
     }
 }
@@ -391,6 +401,7 @@ mod windows {
     pub(super) fn execute(
         mut profile: WorkspaceWriteSandboxProfile,
         mut request: SandboxedProcessRequest,
+        started: Option<super::ProcessStarted>,
     ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
         if request.argv.is_empty() || request.argv[0].trim().is_empty() {
             return Err(SandboxExecutionError::InvalidProfile(
@@ -413,7 +424,7 @@ mod windows {
         apply_advisory_offline_environment(&mut request.environment);
         let effect_temp = create_effect_local_temp(&mut profile, &mut request.environment)?;
         let (effect_temp, output) = run_with_effect_temp_panic_boundary(effect_temp, move |_| {
-            execute_after_effect_temp(profile, request)
+            execute_after_effect_temp(profile, request, started)
         })?;
         let finalization = effect_temp_finalization_for_result(&output);
         let cleanup_errors = finalize_effect_local_temp(effect_temp, finalization);
@@ -429,6 +440,7 @@ mod windows {
     fn execute_after_effect_temp(
         profile: WorkspaceWriteSandboxProfile,
         request: SandboxedProcessRequest,
+        started: Option<super::ProcessStarted>,
     ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
         if request.cancel.is_cancelled() {
             return Ok(cancelled_before_effect(Vec::new(), true));
@@ -446,7 +458,7 @@ mod windows {
         if request.cancel.is_cancelled() {
             return Ok(cancelled_before_effect(Vec::new(), true));
         }
-        let output = spawn_and_capture(token, request);
+        let output = spawn_and_capture(token, request, started);
         drop(prepared);
         output
     }
@@ -2076,6 +2088,7 @@ mod windows {
     fn spawn_and_capture(
         token: OwnedHandle,
         request: SandboxedProcessRequest,
+        started: Option<super::ProcessStarted>,
     ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
         let (child_stdin, parent_stdin) = create_pipe_pair("stdin")?;
         let (parent_stdout, child_stdout) = create_pipe_pair("stdout")?;
@@ -2219,6 +2232,9 @@ mod windows {
         }
         drop(thread);
 
+        if let Some(started) = started {
+            started(process_info.dwProcessId);
+        }
         let max_output = request.max_output_bytes.max(1);
         let stdout_reader = read_pipe_bounded(parent_stdout, max_output);
         let stderr_reader = read_pipe_bounded(parent_stderr, max_output);

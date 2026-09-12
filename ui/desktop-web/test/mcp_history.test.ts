@@ -58,6 +58,21 @@ test("history opens locally, separates instructions and executions, and never qu
   });
 });
 
+test("receiver activity link opens the newest execution page even after browsing instructions", async () => {
+  await withContext(async (_name, args) => page([row({ direction: args.direction as McpHistoryRow["direction"] })]), async ({ context, local, calls }) => {
+    local.direction = "instruction";
+    local.offset = 40;
+    local.previousOffsets = [0, 20];
+    local.selectedId = "old-instruction";
+    await openMcpHistory(context, "execution");
+    assert.equal(local.direction, "execution");
+    assert.equal(local.offset, 0);
+    assert.equal(local.selectedId, null);
+    assert.deepEqual(calls.map(call => call.name), ["show_mcp_history", "mcp_history_list"]);
+    assert.deepEqual(calls[1].args, { direction: "execution", offset: 0, anchor: null });
+  });
+});
+
 test("paging retains the returned anchor and explicit refresh returns to the newest first page", async () => {
   await withContext(async (_name, args) => page([row({ id: `ref-${args.offset}` })], args.offset === 0 ? 50 : args.offset === 50 ? 100 : null, "snapshot-first"), async ({ context, local, calls }) => {
     await refreshMcpHistory(context, true);
@@ -217,8 +232,8 @@ test("rendered history separates state observation from result receipt and treat
   assert.match(html, /&lt;script&gt;/);
   assert.doesNotMatch(html, /<script|<img|href="javascript:/);
   assert.doesNotMatch(html, /class="modal-backdrop" data-action/);
-  assert.match(html, /id="mcp-history-legacy"[^>]* hidden/);
-  assert.doesNotMatch(renderMcpHistoryOverlay(mcpHistoryPresentation(local), true), /id="mcp-history-legacy"[^>]* hidden/);
+  assert.doesNotMatch(html, /id="mcp-history-legacy"/);
+  assert.match(renderMcpHistoryOverlay(mcpHistoryPresentation(local), true), /旧手動配信は廃止/);
   local.direction = "execution"; local.rows = [row({ direction: "execution", state_source: "local_runtime" })]; local.detail = null;
   const incoming = renderMcpHistoryOverlay(mcpHistoryPresentation(local));
   assert.match(incoming, /指示側の結果受信/);
@@ -234,7 +249,7 @@ test("history empty states, primary action registry and retained surface identit
   assert.equal(settingsSurfaceIdentity(view), "mcp-history:application");
   assert.equal(actionById("show-mcp-history")?.label, "MCP履歴");
   assert.equal(ACTIONS.find(action => action.id === "show-mcp-history")?.menu, "view");
-  assert.equal(ACTIONS.find(action => action.id === "show-mcp-publish")?.menu, undefined);
+  assert.equal(ACTIONS.find(action => action.id === "show-mcp-publish"), undefined);
   const model = createDesktopRenderModel(view, DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION);
   assert.equal(actionById("mcp-history-export")?.enabled(model, { value: "", index: -1 }), false);
   assert.equal(actionById("mcp-history-stop")?.enabled(model, { value: "", index: -1 }), false);

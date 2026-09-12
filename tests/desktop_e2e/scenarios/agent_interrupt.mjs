@@ -1,3 +1,4 @@
+import { executeAgentHistoryPage } from "./agent_history_page.mjs";
 import { waitForObservation } from "../core/deadline.mjs";
 import {
   canonicalU64,
@@ -48,6 +49,10 @@ const OUTPUT_AGENT_TRIGGER = Object.freeze({
 const AGENT_LIST_CARD = Object.freeze({
   selector: `aside#sub-agent-inspector button.sub-agent-list-card[data-action="show-agent-pane"][data-agent-path="${AGENT_INTERRUPT_PATH}"]`,
   identity: { tag: "BUTTON", action: "show-agent-pane" },
+});
+const AGENT_LIST_BACK = Object.freeze({
+  selector: 'aside#sub-agent-inspector button.agent-pane-back[data-action="show-agent-list"]',
+  identity: { tag: "BUTTON", action: "show-agent-list" },
 });
 const INTERRUPT = Object.freeze({
   selector: `aside#sub-agent-inspector section.agent-execution[data-agent-path="${AGENT_INTERRUPT_PATH}"] button.agent-interrupt[data-action="interrupt-agent"][data-agent-path="${AGENT_INTERRUPT_PATH}"]`,
@@ -635,7 +640,10 @@ function terminalDecision(sample, expectedTarget, rootOwner) {
   return agentInterruptTerminalFailures(sample, expectedTarget, rootOwner).length === 0 ? "pass" : "pending";
 }
 
-export function createAgentInterruptScenario() {
+export function createAgentInterruptScenario(options = {}) {
+  if (Object.keys(options).some(key => key !== "childToolCalls")) throw new TypeError("agent.interrupt accepts only childToolCalls");
+  const childToolCalls = Object.hasOwn(options, "childToolCalls") ? options.childToolCalls : 0;
+  if (!Number.isInteger(childToolCalls) || (childToolCalls !== 0 && (childToolCalls < 41 || childToolCalls > 64))) throw new TypeError("childToolCalls must be 0 or an integer from 41 through 64");
   const state = {
     provider: null,
     acceptedLedger: null,
@@ -646,13 +654,13 @@ export function createAgentInterruptScenario() {
   return Object.freeze({
     id: "agent.interrupt",
     productOracle: "pass",
-    manualGate: "not_required",
+    manualGate: "pending",
     databaseRequired: true,
     requestGracefulExit,
     async prepare({ context, sink, phase }) {
       state.provider = await startScriptedProvider({
         expectedPrompt: AGENT_INTERRUPT_PROMPT,
-        script: createAgentInterruptProviderScript(),
+        script: createAgentInterruptProviderScript({ childToolCalls }),
       });
       await prepareDesktopFixture({
         context,
@@ -683,7 +691,7 @@ export function createAgentInterruptScenario() {
       const input = new WebviewInput(cdp, { probeId: "agent-interrupt" });
       const commandProbe = new DesktopCommandProbe(cdp, {
         probeId: "agent-interrupt-command",
-        commands: ["interrupt_agent"],
+        commands: ["interrupt_agent", "load_previous_agent_execution_page"],
       });
       let primaryError = null;
       try {
@@ -714,6 +722,15 @@ export function createAgentInterruptScenario() {
           typed_projection_revision: typed.value.projection.projection_revision,
         }, { phase: "executing", owner: OWNER });
 
+        if (childToolCalls > 0) {
+          const history = await executeAgentHistoryPage({
+            cdp, input, commandProbe, provider, sink, count: childToolCalls, agentPath: AGENT_INTERRUPT_PATH,
+            selectors: { output: OUTPUT_AGENT_TRIGGER, card: AGENT_LIST_CARD, interrupt: INTERRUPT },
+          });
+          state.acceptedLedger = history.acceptedLedger;
+          return history.result;
+        }
+
         const inFlight = await waitForProductStage({
           label: "completed root and one exact held child interrupt target",
           timeoutMs: 60_000,
@@ -734,7 +751,7 @@ export function createAgentInterruptScenario() {
           message: "the canonical Sub Agent route did not expose one exact held child",
         });
         const agentListCard = await trustedClick(input, AGENT_LIST_CARD);
-        const control = await waitForProductStage({
+        let control = await waitForProductStage({
           label: "exact held child inspector interrupt control",
           timeoutMs: 10_000,
           sample: () => observeAgentInterruptSample(cdp, provider),
@@ -742,6 +759,33 @@ export function createAgentInterruptScenario() {
           code: "agent-interrupt-control-contract-mismatch",
           message: "the exact held child card did not open one interactable interrupt control",
         });
+        const listBack = await trustedClick(input, AGENT_LIST_BACK);
+        const returned = await waitForProductStage({
+          label: "agent detail returns to the same live agent list",
+          timeoutMs: 10_000,
+          sample: () => observeAgentInterruptSample(cdp, provider),
+          decide: (sample) => listDecision(sample, target),
+          code: "agent-list-back-contract-mismatch",
+          message: "the detail back button did not restore the same live child list",
+        });
+        if (!exactRootOwner(returned.value.surface.projection, rootOwner)) {
+          throw productFailure("agent-list-back-owner", "returning to the agent list changed the Main owner", returned.value);
+        }
+        await captureScenarioScreenshot({ cdp, sink, name: "agent-detail-back-to-live-list", owner: OWNER });
+        const reopenedCard = await trustedClick(input, AGENT_LIST_CARD);
+        control = await waitForProductStage({
+          label: "agent list reopens the same exact live child",
+          timeoutMs: 10_000,
+          sample: () => observeAgentInterruptSample(cdp, provider),
+          decide: (sample) => controlDecision(sample, target),
+          code: "agent-list-reopen-contract-mismatch",
+          message: "returning through the same child card changed the inspected interrupt target",
+        });
+        await sink.record("agent-list-detail-roundtrip", {
+          input_kind: "browser_trusted", list_back: listBack, reopened_card: reopenedCard,
+          interrupt_target: target, root_owner: rootOwner,
+          list: returned.value.surface, reopened: control.value.surface,
+        }, { phase: "executing", owner: OWNER });
         const beforeScreenshot = await captureScenarioScreenshot({
           cdp,
           sink,
@@ -811,7 +855,7 @@ export function createAgentInterruptScenario() {
           surface: terminal.value.surface,
           screenshot: afterScreenshot,
         }, { phase: "executing", owner: OWNER });
-        return { acquisition: "pass", oracle: "pass", manual: "not_required" };
+        return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
         primaryError = error;
         throw error;

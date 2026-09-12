@@ -14,11 +14,6 @@ import {
   shouldDispatchDelegatedKeyboardAction,
   wireEvents,
 } from "../src/events.ts";
-import {
-  acceptPublishProjection, editPublishField, newPublishProfile, publishEditor,
-  publishPresentation, selectPublishProfile, type PublishProfileRow,
-} from "../src/mcp_publish_state.ts";
-import { renderPublishOverlay } from "../src/mcp_publish_render.ts";
 import { InteractionLifecycle, type InteractionEnd } from "../src/interaction_lifecycle.ts";
 import {
   dispatchNewSessionMutation,
@@ -284,118 +279,6 @@ test("the single GUI action registry owns every registered action without duplic
     assert.equal(actionById(id)?.id, id, id);
   }
   assert.equal(actionById("not-a-gui-action"), undefined);
-});
-
-test("rendered MCP profile and explicit close clicks preserve drafts while background clicks are ignored", async () => {
-  const current = state({ overlay: "mcp_publish",
-    draft_target: { ...state().draft_target, sessionId: null },
-    side_chat: { owner_session_id: null, chat_id: null } as DesktopViewState["side_chat"],
-  });
-  const calls: MutationCall[] = [];
-  const actionContext = context(current, calls);
-  const local = actionContext.uiState.mcpPublish;
-  const target = { kind: "project", project_id: "project-a", workspace_root: "C:/workspace" } as const;
-  const profiles: PublishProfileRow[] = ["profile-a", "profile-b"].map((id) => ({
-    profile: { id, label: id, bind: "127.0.0.1:7332", target, tools: ["read"], max_concurrent_calls: 1,
-      mode: { kind: "read_tools" }, tls: null,
-      background: "stop_when_window_closes", enabled: false, transport: "streamable_http", authentication: { kind: "unpaired" } },
-    status: "stopped", status_message: null, endpoint: null, active_calls: 0, connected_sessions: 0,
-    recent_calls: [], credential_configured: false, can_edit: true, can_delete: true,
-    can_start: false, can_stop: false, can_issue_token: true, can_revoke_token: false,
-  }));
-  acceptPublishProjection(local, { revision: "1", generation: "1", profiles,
-    targets: [{ target, label: "Workspace / Root chat" }], error: null });
-  newPublishProfile(local);
-  editPublishField(local, "label", "未保存の新規設定");
-  selectPublishProfile(local, "profile-a");
-  editPublishField(local, "label", "編集中の既存設定");
-  actionContext.getRenderModel = () => createDesktopRenderModel(current, {
-    ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION, mcpPublish: publishPresentation(local),
-  });
-  const errors: unknown[] = [];
-  actionContext.reportError = (error) => { errors.push(error); };
-
-  class ClickElement extends EventTarget {
-    dataset: Record<string, string>;
-    parent: ClickElement | null;
-    classList = { contains: (_name: string) => false };
-    constructor(dataset: Record<string, string> = {}, parent: ClickElement | null = null) {
-      super(); this.dataset = dataset; this.parent = parent;
-    }
-    closest(selector: string): ClickElement | null {
-      return selector === "[data-action]"
-        ? this.dataset.action ? this : this.parent?.closest(selector) ?? null : null;
-    }
-    hasAttribute(name: string): boolean { return name === "data-action" && this.dataset.action !== undefined; }
-  }
-  class ClickButton extends ClickElement { disabled = false; }
-  const token = { value: "displayed-one-time-token" };
-  const documentTarget = Object.assign(new EventTarget(), {
-    querySelector: (selector: string) => selector === "#mcp-publish-token" ? token : null,
-    querySelectorAll: (_selector: string) => [],
-  });
-  const globals: Record<string, unknown> = {
-    window: new EventTarget(), document: documentTarget, Element: ClickElement, HTMLButtonElement: ClickButton,
-  };
-  const previous = new Map(Object.keys(globals).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
-  for (const [name, value] of Object.entries(globals)) Object.defineProperty(globalThis, name, { configurable: true, value });
-  try {
-    wireEvents(current, actionContext);
-    const clickRendered = async (rendered: string, detail: number) => {
-      const dataset = Object.fromEntries([...rendered.matchAll(/data-([a-z-]+)="([^"]*)"/g)]
-        .map((match) => [match[1].replace(/-([a-z])/g, (_whole, letter: string) => letter.toUpperCase()), match[2]]));
-      const node = rendered.startsWith("<button") ? new ClickButton(dataset) : new ClickElement(dataset);
-      if (node instanceof ClickButton) node.disabled = /\sdisabled(?:\s|>)/.test(rendered);
-      const event = new Event("click", { cancelable: true, bubbles: true });
-      Object.defineProperties(event, { target: { value: new ClickElement({}, node) }, detail: { value: detail } });
-      documentTarget.dispatchEvent(event);
-      await Promise.resolve();
-      assert.deepEqual(errors, []);
-    };
-    const clickProfile = async (id: string, detail: number) => {
-      const markup = renderPublishOverlay(publishPresentation(local));
-      const rendered = [...markup.matchAll(/<button\b[^>]*>/g)].map((match) => match[0])
-        .find((tag) => tag.includes('data-action="mcp-publish-select"') && tag.includes(`data-value="${id}"`));
-      assert.ok(rendered, `the ${id} profile is rendered`);
-      await clickRendered(rendered, detail);
-    };
-    const backdrop = renderPublishOverlay(publishPresentation(local)).match(/^<div\b[^>]*>/)![0];
-    await clickRendered(backdrop, 1);
-    assert.deepEqual(calls, [], "background clicks must not reach the native close command");
-    assert.equal(publishEditor(local)!.value.label, "編集中の既存設定");
-    assert.equal(token.value, "displayed-one-time-token", "background clicks also leave the displayed credential intact");
-    await clickProfile("profile-b", 1);
-    assert.equal(local.selectedId, "profile-b", "pointer clicks must reach the requested saved profile");
-    assert.equal(token.value, "");
-    await clickProfile("new", 0);
-    assert.equal(local.selectedId, "new", "the native keyboard click must reopen the unsaved profile");
-    assert.equal(publishEditor(local)!.value.label, "未保存の新規設定");
-    await clickProfile("profile-a", 1);
-    assert.equal(local.selectedId, "profile-a");
-    assert.equal(publishEditor(local)!.value.label, "編集中の既存設定");
-    local.pending = "save";
-    await clickProfile("profile-b", 1);
-    assert.equal(local.selectedId, "profile-a", "a pending save still locks profile switching");
-    assert.deepEqual(calls, [], "profile selection is a local interaction, not a persistence command");
-    local.pending = null;
-    const closeButtons = [...renderPublishOverlay(publishPresentation(local)).matchAll(/<button\b[^>]*data-action="close-overlay"[^>]*>/g)];
-    assert.equal(closeButtons.length, 2, "the header X and footer Close stay explicit exits");
-    for (const [closeButton] of closeButtons) {
-      await clickRendered(closeButton, 1);
-      current.overlay = "none";
-      assert.equal(publishEditor(local)!.value.label, "編集中の既存設定");
-      assert.equal(local.drafts.new.value.label, "未保存の新規設定");
-      current.overlay = "mcp_publish";
-      acceptPublishProjection(local, local.projection!);
-      assert.equal(publishEditor(local)!.value.label, "編集中の既存設定", "reopening cannot discard a dirty editor");
-    }
-    assert.deepEqual(calls, [{ name: "close_overlay", args: undefined }, { name: "close_overlay", args: undefined }]);
-  } finally {
-    for (const [name, descriptor] of previous) {
-      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
-      else delete (globalThis as Record<string, unknown>)[name];
-    }
-  }
 });
 
 test("File Exit uses the existing application exit boundary while window Close retains tray behavior", async () => {

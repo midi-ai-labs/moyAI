@@ -1,7 +1,6 @@
 import { command } from "./api.ts";
 import { editHubField } from "./hub_state.ts";
 import { editDeviceNetworkField } from "./device_network_state.ts";
-import { editPublishField } from "./mcp_publish_state.ts";
 import { editMcpPeerField } from "./mcp_peer.ts";
 import {
   actionEnabledById,
@@ -233,7 +232,13 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         if (!startupSetupRequired(currentState)) dismissOverlayForState(currentState, context);
       } else if (modalShortcutShouldPreventDefault(
         event,
-        isRegularModalOverlay(currentState.overlay) && isNativeTextEditingTarget(target),
+        isRegularModalOverlay(currentState.overlay) && (
+          isNativeTextEditingTarget(target)
+          || (event.key.toLowerCase() === "c"
+            && !currentState.confirmation_visible
+            && activeLocalModalIdentity === null
+            && nativeModalCopySelectionAvailable(target))
+        ),
       )) {
         event.preventDefault();
       }
@@ -357,6 +362,21 @@ function isNativeTextEditingTarget(target: EventTarget | null): boolean {
       && !NON_TEXT_INPUT_TYPES.has(target.type.toLowerCase());
   }
   return target.closest('[contenteditable="true"], [contenteditable="plaintext-only"]') !== null;
+}
+
+function nativeModalCopySelectionAvailable(target: EventTarget | null): boolean {
+  if (!(target instanceof Element) || !target.isConnected) return false;
+  const modal = target.closest('[data-modal][role="dialog"]');
+  if (!modal) return false;
+  if (target instanceof HTMLTextAreaElement) return !target.disabled;
+  if (target instanceof HTMLInputElement) {
+    return !target.disabled && !NON_TEXT_INPUT_TYPES.has(target.type.toLowerCase());
+  }
+  // Read-only text such as the original prompt uses the document's native selection,
+  // even when focus stays on the containing dialog rather than an editable control.
+  const selection = target.ownerDocument.getSelection();
+  return selection !== null && selection.rangeCount > 0 && !selection.isCollapsed
+    && modal.contains(selection.anchorNode) && modal.contains(selection.focusNode);
 }
 
 /**
@@ -637,12 +657,6 @@ function installDelegatedActionEvents(context: ActionContext): void {
     ) {
       return;
     }
-    if (target.dataset.mcpPublishField !== undefined) {
-      if (context.getViewState()?.overlay !== "mcp_publish") return;
-      editPublishField(context.uiState.mcpPublish, target.dataset.mcpPublishField, target.value, target instanceof HTMLInputElement && target.checked);
-      context.rerender();
-      return;
-    }
     if (target.dataset.mcpPeerField !== undefined) {
       if (context.getViewState()?.overlay !== "config") return;
       editMcpPeerField(context.uiState.mcpPeers, target.dataset.mcpPeerField, target.value);
@@ -694,6 +708,10 @@ function installDelegatedActionEvents(context: ActionContext): void {
       if (target.dataset.configKey?.startsWith("side_chat.")) {
         synchronizeSideChatCatalogControls(currentState, context, configDraftEditOpen(context.uiState));
       }
+      if (target.dataset.configKey?.startsWith("model.")) {
+        // Keep the connected URL input, but retire options belonging to its previous target.
+        context.rerender();
+      }
     }
     if (event.type === "change" && target.dataset.configKey === "docling.enabled") {
       context.rerender();
@@ -702,9 +720,6 @@ function installDelegatedActionEvents(context: ActionContext): void {
   document.addEventListener("input", updateSettingsControl);
   document.addEventListener("change", updateSettingsControl);
   document.addEventListener("focusout", (event) => {
-    if (event.target instanceof HTMLSelectElement && event.target.dataset.mcpPublishField === "target") {
-      queueMicrotask(() => { if (context.getViewState()?.overlay === "mcp_publish") context.rerender(); });
-    }
     if (event.target instanceof Element && event.target.closest(".hub-modal")) {
       // Apply a deferred passive model-list refresh only after the user leaves its controls.
       queueMicrotask(() => { if (context.getViewState()?.overlay === "hub") context.rerender(); });
@@ -1023,6 +1038,9 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
     const target = entry.target;
     const generation = entry.generation;
     entry.args = null;
+    // A debounce can outlive its palette or navigation owner. Reject it before IPC;
+    // ignoring the eventual receipt cannot undo a stale command's backend status.
+    if (!searchTargetStillMatches(key, target, context)) continue;
     const settlementOwner = (): TextMutationSettlementOwner => ({
       hasQueuedValue: entry.args !== null,
       currentGeneration: entry.generation,
@@ -1060,7 +1078,7 @@ function searchTargetStillMatches(key: string, target: string, context: ActionCo
   if (!state) return false;
   return key === "session-search"
     ? sessionSearchOwner(state) === target
-    : localSearchOwner(state) === target;
+    : state.overlay === "command_palette" && localSearchOwner(state) === target;
 }
 
 function updateProviderActionButtons(context: ActionContext): void {
@@ -1070,7 +1088,14 @@ function updateProviderActionButtons(context: ActionContext): void {
     .querySelectorAll<HTMLButtonElement>('[data-action="apply-provider-session"], [data-action="save-provider-global"]')
     .forEach((button) => synchronizeActionButtonAvailability(button, context));
   const view = context.getViewState();
-  if (view) synchronizeProviderOverlayFeedback(view);
+  if (view) {
+    synchronizeProviderOverlayFeedback(view);
+    document.querySelectorAll<HTMLButtonElement>('[data-action="select-provider-model"]').forEach((button) => {
+      const index = Number(button.dataset.index);
+      button.hidden = view.provider_model_ids[index] === undefined;
+      synchronizeActionButtonAvailability(button, context);
+    });
+  }
 }
 
 export function textMutationSettlementOwnerIsCurrent(
@@ -1202,7 +1227,7 @@ function synchronizeProviderModelControls(source: SettingsControl): void {
     if (control instanceof HTMLSelectElement) {
       control.querySelectorAll<HTMLOptionElement>("option[data-manual-option]").forEach((option) => option.remove());
       const existing = Array.from(control.options).some((option) => option.value === value);
-      if (!existing && value.length > 0) {
+      if (!existing && value.length > 0 && !source.matches("[data-main-provider-model-control]")) {
         const option = document.createElement("option");
         option.value = value;
         option.textContent = `${value}（手入力）`;
@@ -1227,7 +1252,6 @@ function validateSettingsForm(
     const key = control.dataset.configKey ?? "";
     return key ? [{ key, text: settingsControlValue(control) }] : [];
   });
-  const formValidation = validateConfigFieldValues(fields, values);
   const initialSetup = document.querySelector("[data-surface='initial-setup']") !== null;
   const currentValues = context.getViewState()?.config_fields.map((field) => ({
     key: field.key,
@@ -1239,13 +1263,16 @@ function validateSettingsForm(
       fields,
       currentValues,
     )
-    : formValidation;
+    : validateConfigFieldValues(fields, currentValues);
   for (const control of controls) {
     const key = control.dataset.configKey ?? "";
     if (!key) continue;
     const field = fields.find((candidate) => candidate.key === key);
     if (!field) continue;
-    const result = validateConfigInput(field, settingsControlValue(control), currentValues);
+    const value = control.matches("select[data-main-provider-model-control]")
+      ? currentValues.find((entry) => entry.key === key)?.text ?? ""
+      : settingsControlValue(control);
+    const result = validateConfigInput(field, value, currentValues);
     if (result.ok) control.removeAttribute("aria-invalid");
     else control.setAttribute("aria-invalid", "true");
   }
@@ -1550,9 +1577,12 @@ export function focusOverlayPrimary(
   const focusSelectors = confirmationOverlay
     ? confirmationFocusSelectors(confirmationPending)
     : selectors;
+  const titlebarPopup = titlebarMenuFromOverlay(overlayKey) !== null;
   return {
-    source: "modal-primary",
-    priority: "modal-containment",
+    source: titlebarPopup ? "titlebar-menu" : "modal-primary",
+    // Menu entry is a fallback after rerender: an exact action/range snapshot must keep
+    // ownership. Actual modal entry retains priority over every background continuation.
+    priority: titlebarPopup ? "fallback" : "modal-containment",
     claim: { kind: "force" },
     candidates: focusSelectors.map((selector) => ({
       resolve: () => document.querySelector<HTMLElement>(selector),

@@ -9,6 +9,7 @@ import {
   SETTINGS_PROVIDER_API_KEY_ENV,
   SETTINGS_PROVIDER_PROFILE,
   createSettingsPreferencesScenario,
+  createSettingsPreferencesConfigScenario,
   createStablePreferencesDecision,
   dirtyCloseGuardReady,
   dirtyDoclingPreferencesReady,
@@ -21,8 +22,182 @@ import {
   settingsTriggerRestoredShellReady,
   settingsPreferencesFixtureConfig,
   shellReadyForSettingsDrag,
+  shellReadyForPreferences,
+  smallSettingsEditorWithinViewport,
+  settingsToggleLabelAssociated,
+  tabToSettingsControl,
   trustedClickProbeEvents,
+  trustedReplaceFocusedSettingsDigits,
+  trustedToggleFocusedSettingsCheckbox,
+  trustedTypeFocusedSettingsText,
 } from "../scenarios/settings_preferences.mjs";
+
+test("category navigation requires complete compact editors inside the actual scroll viewport", () => {
+  const editor = {
+    count: 1, connected: true, visible: true, enabled: true,
+    identity: { tag: "INPUT", configKey: "model.context_window" },
+    rect: { left: 100, top: 120, right: 240, bottom: 160, width: 140, height: 40 },
+    scroll_clip: { left: 90, top: 100, right: 700, bottom: 400 },
+    viewport: { width: 800, height: 600 },
+    center_in_viewport: true, center_in_scroll_clip: true, center_hit: true,
+  };
+  const ready = (observation, key = "model.context_window") => smallSettingsEditorWithinViewport({ observation }, key);
+  assert.equal(ready(editor), true);
+  for (const rect of [
+    { left: 89 }, { top: 99 }, { right: 701 }, { bottom: 401 },
+    { top: 390, bottom: 430 }, // Center/hit flags alone cannot prove the entire input is visible.
+    { top: 700, bottom: 740 }, { height: 0 }, { left: NaN },
+  ]) assert.equal(ready({ ...editor, rect: { ...editor.rect, ...rect } }), false);
+  for (const invalid of [
+    { count: 0 }, { count: 2 }, { connected: false }, { visible: false }, { enabled: false },
+    { identity: { tag: "TEXTAREA", configKey: "model.context_window" } },
+    { identity: { tag: "INPUT", configKey: "other" } },
+    { viewport: { width: 220, height: 600 } }, { viewport: { width: 800, height: 150 } },
+    { scroll_clip: null },
+  ]) assert.equal(ready({ ...editor, ...invalid }), false);
+  assert.equal(ready({ ...editor, center_hit: false }), true, "visibility is not a pointer-center hit-test");
+  assert.equal(ready({ ...editor, identity: { tag: "INPUT", configKey: "docling.enabled" } }, "docling.enabled"), true);
+  const visualLabel = { observation: { ...editor, identity: { tag: "LABEL", configKey: "docling.enabled" } } };
+  assert.equal(smallSettingsEditorWithinViewport(visualLabel, "docling.enabled", "LABEL"), true);
+  assert.equal(smallSettingsEditorWithinViewport(visualLabel, "docling.enabled"), false);
+  assert.equal(smallSettingsEditorWithinViewport(visualLabel, "docling.enabled", "TEXTAREA"), false);
+  assert.equal(smallSettingsEditorWithinViewport(null, "model.context_window"), false);
+});
+
+test("custom toggle visibility binds its unique label to the enabled semantic checkbox", () => {
+  const label = { count: 1, config_key: "docling.enabled", associated_input: true };
+  const checkbox = { count: 1, config_key: "docling.enabled", type: "checkbox", enabled: true, checked: false, visible: false };
+  const accepted = (labelValue = label, checkboxValue = checkbox) => settingsToggleLabelAssociated(labelValue, checkboxValue, "docling.enabled");
+  assert.equal(accepted(), true, "a CSS-hidden native input is represented by its visible associated label");
+  assert.equal(accepted(label, { ...checkbox, checked: true }), true);
+  for (const invalid of [{ count: 0 }, { count: 2 }, { config_key: "other" }, { associated_input: false }]) {
+    assert.equal(accepted({ ...label, ...invalid }), false);
+  }
+  for (const invalid of [{ count: 0 }, { count: 2 }, { config_key: "other" }, { type: "text" }, { enabled: false }, { checked: null }]) {
+    assert.equal(accepted(label, { ...checkbox, ...invalid }), false);
+  }
+});
+
+test("Settings reaches an editor with trusted Tab before keyboard typing", async () => {
+  const locator = { selector: "textarea", identity: { tag: "TEXTAREA", configKey: "model.system_prompt" } };
+  const ready = { count: 1, available: true, focus_in_dialog: true, focused: false };
+  function fixture(observations, untrusted = false) {
+    let sequence = 0;
+    const events = [], keys = [];
+    return {
+      keys,
+      cdp: { evaluate: async () => { assert.ok(observations.length); return observations.shift(); } },
+      input: {
+        snapshotProbe: async (after = 0) => ({ found: true, sequence, dropped_through: 0, events: events.filter(e => e.sequence > after) }),
+        pressKey: async (key) => {
+          keys.push(key);
+          for (const type of ["keydown", "keyup"]) events.push({ sequence: ++sequence, type, key, code: key, isTrusted: !untrusted });
+        },
+      },
+    };
+  }
+  const successful = fixture([{ ...ready }, { ...ready }, { ...ready, focused: true }]);
+  const result = await tabToSettingsControl(successful.input, successful.cdp, locator);
+  assert.equal(result.steps, 2);
+  assert.deepEqual(successful.keys, ["Tab", "Tab"]);
+  assert.equal(result.probe.events.length, 4);
+  const focused = fixture([{ ...ready, focused: true }]);
+  assert.equal((await tabToSettingsControl(focused.input, focused.cdp, locator)).steps, 0);
+  assert.deepEqual(focused.keys, []);
+  for (const invalid of [{ count: 0 }, { count: 2 }, { available: false }, { focus_in_dialog: false }]) {
+    const unavailable = fixture([{ ...ready, ...invalid }]);
+    await assert.rejects(tabToSettingsControl(unavailable.input, unavailable.cdp, locator), error => error.code === "settings-tab-target-unavailable");
+    assert.deepEqual(unavailable.keys, []);
+  }
+  const unreachable = fixture([{ ...ready }, { ...ready }, { ...ready }]);
+  await assert.rejects(tabToSettingsControl(unreachable.input, unreachable.cdp, locator, { maxSteps: 2 }), error => error.code === "settings-tab-target-unreachable");
+  assert.deepEqual(unreachable.keys, ["Tab", "Tab"]);
+  const synthetic = fixture([{ ...ready }, { ...ready, focused: true }], true);
+  await assert.rejects(tabToSettingsControl(synthetic.input, synthetic.cdp, locator), error => error.code === "event-probe-untrusted");
+});
+
+test("Settings keyboard typing binds every character to the already-focused textarea without a pointer", async () => {
+  const identity = { tag: "TEXTAREA", configKey: "model.system_prompt" };
+  const locator = { selector: "textarea", identity };
+  function fixture({ active = identity, changeEvents = () => {} } = {}) {
+    const calls = [], events = [];
+    return { calls, input: {
+      snapshotProbe: async () => ({ found: true, sequence: events.length, dropped_through: 0, active, events }),
+      typeText: async (text) => {
+        calls.push(text);
+        for (const character of text) {
+          events.push({ sequence: events.length + 1, isTrusted: true, ...identity, type: "keydown", key: character });
+          events.push({ sequence: events.length + 1, isTrusted: true, ...identity, type: "input", inputType: "insertText", data: character });
+          events.push({ sequence: events.length + 1, isTrusted: true, ...identity, type: "keyup", key: character });
+        }
+        changeEvents(events);
+        return { text, character_count: text.length };
+      },
+    } };
+  }
+  const accepted = fixture();
+  const typed = await trustedTypeFocusedSettingsText(accepted.input, locator, "e2e-prompt");
+  assert.deepEqual(accepted.calls, ["e2e-prompt"]);
+  assert.equal(typed.probe.events.length, 30);
+  const wrongFocus = fixture({ active: { ...identity, configKey: "model.api_key_env" } });
+  await assert.rejects(trustedTypeFocusedSettingsText(wrongFocus.input, locator, "e2e-prompt"), error => error.code === "settings-text-focus-owner");
+  assert.deepEqual(wrongFocus.calls, []);
+  for (const changeEvents of [
+    events => { events[1].configKey = "model.api_key_env"; },
+    events => { events[1].isTrusted = false; },
+    events => { events[1].data = "other"; },
+    events => { events.pop(); },
+  ]) {
+    const invalid = fixture({ changeEvents });
+    await assert.rejects(trustedTypeFocusedSettingsText(invalid.input, locator, "e2e-prompt"));
+    assert.deepEqual(invalid.calls, ["e2e-prompt"], "failed delivery is not retried");
+  }
+});
+
+test("remaining Settings controls use focused keyboard replacement and one native checkbox activation", async () => {
+  const contextIdentity = { tag: "INPUT", configKey: "model.context_window" };
+  const checkboxIdentity = { tag: "INPUT", configKey: "docling.enabled" };
+  const keyEvent = (type, key, code) => ({ type, key, code });
+  const digits = [
+    keyEvent("keydown", "Control", "ControlLeft"), keyEvent("keydown", "a", "KeyA"),
+    keyEvent("keyup", "a", "KeyA"), keyEvent("keyup", "Control", "ControlLeft"),
+    ...Array.from("65537").flatMap(key => [keyEvent("keydown", key, `Digit${key}`),
+      { type: "input", inputType: "insertText", data: key }, keyEvent("keyup", key, `Digit${key}`)]),
+  ];
+  const checkbox = [keyEvent("keydown", " ", "Space"), keyEvent("keyup", " ", "Space"),
+    { type: "click" }, { type: "input" }, { type: "change" }];
+  function fixture(identity, eventRows, active = identity) {
+    const calls = [];
+    return { calls, input: {
+      snapshotProbe: async () => ({ found: true, sequence: calls.length ? eventRows.length : 0, dropped_through: 0,
+        active, events: calls.length ? eventRows.map((row, index) => ({ sequence: index + 1, isTrusted: true, ...identity, ...row })) : [] }),
+      keyDown: async key => { calls.push(["down", key]); },
+      pressKey: async key => { calls.push(["press", key]); },
+      keyUp: async key => { calls.push(["up", key]); },
+      typeText: async text => { calls.push(["text", text]); },
+    } };
+  }
+  const numeric = fixture(contextIdentity, digits);
+  await trustedReplaceFocusedSettingsDigits(numeric.input, { identity: contextIdentity }, "65537");
+  assert.deepEqual(numeric.calls, [["down", "Control"], ["press", "a"], ["up", "Control"], ["text", "65537"]]);
+  const toggle = fixture(checkboxIdentity, checkbox);
+  await trustedToggleFocusedSettingsCheckbox(toggle.input, { identity: checkboxIdentity });
+  assert.deepEqual(toggle.calls, [["press", " "]]);
+  for (const [identity, rows, operate] of [
+    [contextIdentity, digits, input => trustedReplaceFocusedSettingsDigits(input, { identity: contextIdentity }, "65537")],
+    [checkboxIdentity, checkbox, input => trustedToggleFocusedSettingsCheckbox(input, { identity: checkboxIdentity })],
+  ]) {
+    const wrongFocus = fixture(identity, rows, { ...identity, configKey: "other" });
+    await assert.rejects(operate(wrongFocus.input), error => error.code === "settings-text-focus-owner");
+    assert.deepEqual(wrongFocus.calls, []);
+    for (const invalidRows of [
+      rows.slice(0, -1),
+      rows.map((row, index) => index === 0 ? { ...row, configKey: "other" } : row),
+      rows.map((row, index) => index === 0 ? { ...row, isTrusted: false } : row),
+      [...rows, rows.at(-1)],
+    ]) await assert.rejects(operate(fixture(identity, invalidRows).input));
+  }
+});
 
 const target = Object.freeze({
   workspacePath: "C:\\workspace",
@@ -214,6 +389,19 @@ test("shell, provider, and clean Preferences predicates reject network and visib
   }
 });
 
+test("an enabled Docling fixture without a custom prompt uses an explicit empty prompt expectation", () => {
+  const settings = cleanSurface();
+  settings.projection.config_fields.find(row => row.key === "model.system_prompt").value = "";
+  settings.projection.config_fields.find(row => row.key === "docling.enabled").value = "true";
+  settings.settings.system_prompt.value = "";
+  settings.settings.docling.checked = true;
+  const options = { contextWindow: PROVIDER_CONTEXT_AFTER, doclingEnabled: true, systemPrompt: "" };
+  assert.equal(preferencesReady(settings, [], options), true);
+  assert.equal(preferencesReady(settings, [], { ...options, systemPrompt: MAIN_SYSTEM_PROMPT_MARKER }), false);
+  settings.settings.system_prompt.value = "unexpected override";
+  assert.equal(preferencesReady(settings, [], options), false);
+});
+
 test("dirty close predicates preserve the exact target and distinguish guard from ordinary dirty state", () => {
   const dirty = dirtySurface();
   assert.equal(dirtyDoclingPreferencesReady(dirty, [], target), true);
@@ -316,7 +504,39 @@ test("scenario factory returns fresh common-runner contracts", () => {
   assert.notEqual(first, second);
   assert.equal(first.id, "settings.preferences");
   assert.equal(first.databaseRequired, true);
+  assert.equal(first.coverage.native_titlebar_drag, "required");
   for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {
     assert.equal(typeof first[method], "function");
   }
+});
+
+test("config-only scenario declares excluded native drag and retains isolated settings lifecycle", async () => {
+  const config = createSettingsPreferencesConfigScenario();
+  assert.notEqual(config, createSettingsPreferencesConfigScenario());
+  assert.equal(config.id, "settings.preferences-config");
+  assert.equal(config.databaseRequired, true);
+  assert.equal(config.coverage.settings_save_and_restart, "required");
+  assert.equal(config.coverage.native_titlebar_drag, "not_tested");
+  assert.match(config.coverage.native_drag_note, /native drag未確認/);
+  for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {
+    assert.equal(typeof config[method], "function");
+  }
+  const cleanup = await config.cleanup();
+  assert.equal(cleanup.input, "fail");
+  assert.equal(cleanup.resources[0].coverage.native_titlebar_drag, "not_tested");
+  assert.equal(cleanup.resources[0].native_drag_release_verified, null);
+});
+
+test("config shell admission does not claim native drag geometry", () => {
+  const shell = cleanSurface({
+    projection: projection({ overlay: "none" }),
+    visible_dialog_count: 0,
+    visible_backdrop_count: 0,
+    settings_entry: { count: 1, visible: true, enabled: true, text: "設定", title: "設定" },
+    titlebar: null,
+  });
+  assert.equal(shellReadyForPreferences(shell, []), true);
+  assert.equal(shellReadyForSettingsDrag(shell, []), false);
+  assert.equal(shellReadyForPreferences(shell, [{ pathname: "/v1/models" }]), false);
+  assert.equal(shellReadyForPreferences({ ...shell, visible_dialog_count: 1 }, []), false);
 });

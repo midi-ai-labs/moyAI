@@ -1,4 +1,5 @@
 import http from "node:http";
+import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -21,7 +22,7 @@ export const HUB_FIXTURE_MODELS = Object.freeze([
 ]);
 const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
   && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
-const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+const same = isDeepStrictEqual;
 const selectionKeys = ["allowed_model_ids", "preferred_model_id", "required_capabilities", "wait_policy", "affinity_turns"];
 
 function validSelection(value) {
@@ -44,6 +45,7 @@ export class HubSettingsFixture {
   #clients = new Map();
   #active = 0;
   #revision = "7";
+  #models = structuredClone(HUB_FIXTURE_MODELS);
   #address = null;
   #closePromise = null;
   #closed = false;
@@ -74,7 +76,11 @@ export class HubSettingsFixture {
   get revision() { return this.#revision; }
   get clientCount() { return this.#clients.size; }
   containsCredential(text) { return [this.#bootstrap, ...this.#issuedTokens].some((secret) => String(text).includes(secret)); }
-  advanceRevision() { this.#revision = (BigInt(this.#revision) + 1n).toString(); }
+  get catalogModels() { return structuredClone(this.#models); }
+  advanceRevision({ changeModelLabels = false } = {}) {
+    this.#revision = (BigInt(this.#revision) + 1n).toString();
+    if(changeModelLabels) this.#models=this.#models.map(model=>({...model,label:model.label+' revised'}));
+  }
   reviewFor(context) { return structuredClone([...this.#clients.values()][0]?.reviews[context] ?? null); }
 
   async start() {
@@ -139,7 +145,7 @@ export class HubSettingsFixture {
     if (request.method === "GET" && target.pathname === "/v1/catalog") {
       row.revision = this.#revision;
       return reply(200, { hub_id: HUB_FIXTURE_ID, software_version: "0.1.0", revision: this.#revision,
-        models: HUB_FIXTURE_MODELS, changes: [{ revision: this.#revision, at_ms: 1000, summary: "Fixture catalog revision" }] });
+        models: this.#models, changes: [{ revision: this.#revision, at_ms: 1000, summary: "Fixture catalog revision" }] });
     }
     if (request.method !== "POST") return reply(404, { error: "not_found" });
     const parts = [];
@@ -180,8 +186,8 @@ export class HubSettingsFixture {
     if (body.expected_hub_id !== HUB_FIXTURE_ID) return reply(409, { error: "different_hub", current_revision: this.#revision });
     if (body.reviewed_revision !== this.#revision) return reply(409, { error: "review_required", current_revision: this.#revision });
     if (!validSelection(body.selection)) return reply(400, { error: "invalid_selection" });
-    if (body.selection.allowed_model_ids.some((id) => !HUB_FIXTURE_MODELS.some((model) => model.id === id))) return reply(400, { error: "model_removed" });
-    const compatible = HUB_FIXTURE_MODELS.filter((model) => body.selection.allowed_model_ids.includes(model.id)
+    if (body.selection.allowed_model_ids.some((id) => !this.#models.some((model) => model.id === id))) return reply(400, { error: "model_removed" });
+    const compatible = this.#models.filter((model) => body.selection.allowed_model_ids.includes(model.id)
       && body.selection.required_capabilities.every((capability) => model.capabilities.includes(capability)));
     if (!compatible.length || (body.selection.wait_policy === "wait_for_preferred"
       && !compatible.some((model) => model.id === body.selection.preferred_model_id))) return reply(400, { error: "capability_mismatch" });
@@ -215,7 +221,11 @@ async function observeSurface(cdp) {
     const token = one('#hub-token');
     const channel = (name) => ({
       selected: Array.from(document.querySelectorAll('input[data-hub-field^="' + name + ':model:"]:checked')).map((node) => node.dataset.hubField.split(':').at(-1)),
+      preferred: (() => { const n=one('#hub-'+name+'-preferred'); return n ? { value:n.value,enabled:!n.disabled,options:Array.from(n.options).map(o=>({value:o.value,label:o.textContent,disabled:o.disabled})) } : null; })(),
+      wait: (() => { const n=one('#hub-'+name+'-wait'); return n ? { value:n.value,enabled:!n.disabled,options:Array.from(n.options).map(o=>({value:o.value,label:o.textContent,disabled:o.disabled})) } : null; })(),
       affinity: one('#hub-' + name + '-affinity')?.value ?? null,
+      capabilities: one('#hub-'+name+'-capabilities')?.value ?? null,
+      routes: Object.fromEntries(['direct','hub'].map(mode=>{const n=one('[data-action="hub-'+(name==='main'?'main':'side')+'-'+mode+'"]');return [mode,n?{pressed:n.getAttribute('aria-pressed'),enabled:!n.disabled}:null];})),
       save_enabled: one('[data-action="hub-save-' + (name === 'main' ? 'main' : 'side') + '"]')?.disabled === false,
       confirmation: one('[data-settings-passive="hub-' + name + '-confirmation"]')?.textContent ?? '',
       feedback: one('[data-settings-passive="hub-' + name + '-feedback"]')?.textContent ?? '',
@@ -284,23 +294,50 @@ export function hubContextConfirmed(surface, context, revision, modelId, affinit
     && review.selection.preferred_model_id === modelId && review.selection.affinity_turns === affinity
     && surface[context]?.confirmation.includes("Hubで確認済み") && surface.fatal_count === 0;
 }
+export function hubSelectionControlsFailures(surface, context, selection, { confirmed = false } = {}) {
+  const local=surface?.[context], failures=[];
+  if(!local || surface?.fatal_count!==0) return ["selection-surface"];
+  const sameSet=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===new Set(a).size&&b.length===new Set(b).size&&same([...a].sort(),[...b].sort());
+  if(!sameSet(local.selected,selection.allowed_model_ids)) failures.push("allowed-checkboxes");
+  if(!sameSet(local.preferred?.options?.map(o=>o.value),selection.allowed_model_ids)
+    || local.preferred?.options?.some(o=>o.disabled || !o.label.trim())
+    || local.preferred?.enabled!==true || local.preferred?.value!==selection.preferred_model_id) failures.push("preferred-options-or-value");
+  if(!same(local.wait?.options?.map(o=>o.value),["wait_for_preferred","allow_selected_fallback"])
+    || local.wait?.enabled!==true || local.wait?.value!==selection.wait_policy) failures.push("wait-options-or-value");
+  const reviewed=surface.hub?.[`${context}_review`]?.selection;
+  if(confirmed && (surface.hub?.[`${context}_confirmation`]!=="confirmed"
+    || !reviewed || !sameSet(reviewed.allowed_model_ids,selection.allowed_model_ids)
+    || !same({...reviewed,allowed_model_ids:[]},{...selection,allowed_model_ids:[]})
+    || !local.confirmation.includes("Hubで確認済み"))) failures.push("selection-not-confirmed");
+  return failures;
+}
+export function hubEmptySelectionControlsReady(surface, context) {
+  const local=surface?.[context];
+  return surface?.fatal_count===0 && same(local?.selected,[]) && local?.preferred?.enabled===false
+    && same(local.preferred.options.map(o=>o.value),[""]) && local.preferred.value==="" && local.save_enabled===false;
+}
 export function hubDraftRetained(surface, revision, affinity) {
   return surface?.hub?.catalog?.revision === revision && surface.main?.affinity === affinity
     && surface.draft_active === true && surface.draft_same_node === true && surface.main.save_enabled === false
     && surface.main.feedback.includes("最新情報を取得") && surface.hub.main_confirmation === "review_required"
     && surface.hub.side_chat_confirmation === "review_required" && surface.fatal_count === 0;
 }
-export function hubPersistenceFailures(value, { endpoint, mainRevision = "8", sideRevision = "7" }) {
+export function hubPersistenceFailures(value, { endpoint, mainRevision = "8", sideRevision = "7", mainModels = HUB_FIXTURE_MODELS }) {
   const failures = [];
-  if (!exactKeys(value, ["schema_version", "revision", "endpoint", "label", "hub_id", "main_review", "side_chat_review", "main_mode", "side_chat_mode"])) return ["unexpected-settings-shape"];
-  if (value.schema_version !== 2 || value.endpoint !== `${endpoint}/` || value.hub_id !== HUB_FIXTURE_ID) failures.push("saved-hub-identity");
+  if (!exactKeys(value, ["schema_version", "revision", "endpoint", "label", "hub_id", "main_review", "side_chat_review", "main_mode", "side_chat_mode", "main_catalog_baseline", "side_chat_catalog_baseline"])) return ["unexpected-settings-shape"];
+  if (value.schema_version !== 3 || value.endpoint !== `${endpoint}/` || value.hub_id !== HUB_FIXTURE_ID) failures.push("saved-hub-identity");
   if (value.main_mode !== "direct" || value.side_chat_mode !== "direct") failures.push("review-changed-route-mode");
   for (const [context, revision, model, affinity] of [["main", mainRevision, "e2e-main", 9], ["side_chat", sideRevision, "e2e-side", 2]]) {
     const review = value[`${context}_review`];
     if (!exactKeys(review, ["hub_id", "reviewed_revision", "selection"]) || review.hub_id !== HUB_FIXTURE_ID
       || review.reviewed_revision !== revision || !exactKeys(review.selection, selectionKeys)
       || !same(review.selection.allowed_model_ids, [model]) || review.selection.preferred_model_id !== model
-      || review.selection.affinity_turns !== affinity) failures.push(`${context}-logical-selection`);
+      || review.selection.affinity_turns !== affinity || !same(review.selection.required_capabilities, [])
+      || review.selection.wait_policy !== "wait_for_preferred") failures.push(`${context}-logical-selection`);
+    const baseline = value[`${context}_catalog_baseline`];
+    if (!exactKeys(baseline, ["hub_id", "revision", "software_version", "models"])
+      || baseline.hub_id !== HUB_FIXTURE_ID || baseline.revision !== revision
+      || baseline.software_version !== "0.1.0" || !same(baseline.models, context === "main" ? mainModels : HUB_FIXTURE_MODELS)) failures.push(`${context}-catalog-baseline`);
   }
   return failures;
 }
@@ -327,9 +364,17 @@ async function waitSurface(cdp, label, accept) {
     sample: () => observeSurface(cdp), accept, retrySampleErrors: false })).value; }
   catch (error) { if (error?.code === "observation-timeout" && !error.evidence?.last_error) throw productFailure(label, error.evidence); throw error; }
 }
+export function hubControlReady(selector, observation) {
+  if (observation.count > 1) throw productFailure("Hub control cardinality", { selector, ...observation });
+  return observation.count === 1;
+}
 async function tabTo(input, cdp, selector) {
+  const observe = () => cdp.evaluate(`(() => { const nodes = document.querySelectorAll(${JSON.stringify(selector)}); return { count: nodes.length, active: nodes.length === 1 && document.activeElement === nodes[0] }; })()`);
+  // Trusted input delivery can finish before the async action mounts its next surface.
+  await waitForObservation({ label: "Hub control appears after navigation", timeoutMs: 12_000, pollMs: 75,
+    sample: observe, accept: value => hubControlReady(selector, value), retrySampleErrors: false });
   for (let attempt = 0; attempt < 60; attempt += 1) {
-    const state = await cdp.evaluate(`(() => { const nodes = document.querySelectorAll(${JSON.stringify(selector)}); return { count: nodes.length, active: nodes.length === 1 && document.activeElement === nodes[0] }; })()`);
+    const state = await observe();
     if (state.count !== 1) throw productFailure("Hub control cardinality", { selector, ...state });
     if (state.active) return;
     await input.pressKey("Tab");
@@ -348,12 +393,33 @@ async function click(input, cdp, target, sink, options) {
     ] });
   await sink.record("hub-trusted-action", { target, acquired, probe }, { phase: "executing", owner: OWNER });
 }
+export function assertHubTrustedClear(snapshot, afterSequence, target, observation) {
+  const proof = assertTrustedProbeSequence(snapshot, { afterSequence, expected: [
+    { type: "keydown", identity: target.identity, key: "Backspace" },
+    { type: "input", identity: target.identity, inputType: "deleteContentBackward", data: null },
+    { type: "keyup", identity: target.identity, key: "Backspace" },
+  ] });
+  if (observation?.count !== 1 || observation.value !== "" || observation.focused !== true) {
+    throw productFailure("Hub clear did not retain the empty focused field", { target, observation });
+  }
+  return proof;
+}
 async function edit(input, cdp, id, value, sink, { secret = false } = {}) {
   const target = inputTarget(id);
   await tabTo(input, cdp, target.selector);
   await input.keyDown("Control");
   try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
+  const clearStart = (await input.snapshotProbe()).sequence;
   await input.pressKey("Backspace");
+  if (value === "") {
+    const observation = await cdp.evaluate(`(() => {
+      const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
+      return { count: nodes.length, value: nodes[0]?.value, focused: document.activeElement === nodes[0] };
+    })()`);
+    const clearing = assertHubTrustedClear(await input.snapshotProbe(clearStart), clearStart, target, observation);
+    await sink.record("hub-trusted-clear", { target, clearing, observation }, { phase: "executing", owner: OWNER });
+    return;
+  }
   const start = (await input.snapshotProbe()).sequence;
   let insertion;
   try {
@@ -412,10 +478,128 @@ async function openAdvanced(input, cdp, context, sink) {
   }
 }
 
+async function chooseDropdown(input, cdp, id, value, sink) {
+  const target={selector:`#${id}`,identity:{tag:"SELECT",id}};
+  await tabTo(input,cdp,target.selector);
+  const before=await cdp.evaluate(`(() => { const n=document.querySelector(${JSON.stringify(target.selector)});return {value:n?.value,active:n===document.activeElement,disabled:n?.disabled,options:n?Array.from(n.options).map(o=>o.value):[]}; })()`);
+  const index=before.options.indexOf(value);
+  if(!before.active || before.disabled || index<0 || index>8) throw productFailure("Hub dropdown expected option unavailable",{target,value,before});
+  await click(input,cdp,target,sink);
+  const start=(await input.snapshotProbe()).sequence;
+  await input.pressKey("Home");
+  for(let count=0;count<index;count++)await input.pressKey("ArrowDown");
+  await input.pressKey("Enter");
+  // The native select popup owns some navigation keys. Require the trusted
+  // committed input/change at the exact SELECT, rather than imaginary DOM key events.
+  const probe=assertTrustedProbeSequence(await input.snapshotProbe(start),{afterSequence:start,expected:[
+    {type:"input",identity:target.identity},{type:"change",identity:target.identity},
+  ]});
+  await waitForObservation({label:`Hub ${id} keyboard selection`,timeoutMs:5000,pollMs:60,retrySampleErrors:false,
+    sample:()=>cdp.evaluate(`(() => {const n=document.querySelector(${JSON.stringify(target.selector)});return {value:n?.value,active:n===document.activeElement};})()`),accept:state=>state.value===value&&state.active});
+  await sink.record("hub-trusted-dropdown-choice",{target,before,value,probe},{phase:"executing",owner:OWNER});
+}
+
+
+export function hubRouteModeFailures(surface, modes, reviews) {
+  const failures=[];
+  if(surface?.fatal_count!==0 || surface?.hub?.status!=="connected")return ["route-surface"];
+  for(const context of ["main","side_chat"]){
+    const mode=modes[context],buttons=surface[context]?.routes;
+    if(surface.hub[context+"_mode"]!==mode || buttons?.[mode]?.pressed!=="true" || buttons[mode].enabled!==false
+      || buttons?.[mode==="hub"?"direct":"hub"]?.pressed!=="false" || buttons[mode==="hub"?"direct":"hub"].enabled!==true)failures.push(context+"-route-controls");
+    if(!same(surface.hub[context+"_review"],reviews[context]))failures.push(context+"-review-changed");
+  }
+  return failures;
+}
+export function hubCapabilitiesReady(surface,context,text,{valid,feedback=""}){
+  return surface?.fatal_count===0 && surface?.[context]?.capabilities===text
+    && surface[context].save_enabled===valid && (!feedback || surface[context].feedback.includes(feedback));
+}
+async function exerciseHubRoutes(input,cdp,sink){
+  const before=await observeSurface(cdp),reviews={main:before.hub.main_review,side_chat:before.hub.side_chat_review};
+  const modes={main:"direct",side_chat:"direct"};
+  for(const [context,mode] of [["main","hub"],["side_chat","hub"],["main","direct"],["side_chat","direct"]]){
+    await click(input,cdp,actionTarget('hub-'+(context==='main'?'main':'side')+'-'+mode),sink);
+    modes[context]=mode;
+    const observation=await waitSurface(cdp,"Independent Hub route mode",value=>hubRouteModeFailures(value,modes,reviews).length===0);
+    await sink.record("hub-independent-route-mode",{context,mode,observation},{phase:"executing",owner:OWNER});
+    await captureScenarioScreenshot({cdp,sink,name:'hub-route-'+context+'-'+mode,owner:OWNER});
+  }
+}
+async function exerciseHubCapabilities(input,cdp,fixture,sink,context){
+  const requests=fixture.requestLedger.filter(row=>row.pathname==="/v1/clients/review").length;
+  for(const [text,feedback] of [["vision","必要な機能を満たすものがありません"],["tools!","英数字"],["Tools","必要な機能を満たすものがありません"]]){
+    await edit(input,cdp,'hub-'+context+'-capabilities',text,sink);
+    const observation=await waitSurface(cdp,"Hub invalid capability stays unsaved",surface=>hubCapabilitiesReady(surface,context,text,{valid:false,feedback}));
+    await sink.record("hub-invalid-capability-unsaved",{context,text,observation},{phase:"executing",owner:OWNER});
+  }
+  if(fixture.requestLedger.filter(row=>row.pathname==="/v1/clients/review").length!==requests)throw productFailure("Invalid capabilities sent a review",fixture.requestLedger);
+  await edit(input,cdp,'hub-'+context+'-capabilities','tools, tools',sink);
+  await waitSurface(cdp,"Hub duplicate capabilities normalize into a valid selection",surface=>hubCapabilitiesReady(surface,context,'tools, tools',{valid:true}));
+}
+async function exerciseHubCatalogDetails(input,cdp,fixture,sink){
+  for(const context of ["main","side_chat"]){
+    const selector='#hub-'+context+'-catalog-diff',target={selector:selector+' > summary',identity:{tag:"DETAILS",detailsKey:'hub-'+context+'-catalog-diff'}};
+    const observe=()=>cdp.evaluate('(()=>{const n=document.querySelector('+JSON.stringify(selector)+');return {count:document.querySelectorAll('+JSON.stringify(selector)+').length,open:n?.open,text:n?.textContent,region:n?.querySelector("[role=region]")?.getAttribute("aria-label")};})()');
+    await waitForObservation({label:"Actual catalog change has a disclosure",timeoutMs:12000,pollMs:75,sample:observe,accept:v=>v.count===1&&v.open&&v.text.includes('revised')&&v.region===(context==='main'?'Main':'Side')+'のカタログ変更内容'});
+    await click(input,cdp,target,sink);
+    await waitForObservation({label:"Catalog details close",timeoutMs:5000,pollMs:75,sample:observe,accept:v=>v.count===1&&v.open===false});
+    await click(input,cdp,target,sink);
+    const reopened=await waitForObservation({label:"Catalog details reopen",timeoutMs:5000,pollMs:75,sample:observe,accept:v=>v.count===1&&v.open===true&&fixture.catalogModels.every(model=>v.text.includes(model.label))});
+    await sink.record("hub-catalog-disclosure-roundtrip",{context,reopened:reopened.value},{phase:"executing",owner:OWNER});
+    await captureScenarioScreenshot({cdp,sink,name:'hub-'+context+'-catalog-diff-reopened',owner:OWNER});
+  }
+  const target={selector:'#hub-change-history > summary',identity:{tag:"DETAILS",detailsKey:'hub-change-history'}};
+  const observe=()=>cdp.evaluate('(()=>{const n=document.querySelector("#hub-change-history");return {open:n?.open,text:n?.textContent};})()');
+  await click(input,cdp,target,sink);
+  const opened=await waitForObservation({label:"Catalog revision history opens",timeoutMs:5000,pollMs:75,sample:observe,accept:v=>v.open===true&&v.text.includes('更新 8')&&v.text.includes('Fixture catalog revision')});
+  await captureScenarioScreenshot({cdp,sink,name:'hub-catalog-change-history-open',owner:OWNER});
+  await click(input,cdp,target,sink);
+  await waitForObservation({label:"Catalog revision history closes",timeoutMs:5000,pollMs:75,sample:observe,accept:v=>v.open===false});
+  await sink.record("hub-catalog-history-roundtrip",opened.value,{phase:"executing",owner:OWNER});
+}
+
+async function exerciseSelectionDropdowns(input, cdp, fixture, sink) {
+  for(const context of ["main","side_chat"]){
+    const opposite=context==="main"?"side_chat":"main",added=context==="main"?"e2e-side":"e2e-main";
+    const before=await observeSurface(cdp),otherReview=before.hub[`${opposite}_review`];
+    await click(input,cdp,inputTarget(`hub-${context}-model-${added}`),sink);
+    const selection={allowed_model_ids:["e2e-main","e2e-side"],preferred_model_id:added,required_capabilities:["tools"],wait_policy:"allow_selected_fallback",affinity_turns:context==="main"?4:2};
+    await exerciseHubCapabilities(input,cdp,fixture,sink,context);
+    await chooseDropdown(input,cdp,`hub-${context}-preferred`,added,sink);
+    await chooseDropdown(input,cdp,`hub-${context}-wait`,selection.wait_policy,sink);
+    await waitSurface(cdp,"Hub independent dropdown draft",surface=>hubSelectionControlsFailures(surface,context,selection).length===0&&same(surface.hub[`${opposite}_review`],otherReview));
+    await click(input,cdp,actionTarget(context==="main"?"hub-save-main":"hub-save-side"),sink);
+    const saved=await waitSurface(cdp,"Hub independent dropdown save",surface=>hubSelectionControlsFailures(surface,context,selection,{confirmed:true}).length===0&&same(surface.hub[`${opposite}_review`],otherReview));
+    const received=fixture.reviewFor(context)?.selection;
+    if(!received || !same({...received,allowed_model_ids:[...received.allowed_model_ids].sort()},selection))throw productFailure("Hub dropdown wire selection mismatch",{context,selection,received});
+    await sink.record("hub-dropdown-selection-confirmed",{context,selection,saved,other_review_unchanged:true},{phase:"executing",owner:OWNER});
+    await captureScenarioScreenshot({cdp,sink,name:`hub-${context}-multiple-preferred-fallback`,owner:OWNER});
+  }
+  const reviewsBefore=fixture.requestLedger.filter(row=>row.pathname==="/v1/clients/review").length;
+  await click(input,cdp,inputTarget("hub-main-model-e2e-main"),sink);
+  await click(input,cdp,inputTarget("hub-main-model-e2e-side"),sink);
+  const empty=await waitSurface(cdp,"Hub empty model selection cannot be saved",surface=>hubEmptySelectionControlsReady(surface,"main"));
+  if(fixture.requestLedger.filter(row=>row.pathname==="/v1/clients/review").length!==reviewsBefore)throw productFailure("Empty Hub selection auto-saved",fixture.requestLedger);
+  await sink.record("hub-empty-selection-disabled",empty,{phase:"executing",owner:OWNER});
+  await captureScenarioScreenshot({cdp,sink,name:"hub-main-empty-choice-disabled",owner:OWNER});
+  // Restore the original single-model preferences through the same visible controls.
+  await click(input,cdp,inputTarget("hub-main-model-e2e-main"),sink);
+  await edit(input,cdp,"hub-main-capabilities","",sink);
+  await chooseDropdown(input,cdp,"hub-main-wait","wait_for_preferred",sink);
+  await click(input,cdp,actionTarget("hub-save-main"),sink);
+  await waitSurface(cdp,"Hub Main single model restored",surface=>hubContextConfirmed(surface,"main","7","e2e-main",4));
+  await click(input,cdp,inputTarget("hub-side_chat-model-e2e-main"),sink);
+  await edit(input,cdp,"hub-side_chat-capabilities","",sink);
+  await chooseDropdown(input,cdp,"hub-side_chat-wait","wait_for_preferred",sink);
+  await click(input,cdp,actionTarget("hub-save-side"),sink);
+  await waitSurface(cdp,"Hub Side single model restored",surface=>hubContextConfirmed(surface,"main","7","e2e-main",4)&&hubContextConfirmed(surface,"side_chat","7","e2e-side",2));
+}
+
 export function createHubConnectionSettingsScenario() {
   const state = { fixture: null, acceptedLedger: null, quiesce: null, cleanupFailures: [] };
   return Object.freeze({
-    id: "hub.connection-settings", productOracle: "pass", manualGate: "not_required", databaseRequired: true,
+    id: "hub.connection-settings", productOracle: "pass", manualGate: "pending", databaseRequired: true,
     requestGracefulExit,
     async prepare(args) {
       state.fixture = await new HubSettingsFixture().start();
@@ -472,12 +656,16 @@ export function createHubConnectionSettingsScenario() {
         await sink.record("hub-both-independent-reviews", both, { phase: "executing", owner: OWNER });
         await captureScenarioScreenshot({ cdp, sink, name: "hub-independent-selections", owner: OWNER });
 
+        await exerciseSelectionDropdowns(input,cdp,fixture,sink);
+        await exerciseHubRoutes(input,cdp,sink);
+
         await edit(input, cdp, "hub-main-affinity", "9", sink);
         await cdp.evaluate(`globalThis[Symbol.for('${NODE_KEY}')] = document.querySelector('#hub-main-affinity'); void 0`);
-        fixture.advanceRevision();
+        fixture.advanceRevision({changeModelLabels:true});
         const changed = await waitSurface(cdp, "Catalog drift keeps the focused unsaved draft and requires review", (value) => hubDraftRetained(value, "8", "9"));
         await sink.record("hub-revision-keeps-focused-draft", changed, { phase: "executing", owner: OWNER });
         await captureScenarioScreenshot({ cdp, sink, name: "hub-revision-focused-draft", owner: OWNER });
+        await exerciseHubCatalogDetails(input,cdp,fixture,sink);
         await click(input, cdp, actionTarget("hub-refresh"), sink);
         await waitSurface(cdp, "Explicit refresh rebases the retained draft", (value) => value.hub.catalog?.revision === "8" && value.main.affinity === "9" && value.main.save_enabled);
         await click(input, cdp, actionTarget("hub-save-main"), sink);
@@ -490,11 +678,11 @@ export function createHubConnectionSettingsScenario() {
           && value.hub.main_confirmation !== "confirmed" && value.hub.side_chat_confirmation !== "confirmed" && value.token_empty && fixture.clientCount === 0);
         const durableText = await readFile(path.join(context.paths.config, "hub-settings.json"), "utf8");
         const durable = JSON.parse(durableText);
-        const failures = hubPersistenceFailures(durable, { endpoint: fixture.baseUrl });
+        const failures = hubPersistenceFailures(durable, { endpoint: fixture.baseUrl, mainModels: fixture.catalogModels });
         if (fixture.containsCredential(durableText) || failures.length) throw productFailure("Hub durable preferences mismatch", { failures, credential_leak: fixture.containsCredential(durableText) });
         const ledger = fixture.requestLedger;
         if (ledger.some((row) => row.status !== 200 || (row.pathname !== "/v1/clients/register" && row.authorization !== "client"))
-          || !same(ledger.filter((row) => row.pathname === "/v1/clients/review").map((row) => [row.context, row.revision]), [["main", "7"], ["side_chat", "7"], ["main", "8"]])
+          || !same(ledger.filter((row) => row.pathname === "/v1/clients/review").map((row) => [row.context, row.revision]), [["main", "7"], ["side_chat", "7"], ["main", "7"], ["side_chat", "7"], ["main", "7"], ["side_chat", "7"], ["main", "8"]])
           || ledger.filter((row) => row.pathname === "/v1/clients/register").length !== 1
           || ledger.filter((row) => row.pathname === "/v1/clients/disconnect").length !== 1) throw productFailure("Hub authenticated wire flow mismatch", ledger);
         await sink.record("hub-disconnected-durable-logical-settings", { observation: disconnected, durable, ledger, credentials_absent: true }, { phase: "executing", owner: OWNER });
@@ -538,7 +726,7 @@ export function createHubConnectionSettingsScenario() {
         await click(input, cdp, actionTarget("close-overlay", `${DIALOG} .hub-modal-footer`), sink);
         await waitSurface(cdp, "Restored Hub settings close", (value) => value.overlay === "none" && value.dialog_count === 0);
         state.acceptedLedger = fixture.requestLedger;
-        return { acquisition: "pass", oracle: "pass", manual: "not_required" };
+        return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) { primaryError = error; throw error; }
       finally {
         await releaseInput();

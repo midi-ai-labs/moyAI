@@ -2306,6 +2306,22 @@ impl AgentRuntime {
                 lease,
             });
         };
+        // Claim a separate Hub execution before the parent can finish. The worker guard
+        // closes only this scope on normal completion, early return or task abort.
+        let (run_service, hub_execution) = if context.is_sub_agent() {
+            match run_service.with_delegated_hub_execution(lease.run_control().token()) {
+                Ok((service, guard)) => (Arc::new(service), guard),
+                Err(error) => {
+                    return Err(AgentLaunchFailure {
+                        message: error.to_string(),
+                        context,
+                        lease,
+                    });
+                }
+            }
+        } else {
+            (run_service, None)
+        };
         let root_session_id = context.tree.root_session_id;
         let path = context.path.clone();
         let generation = match self.reserve_worker_generation(root_session_id, &path) {
@@ -2514,6 +2530,9 @@ impl AgentRuntime {
                     return;
                 }
             };
+            if let Some(execution) = &hub_execution {
+                execution.finish().await;
+            }
             if !context.has_durable_turn_owner() {
                 let fallback_error = result.as_ref().err().map(ToString::to_string).or_else(|| {
                     Some("sub-agent run returned before binding its durable turn owner".to_string())

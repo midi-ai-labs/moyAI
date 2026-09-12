@@ -73,6 +73,9 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
         .unwrap();
         assert_eq!(pending.context.job_id.to_string(), id);
         assert_eq!(pending.context.profile_id, profile.id);
+        let activity = jobs.activity_now();
+        assert_eq!(activity.awaiting_approval, 1);
+        assert_eq!(activity.running + activity.waiting + activity.cancelling, 0);
         assert_eq!(
             call(&dispatcher, "task_status", json!({"job_id":id})).await["state"],
             "awaiting_approval"
@@ -116,6 +119,7 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
         ));
         assert!(jobs.drain_profile(profile.id, Duration::from_secs(3)).await);
         assert!(jobs.pending_approval().is_none());
+        assert!(!jobs.activity_now().active());
         server.abort();
     }
 }
@@ -556,6 +560,10 @@ async fn remote_job_runs_real_runservice_and_replay_never_reexecutes() {
     let (endpoint, count, _, server) = provider(false).await;
     let (_temp, app, profile) = fixture(&endpoint).await;
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
+    assert_eq!(
+        jobs.activity_now(),
+        super::super::RemoteActivityProjection::default()
+    );
     let dispatcher = jobs
         .dispatcher(profile.clone(), app.config.clone(), vec![])
         .await
@@ -585,6 +593,10 @@ async fn remote_job_runs_real_runservice_and_replay_never_reexecutes() {
             .is_some()
     );
     assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    assert!(
+        !jobs.activity_now().active(),
+        "terminal work no longer animates"
+    );
     let delete_error = app
         .store
         .project_repo()
@@ -646,6 +658,7 @@ async fn remote_job_cancel_owns_running_work_and_stopped_profile_cannot_accept()
     })
     .await
     .unwrap();
+    assert_eq!(jobs.activity_now().running, 1);
     assert!(
         dispatcher
             .call("delegate_task", task("second"), CancellationToken::new())
@@ -657,6 +670,10 @@ async fn remote_job_cancel_owns_running_work_and_stopped_profile_cannot_accept()
     let finished = terminal(&dispatcher, id).await;
     assert_eq!(finished["state"], "interrupted");
     assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    assert!(
+        !jobs.activity_now().active(),
+        "cancelled work no longer animates"
+    );
     jobs.cancel_profile(profile.id);
     assert!(
         dispatcher
@@ -669,6 +686,157 @@ async fn remote_job_cancel_owns_running_work_and_stopped_profile_cannot_accept()
             .is_err()
     );
     released.notify_waiters();
+    server.abort();
+}
+
+#[tokio::test]
+async fn completed_remote_server_survives_workspace_rebuild_and_profile_stop_drains_it() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let count = requests.clone();
+    let captured = recorded.clone();
+    let router = axum::Router::new()
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(json!({"data":[{"id":"remote-fixture-model"}]}))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let count = count.clone();
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(body);
+                    let (delta, finish) = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let command = if cfg!(windows) {
+                            "Start-Sleep -Seconds 120"
+                        } else {
+                            "sleep 120"
+                        };
+                        (
+                            json!({"role":"assistant","tool_calls":[{"index":0,"id":"start-server","type":"function","function":{"name":"shell_start","arguments":json!({"command":command,"timeout_ms":120_000}).to_string()}}]}),
+                            "tool_calls",
+                        )
+                    } else {
+                        (
+                            json!({"role":"assistant","content":"Managed receiver command started"}),
+                            "stop",
+                        )
+                    };
+                    let chunk = json!({"id":"fixture","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                    let end = json!({"id":"fixture","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":finish}]});
+                    (
+                        [("content-type", "text/event-stream")],
+                        format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
+                    )
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (_temp, app, mut profile) = fixture(&endpoint).await;
+    profile.mode = PublishMode::Agent {
+        access_mode: AccessMode::FullAccess,
+    };
+    let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
+    let dispatcher = jobs
+        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .await
+        .unwrap();
+    let accepted = call(&dispatcher, "delegate_task", task("managed-server")).await;
+    let id = accepted["job_id"].as_str().unwrap();
+    let finished = terminal(&dispatcher, id).await;
+    assert_eq!(finished["state"], "completed", "{finished}");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    let start_result = recorded
+        .lock()
+        .unwrap()
+        .last()
+        .and_then(|body| body["messages"].as_array())
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "start-server"
+            })
+        })
+        .and_then(|message| message["content"].as_str())
+        .map(str::to_owned)
+        .expect("the receiver reports the real shell_start result to its provider");
+    let start_result: Value = serde_json::from_str(&start_result).unwrap();
+    assert_eq!(start_result["state"], "running", "{start_result}");
+    assert!(start_result["pid"].as_u64().is_some_and(|pid| pid > 0));
+    assert!(
+        app.process_runtime
+            .managed_shells()
+            .has_profile_work(profile.id.0),
+        "completion of the delegate job must leave its managed command alive"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while jobs.activity_now().active() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !jobs
+            .drain_profile(profile.id, Duration::from_millis(25))
+            .await,
+        "a terminal job must not make an active server disappear from profile drain"
+    );
+
+    let other_workspace = app.workspace.root.parent().unwrap().join("other-project");
+    std::fs::create_dir_all(&other_workspace).unwrap();
+    let rebuilt =
+        AppBootstrap::rebuild_for_directory_as_workspace_root_with_process_runtime_and_config(
+            &other_workspace,
+            app.process_runtime.clone(),
+            app.config.clone(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(app.workspace.project_id, rebuilt.workspace.project_id);
+    drop(app);
+    assert!(
+        rebuilt
+            .process_runtime
+            .managed_shells()
+            .has_profile_work(profile.id.0),
+        "workspace navigation shares the process owner even after the previous App is dropped"
+    );
+
+    jobs.cancel_profile(profile.id);
+    assert!(
+        jobs.drain_profile(profile.id, Duration::from_secs(15))
+            .await
+    );
+    assert!(
+        !rebuilt
+            .process_runtime
+            .managed_shells()
+            .has_profile_work(profile.id.0)
+    );
+    let stored = rebuilt
+        .store
+        .remote_job_store()
+        .get_for_profile(profile.id.0, id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebuilt
+            .session_service
+            .get_session(stored.session_id)
+            .await
+            .unwrap()
+            .status,
+        SessionStatus::Completed,
+        "stopping the managed command does not rewrite the completed job's terminal"
+    );
+    rebuilt.shutdown_managed_shells().await;
     server.abort();
 }
 

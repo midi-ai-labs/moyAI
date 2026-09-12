@@ -73,13 +73,30 @@ impl ResolvedExecutable {
         cwd: &Utf8Path,
         environment: &HashMap<String, String>,
     ) -> Result<Self, ExecutableIdentityError> {
-        Self::resolve_with_search_policy(program, cwd, environment, true, false, None)
+        Self::resolve_with_search_policy(program, cwd, environment, true, false, None, false)
     }
 
     pub(crate) fn resolve_from_captured_search_path(
         program: &str,
         environment: &HashMap<String, String>,
         excluded_root: &Utf8Path,
+    ) -> Result<Self, ExecutableIdentityError> {
+        Self::resolve_captured_search_path(program, environment, excluded_root, false)
+    }
+
+    pub(crate) fn discover_shell_from_captured_search_path(
+        program: &str,
+        environment: &HashMap<String, String>,
+        excluded_root: &Utf8Path,
+    ) -> Result<Self, ExecutableIdentityError> {
+        Self::resolve_captured_search_path(program, environment, excluded_root, true)
+    }
+
+    fn resolve_captured_search_path(
+        program: &str,
+        environment: &HashMap<String, String>,
+        excluded_root: &Utf8Path,
+        skip_reparse_candidates: bool,
     ) -> Result<Self, ExecutableIdentityError> {
         let path = Utf8Path::new(program);
         if path.is_absolute() || program.contains(['/', '\\']) {
@@ -92,6 +109,7 @@ impl ResolvedExecutable {
             false,
             true,
             Some(excluded_root),
+            skip_reparse_candidates,
         )
     }
 
@@ -102,6 +120,7 @@ impl ResolvedExecutable {
         include_working_directory: bool,
         absolute_search_directories_only: bool,
         excluded_root: Option<&Utf8Path>,
+        skip_reparse_candidates: bool,
     ) -> Result<Self, ExecutableIdentityError> {
         if program.trim().is_empty() || program.contains('\0') {
             return Err(ExecutableIdentityError::InvalidProgram(program.to_string()));
@@ -218,6 +237,15 @@ impl ResolvedExecutable {
                 {
                     last_error = Some(source);
                 }
+                Err(ExecutableIdentityError::ReparsePoint { .. }) if skip_reparse_candidates => {
+                    // Windows app execution aliases cannot be pinned as executables.
+                    // Automatic shell discovery may try the next captured PATH entry;
+                    // explicit programs and other admission failures remain strict.
+                    last_error = Some(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no regular executable was found after excluding reparse candidates",
+                    ));
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -293,14 +321,16 @@ impl ResolvedExecutable {
                 program: requested.to_string(),
                 source,
             })?;
+        // OPEN_REPARSE_POINT exposes the link itself; its metadata can report
+        // !is_file(). Classify that exact attribute before the regular-file gate.
+        #[cfg(windows)]
+        reject_windows_reparse_point(&requested, &metadata)?;
         if !metadata.is_file() {
             return Err(ExecutableIdentityError::InvalidPath {
                 program: requested.to_string(),
                 reason: "resolved executable is not a regular file".to_string(),
             });
         }
-        #[cfg(windows)]
-        reject_windows_reparse_point(&requested, &metadata)?;
         let canonical = PathGuard::opened_file_identity_path(&pin).map_err(|error| {
             ExecutableIdentityError::InvalidPath {
                 program: requested.to_string(),
@@ -344,12 +374,6 @@ impl ResolvedExecutable {
                 program: self.inner.requested.to_string(),
                 reason: source.to_string(),
             })?;
-        if !metadata.is_file() {
-            return Err(ExecutableIdentityError::Changed {
-                program: self.inner.requested.to_string(),
-                reason: "the admitted executable is no longer a regular file".to_string(),
-            });
-        }
         #[cfg(windows)]
         reject_windows_reparse_point(&self.inner.requested, &metadata).map_err(|error| {
             ExecutableIdentityError::Changed {
@@ -357,6 +381,12 @@ impl ResolvedExecutable {
                 reason: error.to_string(),
             }
         })?;
+        if !metadata.is_file() {
+            return Err(ExecutableIdentityError::Changed {
+                program: self.inner.requested.to_string(),
+                reason: "the admitted executable is no longer a regular file".to_string(),
+            });
+        }
         let canonical = PathGuard::opened_file_identity_path(&current).map_err(|error| {
             ExecutableIdentityError::Changed {
                 program: self.inner.requested.to_string(),
@@ -774,9 +804,8 @@ fn reject_windows_reparse_point(
     use std::os::windows::fs::MetadataExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(ExecutableIdentityError::InvalidPath {
+        return Err(ExecutableIdentityError::ReparsePoint {
             program: path.to_string(),
-            reason: "resolved executable is a reparse point".to_string(),
         });
     }
     Ok(())
@@ -851,6 +880,9 @@ pub(crate) enum ExecutableIdentityError {
         program: String,
         reason: String,
     },
+    ReparsePoint {
+        program: String,
+    },
     Unavailable {
         program: String,
         source: std::io::Error,
@@ -877,6 +909,12 @@ impl Display for ExecutableIdentityError {
                 write!(
                     formatter,
                     "executable `{program}` could not be pinned: {reason}"
+                )
+            }
+            Self::ReparsePoint { program } => {
+                write!(
+                    formatter,
+                    "executable `{program}` could not be pinned: resolved executable is a reparse point"
                 )
             }
             Self::Unavailable { program, source } => {

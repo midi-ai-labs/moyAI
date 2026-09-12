@@ -155,6 +155,7 @@ function state(
     provider_catalog_api_key_env: null,
     provider_model_ids: [],
     provider_models: [],
+    provider_status: { kind: "idle", title: "", hint: "", details: "" },
     config_target: {
       workspacePath: "C:/workspace",
       sessionId: ownerSessionId,
@@ -455,7 +456,7 @@ test("Settings presents Main and Side LLM URL and native model selection consist
   assert.match(main, /<select id="main-provider-model"[^>]*data-config-key="model\.model"/);
   assert.match(main, /<option value="qwen-main" selected>Qwen Main（ロード済み）<\/option>/);
   assert.match(main, /<option value="qwen-main-alt" >Qwen Main Alt（未ロード）<\/option>/);
-  assert.match(main, /data-action="show-provider"[^>]*aria-controls="main-provider-model main-provider-model-catalog-status"/);
+  assert.match(main, /data-action="load-provider-models"[^>]*aria-controls="main-provider-model main-provider-model-catalog-status"/);
   assert.match(main, /メインチャットの共通の既定値/);
   assert.match(main, /data-config-key="model\.system_prompt"[^>]*>Main instructions<\/textarea>/);
   assert.doesNotMatch(main, /Side instructions/);
@@ -528,9 +529,10 @@ test("Main Settings never offers model rows from a catalog owned by another URL"
     html.indexOf('<section id="settings-model"'),
   );
 
-  assert.match(main, /<option value="current-model" selected>current-model（現在の設定）<\/option>/);
+  assert.doesNotMatch(main, /<option value="current-model"/);
+  assert.match(main, /id="main-provider-model-manual"[^>]*value="current-model"/);
   assert.doesNotMatch(main, /stale-model|Stale model/);
-  assert.match(main, /現在のLLM URLとConnection typeに対応する候補を取得/);
+  assert.match(main, /入力中のURLと接続方式に対応する候補を取得/);
 });
 
 test("Settings model dropdown exposes loaded options and retains a current model outside the catalog", () => {
@@ -1357,6 +1359,7 @@ test("side draft persistence uses exact owner, chat, and draft revision", async 
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       current = state({ draft_text: "new durable draft", draft_revision: "8" });
@@ -1393,6 +1396,7 @@ test("a stale durable draft CAS never replaces the losing local text", async () 
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async () => {
       current = state({ draft_text: "other process", draft_revision: "8" });
     },
@@ -1431,6 +1435,7 @@ test("draft CAS settlement compares typed quote authority even when display text
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       current = state({
@@ -1532,6 +1537,40 @@ test("Ctrl+Enter targets the focused side composer without changing other global
     shortcutActionForComposer({ key: "n", ctrlKey: true, metaKey: false, repeat: false }, true),
     "new-chat",
   );
+});
+
+test("Hub-origin Side Chat captures Direct only on an explicit targeted action and keeps drafts", async () => {
+  const ui = createUiLocalState();
+  ui.drafts.prompt = "keep main draft";
+  const initial = state({ can_send: false, direct_provider_capture: {
+    base_url: "http://direct.test/v1", model: "direct-model", provider_profile: "openai_compatible",
+    enabled: true, reason: "この会話と履歴を保持して、最初のDirect設定を適用します。",
+  } });
+  const html = useSidePane().artifactPane(initial);
+  assert.match(html, /この会話にDirect設定を適用/);
+  assert.match(html, /http:\/\/direct.test\/v1/);
+  assert.match(html, /direct-model/);
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  let release!: () => void;
+  const completion = new Promise<void>((resolve) => { release = resolve; });
+  const context = { uiState: ui, rerender: () => undefined,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args }); await completion;
+    },
+  } as unknown as ActionContext;
+  const action = actionById("capture-side-chat-direct-provider")!;
+  const first = action.run(initial, context, { index: -1, value: "" });
+  await action.run(initial, context, { index: -1, value: "" });
+  assert.equal(ui.sideChatMutations.get("session-a")?.kind, "capture");
+  assert.deepEqual(calls, [{ name: "capture_side_chat_direct_provider", args: {
+    ownerSessionId: "session-a", sideChatId: "side-a", expectedGeneration: "4",
+    expectedDraftRevision: "0", expectedConfigGeneration: "7",
+  } }]);
+  release(); await first;
+  assert.equal(ui.sideChatMutations.size, 0);
+  assert.equal(ui.drafts.prompt, "keep main draft");
+  await action.run(state({ direct_provider_capture: null }), context, { index: -1, value: "" });
+  assert.equal(calls.length, 1);
 });
 
 test("settled canonical transcript and artifact rows expose one native quote action", () => {
@@ -1636,6 +1675,7 @@ test("quote selection creates a first Side Chat, then opens and persists the exa
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       if (name === "ensure_side_chat") {
@@ -1764,6 +1804,7 @@ test("quote action appends to only the Side draft, never auto-sends, and manual 
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       if (name === "save_side_chat_draft") {
@@ -1854,6 +1895,7 @@ test("a second typed quote replaces and persists without orphaning the first aut
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       current = state({
@@ -2113,6 +2155,7 @@ test("side Send waits for queued autosaves and submits the settled draft revisio
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       if (name === "save_side_chat_draft") {

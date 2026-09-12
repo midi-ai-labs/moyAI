@@ -29,6 +29,7 @@ function surface() {
     conversation: rect(260, 34, 840, 686), topbar: rect(260, 34, 840, 130),
     thread: rect(260, 164, 840, 556, { row: "3", padding_bottom: 232 }),
     composer: rect(300, 510, 400, 190), run_strip: null,
+    run_stack: rect(260, 164, 840, 0, { row: "2", visible: false }),
     prompt: { ...rect(310, 524, 380, 70), value: "draft", active: true, same_node: true, selection_start: 5, selection_end: 5 },
     send: { ...rect(600, 602, 80, 34), text: "送信", enabled: true },
     hero: rect(450, 280, 310, 40), errors: 0, projection: { overlay: "none" },
@@ -55,12 +56,36 @@ test("LYNX geometry rejects the observed idle auto-row bug and obscured composer
 
 test("LYNX running geometry requires the real strip above history and reachable Stop", () => {
   const running = surface();
-  running.run_strip = rect(260, 164, 840, 40, { row: "2" });
+  running.run_stack = rect(260, 164, 840, 40, { row: "2" });
+  running.run_strip = rect(260, 164, 840, 40, { row: "auto" });
   running.thread = rect(260, 204, 840, 516, { row: "3", padding_bottom: 232 });
   running.stop = rect(640, 169, 30, 30);
   assert.deepEqual(lynxLayoutFailures(running, { running: true }), []);
   running.stop.center_hit = false;
   assert.ok(lynxLayoutFailures(running, { running: true }).includes("running-stop-occluded"));
+});
+
+test("LYNX running layout accepts a nested strip while rejecting detached status and clipped Stop", () => {
+  const running = surface();
+  running.run_stack = rect(260, 164, 840, 49, { row: "2" });
+  running.run_strip = rect(260, 164, 840, 49, { row: "auto" });
+  running.thread = rect(260, 213, 840, 507, { row: "3", padding_bottom: 232 });
+  running.stop = rect(611, 170, 108, 36);
+  assert.deepEqual(lynxLayoutFailures(running, { running: true }), []);
+  for (const [change, failure] of [
+    [(v) => { v.run_stack = null; }, "running-strip-detached"],
+    [(v) => { v.run_stack.top += 20; }, "running-strip-detached"],
+    [(v) => { v.run_stack.bottom -= 20; }, "thread-detached-from-header"],
+    [(v) => { v.run_strip.bottom += 20; }, "running-strip-detached"],
+    [(v) => { v.run_strip.visible = false; }, "running-strip-detached"],
+    [(v) => { v.stop.bottom = 215; }, "running-stop-occluded"],
+    [(v) => { v.stop.center_hit = false; }, "running-stop-occluded"],
+  ]) {
+    const invalid = structuredClone(running); change(invalid);
+    assert.ok(lynxLayoutFailures(invalid, { running: true }).includes(failure), failure);
+  }
+  const stopped = surface(); stopped.run_stack = running.run_stack;
+  assert.ok(lynxLayoutFailures(stopped).includes("unexpected-running-strip"));
 });
 
 test("LYNX draft evidence requires text, focus, selection and connected input identity", () => {

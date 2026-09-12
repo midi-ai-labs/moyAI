@@ -1,17 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mcpHistoryRegionHasSelection, synchronizeMcpHistorySurface } from "../src/mcp_history_dom.ts";
+import { dialogFocusTargetIsAvailable } from "../src/dialog_focus.ts";
 
 // A focused DOM fixture: membership, connected node identity and replacement effects
 // are modeled explicitly; no private source text or layout placement is asserted.
 function surface() {
   let selected: ElementStub | null = null;
-  const document = { activeElement: null as ElementStub | null, getSelection: () => ({
+  const document = { defaultView: null, activeElement: null as ElementStub | null, getSelection: () => ({
     isCollapsed: selected === null, rangeCount: selected ? 1 : 0,
     containsNode: (element: ElementStub) => element.contains(selected),
   }) };
   class ElementStub {
     ownerDocument = document;
+    readonly isConnected = true;
+    closest(): null { return null; }
+    matches(selector: string): boolean { return selector === ":disabled" && this.disabled; }
+    getClientRects(): unknown[] { return [{}]; }
     dataset: Record<string, string> = {};
     id = "";
     disabled = false;
@@ -56,7 +61,7 @@ function surface() {
   const body = new ElementStub(); body.dataset.historyRegion = "document"; body.innerHTML = "old document";
   const text = new ElementStub(); body.children = [text];
   scroll.children = [body]; modal.children = [list, scroll];
-  return { modal, list, row, title, state, scroll, body, text, document, select(node: ElementStub | null) { selected = node; } };
+  return { modal, list, row, title, state, scroll, body, text, document, element: () => new ElementStub(), select(node: ElementStub | null) { selected = node; } };
 }
 function synchronize(current: ReturnType<typeof surface>, next: ReturnType<typeof surface>) {
   const previous = Object.getOwnPropertyDescriptor(globalThis, "CSS");
@@ -108,4 +113,41 @@ test("explicit task navigation changes the detail owner and starts its document 
   assert.equal(current.scroll.scrollTop, 0);
   assert.equal(current.scroll.scrollLeft, 0);
   assert.equal(current.list.scrollTop, 137);
+});
+
+test("retained MCP controls align native, ARIA and keyboard availability across selection and operation changes", () => {
+  const ids = ["mcp-history-export", "mcp-history-refresh", "mcp-history-stop", "mcp-history-next"];
+  const stages = [
+    { name: "no selection", disabled: [true, false, true, true] },
+    { name: "running row selected", disabled: [false, false, false, false] },
+    { name: "export pending", disabled: [true, false, true, false] },
+    { name: "completed row", disabled: [false, false, true, false] },
+    { name: "another running row", disabled: [false, false, false, false] },
+    { name: "refresh clears selection", disabled: [true, true, true, true] },
+  ];
+  const controls = (disabled: boolean[]) => {
+    const fixture = surface();
+    const buttons = ids.map((id, index) => {
+      const button = fixture.element();
+      button.id = id;
+      button.disabled = disabled[index];
+      button.setAttribute("aria-disabled", String(button.disabled));
+      fixture.modal.children.push(button);
+      return button;
+    });
+    return { fixture, buttons };
+  };
+  const current = controls(stages[0].disabled);
+  current.fixture.document.activeElement = current.buttons[1];
+  for (const stage of stages) {
+    const next = controls(stage.disabled);
+    synchronize(current.fixture, next.fixture);
+    current.buttons.forEach((button, index) => {
+      assert.equal(current.fixture.modal.querySelector(`#${button.id}`), button, `${stage.name}: retained control identity`);
+      assert.equal(button.disabled, stage.disabled[index], `${stage.name}: ${button.id} native state`);
+      assert.equal(button.getAttribute("aria-disabled"), String(stage.disabled[index]), `${stage.name}: ${button.id} accessibility state`);
+      assert.equal(dialogFocusTargetIsAvailable(button as unknown as HTMLElement), !stage.disabled[index], `${stage.name}: ${button.id} dialog focus eligibility`);
+    });
+    assert.equal(current.fixture.document.activeElement, current.buttons[1], `${stage.name}: synchronization does not move focus`);
+  }
 });

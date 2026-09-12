@@ -25,9 +25,22 @@
 .device-network-peer > .device-network-peer-actions { flex: 0 0 auto; display: grid; gap: 10px; max-width: 180px; }
 .device-network-peer strong, .device-network-peer span { display: block; overflow-wrap: anywhere; }
 .device-network-peer strong { font-size: 15px; }
-.device-network-peer > div > span { color: var(--muted); font-size: 13px; margin-top: 5px; }
+.device-network-peer > div > span, .device-network-peer [data-settings-passive] > span { color: var(--muted); font-size: 13px; margin-top: 5px; }
 .device-network-peer .hub-help { margin: 8px 0; }
-.device-network-peer button[aria-pressed="true"] { color: #e9f1ff; border-color: #568cff; background: #24467b; }
+.device-network-use-switch { display: grid; gap: 9px; justify-items: start; text-align: left; }
+.device-network-use-switch .device-network-switch-state { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.device-network-use-switch .device-network-switch-track { position: relative; width: 38px; height: 22px; border: 1px solid var(--muted); border-radius: 12px; background: var(--bg); }
+.device-network-use-switch .device-network-switch-thumb { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); }
+.device-network-use-switch[aria-checked="true"] .device-network-switch-track { background: #24467b; border-color: #568cff; }
+.device-network-use-switch[aria-checked="true"] .device-network-switch-thumb { left: 19px; background: #e9f1ff; }
+.device-network-use-switch[aria-busy="true"] { cursor: progress; }
+.device-network-selection-status[data-error="true"] { color: #eac37a; }
+@media (forced-colors: active) {
+  .device-network-use-switch .device-network-switch-track { background: Canvas; border-color: ButtonText; }
+  .device-network-use-switch .device-network-switch-thumb { background: ButtonText; }
+  .device-network-use-switch[aria-checked="true"] .device-network-switch-track { background: Highlight; }
+  .device-network-use-switch[aria-checked="true"] .device-network-switch-thumb { background: HighlightText; }
+}
 .device-network-leave { padding: 0 5px 12px; }
 .device-network-job { padding: 16px 0; border-top: 1px solid var(--line); }
 .device-network-job strong { font-size: 14px; overflow-wrap: anywhere; }

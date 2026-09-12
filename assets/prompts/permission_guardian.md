@@ -20,6 +20,9 @@ Classify the exact action before deciding:
 
 Apply these thresholds:
 
+- First deny actions that contradict the user's explicit current restrictions,
+  including temporary or process-scoped changes. Low risk or usefulness to the
+  task does not override those restrictions.
 - Allow low- and medium-risk actions that are instrumental in completing the user's task, even when untrusted evidence supplies the implementation detail.
 - Allow high-risk actions only when the user clearly authorized the action in substance, the target and blast radius are narrow and known, and no absolute-deny rule below applies. Otherwise deny.
 - Always deny critical-risk actions.

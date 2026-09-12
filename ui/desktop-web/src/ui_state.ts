@@ -1,7 +1,6 @@
 import type { LocalConfirmation } from "./render_overlays.ts";
 import { createHubUiState, type HubUiState } from "./hub_state.ts";
 import { createDeviceNetworkUiState, type DeviceNetworkUiState } from "./device_network_state.ts";
-import { createPublishUiState, type PublishUiState } from "./mcp_publish_state.ts";
 import { createMcpHistoryUiState, type McpHistoryUiState } from "./mcp_history_state.ts";
 import { createMcpPeerState, type McpPeerState } from "./mcp_peer.ts";
 import { agentActivityRowIdentity } from "./agent_activity.ts";
@@ -156,7 +155,7 @@ export interface SideChatLocalDraft {
 }
 
 export interface SideChatMutationState {
-  kind: "ensure" | "send" | "cancel" | "delete";
+  kind: "ensure" | "capture" | "send" | "cancel" | "delete";
   chatId: string | null;
   generation: string;
 }
@@ -236,7 +235,6 @@ export interface AgentExecutionRequest extends AgentExecutionTarget {
 export interface UiLocalState {
   hub: HubUiState;
   deviceNetwork: DeviceNetworkUiState;
-  mcpPublish: PublishUiState;
   mcpHistory: McpHistoryUiState;
   mcpPeers: McpPeerState;
   drafts: UiDraftState;
@@ -247,6 +245,7 @@ export interface UiLocalState {
   sessionInteractionSnapshots: Map<string, SessionInteractionSnapshot>;
   runStartMutationPending: boolean;
   taskActivityAnimationEpoch: TaskActivityAnimationEpoch | null;
+  mcpActivityAnimationEpoch: TaskActivityAnimationEpoch | null;
   externalConfigMutationPending: boolean;
   activeNewSessionMutation: NewSessionMutationRequest | null;
   pendingLocalConfirmation: LocalConfirmation | null;
@@ -303,7 +302,6 @@ export function createUiLocalState(): UiLocalState {
   return {
     hub: createHubUiState(),
     deviceNetwork: createDeviceNetworkUiState(),
-    mcpPublish: createPublishUiState(),
     mcpHistory: createMcpHistoryUiState(),
     mcpPeers: createMcpPeerState(),
     drafts: {
@@ -343,6 +341,7 @@ export function createUiLocalState(): UiLocalState {
     sessionInteractionSnapshots: new Map(),
     runStartMutationPending: false,
     taskActivityAnimationEpoch: null,
+    mcpActivityAnimationEpoch: null,
     externalConfigMutationPending: false,
     activeNewSessionMutation: null,
     pendingLocalConfirmation: null,

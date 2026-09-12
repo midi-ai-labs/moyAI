@@ -591,6 +591,7 @@ async fn wait_agent_returns_immediately_for_steer_queued_before_wait_starts() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let mut prompt = AllowPrompt;
     let context = ToolContext {
@@ -666,6 +667,7 @@ async fn wait_agent_polls_cross_store_steer_and_delivers_it_to_the_prompt_once()
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let mut prompt = AllowPrompt;
     let context = ToolContext {
@@ -2267,6 +2269,7 @@ async fn child_permission_uses_live_root_mode_and_keeps_the_admitted_process_pla
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let control = RunControl::new();
     let mut prompt = AllowPrompt;
@@ -7401,6 +7404,7 @@ fn bind_agent_script_run_service(
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(config);
     let llm = Arc::new(AgentScriptClient { state: script });
@@ -7568,6 +7572,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(AgentScriptState::default());
@@ -7797,6 +7802,7 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
@@ -8011,6 +8017,7 @@ async fn root_terminal_is_not_recalled_or_rewritten_by_late_child_interrupt() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
@@ -8189,6 +8196,7 @@ async fn idle_goal_continuation_uses_explicit_wait_agent_for_detached_child() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
@@ -8413,6 +8421,7 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(AgentScriptState::default());

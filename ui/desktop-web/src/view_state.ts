@@ -405,7 +405,8 @@ export function synchronizeInitialSetupProviderDraft(
   state: DesktopWebState,
   uiState: UiLocalState,
 ): boolean {
-  if (!state.startup.initial_setup_required || state.overlay !== "initial_setup") return false;
+  if (state.overlay !== "config"
+    && (!state.startup.initial_setup_required || state.overlay !== "initial_setup")) return false;
   const next = providerDraftFromConfigFields(state.config_fields, uiState.drafts.provider);
   if (sameProviderDraft(next, uiState.drafts.provider)) return false;
   const catalogIdentityChanged = !sameProviderCatalogIdentity(next, uiState.drafts.provider);
@@ -673,7 +674,10 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
   const providerTargetChangedDuringLoad = providerCatalogTargetChangedDuringLoad(state, uiState);
   const providerCompletionRejected = uiState.rejectedProviderCatalogRequest !== null;
   const providerCatalogMismatch = state.provider_catalog_base_url !== null && !providerCatalogAccepted;
-  const providerStatus = providerTargetChangedDuringLoad || providerCompletionRejected || providerCatalogMismatch
+  const providerFailureTargetChanged = state.provider_status.kind === "error"
+    && uiState.providerCatalogRevision !== null
+    && uiState.providerCatalogRevision !== uiState.drafts.providerCatalogIdentityRevision;
+  const providerStatus = providerTargetChangedDuringLoad || providerCompletionRejected || providerCatalogMismatch || providerFailureTargetChanged
     ? {
       kind: "warning" as const,
       title: "モデル一覧の対象が変更されました",
@@ -791,7 +795,8 @@ function providerDraftForCurrentSurface(
   state: DesktopWebState,
   uiState: UiLocalState,
 ): ProviderDraft {
-  if (!state.startup.initial_setup_required || state.overlay !== "initial_setup") {
+  if (state.overlay !== "config"
+    && (!state.startup.initial_setup_required || state.overlay !== "initial_setup")) {
     return uiState.drafts.provider;
   }
   return providerDraftFromConfigFields(activeConfigFields(state, uiState), uiState.drafts.provider);

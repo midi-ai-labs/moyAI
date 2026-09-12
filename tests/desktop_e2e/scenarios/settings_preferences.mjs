@@ -11,7 +11,6 @@ import {
 import {
   WebviewInput,
   assertTrustedProbeSequence,
-  assertTrustedTextInsertion,
 } from "../drivers/webview_input.mjs";
 import {
   TAURI_MAIN_WINDOW_CLASS,
@@ -28,11 +27,10 @@ import {
 import { quiesceProviderResource } from "./provider_restart.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 
-const OWNER = "scenario:settings.preferences";
 export const SETTINGS_RESTORE_STABILITY_MS = 500;
 export const PROVIDER_CONTEXT_BEFORE = "65536";
 export const PROVIDER_CONTEXT_AFTER = "65537";
-export const MAIN_SYSTEM_PROMPT_MARKER = "E2E_MAIN_SYSTEM_PROMPT_MARKER";
+export const MAIN_SYSTEM_PROMPT_MARKER = "e2e-main-system-prompt-marker";
 export const SETTINGS_PROVIDER_PROFILE = "openai_responses";
 export const SETTINGS_PROVIDER_API_KEY_ENV = "";
 export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
@@ -66,10 +64,13 @@ const SETTINGS_MODEL = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-model"]',
   identity: { tag: "A", href: "#settings-model" },
 });
+const DOCLING_CHECKBOX = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[type="checkbox"][data-config-key="docling.enabled"]',
+  identity: { tag: "INPUT", configKey: "docling.enabled" },
+});
 const DOCLING_TOGGLE = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] label.settings-toggle[data-config-key="docling.enabled"]',
   identity: { tag: "LABEL", configKey: "docling.enabled" },
-  forwardedClickIdentity: { tag: "INPUT", configKey: "docling.enabled" },
 });
 const CLOSE_SETTINGS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]',
@@ -210,6 +211,8 @@ export async function observeSettingsPreferencesSurface(cdp) {
         count: found.count,
         visible: found.visible,
         enabled: found.node instanceof HTMLInputElement && !found.node.disabled && !found.node.readOnly,
+        config_key: found.node instanceof HTMLInputElement ? found.node.dataset.configKey ?? null : null,
+        type: found.node instanceof HTMLInputElement ? found.node.type : null,
         value: found.node instanceof HTMLInputElement ? found.node.value : null,
         checked: found.node instanceof HTMLInputElement && found.node.type === 'checkbox' ? found.node.checked : null,
       };
@@ -253,7 +256,8 @@ export async function observeSettingsPreferencesSurface(cdp) {
     const settingsSessionOverridesLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-session-scope"]');
     const settingsWindowLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-desktop"]');
     const closeConfirmation = one('[role="alertdialog"][aria-labelledby="settings-close-confirm-title"]');
-    const doclingLabel = one('label.settings-toggle[data-config-key="docling.enabled"]');
+    const doclingLabel = one('[role="dialog"][aria-labelledby="config-dialog-title"] label.settings-toggle[data-config-key="docling.enabled"]');
+    const doclingInput = one('[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[type="checkbox"][data-config-key="docling.enabled"]');
     const doclingReadinessStatus = one('[role="dialog"][aria-labelledby="config-dialog-title"] #docling-readiness-status[data-settings-live-region="docling-readiness"]');
     const titlebarDrag = one('.app-titlebar .titlebar-drag[data-drag-region]');
     const dragRect = titlebarDrag.node instanceof HTMLElement ? titlebarDrag.node.getBoundingClientRect() : null;
@@ -294,6 +298,9 @@ export async function observeSettingsPreferencesSurface(cdp) {
         docling_label: {
           count: doclingLabel.count,
           visible: doclingLabel.visible,
+          config_key: doclingLabel.node instanceof HTMLLabelElement ? doclingLabel.node.dataset.configKey ?? null : null,
+          associated_input: doclingInput.count === 1 && doclingInput.node instanceof HTMLInputElement
+            && doclingLabel.node instanceof HTMLLabelElement && doclingLabel.node.control === doclingInput.node,
           text: doclingLabel.node instanceof HTMLElement ? doclingLabel.node.innerText.trim() : null,
         },
         docling_readiness: {
@@ -361,8 +368,7 @@ export async function observeSettingsPreferencesSurface(cdp) {
   })()`);
 }
 
-export function shellReadyForSettingsDrag(surface, ledger) {
-  const rect = surface?.titlebar?.drag_rect;
+export function shellReadyForPreferences(surface, ledger) {
   return networkStillZero(ledger)
     && errorFree(surface)
     && surface?.projection?.overlay === "none"
@@ -372,7 +378,12 @@ export function shellReadyForSettingsDrag(surface, ledger) {
     && surface.settings_entry.visible === true
     && surface.settings_entry.enabled === true
     && surface.settings_entry.text === "設定"
-    && surface.settings_entry.title === "設定"
+    && surface.settings_entry.title === "設定";
+}
+
+export function shellReadyForSettingsDrag(surface, ledger) {
+  const rect = surface?.titlebar?.drag_rect;
+  return shellReadyForPreferences(surface, ledger)
     && surface?.titlebar?.drag_count === 1
     && surface?.titlebar?.drag_visible === true
     && Number.isFinite(rect?.left)
@@ -648,6 +659,49 @@ function surfaceDecision(predicate) {
   };
 }
 
+export function smallSettingsEditorWithinViewport(target, configKey, visualTag = "INPUT") {
+  const observed = target?.observation;
+  const rect = observed?.rect;
+  const clip = observed?.scroll_clip;
+  const viewport = observed?.viewport;
+  if (observed?.count !== 1 || observed.connected !== true || observed.visible !== true
+    || observed.enabled !== true || !["INPUT", "LABEL"].includes(visualTag) || observed.identity?.tag !== visualTag
+    || observed.identity.configKey !== configKey
+    || ![rect?.left, rect?.top, rect?.right, rect?.bottom, rect?.width, rect?.height,
+      clip?.left, clip?.top, clip?.right, clip?.bottom, viewport?.width, viewport?.height].every(Number.isFinite)) return false;
+  // Compact text inputs and the visible labels of custom switches must fit wholly inside the scroll viewport.
+  // A textarea's center or caret has a different visibility contract.
+  return rect.width > 0 && rect.height > 0
+    && rect.right > rect.left && rect.bottom > rect.top
+    && rect.left >= Math.max(0, clip.left) && rect.top >= Math.max(0, clip.top)
+    && rect.right <= Math.min(viewport.width, clip.right)
+    && rect.bottom <= Math.min(viewport.height, clip.bottom);
+}
+
+export function settingsToggleLabelAssociated(label, input, configKey) {
+  return label?.count === 1 && label.config_key === configKey && label.associated_input === true
+    && input?.count === 1 && input.config_key === configKey && input.type === "checkbox"
+    && input.enabled === true && typeof input.checked === "boolean";
+}
+
+async function waitForSmallSettingsEditor({ input, cdp, provider, locator, visualLocator = locator, label, predicate = () => true }) {
+  return waitForProductStage({
+    label,
+    sample: async () => ({
+      surface: await observeSettingsPreferencesSurface(cdp),
+      ledger: provider.requestLedger,
+      editor: await input.observeExactTarget(visualLocator),
+    }),
+    decide: (sample) => surfaceDecision((surface, ledger) => predicate(surface, ledger)
+      && smallSettingsEditorWithinViewport(sample.editor, locator.identity.configKey, visualLocator.identity.tag)
+      && (visualLocator === locator || settingsToggleLabelAssociated(
+        surface?.settings?.docling_label, surface?.settings?.docling, locator.identity.configKey,
+      )))(sample),
+    code: "settings-category-editor-outside-viewport",
+    message: "Settings category navigation did not expose the complete compact editor before any subsequent keyboard input",
+  });
+}
+
 export function trustedClickProbeEvents(locator) {
   const expected = [
     { type: "pointerdown", identity: locator.identity, button: 0, buttons: 1 },
@@ -684,13 +738,19 @@ function digitEvents(text, identity) {
   ]);
 }
 
-async function trustedReplaceDigits(input, locator, text) {
+function assertFocusedSettingsControl(snapshot, locator) {
+  if (!Object.entries(locator.identity).every(([field, value]) => snapshot.active?.[field] === value)) {
+    throw new DesktopE2eError("harness", "settings-text-focus-owner", "Settings keyboard input requires the exact already-focused control", { locator, active: snapshot.active });
+  }
+}
+
+export async function trustedReplaceFocusedSettingsDigits(input, locator, text) {
   if (!/^\d+$/.test(text)) throw new TypeError("trusted replacement requires decimal digits");
-  const click = await trustedClick(input, locator);
-  const start = click.sequence;
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  const start = before.sequence;
   await input.keyDown("Control");
-  await input.pressKey("a");
-  await input.keyUp("Control");
+  try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
   await input.typeText(text);
   const snapshot = await input.snapshotProbe(start);
   const probe = assertTrustedProbeSequence(snapshot, {
@@ -703,19 +763,72 @@ async function trustedReplaceDigits(input, locator, text) {
       ...digitEvents(text, locator.identity),
     ],
   });
-  return { click, probe, sequence: snapshot.sequence };
+  return { input_kind: "trusted-keyboard", initial_focus: before.active, probe, sequence: snapshot.sequence };
 }
 
-async function trustedInsertText(input, locator, text) {
-  const focus = await trustedClick(input, locator);
-  const start = (await input.snapshotProbe()).sequence;
-  const insertion = await input.insertText(locator, text);
-  const probe = assertTrustedTextInsertion(await input.snapshotProbe(start), {
-    afterSequence: start,
-    identity: locator.identity,
-    text,
+export async function trustedTypeFocusedSettingsText(input, locator, text) {
+  if (!/^[a-z0-9-]+$/.test(text)) throw new TypeError("Settings keyboard fixture requires lowercase ASCII, digits, or hyphens");
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  // Tab already acquired this editor. Keyboard input has no pointer center and must not
+  // force a second click on a partly clipped textarea whose caret is visible.
+  const typing = await input.typeText(text);
+  const probe = assertTrustedProbeSequence(await input.snapshotProbe(before.sequence), {
+    afterSequence: before.sequence,
+    expected: Array.from(text).flatMap((character) => [
+      { type: "keydown", identity: locator.identity, key: character },
+      { type: "input", identity: locator.identity, inputType: "insertText", data: character },
+      { type: "keyup", identity: locator.identity, key: character },
+    ]),
   });
-  return { focus, insertion, probe };
+  return { input_kind: "trusted-keyboard", initial_focus: before.active, typing, probe };
+}
+
+export async function trustedToggleFocusedSettingsCheckbox(input, locator) {
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  await input.pressKey(" ");
+  const probe = assertTrustedProbeSequence(await input.snapshotProbe(before.sequence), {
+    afterSequence: before.sequence, expected: [
+      { type: "keydown", identity: locator.identity, key: " ", code: "Space" },
+      { type: "keyup", identity: locator.identity, key: " ", code: "Space" },
+      { type: "click", identity: locator.identity },
+      { type: "input", identity: locator.identity },
+      { type: "change", identity: locator.identity },
+    ],
+  });
+  return { input_kind: "trusted-keyboard", initial_focus: before.active, probe };
+}
+
+export async function tabToSettingsControl(input, cdp, locator, { maxSteps = 30 } = {}) {
+  const start = (await input.snapshotProbe()).sequence;
+  const observations = [];
+  for (let steps = 0; steps <= maxSteps; steps += 1) {
+    const observed = await cdp.evaluate(`(() => {
+      const nodes = document.querySelectorAll(${JSON.stringify(locator.selector)});
+      const target = nodes.length === 1 ? nodes[0] : null;
+      const dialog = target?.closest('[role="dialog"][aria-labelledby="config-dialog-title"]');
+      return { count: nodes.length, focused: Boolean(target && document.activeElement === target),
+        available: Boolean(target && !target.disabled && !target.readOnly
+          && !target.closest('[hidden], [inert], details:not([open])')),
+        focus_in_dialog: Boolean(dialog?.contains(document.activeElement)) };
+    })()`);
+    observations.push(observed);
+    if (observed.count !== 1 || !observed.available || !observed.focus_in_dialog) {
+      throw productFailure("settings-tab-target-unavailable", "Settings keyboard navigation lost its available target or modal focus", { locator, steps, observations });
+    }
+    if (observed.focused) {
+      const probe = steps === 0 ? null : assertTrustedProbeSequence(await input.snapshotProbe(start), {
+        afterSequence: start, expected: Array.from({ length: steps }, () => [
+          { type: "keydown", key: "Tab", code: "Tab" },
+          { type: "keyup", key: "Tab", code: "Tab" },
+        ]).flat(),
+      });
+      return { locator, steps, observations, probe };
+    }
+    if (steps < maxSteps) await input.pressKey("Tab");
+  }
+  throw new DesktopE2eError("harness", "settings-tab-target-unreachable", "Settings control was not reached through bounded keyboard navigation", { locator, observations });
 }
 
 async function trustedEscape(input, identity) {
@@ -780,6 +893,22 @@ async function settleGenerationResources(state, input, commandProbe, generation,
 }
 
 export function createSettingsPreferencesScenario() {
+  return createPreferencesScenario({ id: "settings.preferences", nativeTitlebarDrag: true });
+}
+
+export function createSettingsPreferencesConfigScenario() {
+  return createPreferencesScenario({ id: "settings.preferences-config", nativeTitlebarDrag: false });
+}
+
+function createPreferencesScenario({ id, nativeTitlebarDrag }) {
+  const OWNER = `scenario:${id}`;
+  const coverage = Object.freeze({
+    settings_save_and_restart: "required",
+    native_titlebar_drag: nativeTitlebarDrag ? "required" : "not_tested",
+    native_drag_note: nativeTitlebarDrag
+      ? "Exact owned native titlebar drag is required before settings verification."
+      : "native drag未確認（このscenarioの対象外）。settings.preferencesの代替合格にはしません。",
+  });
   const state = {
     provider: null,
     acceptedLedger: null,
@@ -788,12 +917,14 @@ export function createSettingsPreferencesScenario() {
     drag: null,
   };
   return Object.freeze({
-    id: "settings.preferences",
+    id,
+    coverage,
     productOracle: "pass",
     manualGate: "not_required",
     databaseRequired: true,
     requestGracefulExit,
     async prepare({ context, sink, phase }) {
+      await sink.record("settings-preferences-coverage", coverage, { phase, owner: OWNER });
       state.provider = await startScriptedProvider({ expectedPrompt: "settings-network-must-remain-unused" });
       await prepareDesktopFixture({
         context,
@@ -833,7 +964,8 @@ export function createSettingsPreferencesScenario() {
         await firstInput.installProbe();
         await firstCommands.install();
         const shellSurface = await observeSettingsPreferencesSurface(firstCdp);
-        if (!shellReadyForSettingsDrag(shellSurface, provider.requestLedger)) {
+        const shellReady = nativeTitlebarDrag ? shellReadyForSettingsDrag : shellReadyForPreferences;
+        if (!shellReady(shellSurface, provider.requestLedger)) {
           throw productFailure("settings-shell-contract-mismatch", "Settings qualification shell was not error-free and idle", {
             surface: shellSurface,
             ledger: provider.requestLedger,
@@ -841,48 +973,50 @@ export function createSettingsPreferencesScenario() {
         }
         const initialIdentity = selectedNavigationIdentity(shellSurface.projection);
 
-        const nativeOwner = {
-          executionRoot: context.root,
-          ownerPath: runtime.desktop_owner_path,
-          expectedOwner: runtime.desktop_owner,
-        };
-        const nativeSnapshot = await snapshotOwnedTopLevelWindows(nativeOwner);
-        const mainWindow = selectSingleOwnedRootWindow(nativeSnapshot, runtime.desktop_owner, {
-          expectedClassName: TAURI_MAIN_WINDOW_CLASS,
-        });
-        const dragRect = shellSurface.titlebar.drag_rect;
-        const dragDelta = chooseDragDelta(shellSurface.titlebar.screen);
-        const dragCommandStart = (await firstCommands.snapshot()).sequence;
-        const drag = await dragExactOwnedWindow({
-          ...nativeOwner,
-          candidate: mainWindow,
-          clientOffsetX: Math.round(dragRect.left + Math.min(dragRect.width / 2, 160)),
-          clientOffsetY: Math.round(dragRect.top + dragRect.height / 2),
-          deltaX: dragDelta.x,
-          deltaY: dragDelta.y,
-        });
-        state.drag = structuredClone(drag);
-        if (!exactOwnedWindowDragObserved(drag)) {
-          throw productFailure("settings-titlebar-drag-did-not-move-window", "trusted native titlebar drag did not move the exact Desktop window", drag);
+        if (nativeTitlebarDrag) {
+          const nativeOwner = {
+            executionRoot: context.root,
+            ownerPath: runtime.desktop_owner_path,
+            expectedOwner: runtime.desktop_owner,
+          };
+          const nativeSnapshot = await snapshotOwnedTopLevelWindows(nativeOwner);
+          const mainWindow = selectSingleOwnedRootWindow(nativeSnapshot, runtime.desktop_owner, {
+            expectedClassName: TAURI_MAIN_WINDOW_CLASS,
+          });
+          const dragRect = shellSurface.titlebar.drag_rect;
+          const dragDelta = chooseDragDelta(shellSurface.titlebar.screen);
+          const dragCommandStart = (await firstCommands.snapshot()).sequence;
+          const drag = await dragExactOwnedWindow({
+            ...nativeOwner,
+            candidate: mainWindow,
+            clientOffsetX: Math.round(dragRect.left + Math.min(dragRect.width / 2, 160)),
+            clientOffsetY: Math.round(dragRect.top + dragRect.height / 2),
+            deltaX: dragDelta.x,
+            deltaY: dragDelta.y,
+          });
+          state.drag = structuredClone(drag);
+          if (!exactOwnedWindowDragObserved(drag)) {
+            throw productFailure("settings-titlebar-drag-did-not-move-window", "trusted native titlebar drag did not move the exact Desktop window", drag);
+          }
+          const dragCommand = await waitForCommands(
+            firstCommands,
+            dragCommandStart,
+            [{ command: "start_window_drag", args: {} }],
+            "exact titlebar drag command",
+          );
+          const afterDrag = await observeSettingsPreferencesSurface(firstCdp);
+          if (!shellReadyForSettingsDrag(afterDrag, provider.requestLedger)
+            || !sameValue(selectedNavigationIdentity(afterDrag.projection), initialIdentity)) {
+            throw productFailure("settings-titlebar-drag-state-drift", "titlebar drag changed the idle Desktop state", { before: shellSurface, after: afterDrag });
+          }
+          await sink.record("settings-titlebar-drag-acquired", {
+            input_kind: "windows_sendinput_exact_hwnd",
+            native_snapshot: nativeSnapshot,
+            candidate: mainWindow,
+            drag,
+            command: dragCommand,
+          }, { phase: "executing", owner: OWNER });
         }
-        const dragCommand = await waitForCommands(
-          firstCommands,
-          dragCommandStart,
-          [{ command: "start_window_drag", args: {} }],
-          "exact titlebar drag command",
-        );
-        const afterDrag = await observeSettingsPreferencesSurface(firstCdp);
-        if (!shellReadyForSettingsDrag(afterDrag, provider.requestLedger)
-          || !sameValue(selectedNavigationIdentity(afterDrag.projection), initialIdentity)) {
-          throw productFailure("settings-titlebar-drag-state-drift", "titlebar drag changed the idle Desktop state", { before: shellSurface, after: afterDrag });
-        }
-        await sink.record("settings-titlebar-drag-acquired", {
-          input_kind: "windows_sendinput_exact_hwnd",
-          native_snapshot: nativeSnapshot,
-          candidate: mainWindow,
-          drag,
-          command: dragCommand,
-        }, { phase: "executing", owner: OWNER });
 
         await trustedClick(firstInput, SHOW_SETTINGS);
         const providerOpened = await waitForProductStage({
@@ -915,7 +1049,9 @@ export function createSettingsPreferencesScenario() {
           "model.system_prompt": MAIN_SYSTEM_PROMPT_MARKER,
         });
         const providerCommandStart = (await firstCommands.snapshot()).sequence;
-        const systemPromptTyping = await trustedInsertText(
+        const systemPromptNavigation = await tabToSettingsControl(firstInput, firstCdp, MAIN_SYSTEM_PROMPT);
+        await sink.record("settings-system-prompt-navigation", systemPromptNavigation, { phase: "executing", owner: OWNER });
+        const systemPromptTyping = await trustedTypeFocusedSettingsText(
           firstInput,
           MAIN_SYSTEM_PROMPT,
           MAIN_SYSTEM_PROMPT_MARKER,
@@ -936,7 +1072,13 @@ export function createSettingsPreferencesScenario() {
           code: "settings-model-category-not-focused",
           message: "Settings category navigation did not focus the canonical model editor",
         });
-        const providerTyping = await trustedReplaceDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER);
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: PROVIDER_CONTEXT,
+          label: "model editor fully visible from category navigation before Tab",
+        });
+        const contextNavigation = await tabToSettingsControl(firstInput, firstCdp, PROVIDER_CONTEXT);
+        await sink.record("settings-context-navigation", contextNavigation, { phase: "executing", owner: OWNER });
+        const providerTyping = await trustedReplaceFocusedSettingsDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER);
         const providerDirty = await waitForProductStage({
           label: "provider context edit ready to save",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
@@ -950,6 +1092,30 @@ export function createSettingsPreferencesScenario() {
           code: "settings-provider-edit-not-ready",
           message: "trusted provider context edit did not produce a saveable offline draft",
         });
+        const dirtyNavigationValuesRetained = (surface) => surface?.projection?.overlay === "config"
+          && sameValue(surface.projection.config_target, providerTarget)
+          && fieldValue(surface.projection, "model.context_window") === PROVIDER_CONTEXT_BEFORE
+          && surface.settings.context.value === PROVIDER_CONTEXT_AFTER
+          && surface.settings.system_prompt.value === MAIN_SYSTEM_PROMPT_MARKER
+          && surface.settings.dirty_badge_visible === true && surface.settings.save.enabled === true;
+        await trustedClick(firstInput, SETTINGS_TOOLS);
+        const dirtyToolsVisible = await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: DOCLING_CHECKBOX, visualLocator: DOCLING_TOGGLE,
+          label: "dirty model edit to Tools exposes Docling without Tab scrolling",
+          predicate: dirtyNavigationValuesRetained,
+        });
+        const dirtyToolsScreenshot = await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "settings-dirty-category-tools-visible", owner: OWNER });
+        await trustedClick(firstInput, SETTINGS_MODEL);
+        const dirtyModelVisible = await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: PROVIDER_CONTEXT,
+          label: "return to Model exposes unchanged dirty context without Tab scrolling",
+          predicate: dirtyNavigationValuesRetained,
+        });
+        await sink.record("settings-dirty-category-navigation", {
+          tools: dirtyToolsVisible.value, model: dirtyModelVisible.value,
+          screenshot: dirtyToolsScreenshot,
+          observation: "category clicks alone exposed the complete compact editors; no Tab or editor input intervened",
+        }, { phase: "executing", owner: OWNER });
         await trustedClick(firstInput, SAVE_GLOBAL_CONFIG);
         const providerSaved = await waitForProductStage({
           label: "consolidated provider global save settled",
@@ -1005,8 +1171,14 @@ export function createSettingsPreferencesScenario() {
           code: "settings-docling-toggle-not-visible",
           message: "trusted Settings navigation did not expose the stable Docling toggle",
         });
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: DOCLING_CHECKBOX, visualLocator: DOCLING_TOGGLE,
+          label: "Docling editor fully visible from category navigation before Tab",
+        });
         const dirtyTarget = structuredClone(preferencesOpened.value.surface.projection.config_target);
-        await trustedClick(firstInput, DOCLING_TOGGLE);
+        const doclingDraftNavigation = await tabToSettingsControl(firstInput, firstCdp, DOCLING_CHECKBOX);
+        const doclingDraftToggle = await trustedToggleFocusedSettingsCheckbox(firstInput, DOCLING_CHECKBOX);
+        await sink.record("settings-docling-draft-toggle", { navigation: doclingDraftNavigation, toggle: doclingDraftToggle }, { phase: "executing", owner: OWNER });
         const dirty = await waitForProductStage({
           label: "dirty Docling Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
@@ -1077,8 +1249,14 @@ export function createSettingsPreferencesScenario() {
           code: "settings-docling-toggle-not-visible-after-reopen",
           message: "Docling toggle was not actionable after reopening Preferences",
         });
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: DOCLING_CHECKBOX, visualLocator: DOCLING_TOGGLE,
+          label: "reopened Docling editor fully visible before Tab",
+        });
         const globalSaveTarget = structuredClone(reopenedClean.value.surface.projection.config_target);
-        await trustedClick(firstInput, DOCLING_TOGGLE);
+        const doclingSaveNavigation = await tabToSettingsControl(firstInput, firstCdp, DOCLING_CHECKBOX);
+        const doclingSaveToggle = await trustedToggleFocusedSettingsCheckbox(firstInput, DOCLING_CHECKBOX);
+        await sink.record("settings-docling-save-toggle", { navigation: doclingSaveNavigation, toggle: doclingSaveToggle }, { phase: "executing", owner: OWNER });
         const saveable = await waitForProductStage({
           label: "saveable Docling Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
@@ -1165,6 +1343,7 @@ export function createSettingsPreferencesScenario() {
         const restoredCloseCommand = await waitForCommands(secondCommands, restoredCloseStart, [{ command: "close_overlay", args: {} }], "restored Preferences close command");
         state.acceptedLedger = structuredClone(provider.requestLedger);
         await sink.record("settings-preferences-restored", {
+          coverage,
           restart: restarted.restart,
           surface: restored.value.surface,
           stable_for_ms: SETTINGS_RESTORE_STABILITY_MS,
@@ -1209,6 +1388,7 @@ export function createSettingsPreferencesScenario() {
         input: resourcesPass && dragPass && quiescePass ? "pass" : "fail",
         resources: [{
           kind: "settings-preferences-verification",
+          coverage,
           generation_resources: state.generationResources,
           native_drag_release_verified: state.drag?.button_release_verified ?? null,
           native_cursor_restore_succeeded: state.drag?.cursor_restore_succeeded ?? null,

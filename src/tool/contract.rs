@@ -103,10 +103,14 @@ pub enum ToolName {
     ApplyPatch,
     Write,
     Shell,
+    ShellStart,
+    ShellStatus,
+    ShellStop,
     CurrentTime,
     Skill,
     DoclingConvert,
     McpCall,
+    WaitRemoteTasks,
     UpdatePlan,
     GetGoal,
     CreateGoal,
@@ -131,10 +135,14 @@ impl std::fmt::Display for ToolName {
             ToolName::ApplyPatch => "apply_patch",
             ToolName::Write => "write",
             ToolName::Shell => "shell",
+            ToolName::ShellStart => "shell_start",
+            ToolName::ShellStatus => "shell_status",
+            ToolName::ShellStop => "shell_stop",
             ToolName::CurrentTime => "current_time",
             ToolName::Skill => "skill",
             ToolName::DoclingConvert => "docling_convert",
             ToolName::McpCall => "mcp_call",
+            ToolName::WaitRemoteTasks => "wait_remote_tasks",
             ToolName::UpdatePlan => "update_plan",
             ToolName::GetGoal => "get_goal",
             ToolName::CreateGoal => "create_goal",
@@ -162,10 +170,14 @@ impl ToolName {
             "apply_patch" => Self::ApplyPatch,
             "write" => Self::Write,
             "shell" => Self::Shell,
+            "shell_start" => Self::ShellStart,
+            "shell_status" => Self::ShellStatus,
+            "shell_stop" => Self::ShellStop,
             "current_time" => Self::CurrentTime,
             "skill" => Self::Skill,
             "docling_convert" => Self::DoclingConvert,
             "mcp_call" => Self::McpCall,
+            "wait_remote_tasks" => Self::WaitRemoteTasks,
             "update_plan" => Self::UpdatePlan,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
@@ -185,6 +197,23 @@ impl ToolName {
 mod tests {
     use super::{PermissionRisk, ToolEffectClass, ToolName};
     use crate::workspace::AccessKind;
+
+    #[test]
+    fn wait_remote_tasks_has_one_canonical_tool_name() {
+        assert_eq!(ToolName::WaitRemoteTasks.to_string(), "wait_remote_tasks");
+        assert_eq!(
+            ToolName::parse("wait_remote_tasks"),
+            ToolName::WaitRemoteTasks
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolName::WaitRemoteTasks).unwrap(),
+            "\"wait_remote_tasks\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"wait_remote_tasks\"").unwrap(),
+            ToolName::WaitRemoteTasks
+        );
+    }
 
     #[test]
     fn update_plan_serializes_canonically() {

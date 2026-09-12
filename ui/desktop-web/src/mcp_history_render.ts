@@ -60,7 +60,8 @@ export function renderMcpHistoryOverlay(input?: McpHistoryPresentation, legacyPr
           </div>
         </section>
       </div>
-      <footer class="mcp-history-footer"><div><button id="mcp-history-settings" data-action="show-hub">受付・接続設定</button><button id="mcp-history-legacy" data-action="show-mcp-publish" ${legacyProfiles ? "" : "hidden"}>旧配信設定の管理</button></div><button id="mcp-history-close" data-action="close-overlay">閉じる</button></footer>
+      <p class="mcp-history-feedback" data-history-region="retirement" role="status">${legacyProfiles ? "旧手動配信は廃止されました。保存済みの設定・証明書・履歴は保持され、旧配信は再開しません。今後の受付は「受付・接続設定」で対象と権限を確認して設定してください。" : ""}</p>
+      <footer class="mcp-history-footer"><div><button id="mcp-history-settings" data-action="show-hub">受付・接続設定</button></div><button id="mcp-history-close" data-action="close-overlay">閉じる</button></footer>
     </section>
   </div>`;
 }

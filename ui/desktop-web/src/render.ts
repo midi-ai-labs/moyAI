@@ -12,8 +12,8 @@ import {
 import { icon } from "./icons.ts";
 import { renderMcpPeers } from "./mcp_peer.ts";
 import { renderHubOverlay } from "./hub_render.ts";
-import { renderPublishOverlay } from "./mcp_publish_render.ts";
 import { renderMcpHistoryOverlay } from "./mcp_history_render.ts";
+import { renderMcpActivityStrip } from "./mcp_activity.ts";
 import { hubExecutionRoute } from "./hub_state.ts";
 import { transcriptAnchors, turnPageLoadPending } from "./history_navigation.ts";
 import { renderMarkdown } from "./markdown.ts";
@@ -171,6 +171,7 @@ const INITIAL_SETUP_TOOL_PRIMARY_KEYS = new Set([
 export interface DesktopMarkupOptions {
   readonly backgroundInert: boolean;
   readonly taskActivityDelay: string;
+  readonly mcpActivityDelay?: string;
 }
 
 /** Pure Desktop markup composition from one explicit immutable render model. */
@@ -197,13 +198,13 @@ export function renderDesktopMarkup(
   const localModalObscuresOverlay = (localConfirmationPending && !settingsClosePending)
     || sideChatDeletePending;
   const markup = `
-    <div class="app-frame ${local.artifactPane.collapsed ? "artifact-collapsed" : ""} ${!local.artifactPane.collapsed && local.artifactPane.mode === "side_chat" ? "side-chat-open" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}; --task-activity-delay: ${options.taskActivityDelay}">
+    <div class="app-frame ${local.artifactPane.collapsed ? "artifact-collapsed" : ""} ${!local.artifactPane.collapsed && local.artifactPane.mode === "side_chat" ? "side-chat-open" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}; --task-activity-delay: ${options.taskActivityDelay}; --mcp-activity-delay: ${options.mcpActivityDelay ?? "0ms"}">
       ${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}
       <div class="shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>
         ${renderSidebar(state)}
         <main class="conversation">
           ${renderTopbar(state, local)}
-          ${renderRunStatusStrip(state)}
+          <div class="run-activity-stack">${renderRunStatusStrip(state)}</div>
           <section class="thread" id="thread" tabindex="-1" aria-label="会話履歴">
             ${renderThreadContent(state, local)}
           </section>
@@ -748,6 +749,15 @@ function renderInitialSetupTypedField(
   field: ConfigFieldProjection,
 ): string {
   const options: ConfigFieldRenderOptions = { initialSetup: true };
+  if (field.key === "model.system_prompt" || field.key === "side_chat.system_prompt") {
+    return renderConfigMultilineField(
+      state,
+      field.key,
+      field.key,
+      `組み込みの指示に追加します。空欄は追加なしです。${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内。`,
+      options,
+    );
+  }
   if (field.value_type === "boolean") {
     return renderConfigToggleField(state, field.key, field.key, options);
   }
@@ -1068,7 +1078,7 @@ export function renderTopbar(
                 : ""
             }
           </div>
-          ${state.status_code === "user_stopped" && hubRoute ? '<p class="hub-stop-explanation">Hubはモデルの終了を確認するまで実行枠を保持します。</p>' : ""}
+          ${state.status_code === "user_stopped" && hubRoute ? '<p class="hub-stop-explanation">Hubの実行枠は中継接続の終了時に解放されます。</p>' : ""}
         </div>
         <div class="chips">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
@@ -1086,7 +1096,8 @@ export function renderTopbar(
 
 export function renderRunStatusStrip(state: DesktopWebState): string {
   const activityBadge = renderTaskActivityBadge(state.task_activity_state);
-  if (!activityBadge) return "";
+  const mcpActivity = renderMcpActivityStrip(state.mcp_activity);
+  if (!activityBadge) return mcpActivity;
   const canCancel = runCanBeCancelled(state);
   const step = hubExecutionRoute(state.hub, "main")?.phaseLabel || state.run_active_step.trim() || state.status_message;
   const toolLine = state.latest_tool_summary.trim() || "ツール待機中";
@@ -1097,6 +1108,7 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
       <small>${escapeHtml(toolLine)}</small>
       ${canCancel ? `<button class="run-stop-button danger" data-action="cancel-run" title="Mainの実行を停止" aria-label="Mainを停止">${icon("square")}<span>Mainを停止</span></button>` : ""}
     </section>
+    ${mcpActivity}
   `;
 }
 
@@ -1235,14 +1247,15 @@ export function renderComposer(
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const sendTitle = composerSendTitle(state, state.draft_prompt);
   const hubRoute = hubExecutionRoute(state.hub, "main");
-  const enhanceTitle = hubRoute ? "Hub利用中は依頼の整形に対応していません"
-    : state.navigation_loading
+  const enhanceTitle = state.navigation_loading
     ? "画面の切り替え完了後にEnhanceできます"
     : state.busy
       ? "実行中はEnhanceできません"
       : state.draft_prompt.trim().length === 0
         ? "依頼文を入力してください"
-        : "Enhance";
+        : hubRoute && !state.enhance_enabled
+          ? "Hubの接続・モデル確認と、実行中の処理を確認してください"
+          : hubRoute ? "Mainで選択したHubモデルで依頼を整えます" : "Enhance";
   const controlsVisible = local.attachmentTrayOpen || state.image_input.trim().length > 0;
   const trayVisible = controlsVisible || state.attached_images.length > 0;
   const goalHint = goalSlashCommandHint(state.draft_prompt);
@@ -1492,9 +1505,9 @@ function renderActivityHistoryRoute(state: DesktopWebState): string {
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
   return `
     <div class="output-activity-history-route" aria-label="完全な実行履歴への導線">
-      <p>この一覧は要確認項目と直近分だけを表示しています。完全な詳細はcanonical会話履歴に残ります。</p>
+      <p>この一覧は要確認項目と直近分を表示しています。会話履歴の該当箇所を開いて詳細を確認できます。以前の履歴は会話欄から読み込めます。</p>
       <div>
-        ${target ? `<button type="button" data-action="jump-history-anchor" data-history-target="${escapeHtml(target.id)}">会話履歴の詳細へ</button>` : ""}
+        ${target ? `<button type="button" data-action="jump-history-anchor" data-history-target="${escapeHtml(target.id)}">会話履歴で詳細を開く</button>` : ""}
         <button type="button" data-action="export-transcript" ${exportDisabled ? 'disabled aria-disabled="true" title="実行完了後にMarkdown保存できます"' : 'title="canonical会話履歴をMarkdown保存"'}>履歴をMarkdown保存</button>
       </div>
     </div>
@@ -1544,7 +1557,7 @@ function renderSideChatPane(
         </div>
         <div class="side-chat-setup" data-focus-key="artifact-pane-content" role="region" aria-label="サイドチャット設定案内" tabindex="0">
           <p>SettingsのGlobal Settings › Side Chat Settingsで、新しく作成するサイドチャットの既定値を設定します。</p>
-          <p>開くと最新のglobal設定から専用snapshotを作成します。既存のサイドチャットは明示的に閉じるまで、そのモデルとプロンプト、履歴、下書きを維持します。</p>
+          <p>Hubを利用する場合は、Hub画面でSide Chatのモデルを確認・保存してから開けます。会話ごとのプロンプト、履歴、下書きは保持します。Hubで作成した会話を初めてDirectに切り替える場合は、会話を残してDirect設定を適用できます。</p>
           ${hubRoute ? '<p>Hub利用時も、先にサイドチャットの会話設定が必要です。モデル・プロンプト・会話容量の設定を用意してください。送信先はHubで割り当てます。</p>' : ""}
           ${side.deleting ? renderSideChatDeletePending() : ""}
           ${renderSideChatFeedback(side)}
@@ -1588,6 +1601,7 @@ function renderSideChatPane(
       </div>
       ${renderSideChatContextMetadata(side)}
       ${renderSideChatFeedback(side)}
+      ${side.direct_provider_capture ? `<div class="side-chat-route-notice" role="status"><p>${escapeHtml(side.direct_provider_capture.reason)}</p><p>${escapeHtml(side.direct_provider_capture.model || "モデル未設定")} · ${escapeHtml(side.direct_provider_capture.base_url || "接続先未設定")} · ${escapeHtml(side.direct_provider_capture.provider_profile)}</p><button data-action="capture-side-chat-direct-provider" ${side.direct_provider_capture.enabled && local.sideChat.operationsOpen && !local.sideChat.mutationPending ? "" : "disabled"}>この会話にDirect設定を適用</button> <button data-action="show-config">設定を開く</button></div>` : ""}
       ${hubRoute?.blockedReason ? `<p class="side-chat-route-notice" role="status">${escapeHtml(hubRoute.blockedReason)} <button data-action="show-hub">Hub設定を開く</button></p>` : ""}
       ${side.deleting ? renderSideChatDeletePending() : ""}
       <div class="side-chat-scroll" data-focus-key="artifact-pane-content" role="log" aria-label="サイドチャット履歴" tabindex="0">
@@ -1718,8 +1732,7 @@ export function renderOverlay(
   if (state.overlay === "provider") return renderProviderOverlay(state, local);
   if (state.overlay === "config") return renderConfigOverlay(state, local);
   if (state.overlay === "hub") return renderHubOverlay(local.hub, local.deviceNetwork);
-  if (state.overlay === "mcp_publish") return renderPublishOverlay(local.mcpPublish);
-  if (state.overlay === "mcp_history") return renderMcpHistoryOverlay(local.mcpHistory, Boolean(local.mcpPublish.projection?.profiles.length));
+  if (state.overlay === "mcp_history") return renderMcpHistoryOverlay(local.mcpHistory, Boolean(state.mcp_publish?.profiles.length));
   if (state.overlay === "session_settings") return renderSessionSettingsOverlay(state, local);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
   if (state.overlay === "prompt_review") return renderPromptReviewOverlay(state);
@@ -1919,7 +1932,6 @@ function renderProviderOverlay(
 ): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
   const providerFeedback = providerOverlayFeedback(state.provider_base_url, state.provider_status);
-  const providerStatus = providerStatusView(providerFeedback.status);
   const setupRequired = startupSetupRequired(state);
   return `
     <div class="modal-backdrop">
@@ -1979,26 +1991,20 @@ function renderProviderOverlay(
               .join("")}
           </div>
         </details>
-        <div id="provider-status" class="provider-status ${providerStatus.kind}" role="status" aria-live="polite">
-          <strong data-provider-status-title>${escapeHtml(providerStatus.title)}</strong>
-          <p data-provider-status-hint>${escapeHtml(providerStatus.hint)}</p>
-          <details data-details-key="provider-status-details" ${providerStatus.details.trim().length > 0 ? "" : "hidden"}>
-            <summary>技術詳細</summary>
-            <pre data-provider-status-details>${escapeHtml(providerStatus.details)}</pre>
-          </details>
-        </div>
+        ${renderProviderStatus(providerFeedback.status, "provider-status")}
       </section>
     </div>
   `;
 }
 
-function providerStatusView(typed: DesktopWebState["provider_status"]): { kind: string; title: string; hint: string; details: string } {
-  return {
-    kind: typed.kind === "success" ? "ok" : typed.kind,
-    title: typed.title,
-    hint: typed.hint,
-    details: typed.details,
-  };
+function renderProviderStatus(status: DesktopWebState["provider_status"], id: string): string {
+  return `<div id="${id}" class="provider-status ${status.kind === "success" ? "ok" : status.kind}" data-settings-passive="${id}" data-settings-preserve-focused-region role="status" aria-live="polite">
+    <strong data-provider-status-title>${escapeHtml(status.title)}</strong>
+    <p data-provider-status-hint>${escapeHtml(status.hint)}</p>
+    <details data-details-key="${id}-details" ${status.details.trim().length > 0 ? "" : "hidden"}>
+      <summary>技術詳細</summary><pre data-provider-status-details>${escapeHtml(status.details)}</pre>
+    </details>
+  </div>`;
 }
 
 function renderInitialSetupStatus(
@@ -2148,13 +2154,13 @@ function renderConfigOverlay(
                   <h3 id="settings-provider-title">メインチャット</h3>
                   <p id="main-provider-settings-help">メインチャットの共通の既定値です。いまの会話だけを変更する場合は「現在のチャット」を開いてください。</p>
                 </div>
-                <button data-action="show-provider" aria-controls="main-provider-model main-provider-model-catalog-status" title="Main Chatのモデル一覧と接続詳細を開く" ${state.config_draft.external_owner_mutation_open ? "" : "disabled"}>モデル読込・詳細設定</button>
+                <button data-action="load-provider-models" aria-controls="main-provider-model main-provider-model-catalog-status" title="入力中の接続先からモデル一覧を取得" ${state.config_draft.edit_enabled && !state.provider_loading ? "" : "disabled"}>モデル読込</button>
               </div>
               <div class="settings-grid-two">
                 ${renderConfigTextField(state, "model.base_url", "接続先URL", "url", "このURLと接続方式に対応するモデルを使います。")}
                 ${renderMainProviderModelField(state)}
               </div>
-              <p id="main-provider-model-catalog-status" class="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(mainProviderCatalogStatusText(state))}</p>
+              ${renderProviderStatus(mainProviderCatalogStatus(state), "main-provider-model-catalog-status")}
               <div class="settings-grid-two">
                 ${renderConfigEnumField(state, "model.provider_profile", "接続方式", PROVIDER_PROFILE_LABELS)}
                 ${renderConfigTextField(
@@ -2494,16 +2500,14 @@ function renderMainProviderModelField(state: DesktopViewState): string {
       label: state.provider_models[index] ?? id,
     }))
     : [];
-  if (currentModel.length > 0 && !options.some((option) => option.id === currentModel)) {
-    options.unshift({ id: currentModel, label: `${currentModel}（現在の設定）` });
-  }
+  const currentInCatalog = options.some((option) => option.id === currentModel);
   const controlsEnabled = state.config_draft.edit_enabled;
   const describedBy = configFieldDescriptionIds(found.field, ["main-provider-model-catalog-status"]);
   return `
     <div class="settings-field main-provider-model-field">
       <label for="main-provider-model">モデル</label>
       <select id="main-provider-model" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" aria-describedby="${describedBy}"${configFieldValidationAttribute(state, found.field)} ${controlsEnabled && options.length > 0 ? "" : "disabled"}>
-        ${currentModel.length === 0 ? '<option value="" selected disabled>モデルを選択してください</option>' : ""}
+        ${!currentInCatalog ? '<option value="" selected disabled>モデルを読み込んで選択してください</option>' : ""}
         ${options.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === currentModel ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
       </select>
       <details class="side-chat-manual-model main-provider-manual-model" data-details-key="main-provider-manual-model">
@@ -2511,6 +2515,7 @@ function renderMainProviderModelField(state: DesktopViewState): string {
         <label for="main-provider-model-manual">モデルID</label>
         <input id="main-provider-model-manual" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" value="${escapeHtml(found.field.value)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}"${configFieldValidationAttribute(state, found.field)} ${controlsEnabled ? "" : "disabled"} />
       </details>
+      <small data-settings-live-region="main-provider-manual-status">${!currentInCatalog && currentModel ? `候補に含まれない設定中のID: ${escapeHtml(currentModel)}。モデルを選択すると置き換わります。` : ""}</small>
       ${renderConfigFieldHelp(found.field)}
     </div>
   `;
@@ -2554,15 +2559,14 @@ function mainProviderCatalogMatchesSettings(state: DesktopViewState): boolean {
     && apiKeyEnv === state.provider_catalog_api_key_env;
 }
 
-function mainProviderCatalogStatusText(state: DesktopViewState): string {
-  if (state.provider_loading) return "Main Chatのモデル一覧を読み込んでいます…";
-  if (!state.config_draft.external_owner_mutation_open) {
-    return "未保存の変更を適用、保存、または破棄してからモデル一覧を更新できます。一覧にないモデルIDは直接入力できます。";
-  }
+function mainProviderCatalogStatus(state: DesktopViewState): DesktopWebState["provider_status"] {
+  if (state.provider_loading) return { kind: "loading", title: "Main Chatのモデル一覧を読み込んでいます…", hint: "", details: "" };
+  const status = providerOverlayFeedback(state.provider_base_url, state.provider_status).status;
+  if (status.kind === "error" || status.kind === "warning") return status;
   if (mainProviderCatalogMatchesSettings(state) && state.provider_model_ids.length > 0) {
-    return `${state.provider_model_ids.length}件のMain Chatモデルから選択できます。`;
+    return { kind: "success", title: `${state.provider_model_ids.length}件のMain Chatモデルから選択できます。`, hint: "", details: "" };
   }
-  return "「モデル読込・詳細設定」で現在のLLM URLとConnection typeに対応する候補を取得できます。一覧にないモデルIDは直接入力できます。";
+  return { kind: "idle", title: "「モデル読込」で入力中のURLと接続方式に対応する候補を取得できます。", hint: "保存済み・手入力のモデルIDは候補に追加しません。", details: "" };
 }
 
 function renderDoclingReadiness(
@@ -2733,6 +2737,7 @@ function renderWorkspaceOverlay(state: DesktopWebState): string {
         <h2 id="workspace-dialog-title">ワークスペース</h2>
         <label class="field-label" for="workspace-input">パス</label>
         <input id="workspace-input" value="${escapeHtml(state.workspace_input)}" />
+        <pre id="workspace-feedback" class="feedback" role="status">${escapeHtml(state.status_message)}</pre>
         <div class="split-actions">
           <button data-action="switch-workspace">切り替え</button>
           <button data-action="browse-workspace">参照</button>
@@ -2770,6 +2775,11 @@ function renderCommandPalette(
   renderModel: DesktopRenderModel,
 ): string {
   const actions = paletteActions(renderModel);
+  const query = state.local_search_text.trim().toLowerCase();
+  // Match the search projection by name/path while keeping each command's original
+  // index for the exact-target insertion command.
+  const commands = state.command_rows.map((row, index) => ({ row, index }))
+    .filter(({ row }) => !query || row.name.toLowerCase().includes(query) || row.path.toLowerCase().includes(query));
   return `
     <div class="modal-backdrop" data-action="close-overlay">
       <section class="modal command" data-modal role="dialog" aria-modal="true" aria-labelledby="command-palette-dialog-title" tabindex="-1">
@@ -2779,7 +2789,7 @@ function renderCommandPalette(
         <pre class="feedback">${escapeHtml(state.local_search_results_text)}</pre>
         <div class="select-list compact">
           ${
-            actions.length === 0
+            actions.length === 0 && commands.length === 0
               ? '<div class="empty">実行できるアクションはありません</div>'
               : actions
                   .map(
@@ -2790,9 +2800,9 @@ function renderCommandPalette(
                   )
                   .join("")
           }
-          ${state.command_rows
+          ${commands
             .map(
-              (row, index) => `
+              ({ row, index }) => `
                 <button data-action="insert-command" data-index="${index}" data-focus-key="palette-command:${escapeHtml(row.path)}">
                   <span>/${escapeHtml(row.name)}</span><small>${escapeHtml(row.path)}</small>
                 </button>`

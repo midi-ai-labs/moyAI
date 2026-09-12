@@ -17,7 +17,7 @@ const OWNER = "scenario:provider.restart";
 export const PROVIDER_RESTART_PROMPT = "return only main-ok";
 export const RESTORED_STATE_STABILITY_MS = 500;
 const SHOW_PROVIDER = Object.freeze({
-  selector: 'aside.sidebar button[data-action="show-provider"][title="LLM URL"]',
+  selector: 'header.topbar button[data-action="show-provider"]',
   identity: { tag: "BUTTON", action: "show-provider" },
 });
 const LOAD_MODELS = Object.freeze({

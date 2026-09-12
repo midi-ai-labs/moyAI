@@ -110,6 +110,10 @@ impl ManagedProcess {
         self.child.stdin.take()
     }
 
+    pub(crate) fn id(&self) -> u32 {
+        self.pid
+    }
+
     pub async fn wait(&mut self) -> Result<ExitStatus, io::Error> {
         self.child.wait().await
     }

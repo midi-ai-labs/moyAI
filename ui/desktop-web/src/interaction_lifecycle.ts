@@ -186,7 +186,12 @@ export function installInteractionEventGate<T>(options: InteractionEventGateOpti
       'input, textarea, select, summary, [contenteditable="true"]',
     );
     const action = target.closest<HTMLElement>("[data-action]");
-    const owner = directOwner ?? action;
+    // Dialog text can have a dismiss action on the enclosing backdrop. Capturing
+    // that ancestor retargets pointerup/click outside the dialog, closing it even
+    // when the user only selects text. Match the delegated click's modal boundary.
+    const modal = target.closest<HTMLElement>("[data-modal]");
+    const actionOwner = action && modal && !modal.contains(action) ? null : action;
+    const owner = directOwner ?? actionOwner;
     lifecycle.beginPointer(event.pointerId);
     if (owner && !owner.matches(":disabled")) {
       try {

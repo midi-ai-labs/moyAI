@@ -154,7 +154,8 @@ test("Initial Setup projects imported sensitive configured metadata without expo
   assert.equal(projectViewState(drifted, ui).config_fields[0]?.configured, false);
 });
 
-test("Initial Setup catalog evidence is invalidated by A to B to A config-draft edits", () => {
+for (const overlay of ["initial_setup", "config"] as const) {
+test(`${overlay} catalog evidence is invalidated by A to B to A config-draft edits`, () => {
   const providerFields: ConfigFieldProjection[] = [
     {
       key: "model.base_url",
@@ -219,7 +220,7 @@ test("Initial Setup catalog evidence is invalidated by A to B to A config-draft 
   ];
   const state = projection({
     confirmation_visible: false,
-    overlay: "initial_setup",
+    overlay,
     startup: {
       status: "requires_config",
       title: "Initial Setup",
@@ -301,6 +302,8 @@ test("Initial Setup catalog evidence is invalidated by A to B to A config-draft 
     "the old A catalog cannot become current evidence after an ABA draft edit",
   );
 });
+
+}
 
 function actionTestModel(
   state: DesktopViewState,
@@ -2149,6 +2152,9 @@ class FakeInteractionDocument extends FakeInteractionEventTarget {
 
 class FakeInteractionElement extends FakeInteractionEventTarget {
   disabled = false;
+  action = false;
+  modal = false;
+  readonly capturedPointers: number[] = [];
   projection = "revision-1";
   replacements = 0;
   readonly kind: "html" | "body" | "div" | "input";
@@ -2173,18 +2179,23 @@ class FakeInteractionElement extends FakeInteractionEventTarget {
   }
 
   closest<E extends Element = Element>(selectors: string): E | null {
-    if (selectors === ":disabled") {
-      return (this.disabled ? this : null) as unknown as E | null;
+    let candidate: FakeInteractionElement | null = this;
+    while (candidate) {
+      const matches = selectors === ":disabled" ? candidate.disabled
+        : selectors === "[data-action]" ? candidate.action
+        : selectors === "[data-modal]" ? candidate.modal
+        : candidate.kind === "input";
+      if (matches) return candidate as unknown as E;
+      candidate = candidate.parentElement;
     }
-    if (selectors === "[data-action]") return null;
-    return (this.kind === "input" ? this : null) as unknown as E | null;
+    return null;
   }
 
   matches(selectors: string): boolean {
     return selectors === ":disabled" && this.disabled;
   }
 
-  setPointerCapture(_pointerId: number): void {}
+  setPointerCapture(pointerId: number): void { this.capturedPointers.push(pointerId); }
 
   applyProjection(revision: number): void {
     this.projection = `revision-${revision}`;
@@ -2350,6 +2361,46 @@ function createFastCommandPaletteActivation(
     },
   };
 }
+
+test("selecting dialog text keeps pointer events inside the dialog while projections wait for release", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, lifecycle, queueProjection, applied }) => {
+    const backdrop = new FakeInteractionElement("div", appRoot);
+    backdrop.action = true;
+    const dialog = new FakeInteractionElement("div", backdrop);
+    dialog.modal = true;
+    const text = new FakeInteractionElement("div", dialog);
+
+    documentTarget.dispatch("pointerdown", { target: text, button: 0, pointerId: 21 });
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(backdrop.capturedPointers, [], "dialog text must not redirect pointerup/click to the dismiss action");
+    queueProjection(2);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("pointerup", { target: text, pointerId: 21 });
+    windowTarget.advanceBy(0);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
+test("dialog buttons, text inputs, and genuine backdrop clicks retain their pointer capture owner", () => {
+  withInteractionGate(({ documentTarget, appRoot }) => {
+    const backdrop = new FakeInteractionElement("div", appRoot);
+    backdrop.action = true;
+    const dialog = new FakeInteractionElement("div", backdrop);
+    dialog.modal = true;
+    const button = new FakeInteractionElement("div", dialog);
+    button.action = true;
+    const icon = new FakeInteractionElement("div", button);
+    const input = new FakeInteractionElement("input", dialog);
+    documentTarget.dispatch("pointerdown", { target: icon, button: 0, pointerId: 22 });
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 23 });
+    documentTarget.dispatch("pointerdown", { target: backdrop, button: 0, pointerId: 24 });
+    button.disabled = true;
+    documentTarget.dispatch("pointerdown", { target: icon, button: 0, pointerId: 25 });
+    assert.deepEqual(button.capturedPointers, [22]);
+    assert.deepEqual(input.capturedPointers, [23]);
+    assert.deepEqual(backdrop.capturedPointers, [24]);
+  });
+});
 
 test("pointer activation starts one command before the deferred release and settles a fast response once", async () => {
   await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
@@ -6073,4 +6124,43 @@ test("incomplete canonical turn is rendered as nonterminal evidence", () => {
   assert.match(html, /message work-summary work_summary_incomplete/);
   assert.match(html, /状態未確定/);
   assert.match(html, /<details[^>]+open>/);
+});
+
+test("Settings Main and Provider present typed model-load failure and recover on retry", () => {
+  const failure = { kind: "error" as const, title: "Providerモデル一覧を読み込めません", hint: "接続先を確認して再試行してください。", details: "connection refused <diagnostic>" };
+  for (const overlay of ["config", "provider"] as const) {
+    const current = projection({ overlay, provider_status: failure, provider_catalog_base_url: null, provider_catalog_profile: null });
+    const id = overlay === "config" ? "main-provider-model-catalog-status" : "provider-status";
+    const html = renderOverlay(current);
+    assert.match(html, new RegExp(`id="${id}" class="provider-status error"[^>]*data-settings-passive="${id}"[^>]*data-settings-preserve-focused-region`));
+    assert.match(html, /<strong data-provider-status-title>Providerモデル一覧を読み込めません<\/strong>/);
+    assert.match(html, /<p data-provider-status-hint>接続先を確認して再試行してください。<\/p>/);
+    assert.match(html, /<pre data-provider-status-details>connection refused &lt;diagnostic&gt;<\/pre>/);
+    assert.doesNotMatch(html, new RegExp(`data-details-key="${id}-details"[^>]*\\bopen`));
+    assert.doesNotMatch(renderOverlay({ ...current, provider_loading: true, provider_status: { kind: "loading", title: "読込中", hint: "", details: "" } }), /connection refused|Providerモデル一覧を読み込めません/);
+    assert.doesNotMatch(renderOverlay({ ...current, provider_status: { kind: "success", title: "読み込みました", hint: "選択できます", details: "" } }), /connection refused|Providerモデル一覧を読み込めません/);
+  }
+});
+
+test("a completed provider failure cannot describe a subsequently edited connection target", () => {
+  const initial = projection({ overlay: "provider", provider_catalog_base_url: null, provider_catalog_profile: null });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  beginProviderCatalogRequest(ui, initial);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({ ...initial, projection_revision: "2", provider_loading: true,
+    provider_status: { kind: "loading", title: "Loading", hint: "", details: "" } });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+  const failed = projection({ ...initial, projection_revision: "3", provider_loading: false,
+    provider_status: { kind: "error", title: "読み込めません", hint: "接続先を確認", details: "old connection failure" } });
+  reconcileUiDrafts(ui, loading, failed, null);
+  assert.equal(projectViewState(failed, ui).provider_status.kind, "error");
+  ui.drafts.provider.baseUrl = "http://127.0.0.1:45678";
+  ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
+  const changed = projectViewState(failed, ui);
+  assert.equal(changed.provider_status.kind, "warning");
+  assert.equal(changed.provider_status.title, "モデル一覧の対象が変更されました");
+  assert.doesNotMatch(changed.provider_status.details, /old connection failure/);
 });

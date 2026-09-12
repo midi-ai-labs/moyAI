@@ -53,6 +53,11 @@ impl ToolSpecPlan {
         if step.external_tools.mcp.is_none() {
             router.retain_tools(|name| name != "mcp_call");
         }
+        if !crate::tool::wait_remote_tasks::remote_wait_available(
+            step.turn.resolved_config().runtime_config(),
+        ) {
+            router.retain_tools(|name| name != "wait_remote_tasks");
+        }
 
         let model_visible_specs = router
             .specs()
@@ -150,6 +155,72 @@ mod tests {
 
     fn step(mode_kind: ModeKind) -> StepContext {
         step_for_config(mode_kind, &ResolvedConfig::default())
+    }
+
+    #[test]
+    fn remote_wait_is_advertised_and_routed_as_a_read_with_local_multi_agent_disabled() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        config.mcp.servers[0].id = "hub-device-peer".into();
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        for mode in [ModeKind::Default, ModeKind::Plan] {
+            let plan = ToolSpecPlan::build(&step_for_config(mode, &config), &registry);
+            assert!(plan.tool_names().contains(&"wait_remote_tasks".into()));
+            assert!(!plan.tool_names().contains(&"wait_agent".into()));
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+            assert_eq!(
+                plan.router()
+                    .validate_call_effect("wait_remote_tasks", &serde_json::json!({}), &config.mcp)
+                    .unwrap(),
+                ToolEffectClass::Read
+            );
+        }
+    }
+
+    #[test]
+    fn remote_wait_current_step_hides_stale_hub_registration() {
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        config.mcp.servers[0].id = "hub-device-peer".into();
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        config.mcp.servers[0].id = "manual-agent".into();
+        for enabled in [true, false] {
+            config.mcp.enabled = enabled;
+            let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Default, &config), &registry);
+            assert!(!plan.tool_names().contains(&"wait_remote_tasks".into()));
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+            assert!(
+                plan.router()
+                    .validate_call_effect("wait_remote_tasks", &serde_json::json!({}), &config.mcp)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_wait_stays_available_for_configured_hub_when_live_directory_is_empty() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        config.mcp.enabled = false;
+        config.mcp.servers.clear();
+        config.device_network.hub_url = "https://hub.example.test:9471".into();
+        let registry = ToolRegistry::core_agent().with_config_overlays(&config);
+        let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Default, &config), &registry);
+        assert!(plan.tool_names().contains(&"wait_remote_tasks".into()));
+        assert!(!plan.tool_names().contains(&"mcp_call".into()));
+        assert!(!plan.tool_names().contains(&"wait_agent".into()));
+        assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+        assert_eq!(
+            plan.router()
+                .validate_call_effect("wait_remote_tasks", &serde_json::json!({}), &config.mcp)
+                .unwrap(),
+            ToolEffectClass::Read
+        );
     }
 
     #[test]

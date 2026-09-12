@@ -172,7 +172,7 @@ function runningSample(overrides = {}) {
   return {
     surface: {
       projection: runningProjection(),
-      stop_button: { count: 1, visible: true, enabled: true },
+      stop_button: { count: 1, visible: true, enabled: true, aria_label: "Mainを停止", text: "Mainを停止" },
       task_activity: {
         total_count: 2,
         visible_count: 2,
@@ -416,6 +416,20 @@ test("in-flight oracle binds one held provider request to the projected and row 
   reducedMotion.surface.task_activity.run_strip.animation_name = "none";
   reducedMotion.surface.task_activity.selected_sidebar.animation_name = "none";
   assert.deepEqual(runStopInFlightFailures(reducedMotion), []);
+});
+
+test("Main Stop is acquired by action while its visible and accessible purpose are checked separately", () => {
+  for (const change of [
+    (v) => { v.surface.stop_button.aria_label = "実行停止"; },
+    (v) => { v.surface.stop_button.text = "MCPを停止"; },
+    (v) => { v.surface.stop_button.aria_label = null; },
+  ]) {
+    const sample = runningSample(); change(sample);
+    const failures = runStopInFlightFailures(sample);
+    assert.ok(failures.includes("main-stop-label-mismatch"));
+    assert.equal(failures.includes("semantic-stop-not-interactable"), false,
+      "a label regression must remain observable rather than hiding the acquired button");
+  }
 });
 
 test("terminal oracle requires durable UserStop Idle, one cancelled history, no replay, and no error overlay", () => {

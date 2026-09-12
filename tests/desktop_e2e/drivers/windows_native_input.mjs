@@ -538,6 +538,56 @@ export async function selectFileInOwnedNativeDialog(
   return result;
 }
 
+/** Exact native-control input. This does not establish physical keyboard or IME behavior. */
+export async function openFilePathInOwnedNativeDialog(
+  { executionRoot, ownerPath, candidate, selectedPath },
+  { invoke = invokeWindowsNativeInput } = {},
+) {
+  const fingerprint = requireInteractiveCandidate(candidate);
+  if (fingerprint.className !== "#32770") throw new TypeError("An exact native file dialog is required");
+  if (typeof selectedPath !== "string" || !path.win32.isAbsolute(selectedPath)
+    || selectedPath.includes("\0") || selectedPath.length >= 32768) {
+    throw new TypeError("selectedPath must be a bounded absolute Windows path without NUL bytes");
+  }
+  const result = await invoke("OpenFilePath", {
+    ExecutionRoot: executionRoot, OwnerPath: ownerPath, WindowHandle: fingerprint.hwnd,
+    ExpectedThreadId: fingerprint.threadId, ExpectedClassName: fingerprint.className, SelectedPath: selectedPath,
+  });
+  const hwnd = value => typeof value === "string" && /^0x[0-9a-f]+$/i.test(value) && BigInt(value) !== 0n
+    ? BigInt(value).toString(16) : null;
+  const dialogHwnd = hwnd(fingerprint.hwnd);
+  const identities = [
+    ["combo_ex", dialogHwnd, "ComboBoxEx32", 1148],
+    ["combo", hwnd(result?.controls?.combo_ex?.hwnd), "ComboBox", 1148],
+    ["edit", hwnd(result?.controls?.combo?.hwnd), "Edit", 1148],
+    ["button", dialogHwnd, "Button", 1],
+  ];
+  const exactControls = identities.every(([name, parent, className, id]) => {
+    const control = result?.controls?.[name];
+    return parent !== null && hwnd(control?.hwnd) !== null && hwnd(control?.hwnd) !== dialogHwnd && hwnd(control?.parent_hwnd) === parent
+      && hwnd(control?.root_hwnd) === dialogHwnd && control?.process_id === candidate.process_id
+      && control?.thread_id === candidate.thread_id && control?.class_name === className
+      && control?.control_id === id && control?.visible === true && control?.enabled === true;
+  }) && new Set(identities.map(([name]) => hwnd(result?.controls?.[name]?.hwnd))).size === identities.length;
+  if (!exactControls || hwnd(result?.window?.hwnd) !== dialogHwnd
+    || hwnd(result?.window?.root_hwnd) !== dialogHwnd || result?.window?.is_root !== true
+    || result?.window?.visible !== true || result?.window?.enabled !== true
+    || result?.window?.process_id !== candidate.process_id || result?.window?.thread_id !== candidate.thread_id
+    || result?.window?.class_name !== fingerprint.className
+    || path.win32.normalize(String(result?.selected_path ?? "")).toLowerCase() !== path.win32.normalize(selectedPath).toLowerCase()
+    || result?.delivery_verified !== true || result?.filename_set_count !== 1
+    || result?.filename_readback_verified !== true || result?.open_click_count !== 1
+    || result?.open_call_returned !== true || result?.retry_count !== 0
+    || result?.foreground_required !== false
+    || result?.cleanup_only !== false || result?.representative_input !== true
+    || result?.os_keyboard_ime_evidence !== false
+    || result?.input !== "native-control: WM_SETTEXT -> WM_GETTEXT exact readback -> BM_CLICK") {
+    throw new NativeInputError("native-dialog-path-open-invalid",
+      "Native file-dialog input did not satisfy exact control identity, readback, and single-delivery requirements", result);
+  }
+  return result;
+}
+
 export async function captureOwnedWindowPng(
   { executionRoot, ownerPath, candidate },
   { invoke = invokeWindowsNativeInput } = {},

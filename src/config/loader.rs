@@ -958,6 +958,87 @@ mod tests {
     }
 
     #[test]
+    fn shell_environment_defaults_survive_config_generation_and_load() {
+        let source = Utf8Path::new("shell-defaults.toml");
+        let defaults = ResolvedConfig::default().shell.env_allowlist;
+        for text in ["", "[shell]\nhide_windows = true\n"] {
+            let config = ConfigLoader::resolve_global_config_text_without_environment(source, text)
+                .expect("config without an explicit environment allowlist");
+            assert_eq!(config.shell.env_allowlist, defaults);
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
+        write_default_global_config_if_missing(&path).expect("generate current config");
+        let text = fs::read_to_string(&path).expect("read generated config");
+        let config = ConfigLoader::resolve_global_config_text_without_environment(&path, &text)
+            .expect("load generated config");
+        assert_eq!(config.shell.env_allowlist, defaults);
+        assert_eq!(
+            config
+                .shell
+                .env_allowlist
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("COMPUTERNAME")),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn explicit_shell_environment_allowlists_survive_load_and_export_unchanged() {
+        let source = Utf8Path::new("shell-explicit.toml");
+        let previous_windows_defaults = [
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "ComSpec",
+            "USERPROFILE",
+            "USERNAME",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "TMP",
+            "TEMP",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for allowlist in [
+            Vec::<String>::new(),
+            vec!["PATH".into(), "TASK_CUSTOM_ENV".into()],
+            previous_windows_defaults,
+        ] {
+            let mut patch = PartialResolvedConfig::default();
+            patch.shell = Some(PartialShellConfig {
+                env_allowlist: Some(allowlist.clone()),
+                ..PartialShellConfig::default()
+            });
+            let text = toml::to_string_pretty(&patch).expect("explicit shell config");
+            let loaded =
+                ConfigLoader::resolve_global_config_text_without_environment(source, &text)
+                    .expect("load explicit shell config");
+            assert_eq!(loaded.shell.env_allowlist, allowlist);
+
+            let exported = toml::to_string_pretty(&default_config_patch(&loaded))
+                .expect("export resolved shell config");
+            let imported =
+                ConfigLoader::resolve_global_config_text_without_environment(source, &exported)
+                    .expect("reload exported shell config");
+            assert_eq!(imported.shell.env_allowlist, allowlist);
+            assert!(
+                !imported
+                    .shell
+                    .env_allowlist
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("COMPUTERNAME"))
+            );
+        }
+    }
+
+    #[test]
     fn load_uses_global_config_and_ignores_workspace_config_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 path");

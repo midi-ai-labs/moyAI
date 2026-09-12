@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{ProviderDeadlines, ProviderProfile, ProviderTarget, ResolvedConfig};
 use crate::error::LlmError;
+use crate::hub::HubRequestPurpose;
 use crate::hub::client::PreparedRequest;
 use crate::llm::{ChatRequest, LlmClient, LlmEventSink, LlmResponseSummary};
 
@@ -29,11 +30,13 @@ struct TurnRouteInner {
     client: RegisteredHubClient,
     generation: u64,
     context: HubReviewContext,
+    purpose: HubRequestPurpose,
     turn_id: String,
     review: ReviewedHubSelection,
     catalog: HubCatalog,
     endpoint: String,
     cancel: CancellationToken,
+    connection_cancel: CancellationToken,
     finished: std::sync::atomic::AtomicBool,
     used_models: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
@@ -41,6 +44,19 @@ struct TurnRouteInner {
 #[derive(Clone)]
 pub struct HubTurnRoute {
     inner: Arc<TurnRouteInner>,
+}
+
+/// One worker owns this guard, even when descendants retain the route as a factory.
+pub(crate) struct HubExecutionGuard(HubTurnRoute);
+impl HubExecutionGuard {
+    pub(crate) async fn finish(&self) {
+        self.0.finish().await;
+    }
+}
+impl Drop for HubExecutionGuard {
+    fn drop(&mut self) {
+        self.0.inner.abandon();
+    }
 }
 
 impl std::fmt::Debug for HubConnection {
@@ -112,6 +128,23 @@ impl HubConnection {
         context: HubReviewContext,
         cancel: CancellationToken,
     ) -> Result<Option<HubTurnRoute>, HubError> {
+        self.begin_request(context, HubRequestPurpose::UserTurn, cancel)
+    }
+
+    pub(crate) fn begin_preparation(
+        &self,
+        context: HubReviewContext,
+        cancel: CancellationToken,
+    ) -> Result<Option<HubTurnRoute>, HubError> {
+        self.begin_request(context, HubRequestPurpose::Preparation, cancel)
+    }
+
+    fn begin_request(
+        &self,
+        context: HubReviewContext,
+        purpose: HubRequestPurpose,
+        cancel: CancellationToken,
+    ) -> Result<Option<HubTurnRoute>, HubError> {
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
         if context.mode(&state.settings) == HubRouteMode::Direct {
             return Ok(None);
@@ -146,11 +179,13 @@ impl HubConnection {
                 client,
                 generation: state.generation,
                 context,
+                purpose,
                 turn_id,
                 review,
                 catalog,
                 endpoint: state.settings.endpoint.clone(),
                 cancel,
+                connection_cancel: state.cancellation.clone(),
                 finished: std::sync::atomic::AtomicBool::new(false),
                 used_models: std::sync::Mutex::new(Default::default()),
             }),
@@ -159,6 +194,89 @@ impl HubConnection {
 }
 
 impl HubTurnRoute {
+    pub(crate) fn fork_delegated(&self, cancel: CancellationToken) -> Result<Self, HubError> {
+        if !self.inner.client.supports_delegated_execution {
+            return Err(HubError::DelegatedExecutionUnsupported);
+        }
+        let mut state = self
+            .inner
+            .connection
+            .inner
+            .state
+            .lock()
+            .expect("Hub state lock poisoned");
+        if state.generation != self.inner.generation
+            || state.status != HubConnectionStatus::Connected
+        {
+            return Err(HubError::ConnectionChanged);
+        }
+        self.inner
+            .review
+            .check_admission(state.catalog.as_ref().ok_or(HubError::Unavailable)?)?;
+        if state.confirmed[self.inner.context.index()].as_ref() != Some(&self.inner.review) {
+            return Err(HubError::ReviewRequired);
+        }
+        if state.delegated_active.len() >= 14 {
+            return Err(HubError::RouteBusy);
+        }
+        let turn_id = ulid::Ulid::new().to_string();
+        state.delegated_active.insert(
+            turn_id.clone(),
+            (
+                self.inner.context,
+                ActiveHubTurn {
+                    display: HubActiveTurnProjection {
+                        turn_id: turn_id.clone(),
+                        phase: "waiting",
+                        logical_model_id: None,
+                    },
+                    cancel: cancel.clone(),
+                },
+            ),
+        );
+        Ok(Self {
+            inner: Arc::new(TurnRouteInner {
+                connection: self.inner.connection.clone(),
+                client: self.inner.client.clone(),
+                generation: self.inner.generation,
+                context: self.inner.context,
+                purpose: HubRequestPurpose::Delegated,
+                turn_id,
+                review: self.inner.review.clone(),
+                catalog: self.inner.catalog.clone(),
+                endpoint: self.inner.endpoint.clone(),
+                cancel,
+                connection_cancel: state.cancellation.clone(),
+                finished: std::sync::atomic::AtomicBool::new(false),
+                used_models: std::sync::Mutex::new(Default::default()),
+            }),
+        })
+    }
+
+    pub(crate) fn execution_guard(&self) -> HubExecutionGuard {
+        HubExecutionGuard(self.clone())
+    }
+
+    /// The admitted root owner binds its control once, independently of each LLM request.
+    pub(crate) fn bind_run_control(&self, cancel: CancellationToken) {
+        if self.inner.purpose == HubRequestPurpose::Delegated {
+            return;
+        }
+        let mut state = self
+            .inner
+            .connection
+            .inner
+            .state
+            .lock()
+            .expect("Hub state lock poisoned");
+        if let Some(active) = state.active[self.inner.context.index()]
+            .as_mut()
+            .filter(|active| active.display.turn_id == self.inner.turn_id)
+        {
+            active.cancel = cancel;
+        }
+    }
+
     pub fn logical_model(&self) -> &str {
         &self.inner.review.selection.preferred_model_id
     }
@@ -208,7 +326,6 @@ impl HubTurnRoute {
             .iter()
             .all(|model| model.capabilities.contains("vision"));
         config.model.supports_reasoning = false;
-        config.multi_agent.enabled = false;
         config
     }
 
@@ -219,7 +336,14 @@ impl HubTurnRoute {
     }
 
     fn ensure_current(&self) -> Result<(), LlmError> {
-        if self.inner.cancel.is_cancelled() {
+        if self
+            .inner
+            .finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LlmError::Hub(HubError::TurnClosed));
+        }
+        if self.inner.cancel.is_cancelled() || self.inner.connection_cancel.is_cancelled() {
             return Err(LlmError::Message("Hub request cancelled".into()));
         }
         let state = self
@@ -232,7 +356,7 @@ impl HubTurnRoute {
         if state.generation != self.inner.generation
             || state.status != HubConnectionStatus::Connected
         {
-            return Err(LlmError::Message(HubError::ConnectionChanged.code().into()));
+            return Err(LlmError::Hub(HubError::ConnectionChanged));
         }
         self.inner
             .review
@@ -240,9 +364,9 @@ impl HubTurnRoute {
                 state
                     .catalog
                     .as_ref()
-                    .ok_or_else(|| LlmError::Message("Hub unavailable".into()))?,
+                    .ok_or_else(|| LlmError::Hub(HubError::Unavailable))?,
             )
-            .map_err(|error| LlmError::Message(error.code().into()))
+            .map_err(LlmError::Hub)
     }
 
     fn phase(&self, phase: &'static str, model: Option<String>) {
@@ -253,10 +377,17 @@ impl HubTurnRoute {
             .state
             .lock()
             .expect("Hub state lock poisoned");
-        if let Some(active) = state.active[self.inner.context.index()]
-            .as_mut()
-            .filter(|active| active.display.turn_id == self.inner.turn_id)
-        {
+        let active = if self.inner.purpose == HubRequestPurpose::Delegated {
+            state
+                .delegated_active
+                .get_mut(&self.inner.turn_id)
+                .map(|(_, active)| active)
+        } else {
+            state.active[self.inner.context.index()]
+                .as_mut()
+                .filter(|active| active.display.turn_id == self.inner.turn_id)
+        };
+        if let Some(active) = active {
             active.display.phase = phase;
             active.display.logical_model_id = model;
         }
@@ -276,93 +407,103 @@ impl HubTurnRoute {
     }
 
     pub async fn finish(&self) {
-        if self
-            .inner
-            .finished
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        let cancelled = self.inner.cancel.is_cancelled()
-            || self
-                .inner
-                .connection
-                .inner
-                .state
-                .lock()
-                .expect("Hub state lock poisoned")
-                .active[self.inner.context.index()]
-            .as_ref()
-            .filter(|active| active.display.turn_id == self.inner.turn_id)
-            .is_some_and(|active| active.cancel.is_cancelled());
-        self.inner
-            .client
-            .close_turn(self.inner.context, &self.inner.turn_id, cancelled)
-            .await;
-        self.clear_active();
-        if self.inner.connection.inner.store.is_none() {
-            self.inner.client.disconnect().await;
-        }
-    }
-
-    fn clear_active(&self) {
-        let mut state = self
-            .inner
-            .connection
-            .inner
-            .state
-            .lock()
-            .expect("Hub state lock poisoned");
-        if state.active[self.inner.context.index()]
-            .as_ref()
-            .is_some_and(|active| active.display.turn_id == self.inner.turn_id)
-        {
-            state.active[self.inner.context.index()] = None;
+        if let Some(close) = self.inner.dispatch_close(false) {
+            // Dropping this await detaches the owned cleanup task; it does not abort it.
+            let _ = close.await;
         }
     }
 }
 
 impl Drop for TurnRouteInner {
     fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+impl TurnRouteInner {
+    fn abandon(&self) {
+        let _ = self.dispatch_close(true);
+    }
+
+    fn dispatch_close(&self, force_cancel: bool) -> Option<tokio::task::JoinHandle<()>> {
         if self
             .finished
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return;
+            return None;
         }
-        self.cancel.cancel();
-        {
+        if force_cancel {
+            self.cancel.cancel();
+        }
+        // The exact local scope is released before any await, including on worker abort.
+        let cancelled = {
             let mut state = self
                 .connection
                 .inner
                 .state
                 .lock()
                 .expect("Hub state lock poisoned");
-            if state.active[self.context.index()]
+            let active = if self.purpose == HubRequestPurpose::Delegated {
+                state
+                    .delegated_active
+                    .remove(&self.turn_id)
+                    .map(|(_, active)| active)
+            } else if state.active[self.context.index()]
                 .as_ref()
                 .is_some_and(|active| active.display.turn_id == self.turn_id)
             {
-                if let Some(active) = &state.active[self.context.index()] {
+                state.active[self.context.index()].take()
+            } else {
+                None
+            };
+            if force_cancel {
+                if let Some(active) = &active {
                     active.cancel.cancel();
                 }
-                state.active[self.context.index()] = None;
             }
-        }
+            force_cancel
+                || self.cancel.is_cancelled()
+                || self.connection_cancel.is_cancelled()
+                || active.is_some_and(|active| active.cancel.is_cancelled())
+        };
         let client = self.client.clone();
+        let connection = self.connection.clone();
+        let generation = self.generation;
         let context = self.context;
         let turn_id = self.turn_id.clone();
-        let dedicated = self.connection.inner.store.is_none();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                client.close_turn(context, &turn_id, true).await;
-                if dedicated {
-                    client.disconnect().await;
+        let delegated = self.purpose == HubRequestPurpose::Delegated;
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        Some(runtime.spawn(async move {
+            client
+                .close_turn(context, &turn_id, cancelled, delegated)
+                .await;
+            // A received remote job uses a private registration. Descendants can outlive
+            // its root, so retire that registration only after the final exact scope.
+            let disconnect = if connection.inner.store.is_none() {
+                let mut state = connection
+                    .inner
+                    .state
+                    .lock()
+                    .expect("Hub state lock poisoned");
+                if state.generation == generation
+                    && state.active.iter().all(Option::is_none)
+                    && state.delegated_active.is_empty()
+                {
+                    state.status = HubConnectionStatus::Disconnected;
+                    state.cancellation.cancel();
+                    true
+                } else {
+                    false
                 }
-            });
-        }
+            } else {
+                false
+            };
+            if disconnect {
+                client.disconnect().await;
+            }
+        }))
     }
 }
-
 struct HubRoutedClient {
     route: HubTurnRoute,
 }
@@ -425,194 +566,183 @@ impl LlmClient for HubRoutedClient {
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
         self.route.ensure_current()?;
-        {
-            let mut state = self
+        let operation = async {
+            let request_id = ulid::Ulid::new().to_string();
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(request.provider_target().deadlines().request_timeout_ms);
+            self.route.phase("waiting", None);
+            let network_http = self
                 .route
                 .inner
                 .connection
                 .inner
-                .state
+                .network_http
                 .lock()
-                .expect("Hub state lock poisoned");
-            if state.generation != self.route.inner.generation {
-                return Err(LlmError::Message(HubError::ConnectionChanged.code().into()));
-            }
-            if let Some(active) = state.active[self.route.inner.context.index()]
-                .as_mut()
-                .filter(|active| active.display.turn_id == self.route.inner.turn_id)
-            {
-                // Main replaces its outer admission control with the admitted turn control.
-                // Disconnect and /turns/cancel must observe that current request owner.
-                active.cancel = cancel.clone();
-            }
-        }
-        let request_id = ulid::Ulid::new().to_string();
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(request.provider_target().deadlines().request_timeout_ms);
-        self.route.phase("waiting", None);
-        let network_http = self
-            .route
-            .inner
-            .connection
-            .inner
-            .network_http
-            .lock()
-            .unwrap()
-            .clone();
-        let (prepared, transport_lease) = loop {
-            self.route.ensure_current()?;
-            let lease = match &network_http {
-                Some(http) => Some(tokio::select! {
-                    _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
-                    _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Message("Hub allocation wait timed out".into())),
-                    lease = http.acquire() => lease,
-                }),
-                None => None,
-            };
-            let result = tokio::select! {
-                _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
-                _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Message("Hub allocation wait timed out".into())),
-                result = self.route.inner.client.prepare(self.route.inner.context, &self.route.inner.turn_id, &request_id, &self.route.inner.review) => result,
-            }.map_err(|error| { self.route.review_rejected(error); LlmError::Message(error.code().into()) })?;
-            match result {
-                PreparedRequest::Waiting {
-                    reason,
-                    retry_after_ms,
-                } => {
-                    // No permit exists while waiting. Let identity renewal run between polls.
-                    drop(lease);
-                    if !matches!(
-                        reason.as_str(),
-                        "busy"
-                            | "global_capacity"
-                            | "target_unavailable"
-                            | "maintenance"
-                            | "jit_pending"
-                    ) || !(100..=10_000).contains(&retry_after_ms)
-                    {
-                        return Err(LlmError::Message("Hub wait response is invalid".into()));
-                    }
-                    tokio::select! {
+                .unwrap()
+                .clone();
+            let (prepared, transport_lease) = loop {
+                self.route.ensure_current()?;
+                let lease = match &network_http {
+                    Some(http) => Some(tokio::select! {
                         _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
-                        _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Message("Hub allocation wait timed out".into())),
-                        _ = tokio::time::sleep(Duration::from_millis(retry_after_ms)) => {}
+                        _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Hub(HubError::Deadline)),
+                        lease = http.acquire() => lease,
+                    }),
+                    None => None,
+                };
+                let result = tokio::select! {
+                _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
+                _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Hub(HubError::Deadline)),
+                result = self.route.inner.client.prepare(self.route.inner.context, self.route.inner.purpose, &self.route.inner.turn_id, &request_id, &self.route.inner.review) => result,
+            }.map_err(|error| { self.route.review_rejected(error); LlmError::Hub(error) })?;
+                match result {
+                    PreparedRequest::Waiting {
+                        reason,
+                        retry_after_ms,
+                    } => {
+                        // No permit exists while waiting. Let identity renewal run between polls.
+                        drop(lease);
+                        if !matches!(
+                            reason.as_str(),
+                            "busy"
+                                | "global_capacity"
+                                | "target_unavailable"
+                                | "maintenance"
+                                | "jit_pending"
+                        ) || !(100..=10_000).contains(&retry_after_ms)
+                        {
+                            return Err(LlmError::Hub(HubError::InvalidCatalog));
+                        }
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
+                            _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Hub(HubError::Deadline)),
+                            _ = tokio::time::sleep(Duration::from_millis(retry_after_ms)) => {}
+                        }
                     }
+                    ready => break (ready, lease),
                 }
-                ready => break (ready, lease),
-            }
-        };
-        let PreparedRequest::Ready {
-            lease_id,
-            permit_id,
-            logical_model_id,
-            gateway_base_url,
-            request_token,
-            expires_at_ms,
-            provider_profile,
-            provider_api_mode,
-        } = prepared
-        else {
-            unreachable!()
-        };
-        if !crate::hub::valid_id(&lease_id)
-            || !crate::hub::valid_id(&permit_id)
-            || !self
-                .route
-                .inner
-                .review
-                .selection
-                .allowed_model_ids
-                .contains(&logical_model_id)
-            || (self.route.inner.review.selection.wait_policy
-                == crate::hub::HubWaitPolicy::WaitForPreferred
-                && self.route.inner.review.selection.preferred_model_id != logical_model_id)
-            || !self.route.inner.catalog.models.iter().any(|model| {
-                model.id == logical_model_id
-                    && self
-                        .route
-                        .inner
-                        .review
-                        .selection
-                        .required_capabilities
-                        .is_subset(&model.capabilities)
-            })
-            || decimal(&expires_at_ms).is_none()
-            || provider_profile != "openai_compatible_chat"
-            || provider_api_mode != "chat_completions"
-        {
-            return Err(LlmError::Message("Hub route response is invalid".into()));
-        }
-        let url = reqwest::Url::parse(&gateway_base_url)
-            .map_err(|_| LlmError::Message("Hub gateway target is invalid".into()))?;
-        let transport_allowed = if network_http.is_some() {
-            let hub = reqwest::Url::parse(self.route.hub_endpoint())
-                .map_err(|_| LlmError::Message("Hub gateway target is invalid".into()))?;
-            url.scheme() == "https" && url.host_str() == hub.host_str()
-        } else {
-            url.scheme() == "http"
-                && url.host_str().is_some_and(|host| {
-                    host.trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
+            };
+            let PreparedRequest::Ready {
+                lease_id,
+                permit_id,
+                logical_model_id,
+                gateway_base_url,
+                request_token,
+                expires_at_ms,
+                provider_profile,
+                provider_api_mode,
+            } = prepared
+            else {
+                unreachable!()
+            };
+            let gateway_profile = match (provider_profile.as_str(), provider_api_mode.as_str()) {
+                ("openai_compatible_chat", "chat_completions") => ProviderProfile::OpenAiCompatible,
+                ("openai_compatible_responses", "responses") => ProviderProfile::OpenAiResponses,
+                _ => return Err(LlmError::Hub(HubError::InvalidCatalog)),
+            };
+            if !crate::hub::valid_id(&lease_id)
+                || !crate::hub::valid_id(&permit_id)
+                || !self
+                    .route
+                    .inner
+                    .review
+                    .selection
+                    .allowed_model_ids
+                    .contains(&logical_model_id)
+                || (self.route.inner.review.selection.wait_policy
+                    == crate::hub::HubWaitPolicy::WaitForPreferred
+                    && self.route.inner.review.selection.preferred_model_id != logical_model_id)
+                || !self.route.inner.catalog.models.iter().any(|model| {
+                    model.id == logical_model_id
+                        && self
+                            .route
+                            .inner
+                            .review
+                            .selection
+                            .required_capabilities
+                            .is_subset(&model.capabilities)
                 })
-        };
-        if !transport_allowed
-            || url.path() != format!("/r/{permit_id}/v1")
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || !(32..=256).contains(&request_token.len())
-            || !request_token.bytes().all(|value| {
-                value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_' | b'.' | b'~')
-            })
-        {
-            return Err(LlmError::Message("Hub gateway target is invalid".into()));
-        }
-        self.route.ensure_current()?;
-        let deadlines = request.provider_target().deadlines();
-        let target = ProviderTarget::new(
-            &gateway_base_url,
-            &logical_model_id,
-            ProviderProfile::OpenAiCompatible,
-            ProviderDeadlines {
-                max_connect_retries: 0,
-                ..deadlines
-            },
-        )
-        .map_err(|_| LlmError::Message("Hub gateway target is invalid".into()))?;
-        request.route_through_hub(target, request_token);
-        self.route
-            .inner
-            .used_models
-            .lock()
-            .expect("Hub model identity lock poisoned")
-            .insert(logical_model_id.clone());
-        self.route.phase("running", Some(logical_model_id));
-        // The gateway is a separate process. It claims once, substitutes the real provider
-        // model, and owns upstream completion/settlement even after downstream Stop.
-        let mut trace = HubTraceSink {
-            inner: sink,
-            endpoint: self.route.hub_endpoint(),
-        };
-        let gateway = match &transport_lease {
-            Some(lease) => {
-                crate::llm::OpenAiCompatClient::new(None).with_runtime_http(lease.http.clone())
+                || decimal(&expires_at_ms).is_none()
+            {
+                return Err(LlmError::Hub(HubError::InvalidCatalog));
             }
-            None => crate::llm::OpenAiCompatClient::new(None),
-        };
-        let result = gateway
-            .stream_chat(request, cancel, &mut trace)
-            .await
-            .map_err(|error| {
-                if let Some(rejected) = gateway_review_rejection(&error) {
-                    self.route.review_rejected(rejected);
-                    LlmError::Message(rejected.code().into())
-                } else {
-                    public_route_error(error, self.route.hub_endpoint())
+            let url = reqwest::Url::parse(&gateway_base_url)
+                .map_err(|_| LlmError::Hub(HubError::InvalidCatalog))?;
+            let transport_allowed = if network_http.is_some() {
+                let hub = reqwest::Url::parse(self.route.hub_endpoint())
+                    .map_err(|_| LlmError::Hub(HubError::InvalidCatalog))?;
+                url.scheme() == "https" && url.host_str() == hub.host_str()
+            } else {
+                url.scheme() == "http"
+                    && url.host_str().is_some_and(|host| {
+                        host.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                    })
+            };
+            if !transport_allowed
+                || url.path() != format!("/r/{permit_id}/v1")
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !(32..=256).contains(&request_token.len())
+                || !request_token.bytes().all(|value| {
+                    value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_' | b'.' | b'~')
+                })
+            {
+                return Err(LlmError::Hub(HubError::InvalidCatalog));
+            }
+            self.route.ensure_current()?;
+            let deadlines = request.provider_target().deadlines();
+            let target = ProviderTarget::new(
+                &gateway_base_url,
+                &logical_model_id,
+                gateway_profile,
+                ProviderDeadlines {
+                    max_connect_retries: 0,
+                    ..deadlines
+                },
+            )
+            .map_err(|_| LlmError::Hub(HubError::InvalidCatalog))?;
+            request.route_through_hub(target, request_token);
+            self.route
+                .inner
+                .used_models
+                .lock()
+                .expect("Hub model identity lock poisoned")
+                .insert(logical_model_id.clone());
+            self.route.phase("running", Some(logical_model_id));
+            // The gateway is a separate process. It claims once, substitutes the real provider
+            // model, and owns upstream HTTP cleanup/settlement even after downstream Stop.
+            let mut trace = HubTraceSink {
+                inner: sink,
+                endpoint: self.route.hub_endpoint(),
+            };
+            let gateway = match &transport_lease {
+                Some(lease) => {
+                    crate::llm::OpenAiCompatClient::new(None).with_runtime_http(lease.http.clone())
                 }
-            });
-        drop(transport_lease);
-        result
+                None => crate::llm::OpenAiCompatClient::new(None),
+            };
+            let result = gateway
+                .stream_chat(request, cancel, &mut trace)
+                .await
+                .map_err(|error| {
+                    if let Some(rejected) = gateway_review_rejection(&error) {
+                        self.route.review_rejected(rejected);
+                        LlmError::Hub(rejected)
+                    } else {
+                        public_route_error(error, self.route.hub_endpoint())
+                    }
+                });
+            drop(transport_lease);
+            result
+        };
+        tokio::select! {
+            result = operation => result,
+            _ = self.route.inner.cancel.cancelled() => Err(LlmError::Message("Hub request cancelled".into())),
+            _ = self.route.inner.connection_cancel.cancelled() => Err(LlmError::Hub(HubError::ConnectionChanged)),
+        }
     }
 }

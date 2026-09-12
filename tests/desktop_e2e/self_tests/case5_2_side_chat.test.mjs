@@ -104,7 +104,7 @@ function surface({
       prompt_enabled: true,
       send_visible: paneVisible,
       send_enabled: paneVisible && ["idle", "completed"].includes(status) && draft !== "",
-      stop_visible: paneVisible,
+      stop_visible: paneVisible && status === "running",
       stop_enabled: paneVisible && status === "running",
       metadata: ["参照: このタスクの履歴", "履歴位置: 194"],
       truncated_count: contextTruncated ? 1 : 0,
@@ -299,6 +299,8 @@ test("Stage5 terminal rejects changed question, empty answer, control tokens, er
   ];
   const staleFinalControls = surface({ status: "completed", generation: "1", messages: messages() });
   staleFinalControls.side.stop_enabled = true;
+  const obsoleteStopControl = surface({ status: "completed", generation: "1", messages: messages() });
+  obsoleteStopControl.side.stop_visible = true;
   const variants = [
     ["unchanged generation", surface({ status: "completed", messages: messages() })],
     ["changed question", surface({ status: "completed", generation: "1", messages: messages(ANSWER, "other") })],
@@ -318,6 +320,7 @@ test("Stage5 terminal rejects changed question, empty answer, control tokens, er
       ],
     })],
     ["stale final controls", staleFinalControls],
+    ["obsolete visible Stop after completion", obsoleteStopControl],
     ["changed Main", surface({ status: "completed", generation: "1", messages: messages(), mainDraft: "replaced" })],
   ];
   for (const [name, candidate] of variants) {

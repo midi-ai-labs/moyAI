@@ -40,3 +40,42 @@ test("sender and receiver show canonical approval waiting while preserving task 
   assert.equal(stops.length, 2);
   for (const button of stops) assert.doesNotMatch(button[0], /disabled/);
 });
+
+test("long permission details have a keyboard-readable region separate from identity and decisions", () => {
+  const requester = "WinA <controller> " + "long device name ".repeat(12);
+  const target = "C:\\projects\\" + "long receiving folder\\".repeat(18);
+  const command = "Write-Output <reviewed>\n".repeat(100);
+  const summary = "Review this exact operation. ".repeat(80);
+  const state = {
+    confirmation_visible: true, confirmation_id: "permission-long", confirmation_text: "",
+    confirmation: { summary, details: [command], targets: [target], outside_workspace: true,
+      risks: ["outside target"], remote: { job_id: "job-long", profile_id: "receiver-long",
+        session_id: "session-long", requester_label: requester, target_label: target } },
+  } as unknown as DesktopWebState;
+  const html = renderConfirmation(state);
+  const header = html.match(/<header\b[^>]*>([\s\S]*?)<\/header>/)?.[1];
+  const review = html.match(/<section\b[^>]*role="region"[^>]*>([\s\S]*?)<\/section>/)?.[1];
+  const footer = html.match(/<footer\b[^>]*>([\s\S]*?)<\/footer>/)?.[1];
+  assert.ok(header, "permission identity must be outside the scrollable operation details");
+  assert.ok(review, "complete details must remain accessible in their own named region");
+  assert.ok(footer, "decision actions and status must remain outside the details region");
+  assert.match(header, /id="permission-title">受入タスクの操作を確認/);
+  assert.match(header, /依頼元/);
+  assert.match(header, /受入場所/);
+  assert.match(header, /WinA &lt;controller&gt;/);
+  assert.ok(header.includes(target));
+  assert.match(html, /<section[^>]*role="region"[^>]*aria-label="操作の詳細"[^>]*tabindex="0"/);
+  assert.match(review, /id="permission-summary"/);
+  assert.ok(review.includes(summary), "long operation summary is never truncated from the review");
+  assert.ok(review.includes(command.replaceAll("<", "&lt;").replaceAll(">", "&gt;")));
+  assert.ok(review.includes(target), "complete receiving path remains available when its header preview is narrow");
+  assert.match(review, /job-long/);
+  assert.match(review, /outside target/);
+  assert.doesNotMatch(review, /data-permission-action/);
+  assert.doesNotMatch(header, /Write-Output|data-permission-action/);
+  assert.match(footer, /role="status"[^>]*aria-live="polite"/);
+  assert.deepEqual([...footer.matchAll(/data-action="([^"]+)"/g)].map(match => match[1]),
+    ["deny-permission", "abort-permission", "approve-permission"]);
+  assert.match(footer, /data-action="deny-permission"[^>]*autofocus/);
+  assert.doesNotMatch(footer, /Write-Output/);
+});

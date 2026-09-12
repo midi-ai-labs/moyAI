@@ -29,6 +29,10 @@ export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
   "Use current_time exactly once with {}. After the tool result, reply only CHAT_TOOL_CONTINUATION_OK.";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE = "CHAT_TOOL_CONTINUATION_OK";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID = "call_chat_current_time";
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_KIND = "managed_shell_lifecycle";
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_RESPONSES = 2;
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID = "call_managed_shell_start";
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_OUTPUT_BYTES = 16 * 1024;
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND = "side_chat_quote";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAX_RESPONSES = 4;
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT =
@@ -226,6 +230,9 @@ function exactKeys(value, expected) {
 function agentInterruptScript(value) {
   if (value === null || value === undefined) return null;
   const expectedKeys = ["childMessage", "childTaskName", "kind", "rootResponseText"];
+  const childToolCalls = Object.hasOwn(value, "childToolCalls") ? value.childToolCalls : 0;
+  if (Object.hasOwn(value, "childToolCalls")) expectedKeys.push("childToolCalls");
+  if (!Number.isInteger(childToolCalls) || childToolCalls < 0 || childToolCalls > 64) throw new TypeError("childToolCalls must be an integer from 0 through 64");
   if (!exactKeys(value, expectedKeys) || value.kind !== SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND) {
     throw new TypeError("agent interrupt scripted provider mode must use its exact schema");
   }
@@ -237,6 +244,7 @@ function agentInterruptScript(value) {
     kind: value.kind,
     childTaskName,
     childMessage: nonEmptyString(value.childMessage, "script.childMessage"),
+    ...(childToolCalls ? { childToolCalls } : {}),
     rootResponseText: nonEmptyString(value.rootResponseText, "script.rootResponseText"),
   });
 }
@@ -338,12 +346,39 @@ function permissionTempEscalationScript(value) {
 }
 
 function chatToolContinuationScript(value) {
-  const expectedKeys = ["kind"];
+  const expectedKeys = Object.hasOwn(value ?? {}, "call") ? ["kind", "call"] : ["kind"];
   if (!exactKeys(value, expectedKeys)
     || value.kind !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     throw new TypeError("Chat tool continuation scripted provider mode must use its exact schema");
   }
-  return Object.freeze({ kind: value.kind });
+  if (!Object.hasOwn(value, "call")) return Object.freeze({ kind: value.kind });
+  const call = value.call;
+  if (!exactKeys(call, ["prompt", "name", "arguments", "outputMarker", "responseText"])
+    || !/^[a-z][a-z0-9_]{1,63}$/.test(call.name ?? "")
+    || call.arguments === null || typeof call.arguments !== "object" || Array.isArray(call.arguments)
+    || Buffer.byteLength(JSON.stringify(call.arguments), "utf8") > 32768) {
+    throw new TypeError("Chat continuation call requires one bounded tool and exact arguments");
+  }
+  return Object.freeze({ kind: value.kind, call: Object.freeze({
+    prompt: nonEmptyString(call.prompt, "call.prompt"), name: call.name,
+    arguments: structuredClone(call.arguments), outputMarker: nonEmptyString(call.outputMarker, "call.outputMarker"),
+    responseText: nonEmptyString(call.responseText, "call.responseText"),
+  }) });
+}
+
+function managedShellScript(value) {
+  if (!exactKeys(value, ["kind", "taskPrompt", "command", "workdir", "responseText", "timeoutMs"])
+    || value.kind !== SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+    throw new TypeError("managed shell scripted provider mode must use its exact schema");
+  }
+  return Object.freeze({
+    kind: value.kind,
+    taskPrompt: nonEmptyString(value.taskPrompt, "script.taskPrompt"),
+    command: nonEmptyString(value.command, "script.command"),
+    workdir: nonEmptyString(value.workdir, "script.workdir"),
+    responseText: nonEmptyString(value.responseText, "script.responseText"),
+    timeoutMs: positiveInteger(value.timeoutMs, "script.timeoutMs"),
+  });
 }
 
 function sideChatQuoteScript(value) {
@@ -416,6 +451,7 @@ function providerScript(value) {
   if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return chatToolContinuationScript(value);
   }
+  if (value?.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) return managedShellScript(value);
   if (value?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
     return sideChatQuoteScript(value);
   }
@@ -441,6 +477,9 @@ function scriptedResponseMaximum(script) {
   if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
   }
+  if (script?.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+    return SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_RESPONSES;
+  }
   if (script?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
     return SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAX_RESPONSES;
   }
@@ -450,19 +489,21 @@ function scriptedResponseMaximum(script) {
   if (script?.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
     return script.toolCallCount + 3;
   }
-  return SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES;
+  return SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES + (script?.childToolCalls ?? 0);
 }
 
 export function createAgentInterruptProviderScript({
   childTaskName = SCRIPTED_PROVIDER_AGENT_INTERRUPT_TASK_NAME,
   childMessage = SCRIPTED_PROVIDER_AGENT_INTERRUPT_MESSAGE,
   rootResponseText = SCRIPTED_PROVIDER_AGENT_INTERRUPT_ROOT_RESPONSE,
+  childToolCalls = 0,
 } = {}) {
   return agentInterruptScript({
     kind: SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND,
     childTaskName,
     childMessage,
     rootResponseText,
+    childToolCalls,
   });
 }
 
@@ -517,9 +558,19 @@ export function createPermissionTempEscalationProviderScript({
   });
 }
 
-export function createChatToolContinuationProviderScript() {
+export function createChatToolContinuationProviderScript({ call } = {}) {
   return chatToolContinuationScript({
     kind: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND,
+    ...(call === undefined ? {} : { call }),
+  });
+}
+
+export function createManagedShellProviderScript({
+  taskPrompt, command, workdir, responseText, timeoutMs = 60_000,
+} = {}) {
+  return managedShellScript({
+    kind: SCRIPTED_PROVIDER_MANAGED_SHELL_KIND,
+    taskPrompt, command, workdir, responseText, timeoutMs,
   });
 }
 
@@ -1203,7 +1254,13 @@ function currentTimeToolOutputShape(value) {
   return /^local: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\r?\nutc: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\r?\ntimezone: [+-]\d{2}:\d{2}\r?\nunix_ms: \d{10,16}$/.test(value);
 }
 
-function chatToolContinuationRole(body) {
+function chatToolContinuationRole(body, script) {
+  const expectedPrompt = script.call?.prompt ?? SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
+  const expectedName = script.call?.name ?? "current_time";
+  const expectedArguments = JSON.stringify(script.call?.arguments ?? {});
+  const outputMatches = value => script.call
+    ? typeof value === "string" && Buffer.byteLength(value, "utf8") <= CHAT_TOOL_OUTPUT_MAX_BYTES && value.includes(script.call.outputMarker)
+    : currentTimeToolOutputShape(value);
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const systemText = exactChatTextMessage(messages[0], "system");
   const userText = exactChatTextMessage(messages[1], "user");
@@ -1219,8 +1276,8 @@ function chatToolContinuationRole(body) {
     && toolCall.id === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID
     && toolCall.type === "function"
     && exactKeys(toolCall.function, ["arguments", "name"])
-    && toolCall.function.name === "current_time"
-    && toolCall.function.arguments === "{}";
+    && toolCall.function.name === expectedName
+    && toolCall.function.arguments === expectedArguments;
   const toolOutput = exactKeys(tool, ["content", "role", "tool_call_id"])
     && tool.role === "tool"
     && tool.tool_call_id === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID
@@ -1230,13 +1287,13 @@ function chatToolContinuationRole(body) {
   const initial = messages.length === 2
     && systemText !== null
     && systemText.trim().length > 0
-    && userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
+    && userText === expectedPrompt;
   const continuation = messages.length === 4
     && systemText !== null
     && systemText.trim().length > 0
-    && userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT
+    && userText === expectedPrompt
     && callMatches
-    && currentTimeToolOutputShape(toolOutput);
+    && outputMatches(toolOutput);
   return {
     role: initial ? "chat_tool_initial" : continuation ? "chat_continuation" : null,
     evidence: {
@@ -1245,13 +1302,13 @@ function chatToolContinuationRole(body) {
       system_content_sha256: systemText === null ? null : sha256(Buffer.from(systemText, "utf8")),
       system_content_non_empty: systemText !== null && systemText.trim().length > 0,
       user_content_sha256: userText === null ? null : sha256(Buffer.from(userText, "utf8")),
-      user_prompt_matches: userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT,
+      user_prompt_matches: userText === expectedPrompt,
       assistant_content_absent: assistant !== null
         && typeof assistant === "object"
         && !Array.isArray(assistant)
         && !Object.hasOwn(assistant, "content"),
       current_time_call_matches: callMatches,
-      tool_output_shape_matches: currentTimeToolOutputShape(toolOutput),
+      tool_output_shape_matches: outputMatches(toolOutput),
       tool_output_size_bytes: toolOutput === null ? null : Buffer.byteLength(toolOutput, "utf8"),
       tool_output_sha256: toolOutput === null ? null : sha256(Buffer.from(toolOutput, "utf8")),
     },
@@ -1263,7 +1320,7 @@ function chatToolContinuationRequestContract(body, modelId, script) {
   const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
     ? Object.keys(body).sort()
     : [];
-  const classified = chatToolContinuationRole(body);
+  const classified = chatToolContinuationRole(body, script);
   const tools = chatToolsContract(body?.tools);
   const generation = clientGenerationContract(body);
   const contract = {
@@ -1294,8 +1351,80 @@ function chatToolContinuationRequestContract(body, modelId, script) {
       && contract.n_one
       && contract.max_tokens_absent
       && contract.parallel_tool_calls_false
-      && contract.tools.pass,
+      && contract.tools.pass
+      && (!script.call || body.tools.some(tool => tool.function.name === script.call.name)),
   };
+}
+
+function managedShellArguments(script) {
+  return JSON.stringify({
+    command: script.command,
+    sandbox_permissions: "use_default",
+    timeout_ms: script.timeoutMs,
+    workdir: script.workdir,
+  });
+}
+
+function managedShellRequestContract(body, modelId, script) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const system = exactChatTextMessage(messages[0], "system");
+  const promptMatches = exactChatTextMessage(messages[1], "user") === script.taskPrompt;
+  const assistant = messages[2];
+  const call = Array.isArray(assistant?.tool_calls) && assistant.tool_calls.length === 1
+    ? assistant.tool_calls[0] : null;
+  const callMatches = exactKeys(assistant, ["role", "tool_calls"])
+    && assistant.role === "assistant"
+    && exactKeys(call, ["id", "type", "function"])
+    && call.id === SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID && call.type === "function"
+    && exactKeys(call.function, ["name", "arguments"])
+    && call.function.name === "shell_start"
+    && call.function.arguments === managedShellArguments(script);
+  const tool = messages[3];
+  const output = exactKeys(tool, ["role", "content", "tool_call_id"])
+    && tool.role === "tool" && tool.tool_call_id === SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID
+    && typeof tool.content === "string" ? tool.content : null;
+  let observed = null;
+  if (output !== null && Buffer.byteLength(output, "utf8") <= SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_OUTPUT_BYTES) {
+    try { observed = JSON.parse(output); } catch { /* Non-JSON failures are not an observed start. */ }
+  }
+  const observedStart = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(observed?.process_id ?? "")
+    && ["starting", "running"].includes(observed?.state)
+    && observed?.timeout_ms === script.timeoutMs && observed?.readiness === "not_checked"
+    && observed?.success === null && observed?.result === null && observed?.error === null
+    && observed?.output_available === false;
+  const role = system?.trim() && promptMatches
+    ? messages.length === 2 ? "managed_shell_initial"
+      : messages.length === 4 && callMatches && observedStart ? "managed_shell_continuation" : null
+    : null;
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  const starts = tools.filter((entry) => entry?.type === "function"
+    && entry.function?.name === "shell_start");
+  const schema = starts[0]?.function?.parameters;
+  const toolsMatch = starts.length === 1 && tools.every((entry) => entry?.type === "function"
+    && typeof entry.function?.name === "string")
+    && new Set(tools.map((entry) => entry.function.name)).size === tools.length
+    && schema?.type === "object" && Array.isArray(schema?.required) && schema.required.includes("command")
+    && schema?.properties?.command?.type === "string"
+    && schema?.properties?.workdir?.type === "string"
+    && schema?.properties?.timeout_ms?.type === "integer"
+    && Array.isArray(schema?.properties?.sandbox_permissions?.enum)
+    && schema.properties.sandbox_permissions.enum.includes("use_default");
+  const contract = {
+    script_kind: script.kind, role,
+    model_matches: body?.model === modelId, stream_true: body?.stream === true,
+    include_usage_true: body?.stream_options?.include_usage === true,
+    n_one: body?.n === 1, parallel_tool_calls_false: body?.parallel_tool_calls === false,
+    tools: { shell_start_schema_matches: toolsMatch },
+    role_evidence: {
+      user_prompt_matches: promptMatches, shell_start_call_matches: callMatches,
+      observed_start_matches: observedStart,
+      tool_output_sha256: output === null ? null : sha256(output),
+      process_id: observedStart ? observed.process_id : null,
+      state: observedStart ? observed.state : null,
+    },
+  };
+  return { ...contract, pass: role !== null && contract.model_matches && contract.stream_true
+    && contract.include_usage_true && contract.n_one && contract.parallel_tool_calls_false && toolsMatch };
 }
 
 function agentInterruptExpected(script) {
@@ -1321,7 +1450,18 @@ function agentInterruptRole(body, expectedPrompt, script) {
   const call = input[1];
   const output = input[2];
   const rootInitial = input.length === 1 && firstInputText === expectedPrompt;
-  const child = input.length === 1 && firstInputText === expected.childEnvelope;
+  const childCount = (input.length - 1) / 2;
+  const childLimit = script.childToolCalls ?? 0;
+  const child = firstInputText === expected.childEnvelope && Number.isInteger(childCount)
+    && childCount >= 0 && childCount <= childLimit
+    && Array.from({ length: childCount }, (_, index) => {
+      const call = input[index * 2 + 1], output = input[index * 2 + 2];
+      const callId = "call_agent_history_" + index;
+      return exactKeys(call, ["type", "call_id", "name", "arguments"])
+        && call.type === "function_call" && call.call_id === callId && call.name === "current_time" && call.arguments === "{}"
+        && exactKeys(output, ["type", "call_id", "output"]) && output.type === "function_call_output"
+        && output.call_id === callId && currentTimeToolOutputShape(output.output);
+    }).every(Boolean);
   const rootContinuation = input.length === 3
     && firstInputText === expectedPrompt
     && exactKeys(call, ["arguments", "call_id", "name", "type"])
@@ -1336,7 +1476,7 @@ function agentInterruptRole(body, expectedPrompt, script) {
   const role = rootInitial
     ? "root_initial"
     : child
-      ? "child_held"
+      ? (childCount === childLimit ? "child_held" : `child_tool_${childCount}`)
       : rootContinuation
         ? "root_continuation"
         : null;
@@ -1350,6 +1490,7 @@ function agentInterruptRole(body, expectedPrompt, script) {
         : sha256(Buffer.from(firstInputText, "utf8")),
       expected_prompt_matches: firstInputText === expectedPrompt,
       child_envelope_matches: firstInputText === expected.childEnvelope,
+      child_completed_tool_count: child ? childCount : null,
       spawn_call_matches: rootContinuation,
     },
   };
@@ -1369,6 +1510,7 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, script) {
     script_kind: script.kind,
     role: classified.role,
     role_evidence: classified.evidence,
+    child_tool_present: !(script.childToolCalls > 0) || body.tools?.filter(tool => tool?.name === "current_time").length === 1,
     model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
     instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
     top_level_keys: topLevelKeys,
@@ -1386,6 +1528,7 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, script) {
     ...contract,
     pass: contract.client_generation_fields_absent
       && contract.role !== null
+      && contract.child_tool_present
       && contract.model_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
@@ -3180,6 +3323,19 @@ function chatCompletionSse(chunks) {
   return chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
 }
 
+function managedShellSse(modelId, script, initial) {
+  const common = { id: initial ? "chatcmpl_managed_shell_start" : "chatcmpl_managed_shell_done",
+    object: "chat.completion.chunk", model: modelId };
+  const delta = initial ? { tool_calls: [{
+    index: 0, id: SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID, type: "function",
+    function: { name: "shell_start", arguments: managedShellArguments(script) },
+  }] } : { content: script.responseText };
+  return chatCompletionSse([
+    { ...common, choices: [{ index: 0, delta, finish_reason: initial ? "tool_calls" : "stop" }] },
+    { ...common, choices: [], usage: { prompt_tokens: 24, completion_tokens: 8, total_tokens: 32 } },
+  ]);
+}
+
 function permissionRestartGuardianChatTextSse(modelId, id, text, {
   promptTokens,
   completionTokens,
@@ -3242,7 +3398,7 @@ function permissionRestartGuardianChatShellSse(modelId, script) {
   ]);
 }
 
-function chatToolContinuationCallSse(modelId) {
+function chatToolContinuationCallSse(modelId, script) {
   const common = {
     id: "chatcmpl_chat_tool_initial",
     object: "chat.completion.chunk",
@@ -3267,7 +3423,7 @@ function chatToolContinuationCallSse(modelId) {
             index: 0,
             id: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID,
             type: "function",
-            function: { name: "current_time", arguments: "{}" },
+            function: { name: script.call?.name ?? "current_time", arguments: JSON.stringify(script.call?.arguments ?? {}) },
           }],
         },
         finish_reason: "tool_calls",
@@ -3278,10 +3434,10 @@ function chatToolContinuationCallSse(modelId) {
       choices: [],
       usage: { prompt_tokens: 8, completion_tokens: 6, total_tokens: 14 },
     },
-  ]);
+  ]) + "data: [DONE]\n\n";
 }
 
-function chatToolContinuationFinalSse(modelId) {
+function chatToolContinuationFinalSse(modelId, script) {
   return chatCompletionSse([
     {
       id: "chatcmpl_chat_continuation",
@@ -3289,7 +3445,7 @@ function chatToolContinuationFinalSse(modelId) {
       model: modelId,
       choices: [{
         index: 0,
-        delta: { content: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE },
+        delta: { content: script.call?.responseText ?? SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE },
         finish_reason: "stop",
       }],
     },
@@ -3300,7 +3456,16 @@ function chatToolContinuationFinalSse(modelId) {
       choices: [],
       usage: { prompt_tokens: 16, completion_tokens: 4, total_tokens: 20 },
     },
-  ]);
+  ]) + "data: [DONE]\n\n";
+}
+
+function agentInterruptChildToolSse(index) {
+  const item = { type: "function_call", id: "fc_agent_history_" + index,
+    call_id: "call_agent_history_" + index, name: "current_time", arguments: "{}" };
+  return [{ type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_agent_history_" + index, output: [item],
+      usage: { input_tokens: 8, output_tokens: 6, total_tokens: 14, output_tokens_details: { reasoning_tokens: 0 } } } }]
+    .map(event => "data: " + JSON.stringify(event) + "\n\n").join("");
 }
 
 function agentInterruptSpawnSse(script) {
@@ -3607,8 +3772,9 @@ function parsedTarget(request) {
   };
 }
 
-function routeFor(target) {
+function routeFor(target, mcpPeerEnabled = false) {
   if (!target.exact_target) return "unknown";
+  if (mcpPeerEnabled && target.pathname === "/mcp") return "mcp_peer";
   if (target.pathname === "/v1/models") return "models";
   if (target.pathname === "/api/v1/models") return "lm_studio_models";
   if (target.pathname === "/v1/responses") return "responses";
@@ -3710,6 +3876,7 @@ export class ScriptedProvider {
   #closePromise = null;
   #closeObservation = null;
   #doclingReadinessStatus;
+  #mcpPeerToken;
   #doclingReadinessRequestCount = 0;
   #doclingReadinessReleased = false;
   #doclingReadinessReleasedByCleanup = false;
@@ -3726,6 +3893,7 @@ export class ScriptedProvider {
     responseBehavior: configuredResponseBehavior = "complete",
     responsePacing: configuredResponsePacing = null,
     doclingReadinessStatus = null,
+    mcpPeerToken = null,
     turns = null,
     orderedConversation = false,
     script = null,
@@ -3745,6 +3913,10 @@ export class ScriptedProvider {
     this.responseBehavior = responseBehavior(configuredResponseBehavior);
     this.responsePacing = responsePacing(configuredResponsePacing);
     this.#doclingReadinessStatus = optionalHttpStatus(doclingReadinessStatus, "doclingReadinessStatus");
+    if (mcpPeerToken !== null && (typeof mcpPeerToken !== "string" || !/^[A-Za-z0-9._~-]{32,256}$/.test(mcpPeerToken))) {
+      throw new TypeError("mcpPeerToken requires 32 through 256 ASCII token characters");
+    }
+    this.#mcpPeerToken = mcpPeerToken;
     this.#doclingReadinessRelease = new Promise((resolve) => { this.#releaseDoclingReadiness = resolve; });
     this.script = providerScript(script);
     if (this.responsePacing !== null && this.responseBehavior !== "complete") {
@@ -3890,6 +4062,7 @@ export class ScriptedProvider {
         : scriptedResponseMaximum(this.script),
       scripted_response_roles: [...this.#acceptedRoles],
       docling_readiness_configured: this.#doclingReadinessStatus !== null,
+      mcp_peer_configured: this.#mcpPeerToken !== null,
       docling_readiness_status: this.#doclingReadinessStatus,
       docling_readiness_request_count: this.#doclingReadinessRequestCount,
       docling_readiness_released: this.#doclingReadinessReleased,
@@ -4025,7 +4198,7 @@ export class ScriptedProvider {
 
   async #handleRequest(request, response) {
     const target = parsedTarget(request);
-    const route = routeFor(target);
+    const route = routeFor(target, this.#mcpPeerToken !== null);
     const row = {
       schema_version: "desktop-e2e.scripted-provider-request.v1",
       sequence: this.#ledger.length + 1,
@@ -4052,6 +4225,7 @@ export class ScriptedProvider {
     }
     const chatCompletionsScriptMode = this.script?.kind
       === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
+      || this.script?.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND
       || (this.script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
         && this.script.apiMode === "chat_completions");
     if ((route === "chat_completions" && !chatCompletionsScriptMode)
@@ -4150,6 +4324,26 @@ export class ScriptedProvider {
       fixedError(response, 400, "invalid_json");
       return;
     }
+    if (route === "mcp_peer") {
+      const rpc = decoded.value;
+      const pass = rpc?.jsonrpc === "2.0" && Number.isSafeInteger(rpc.id) && rpc.method === "tools/list"
+        && rpc.params !== null && typeof rpc.params === "object" && !Array.isArray(rpc.params) && Object.keys(rpc.params).length === 0;
+      const authorized = request.headers.authorization === `Bearer ${this.#mcpPeerToken}`;
+      row.contract = { pass, rpc_method: typeof rpc?.method === "string" ? rpc.method : null, authorized };
+      row.response_phase = "completed";
+      row.response_status = !authorized ? 401 : pass ? 200 : 422;
+      if (!authorized || !pass) {
+        fixedError(response, row.response_status, authorized ? "unsupported_mcp_fixture_request" : "unauthorized");
+      } else {
+        writeResponse(response, 200, "application/json; charset=utf-8", {
+          jsonrpc: "2.0", id: rpc.id,
+          result: { tools: ["delegate_task", "task_status", "task_artifacts", "cancel_task"].map(name => ({
+            name, description: "Isolated GUI connection fixture; execution is not accepted.", inputSchema: { type: "object", properties: {} },
+          })) },
+        });
+      }
+      return;
+    }
     if (this.script !== null) {
       this.#scriptedResponsesRequestCount += 1;
       if (this.script.kind === SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND) {
@@ -4172,6 +4366,8 @@ export class ScriptedProvider {
           this.modelId,
           this.script,
         );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+        row.contract = managedShellRequestContract(decoded.value, this.modelId, this.script);
       } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
         row.contract = sideChatQuoteRequestContract(
           decoded.value,
@@ -4222,6 +4418,8 @@ export class ScriptedProvider {
         await this.#handleToolErrorRecoveryResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
         await this.#handleChatToolContinuationResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+        this.#handleManagedShellResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
         await this.#handleSideChatQuoteResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
@@ -4316,6 +4514,12 @@ export class ScriptedProvider {
       return;
     }
 
+    const childIndex = role.startsWith("child_tool_") ? Number(role.slice("child_tool_".length))
+      : role === "child_held" ? (this.script.childToolCalls ?? 0) : 0;
+    if (childIndex > 0 && !this.#acceptedRoles.has("child_tool_" + (childIndex - 1))) {
+      row.response_phase = "rejected"; row.response_status = 409;
+      fixedError(response, 409, "child_tool_prerequisite_missing"); return;
+    }
     this.#acceptedRoles.add(role);
     this.#acceptedResponseCount += 1;
     if (role === "child_held") {
@@ -4328,7 +4532,9 @@ export class ScriptedProvider {
     this.#successfulResponseCount += 1;
     row.response_phase = "completed";
     row.response_status = 200;
-    const payload = role === "root_initial"
+    const payload = role.startsWith("child_tool_")
+      ? agentInterruptChildToolSse(childIndex)
+      : role === "root_initial"
       ? agentInterruptSpawnSse(this.script)
       : responsesSse(this.script.rootResponseText, {
         itemId: "msg_agent_interrupt_root_done",
@@ -4508,9 +4714,31 @@ export class ScriptedProvider {
     row.response_phase = "completed";
     row.response_status = 200;
     const payload = role === "chat_tool_initial"
-      ? chatToolContinuationCallSse(this.modelId)
-      : chatToolContinuationFinalSse(this.modelId);
+      ? chatToolContinuationCallSse(this.modelId, this.script)
+      : chatToolContinuationFinalSse(this.modelId, this.script);
     writeResponse(response, 200, "text/event-stream", payload);
+  }
+
+  #handleManagedShellResponse(response, row) {
+    const role = row.contract.role;
+    const error = !row.contract.pass ? "request_contract_mismatch"
+      : this.#acceptedRoles.has(role) ? "script_role_already_consumed"
+        : role === "managed_shell_continuation" && !this.#acceptedRoles.has("managed_shell_initial")
+          ? "script_role_prerequisite_missing" : null;
+    if (error !== null) {
+      row.response_phase = "rejected";
+      row.response_status = row.contract.pass ? 409 : 422;
+      fixedError(response, row.response_status, error);
+      return;
+    }
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    writeResponse(response, 200, "text/event-stream", managedShellSse(
+      this.modelId, this.script, role === "managed_shell_initial",
+    ));
   }
 
   async #handleResponsesCompactionResponse(response, row) {

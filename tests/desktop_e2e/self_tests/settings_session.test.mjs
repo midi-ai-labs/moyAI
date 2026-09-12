@@ -128,6 +128,7 @@ function surface({
       api_key_env: panelField(SESSION_PROVIDER_API_KEY_ENV),
       access_mode: panelField("default"),
       context_window: panelField(contextWindow),
+      context_inherited_badge: { count: 1, visible: inherited },
       max_output_tokens: { count: 0, visible: false, enabled: false, value: null, options: [] },
       apply: { count: 1, visible: true, enabled: dirty },
       discard: { count: dirty ? 1 : 0, visible: dirty, enabled: dirty },
@@ -488,6 +489,17 @@ test("Session Settings panel predicate binds root target, local badge, fields, a
   }), false, "Connection type requires the complete four-profile selector");
 });
 
+test("Session Settings rejects a visible inheritance badge for an applied session override", () => {
+  const overridden = surface({ contextWindow: SESSION_CONTEXT_AFTER, inherited: false });
+  const expected = { contextWindow: SESSION_CONTEXT_AFTER, inherited: false };
+  assert.equal(sessionSettingsPanelReady(overridden, expected), true);
+  overridden.panel.context_inherited_badge.visible = true;
+  assert.equal(sessionSettingsPanelReady(overridden, expected), false);
+  const inherited = surface();
+  inherited.panel.context_inherited_badge.visible = false;
+  assert.equal(sessionSettingsPanelReady(inherited, { contextWindow: SESSION_CONTEXT_BEFORE, inherited: true }), false);
+});
+
 test("dirty close guard preserves the exact root draft behind one inert panel", () => {
   const dirty = surface({ contextWindow: SESSION_CONTEXT_AFTER, dirty: true });
   const dirtyPanel = {
@@ -768,10 +780,15 @@ test("restored root panel decision exposes every durable owner, value, control, 
   const ledger = acceptedLedger();
   const exact = restoredSessionSettingsPanelDecision({ surface: restored, ledger }, restoredExpected);
   assert.equal(exact.status, "pass");
-  assert.equal(exact.gates.length, 31);
+  assert.equal(exact.gates.length, 32);
   assert.equal(exact.gates.every((gate) => gate.pass), true);
   assert.equal(exact.gates.find((gate) => gate.id === "target-owner").actual.target.configGeneration, "1");
   assert.equal(exact.gates.find((gate) => gate.id === "target-owner").actual.target.runtimeOwnerToken, "idle:0");
+  const visibleInheritance = structuredClone(restored);
+  visibleInheritance.panel.context_inherited_badge.visible = true;
+  const wrongBadge = restoredSessionSettingsPanelDecision({ surface: visibleInheritance, ledger }, restoredExpected);
+  assert.equal(wrongBadge.status, "fail");
+  assert.ok(wrongBadge.terminal_failures.includes("restart-restored-inheritance-badge-mismatch"));
 
   const wrongRevision = restartedSurface({
     targetValue: { ...restoredTarget, settingsRevision: "5" },

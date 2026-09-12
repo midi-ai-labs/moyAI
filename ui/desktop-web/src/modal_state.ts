@@ -2,7 +2,7 @@ const REGULAR_MODAL_OVERLAYS = new Set([
   "provider",
   "config",
   "hub",
-  "mcp_publish",
+  "mcp_history",
   "session_settings",
   "workspace",
   "prompt_review",
@@ -79,7 +79,10 @@ export function overlayPrimaryFocusSelectors(overlay: string): readonly string[]
   if (overlay === "provider") return ["#provider-url"];
   if (overlay === "config") return [".settings-control"];
   if (overlay === "hub") return ["#hub-tab-devices:not(:disabled)", ".hub-modal"];
-  if (overlay === "mcp_publish") return ["#mcp-publish-label:not(:disabled)", "#mcp-publish-add:not(:disabled)", ".mcp-publish-modal"];
+  if (overlay === "mcp_history") return [
+    ".mcp-history-modal [data-action='mcp-history-direction'][aria-pressed='true']:not(:disabled)",
+    ".mcp-history-modal",
+  ];
   if (overlay === "session_settings") {
     return [
       ".session-settings-control:not(:disabled):not([aria-disabled='true'])",

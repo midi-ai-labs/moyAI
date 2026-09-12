@@ -1,10 +1,7 @@
 use crate::config::{AccessMode, ProviderProfile, ResolvedConfig};
 use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
 
-use super::state::{
-    ensure_current_model, ensure_current_model_infos, initial_provider_model_infos,
-    initial_provider_models,
-};
+use super::state::{initial_provider_model_infos, initial_provider_models};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopProviderStatusKind {
@@ -118,12 +115,9 @@ impl DesktopProviderConfigState {
         self.config_generation = self.config_generation.saturating_add(1);
         self.effective_config = config.clone();
         self.provider_base_url_input = config.model.base_url.clone();
-        self.provider_models = retained_models
-            .map(|models| ensure_current_model(models, &config.model.model))
-            .unwrap_or_else(|| initial_provider_models(&config));
-        self.provider_model_infos = retained_model_infos
-            .map(|infos| ensure_current_model_infos(infos, &config))
-            .unwrap_or_else(|| initial_provider_model_infos(&config));
+        self.provider_models = retained_models.unwrap_or_else(|| initial_provider_models(&config));
+        self.provider_model_infos =
+            retained_model_infos.unwrap_or_else(|| initial_provider_model_infos(&config));
         self.provider_selected_index = self
             .provider_models
             .iter()

@@ -413,15 +413,17 @@ impl AppState {
         {
             return;
         }
-        for status in tool_statuses_from_turn_items_for_turn(turn_items, Some(progress.turn_id)) {
+        let canonical_tools =
+            tool_statuses_from_turn_items_for_turn(turn_items, Some(progress.turn_id));
+        for status in &canonical_tools {
             if let Some(existing) = self
                 .tool_statuses
                 .iter_mut()
                 .find(|existing| existing.tool_call_id == status.tool_call_id)
             {
-                *existing = status;
+                *existing = status.clone();
             } else {
-                self.tool_statuses.push(status);
+                self.tool_statuses.push(status.clone());
             }
         }
         self.progress.model_requests = progress.model_request_count;
@@ -431,6 +433,41 @@ impl AppState {
         self.progress.tool_calls_cancelled = progress.cancelled_tool_count;
         self.progress.tool_calls_failed = progress.failed_tool_count;
         self.progress.compactions = progress.compaction_count;
+        // Committed tool events arrive through the canonical cursor on Desktop.
+        // Their lifecycle must replace finished provider telemetry here as well
+        // as updating the separate tool list. Preserve newer provider activity,
+        // permission interaction, and Stop until their own owners advance them.
+        if matches!(
+            self.progress.current_phase,
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::ProviderTerminal)
+                | RunProgressPhase::Loaded
+                | RunProgressPhase::Tool
+        ) {
+            let settled = progress.completed_tool_count
+                + progress.declined_tool_count
+                + progress.cancelled_tool_count
+                + progress.failed_tool_count;
+            if settled < progress.tool_call_count {
+                if let Some(tool) = canonical_tools.iter().find(|tool| {
+                    matches!(
+                        tool.status,
+                        ToolCallStatus::Pending | ToolCallStatus::Running
+                    )
+                }) {
+                    self.progress.current_phase = RunProgressPhase::Tool;
+                    self.progress.active_step = if tool.tool == ToolName::WaitRemoteTasks {
+                        "遠隔タスクの結果を待っています".to_string()
+                    } else {
+                        format!("{}を実行しています", tool_action_label(tool.tool))
+                    };
+                }
+            } else if progress.tool_call_count > 0
+                && self.progress.current_phase == RunProgressPhase::Tool
+            {
+                // Ending a wait tool does not mean the remote jobs completed.
+                self.progress.active_step = "ツールの処理が終了しました".to_string();
+            }
+        }
     }
 
     pub fn refresh_canonical_conversation(&mut self, read: &CanonicalSessionRead) -> bool {
@@ -1295,6 +1332,9 @@ pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
         ToolName::Read => "ファイルの確認",
         ToolName::ApplyPatch | ToolName::Write => "ファイルの更新",
         ToolName::Shell => "コマンド",
+        ToolName::ShellStart => "継続コマンドの開始",
+        ToolName::ShellStatus => "継続コマンドの状態確認",
+        ToolName::ShellStop => "継続コマンドの停止",
         ToolName::CurrentTime => "時刻の確認",
         ToolName::Skill => "Skillの読込",
         ToolName::DoclingConvert => "文書の変換",
@@ -1304,6 +1344,7 @@ pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
         ToolName::SpawnAgent => "Sub Agentの開始",
         ToolName::SendMessage | ToolName::FollowupTask => "Sub Agentへの連絡",
         ToolName::WaitAgent => "Sub Agentの完了待ち",
+        ToolName::WaitRemoteTasks => "遠隔タスクの結果待ち",
         ToolName::InterruptAgent => "Sub Agentの中断",
         ToolName::ListAgents => "Sub Agent状態の確認",
         ToolName::Invalid => "ツール",
@@ -1825,6 +1866,182 @@ fn terminal_transcript_kind(outcome: &TurnTerminalOutcome) -> TranscriptKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_wait_progress_fixture() -> (
+        AppState,
+        crate::session::model::CanonicalActiveTurnProgress,
+        TurnItem,
+    ) {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            run_status: RunStatus::Running,
+            active_turn_expectation: ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: 1,
+            },
+            ..AppState::default()
+        };
+        state.progress.current_phase =
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::ProviderTerminal);
+        state.progress.active_step = "LLMの応答を反映しています".into();
+        let progress = crate::session::model::CanonicalActiveTurnProgress {
+            turn_id,
+            model_request_count: 1,
+            tool_call_count: 1,
+            completed_tool_count: 0,
+            declined_tool_count: 0,
+            cancelled_tool_count: 0,
+            failed_tool_count: 0,
+            compaction_count: 0,
+        };
+        let item = TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::ToolStatus {
+                call_id: ToolCallId::new(),
+                tool: ToolName::WaitRemoteTasks,
+                status: ToolLifecycleStatus::Pending,
+                title: "wait_remote_tasks".into(),
+                summary: String::new(),
+            },
+        };
+        (state, progress, item)
+    }
+
+    #[test]
+    fn canonical_tool_progress_replaces_finished_provider_telemetry_with_remote_wait() {
+        let (mut state, progress, item) = canonical_wait_progress_fixture();
+        state.reconcile_active_turn_progress(
+            item.session_id,
+            &progress,
+            std::slice::from_ref(&item),
+        );
+        assert_eq!(state.progress.current_phase, RunProgressPhase::Tool);
+        assert_eq!(state.progress.active_step, "遠隔タスクの結果を待っています");
+        let first = state.progress.clone();
+        state.reconcile_active_turn_progress(item.session_id, &progress, &[item]);
+        assert_eq!(state.progress, first);
+        assert_eq!(state.tool_statuses.len(), 1);
+    }
+
+    #[test]
+    fn canonical_tool_progress_preserves_stop_permission_and_later_provider_request() {
+        for phase in [
+            RunProgressPhase::StopRequested,
+            RunProgressPhase::Permission,
+            RunProgressPhase::Model,
+            RunProgressPhase::Context,
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::AttemptStarted),
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::RequestInFlight),
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::HeadersReceived),
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::FirstProgress),
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::LastProgress),
+        ] {
+            let (mut state, progress, item) = canonical_wait_progress_fixture();
+            state.progress.current_phase = phase;
+            state.progress.active_step = "現在の操作を保持".into();
+            state.reconcile_active_turn_progress(item.session_id, &progress, &[item]);
+            assert_eq!(state.progress.current_phase, phase);
+            assert_eq!(state.progress.active_step, "現在の操作を保持");
+        }
+    }
+
+    #[test]
+    fn canonical_tool_progress_ignores_cached_old_tools_and_other_turns() {
+        let (mut state, progress, item) = canonical_wait_progress_fixture();
+        let mut older = item.clone();
+        older.turn_id = TurnId::new();
+        let mut stale_progress = progress.clone();
+        stale_progress.turn_id = older.turn_id;
+        let before = state.progress.clone();
+        state.reconcile_active_turn_progress(
+            item.session_id,
+            &stale_progress,
+            std::slice::from_ref(&older),
+        );
+        assert_eq!(state.progress, before);
+        let TurnItemPayload::ToolStatus { call_id, .. } = older.payload else {
+            unreachable!()
+        };
+        state.tool_statuses.push(ToolStatusView {
+            tool_call_id: call_id,
+            tool: ToolName::WaitRemoteTasks,
+            title: "old wait".into(),
+            status: ToolCallStatus::Pending,
+            summary: None,
+            error: None,
+        });
+        let mut active_item = item.clone();
+        let TurnItemPayload::ToolStatus { tool, call_id, .. } = &mut active_item.payload else {
+            unreachable!()
+        };
+        *tool = ToolName::Shell;
+        *call_id = ToolCallId::new();
+        state.reconcile_active_turn_progress(item.session_id, &progress, &[older, active_item]);
+        assert_eq!(state.progress.current_phase, RunProgressPhase::Tool);
+        assert_eq!(
+            state.progress.active_step,
+            format!("{}を実行しています", tool_action_label(ToolName::Shell))
+        );
+    }
+
+    #[test]
+    fn canonical_tool_progress_settlement_clears_wait_without_claiming_remote_completion() {
+        for status in [
+            ToolLifecycleStatus::Completed,
+            ToolLifecycleStatus::Cancelled,
+            ToolLifecycleStatus::Failed,
+        ] {
+            let (mut state, mut progress, mut item) = canonical_wait_progress_fixture();
+            state.reconcile_active_turn_progress(
+                item.session_id,
+                &progress,
+                std::slice::from_ref(&item),
+            );
+            let TurnItemPayload::ToolStatus {
+                status: current, ..
+            } = &mut item.payload
+            else {
+                unreachable!()
+            };
+            *current = status;
+            match status {
+                ToolLifecycleStatus::Completed => progress.completed_tool_count = 1,
+                ToolLifecycleStatus::Cancelled => progress.cancelled_tool_count = 1,
+                ToolLifecycleStatus::Failed => progress.failed_tool_count = 1,
+                _ => unreachable!(),
+            }
+            state.reconcile_active_turn_progress(item.session_id, &progress, &[item]);
+            assert_eq!(state.progress.current_phase, RunProgressPhase::Tool);
+            assert_eq!(state.progress.active_step, "ツールの処理が終了しました");
+        }
+    }
+
+    #[test]
+    fn canonical_tool_progress_settled_counts_do_not_revive_a_retained_pending_item() {
+        let (mut state, mut progress, item) = canonical_wait_progress_fixture();
+        progress.completed_tool_count = 1;
+        let before = state.progress.active_step.clone();
+        state.reconcile_active_turn_progress(
+            item.session_id,
+            &progress,
+            std::slice::from_ref(&item),
+        );
+        assert_eq!(
+            state.progress.current_phase,
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::ProviderTerminal)
+        );
+        assert_eq!(state.progress.active_step, before);
+        state.progress.current_phase = RunProgressPhase::Tool;
+        state.progress.active_step = "遠隔タスクの結果を待っています".into();
+        state.reconcile_active_turn_progress(item.session_id, &progress, &[item]);
+        assert_eq!(state.progress.active_step, "ツールの処理が終了しました");
+    }
 
     #[test]
     fn raw_review_submission_preserves_the_frontend_owned_edited_draft() {

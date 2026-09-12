@@ -4,7 +4,6 @@ import { deviceUiFixture } from "./device_network_fixture.ts";
 import { deviceNetworkPresentation } from "../src/device_network_state.ts";
 
 import { ACTIONS, actionById, actionEnabledById } from "../src/actions.ts";
-import { acceptPublishProjection, createPublishUiState, newPublishProfile, publishPresentation } from "../src/mcp_publish_state.ts";
 import {
   renderArtifactPane,
   renderComposer,
@@ -580,15 +579,6 @@ function defaultRenderLocal(overrides: {
 function representativeSurfaces(): RenderedSurface[] {
   const base = representativeState();
   const local = defaultRenderLocal();
-  const publish = createPublishUiState();
-  acceptPublishProjection(publish, { revision: "0", generation: "0", profiles: [], targets: [], error: null });
-  newPublishProfile(publish);
-  const receiving = structuredClone(publish.drafts.new);
-  publish.drafts["profile-a"] = receiving;
-  publish.selectedId = "profile-a";
-  publish.jobs = [{ job_id: "job-a", profile_id: "profile-a", parent: { peer_id: "WinA", task_id: "task-a", turn_id: "turn-a" },
-    prompt_preview: "Investigate workspace", session_id: "session-a", state: "running", model: "model-a", result: null, result_truncated: false, can_stop: true }];
-  local.mcpPublish = publishPresentation(publish);
   local.mcpHistory = { ...local.mcpHistory, loaded: true, rows: [{ id: "ref-a", direction: "instruction",
     created_at_ms: 1_700_000_000_000, updated_at_ms: null, title: "Investigate WinB", peer_label: "WinB", target_label: "temp",
     state: "running", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
@@ -603,6 +593,9 @@ function representativeSurfaces(): RenderedSurface[] {
     { name: "sidebar", html: renderSidebar(base) },
     { name: "topbar", html: renderTopbar(base, local) },
     { name: "run-status", html: renderRunStatusStrip(base) },
+    { name: "mcp-run-status", html: renderRunStatusStrip({ ...base, task_activity_state: "idle", mcp_activity: {
+      running: 1, waiting: 0, awaiting_approval: 0, cancelling: 0, unavailable: false,
+    } }) },
     { name: "thread", html: renderThreadContent(base, local) },
     { name: "pending-turn-input", html: renderPendingTurnInputs(base.pending_turn_inputs) },
     { name: "composer", html: renderComposer(base, local) },
@@ -618,7 +611,6 @@ function representativeSurfaces(): RenderedSurface[] {
     "provider",
     "config",
     "hub",
-    "mcp_publish",
     "mcp_history",
     "workspace",
     "prompt_review",
@@ -827,6 +819,14 @@ function representativeSurfaces(): RenderedSurface[] {
     },
   });
   surfaces.push({ name: "artifact-side-chat", html: renderArtifactPane(base, sideChatLocal) });
+  surfaces.push({ name: "artifact-side-chat-first-direct", html: renderArtifactPane({
+    ...base,
+    side_chat: { ...base.side_chat, can_send: false, direct_provider_capture: {
+      base_url: "http://direct.test:1234/v1", model: "direct-model",
+      provider_profile: "openai_compatible", enabled: true,
+      reason: "会話を保持し、最初のDirect設定を適用します。",
+    } },
+  }, defaultRenderLocal({ artifactPane: { mode: "side_chat" } })) });
   surfaces.push({
     name: "side-chat-delete-confirmation",
     html: renderSideChatDeleteConfirmation(base, sideChatLocal),
@@ -957,6 +957,31 @@ test("initial setup is a six-step blocking shell and session settings exposes st
     surfaces.get("local-confirm-session-settings-close") ?? "",
     /data-modal="session-settings-close-confirmation"/,
   );
+});
+
+test("Initial Setup exposes both system prompts as multiline editors without losing draft line breaks", () => {
+  const baseline = representativeState();
+  const text = "日本語の追加指示\nsecond <line> & detail";
+  const promptKeys = ["model.system_prompt", "side_chat.system_prompt"];
+  const fields: ConfigFieldProjection[] = promptKeys.map(key => ({
+    key, value: text, value_type: "string", required: false, min_value: null,
+    max_value: null, options: [], sensitive: false, configured: true, env_override: null,
+  }));
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "initial_setup",
+    startup: { ...baseline.startup, action_overlay: "initial_setup", initial_setup_required: true },
+    config_fields: [...baseline.config_fields.filter(field => !promptKeys.includes(field.key)), ...fields],
+  });
+  for (const [step, key] of [["model", "model.system_prompt"], ["finish", "side_chat.system_prompt"]] as const) {
+    const html = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step } })),
+      { backgroundInert: false, taskActivityDelay: "0ms" });
+    const escapedKey = key.replaceAll(".", "\\.");
+    const controls = [...html.matchAll(new RegExp(`<textarea\\b[^>]*data-config-key="${escapedKey}"[^>]*>([\\s\\S]*?)<\\/textarea>`, "g"))];
+    assert.equal(controls.length, 1, `${key} must be one multiline control in ${step}`);
+    assert.equal(controls[0][1], "日本語の追加指示\nsecond &lt;line&gt; &amp; detail");
+    assert.doesNotMatch(html, new RegExp(`<input\\b[^>]*data-config-key="${escapedKey}"`));
+  }
 });
 
 test("initial setup owns a retained dismissible live error inside its blocking shell", () => {
@@ -1363,6 +1388,7 @@ test("each primary GUI surface retains its required action routes", () => {
       "remove-image",
     ],
     "run-status": ["cancel-run"],
+    "mcp-run-status": ["show-mcp-execution-history"],
     permission: ["abort-permission", "cancel-run", "approve-permission"],
     "local-confirm-session": ["cancel-local-confirm", "confirm-local-delete"],
     "local-confirm-archive_session": ["cancel-local-confirm", "confirm-local-archive-state"],
@@ -1399,7 +1425,7 @@ test("each primary GUI surface retains its required action routes", () => {
       "close-overlay",
       "open-global-config-folder",
       "open-user-data-folder",
-      "show-provider",
+      "load-provider-models",
       "load-side-chat-models",
       "show-session-settings",
     ],
@@ -1521,6 +1547,17 @@ test("Initial Setup Finish and Session Settings Apply render as text-sized prima
   );
 });
 
+test("workspace validation feedback is readable inside the active dialog", () => {
+  for (const message of ["workspace path is empty", "workspace path is not accessible: <missing>", "workspace path is not a directory"]) {
+    const state = representativeState({ overlay: "workspace", confirmation_visible: false, status_message: message });
+    const html = renderOverlay(state, defaultRenderLocal());
+    const dialog = html.match(/<section[^>]*aria-labelledby="workspace-dialog-title"[\s\S]*?<\/section>/)?.[0];
+    assert.ok(dialog);
+    const feedback = dialog.match(/<pre[^>]*id="workspace-feedback"[^>]*role="status"[^>]*>([\s\S]*?)<\/pre>/)?.[1];
+    assert.equal(feedback, message.replaceAll("<", "&lt;").replaceAll(">", "&gt;"));
+  }
+});
+
 test("every action rendered by public GUI surfaces resolves through the single registry", () => {
   const unresolved: Array<{ surface: string; action: string }> = [];
   for (const surface of representativeSurfaces()) {
@@ -1558,7 +1595,6 @@ test("production render button availability matches the shared action resolver",
       "provider",
       "config",
       "hub",
-      "mcp_publish",
       "mcp_history",
       "workspace",
       "prompt_review",

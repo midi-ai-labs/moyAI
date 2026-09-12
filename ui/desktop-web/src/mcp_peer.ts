@@ -1,7 +1,7 @@
 import { command } from "./api.ts";
 import type { ActionContext } from "./actions.ts";
 import { beginConfigMutation, configMutationPending, finishConfigMutation, sameConfigMutationTarget } from "./config_mutation.ts";
-import type { DesktopWebState } from "./types.ts";
+import type { ConfigMutationTarget, DesktopWebState } from "./types.ts";
 import { escapeHtml } from "./utils.ts";
 
 export interface McpPeerRow {
@@ -62,7 +62,9 @@ export function renderMcpPeers(local: McpPeerPresentation, configBusy: boolean, 
 }
 export async function refreshMcpPeers(context: ActionContext): Promise<void> {
   const local = context.uiState.mcpPeers;
-  if (local.pending || context.getViewState()?.overlay !== "config") return;
+  const view = context.getViewState();
+  if (local.pending || view?.overlay !== "config") return;
+  const target = { ...view.config_target };
   const serial = ++local.serial;
   local.pending = "load";
   context.rerender();
@@ -72,7 +74,22 @@ export async function refreshMcpPeers(context: ActionContext): Promise<void> {
     local.rows = result.rows;
     local.error = "";
   } catch { if (serial === local.serial) local.error = "登録済み端末を取得できませんでした。"; }
-  finally { if (serial === local.serial) { local.pending = null; context.rerender(); } }
+  finally { settleMcpPeerRequest(context, serial, target); }
+}
+
+function settleMcpPeerRequest(context: ActionContext, serial: number, target: ConfigMutationTarget): void {
+  const local = context.uiState.mcpPeers;
+  if (serial !== local.serial) return;
+  local.pending = null;
+  const view = context.getViewState();
+  // Disabling the initiating button while busy can leave focus on BODY. The existing
+  // Settings arbiter restores only unowned focus after the same owner's controls reenable.
+  if (view?.overlay === "config" && sameConfigMutationTarget(target, view.config_target)) {
+    context.uiState.settingsActionFocusContinuation = {
+      target, primaryAction: "mcp-peer-refresh", fallbackAction: "close-overlay",
+    };
+  }
+  context.rerender();
 }
 export async function mutateMcpPeer(context: ActionContext, removeId?: string): Promise<void> {
   const local = context.uiState.mcpPeers;
@@ -102,12 +119,15 @@ export async function mutateMcpPeer(context: ActionContext, removeId?: string): 
     context.acceptProjection(state, true, succeeded ? {
       target: { ...state.config_target }, primaryAction: "mcp-peer-refresh", fallbackAction: "close-overlay", viewport,
     } : undefined);
+    if (!succeeded) return;
   } catch (error) {
     finishConfigMutation(context.uiState, request, false, request.target, context.getViewState()?.config_target ?? null);
-    if (serial === local.serial && !context.recoverCommandConflict(error)) local.error = "端末の接続設定を更新できませんでした。名前の重複、URLと証明書を確認してください。";
+    if (serial === local.serial && !context.recoverCommandConflict(error)) local.error = "端末の接続設定を更新できませんでした。名前の重複、URL、トークン、証明書を確認してください。";
+    return;
   } finally {
-    if (serial === local.serial) { local.pending = null; context.rerender(); }
+    settleMcpPeerRequest(context, serial, request.target);
   }
+  // A successful list refresh must not erase a rejected mutation's explanation.
   await refreshMcpPeers(context);
 }
 export async function checkMcpPeer(context: ActionContext, id: string): Promise<void> {
@@ -125,5 +145,5 @@ export async function checkMcpPeer(context: ActionContext, id: string): Promise<
       ? "接続できました。エージェント受付を確認しました。" : "接続できました。エージェント受付ツールは確認できません。";
   } catch {
     if (serial === local.serial) local.checks[id] = "接続できません。配信状態・URL・トークン・証明書を確認してください。";
-  } finally { if (serial === local.serial) { local.pending = null; context.rerender(); } }
+  } finally { settleMcpPeerRequest(context, serial, target); }
 }

@@ -3,10 +3,15 @@
 //! Direct remains the default. Hub permits and gateway targets live only in memory;
 //! prompt and response traffic uses a separate local gateway process.
 
+mod catalog_review;
 mod client;
 mod connection;
 mod settings;
+pub use catalog_review::{
+    HubCatalogBaseline, HubCatalogComparison, HubCatalogComparisonStatus, HubCatalogModelChange,
+};
 pub use client::HubCatalogClient;
+pub(crate) use connection::HubExecutionGuard;
 pub use connection::{
     HubConnection, HubConnectionProjection, HubConnectionStatus, HubReviewContext,
 };
@@ -22,6 +27,14 @@ use thiserror::Error;
 const MAX_MODELS: usize = 128;
 const MAX_SELECTED_MODELS: usize = 128;
 const MAX_CAPABILITIES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HubRequestPurpose {
+    UserTurn,
+    Preparation,
+    Delegated,
+}
 
 /// Decimal wire representation avoids loss of revision identity in JavaScript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -302,10 +315,20 @@ pub struct DesktopHubRoutes {
 /// Safe public errors intentionally omit URL, response body and credential material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum HubError {
+    #[error("このHubは子エージェントの独立実行に未対応です。Hubを更新してください。")]
+    DelegatedExecutionUnsupported,
     #[error("A Hub turn is already active for this context")]
     RouteBusy,
     #[error("Hub request routing is unavailable")]
     GatewayUnavailable,
+    #[error("The Hub route lease expired; reconnect and start a new turn")]
+    LeaseExpired,
+    #[error("The Hub request permit expired; start a new turn")]
+    PermitExpired,
+    #[error("The Hub turn was already completed or cancelled; start a new turn")]
+    TurnClosed,
+    #[error("The Hub connection heartbeat expired; reconnect before continuing")]
+    StaleClient,
     #[error("Hub connection changed; reload the current connection")]
     ConnectionChanged,
     #[error("Hub settings changed; reload before saving")]
@@ -347,8 +370,13 @@ pub enum HubError {
 impl HubError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::DelegatedExecutionUnsupported => "delegated_execution_unsupported",
             Self::RouteBusy => "route_busy",
             Self::GatewayUnavailable => "gateway_unavailable",
+            Self::LeaseExpired => "lease_expired",
+            Self::PermitExpired => "permit_expired",
+            Self::TurnClosed => "turn_closed",
+            Self::StaleClient => "stale_client",
             Self::ConnectionChanged => "connection_changed",
             Self::SettingsChanged => "settings_changed",
             Self::SettingsInvalid => "settings_invalid",

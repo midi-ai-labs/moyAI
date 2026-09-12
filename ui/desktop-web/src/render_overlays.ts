@@ -79,24 +79,33 @@ export function renderConfirmation(
     : "";
   return `
     <div class="modal-backdrop">
-      <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1" data-permission-id="${escapeHtml(requestId)}" ${pending ? 'aria-busy="true"' : ""}>
-        <h2 id="permission-title">${remote ? "受入タスクの操作を確認" : "確認が必要です"}</h2>
-        <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
-        <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
-        <dl class="confirm-details">
-          ${remote ? `<dt>依頼元</dt><dd>${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd>${escapeHtml(remote.target_label)}</dd><dt>受入タスク</dt><dd>${escapeHtml(remote.job_id)}</dd>` : ""}
-          ${agentPath ? `<dt>要求元</dt><dd>${renderPermissionAgentIdentity(agentPath, agentTaskName)}</dd>` : ""}
-          <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
-          <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
-          <dt>リスク</dt><dd>${escapeHtml(risks)}</dd>
-        </dl>
-        <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1" data-focus-key="permission:${escapeHtml(requestId)}:status">${escapeHtml(status)}</div>
-        <div class="modal-actions">
-          ${remote ? `<button data-action="deny-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:deny" ${pending ? "disabled" : "autofocus"}>${pending && currentDecision.decision === "denied" ? "拒否しています…" : "許可しない"}</button>` : ""}
-          <button data-action="abort-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:abort" ${pending ? "disabled" : remote ? "" : "autofocus"}>${abortLabel}</button>
-          ${stopAction}
-          <button class="send wide-send" data-action="approve-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:approve" ${pending ? "disabled" : ""}>${approveLabel}</button>
-        </div>
+      <section class="modal confirmation permission-confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1" data-permission-id="${escapeHtml(requestId)}" ${pending ? 'aria-busy="true"' : ""}>
+        <header class="permission-header">
+          <h2 id="permission-title">${remote ? "受入タスクの操作を確認" : "確認が必要です"}</h2>
+          ${remote || agentPath ? `<dl class="confirm-details permission-context">
+            ${remote ? `<dt>依頼元</dt><dd title="${escapeHtml(remote.requester_label || "登録端末")}">${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd title="${escapeHtml(remote.target_label)}">${escapeHtml(remote.target_label)}</dd>` : ""}
+            ${agentPath ? `<dt>要求元</dt><dd>${renderPermissionAgentIdentity(agentPath, agentTaskName)}</dd>` : ""}
+          </dl>` : ""}
+        </header>
+        <section class="permission-review-body" role="region" aria-label="操作の詳細" tabindex="0" data-focus-key="permission:${escapeHtml(requestId)}:details">
+          <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
+          <dl class="confirm-details">
+            ${remote ? `<dt>依頼元</dt><dd>${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd>${escapeHtml(remote.target_label)}</dd><dt>受入タスク</dt><dd>${escapeHtml(remote.job_id)}</dd>` : ""}
+            <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
+            <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
+            <dt>リスク</dt><dd>${escapeHtml(risks)}</dd>
+          </dl>
+          <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
+        </section>
+        <footer class="permission-footer">
+          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1" data-focus-key="permission:${escapeHtml(requestId)}:status">${escapeHtml(status)}</div>
+          <div class="modal-actions">
+            ${remote ? `<button data-action="deny-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:deny" ${pending ? "disabled" : "autofocus"}>${pending && currentDecision.decision === "denied" ? "拒否しています…" : "許可しない"}</button>` : ""}
+            <button data-action="abort-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:abort" ${pending ? "disabled" : remote ? "" : "autofocus"}>${abortLabel}</button>
+            ${stopAction}
+            <button class="send wide-send" data-action="approve-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:approve" ${pending ? "disabled" : ""}>${approveLabel}</button>
+          </div>
+        </footer>
       </section>
     </div>
   `;

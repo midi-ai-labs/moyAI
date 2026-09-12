@@ -56,15 +56,23 @@ and task constraints. Receiving OFF blocks new work; existing jobs have separate
 Startup and tray receiving are explicit preferences. See the [device-network guide](docs/hub-device-network-guide.md)
 and [design and acceptance status](docs/design/hub-device-network.md).
 
+Development servers can use `shell_start`, `shell_status`, and `shell_stop` for finite,
+app-owned command lifetimes. Starting a process does not attest to HTTP readiness.
+See the [managed command guide](docs/managed-shell-guide.md) for time limits and ownership.
+
 The model tab retains independent Main / Side Chat model selection and review. The Hub route uses
-a companion Chat Completions gateway with capacity control and has no implicit Direct fallback.
+a companion Chat Completions / Responses gateway that counts its own forwarded HTTP requests,
+with no implicit Direct fallback. Per-context catalog review includes saved comparison baselines;
+Hub-only Side Chat, prompt enhancement, and independent child-agent execution are implemented
+and undergoing final verification.
 Direct settings remain available. **MCP履歴** provides **MCP指示** and **MCP実行** views of locally saved
 delegation records, results and errors, with Markdown export. A compatible Hub can also retrieve and save
 device history snapshots; update both Hub and Desktop. See the [MCP history guide](docs/mcp-history-guide.md).
-Existing manual publishing profiles remain accessible through **旧配信設定の管理** in the history screen,
-and the manual peer connection form remains available. These profiles retain their own token/TLS and
-lifecycle settings. See
-[Desktop MCP publishing](docs/design/mcp-publish-foundation.md) and [Hub integration](docs/hub-integration.md).
+The manual publishing editor and its settings/start commands have been retired. Existing profile files,
+credentials, certificates and execution history are retained; updating or restarting Desktop does not reopen
+those listeners. Configure reception explicitly through **moyAI Hub → 端末連携**. Read-only grants and shared
+tokens are never upgraded automatically to agent authority. Outbound MCP connections and the shared
+transport remain available. See [MCP compatibility](docs/design/mcp-publish-foundation.md).
 The implementation includes delegation recovery after a Hub restart, certificate renewal, approval on
 the receiving device, explicit versioned inputs and bounded UTF-8 artifact export to a new folder on Windows.
 Physical multi-Windows and three-device redelegation acceptance remain outstanding. Automatic application
@@ -899,6 +907,11 @@ npm run build:desktop-web
 ```
 
 Desktop interaction changes also require operating the actual Tauri window and saving screenshot evidence under `../project_sandbox/<task>/`; a build and startup check alone do not prove UI behavior.
+
+Run `npm run verify:gui -- --suite smoke` for the regular unit/build/actual-GUI phase;
+use `--suite regression` for broader coverage. The [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md)
+explains prerequisites, existing-binary runs, CI and pending manual review. Automated GUI results
+do not approve visual quality, native input or all untested control states.
 
 Published release packages must also pass a visible Desktop GUI manual ST before upload.
 Record the result in a UTF-8 Markdown artifact containing `Manual ST Gate: PASS`, then pass that

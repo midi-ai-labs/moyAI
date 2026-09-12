@@ -13,7 +13,19 @@ export function synchronizeDeviceNetworkControls(current: HTMLElement, next: HTM
       // Shared Settings synchronization updates the retained row's passive facts and
       // button availability. Keep its details, keyboard focus and scroll owner mounted.
       if (!retained) jobs.insertBefore(row, jobs.children[index] ?? null);
-      else if (jobs.children[index] !== retained) jobs.insertBefore(retained, jobs.children[index] ?? null);
+      else {
+        if (jobs.children[index] !== retained) jobs.insertBefore(retained, jobs.children[index] ?? null);
+        // Artifact controls first appear when a running job becomes terminal.
+        // Retain existing disclosures; shared Settings sync updates their facts.
+        const artifacts = retained.querySelector<HTMLElement>(".device-network-artifacts");
+        const nextArtifacts = row.querySelector<HTMLElement>(".device-network-artifacts");
+        if (!artifacts && nextArtifacts) {
+          retained.insertBefore(nextArtifacts, retained.querySelector('[data-action="device-network-stop-job"]'));
+        } else if (artifacts && !nextArtifacts) {
+          if (artifacts.contains(current.ownerDocument.activeElement)) current.querySelector<HTMLElement>("#device-network-refresh")?.focus({ preventScroll: true });
+          artifacts.remove();
+        }
+      }
     }
     for (const [id, row] of existing) if (!wanted.has(id)) {
       if (row.contains(current.ownerDocument.activeElement)) current.querySelector<HTMLElement>("#device-network-refresh")?.focus({ preventScroll: true });

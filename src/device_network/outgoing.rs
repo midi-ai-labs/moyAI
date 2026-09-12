@@ -6,12 +6,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+use super::peer_connections::{PeerConnectionKey, PeerConnections};
 use super::{DeviceError, DeviceGrant, DeviceNetworkService, DirectoryPeer, VerifiedGrant};
-use crate::config::{
-    McpConfig, McpServerConfig, McpToolRouteConfig, McpTransportKind, ResolvedConfig,
-};
+use crate::config::{McpServerConfig, McpToolRouteConfig, McpTransportKind, ResolvedConfig};
 use crate::error::ToolError;
-use crate::mcp::{McpClient, McpOperationResult};
+use crate::mcp::McpOperationResult;
 use crate::protocol::TurnId;
 use crate::remote_agent::store::StoredDeviceReference;
 use crate::runtime::RunControl;
@@ -42,7 +41,9 @@ pub(super) struct OutgoingOwner {
     store: StoreBundle,
     inbound: Mutex<HashMap<SessionId, (Ulid, VerifiedGrant)>>,
     watched: Mutex<HashSet<(SessionId, TurnId)>>,
-    lane: tokio::sync::Mutex<()>,
+    pub(super) lane: tokio::sync::Mutex<()>,
+    pub(super) peer_connections: PeerConnections,
+    pub(super) updates: tokio::sync::watch::Sender<()>,
 }
 impl OutgoingOwner {
     pub fn new(store: StoreBundle) -> Self {
@@ -51,6 +52,8 @@ impl OutgoingOwner {
             inbound: Mutex::new(HashMap::new()),
             watched: Mutex::new(HashSet::new()),
             lane: tokio::sync::Mutex::new(()),
+            peer_connections: PeerConnections::default(),
+            updates: tokio::sync::watch::channel(()).0,
         }
     }
 }
@@ -251,10 +254,10 @@ fn server_config(peer: &DirectoryPeer) -> McpServerConfig {
         trusted_certificate_pem: None,
     }
 }
-fn terminal(state: &str) -> bool {
+pub(super) fn terminal(state: &str) -> bool {
     matches!(state, "completed" | "failed" | "interrupted")
 }
-fn public_row(row: StoredDeviceReference) -> DeviceDelegationRow {
+pub(super) fn public_row(row: StoredDeviceReference) -> DeviceDelegationRow {
     DeviceDelegationRow {
         reference_id: row.id.to_string(),
         root_task_id: row.root_task_id,
@@ -384,24 +387,63 @@ impl DeviceNetworkService {
         arguments: Value,
         mut checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
-        let mut server = server_config(&grant.peer);
-        let id = server.id.clone();
-        server
-            .headers
-            .insert("Authorization".into(), format!("Bearer {}", grant.token));
-        let client = McpClient::new(McpConfig {
-            enabled: true,
-            servers: vec![server],
-        })
-        .with_runtime_http(&id, self.peer_http(&grant.peer).map_err(safe_error)?);
-        match name {
-            Some(name) => {
-                client
-                    .call_tool(&id, name, arguments, &mut checkpoint)
-                    .await
+        let key = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| safe_error(DeviceError::Unavailable))?;
+            PeerConnectionKey::new(
+                grant,
+                &state.shared.hub_url,
+                &state.shared.ca_certificate_pem,
+                state
+                    .settings
+                    .certificate_pem
+                    .as_deref()
+                    .ok_or_else(|| safe_error(DeviceError::InvalidIdentity))?,
+                state
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| safe_error(DeviceError::InvalidIdentity))?
+                    .private_key_pem(),
+            )?
+        };
+        let connections = &self.inner.outgoing.peer_connections;
+        let result = connections
+            .operate(
+                key,
+                server_config(&grant.peer),
+                &grant.token,
+                || self.peer_http(&grant.peer).map_err(safe_error),
+                name,
+                arguments,
+                &mut checkpoint,
+            )
+            .await;
+        let finished = result.as_ref().is_ok_and(|operation| match operation {
+            McpOperationResult::ToolCalled { raw_result, .. } => {
+                let data = raw_result.get("structuredContent").cloned().or_else(|| {
+                    raw_result
+                        .get("content")?
+                        .as_array()?
+                        .iter()
+                        .find_map(|part| {
+                            serde_json::from_str::<Value>(part.get("text")?.as_str()?).ok()
+                        })
+                });
+                data.as_ref()
+                    .and_then(|data| data.get("state"))
+                    .and_then(Value::as_str)
+                    .is_some_and(terminal)
             }
-            None => client.list_tools(&id, &mut checkpoint).await,
+            _ => false,
+        });
+        if result.is_ok() && (name.is_none() || finished) {
+            // Cleanup cannot turn a successfully observed result into a failure.
+            let _ = connections.retire(key, &grant.token, &mut checkpoint).await;
         }
+        result
     }
     fn validate_grant(
         &self,
@@ -764,7 +806,11 @@ impl DeviceNetworkService {
             .store
             .remote_job_store()
             .update_device_reference(row)
-            .map_err(|_| DeviceError::Storage)
+            .map_err(|_| DeviceError::Storage)?;
+        // The durable reference owns the observation. This edge only wakes local
+        // waiters, which re-read their exact targets before returning to a model.
+        self.inner.outgoing.updates.send_replace(());
+        Ok(())
     }
 
     async fn control_reference(

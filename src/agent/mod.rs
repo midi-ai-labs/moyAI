@@ -284,6 +284,7 @@ pub struct AgentLoop {
     store: StoreBundle,
     prompt_builder: PromptBuilder,
     tool_services: Arc<Mutex<ToolServices>>,
+    managed_shell_lifetime: Option<CancellationToken>,
     model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(test)]
     provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
@@ -292,6 +293,11 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    pub(crate) fn with_managed_shell_lifetime(mut self, lifetime: CancellationToken) -> Self {
+        self.managed_shell_lifetime = Some(lifetime);
+        self
+    }
+
     pub(crate) fn with_hub_turn(mut self, route: crate::hub::HubTurnRoute) -> Self {
         self.llm = route.client();
         self.hub_route = Some(route);
@@ -312,6 +318,7 @@ impl AgentLoop {
             store,
             prompt_builder,
             tool_services: Arc::new(Mutex::new(tool_services)),
+            managed_shell_lifetime: None,
             model_request_gate: None,
             #[cfg(test)]
             provider_api_key_resolver: None,
@@ -373,7 +380,12 @@ impl AgentLoop {
         }
         // Each admitted turn keeps its immutable client, including peer trust
         // and credentials. Equal later configurations reuse its MCP sessions.
-        Ok(services.clone())
+        let mut turn_services = services.clone();
+        if let Some(lifetime) = &self.managed_shell_lifetime {
+            turn_services.managed_shells =
+                turn_services.managed_shells.with_lifetime(lifetime.clone());
+        }
+        Ok(turn_services)
     }
 
     pub async fn run(
@@ -4249,6 +4261,8 @@ fn goal_token_delta(usage: Option<&TokenUsage>) -> i64 {
 mod tests {
     use super::*;
 
+    mod remote_wait;
+
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4359,9 +4373,148 @@ Apply the selected write change, then run its focused verification.
 ## Evidence coverage
 Repository inspection was observed; mutation and verification results remain unobserved."#;
 
-    // With the full prepared-request estimate as a safety lower bound, this keeps the
-    // rejection fixtures above the working compaction target but below the hard limit.
-    const REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS: usize = 235_000;
+    struct CompactionFixtureBudget {
+        read_output_chars: usize,
+        working_limit: u32,
+        hard_limit: u32,
+        saturated_prompt_tokens: u32,
+        saturated_total_tokens: u32,
+        continuation_total_tokens: u32,
+        hard_continuation_total_tokens: u32,
+    }
+
+    impl CompactionFixtureBudget {
+        fn assert_rejection_band(&self, request: &ChatRequest) {
+            let tokens = ContextWindowTokenStatus::for_request(request, 0).active_context_tokens;
+            assert!(
+                self.working_limit < tokens && tokens < self.hard_limit,
+                "fixture must request compaction without reaching the hard boundary: {} < {tokens} < {}",
+                self.working_limit,
+                self.hard_limit,
+            );
+        }
+    }
+
+    async fn compaction_fixture_budget(
+        config: &ResolvedConfig,
+        call_ids: &[&str],
+        with_goal: bool,
+    ) -> CompactionFixtureBudget {
+        assert!(matches!(call_ids.len(), 1 | 2));
+        const CALIBRATION_FINAL: &str = "compaction budget calibration completed";
+        let mut outcomes = call_ids
+            .iter()
+            .map(|call_id| ScriptedOutcome::Response(scripted_read_call(call_id)))
+            .collect::<Vec<_>>();
+        outcomes.push(ScriptedOutcome::Response(ScriptedResponse {
+            events: vec![LlmEvent::TextDelta(CALIBRATION_FINAL.to_string())],
+            finish_reason: FinishReason::Stop,
+        }));
+        // Obtain the actual prepared instructions, goal and tool schemas. The four-byte
+        // read payload is one estimated token; only that payload grows in the real run.
+        let run = run_scripted_internal_with_pending_steers(
+            config.clone(),
+            outcomes,
+            with_goal.then_some(("finish after compaction", ThreadGoalStatus::Active, None)),
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool { output_chars: 4 })),
+            false,
+        )
+        .await
+        .expect("compaction budget calibration run");
+        run.summary
+            .as_ref()
+            .expect("calibration completes without compaction");
+        assert_eq!(run.requests.len(), call_ids.len() + 1);
+        assert!(run.requests.iter().all(|request| !request.tools.is_empty()));
+        let policy = crate::llm::model_policy::ModelPolicy::from_config(config);
+        let working_limit = policy.working_context_token_limit;
+        let hard_limit = policy.effective_context_token_limit;
+        let middle = working_limit + (hard_limit - working_limit) / 2;
+        let saturated_prompt_tokens = hard_limit.checked_sub(1_000).expect("reasoning headroom");
+        let normal = &run.requests[call_ids.len()];
+        let estimate = |request: &ChatRequest| {
+            ContextWindowTokenStatus::for_request(request, 0).active_context_tokens
+        };
+        let source = |request: &ChatRequest| {
+            estimate(&compaction_request_with_messages(
+                request,
+                request.messages.clone(),
+            ))
+        };
+        let normal_tokens = estimate(normal);
+        let added_read_tokens = if call_ids.len() == 1 {
+            middle
+                .checked_sub(normal_tokens)
+                .expect("room for rejection fixture output")
+        } else {
+            let reserve = local_request_projection_after_hypothetical_compaction(
+                &run,
+                2,
+                2,
+                "x".repeat(COMPACTION_CHECKPOINT_RESERVE_TOKENS * 4),
+                CALIBRATION_FINAL,
+            );
+            let oversized = local_request_projection_after_hypothetical_compaction(
+                &run,
+                2,
+                2,
+                format!(
+                    "{}\n{}",
+                    VALID_C8_COMPACTION_CHECKPOINT,
+                    "summary-padding".repeat(600)
+                ),
+                CALIBRATION_FINAL,
+            );
+            let summary_delta = oversized
+                .checked_sub(reserve)
+                .expect("oversized checkpoint grows beyond reserve");
+            assert!(summary_delta > 0);
+            let headroom = (summary_delta / 2).max(1);
+            let all_source = source(normal);
+            let added = i64::from(reserve) + i64::from(saturated_prompt_tokens)
+                - i64::from(all_source)
+                - i64::from(working_limit)
+                + i64::from(headroom);
+            assert!(
+                added > 0,
+                "reasoning fixture needs a positive read payload increment"
+            );
+            let added = u32::try_from(added).expect("bounded read payload increment");
+            let expanded_source = all_source + 2 * added;
+            let gap = saturated_prompt_tokens
+                .checked_sub(expanded_source)
+                .expect("positive observed prompt gap");
+            assert!(gap > 0);
+            assert!(expanded_source <= working_limit / COMPACTION_SOURCE_TARGET_DIVISOR);
+            assert!(reserve + added + gap < working_limit);
+            assert!(oversized + added + gap >= working_limit);
+            assert!(source(&run.requests[1]) + added + gap < working_limit);
+            added
+        };
+        let tool_increment = normal_tokens
+            .checked_sub(estimate(&run.requests[call_ids.len() - 1]))
+            .expect("completed read increases the prepared request")
+            + added_read_tokens;
+        CompactionFixtureBudget {
+            read_output_chars: usize::try_from(added_read_tokens + 1)
+                .expect("read token count fits usize")
+                .checked_mul(4)
+                .expect("bounded ASCII read payload"),
+            working_limit,
+            hard_limit,
+            saturated_prompt_tokens,
+            saturated_total_tokens: hard_limit,
+            continuation_total_tokens: middle
+                .checked_sub(tool_increment)
+                .expect("positive continuation usage"),
+            hard_continuation_total_tokens: (hard_limit + 512)
+                .checked_sub(tool_increment)
+                .expect("positive hard-boundary usage"),
+        }
+    }
 
     const EXPECTED_CODEX_MULTI_AGENT_ROOT_ROLE_PREFIX: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
@@ -5874,6 +6027,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["large-read"], false).await;
         let oversized_summary = format!(
             "{}\n{}",
             VALID_C8_COMPACTION_CHECKPOINT,
@@ -5908,11 +6062,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS,
+                output_chars: budget.read_output_chars,
             }),
         )
         .await
         .expect("nonshrinking compaction run");
+
+        budget.assert_rejection_band(run.requests.last().expect("normal continuation"));
 
         run.summary
             .expect("the turn can finish while still below the hard context boundary");
@@ -5949,6 +6105,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["large-read"], false).await;
         let run = run_scripted_with_control_and_tool(
             config,
             vec![
@@ -5980,11 +6137,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS,
+                output_chars: budget.read_output_chars,
             }),
         )
         .await
         .expect("malformed C8 checkpoint run");
+
+        budget.assert_rejection_band(run.requests.last().expect("normal continuation"));
 
         run.summary
             .expect("the turn can continue below the hard context boundary");
@@ -6111,22 +6270,26 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     #[tokio::test]
     async fn reasoning_only_compaction_retries_one_gap_safe_aligned_unit_prefix() {
         const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
-        const SATURATED_PROMPT_TOKENS: u32 = 63_600;
-        const SATURATED_TOTAL_TOKENS: u32 = 64_600;
 
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(
+            &config,
+            &["reasoning-read-oldest", "reasoning-read-newer"],
+            true,
+        )
+        .await;
         let working_limit =
             crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
         let mut second_read = scripted_read_call("reasoning-read-newer");
         second_read.events.push(LlmEvent::Finished {
             finish_reason: FinishReason::ToolCall,
             usage: Some(TokenUsage {
-                prompt_tokens: 54_900,
+                prompt_tokens: budget.continuation_total_tokens - 100,
                 completion_tokens: 100,
-                total_tokens: 55_000,
+                total_tokens: budget.continuation_total_tokens,
                 reasoning_tokens: None,
             }),
         });
@@ -6139,9 +6302,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     events: vec![LlmEvent::Finished {
                         finish_reason: FinishReason::Stop,
                         usage: Some(TokenUsage {
-                            prompt_tokens: SATURATED_PROMPT_TOKENS,
+                            prompt_tokens: budget.saturated_prompt_tokens,
                             completion_tokens: 1_000,
-                            total_tokens: SATURATED_TOTAL_TOKENS,
+                            total_tokens: budget.saturated_total_tokens,
                             reasoning_tokens: Some(1_000),
                         }),
                     }],
@@ -6161,7 +6324,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 30_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
         )
@@ -6182,7 +6345,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(!request_contains_model_call(retry, "reasoning-read-newer"));
         let compact_estimate =
             ContextWindowTokenStatus::for_request(compact, 0).active_context_tokens;
-        let observed_prompt_gap = SATURATED_PROMPT_TOKENS.saturating_sub(compact_estimate);
+        let observed_prompt_gap = budget
+            .saturated_prompt_tokens
+            .saturating_sub(compact_estimate);
         assert!(observed_prompt_gap > 0);
         assert!(
             ContextWindowTokenStatus::for_request(retry, 0)
@@ -6227,7 +6392,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .expect("goal")
             .expect("stored goal");
         assert_eq!(
-            goal.tokens_used, 119_645,
+            goal.tokens_used,
+            i64::from(budget.continuation_total_tokens)
+                + i64::from(budget.saturated_total_tokens)
+                // The first read, successful retry and final reply use the fixture's 15-token default.
+                + 3 * 15,
             "the failed reasoning-only compaction attempt must be accounted once"
         );
     }
@@ -6247,15 +6416,21 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(
+            &config,
+            &["actual-summary-read-oldest", "actual-summary-read-newer"],
+            true,
+        )
+        .await;
         let working_limit =
             crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
         let mut second_read = scripted_read_call("actual-summary-read-newer");
         second_read.events.push(LlmEvent::Finished {
             finish_reason: FinishReason::ToolCall,
             usage: Some(TokenUsage {
-                prompt_tokens: 54_900,
+                prompt_tokens: budget.continuation_total_tokens - 100,
                 completion_tokens: 100,
-                total_tokens: 55_000,
+                total_tokens: budget.continuation_total_tokens,
                 reasoning_tokens: None,
             }),
         });
@@ -6268,9 +6443,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     events: vec![LlmEvent::Finished {
                         finish_reason: FinishReason::Stop,
                         usage: Some(TokenUsage {
-                            prompt_tokens: 63_600,
+                            prompt_tokens: budget.saturated_prompt_tokens,
                             completion_tokens: 1_000,
-                            total_tokens: 64_600,
+                            total_tokens: budget.saturated_total_tokens,
                             reasoning_tokens: Some(1_000),
                         }),
                     }],
@@ -6292,7 +6467,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 30_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
         )
@@ -6347,7 +6522,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         let local_projected_request_tokens = before_request_tokens
             .saturating_sub(before_context_tokens)
             .saturating_add(after_context_tokens);
-        let observed_prompt_gap = 63_600u32.saturating_sub(
+        let observed_prompt_gap = budget.saturated_prompt_tokens.saturating_sub(
             ContextWindowTokenStatus::for_request(&run.requests[2], 0).active_context_tokens,
         );
         assert!(local_projected_request_tokens < working_limit);
@@ -6739,26 +6914,32 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(
+            &config,
+            &["retry-limit-read-oldest", "retry-limit-read-newer"],
+            false,
+        )
+        .await;
         let mut second_read = scripted_read_call("retry-limit-read-newer");
         second_read.events.push(LlmEvent::Finished {
             finish_reason: FinishReason::ToolCall,
             usage: Some(TokenUsage {
-                prompt_tokens: 57_900,
+                prompt_tokens: budget.hard_continuation_total_tokens - 100,
                 completion_tokens: 100,
-                total_tokens: 58_000,
+                total_tokens: budget.hard_continuation_total_tokens,
                 reasoning_tokens: None,
             }),
         });
         let first_usage = TokenUsage {
-            prompt_tokens: 63_600,
+            prompt_tokens: budget.saturated_prompt_tokens,
             completion_tokens: 1_000,
-            total_tokens: 64_600,
+            total_tokens: budget.saturated_total_tokens,
             reasoning_tokens: Some(1_000),
         };
         let second_usage = TokenUsage {
-            prompt_tokens: 63_400,
+            prompt_tokens: budget.saturated_total_tokens - 1_200,
             completion_tokens: 1_200,
-            total_tokens: 64_600,
+            total_tokens: budget.saturated_total_tokens,
             reasoning_tokens: Some(1_200),
         };
         let reasoning_only = |usage| ScriptedResponse {
@@ -6778,7 +6959,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 30_000,
+                output_chars: budget.read_output_chars,
             }),
         )
         .await
@@ -7087,6 +7268,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["large-read"], false).await;
         let run = run_scripted_with_control_and_tool(
             config,
             vec![
@@ -7116,11 +7298,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS,
+                output_chars: budget.read_output_chars,
             }),
         )
         .await
         .expect("scripted cancelled compaction run");
+
+        budget.assert_rejection_band(run.requests.last().expect("normal continuation"));
 
         run.summary.expect("run continues below the hard limit");
         assert_eq!(run.requests.len(), 3);
@@ -12111,6 +12295,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         }
     }
 }

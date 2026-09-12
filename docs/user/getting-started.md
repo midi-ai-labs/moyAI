@@ -35,7 +35,7 @@ Global Settingsはuser-wide `config.toml`を所有し、MainとSide Chatを含�
 2. `Base URL`とmodel IDを入力する。
 3. 認証が必要なら`API key environment variable (optional)`へsecretを保持する環境変数名（例`OPENAI_API_KEY`）を入力する。secretそのものは入力・保存しない。
 4. 必要なら`追加システムプロンプト（任意）`へMain用の追加指示を入力する。moyAI組み込みpromptは置換されず、その後へ追加される。空欄は追加なし、上限は16,384 Unicode文字である。
-5. 必要なら`モデル読込`でmodel catalogを確認する。手入力したmodel IDは接続不能時でもlocalにvalidなら保存できる。
+5. Global Settingsでは、入力したURL・接続方式のまま同じ画面の`モデル読込`で候補を取得する。未保存の変更があっても読込できる。候補はその接続先が返したmodel catalogのみで、以前の接続先や保存済みのmodel IDは追加しない。一覧にないIDは`一覧にないモデルIDを入力`で保持し、接続不能時でもlocalにvalidなら保存できる。
 6. Global Settingsではuser-wide設定として保存し、Session Settingsではcurrent root sessionのMain ChatだけへApplyする。
 
 provider custom header/body、Docling header、MCP server定義等のsensitive JSON fieldはraw値を再表示せず **設定済み（非表示）** と示す。complete draftで空欄または空白だけにした場合は既存値を保持する。置換またはclearする場合は`{}` / `[]`等の明示的なvalid JSONを入力する。API key環境変数名は表示・保存できるが、解決したsecret値は保存・投影しない。
@@ -200,6 +200,10 @@ Desktop:
 
 Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。
 
+Desktopのプロジェクト追加でフォルダを選択すると、そのフォルダで新しいチャットを準備する。親のGitプロジェクトに以前のチャットがあっても、作業フォルダを以前の場所へ戻さない。以前のチャットを続ける場合は一覧から開く。
+
+Windowsのシェルを自動選択する場合、実行ファイルとして固定できないアプリ実行エイリアスを除外し、PATH上の実体のPowerShellを使う。`shell.program`を明示する場合は実体の実行ファイルを指定する。明示指定の失敗を別のシェルへ置き換えることはない。
+
 CLI:
 
 ```powershell
@@ -211,6 +215,8 @@ moyai.exe tui --dir C:\path\to\workspace
 TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`Ctrl+X` でexact current root executionを停止できる。`F10`のSub Agent pickerではRunning childを選び、`x`で表示時のexact child turnだけを停止する。composerで`F6`を押すとPrompt Enhanceを開始し、通信中の`Esc`はprovider requestをcancelしてraw promptを保持したままTUIへ戻る。通信中の`Ctrl+Q`は同じrequestをcancelし、pending reviewを清算してからTUIを終了する。cancel後の遅延responseをreviewとして再表示しない。新規user rowはdurable history保存後に追加する。active-turn steerはdurable queueへの受理後にcomposerをclearしてpending入力として別表示し、安全な次request境界で同じstable IDのcanonical user rowへ置き換える。次requestがない場合も非Interrupted terminalは終了前にhistoryへdrainし、Interrupted terminalは中断を記録して未配信steerをdiscardする。送信時と同じdraft revision・textの場合だけclearし、保存前の失敗や送信後の再編集ではdraftを保持してphantom rowを作らない。CLI の `session steer` / `session interrupt` を別 process から実行した場合も、SQLite の durable control state を実行 process が取り込む。
 
 `write`と`apply_patch`のcreate / update / delete / rollbackは、同じstable-handle・no-clobber条件付きcommitを使う。既存file全体を`write`で置換する場合は、同じsessionでUTF-8全文をtruncationなしに読んだか、直前のtyped mutation成功で同期されたcurrent baselineが必要になる。`apply_patch` Updateはこの全文履歴を要求せず、contextを持つhunkをcurrent UTF-8 contentへ照合する。bare `@@`に`+`行だけを置くhunkは既存内容を置換せずEOFへ追記し、その後に記述されたcontext hunkの探索位置も進めない。`apply_patch` Deleteも全文履歴は要求しないが、destructive permissionとcurrent file identityを確認して条件付き削除する。準備中に別processがtargetを更新・置換した場合は外部側を上書きせず、復元不能時は保持したbackup pathをerrorへ含める。親directoryは暗黙作成しないため、存在しない場合は先に明示作成する。
+
+`apply_patch`の更新・移動は、変更しない行の内容とCRLF/LFの混在を保持し、末尾改行も一律には追加・削除しない。置換行は対応する元の改行を、新たな挿入行は周辺の改行を使う。末尾改行のないファイルへの追記には必要な区切りだけを加える。新規ファイルと全文`write`には従来の書式設定を適用する。明示設定されたformatterを実行する場合は、そのformatterがファイル全体を書き換えることがある。
 
 Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する。
 
@@ -239,6 +245,12 @@ Desktopではtopbar/composer付近のaccess mode chipから切り替える。明
 Desktop Settingsの編集中の値、baseline、dirty状態、monotonic revisionはfrontend local draftだけが所有し、Rustへ第二のfield-value / dirty / revision mirrorを作らない。Rustはclean/dirty双方のtyped semantic capability variantを投影し、frontendはlocal dirtyに対応するvariantを選んでlocal single-flightだけを追加gateする。Apply / Save / Resetはcomplete stable key/value draftとworkspace/session/config generation targetを同一commandで送り、Access / Provider Apply・Save / Importも同じcomplete draftと各owner targetを送る。Rustはcurrent effective baselineとの比較、draft completeness、target/admissionを副作用前にstatelessに検証する。config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberへ変換しない。Apply時だけ一時的な完全`ResolvedConfig`を一度だけ組み立て、optionalの空欄を`None` / emptyとして確定する。完全値をPartialへ落として古いglobal/base値を再継承しない。global Saveはdirty fieldだけをcurrent TOMLへmergeし、ResetはRustへdraftを保存せず、latest local revision/targetと一致するcorrelated success後だけfrontend draftを破棄する。古いprovider/import/access commandはtyped conflictとして拒否され、古いasync応答やpollingは新しいlocal draftをclear/上書きしない。active turnへの追加指示はowner-boundな単一flightで非同期保存し、同じsession/runへのdurable受理後だけ送信対象のdraftとattachmentをclearする。
 
 TUIでは、root sessionを開いた状態のF8とConfig EditorのF2（Apply Session）は3 modeを順に切り替えて現在のroot sessionへ保存し、commit後の次のpermission requestからactive Turn内のroot/childにも適用する。新規root sessionのpre-admission中にF8で切り替えた場合は`RunSessionAccessModeAdoption`が作成されたsessionへ最新値をCASし、その成功後にだけ`SessionStarted`とagent loopへ進む。human permission promptがpending中のF8はそのpromptのidentity、内容、decision ownerを変更・清算せず、新modeを次のpermission decisionだけへ使う。admit済みeffectも変更しない。再度開いたときも同じ選択を使う。sessionを開いていない状態のF8はglobal configへ保存する。明示的にchild agent sessionを開いた場合、そのchildからrootのaccess ownerを変更する操作は拒否される。
+
+### Shellの環境変数
+
+shellとformatterへ引き継ぐ環境変数は、すべての実行権限で`[shell].env_allowlist`に限定します。Windowsの標準値には`COMPUTERNAME`を含みます。設定に一覧を明示している場合は、その一覧が優先され、空の一覧も保持されます。旧版が保存した一覧も更新時に自動補完しません。
+
+モデルには許可された変数の**名前だけ**を実行環境として渡します。変数の値は列挙しません。旧設定などで`COMPUTERNAME`が引き継がれない場合も、PowerShellの`[System.Net.Dns]::GetHostName()`で端末名を取得できます。PowerShellでは`$Host`などの自動変数へ代入せず、エラー出力と取得内容も確認するよう実行説明を提供します。
 
 ## Confirmation
 

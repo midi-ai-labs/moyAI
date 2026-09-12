@@ -79,6 +79,7 @@ impl ToolRegistry {
         );
         tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
         tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+        insert_managed_shell_tools(&mut tools);
         tools.insert(
             "current_time".to_string(),
             Arc::new(crate::tool::current_time::CurrentTimeTool),
@@ -132,6 +133,7 @@ impl ToolRegistry {
                 Arc::new(crate::tool::mcp_call::McpCallTool),
             );
         }
+        synchronize_remote_wait_tool(&mut tools, config);
         Self {
             tools,
             effect_filter: None,
@@ -162,6 +164,7 @@ impl ToolRegistry {
         } else {
             tools.remove("mcp_call");
         }
+        synchronize_remote_wait_tool(&mut tools, config);
         Self {
             tools,
             effect_filter: self.effect_filter,
@@ -253,6 +256,20 @@ impl ToolRegistry {
     }
 }
 
+fn synchronize_remote_wait_tool(
+    tools: &mut HashMap<String, Arc<dyn Tool>>,
+    config: &crate::config::ResolvedConfig,
+) {
+    if crate::tool::wait_remote_tasks::remote_wait_available(config) {
+        tools.insert(
+            "wait_remote_tasks".to_string(),
+            Arc::new(crate::tool::wait_remote_tasks::WaitRemoteTasksTool),
+        );
+    } else {
+        tools.remove("wait_remote_tasks");
+    }
+}
+
 fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     insert_goal_tools(tools);
     tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
@@ -273,9 +290,25 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     );
     tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+    insert_managed_shell_tools(tools);
     tools.insert(
         "current_time".to_string(),
         Arc::new(crate::tool::current_time::CurrentTimeTool),
+    );
+}
+
+fn insert_managed_shell_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    tools.insert(
+        "shell_start".into(),
+        Arc::new(crate::tool::shell::ShellStartTool),
+    );
+    tools.insert(
+        "shell_status".into(),
+        Arc::new(crate::tool::shell::ShellStatusTool),
+    );
+    tools.insert(
+        "shell_stop".into(),
+        Arc::new(crate::tool::shell::ShellStopTool),
     );
 }
 
@@ -337,6 +370,58 @@ fn remove_multi_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remote_wait_registration_requires_enabled_hub_agent_but_not_local_multi_agent() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        for (mcp_enabled, server_enabled, remote_agent, server_id, expected) in [
+            (true, true, true, "hub-device-peer", true),
+            (false, true, true, "hub-device-peer", false),
+            (true, false, true, "hub-device-peer", false),
+            (true, true, false, "hub-device-peer", false),
+            (true, true, true, "manual-device", false),
+        ] {
+            config.mcp.enabled = mcp_enabled;
+            config.mcp.servers[0].enabled = server_enabled;
+            config.mcp.servers[0].remote_agent = remote_agent;
+            config.mcp.servers[0].id = server_id.into();
+            let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+            assert_eq!(
+                names.contains(&"wait_remote_tasks".into()),
+                expected,
+                "MCP={mcp_enabled} server={server_enabled} agent={remote_agent} id={server_id}"
+            );
+            assert!(!names.contains(&"wait_agent".into()));
+        }
+    }
+
+    #[test]
+    fn remote_wait_config_overlays_add_and_remove_stale_registration() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        config.mcp.servers[0].id = "hub-device-peer".into();
+        let active = super::ToolRegistry::core_agent().with_config_overlays(&config);
+        assert!(
+            active
+                .available_tool_names()
+                .contains(&"wait_remote_tasks".into())
+        );
+        config.mcp.servers.clear();
+        let removed = active.with_config_overlays(&config);
+        assert!(
+            !removed
+                .available_tool_names()
+                .contains(&"wait_remote_tasks".into())
+        );
+        assert!(
+            active
+                .available_tool_names()
+                .contains(&"wait_remote_tasks".into())
+        );
+    }
+
+    #[test]
     fn core_agent_registry_exposes_only_minimal_live_smoke_tools() {
         assert_eq!(
             super::ToolRegistry::core_agent().available_tool_names(),
@@ -351,6 +436,9 @@ mod tests {
                 "list",
                 "read",
                 "shell",
+                "shell_start",
+                "shell_status",
+                "shell_stop",
                 "update_goal",
                 "update_plan",
                 "write"

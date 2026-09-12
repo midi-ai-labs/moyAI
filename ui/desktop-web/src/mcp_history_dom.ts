@@ -22,6 +22,7 @@ export function synchronizeMcpHistorySurface(current: HTMLElement, next: HTMLEle
     const replacement = next.querySelector<HTMLButtonElement>(`#${CSS.escape(button.id)}`);
     if (!replacement) continue;
     button.disabled = replacement.disabled;
+    button.setAttribute("aria-disabled", String(button.disabled));
     button.hidden = replacement.hidden;
     const pressed = replacement.getAttribute("aria-pressed");
     if (pressed !== null) button.setAttribute("aria-pressed", pressed);

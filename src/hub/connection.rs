@@ -8,12 +8,13 @@ use tokio_util::sync::CancellationToken;
 use super::client::{RegisteredHubClient, validated_endpoint};
 use super::settings::decimal;
 use super::{
-    CatalogRevision, HubCatalog, HubCatalogClient, HubError, HubSelection, HubSettings,
-    HubSettingsStore, ReviewedHubSelection, bounded_text,
+    CatalogRevision, HubCatalog, HubCatalogBaseline, HubCatalogClient, HubCatalogComparison,
+    HubError, HubSelection, HubSettings, HubSettingsStore, ReviewedHubSelection, bounded_text,
 };
 
 #[path = "runtime.rs"]
 mod runtime;
+pub(crate) use runtime::HubExecutionGuard;
 use runtime::{ActiveHubTurn, HubActiveTurnProjection};
 pub use runtime::{HubRouteMode, HubTurnRoute};
 
@@ -37,10 +38,16 @@ impl HubReviewContext {
             Self::SideChat => &settings.side_chat_review,
         }
     }
-    fn set(self, settings: &mut HubSettings, review: ReviewedHubSelection) {
+    fn set(self, settings: &mut HubSettings, review: ReviewedHubSelection, catalog: &HubCatalog) {
         match self {
-            Self::Main => settings.main_review = Some(review),
-            Self::SideChat => settings.side_chat_review = Some(review),
+            Self::Main => {
+                settings.main_review = Some(review);
+                settings.main_catalog_baseline = Some(HubCatalogBaseline::capture(catalog));
+            }
+            Self::SideChat => {
+                settings.side_chat_review = Some(review);
+                settings.side_chat_catalog_baseline = Some(HubCatalogBaseline::capture(catalog));
+            }
         }
     }
 }
@@ -77,6 +84,8 @@ pub struct HubConnectionProjection {
     #[serde(default)]
     pub recommended_main_selection: Option<HubSelection>,
     pub side_chat_review: Option<ReviewedHubSelection>,
+    pub main_catalog_comparison: HubCatalogComparison,
+    pub side_chat_catalog_comparison: HubCatalogComparison,
     pub main_confirmation: HubReviewConfirmation,
     pub side_chat_confirmation: HubReviewConfirmation,
     pub error: Option<&'static str>,
@@ -103,6 +112,7 @@ struct ConnectionState {
     cancellation: CancellationToken,
     error: Option<HubError>,
     active: [Option<ActiveHubTurn>; 2],
+    delegated_active: std::collections::BTreeMap<String, (HubReviewContext, ActiveHubTurn)>,
 }
 
 impl ConnectionState {
@@ -157,6 +167,10 @@ impl ConnectionState {
         for active in self.active.iter().flatten() {
             active.cancel.cancel();
         }
+        for (_, active) in self.delegated_active.values() {
+            active.cancel.cancel();
+        }
+        self.delegated_active.clear();
         self.cancellation = CancellationToken::new();
         self.confirmed = [None, None];
         self.error = self.storage_error;
@@ -209,6 +223,16 @@ impl ConnectionState {
                 })
                 .map(|review| review.selection.clone()),
             side_chat_review: self.settings.side_chat_review.clone(),
+            main_catalog_comparison: HubCatalogComparison::between(
+                self.settings.main_review.as_ref(),
+                self.settings.main_catalog_baseline.as_ref(),
+                self.catalog.as_ref(),
+            ),
+            side_chat_catalog_comparison: HubCatalogComparison::between(
+                self.settings.side_chat_review.as_ref(),
+                self.settings.side_chat_catalog_baseline.as_ref(),
+                self.catalog.as_ref(),
+            ),
             main_confirmation: self.confirmation(HubReviewContext::Main),
             side_chat_confirmation: self.confirmation(HubReviewContext::SideChat),
             error: self.error.map(HubError::code),
@@ -276,6 +300,7 @@ impl HubConnection {
                     cancellation: CancellationToken::new(),
                     error: storage_error,
                     active: [None, None],
+                    delegated_active: Default::default(),
                 }),
                 store: Some(store),
                 network_http: std::sync::Mutex::new(None),
@@ -346,6 +371,7 @@ impl HubConnection {
                     cancellation: cancellation.clone(),
                     error: None,
                     active: [None, None],
+                    delegated_active: Default::default(),
                 }),
                 store: None,
                 network_http: std::sync::Mutex::new(Some(http)),
@@ -420,7 +446,7 @@ impl HubConnection {
             if use_default && proposed.main_review.is_none() {
                 if let Some(review) = recommendation.clone() {
                     client.review(HubReviewContext::Main, &review).await?;
-                    proposed.main_review = Some(review.clone());
+                    HubReviewContext::Main.set(&mut proposed, review.clone(), &catalog);
                     proposed.main_mode = HubRouteMode::Hub;
                     confirmed[0] = Some(review);
                 }
@@ -572,6 +598,8 @@ impl HubConnection {
                 {
                     proposed.main_review = None;
                     proposed.side_chat_review = None;
+                    proposed.main_catalog_baseline = None;
+                    proposed.side_chat_catalog_baseline = None;
                     proposed.main_mode = HubRouteMode::Direct;
                     proposed.side_chat_mode = HubRouteMode::Direct;
                 }
@@ -703,7 +731,7 @@ impl HubConnection {
                 selection,
             )?;
             let mut proposed = state.settings.clone();
-            context.set(&mut proposed, review.clone());
+            context.set(&mut proposed, review.clone(), catalog);
             // Local durability precedes remote confirmation. Failure never rolls a newer save
             // back; the durable choice remains visibly unconfirmed and can be explicitly retried.
             state.settings = self.persisted_store()?.save(&proposed)?;
@@ -745,7 +773,7 @@ impl HubConnection {
                     break;
                 };
                 let service = HubConnection { inner };
-                let (client, previous_revision, activity) = {
+                let (client, previous_revision, activity, active_turns) = {
                     let state = service.inner.state.lock().expect("Hub state lock poisoned");
                     if state.generation != generation {
                         break;
@@ -761,16 +789,38 @@ impl HubConnection {
                             .iter()
                             .flatten()
                             .any(|active| active.display.phase == "running")
+                            || state
+                                .delegated_active
+                                .values()
+                                .any(|(_, active)| active.display.phase == "running")
                         {
                             "running"
-                        } else if state.active.iter().any(Option::is_some) {
+                        } else if state.active.iter().any(Option::is_some)
+                            || !state.delegated_active.is_empty()
+                        {
                             "waiting"
                         } else {
                             "idle"
                         },
+                        [HubReviewContext::Main, HubReviewContext::SideChat]
+                            .into_iter()
+                            .filter_map(|context| {
+                                state.active[context.index()]
+                                    .as_ref()
+                                    .filter(|active| !active.cancel.is_cancelled())
+                                    .map(|active| (context, active.display.turn_id.clone(), false))
+                            })
+                            .chain(
+                                state
+                                    .delegated_active
+                                    .iter()
+                                    .filter(|(_, (_, active))| !active.cancel.is_cancelled())
+                                    .map(|(turn, (context, _))| (*context, turn.clone(), true)),
+                            )
+                            .collect::<Vec<_>>(),
                     )
                 };
-                let result = client.heartbeat(activity).await;
+                let result = client.heartbeat(activity, &active_turns).await;
                 match result {
                     Ok(revision)
                         if previous_revision.is_some_and(|previous| revision < previous) =>

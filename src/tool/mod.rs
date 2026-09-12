@@ -23,6 +23,7 @@ pub mod spec_plan;
 pub(crate) mod text_encoding;
 pub mod truncate;
 pub mod update_plan;
+pub mod wait_remote_tasks;
 pub mod write;
 pub(crate) mod write_support;
 

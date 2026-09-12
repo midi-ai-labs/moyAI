@@ -213,9 +213,17 @@ export async function observeInitialSetupSurface(cdp) {
     };
     const button = (selector) => {
       const found = one(selector);
+      const rect = found.node?.getBoundingClientRect();
+      const labelRange = document.createRange();
+      if (found.node) labelRange.selectNodeContents(found.node);
+      const labelRects = found.node ? Array.from(labelRange.getClientRects()) : [];
       return {
         count: found.count,
         visible: found.visible,
+        label_line_count: labelRects.length,
+        label_contained: Boolean(rect) && labelRects.length > 0 && labelRects.every(label =>
+          label.left >= rect.left - 1 && label.right <= rect.right + 1
+          && label.top >= rect.top - 1 && label.bottom <= rect.bottom + 1),
         enabled: found.node instanceof HTMLButtonElement
           && !found.node.disabled
           && found.node.getAttribute('aria-disabled') !== 'true',
@@ -320,6 +328,7 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
   const target = surface?.projection?.startup?.setup_target;
   const rect = surface?.wizard?.rect;
   const viewport = surface?.viewport;
+  const primary = expectedStep === "finish" ? surface?.wizard?.finish : surface?.wizard?.next;
   const providerFieldsReady = expectedStep !== "provider" || (
     surface?.wizard?.provider?.profile?.count === 1
     && surface.wizard.provider.profile.visible === true
@@ -361,9 +370,8 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
     && surface.visible_shell_count === 0
     && surface.visible_dialog_count === 0
     && surface.visible_backdrop_count === 0
-    && (expectedStep === "finish"
-      ? surface.wizard.finish.count === 1 && surface.wizard.finish.visible && surface.wizard.finish.enabled
-      : surface.wizard.next.count === 1 && surface.wizard.next.visible && surface.wizard.next.enabled)
+    && primary?.count === 1 && primary.visible && primary.enabled
+    && primary.label_contained === true && primary.label_line_count === 1
     && (expectedStep !== "start"
       || (surface.wizard.import_config.count === 1 && surface.wizard.import_config.visible))
     && INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS.every((key) => (

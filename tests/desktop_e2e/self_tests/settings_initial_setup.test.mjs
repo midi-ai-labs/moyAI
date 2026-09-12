@@ -62,9 +62,9 @@ function surface(step = "start", overrides = {}) {
         visible: true,
         current: row === step ? "step" : null,
       })),
-      next: { count: step === "finish" ? 0 : 1, visible: step !== "finish", enabled: step !== "finish" },
+      next: { count: step === "finish" ? 0 : 1, visible: step !== "finish", enabled: step !== "finish", label_contained: true, label_line_count: 1 },
       back: { count: step === "start" ? 0 : 1, visible: step !== "start", enabled: step !== "start" },
-      finish: { count: step === "finish" ? 1 : 0, visible: step === "finish", enabled: step === "finish" },
+      finish: { count: step === "finish" ? 1 : 0, visible: step === "finish", enabled: step === "finish", label_contained: true, label_line_count: 1 },
       import_config: { count: step === "start" ? 1 : 0, visible: step === "start", enabled: step === "start" },
       import_source: { count: step === "start" ? 1 : 0, visible: step === "start", text: "キャンセルした場合、現在のdraftは変わりません。" },
       provider: {
@@ -150,6 +150,16 @@ test("Initial Setup predicate requires the exact fullscreen six-step zero-networ
         },
       },
     }), [], "model", workspace), false, `${key} must remain absent from Initial Setup`);
+  }
+});
+
+test("Initial Setup rejects a visible enabled primary action with wrapped or overflowing text", () => {
+  for (const [step, action] of [["start", "next"], ["finish", "finish"]]) {
+    for (const change of [{ label_contained: false }, { label_line_count: 2 }]) {
+      const candidate = surface(step);
+      Object.assign(candidate.wizard[action], change);
+      assert.equal(initialSetupStepReady(candidate, [], step, workspace), false);
+    }
   }
 });
 

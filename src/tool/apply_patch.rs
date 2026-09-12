@@ -983,17 +983,14 @@ async fn classify_patch_operations_before_side_effects(
                     guarded.inside_workspace,
                 )
                 .map_err(|error| bounded_patch_application_error(path, error))?;
-                let normalized = ctx.services.formatter.normalize_text(
-                    &ctx.config.format,
-                    &destination,
-                    Some(&original),
-                    patched,
-                )?;
+                // A targeted patch preserves untouched bytes and the source EOF
+                // shape. Only an explicitly admitted formatter may rewrite the
+                // whole updated file; Add/whole-file write keep their defaults.
                 let formatted = effect_admission
                     .format_if_planned(
                         &ctx.services.formatter,
                         formatter_plan,
-                        normalized.clone(),
+                        patched,
                         formatter_execution_options(ctx),
                     )
                     .await?;
@@ -1693,6 +1690,7 @@ mod tests {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         };
         let large_path = root.join("large.txt");
         let deleted_path = root.join("obsolete.txt");
@@ -1822,6 +1820,140 @@ mod tests {
                 .is_some(),
             "successful public apply_patch must synchronize the typed mutation baseline"
         );
+    }
+
+    #[tokio::test]
+    async fn targeted_updates_and_moves_preserve_mixed_endings_through_public_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).unwrap();
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &root, "mixed newlines", "none")
+            .await
+            .unwrap();
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "mixed newlines".into(),
+                cwd: root.clone(),
+                model: "model".into(),
+                base_url: "http://localhost:1234".into(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        let mut config = crate::config::ResolvedConfig::default();
+        config.format.default_newline = NewlineStyle::Crlf;
+        config.format.ensure_trailing_newline = true;
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).unwrap();
+        let session = SessionContext { session, workspace };
+        let services = ToolServices {
+            edit_safety: EditSafety::default(),
+            formatter: Formatter::new(config.format.clone()),
+            change_tracker: crate::edit::ChangeTracker,
+            store: store.clone(),
+            storage_paths: paths,
+            truncator: ToolTruncator,
+            mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+            skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
+        };
+        for (name, content) in [
+            ("edited.txt", "head\r\ncontext  \nold\r\nuntouched\nlast"),
+            ("source.txt", "one\r\ntwo\nlast"),
+            ("eof.txt", "old\r\n"),
+            ("same.txt", "head\r\nold\nlast"),
+        ] {
+            std::fs::write(root.join(name), content).unwrap();
+        }
+        let patch = "*** Begin Patch\n*** Update File: edited.txt\n@@\n head\n context\n-old\n+new\n*** Update File: source.txt\n*** Move to: moved.txt\n@@\n one\n two\n last\n*** Update File: eof.txt\n@@\n-old\n+new\n*** Update File: same.txt\n@@\n-old\n+old\n*** Add File: created.txt\n+first\n+second\n*** End Patch";
+        let control = RunControl::new();
+        let turn_id = TurnId::new();
+        let admission_id = store
+            .session_repo()
+            .admit_session_turn(session.session.id, turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .admission_id;
+        let mutation_fence = RunMutationFence::new(
+            store.session_repo(),
+            session.session.id,
+            admission_id,
+            turn_id,
+            control.clone(),
+        );
+        let tool_call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session.session.id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: tool_call_id,
+                        model_call_id: "mixed-newlines".into(),
+                        tool_name: "apply_patch".into(),
+                        arguments_json: serde_json::json!({"patch_text": patch}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let mut prompt = AllowPrompt;
+        let result = ApplyPatchTool
+            .execute(
+                serde_json::json!({"patch_text": patch}),
+                ToolContext {
+                    session: &session,
+                    workspace: &session.workspace,
+                    config: &config,
+                    tool_call_id,
+                    cancel: control.token(),
+                    run_control: control,
+                    run_mutation_fence: mutation_fence,
+                    prompt: &mut prompt,
+                    services: &services,
+                    agent: None,
+                    permission_guardian: None,
+                },
+            )
+            .await
+            .expect("public apply_patch must preserve source bytes independently of defaults");
+        assert_eq!(result.recorded_changes.len(), 4);
+        assert!(!root.join("source.txt").exists());
+        for (name, expected) in [
+            ("edited.txt", "head\r\ncontext  \nnew\r\nuntouched\nlast"),
+            ("moved.txt", "one\r\ntwo\nlast"),
+            ("eof.txt", "new\r\n"),
+            ("same.txt", "head\r\nold\nlast"),
+            ("created.txt", "first\r\nsecond\r\n"),
+        ] {
+            assert_eq!(
+                std::fs::read(root.join(name)).unwrap(),
+                expected.as_bytes(),
+                "{name}"
+            );
+        }
     }
 
     #[cfg(windows)]

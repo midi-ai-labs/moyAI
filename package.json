@@ -8,6 +8,8 @@
     "test:desktop-web": "node --test ui/desktop-web/test/*.test.ts",
     "test:desktop-e2e-harness": "node --test tests/desktop_e2e/self_tests/*.test.mjs",
     "qualify:desktop-e2e-harness": "node tests/desktop_e2e/run_scenario.mjs",
+    "test:gui": "node tests/desktop_e2e/run_suite.mjs",
+    "verify:gui": "node scripts/verify-gui.mjs",
     "build:desktop-web": "tsc --noEmit && vite build",
     "tauri:dev": "tauri dev --features tauri-desktop",
     "tauri:build": "tauri build --features tauri-desktop"

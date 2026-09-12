@@ -400,6 +400,46 @@ test("navigation, Escape, Tab, and printable keys expose distinct browser keyDow
   assert.throws(() => normalizeWebviewKey("A"), /unsupported WebView key/);
 });
 
+test("named function and navigation keys deliver distinct events without text or retained pressed keys", async () => {
+  for (const [key, virtualKey] of [["F8", 119], ["F9", 120], ["End", 35], ["ArrowLeft", 37], ["ArrowRight", 39]]) {
+    const cdp = new FakeCdp();
+    const input = new WebviewInput(cdp);
+    await input.pressKey(key);
+    assert.deepEqual(cdp.calls.map(call => [call.method, call.params.type, call.params.key, call.params.code, call.params.windowsVirtualKeyCode]), [
+      ["Input.dispatchKeyEvent", "keyDown", key, key, virtualKey],
+      ["Input.dispatchKeyEvent", "keyUp", key, key, virtualKey],
+    ]);
+    assert.equal(cdp.calls.some(call => Object.hasOwn(call.params, "text") || Object.hasOwn(call.params, "unmodifiedText")), false);
+    assert.deepEqual(input.pressedKeys, []);
+  }
+});
+
+test("Enter delivers one native activation character and suppresses it for command modifiers", async () => {
+  for (const [modifier, characterExpected] of [[null, true], ["Shift", true], ["Control", false], ["Alt", false], ["Meta", false]]) {
+    const cdp = new FakeCdp();
+    const input = new WebviewInput(cdp);
+    if (modifier) await input.keyDown(modifier);
+    await input.pressKey("Enter");
+    if (modifier) await input.keyUp(modifier);
+    const events = cdp.calls.filter((call) => call.params.code === "Enter");
+    assert.deepEqual(events.map((call) => [call.method, call.params.type]), [
+      ["Input.dispatchKeyEvent", "keyDown"], ["Input.dispatchKeyEvent", "keyUp"],
+    ], `${modifier ?? "plain"} Enter has one delivery and one release`);
+    for (const event of events) {
+      assert.equal(event.params.key, "Enter");
+      assert.equal(event.params.windowsVirtualKeyCode, 13);
+    }
+    assert.equal(Object.hasOwn(events[0].params, "text"), characterExpected, modifier ?? "plain");
+    assert.equal(Object.hasOwn(events[0].params, "unmodifiedText"), characterExpected, modifier ?? "plain");
+    if (characterExpected) {
+      assert.equal(events[0].params.text, "\r", "native summary activation requires the Enter character");
+      assert.equal(events[0].params.unmodifiedText, "\r");
+    }
+    assert.equal(Object.hasOwn(events[1].params, "text"), false, "key release does not deliver another character");
+    assert.deepEqual(input.pressedKeys, []);
+  }
+});
+
 test("exact focused text insertion supports byte-identical Unicode and multiline input without DOM assignment", async () => {
   const identity = {
     tag: "TEXTAREA",

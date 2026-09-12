@@ -31,6 +31,7 @@ pub struct ToolServices {
     pub truncator: ToolTruncator,
     pub mcp: Arc<crate::mcp::McpClient>,
     pub skills: crate::skill::SkillsService,
+    pub managed_shells: crate::tool::shell::ManagedShells,
 }
 
 pub struct ToolContext<'a> {
@@ -251,6 +252,14 @@ pub struct RunMutationFence {
 impl RunMutationFence {
     pub(crate) fn turn_id(&self) -> TurnId {
         self.turn_id
+    }
+
+    pub(crate) fn has_pending_turn_steer_input(&self) -> Result<bool, ToolError> {
+        Ok(self.repo.has_pending_turn_steers_for_admitted_turn(
+            self.session_id,
+            self.admission_id,
+            self.turn_id,
+        )?)
     }
 
     pub fn new(
@@ -752,6 +761,7 @@ mod tests {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         };
         (config, SessionContext { session, workspace }, services)
     }
@@ -1435,6 +1445,82 @@ mod tests {
 
         assert!(matches!(admission.admit(), Err(ToolError::Message(_))));
         assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn remote_wait_fence_reads_cross_store_steer_without_an_agent_or_consuming_input() {
+        use crate::protocol::{SteerTurn, UserInputItem, UserTurn};
+
+        let (store, session_id) = fence_test_session().await;
+        let repo = store.session_repo();
+        let turn_id = TurnId::new();
+        let admission_id = repo
+            .admit_session_turn(session_id, turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .admission_id;
+        repo.append_user_turn_with_protocol_bundle(
+            session_id,
+            admission_id,
+            &UserTurn {
+                turn_id,
+                items: vec![UserInputItem::Text {
+                    text: "Wait for the remote task".into(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+            turn_id,
+            0,
+        )
+        .await
+        .unwrap();
+        let fence = RunMutationFence::new(
+            repo.clone(),
+            session_id,
+            admission_id,
+            turn_id,
+            RunControl::new(),
+        );
+        assert!(!fence.has_pending_turn_steer_input().unwrap());
+        let other_store = StoreBundle::new(SqliteStore::open(store.paths()).unwrap());
+        let steer_id = other_store
+            .session_repo()
+            .accept_active_turn_steer(
+                session_id,
+                1,
+                &SteerTurn {
+                    expected_turn_id: turn_id,
+                    items: vec![UserInputItem::Text {
+                        text: "Inspect the latest result first".into(),
+                    }],
+                    additional_context: Default::default(),
+                    client_user_message_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(fence.has_pending_turn_steer_input().unwrap());
+        assert!(fence.has_pending_turn_steer_input().unwrap());
+        let stale = RunMutationFence::new(
+            repo.clone(),
+            session_id,
+            admission_id,
+            TurnId::new(),
+            RunControl::new(),
+        );
+        assert!(stale.has_pending_turn_steer_input().is_err());
+        assert_eq!(
+            repo.deliver_all_pending_turn_steers_for_admitted_turn(
+                session_id,
+                admission_id,
+                turn_id
+            )
+            .unwrap(),
+            vec![steer_id]
+        );
+        assert!(!fence.has_pending_turn_steer_input().unwrap());
     }
 
     #[tokio::test]

@@ -47,6 +47,14 @@ Run verification commands directly. Do not append status-printing wrappers that
 mask the command exit code. When the user specifies stdout, stderr, or exit-code
 requirements, verify those exact streams and codes before finishing.
 
+Keep measured results distinct from estimates and other agents' reports. A missing
+or failed measurement stays unknown: expected code paths, elapsed time, or a
+process disappearing do not establish an observed result. Do not replace recorded
+failures, null values, or timestamps with inferred success. Label estimates
+separately; when new measurements correct an earlier result, preserve the earlier
+evidence and identify the new observation. Task completion does not prove that its
+acceptance checks passed.
+
 When the task is complete, answer concisely with the outcome and the evidence that
 supports it. If you cannot complete the task, say what blocked you and what
 evidence you saw.

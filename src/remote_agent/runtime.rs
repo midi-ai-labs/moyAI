@@ -102,6 +102,7 @@ struct JobWorker {
     profile: PublishProfileId,
     run_control: RunControl,
     run_service: Arc<RunService>,
+    managed_shell_lifetime: CancellationToken,
     handle: OwnedTaskHandle,
 }
 
@@ -147,6 +148,57 @@ impl RemoteJobService {
         self.inner.state.lock().is_ok_and(|mut state| {
             state.reap();
             !state.workers.is_empty()
+        })
+    }
+
+    /// Synchronous snapshot for Desktop's existing ordered projection. At most
+    /// MAX_ACTIVE_JOBS job mappings are read; result bodies/history are never loaded.
+    pub(crate) fn activity_now(&self) -> super::RemoteActivityProjection {
+        let result = (|| {
+            let workers = {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| PublishCallError::Unavailable)?;
+                state
+                    .workers
+                    .iter()
+                    .filter(|(_, worker)| !worker.handle.is_finished())
+                    .map(|(session, worker)| {
+                        (
+                            *session,
+                            worker.run_control.is_cancelled()
+                                || state
+                                    .profiles
+                                    .get(&worker.profile)
+                                    .is_some_and(|scope| scope.admission_closed.is_cancelled()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let store = self.inner.process.store().remote_job_store();
+            let mut states = Vec::with_capacity(workers.len());
+            for (session, cancelling) in workers {
+                let job = store
+                    .job_for_session(session)
+                    .map_err(|_| PublishCallError::Unavailable)?
+                    .ok_or(PublishCallError::Unavailable)?;
+                states.push(if cancelling {
+                    RemoteJobState::Cancelling
+                } else if self.inner.approvals.waiting(job.id) {
+                    RemoteJobState::AwaitingApproval
+                } else if job.admitted_turn_id.is_some() {
+                    RemoteJobState::Running
+                } else {
+                    RemoteJobState::Accepted
+                });
+            }
+            Ok::<_, PublishCallError>(super::RemoteActivityProjection::from_states(states))
+        })();
+        result.unwrap_or(super::RemoteActivityProjection {
+            unavailable: true,
+            ..Default::default()
         })
     }
 
@@ -459,6 +511,10 @@ impl RemoteJobService {
     pub(crate) fn cancel_profile(&self, profile: PublishProfileId) {
         let captured = {
             let Ok(mut state) = self.inner.state.lock() else {
+                self.inner
+                    .process
+                    .managed_shells()
+                    .cancel_profile(profile.0);
                 return;
             };
             state.reap();
@@ -472,6 +528,11 @@ impl RemoteJobService {
                 .map(|worker| (worker.run_service.clone(), worker.run_control.clone()))
                 .collect::<Vec<_>>()
         };
+        // Completed jobs may still own a managed server process.
+        self.inner
+            .process
+            .managed_shells()
+            .cancel_profile(profile.0);
         // A stop operation is owned until it has requested the ordinary canonical Stop.
         // The job worker remains in the registry until it actually finishes.
         if let Ok(handle) = self.inner.executor.spawn(0, move || async move {
@@ -489,6 +550,10 @@ impl RemoteJobService {
         }
         let captured = {
             let Ok(state) = self.inner.state.lock() else {
+                self.inner
+                    .process
+                    .managed_shells()
+                    .cancel_lineages(&lineages);
                 return;
             };
             let store = self.inner.process.store().remote_job_store();
@@ -511,10 +576,21 @@ impl RemoteJobService {
                         .any(|(origin, root)| {
                             origin == &claims.origin_device_id && root == &claims.root_task_id
                         })
-                        .then(|| (worker.run_service.clone(), worker.run_control.clone()))
+                        .then(|| {
+                            // Close command admission synchronously with selecting the job.
+                            // Canonical Stop below may settle after a shell_start resumes.
+                            worker.managed_shell_lifetime.cancel();
+                            (worker.run_service.clone(), worker.run_control.clone())
+                        })
                 })
                 .collect::<Vec<_>>()
         };
+        // A completed worker can be reaped before this lock is acquired. Its
+        // command was already registered; scan after closing every active lifetime.
+        self.inner
+            .process
+            .managed_shells()
+            .cancel_lineages(&lineages);
         if let Ok(handle) = self.inner.executor.spawn(0, move || async move {
             for (service, control) in captured {
                 let _ = service.request_root_execution_stop(&control).await;
@@ -526,6 +602,7 @@ impl RemoteJobService {
 
     pub(crate) async fn drain_profile(&self, profile: PublishProfileId, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
+        let managed_shells = self.inner.process.managed_shells();
         loop {
             let active = match self.inner.state.lock() {
                 Ok(mut state) => {
@@ -537,7 +614,7 @@ impl RemoteJobService {
                 }
                 Err(_) => return false,
             };
-            if !active {
+            if !active && !managed_shells.has_profile_work(profile.0) {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -690,7 +767,10 @@ impl RemoteJobService {
                     if let (Some(network), Some(authority)) = (&network, &authority) {
                         network.capture_inbound(session_id, job.id, authority.clone());
                     }
-                    let worker_run_service = run_service.clone();
+                    let managed_shell_lifetime = scope.admission_closed.child_token();
+                    let worker_run_service = Arc::new(
+                        run_service.with_managed_shell_lifetime(managed_shell_lifetime.clone()),
+                    );
                     let worker_network = network.clone();
                     let worker_authority = authority.clone();
                     let worker_service = self.clone();
@@ -831,6 +911,7 @@ impl RemoteJobService {
                             profile: scope.profile.id,
                             run_control: control,
                             run_service: run_service.clone(),
+                            managed_shell_lifetime,
                             handle,
                         },
                     );

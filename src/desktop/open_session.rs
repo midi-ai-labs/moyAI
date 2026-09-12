@@ -358,17 +358,19 @@ fn canonical_suffix_boundary(
         let mut boundary = None;
         let mut invalid = false;
         for (live_index, row) in &live_primary {
-            let Some((expected_kind, expected_body)) = expected.get(expected_index) else {
-                break;
-            };
-            if row.row_kind == *expected_kind && row.body == *expected_body {
-                expected_index += 1;
+            if let Some(matched) =
+                canonical_conversation_match(expected, expected_index, row.row_kind, &row.body)
+            {
+                expected_index = matched + 1;
                 boundary = Some(*live_index);
                 if expected_index == expected.len() {
                     break;
                 }
-            } else if row.row_kind != Assistant {
-                invalid = true;
+            } else {
+                // Unknown live content is not an overlap. Preserve the remaining
+                // suffix, including streaming text, instead of skipping it to
+                // find a later matching user row.
+                invalid = row.row_kind != Assistant;
                 break;
             }
         }
@@ -497,34 +499,55 @@ fn canonical_suffix_covers_live_conversation(
     stored: &[(super::models::DesktopTranscriptRowKind, String)],
     live: &[(super::models::DesktopTranscriptRowKind, String)],
 ) -> bool {
-    use super::models::DesktopTranscriptRowKind::{Assistant, Error};
-
     for suffix_start in 0..stored.len() {
-        let mut live_index = 0;
+        let mut stored_index = suffix_start;
         let mut valid = true;
-        for stored_row in &stored[suffix_start..] {
-            match live.get(live_index) {
-                Some(live_row) if live_row == stored_row => live_index += 1,
-                Some(live_row)
-                    if stored_row.0 == Assistant
-                        && live_row.0 == Assistant
-                        && !live_row.1.is_empty()
-                        && stored_row.1.starts_with(&live_row.1) =>
-                {
-                    live_index += 1;
-                }
-                _ if matches!(stored_row.0, Assistant | Error) => {}
-                _ => {
-                    valid = false;
-                    break;
-                }
+        for (kind, body) in live {
+            if let Some(matched) = canonical_conversation_match(stored, stored_index, *kind, body) {
+                stored_index = matched + 1;
+            } else {
+                valid = false;
+                break;
             }
         }
-        if valid && live_index == live.len() {
+        if valid
+            && stored[stored_index..]
+                .iter()
+                .all(|row| canonical_row_may_be_missing_live(row.0))
+        {
             return true;
         }
     }
     false
+}
+
+/// Ordered overlap shared by active and terminal projection. Canonical assistant
+/// and error delivery may precede live rendering, but a user boundary may not be
+/// skipped and unmatched live content is never treated as already stored.
+fn canonical_conversation_match(
+    stored: &[(super::models::DesktopTranscriptRowKind, String)],
+    start: usize,
+    live_kind: super::models::DesktopTranscriptRowKind,
+    live_body: &str,
+) -> Option<usize> {
+    use super::models::DesktopTranscriptRowKind::Assistant;
+    for (index, (kind, body)) in stored.iter().enumerate().skip(start) {
+        if *kind == live_kind
+            && (body == live_body
+                || (*kind == Assistant && !live_body.is_empty() && body.starts_with(live_body)))
+        {
+            return Some(index);
+        }
+        if !canonical_row_may_be_missing_live(*kind) {
+            return None;
+        }
+    }
+    None
+}
+
+fn canonical_row_may_be_missing_live(kind: super::models::DesktopTranscriptRowKind) -> bool {
+    use super::models::DesktopTranscriptRowKind::{Assistant, Error};
+    matches!(kind, Assistant | Error)
 }
 
 fn stored_lifecycle_matches_live(stored: crate::session::SessionStatus, live: RunStatus) -> bool {
@@ -1503,6 +1526,148 @@ mod tests {
                 "{body} appears once across canonical delivery and the live suffix"
             );
         }
+    }
+
+    #[test]
+    fn running_detail_does_not_duplicate_users_when_prior_assistant_is_missing_from_live() {
+        let mut session = session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let prior = TurnId::new();
+        let active = TurnId::new();
+        let items = vec![
+            turn_item(
+                session.id,
+                prior,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "first request".into(),
+                },
+            ),
+            turn_item(
+                session.id,
+                prior,
+                2,
+                TurnItemPayload::AgentMessage {
+                    text: "first final".into(),
+                },
+            ),
+            turn_item(
+                session.id,
+                prior,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+            turn_item(
+                session.id,
+                active,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "second request".into(),
+                },
+            ),
+        ];
+        let mut read = canonical_read(&session, 0, items.len(), items.len(), items);
+        read.active_turn_id = Some(active);
+        let view = OpenSessionView::from_loaded(&read);
+        let mut live = AppState::default();
+        live.current_session_id = Some(session.id);
+        live.run_status = RunStatus::Running;
+        live.transcript_entries = ["first request", "second request"]
+            .into_iter()
+            .map(|body| TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".into(),
+                body: body.into(),
+                response_id: None,
+                tool_call_id: None,
+            })
+            .collect();
+
+        let detail = view.live_detail(&live, None);
+
+        assert_eq!(
+            primary_conversation_rows(&detail),
+            vec![
+                (DesktopTranscriptRowKind::User, "first request".into()),
+                (DesktopTranscriptRowKind::Assistant, "first final".into()),
+                (DesktopTranscriptRowKind::User, "second request".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_reconciliation_keeps_unmatched_live_content_and_user_order() {
+        use DesktopTranscriptRowKind::{Assistant, Error, User};
+        let prefix = vec![
+            transcript_row(User, "User", "first request"),
+            transcript_row(Assistant, "Assistant", "first final"),
+            transcript_row(User, "User", "second request"),
+        ];
+        for kind in [User, Assistant, Error] {
+            let live = vec![
+                transcript_row(User, "User", "first request"),
+                transcript_row(kind, "Live", "unmatched live content"),
+                transcript_row(User, "User", "second request"),
+            ];
+            let merged = merge_canonical_prefix_with_live_suffix(prefix.clone(), live);
+            let unmatched = merged
+                .iter()
+                .position(|row| row.body == "unmatched live content")
+                .unwrap();
+            assert_eq!(
+                merged
+                    .iter()
+                    .filter(|row| row.body == "unmatched live content")
+                    .count(),
+                1
+            );
+            assert!(
+                merged[unmatched + 1..]
+                    .iter()
+                    .any(|row| row.row_kind == User && row.body == "second request")
+            );
+        }
+        let reversed = vec![
+            transcript_row(User, "User", "second request"),
+            transcript_row(User, "User", "first request"),
+        ];
+        let merged = merge_canonical_prefix_with_live_suffix(prefix, reversed);
+        assert!(primary_conversation_rows_from_rows(&merged).ends_with(&[
+            (User, "second request".into()),
+            (User, "first request".into()),
+        ]));
+    }
+
+    #[test]
+    fn active_reconciliation_preserves_repeated_user_submissions_and_current_streaming_text() {
+        use DesktopTranscriptRowKind::{Assistant, Error, User};
+        let prefix = vec![
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(Error, "Error", "stored warning"),
+            transcript_row(Assistant, "Assistant", "previous final"),
+            transcript_row(User, "User", "repeat this"),
+        ];
+        let live = vec![
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(Assistant, "Assistant", "current stream"),
+        ];
+        let merged = merge_canonical_prefix_with_live_suffix(prefix, live);
+        assert_eq!(
+            primary_conversation_rows_from_rows(&merged),
+            vec![
+                (User, "repeat this".into()),
+                (Error, "stored warning".into()),
+                (Assistant, "previous final".into()),
+                (User, "repeat this".into()),
+                (User, "repeat this".into()),
+                (Assistant, "current stream".into()),
+            ]
+        );
     }
 
     #[test]

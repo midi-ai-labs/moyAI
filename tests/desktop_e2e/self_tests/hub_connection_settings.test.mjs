@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  HUB_FIXTURE_ID, HubSettingsFixture, createHubConnectionSettingsScenario,
-  hubAdvancedControlsReady, hubConnectedLayoutFailures, hubContextConfirmed, hubDraftRetained, hubPersistenceFailures, hubRestartPreferencesReady,
+  HUB_FIXTURE_ID, HUB_FIXTURE_MODELS, HubSettingsFixture, createHubConnectionSettingsScenario,
+  hubAdvancedControlsReady, hubConnectedLayoutFailures, hubContextConfirmed, hubControlReady, hubDraftRetained, hubPersistenceFailures, hubRestartPreferencesReady, hubSelectionControlsFailures, hubEmptySelectionControlsReady,
 } from "../scenarios/hub_connection_settings.mjs";
 
 function selection(model = "e2e-main", affinity = 9) {
@@ -14,8 +14,10 @@ function review(model = "e2e-main", revision = "8", affinity = 9) {
   return { hub_id: HUB_FIXTURE_ID, reviewed_revision: revision, selection: selection(model, affinity) };
 }
 function durable() {
-  return { schema_version: 2, revision: "4", endpoint: "http://127.0.0.1:43210/", label: "Desktop E2E device", hub_id: HUB_FIXTURE_ID,
+  return { schema_version: 3, revision: "4", endpoint: "http://127.0.0.1:43210/", label: "Desktop E2E device", hub_id: HUB_FIXTURE_ID,
     main_mode: "direct", side_chat_mode: "direct",
+    main_catalog_baseline: {hub_id:HUB_FIXTURE_ID,revision:"8",software_version:"0.1.0",models:structuredClone(HUB_FIXTURE_MODELS)},
+    side_chat_catalog_baseline: {hub_id:HUB_FIXTURE_ID,revision:"7",software_version:"0.1.0",models:structuredClone(HUB_FIXTURE_MODELS)},
     main_review: review(), side_chat_review: review("e2e-side", "7", 2) };
 }
 function confirmedSurface() {
@@ -36,9 +38,43 @@ test("Hub scenario uses the shared execution lifecycle with a bounded public nam
   const scenario = createHubConnectionSettingsScenario();
   assert.equal(scenario.id, "hub.connection-settings");
   assert.equal(scenario.productOracle, "pass");
-  assert.equal(scenario.manualGate, "not_required");
+  assert.equal(scenario.manualGate, "pending");
   for (const operation of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) assert.equal(typeof scenario[operation], "function");
   assert.equal("launch" in scenario, false);
+});
+
+test("Hub dropdown oracle requires the allowed subset, independent preferred and wait choice",()=>{
+  const selection={allowed_model_ids:["e2e-main","e2e-side"],preferred_model_id:"e2e-side",required_capabilities:[],wait_policy:"allow_selected_fallback",affinity_turns:4};
+  const local={selected:selection.allowed_model_ids,preferred:{enabled:true,value:"e2e-side",options:[{value:"e2e-main",label:"Main",disabled:false},{value:"e2e-side",label:"Side",disabled:false}]},wait:{enabled:true,value:"allow_selected_fallback",options:[{value:"wait_for_preferred",label:"Wait"},{value:"allow_selected_fallback",label:"Fallback"}]},confirmation:"Hubで確認済み"};
+  const surface={main:local,hub:{main_confirmation:"confirmed",main_review:{selection}},fatal_count:0};
+  assert.deepEqual(hubSelectionControlsFailures(surface,"main",selection,{confirmed:true}),[]);
+  const reorderedObject=structuredClone(surface);
+  reorderedObject.hub.main_review.selection=Object.fromEntries(Object.entries(reorderedObject.hub.main_review.selection).reverse());
+  assert.deepEqual(hubSelectionControlsFailures(reorderedObject,"main",selection,{confirmed:true}),[],"JSON object property order does not change the reviewed values");
+  const reordered=structuredClone(surface);reordered.hub.main_review.selection.allowed_model_ids.reverse();
+  assert.deepEqual(hubSelectionControlsFailures(reordered,"main",selection,{confirmed:true}),[]);
+  for(const mutate of [v=>v.main.preferred.options.push({value:"phantom",label:"not allowed",disabled:false}),v=>v.main.preferred.value="e2e-main",v=>v.main.wait.value="wait_for_preferred",v=>v.hub.main_review.selection.affinity_turns=8,v=>v.main.selected=[]]){
+    const value=structuredClone(surface);mutate(value);assert.notDeepEqual(hubSelectionControlsFailures(value,"main",selection,{confirmed:true}),[]);
+  }
+});
+
+test("Hub no candidates disables both preferred selection and Save",()=>{
+  const value={fatal_count:0,main:{selected:[],preferred:{enabled:false,value:"",options:[{value:"",label:"利用候補から選択してください"}]},save_enabled:false}};
+  assert.equal(hubEmptySelectionControlsReady(value,"main"),true);
+  for(const mutate of [v=>v.main.save_enabled=true,v=>v.main.preferred.enabled=true,v=>v.main.preferred.options=[{value:"phantom"}],v=>v.main.selected=["old"]]){const bad=structuredClone(value);mutate(bad);assert.equal(hubEmptySelectionControlsReady(bad,"main"),false);}
+});
+
+test("Hub navigation waits for an absent next control but rejects duplicate targets", () => {
+  const selector = "#hub-tab-models";
+  assert.equal(hubControlReady(selector, { count: 0, active: false }), false);
+  assert.equal(hubControlReady(selector, { count: 1, active: false }), true);
+  assert.equal(hubControlReady(selector, { count: 1, active: true }), true);
+  assert.throws(() => hubControlReady(selector, { count: 2, active: false }), error => {
+    assert.equal(error.owner, "product");
+    assert.equal(error.evidence.selector, selector);
+    assert.equal(error.evidence.count, 2);
+    return true;
+  });
 });
 
 test("Connected layout rejects clipped footer, oversized checkbox, missing label and unreachable close", () => {
@@ -122,6 +158,8 @@ test("Durable preferences oracle rejects credential fields and independent selec
     (value) => { value.main_review.selection.affinity_turns = 4; },
     (value) => { value.hub_id = "different-hub"; },
     (value) => { value.main_mode = "hub"; },
+    (value) => { value.side_chat_catalog_baseline.revision = "8"; },
+    (value) => { value.main_catalog_baseline.models[0].endpoint = "http://provider"; },
   ]) {
     const invalid = durable();
     change(invalid);

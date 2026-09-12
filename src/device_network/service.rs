@@ -803,6 +803,7 @@ impl DeviceNetworkService {
         commit()?;
         if state.shared != shared {
             state.pending_join = None;
+            self.inner.outgoing.peer_connections.clear();
         }
         state.shared = shared;
         state.generation += 1;
@@ -984,6 +985,7 @@ impl DeviceNetworkService {
         proposed.certificate_sha256 = Some(receipt.certificate_sha256);
         proposed.expires_at_ms = Some(receipt.expires_at_ms.to_string());
         state.settings = self.inner.settings.save(&proposed)?;
+        self.inner.outgoing.peer_connections.clear();
         state.client = Some(client);
         state.status = "active";
         state.error = None;
@@ -1526,6 +1528,7 @@ impl DeviceNetworkService {
             .lock()
             .expect("device network state poisoned");
         state.closing = true;
+        self.inner.outgoing.peer_connections.clear();
         state.receiver_requested = false;
         state.generation += 1;
         state.cancellation.cancel();
@@ -1584,6 +1587,7 @@ impl DeviceNetworkService {
             .map_err(|_| DeviceError::Unavailable)?;
         state.cancellation.cancel();
         state.client = None;
+        self.inner.outgoing.peer_connections.clear();
         state.peers.clear();
         state.status = "disconnected";
         state.generation += 1;

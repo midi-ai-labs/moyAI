@@ -95,9 +95,9 @@ function chatRequest(messages, overrides = {}) {
 }
 
 function parseSse(text) {
-  return text
-    .split("\n\n")
-    .filter(Boolean)
+  const blocks = text.split("\n\n").filter(Boolean);
+  assert.equal(blocks.pop(), "data: [DONE]", "each successful Chat response must terminate explicitly before EOF");
+  return blocks
     .map((block) => {
       assert.match(block, /^data: /);
       return JSON.parse(block.slice("data: ".length));
@@ -130,7 +130,55 @@ async function startChatProvider() {
   });
 }
 
-test("Chat continuation script emits split bare ChatML, one current_time call, then a released final", async (context) => {
+test("a selected GUI fixture tool keeps exact arguments and requires its actual output marker", async (context) => {
+  const call = { prompt: "Run the isolated read fixture", name: "read", arguments: { path: "receipt.txt" },
+    outputMarker: "RECEIPT_FROM_TOOL", responseText: "GUI_FIXTURE_DONE" };
+  const provider = await startScriptedProvider({ responseBehavior: "hold_until_release",
+    script: createChatToolContinuationProviderScript({ call }) });
+  context.after(() => provider.close());
+  const initial = [{ role: "system", content: SYSTEM }, { role: "user", content: call.prompt }];
+  const absentProvider = await startScriptedProvider({ responseBehavior: "hold_until_release",
+    script: createChatToolContinuationProviderScript({ call }) });
+  context.after(() => absentProvider.close());
+  const absentTool = await post(absentProvider, chatRequest(initial, { tools: [currentTimeTool()] }));
+  assert.equal(absentTool.status, 422);
+  const response = await post(provider, chatRequest(initial));
+  assert.equal(response.status, 200);
+  const emitted = parseSse(await response.text())[1].choices[0].delta.tool_calls[0];
+  assert.deepEqual(emitted.function, { name: call.name, arguments: JSON.stringify(call.arguments) });
+  const continuation = [ ...initial, { role: "assistant", tool_calls: [{
+    id: emitted.id, type: emitted.type, function: emitted.function,
+  }] }, { role: "tool", tool_call_id: emitted.id, content: call.outputMarker } ];
+  for (const mutate of [
+    rows => { rows[2].tool_calls[0].function.arguments = '{"path":"wrong.txt"}'; },
+    rows => { rows[2].tool_calls[0].function.name = "current_time"; },
+    rows => { rows[3].content = "NO_RECEIPT"; },
+  ]) {
+    const invalidProvider = await startScriptedProvider({ responseBehavior: "hold_until_release",
+      script: createChatToolContinuationProviderScript({ call }) });
+    context.after(() => invalidProvider.close());
+    const invalid = structuredClone(continuation); mutate(invalid);
+    assert.equal((await post(invalidProvider, chatRequest(invalid))).status, 422);
+  }
+  const held = post(provider, chatRequest(continuation));
+  await waitFor(() => provider.requestLedger.some(row => row.response_phase === "held"));
+  provider.releaseScriptRole("chat_continuation");
+  const final = await held;
+  assert.equal(final.status, 200);
+  assert.equal(parseSse(await final.text())[0].choices[0].delta.content, call.responseText);
+  assert.equal(provider.resourceObservation().successful_response_count, 2);
+});
+
+test("selected GUI tool fixture rejects malformed or unbounded calls", () => {
+  const call = { prompt: "Fixture", name: "read", arguments: { path: "receipt.txt" },
+    outputMarker: "RECEIPT", responseText: "DONE" };
+  for (const changed of [ { arguments: null }, { arguments: [] }, { name: "Invalid-tool" },
+    { arguments: { text: "x".repeat(32769) } }, { excess: true }, { outputMarker: "" } ]) {
+    assert.throws(() => createChatToolContinuationProviderScript({ call: { ...call, ...changed } }));
+  }
+});
+
+test("Chat continuation HTTP responses terminate with DONE after the split tool call and released final", async (context) => {
   const provider = await startChatProvider();
   context.after(() => provider.close());
 

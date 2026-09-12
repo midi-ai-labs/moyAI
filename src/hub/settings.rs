@@ -5,9 +5,10 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::HubRouteMode;
-use super::{HubError, ReviewedHubSelection, bounded_text, valid_id};
+use super::{HubCatalogBaseline, HubError, ReviewedHubSelection, bounded_text, valid_id};
 
-const MAX_SETTINGS_BYTES: usize = 128 * 1024;
+// Two bounded public catalog snapshots (128 models / 32 capabilities each), plus preferences.
+const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 
 /// Application-owned preferences only. Runtime credentials and provider allocations cannot
 /// be represented by this strict, versioned document. Revision zero means never saved.
@@ -22,6 +23,10 @@ pub struct HubSettings {
     pub main_review: Option<ReviewedHubSelection>,
     pub side_chat_review: Option<ReviewedHubSelection>,
     #[serde(default)]
+    pub main_catalog_baseline: Option<HubCatalogBaseline>,
+    #[serde(default)]
+    pub side_chat_catalog_baseline: Option<HubCatalogBaseline>,
+    #[serde(default)]
     pub main_mode: HubRouteMode,
     #[serde(default)]
     pub side_chat_mode: HubRouteMode,
@@ -30,13 +35,15 @@ pub struct HubSettings {
 impl Default for HubSettings {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             revision: "0".into(),
             endpoint: String::new(),
             label: "moyAI Desktop".into(),
             hub_id: None,
             main_review: None,
             side_chat_review: None,
+            main_catalog_baseline: None,
+            side_chat_catalog_baseline: None,
             main_mode: HubRouteMode::Direct,
             side_chat_mode: HubRouteMode::Direct,
         }
@@ -52,7 +59,7 @@ pub(super) fn decimal(value: &str) -> Option<u64> {
 
 impl HubSettings {
     fn validate(&self) -> Result<(), HubError> {
-        if self.schema_version != 2
+        if self.schema_version != 3
             || decimal(&self.revision).is_none()
             || !bounded_text(&self.label, 256)
         {
@@ -85,6 +92,16 @@ impl HubSettings {
                 .selection
                 .validate_shape()
                 .map_err(|_| HubError::SettingsInvalid)?;
+        }
+        for (review, baseline) in [
+            (&self.main_review, &self.main_catalog_baseline),
+            (&self.side_chat_review, &self.side_chat_catalog_baseline),
+        ] {
+            if let Some(baseline) = baseline {
+                baseline
+                    .validate(review.as_ref().ok_or(HubError::SettingsInvalid)?)
+                    .map_err(|_| HubError::SettingsInvalid)?;
+            }
         }
         if (self.main_mode == HubRouteMode::Hub && self.main_review.is_none())
             || (self.side_chat_mode == HubRouteMode::Hub && self.side_chat_review.is_none())
@@ -123,22 +140,31 @@ impl HubSettingsStore {
         }
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| HubError::SettingsInvalid)?;
+        let has_baselines = value.get("main_catalog_baseline").is_some()
+            || value.get("side_chat_catalog_baseline").is_some();
         match value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
         {
             Some(1)
-                if value.get("main_mode").is_none() && value.get("side_chat_mode").is_none() => {}
+                if value.get("main_mode").is_none()
+                    && value.get("side_chat_mode").is_none()
+                    && !has_baselines => {}
             Some(2)
-                if value.get("main_mode").is_some() && value.get("side_chat_mode").is_some() => {}
+                if value.get("main_mode").is_some()
+                    && value.get("side_chat_mode").is_some()
+                    && !has_baselines => {}
+            Some(3)
+                if value.get("main_mode").is_some()
+                    && value.get("side_chat_mode").is_some()
+                    && value.get("main_catalog_baseline").is_some()
+                    && value.get("side_chat_catalog_baseline").is_some() => {}
             _ => return Err(HubError::SettingsInvalid),
         }
         // Deserialize the original bytes so duplicate object fields remain errors.
         let mut settings: HubSettings =
             serde_json::from_slice(&bytes).map_err(|_| HubError::SettingsInvalid)?;
-        if settings.schema_version == 1 {
-            settings.schema_version = 2;
-        }
+        settings.schema_version = 3;
         settings.validate()?;
         Ok(settings)
     }

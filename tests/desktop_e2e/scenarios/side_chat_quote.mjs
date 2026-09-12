@@ -211,6 +211,8 @@ export async function observeSideChatQuoteSurface(cdp) {
     const sidePrompt = sidePane?.querySelector('textarea#side-chat-prompt') ?? null;
     const sideSend = sidePane?.querySelector('button[data-action="send-side-chat"]') ?? null;
     const sideStop = sidePane?.querySelector('button[data-action="cancel-side-chat"]') ?? null;
+    const sideStatuses = Array.from(sidePane?.querySelectorAll('.side-chat-meta [role="status"]') ?? []);
+    const sideNotices = Array.from(sidePane?.querySelectorAll('.side-chat-notice[role="status"]') ?? []).filter(visible);
     const pending = sidePane?.querySelector('.side-chat-pending-quote') ?? null;
     const settings = document.querySelector('[role="dialog"][aria-labelledby="config-dialog-title"]');
     const sideSettings = settings?.querySelector('section#settings-side-chat') ?? null;
@@ -266,6 +268,12 @@ export async function observeSideChatQuoteSurface(cdp) {
         send_enabled: enabled(sideSend),
         stop_visible: visible(sideStop),
         stop_enabled: enabled(sideStop),
+        stop_count: sidePane?.querySelectorAll('button[data-action="cancel-side-chat"]').length ?? 0,
+        status_count: sideStatuses.length,
+        status_visible: visible(sideStatuses[0]),
+        status_text: sideStatuses[0]?.textContent?.trim() ?? null,
+        notice_texts: sideNotices.map(node => node.textContent?.trim() ?? ''),
+        error_count: Array.from(sidePane?.querySelectorAll('[role="alert"]') ?? []).filter(visible).length,
         metadata: Array.from(sidePane?.querySelectorAll('.side-chat-context-meta > span') ?? [])
           .map((node) => (node.textContent ?? '').trim()),
         truncated_count: sidePane?.querySelectorAll('.side-chat-context-truncated').length ?? 0,
@@ -307,6 +315,26 @@ export async function observeSideChatQuoteSurface(cdp) {
 export function surfaceHasNoErrors(surface) {
   return surface?.visible_fatal_count === 0
     && surface?.visible_recoverable_error_count === 0;
+}
+
+export function sideChatStoppedSurfaceReady(surface, target) {
+  const side = surface?.projection?.side_chat;
+  const dom = surface?.side;
+  return side?.owner_session_id === target.ownerSessionId
+    && side.chat_id === target.chatId && side.generation === target.expectedGeneration
+    && side.status === "cancelled" && side.deleting === false
+    && side.can_send === true && side.can_cancel === false
+    && side.phase === "" && side.last_error === "run stopped by user"
+    && side.draft_text === "" && side.draft_quote === null
+    && dom?.pane_count === 1 && dom.pane_visible === true && dom.setup_visible === false
+    && dom.owner_session_id === target.ownerSessionId
+    && dom.status_count === 1 && dom.status_visible === true && dom.status_text === "停止済み"
+    && sameValue(dom.notice_texts, ["サイドチャットの実行を停止しました。"])
+    && dom.stop_count === 0 && dom.stop_visible === false && dom.stop_enabled === false
+    && dom.prompt_visible === true && dom.prompt_enabled === true && dom.prompt_value === ""
+    && dom.send_visible === true && dom.send_enabled === false
+    && dom.pending_count === 0 && dom.error_count === 0
+    && surfaceHasNoErrors(surface);
 }
 
 export async function waitForProductStage({ label, timeoutMs = 30_000, sample, accept, code, message }) {
@@ -1228,7 +1256,6 @@ export function createSideChatQuoteScenario() {
             provider: provider.resourceObservation(),
           }),
           accept: (sample) => {
-            const side = sample?.surface?.projection?.side_chat;
             const rows = responseRows(sample?.ledger);
             return exactResponseRoles(sample?.ledger, [
               "side_quote_main_initial",
@@ -1237,9 +1264,7 @@ export function createSideChatQuoteScenario() {
               "side_quote_artifact_held",
             ], { finalHeld: true })
               && rows.at(-1)?.response_phase === "peer_closed"
-              && side?.status === "cancelled"
-              && side.can_send === true
-              && side.can_cancel === false
+              && sideChatStoppedSurfaceReady(sample.surface, cancelExpected.args)
               && sample?.surface?.main?.prompt_value === MAIN_DRAFT_SENTINEL
               && sample.surface.main.send_visible === true
               && sample.surface.main.send_enabled === true
@@ -1250,7 +1275,7 @@ export function createSideChatQuoteScenario() {
               && surfaceHasNoErrors(sample.surface);
           },
           code: "side-chat-quote-stop-terminal",
-          message: "trusted Side Stop did not cancel only the Side request and preserve the Main owner",
+          message: "trusted Side Stop did not settle the same Side owner in both Rust and the visible stopped UI while preserving Main",
         });
         const finalCommands = assertExactDesktopCommandSequence(
           await commands.snapshot(),
@@ -1313,6 +1338,7 @@ export function createSideChatQuoteScenario() {
             stop_action: sideStop,
             stop_command: cancelCommand,
             terminal_projection: terminal.value.surface.projection.side_chat,
+            terminal_dom: terminal.value.surface.side,
             final_commands: finalCommands,
             held_screenshot: heldScreenshot,
             terminal_screenshot: finalScreenshot,

@@ -9,6 +9,7 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
   if (local.pending || context.getViewState()?.overlay !== "hub") return;
   const serial = ++local.requestSerial;
   local.pending = pending; local.error = ""; local.notice = "";
+  local.selectionKey = pending === "select" ? devicePeerKey({ device_id: String(args.deviceId), profile_id: String(args.profileId) }) : null;
   context.rerender();
   const current = () => serial === local.requestSerial && context.getViewState()?.overlay === "hub";
   try {
@@ -21,7 +22,10 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     } else if ((pending === "import" || pending === "join") && projection.enrollment === "active") {
       local.notice = "Hubに接続しました。「モデル割当」を確認してください。この端末の受付は、公開対象と権限を確認してから開始します。";
     } else if (pending === "receiver") local.notice = projection.receiver.enabled ? "受付設定を保存しました。稼働状態を確認してください。" : "受付をOFFにしました。実行中タスクの停止完了は経路の状態を確認してください。";
-    else if (pending === "select") local.notice = "利用先の選択を保存しました。次の依頼から適用されます。";
+    else if (pending === "select") {
+      const peer = projection.peers.find(row => devicePeerKey(row) === local.selectionKey);
+      local.notice = peer ? `${peer.display_name}の利用を${peer.selected ? "ON" : "OFF"}で保存しました。次の依頼から適用されます。` : "利用先の選択を保存しました。最新の端末一覧を確認してください。";
+    }
     else if (pending === "leave") {
       local.leaveConfirmed = false;
       local.notice = "接続を一時解除しました。登録IDと設定は保持されています。「再接続」で接続を戻せます。";
@@ -111,7 +115,7 @@ export async function stopDeviceNetworkJob(context: ActionContext, key: string):
       if (current() && row.reference_id === referenceId) local.jobs.outgoing = local.jobs.outgoing.map(job => job.reference_id === referenceId ? row : job);
     } else {
       const job = local.jobs.incoming.find(row => row.job_id === key.slice(9) && row.profile_id === local.projection?.receiver.profile_id)!;
-      const row = await command<DeviceIncomingJob>("mcp_publish_cancel_job", { profileId: job.profile_id, jobId: job.job_id });
+      const row = await command<DeviceIncomingJob>("remote_job_cancel", { profileId: job.profile_id, jobId: job.job_id });
       if (current() && row.job_id === job.job_id && row.profile_id === job.profile_id) local.jobs.incoming = local.jobs.incoming.map(candidate => candidate.job_id === row.job_id ? { ...row, network: row.network ?? candidate.network } : candidate);
     }
     if (current()) local.notice = "停止を要求しました。停止確認済みになるまで状態を確認してください。";

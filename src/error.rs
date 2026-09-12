@@ -182,6 +182,8 @@ impl std::fmt::Display for ProviderRequestLimit {
 
 #[derive(Debug, Error)]
 pub enum LlmError {
+    #[error("Hub request failed ({code}): {0}", code = .0.code())]
+    Hub(#[from] crate::hub::HubError),
     #[error("llm http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("llm json error: {0}")]
@@ -286,6 +288,7 @@ impl LlmError {
     /// consumers must use this method instead of persisting `to_string()`.
     pub fn public_message(&self) -> String {
         match self {
+            Self::Hub(error) => format!("{} ({})", error, error.code()),
             Self::ProviderFailure { failure, .. } => failure.public_message(),
             Self::ProviderResponseStartTimeout { .. } | Self::ProviderRequestTimeout { .. } => {
                 "The model provider did not start a response before the request deadline. Check the provider load or increase the response timeout."
