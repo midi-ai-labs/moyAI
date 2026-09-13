@@ -1,5 +1,6 @@
 import { scenario as shellBaseline } from "./scenarios/shell_baseline.mjs";
 import { createShellAboutScenario } from "./scenarios/shell_about.mjs";
+import { createShellSingleInstanceScenario } from "./scenarios/shell_single_instance.mjs";
 import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
 import { createShellManagedLifecycleScenario } from "./scenarios/shell_managed_lifecycle.mjs";
 import { createHubConnectionSettingsScenario } from "./scenarios/hub_connection_settings.mjs";
@@ -42,6 +43,8 @@ import { createSideChatSessionScenario } from "./scenarios/side_chat_session.mjs
 import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_docling_readiness.mjs";
 import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial_setup.mjs";
 import { createInitialSetupHubScenario } from "./scenarios/settings_initial_setup_hub.mjs";
+import { createSharedWorkEntryScenario } from "./scenarios/shared_work_entry.mjs";
+import { createSharedWorkContinuationScenario } from "./scenarios/shared_work_continuation.mjs";
 import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
 import { createSettingsMcpPeerControlsScenario } from "./scenarios/settings_mcp_peers.mjs";
@@ -57,10 +60,13 @@ import { createHistoryTerminalReconcileScenario } from "./scenarios/history_term
 const factories = new Map([
   [shellBaseline.id, () => shellBaseline],
   ["shell.about", createShellAboutScenario],
+  ["shell.single-instance", createShellSingleInstanceScenario],
   ["shell.lynx", createShellLynxScenario],
   ["shell.managed-lifecycle", createShellManagedLifecycleScenario],
   ["hub.connection-settings", createHubConnectionSettingsScenario],
   ["hub.browser-enrollment", createHubBrowserEnrollmentScenario],
+  ["settings.shared-work", createSharedWorkEntryScenario],
+  ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
   ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
   ["hub.receiver-settings-controls", createHubReceiverSettingsScenario],
   ["hub.outgoing-controls", createOutgoingControlsScenario],
@@ -129,6 +135,8 @@ const factories = new Map([
   ["side-chat.session", createSideChatSessionScenario],
 ]);
 const configurableScenarios = new Set([
+  "settings.shared-work",
+  "settings.shared-work-continuation",
   "agent.interrupt",
   "navigation.external-rejoin",
   "navigation.external-sidebar-stop",

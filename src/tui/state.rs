@@ -1345,6 +1345,8 @@ pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
         ToolName::SendMessage | ToolName::FollowupTask => "Sub Agentへの連絡",
         ToolName::WaitAgent => "Sub Agentの完了待ち",
         ToolName::WaitRemoteTasks => "遠隔タスクの結果待ち",
+        ToolName::SharedDelegate => "共有仕事の委任・結果待ち",
+        ToolName::SharedPublishArtifact => "共有成果ファイルの保存",
         ToolName::InterruptAgent => "Sub Agentの中断",
         ToolName::ListAgents => "Sub Agent状態の確認",
         ToolName::Invalid => "ツール",

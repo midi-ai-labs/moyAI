@@ -1574,6 +1574,7 @@ fn overlay_key(overlay: DesktopOverlay) -> &'static str {
         DesktopOverlay::ProjectMenu => "project_menu",
         DesktopOverlay::ConfigEditor => "config",
         DesktopOverlay::HubConnection => "hub",
+        DesktopOverlay::SharedWork => "shared_work",
         DesktopOverlay::McpHistory => "mcp_history",
         DesktopOverlay::SessionSettings => "session_settings",
         DesktopOverlay::ProviderEditor => "provider",

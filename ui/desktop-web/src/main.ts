@@ -4,6 +4,10 @@ import { acceptHubProjection, hubPresentation } from "./hub_state.ts";
 import { acceptDeviceNetworkProjection, deviceNetworkPresentation } from "./device_network_state.ts";
 import { synchronizeDeviceNetworkControls } from "./device_network_dom.ts";
 import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
+import { refreshSharedWork } from "./shared_work_actions.ts";
+import { sharedWorkPresentation } from "./shared_work_state.ts";
+import { retainSharedWorkSurface } from "./shared_work_render.ts";
+import "./shared_work.css";
 import { refreshMcpHistory } from "./mcp_history_actions.ts";
 import { invalidateMcpHistory, mcpHistoryPresentation } from "./mcp_history_state.ts";
 import { synchronizeMcpHistorySurface } from "./mcp_history_dom.ts";
@@ -243,6 +247,7 @@ const refresh = createSnapshotRefresh(async () => {
   try {
     acceptState(await command<DesktopWebState>("desktop_state"), false);
     await refreshDeviceNetworkJobs(eventContext);
+    await refreshSharedWork(eventContext);
     await refreshMcpHistory(eventContext);
   } catch (error) {
     reportError(error);
@@ -353,7 +358,7 @@ installWindowMaximizedSync();
 void refresh();
 installRuntimePolling(window, document, () => Boolean(
     currentState
-    && (currentState.overlay === "mcp_history" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
+    && (currentState.overlay === "shared_work" || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
     && shouldAutoRefresh(currentState)
 ), refresh);
 
@@ -894,6 +899,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
   return createDesktopRenderModel(state, {
     hub: hubPresentation(uiState.hub),
     deviceNetwork: deviceNetworkPresentation(uiState.deviceNetwork),
+    sharedWork: sharedWorkPresentation(uiState.sharedWork),
     mcpHistory: mcpHistoryPresentation(uiState.mcpHistory),
     mcpPeers: mcpPeerPresentation(uiState.mcpPeers),
     artifactPane: {
@@ -1329,6 +1335,13 @@ function renderCommitted(
   });
   let retainedConnectedSettings = false;
   let retainedConnectedPrompt = false;
+  if (state.overlay === "shared_work") {
+    const currentShared = appRoot.querySelector<HTMLElement>(".shared-work");
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextShared = template.content.querySelector<HTMLElement>(".shared-work");
+    if (currentShared && nextShared) retainedConnectedSettings = retainSharedWorkSurface(currentShared, nextShared);
+  }
   if (currentSettingsModal && retainingInitialSetup) {
     const template = document.createElement("template");
     template.innerHTML = renderedMarkup;

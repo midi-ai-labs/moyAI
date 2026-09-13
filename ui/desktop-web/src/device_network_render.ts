@@ -27,12 +27,18 @@ export function renderDeviceNetwork(input?: DeviceNetworkPresentation): string {
   const error = local.error || (projection?.error ? deviceNetworkError(projection.error) : "");
   const feedback = error || local.notice;
   return `<div class="device-network-content">
-    <p class="hub-scope-note">Hubに参加すると、許可された端末を検索してタスクの委任先に選べます。この端末でも、ほかの端末への依頼とタスクの受付を両方使えます。</p>
+    <p class="hub-scope-note">管理者から受け取った設定ファイルで、このPCをHubに接続します。参加が許可されたら、共有仕事の依頼や、このPCでの仕事の受付へ進めます。</p>
     <div id="device-network-feedback" class="hub-feedback" data-settings-passive="device-network-feedback" data-error="${Boolean(error)}" role="status" aria-live="polite" ${feedback ? "" : "hidden"}>${escapeHtml(feedback)}</div>
-    <section class="device-network-card"><div class="hub-section-heading"><h3>Hubへの参加</h3><span data-settings-passive="device-network-enrollment" class="device-network-status ${active ? "ready" : "muted"}">${status}</span></div>
+    <section class="device-network-card" data-network-visible="member" ${member ? "" : "hidden"} aria-labelledby="device-network-next-title">
+      <h3 id="device-network-next-title">接続後にできること</h3>
+      <div class="device-network-actions"><button id="device-network-open-shared" class="hub-primary" data-action="show-shared-work" ${busy ? "disabled" : ""}>共有仕事を開く</button><button id="device-network-open-models" data-action="hub-tab-models" ${busy ? "disabled" : ""}>チャットのモデルを選ぶ</button></div>
+      <p class="hub-help">複数人で使う仕事の依頼・進捗・承認は「共有仕事」へ。利用者としてログインすると、所属プロジェクトが表示されます。依頼するだけなら、このPCのモデルや作業フォルダーの設定は不要です。</p>
+      <p class="hub-help">このPCで仕事を実行する場合も「共有仕事」から受付を設定します。通常チャットでHubのモデルを使う場合は「チャットのモデルを選ぶ」へ進んでください。</p>
+    </section>
+    <section class="device-network-card"><div class="hub-section-heading"><h3>このPCをHubに接続</h3><span data-settings-passive="device-network-enrollment" class="device-network-status ${active ? "ready" : "muted"}">${status}</span></div>
       <p class="hub-help" data-settings-passive="device-network-self">このPC: ${escapeHtml(projection?.local_hostname || "確認中")} · ${projection?.display_name ? `登録名: ${escapeHtml(projection.display_name)}` : "端末名とIPv4を自動で申請します。"}${projection?.local_ipv4 ? ` · 申請IPv4: ${escapeHtml(projection.local_ipv4)}` : ""}</p>
       <div class="device-network-actions"><button id="device-network-import" data-action="device-network-import" ${busy ? "disabled" : ""}>Hubの共通設定ファイルを読み込む</button><button id="device-network-refresh" data-action="device-network-refresh" ${busy ? "disabled" : ""}>${enrollment === "disconnected" ? "再接続" : "最新情報を取得"}</button></div>
-      <p class="hub-help">管理者から受け取った共通TOML設定を読み込むと、この端末の参加を自動で申請します。名前や参加コードの入力は不要です。モデルや手動MCPの既存設定は置き換えません。</p>
+      <p class="hub-help">初回は設定ファイルを1回選ぶだけで参加を申請します。PC名や参加コードの入力は不要です。管理者が許可すると自動で接続し、次回起動時も保存した接続先を使います。</p>
       <button id="device-network-diagnose-hub" data-action="device-network-diagnose-hub" ${deviceCanDiagnose(local, "hub") ? "" : "disabled"}>Hubへの接続を診断</button>
       <details data-details-key="device-network-hub-diagnostic"><summary>Hub接続の診断結果</summary>${renderDeviceDiagnostic(local, "hub")}</details>
       <div data-network-visible="join" ${member ? "hidden" : ""}>

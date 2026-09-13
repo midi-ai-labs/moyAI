@@ -12,7 +12,9 @@ param(
   [int]$ClientOffsetY = -1,
   [int]$DragDeltaX = 0,
   [int]$DragDeltaY = 0,
-  [string]$SelectedPath
+  [string]$SelectedPath,
+  [ValidateSet("open", "save_new", "directory")]
+  [string]$SelectedPathIntent = "open"
 )
 
 $ErrorActionPreference = "Stop"
@@ -602,6 +604,7 @@ function Get-WindowRow {
       class_name = $className
       title = $title
       visible = $visible
+      minimized = [bool][Moyai.DesktopE2e.NativeWindowInterop]::IsIconic($Handle)
       enabled = [bool][Moyai.DesktopE2e.NativeWindowInterop]::IsWindowEnabled($Handle)
       is_root = $root -eq $Handle
       rect = [ordered]@{
@@ -673,10 +676,23 @@ function Resolve-ExactDialogControl {
     [Parameter(Mandatory)][object]$Candidate,
     [Parameter(Mandatory)][IntPtr]$ParentHandle,
     [Parameter(Mandatory)][int]$ControlId,
-    [Parameter(Mandatory)][string]$ClassName
+    [Parameter(Mandatory)][string]$ClassName,
+    [IntPtr]$ExactHandle = [IntPtr]::Zero
   )
-  $handle = [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgItem($ParentHandle, $ControlId)
-  if ($handle -eq [IntPtr]::Zero) { throw "Exact native file control is absent: $ClassName/$ControlId" }
+  $handle = if ($ExactHandle -ne [IntPtr]::Zero) { $ExactHandle } else { [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgItem($ParentHandle, $ControlId) }
+  if ($handle -eq [IntPtr]::Zero) {
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    $dialog = [System.Windows.Automation.AutomationElement]::FromHandle($Candidate.handle)
+    $observed = @($dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object {
+      $_.Current.NativeWindowHandle -ne 0 -and $_.Current.ProcessId -eq $Candidate.row.process_id
+    } | Select-Object -First 80 | ForEach-Object {
+      [long]$nativeValue = $_.Current.NativeWindowHandle
+      if ($nativeValue -lt 0) { $nativeValue += 4294967296 }
+      $native = [IntPtr]::new($nativeValue)
+      [ordered]@{ hwnd = Format-WindowHandle $native; parent = Format-WindowHandle ([Moyai.DesktopE2e.NativeWindowInterop]::GetParent($native)); class_name = $_.Current.ClassName; control_id = [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgCtrlID($native) }
+    })
+    throw "Exact native file control is absent: $ClassName/$ControlId; observed native control identities: $($observed | ConvertTo-Json -Compress)"
+  }
   $row = Get-WindowRow -Handle $handle -OwnerProcessId ([int]$Candidate.row.process_id)
   if ($null -eq $row -or -not $row.enabled -or $row.thread_id -ne $Candidate.row.thread_id -or
       $row.root_hwnd -ne $Candidate.row.hwnd -or $row.class_name -cne $ClassName -or
@@ -695,6 +711,39 @@ function Resolve-ExactDialogControl {
 function Resolve-ExactOpenFileControls {
   param([Parameter(Mandatory)][object]$Candidate)
   if ($Candidate.row.class_name -cne '#32770') { throw "OpenFilePath requires an exact native file dialog" }
+  if ($SelectedPathIntent -ceq 'directory') {
+    # Live folder-picker fingerprint: an Edit/1152 directly beneath the dialog.
+    $edit = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1152 -ClassName 'Edit'
+    $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1 -ClassName 'Button'
+    return [ordered]@{ edit = $edit; button = $button }
+  }
+  if ($SelectedPathIntent -ceq 'save_new') {
+    # The live save picker uses a DirectUI filename Edit/1001. Identify the
+    # unique native edit first, then verify every native parent in that tree.
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    $dialog = [System.Windows.Automation.AutomationElement]::FromHandle($Candidate.handle)
+    $filenameMatches = @($dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object {
+      if ($_.Current.NativeWindowHandle -eq 0 -or $_.Current.ProcessId -ne $Candidate.row.process_id -or $_.Current.ClassName -cne 'Edit') { return $false }
+      [long]$value = $_.Current.NativeWindowHandle
+      if ($value -lt 0) { $value += 4294967296 }
+      return [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgCtrlID([IntPtr]::new($value)) -eq 1001
+    })
+    if ($filenameMatches.Count -ne 1) { throw "Save filename native Edit/1001 is not unique" }
+    [long]$editValue = $filenameMatches[0].Current.NativeWindowHandle
+    if ($editValue -lt 0) { $editValue += 4294967296 }
+    $editHandle = [IntPtr]::new($editValue)
+    $comboHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($editHandle)
+    $sinkHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($comboHandle)
+    $directHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($sinkHandle)
+    $viewHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($directHandle)
+    $view = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 0 -ClassName 'DUIViewWndClassName' -ExactHandle $viewHandle
+    $direct = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $viewHandle -ControlId 0 -ClassName 'DirectUIHWND' -ExactHandle $directHandle
+    $sink = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $directHandle -ControlId 0 -ClassName 'FloatNotifySink' -ExactHandle $sinkHandle
+    $combo = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $sinkHandle -ControlId 0 -ClassName 'ComboBox' -ExactHandle $comboHandle
+    $edit = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $comboHandle -ControlId 1001 -ClassName 'Edit' -ExactHandle $editHandle
+    $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1 -ClassName 'Button'
+    return [ordered]@{ view = $view; direct = $direct; sink = $sink; combo = $combo; edit = $edit; button = $button }
+  }
   # Windows common file-dialog hierarchy observed in the live native picker. A different hierarchy fails closed.
   $comboEx = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1148 -ClassName 'ComboBoxEx32'
   $combo = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $comboEx.handle -ControlId 1148 -ClassName 'ComboBox'
@@ -705,7 +754,7 @@ function Resolve-ExactOpenFileControls {
 
 function Assert-SameOpenFileControls {
   param([Parameter(Mandatory)][object]$Before, [Parameter(Mandatory)][object]$After)
-  foreach ($name in @('combo_ex', 'combo', 'edit', 'button')) {
+  foreach ($name in $Before.Keys) {
     if ($Before[$name].handle -ne $After[$name].handle) { throw "Native file-dialog control HWND changed before input: $name" }
   }
 }
@@ -1236,7 +1285,16 @@ switch ($Action) {
       throw "OpenFilePath requires a bounded absolute path without NUL"
     }
     $resolvedSelectedPath = [IO.Path]::GetFullPath($SelectedPath)
-    if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Leaf)) { throw "OpenFilePath requires an existing file" }
+    if ($SelectedPathIntent -ceq 'open') {
+      if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Leaf)) { throw "OpenFilePath requires an existing file" }
+    } elseif ($SelectedPathIntent -ceq 'directory') {
+      $resolvedSelectedPath = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $resolvedSelectedPath
+      if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Container)) { throw "directory selection requires an existing directory" }
+    } else {
+      $resolvedSelectedPath = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $resolvedSelectedPath
+      if (Test-Path -LiteralPath $resolvedSelectedPath) { throw "save_new requires a new file, without an overwrite confirmation" }
+      if (-not (Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($resolvedSelectedPath)) -PathType Container)) { throw "save_new requires an existing parent directory" }
+    }
     $candidate = Resolve-ExactCandidate -Owner $validatedOwner
     $controls = Resolve-ExactOpenFileControls -Candidate $candidate
     $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
@@ -1254,15 +1312,18 @@ switch ($Action) {
     $beforeClick = Resolve-ExactOpenFileControls -Candidate $candidate
     Assert-SameOpenFileControls -Before $controls -After $beforeClick
     [Moyai.DesktopE2e.NativeWindowInterop]::ClickOpenOnce($beforeClick.button.handle)
+    $controlEvidence = [ordered]@{}
+    foreach ($name in $controls.Keys) { $controlEvidence[$name] = $controls[$name].row }
     Write-Result ([ordered]@{
       window = $candidate.row
       selected_path = $resolvedSelectedPath
+      selected_path_intent = $SelectedPathIntent
       delivery_verified = $true
       filename_set_count = 1
       filename_readback_verified = $true
       open_click_count = 1
       open_call_returned = $true
-      controls = [ordered]@{ combo_ex = $controls.combo_ex.row; combo = $controls.combo.row; edit = $controls.edit.row; button = $controls.button.row }
+      controls = $controlEvidence
       foreground_required = $false
       input = 'native-control: WM_SETTEXT -> WM_GETTEXT exact readback -> BM_CLICK'
       os_keyboard_ime_evidence = $false

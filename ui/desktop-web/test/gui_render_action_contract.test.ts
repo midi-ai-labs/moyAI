@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { deviceUiFixture } from "./device_network_fixture.ts";
 import { deviceNetworkPresentation } from "../src/device_network_state.ts";
+import { sharedWorkPresentation } from "../src/shared_work_state.ts";
+import { renderSharedWork } from "../src/shared_work_render.ts";
+import { sharedUiFixture } from "./shared_work_fixture.ts";
 
 import { ACTIONS, actionById, actionEnabledById } from "../src/actions.ts";
 import {
@@ -832,6 +835,31 @@ function representativeSurfaces(): RenderedSurface[] {
     html: renderSideChatDeleteConfirmation(base, sideChatLocal),
   });
 
+  const shared = sharedUiFixture();
+  shared.projection!.approval = { id: "approval-a", attempt_id: "attempt-a", request: { access: "shell", summary: "実行の確認", details: [], targets: [], outside_workspace: false, risks: [] }, status: "pending", decision: null, can_decide: true, expires_at_ms: 9999999999999 };
+  shared.projection!.submission_uncertain = true;
+  const asset = { id: "asset-a", project_id: "project-a", job_id: "job-a", kind: "artifact", name: "result.txt", sha256: "a".repeat(64), byte_length: 4, created_at_ms: 1, version: 1, base_sha256: null, purged_at_ms: null };
+  const template = { id: "workspace", label: "作業領域", base_root: "C:/fixture", access_mode: "default", allowed_child_environments: [] };
+  shared.projection!.inputs = [asset]; shared.projection!.assets = [asset];
+  shared.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a", title: "終了した仕事", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: true };
+  shared.projection!.handover = { candidates: [{ user_id: "user-b", display_name: "次の担当" }], pending: null, can_handover: true };
+  shared.projection!.inbox = { items: [{ id: "finished:job-a", project_id: "project-a", job_id: "job-a", kind: "finished", title: "完了", created_at_ms: 1, read_at_ms: null, can_act: true, approval_id: null }], unread_count: 1, next_before: "older" };
+  shared.projection!.transcript = { items: [], next_after: 100 };
+  shared.projection!.provider = { runner_id: "runner-a", mode: "shared", state: "paused", accepting: false, maintenance_until_ms: null, autostart: false, templates: [template], environments: [], active_attempts: [], unknown_attempts: [{ attempt_id: "attempt-a", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }], error: null };
+  shared.projection!.provider_draft = template;
+  surfaces.push({ name: "shared-work-authenticated", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.provider.autostart = true;
+  surfaces.push({ name: "shared-work-provider-autostart", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.provider.state = "available";
+  shared.projection!.provider.accepting = true;
+  surfaces.push({ name: "shared-work-provider-accepting", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.provider = null;
+  shared.projection!.provider_draft = null;
+  surfaces.push({ name: "shared-work-provider-not-started", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.principal = null;
+  surfaces.push({ name: "shared-work-login", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.connected = false;
+  surfaces.push({ name: "shared-work-enrollment", html: renderSharedWork(sharedWorkPresentation(shared)) });
   return surfaces;
 }
 

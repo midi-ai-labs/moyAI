@@ -22,6 +22,7 @@ mod enrollment;
 #[cfg(test)]
 mod enrollment_tests;
 mod history;
+mod runner;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceTargetChoice {
@@ -378,6 +379,7 @@ pub(super) struct DeviceNetworkInner {
     pub use_default_model: std::sync::atomic::AtomicBool,
     pub receiver: AsyncMutex<Option<super::receiver::ManagedReceiver>>,
     pub outgoing: super::outgoing::OutgoingOwner,
+    pub shared_work: super::shared_work::SharedWorkOwner,
 }
 pub(super) struct DeviceState {
     pub settings: DeviceSettings,
@@ -576,7 +578,7 @@ impl DeviceNetworkService {
                 lane: AsyncMutex::new(()),
                 settings: settings_store,
                 identity: identity_store,
-                directory,
+                directory: directory.clone(),
                 store: store.clone(),
                 jobs,
                 publish,
@@ -586,6 +588,9 @@ impl DeviceNetworkService {
                 use_default_model: std::sync::atomic::AtomicBool::new(false),
                 receiver: AsyncMutex::new(None),
                 outgoing: super::outgoing::OutgoingOwner::new(store.clone()),
+                shared_work: super::shared_work::SharedWorkOwner::new(
+                    directory.join("shared-submissions.json"),
+                ),
             }),
         };
         store.attach_device_network(service.downgrade());

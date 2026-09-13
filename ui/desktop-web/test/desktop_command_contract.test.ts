@@ -152,6 +152,11 @@ test("Hub credential reaches native connect but is redacted before command diagn
     assert.deepEqual(deliveries, [{ name: "hub_connect", args }]);
     assert.deepEqual(observations, [{ name: "hub_connect", args: { ...args, token: "[redacted]" } }]);
     assert.doesNotMatch(JSON.stringify(observations), /private-bootstrap-token/);
+    const sharedArgs = { expectedGeneration: "2", request: { kind: "login", username: "alice", password: "private-human-password" } };
+    await command("shared_work_command", sharedArgs);
+    assert.deepEqual(deliveries[1], { name: "shared_work_command", args: sharedArgs });
+    assert.deepEqual(observations[1], { name: "shared_work_command", args: { ...sharedArgs, request: { ...sharedArgs.request, password: "[redacted]" } } });
+    assert.doesNotMatch(JSON.stringify(observations), /private-human-password/);
   } finally {
     if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else delete globals.window;
     if (previousObserver) Object.defineProperty(globalThis, observerKey, previousObserver); else delete globals[observerKey];

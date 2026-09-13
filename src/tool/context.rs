@@ -147,14 +147,17 @@ pub struct ToolEffectAdmission {
     control: RunControl,
     sandbox_plan: ProcessSandboxPlan,
     permission_retry_lease: Option<crate::storage::PermissionReviewLease>,
+    external_approval_id: Option<String>,
 }
 
 impl ToolEffectAdmission {
     pub(crate) fn new(control: RunControl, sandbox_plan: ProcessSandboxPlan) -> Self {
+        let external_approval_id = control.take_approval_identity();
         Self {
             control,
             sandbox_plan,
             permission_retry_lease: None,
+            external_approval_id,
         }
     }
 
@@ -175,6 +178,15 @@ impl ToolEffectAdmission {
     /// effect so a later formatter, process, network request, or mutation cannot start after a
     /// terminal producer wins.
     pub fn admit(&self) -> Result<(), ToolError> {
+        self.control
+            .authorize_external_effect(self.external_approval_id.as_deref())
+            .map_err(|message| {
+                if self.control.is_cancelled() {
+                    return ToolError::RunInterrupted;
+                }
+                self.control.fail(message.clone());
+                ToolError::Message(message)
+            })?;
         if let Some(lease) = &self.permission_retry_lease {
             let admission = lease.admit_if_authority_current().map_err(|error| {
                 let message = format!(

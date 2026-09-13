@@ -8,6 +8,7 @@ import { CdpClient, assertLocalTargetEndpoint, discoverDevToolsEndpoint, waitFor
 import { auditClosedSqlite } from "./sqlite_cleanup.mjs";
 import { acquireDesktopAdmission } from "./windows_admission_lock.mjs";
 import { invokeWindowsProcess, waitForChildExit } from "./windows_process.mjs";
+import { runWindowsExternalProcess } from "./windows_external_process.mjs";
 
 function arrayValue(value) {
   if (value === null || value === undefined) return [];
@@ -142,6 +143,9 @@ export class WindowsTauriHost {
   #stdoutHandle = null;
   #stderrHandle = null;
   #processTemp = null;
+  #launchEnvironment = null;
+  #duplicateCount = 0;
+  #activeContext = null;
 
   async preflight({ context, sink, phase }) {
     if (process.platform !== "win32") {
@@ -174,6 +178,7 @@ export class WindowsTauriHost {
   }
 
   async launch({ context, scenario, sink, phase }) {
+    this.#activeContext = context;
     const launchStartedAt = new Date().toISOString();
     this.#generation += 1;
     const processTemp = path.join(context.paths.logs, "desktop-temp");
@@ -198,21 +203,22 @@ export class WindowsTauriHost {
     this.#stdoutHandle = await open(stdout, "wx");
     this.#stderrHandle = await open(stderr, "wx");
     this.#logPaths.push(stdout, stderr);
+    this.#launchEnvironment = {
+      ...process.env,
+      ...normalizeScenarioEnvironment(scenario.environment),
+      MOYAI_CONFIG_PATH: context.paths.config_file,
+      MOYAI_DATA_DIR: context.paths.data,
+      MOYAI_DESKTOP_PREFS_PATH: context.paths.prefs_file,
+      WEBVIEW2_USER_DATA_FOLDER: context.paths.webview,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=0",
+      TEMP: processTemp,
+      TMP: processTemp,
+      TMPDIR: processTemp,
+      RUST_BACKTRACE: "1",
+    };
     this.#desktop = spawn(context.binary, ["--dir", context.paths.workspace], {
       cwd: context.paths.workspace,
-      env: {
-        ...process.env,
-        ...normalizeScenarioEnvironment(scenario.environment),
-        MOYAI_CONFIG_PATH: context.paths.config_file,
-        MOYAI_DATA_DIR: context.paths.data,
-        MOYAI_DESKTOP_PREFS_PATH: context.paths.prefs_file,
-        WEBVIEW2_USER_DATA_FOLDER: context.paths.webview,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=0",
-        TEMP: processTemp,
-        TMP: processTemp,
-        TMPDIR: processTemp,
-        RUST_BACKTRACE: "1",
-      },
+      env: this.#launchEnvironment,
       windowsHide: false,
       stdio: ["ignore", this.#stdoutHandle.fd, this.#stderrHandle.fd],
     });
@@ -279,6 +285,31 @@ export class WindowsTauriHost {
     }
   }
 
+  async launchDuplicate({ context, sink, phase = "executing" }) {
+    if (this.#desktop === null || this.#driver === null || this.#launchEnvironment === null) {
+      throw new DesktopE2eError("harness", "duplicate-owner-missing", "duplicate launch requires an attached live Desktop");
+    }
+    const label = `desktop-duplicate-${++this.#duplicateCount}`;
+    const stdout = path.join(context.paths.logs, `${label}.stdout.log`);
+    const stderr = path.join(context.paths.logs, `${label}.stderr.log`);
+    this.#logPaths.push(stdout, stderr);
+    // The common Job owner settles even a broken duplicate and its descendants.
+    // Reuse the live generation's config, data, WebView profile and temp owners.
+    const processResult = await runWindowsExternalProcess({
+      executionRoot: context.root, executable: context.binary,
+      args: ["--dir", context.paths.workspace], cwd: context.paths.workspace,
+      env: this.#launchEnvironment, stdoutPath: stdout, stderrPath: stderr,
+      timeoutMs: 10_000, label,
+    });
+    const result = {
+      process: processResult,
+      stdout: await readFile(stdout, "utf8"), stderr: await readFile(stderr, "utf8"),
+      desktops: arrayValue(await invokeWindowsProcess("ListDesktop")),
+    };
+    await sink.record("desktop-duplicate-launched", result, { phase, owner: "desktop-app" });
+    return result;
+  }
+
   async #closeCurrentLogs() {
     let primary = null;
     try { await this.#stdoutHandle?.close(); } catch (error) { primary ??= error; }
@@ -288,7 +319,14 @@ export class WindowsTauriHost {
     if (primary !== null) throw primary;
   }
 
-  async restart({ context, scenario, sink, driver, phase = "executing" }) {
+  async restart({ context, nextContext = context, scenario, sink, driver, phase = "executing" }) {
+    if (nextContext.root !== context.root || nextContext.binary !== context.binary || nextContext.paths.logs !== context.paths.logs) {
+      throw new DesktopE2eError("harness", "restart-context-owner-drift", "Another Desktop fixture must keep the same execution, binary, and log owner");
+    }
+    for (const name of ["workspace", "config", "data", "prefs", "webview"]) {
+      const relative = path.relative(context.root, nextContext.paths[name]);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new DesktopE2eError("harness", "restart-context-outside-execution", "Desktop fixture paths must remain inside the execution");
+    }
     const activeDriver = this.#driver ?? driver;
     if (activeDriver === null || this.#desktop === null) {
       throw new DesktopE2eError("harness", "restart-owner-missing", "Desktop restart requires an attached live generation");
@@ -328,8 +366,9 @@ export class WindowsTauriHost {
       desktop_exited: true,
       profile_webviews_remaining: 0,
     }, { phase, owner: "desktop-app" });
-    const runtime = await this.launch({ context, scenario, sink, phase });
-    const nextDriver = await this.attach({ context, scenario, sink, runtime, phase });
+    await sink.record("desktop-next-fixture", { paths: nextContext.paths, previous_paths: context.paths }, { phase, owner: "run-context" });
+    const runtime = await this.launch({ context: nextContext, scenario, sink, phase });
+    const nextDriver = await this.attach({ context: nextContext, scenario, sink, runtime, phase });
     return {
       runtime,
       driver: nextDriver,
@@ -345,6 +384,7 @@ export class WindowsTauriHost {
   }
 
   async cleanup({ context, scenario, driver, inputs, releaseScenarioResources }) {
+    context = this.#activeContext ?? context;
     if (typeof releaseScenarioResources !== "function") throw new TypeError("releaseScenarioResources callback is required");
     const activeDriver = selectActiveCleanupDriver(this.#driver, driver, { restartBegan: this.#restartBegan });
     let gracefulExit = { requested: false, reason: activeDriver === null ? "not-attached" : "not-requested" };

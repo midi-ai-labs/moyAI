@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+mod shared_archive;
+mod shared_runs;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -371,14 +373,15 @@ pub(crate) struct StoredAgentSpawn {
     pub initial_task_history_item_id: HistoryItemId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalOwnerGuard {
+#[derive(Debug, Clone, Copy)]
+enum TerminalOwnerGuard<'a> {
     Admitted {
         admission_id: AdmissionId,
         turn_id: TurnId,
     },
     Captured(RunningSessionTerminalTarget),
     AgentWake(AgentExecutionWakeTerminalOwner),
+    SharedCheckpoint(&'a crate::agent::shared::SharedCheckpoint),
 }
 
 #[derive(Debug, Clone)]
@@ -1295,6 +1298,13 @@ impl SqliteSessionRepository {
                    ON edge.child_session_id = sessions.id
                  WHERE sessions.status = 'running'
                    AND sessions.id <= ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM shared_run_checkpoints AS checkpoint
+                       WHERE checkpoint.session_id = sessions.id
+                         AND checkpoint.turn_id = sessions.active_turn_id
+                         AND checkpoint.admission_id = sessions.active_run_id
+                         AND checkpoint.state = 'paused'
+                   )
              )
              SELECT *
              FROM recovery_candidates
@@ -3568,6 +3578,14 @@ impl SqliteSessionRepository {
         let lease_expires_at_ms = run_lease_expiry_ms(now, lease_duration_ms);
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shared_run_checkpoints WHERE session_id = ?1)",
+            params![session_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            transaction.commit()?;
+            return Ok((ActiveGoalTurnAdmission::Unavailable, None));
+        }
         let Some(runtime_state) = session_runtime_state_from_connection(&transaction, session_id)?
         else {
             transaction.commit()?;
@@ -4954,7 +4972,7 @@ impl SqliteSessionRepository {
         &self,
         session_id: SessionId,
         event: &RunEvent,
-        owner_guard: TerminalOwnerGuard,
+        owner_guard: TerminalOwnerGuard<'_>,
         protocol_sequence_no: Option<i64>,
         retain_active_admission: bool,
         orphan_recovery: bool,
@@ -4966,6 +4984,38 @@ impl SqliteSessionRepository {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        let shared_admission = if let TerminalOwnerGuard::SharedCheckpoint(checkpoint) = owner_guard
+        {
+            match shared_runs::pending_checkpoint_admission(&transaction, checkpoint)? {
+                Some(admission) => {
+                    validate_canonical_tool_call_in_transaction(
+                        &transaction,
+                        session_id,
+                        checkpoint.turn_id,
+                        checkpoint.tool_call_id,
+                        crate::tool::ToolName::SharedDelegate,
+                    )?;
+                    if count_unfinished_tool_calls_for_turn_in_transaction(
+                        &transaction,
+                        session_id,
+                        checkpoint.turn_id,
+                    )? != 1
+                    {
+                        return Err(StorageError::Message(
+                            "paused shared turn must retain exactly one unfinished child call"
+                                .into(),
+                        ));
+                    }
+                    Some(admission)
+                }
+                None => {
+                    transaction.commit()?;
+                    return Ok(GuardedTerminalization::NotOwned);
+                }
+            }
+        } else {
+            None
+        };
         let Some(runtime_state) = session_runtime_state_from_connection(&transaction, session_id)?
         else {
             transaction.commit()?;
@@ -4982,7 +5032,9 @@ impl SqliteSessionRepository {
                 request_id,
             )) => owner_resume_claimed_turn_in_connection(&transaction, session_id, request_id)?
                 .map(|turn_id| (None, turn_id)),
-            TerminalOwnerGuard::Admitted { .. } | TerminalOwnerGuard::Captured(_) => None,
+            TerminalOwnerGuard::Admitted { .. }
+            | TerminalOwnerGuard::Captured(_)
+            | TerminalOwnerGuard::SharedCheckpoint(_) => None,
         };
         if let TerminalOwnerGuard::AgentWake(wake) = owner_guard
             && wake_claim.is_none()
@@ -5070,6 +5122,7 @@ impl SqliteSessionRepository {
                     && durable_admission.is_fresh_at(now)
             }
             TerminalOwnerGuard::Captured(target) => target.matches(durable_admission),
+            TerminalOwnerGuard::SharedCheckpoint(_) => shared_admission == Some(durable_admission),
             TerminalOwnerGuard::AgentWake(_) => {
                 wake_claim.is_some_and(|(expected_admission_id, expected_turn_id)| {
                     expected_turn_id == durable_admission.turn_id
@@ -5557,6 +5610,20 @@ impl SqliteSessionRepository {
             )?;
         }
         let committed_terminal = terminal.clone();
+        if let TerminalOwnerGuard::SharedCheckpoint(checkpoint) = owner_guard {
+            // Keep the shared-job binding so local admission cannot borrow this history.
+            // The checkpoint and canonical terminal are cleared/committed as one fact.
+            transaction.execute(
+                "UPDATE shared_run_checkpoints SET state = 'active', checkpoint_json = NULL
+                 WHERE job_id = ?1 AND session_id = ?2 AND turn_id = ?3 AND admission_id = ?4",
+                params![
+                    checkpoint.job_id,
+                    session_id.to_string(),
+                    protocol_turn_id.to_string(),
+                    admission_id_text
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(GuardedTerminalization::Settled {
             commit: AdmittedTerminalCommit::Applied,

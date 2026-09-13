@@ -1,4 +1,5 @@
 import type { PermissionDecisionState } from "./decision_state.ts";
+import { createSharedWorkUiState, sharedWorkPresentation, type SharedWorkPresentation } from "./shared_work_state.ts";
 import { createHubUiState, hubPresentation, type HubPresentation } from "./hub_state.ts";
 import { createDeviceNetworkUiState, deviceNetworkPresentation, type DeviceNetworkPresentation } from "./device_network_state.ts";
 import { createMcpHistoryUiState, mcpHistoryPresentation, type McpHistoryPresentation } from "./mcp_history_state.ts";
@@ -34,6 +35,7 @@ import type { SideChatPendingQuote } from "./types.ts";
  * not belong in the render model.
  */
 export interface DesktopRenderLocalPresentation {
+  readonly sharedWork: SharedWorkPresentation;
   readonly hub: HubPresentation;
   readonly deviceNetwork: DeviceNetworkPresentation;
   readonly mcpHistory: McpHistoryPresentation;
@@ -99,6 +101,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
   = snapshotLocalPresentation({
     hub: hubPresentation(createHubUiState()),
     deviceNetwork: deviceNetworkPresentation(createDeviceNetworkUiState()),
+    sharedWork: sharedWorkPresentation(createSharedWorkUiState()),
     mcpHistory: mcpHistoryPresentation(createMcpHistoryUiState()),
     mcpPeers: mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
@@ -206,6 +209,7 @@ function snapshotLocalPresentation(
   const snapshot: DesktopRenderLocalPresentation = {
     hub: local.hub ?? hubPresentation(createHubUiState()),
     deviceNetwork: local.deviceNetwork ?? deviceNetworkPresentation(createDeviceNetworkUiState()),
+    sharedWork: local.sharedWork ?? sharedWorkPresentation(createSharedWorkUiState()),
     mcpHistory: local.mcpHistory ?? mcpHistoryPresentation(createMcpHistoryUiState()),
     mcpPeers: local.mcpPeers ?? mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {

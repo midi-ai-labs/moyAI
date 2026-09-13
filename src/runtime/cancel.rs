@@ -63,6 +63,13 @@ struct RunControlInner {
     terminal_router: Mutex<Option<RunTerminalRouter>>,
     root_admission: Mutex<RootAdmissionState>,
     root_admission_activity: watch::Sender<u64>,
+    effect_authority: Mutex<Option<Arc<dyn ExternalEffectAuthority>>>,
+    approval_identity: Mutex<Option<String>>,
+}
+
+/// Additional resource/identity authorization. It never replaces permission or cancellation.
+pub(crate) trait ExternalEffectAuthority: fmt::Debug + Send + Sync {
+    fn authorize(&self, approval_id: Option<&str>) -> Result<(), String>;
 }
 
 /// Opaque identity for one pre-database root admission attempt.
@@ -281,12 +288,68 @@ impl RunControl {
                 terminal_router: Mutex::new(None),
                 root_admission: Mutex::new(RootAdmissionState::default()),
                 root_admission_activity,
+                effect_authority: Mutex::new(None),
+                approval_identity: Mutex::new(None),
             }),
         }
     }
 
     pub fn token(&self) -> CancellationToken {
         self.inner.wake.clone()
+    }
+
+    pub(crate) fn set_effect_authority(&self, authority: Arc<dyn ExternalEffectAuthority>) {
+        *self
+            .inner
+            .effect_authority
+            .lock()
+            .expect("effect authority poisoned") = Some(authority);
+    }
+
+    pub(crate) fn inherit_effect_authority(&self, source: &RunControl) {
+        let authority = source
+            .inner
+            .effect_authority
+            .lock()
+            .expect("effect authority poisoned")
+            .clone();
+        *self
+            .inner
+            .effect_authority
+            .lock()
+            .expect("effect authority poisoned") = authority;
+    }
+
+    pub(crate) fn record_approval_identity(&self, id: String) {
+        *self
+            .inner
+            .approval_identity
+            .lock()
+            .expect("effect approval poisoned") = Some(id);
+    }
+
+    pub(crate) fn take_approval_identity(&self) -> Option<String> {
+        self.inner
+            .approval_identity
+            .lock()
+            .expect("effect approval poisoned")
+            .take()
+    }
+
+    pub(crate) fn authorize_external_effect(&self, approval: Option<&str>) -> Result<(), String> {
+        let authority = self
+            .inner
+            .effect_authority
+            .lock()
+            .map_err(|_| "Effect authority unavailable")?
+            .clone();
+        if self.is_cancelled() {
+            return Err("Execution was stopped".into());
+        }
+        if let Some(authority) = authority {
+            authority.authorize(approval)?;
+        }
+        Ok(())
     }
 
     pub fn is_cancelled(&self) -> bool {

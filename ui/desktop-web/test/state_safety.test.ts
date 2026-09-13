@@ -379,6 +379,8 @@ test("a repeated-click conflict wins over the earlier command response by Rust r
 
 test("regular modal detection excludes menu popovers and contains focus cyclically", () => {
   assert.equal(isRegularModalOverlay("provider"), true);
+  assert.equal(isRegularModalOverlay("shared_work"), true);
+  assert.deepEqual(overlayPrimaryFocusSelectors("shared_work"), ["#shared-username:not(:disabled)", ".shared-work"]);
   assert.equal(isRegularModalOverlay("shortcuts"), true);
   assert.equal(isRegularModalOverlay("about"), true);
   assert.equal(isRegularModalOverlay("file_menu"), false);

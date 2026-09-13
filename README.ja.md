@@ -4,6 +4,8 @@
 
 <h1 align="center">moyAI</h1>
 
+開発版に、Desktopから独立して動く[Windows Runner](docs/runner-local.md)と、Hubの仕事を実行する[共有Runner](docs/runner-shared.md)を追加しています。[Desktopの共有仕事](docs/shared-work-desktop.md)では、このPCにモデルやローカルProjectを設定せず、所属・共通資源の状況、開始期限、承認・取消、担当交代、入力と成果の共有、会話の継続を扱えます。仕事は画面の接続から独立してHubとRunnerが保持します。従来の独立ローカル利用にはHub登録・ログインを要求しません。Runnerは同一Windows利用者のログオン中に動作し、サービス運用や物理別端末への導入は別途検証が必要です。
+
 <p align="center">
   <strong>ローカルLLM と、閉鎖環境専用のコーディングエージェント。</strong>
 </p>
@@ -56,9 +58,10 @@ Hub管理者がグループと方向付きの利用許可を設定します。Hu
 **MCP履歴** の **MCP指示**・**MCP実行** では、端末に保存された委任履歴・結果・エラーを確認し、Markdownで保存できます。
 対応版Hubからも端末の履歴を取得・保存できます。HubとDesktopの両方を更新してください。
 [MCP履歴の手順](docs/mcp-history-guide.md) を参照してください。
-保存済みの手動配信profileは、履歴画面の **旧配信設定の管理** から管理できます。手動接続先フォームも残ります。
-手動配信には独自のtoken・TLS・起動・終了設定が適用されます。[Desktop MCP配信](docs/design/mcp-publish-foundation.md) と
-[Hub連携設計](docs/hub-integration.md) を参照してください。
+手動配信の編集画面と設定・起動commandは廃止しました。保存済みprofile・資格・証明書・実行履歴は保持し、
+更新や再起動だけでは旧配信を再開しません。新しい受付は **moyAI Hub → 端末連携** から明示的に設定してください。
+read-only権限や共有tokenをagent実行権限へ自動昇格させません。外向きのMCP接続と共通transportは維持します。
+[MCP互換性](docs/design/mcp-publish-foundation.md) を参照してください。
 Hub再起動後の委任関係の復旧、証明書更新、受入端末での対話承認、明示した版付き入力の受渡し、
 上限付きUTF-8成果物のWindowsでの新規フォルダへの書き出しを実装しています。
 物理Windows複数台・3台再委任の受入は未実施です。成果物の元Projectへの自動適用、OSサービス運用、
@@ -90,7 +93,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 ## できること
 
 - Project Chat / Quick Chat / Transcript / Artifact Pane / Settings と、メインとは別modelで動くtool-lessなsession-scopedサイドチャットを備えた Tauri Desktop App。サイドチャットはprovider POST直前にexact owner sessionのactive canonical historyとappend fenceをcaptureし、任意の引用は一つのstable transcript/artifact rowと同じsnapshotへtypedに結びます。storage workはappend-only source item 65,536件・derived active item 16,384件・eligible semantic unit 8,192件を上限とし、超過時はprovider transport前に拒否します。untrustedな引用・canonical evidence textはowner-context envelopeへ入れる前にXML entity encodeし、evidenceから構造delimiterを偽装できないようにします。引用は自動送信せずSide draftへ追加し、live workspaceとメインcomposerは変更しません
-- Desktop は1ユーザーにつき1 instanceだけ起動し、再起動操作では既存windowを復元
+- Desktop は1ユーザーにつき1 instanceだけ起動し、再度起動すると既存windowを復元して起動済みであることを表示
 - Desktop の Stop は表示時のworkspace / root session / run generation / Agent Tree epochを検証し、古い画面操作を別runへ適用しない。Settingsの入力値、baseline、dirty状態、monotonic revisionはfrontend local draftだけが所有し、Rustにmirrorを置かない。Rustはtyped clean/dirty capability variantを投影し、Apply / Save / Reset / 別config owner mutationの前にcomplete draftとdecimal-string config generation targetをstatelessに検証する。commit時は一時的な完全`ResolvedConfig`を一度だけ作り、optionalの空欄を古いglobal/base値から再継承しない。active steerもdurable受理後だけ入力をclearする
 - terminal から利用できる CLI / TUI
 - OpenAI 互換 local LLM への接続と明示model availability diagnostic
@@ -128,6 +131,7 @@ Windows 向け release zip には、次のものが含まれています。
 
 - CLI / TUI 用の `bin/moyai.exe`
 - Desktop App 用の `bin/moyai-desktop.exe`
+- 独立した実行と共有環境用の `bin/moyai-runner.exe`
 - user-wide moyAI AppDataを初回状態へ戻す`bin/moyai-cleanup.exe`
 - bundled `ui/desktop-web/dist/` assets
 - README、LICENSE、release notes、config example、getting-started guide、package内SHA256 checksum
@@ -143,6 +147,10 @@ GitHub Releaseでは、zipとあわせて外部manifestとzip SHA256 sidecarも�
 3. `bin/moyai-desktop.exe` を起動します。
 4. 初回起動ではfullscreenのInitial Setupを進めます。provider、model、permission、optional toolを入力またはTOMLから取り込み、local validationを確認してから **Finish and open moyAI** を選びます。model読込とprovider / Docling diagnosticは明示操作時だけ実行され、endpointへ到達できない場合もwarningとして表示するだけで、localにvalidなsetup完了を妨げません。
 5. まずは Quick Chat を試します。コードを扱わせる場合は、project workspace を選択し、開発チャットを開始します。
+
+ウィンドウを閉じるとmoyAIはシステムトレイに残ります。もう一度起動すると、隠れている場合や
+最小化中でも既存ウィンドウを表示し、チャットタイトルの下に起動済みの案内を表示します。
+Desktopを完全に終了する場合は、トレイメニューの **終了** を選びます。
 
 CLI から使う場合は、次のように実行します。
 

@@ -1886,6 +1886,74 @@ pub(crate) fn fork_canonical_items_in_transaction(
     Ok((stats.copied_history_items, stats.copied_turn_items))
 }
 
+/// Copy an authenticated shared archive through the same canonical identity/compaction owners
+/// as a local fork. Imported conversation items grant no execution or permission authority.
+pub(crate) fn fork_shared_history_in_transaction(
+    transaction: &Transaction<'_>,
+    source: SessionId,
+    target: SessionId,
+    history: Vec<HistoryItem>,
+    turns: Vec<TurnItem>,
+) -> Result<(), StorageError> {
+    ensure_empty_protocol_target(transaction, target, "shared continuation")?;
+    if source == target
+        || history.len().saturating_add(turns.len()) > 100_000
+        || history.iter().any(|item| item.session_id != source)
+        || turns.iter().any(|item| item.session_id != source)
+    {
+        return Err(StorageError::Message(
+            "invalid shared continuation history identity".into(),
+        ));
+    }
+    with_canonical_fork_history_id_map(transaction, || {
+        for item in &history {
+            insert_canonical_fork_history_id_mapping(
+                transaction,
+                source,
+                target,
+                item.id,
+                HistoryItemId::new(),
+            )?;
+        }
+        let mut copied = Vec::with_capacity(history.len());
+        for item in history {
+            let forked = HistoryItem {
+                id: canonical_fork_target_history_id(transaction, source, target, item.id)?,
+                session_id: target,
+                payload: fork_history_payload_for_session(
+                    transaction,
+                    source,
+                    target,
+                    item.payload,
+                )?,
+                ..item
+            };
+            insert_history_item(transaction, &forked)?;
+            insert_forked_turn_steer_provenance(transaction, &forked)?;
+            copied.push(forked);
+        }
+        seed_history_turn_sequence_allocators(transaction, target, &copied)?;
+        for item in turns {
+            let forked = TurnItem {
+                id: TurnItemId::new(),
+                session_id: target,
+                source_item_id: item
+                    .source_item_id
+                    .map(|id| canonical_fork_target_history_id(transaction, source, target, id))
+                    .transpose()?,
+                ..item
+            };
+            insert_turn_item(transaction, &forked)?;
+            seed_turn_sequence_allocators(
+                transaction,
+                target,
+                [(forked.turn_id, forked.sequence_no)],
+            )?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 const CANONICAL_FORK_HISTORY_ID_MAP_TABLE: &str = "moyai_canonical_fork_history_id_map";
 

@@ -17,6 +17,8 @@ pub mod read_context;
 pub mod registry;
 pub(crate) mod sandbox_process;
 pub mod search;
+pub(crate) mod shared_delegate;
+pub(crate) mod shared_publish_artifact;
 pub mod shell;
 pub mod skill;
 pub mod spec_plan;

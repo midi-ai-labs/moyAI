@@ -1,4 +1,5 @@
 import type { LocalConfirmation } from "./render_overlays.ts";
+import { createSharedWorkUiState, type SharedWorkUiState } from "./shared_work_state.ts";
 import { createHubUiState, type HubUiState } from "./hub_state.ts";
 import { createDeviceNetworkUiState, type DeviceNetworkUiState } from "./device_network_state.ts";
 import { createMcpHistoryUiState, type McpHistoryUiState } from "./mcp_history_state.ts";
@@ -233,6 +234,7 @@ export interface AgentExecutionRequest extends AgentExecutionTarget {
 }
 
 export interface UiLocalState {
+  sharedWork: SharedWorkUiState;
   hub: HubUiState;
   deviceNetwork: DeviceNetworkUiState;
   mcpHistory: McpHistoryUiState;
@@ -302,6 +304,7 @@ export function createUiLocalState(): UiLocalState {
   return {
     hub: createHubUiState(),
     deviceNetwork: createDeviceNetworkUiState(),
+    sharedWork: createSharedWorkUiState(),
     mcpHistory: createMcpHistoryUiState(),
     mcpPeers: createMcpPeerState(),
     drafts: {

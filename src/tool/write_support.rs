@@ -30,6 +30,25 @@ fn create_new_text_tree_with_observer(
     files: &[(String, String)],
     after_parent_open: impl FnOnce(),
 ) -> Result<(), EditError> {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (path.clone(), text.as_bytes().to_vec()))
+        .collect();
+    create_new_bytes_tree_with_observer(guarded, &files, after_parent_open)
+}
+
+pub(crate) fn create_new_bytes_tree(
+    guarded: &GuardedPath,
+    files: &[(String, Vec<u8>)],
+) -> Result<(), EditError> {
+    create_new_bytes_tree_with_observer(guarded, files, || {})
+}
+
+fn create_new_bytes_tree_with_observer(
+    guarded: &GuardedPath,
+    files: &[(String, Vec<u8>)],
+    after_parent_open: impl FnOnce(),
+) -> Result<(), EditError> {
     let parent_path = guarded
         .absolute
         .parent()
@@ -53,7 +72,7 @@ fn create_new_text_tree_with_observer(
                 file: root,
             },
         );
-        for (path, text) in files {
+        for (path, bytes) in files {
             let components: Vec<_> = path.split('/').collect();
             if components.iter().any(|part| {
                 part.is_empty() || matches!(*part, "." | "..") || part.contains(['\\', ':', '\0'])
@@ -89,7 +108,7 @@ fn create_new_text_tree_with_observer(
                 &directories[&key],
                 components.last().expect("one component"),
             )?;
-            file.write_all(text.as_bytes())?;
+            file.write_all(bytes)?;
             file.sync_all()?;
         }
         Ok::<_, EditError>(())
@@ -119,6 +138,20 @@ pub(crate) fn write_text_file_conditionally(
     expected_identity: Option<&FileContentIdentity>,
     validate_temporary_file: impl FnOnce(&File) -> Result<(), EditError>,
 ) -> Result<FileContentIdentity, EditError> {
+    write_bytes_file_conditionally(
+        guarded,
+        text.as_bytes(),
+        expected_identity,
+        validate_temporary_file,
+    )
+}
+
+pub(crate) fn write_bytes_file_conditionally(
+    guarded: &GuardedPath,
+    bytes: &[u8],
+    expected_identity: Option<&FileContentIdentity>,
+    validate_temporary_file: impl FnOnce(&File) -> Result<(), EditError>,
+) -> Result<FileContentIdentity, EditError> {
     let path = guarded.absolute.as_path();
     let parent = path
         .parent()
@@ -137,9 +170,9 @@ pub(crate) fn write_text_file_conditionally(
         ));
     }
     let prepared = (|| {
-        staged.file.write_all(text.as_bytes())?;
+        staged.file.write_all(bytes)?;
         staged.file.flush()?;
-        written_text_identity(&staged.file, text)
+        written_bytes_identity(&staged.file, bytes)
     })();
     let committed_identity = match prepared {
         Ok(identity) => identity,
@@ -1498,7 +1531,7 @@ fn windows_delete_by_handle(entry: &File) -> std::io::Result<()> {
     }
 }
 
-fn written_text_identity(file: &File, text: &str) -> Result<FileContentIdentity, EditError> {
+fn written_bytes_identity(file: &File, bytes: &[u8]) -> Result<FileContentIdentity, EditError> {
     use sha2::{Digest as _, Sha256};
 
     let metadata = file.metadata()?;
@@ -1509,7 +1542,7 @@ fn written_text_identity(file: &File, text: &str) -> Result<FileContentIdentity,
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_millis() as i64),
         size_bytes: metadata.len(),
-        content_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+        content_sha256: format!("{:x}", Sha256::digest(bytes)),
     })
 }
 

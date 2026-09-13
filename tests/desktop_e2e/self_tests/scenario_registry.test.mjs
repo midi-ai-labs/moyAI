@@ -12,6 +12,10 @@ const case52Options = Object.freeze({
   expected_main_variant: "example/main@q6",
   expected_side_variant: "example/side@q4",
 });
+test("shared entry accepts the explicit Hub build identity used by the common CLI", () => {
+  const scenario = createScenario("settings.shared-work", { hubBinary: "C:/fixture/moyai-hub.exe", browserChannel: "msedge", headed: true });
+  assert.equal(scenario.id, "settings.shared-work");
+});
 const liveProviderOptions = Object.freeze({
   provider_base_url: "http://192.0.2.10:8119/v1",
   model: "example/Qwen-27B",
@@ -31,10 +35,13 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.deepEqual(scenarioIds, [
     "shell.baseline",
     "shell.about",
+    "shell.single-instance",
     "shell.lynx",
     "shell.managed-lifecycle",
     "hub.connection-settings",
     "hub.browser-enrollment",
+    "settings.shared-work",
+    "settings.shared-work-continuation",
     "hub.join-retry-controls",
     "hub.receiver-settings-controls",
     "hub.outgoing-controls",

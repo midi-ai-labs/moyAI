@@ -487,6 +487,7 @@ impl SqliteStore {
                  FROM tool_calls INDEXED BY idx_tool_calls_truncated_output_path
                  WHERE truncated_output_path IS NOT NULL
                    AND truncated_output_path = ?1
+                 UNION ALL SELECT 1 FROM shared_history_files WHERE local_path = ?1
              )",
         )?;
         for entry in entries {

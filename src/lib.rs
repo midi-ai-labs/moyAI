@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod mcp_publish;
 pub mod protocol;
 pub mod remote_agent;
+pub mod runner;
 pub mod runtime;
 pub mod session;
 pub mod skill;

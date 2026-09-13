@@ -37,6 +37,29 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub(crate) fn with_shared_environments(
+        mut self,
+        job_id: &str,
+        environments: &[String],
+    ) -> Self {
+        self.tools.insert(
+            "shared_publish_artifact".into(),
+            Arc::new(
+                crate::tool::shared_publish_artifact::SharedPublishArtifactTool {
+                    job_id: job_id.to_owned(),
+                },
+            ),
+        );
+        if !environments.is_empty() {
+            self.tools.insert(
+                "shared_delegate".into(),
+                Arc::new(crate::tool::shared_delegate::SharedDelegateTool {
+                    environments: environments.to_vec(),
+                }),
+            );
+        }
+        self
+    }
     pub(crate) fn empty() -> Self {
         Self {
             tools: HashMap::new(),

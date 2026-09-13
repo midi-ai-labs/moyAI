@@ -375,6 +375,12 @@ impl ManagedShells {
         self.cancel_matching(|owner| matches!(&owner.authority, Authority::Remote { profile: p, .. } if *p == profile));
     }
 
+    pub(crate) fn cancel_local(&self, root: SessionId) {
+        self.cancel_matching(
+            |owner| matches!(&owner.authority, Authority::Local(session) if *session == root),
+        );
+    }
+
     pub(crate) fn cancel_lineages(&self, lineages: &[(String, String)]) {
         self.cancel_matching(|owner| {
             matches!(&owner.authority,
@@ -394,6 +400,17 @@ impl ManagedShells {
     pub(crate) fn has_profile_work(&self, profile: Ulid) -> bool {
         self.inner.lock().map_or(true, |registry| registry.records.values().any(|record|
             !record.worker.is_finished() && matches!(&record.owner.authority, Authority::Remote { profile: p, .. } if *p == profile)))
+    }
+
+    /// A terminal local turn may still own a managed process. The Runner keeps its execution
+    /// capacity occupied until the existing process-tree owner confirms that worker has ended.
+    pub(crate) fn has_local_work(&self, root: SessionId) -> bool {
+        self.inner.lock().map_or(true, |registry| {
+            registry.records.values().any(|record| {
+                !record.worker.is_finished()
+                    && matches!(&record.owner.authority, Authority::Local(session) if *session == root)
+            })
+        })
     }
 }
 

@@ -612,12 +612,80 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
             run_device_outgoing_references(connection)?;
             run_remote_network_receipts(connection)?;
             run_remote_artifacts(connection)?;
-            return run_side_chat_route_kind(connection);
+            run_side_chat_route_kind(connection)?;
+            run_shared_run_checkpoints(connection)?;
+            return run_shared_history_files(connection);
         }
     }
     Err(StorageError::Message(format!(
         "storage migration did not reach current endpoint V{SIDE_CHAT_SYSTEM_PROMPT_VERSION}"
     )))
+}
+
+fn run_shared_history_files(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 68)? {
+            connection.execute_batch(include_str!(
+                "../../migrations/V68__shared_history_files.sql"
+            ))?;
+        }
+        if !schema_migration_has_exact_name(connection, 68, "shared_history_files")? {
+            return Err(StorageError::Message(
+                "invalid shared history file migration marker".into(),
+            ));
+        }
+        connection.prepare(
+            "SELECT session_id,original_path,local_path,sha256 FROM shared_history_files LIMIT 0",
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn run_shared_run_checkpoints(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, 67)? {
+            connection.execute_batch(include_str!(
+                "../../migrations/V67__shared_run_checkpoints.sql"
+            ))?;
+        }
+        if !schema_migration_has_exact_name(connection, 67, "shared_run_checkpoints")? {
+            return Err(StorageError::Message(
+                "invalid shared checkpoint migration marker".into(),
+            ));
+        }
+        connection.prepare("SELECT job_id, project_id, environment_id, session_id, turn_id, admission_id, state, checkpoint_json FROM shared_run_checkpoints LIMIT 0")?;
+        let guarded: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'shared_run_fixed_access_mode')", [], |row| row.get(0),
+        )?;
+        if !guarded {
+            return Err(StorageError::Message(
+                "shared checkpoint access mode guard is missing".into(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn run_side_chat_route_kind(connection: &Connection) -> Result<(), StorageError> {

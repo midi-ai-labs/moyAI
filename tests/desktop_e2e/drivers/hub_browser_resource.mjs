@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -57,6 +58,15 @@ export async function startHubBrowserResource({ context, sink, phase = "prepared
     browserContext.setDefaultTimeout(15_000);
     const page = browserContext.pages()[0] ?? await browserContext.newPage();
     page.on("pageerror", error => pageErrors.push(error.message));
+    const administrator = { username: "desktop-fixture-admin", password: randomUUID() };
+    await page.goto(hub.url);
+    await page.locator("#web-auth-display-name").waitFor();
+    await page.locator("#web-auth-username").fill(administrator.username);
+    await page.locator("#web-auth-display-name").fill("Desktop fixture administrator");
+    await page.locator("#web-auth-password").fill(administrator.password);
+    await page.locator("#web-auth-password-confirm").fill(administrator.password);
+    await page.locator("#web-auth-submit").click();
+    await page.locator("#management-status").filter({ hasText: "Hub本体に接続中" }).waitFor();
     await record("hub-browser-started", { root, channel: settings.browserChannel, headed: settings.headed, url: hub.url,
       browser_version: browserContext.browser()?.version() ?? null, playwright_version: requireHub("playwright/package.json").version });
     const readOnlyHub = Object.freeze({ url: hub.url, networkPort: hub.networkPort, observeNetwork: hub.observeNetwork,
@@ -67,7 +77,7 @@ export async function startHubBrowserResource({ context, sink, phase = "prepared
         return hub.command(name);
       },
     });
-    return Object.freeze({ hub: readOnlyHub, page, provider, downloads, close,
+    return Object.freeze({ hub: readOnlyHub, page, provider, downloads, close, administrator,
       pageErrors: () => [...pageErrors],
       screenshot: async name => {
         evidencePhase = "executing";

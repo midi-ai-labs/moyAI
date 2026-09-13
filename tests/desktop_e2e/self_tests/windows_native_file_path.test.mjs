@@ -8,7 +8,7 @@ const candidate = {
 };
 const args = {
   executionRoot: "C:\\execution", ownerPath: "C:\\execution\\owner.json", candidate,
-  selectedPath: "C:\\fixtures\\日本語 フォルダ\\hub-participation.toml",
+  selectedPath: "C:\\fixtures\\日本語 フォルダ\\hub-config.toml",
 };
 function delivered() {
   const control = (hwnd, parent, className, id) => ({
@@ -98,4 +98,28 @@ test("native absolute-path input rejects an invalid path or dialog before dispat
     ...args, candidate: { ...candidate, class_name: "Tauri Window" },
   }, { invoke }), TypeError);
   assert.equal(calls, 0);
+});
+
+test("native save and directory choices require their explicit intent and cannot accept open-mode evidence", async () => {
+  for (const intent of ["save_new", "directory"]) {
+  const selectedPath = "C:\\execution\\output\\new.bin";
+  const parameters = { ...args, selectedPath, intent };
+  const evidence = { ...delivered(), selected_path: selectedPath, selected_path_intent: intent };
+  if (intent === "save_new") {
+    const control = (hwnd, parent_hwnd, class_name, control_id) => ({ ...evidence.controls.edit, hwnd, parent_hwnd, class_name, control_id });
+    evidence.controls = { view: control("0x110", "0x100", "DUIViewWndClassName", 0), direct: control("0x120", "0x110", "DirectUIHWND", 0), sink: control("0x130", "0x120", "FloatNotifySink", 0), combo: control("0x140", "0x130", "ComboBox", 0), edit: control("0x150", "0x140", "Edit", 1001), button: control("0x160", "0x100", "Button", 1) };
+    const wrongParent = structuredClone(evidence); wrongParent.controls.sink.parent_hwnd = candidate.hwnd;
+    await assert.rejects(() => nativeInput.openFilePathInOwnedNativeDialog(parameters, { invoke: async () => wrongParent }), error => error.code === "native-dialog-path-open-invalid");
+  }
+  if (intent === "directory") {
+    evidence.controls = { edit: { ...evidence.controls.edit, parent_hwnd: candidate.hwnd, control_id: 1152 }, button: evidence.controls.button };
+    await assert.rejects(() => nativeInput.openFilePathInOwnedNativeDialog(parameters, { invoke: async () => ({ ...delivered(), selected_path: selectedPath, selected_path_intent: intent }) }), error => error.code === "native-dialog-path-open-invalid");
+  }
+  const result = await nativeInput.openFilePathInOwnedNativeDialog(parameters, { invoke: async (action, values) => {
+    assert.equal(action, "OpenFilePath"); assert.equal(values.SelectedPathIntent, intent);
+    return evidence;
+  } });
+  assert.equal(result, evidence);
+  await assert.rejects(() => nativeInput.openFilePathInOwnedNativeDialog(parameters, { invoke: async () => ({ ...evidence, selected_path_intent: "open" }) }), error => error.code === "native-dialog-path-open-invalid");
+  }
 });

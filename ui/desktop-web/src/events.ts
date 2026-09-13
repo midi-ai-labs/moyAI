@@ -1,6 +1,7 @@
 import { command } from "./api.ts";
 import { editHubField } from "./hub_state.ts";
 import { editDeviceNetworkField } from "./device_network_state.ts";
+import { editSharedWork } from "./shared_work_state.ts";
 import { editMcpPeerField } from "./mcp_peer.ts";
 import {
   actionEnabledById,
@@ -660,6 +661,12 @@ function installDelegatedActionEvents(context: ActionContext): void {
     if (target.dataset.mcpPeerField !== undefined) {
       if (context.getViewState()?.overlay !== "config") return;
       editMcpPeerField(context.uiState.mcpPeers, target.dataset.mcpPeerField, target.value);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.sharedField !== undefined) {
+      if (context.getViewState()?.overlay !== "shared_work") return;
+      editSharedWork(context.uiState.sharedWork, target.dataset.sharedField, target.value);
       context.rerender();
       return;
     }

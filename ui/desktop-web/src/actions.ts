@@ -1,4 +1,6 @@
 import { command } from "./api.ts";
+import { openSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
+import { sharedWorkActionEnabled } from "./shared_work_state.ts";
 import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
 import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "./device_network_actions.ts";
 import { deviceCanJoin, deviceCanReceive, deviceCanSelect, deviceCanStopJob } from "./device_network_state.ts";
@@ -1508,6 +1510,12 @@ const ACTION_DEFINITIONS = [
     run: (_state, context) => context.mutate("show_config_editor"),
   },
   { id: "show-hub", label: "moyAI Hub", menu: "view", palette: true, enabled: always, run: (_state, context) => openHub(context) },
+  { id: "show-shared-work", label: "共有仕事", menu: "view", palette: true, enabled: always, run: (_state, context) => openSharedWork(context) },
+  ...["login", "logout", "refresh", "project", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "latest", "reconnect", "import", "approve", "deny", "stop", "continue", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest", "provider-status", "provider-start", "provider-prepare", "provider-install", "provider-pause", "provider-resume", "provider-drain", "provider-maintenance", "provider-provision", "provider-reconcile", "provider-autostart", "provider-no-autostart", "provider-remove-template"].map(kind => ({
+    id: `shared-${kind}`, label: "共有仕事の操作",
+    enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.overlay === "shared_work" && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
+    run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => sharedWorkAction(context, kind.replaceAll("-", "_"), payload.value),
+  })),
   { id: "hub-tab-devices", label: "Hubの端末連携", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "devices") },
   { id: "hub-tab-models", label: "Hubのモデル割当", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "models") },
   { id: "device-network-import", label: "Hub共通設定を読み込む", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection), run: (_state, context) => importDeviceNetwork(context) },

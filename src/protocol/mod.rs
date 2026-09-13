@@ -32,8 +32,9 @@ pub use store::{
 };
 pub(crate) use store::{
     canonical_protocol_snapshot_from_connection, fork_agent_context_in_transaction_for_spawn,
-    fork_canonical_items_in_transaction, insert_mailbox_append_order_in_transaction,
-    insert_session_owned_event_bundle_in_transaction, latest_protocol_turn_ids_in_transaction,
+    fork_canonical_items_in_transaction, fork_shared_history_in_transaction,
+    insert_mailbox_append_order_in_transaction, insert_session_owned_event_bundle_in_transaction,
+    latest_protocol_turn_ids_in_transaction,
 };
 
 macro_rules! protocol_id {

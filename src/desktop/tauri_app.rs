@@ -106,6 +106,9 @@ macro_rules! desktop_command_manifest {
             create_project_from_picker,
             show_config_editor,
             show_hub_editor,
+            show_shared_work,
+            shared_work_projection,
+            shared_work_command,
             hub_projection,
             hub_connect,
             hub_refresh,
@@ -409,6 +412,12 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             restore_main_window(app);
+            let shared = app.state::<SharedController>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                shared.lock().await.state.set_status_message(
+                    "moyAI は既に起動しています。既存のウィンドウを表示しました。",
+                );
+            });
         }))
         .manage(shared)
         .manage(hub_connection)
@@ -3293,6 +3302,41 @@ async fn show_config_editor(
         Ok(())
     })
     .await
+}
+
+#[tauri::command]
+async fn show_shared_work(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "Shared work")?;
+        if !controller.state.show_shared_work() {
+            return Err(rejected_action(
+                controller,
+                "Shared work could not be opened",
+            ));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn shared_work_projection(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::SharedWorkProjection, String> {
+    Ok(service.shared_work_projection())
+}
+
+#[tauri::command]
+async fn shared_work_command(
+    service: State<'_, DeviceNetworkService>,
+    expected_generation: String,
+    request: crate::device_network::SharedWorkCommand,
+) -> Result<crate::device_network::SharedWorkProjection, String> {
+    Ok(service
+        .shared_work_command(&expected_generation, request)
+        .await)
 }
 
 #[tauri::command]

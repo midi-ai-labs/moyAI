@@ -27,6 +27,7 @@ tests/desktop_e2e/
 - `ExecutionLifecycle` は execution の単一 state owner である。scenario やdriverは独自のphase flagを持たない。
 - `executeDesktopScenario` はpreflightからsealまでを一度だけ進める共通orchestratorである。CLIは引数とscenarioをbindingするだけで、scenarioごとのrunnerを実装しない。
 - `WindowsTauriHost` はatomic admission、launch、dynamic attach、exact process/profile ownership、graceful/forced cleanup、SQLite最終auditを所有する。
+- `shell.single-instance` は完了済みsessionの未送信draftを残し、exact HWNDを非表示・最小化して同じbinaryを再起動する。`WindowsTauriHost.launchDuplicate` が現行generationのconfig/data/profileを再利用し、共通Windows Job ownerで二重起動側を終了・回収する。同一HWNDの表示/最小化解除、既存Desktop processがexact 1件、session/history/draft保持、起動側stdoutと画面の明示noticeを検証する。foreground権限と物理入力は別の確認項目である。
 - `EvidenceSink` だけが append-only evidence と final seal を書く。driverはtyped observationを返すだけで、final resultを書かない。
 - `DesktopScenario` は操作意図、product predicate、scenario固有resourceのquiesce、input/probe cleanupを所有する。process、profile、port、SQLite、共通deadline、screenshot path、verdictは所有しない。
 - `CdpDriver` はWebView内のsemantic locator、trusted browser input、DOM/AX/event観測を所有する。native dialogはexact HWNDへ束縛したWindows UI Automation / Win32 adapterで扱い、foreground依存の`SendInput`は入力先を証明できない環境で送信しない。
@@ -211,6 +212,14 @@ npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe -
 
 Hubの管理画面はブラウザーへ移行したため、旧Hubネイティブウィンドウを起動・操作するdriverと結合シナリオは削除した。現在は[HubのPlaywright試験](../../../moyAI-Hub/tests/browser/README.md)と、このharnessのDesktop試験を使用する。`hub.connection-settings`はHTTP fixtureを使って実Desktopの接続設定を確認する現役シナリオとして維持する。
 
+`settings.shared-work` はconfig/model/local Projectを用意せず起動し、共有入口、native共通設定import、Hubブラウザーの端末承認、人のlogin、所属projectと占有の秘匿、仕事の投入・詳細・取消、logout、別利用者のloginを実Tauriで操作する。初期設定は未完了のまま維持する。Hubのfixture専用mTLS参加者が2人の所属と共通資源上の待機仕事を実APIで用意する。製品GUIからの投入とfixture準備を証跡で区別し、solver実行・物理別PC・受付応答喪失の実通信試験はこのシナリオの範囲へ含めない。共通Hub browser resourceは初回管理者設定を実ブラウザーで行い、人のパスワードを証跡へ記録しない。
+
+`settings.shared-work-continuation` は同じHubと実Runnerを保ち、Desktop Aのnative入力添付・投入・担当引継ぎ要求、Aの通常終了、設定のない別端末登録のDesktop Bからの実操作承認・成果保存・担当交代・会話を引き継ぐ追加依頼を実行する。Aでは人のログイン前にも実Runnerの受付停止・再開をGUIで確認する。scenario configには共通Hubの `hubBinary` / `hubRepository` と製品 `runnerBinary` に加え、現在sourceから作ったlibtest実行ファイルの絶対pathを `runnerTestBinary` で指定する。RunnerHost / LocalListener / SharedWorkerを実行する `cfg(test)` 専用入口でmachine資源registryだけをexecution directoryへ注入し、製品のProgramData設定を変更しない。証跡には両binaryのidentityと注入範囲を記録する。同一Windows上の独立した端末設定であり、物理別PC、別Windowsアカウント、外部solverの試験ではない。最終画像の目視は自動判定とは別に記録する。
+
+提供設定は名前だけを入力してnativeフォルダ選択へ進み、生成された識別名と標準の権限・共有範囲を追加設定から確認する。公開済みひな形の選択で入力値を再利用し、編集後の古いフォルダ確認では公開できないこと、選び直したフォルダの確認後に更新できることを操作する。Hubでは同じひな形のカードから端末・共有枠・名前を引き継ぎ、公開先プロジェクトの選択と1回の保存でフォルダ作成まで依頼し、実Runnerが作成したパスを確認する。native SELECTは既存のclick / Home / ArrowDown / Enterに加え、exact対象のtrusted input/changeと要求した値の読戻しを要求し、入力を再送して成功するまで繰り返す動作はしない。
+
+同シナリオではnative親フォルダ選択によるテンプレート公開、Hub管理画面からの環境作成・配置依頼、実Runnerによる領域作成、公開停止後の既存mapping保持も確認する。共通native path helperは既存fileを選ぶ `open`、execution配下の既存folderを選ぶ `directory`、execution配下の既存parentへ新fileを保存する `save_new` の意図を明示する。対象HWND・controlの照合とfile名のreadbackを経て確認buttonを一度だけ押し、別意図のdelivery evidenceや上書き確認への暗黙fallbackを受理しない。
+
 `hub.browser-enrollment` は実Hubを公開CLIからisolated data directoryで起動し、headed Edge/Chromeのモデル登録・ネットワーク開始・共通設定download・端末承認と、実Desktopのnative pickerによるimport・Main/Side別モデル選択/確認/Hub送信先切替を通す。管理側のmutationはブラウザーGUI、Desktop側は実Tauri上のtrusted WebView inputと、下記の検証済みnative picker control入力を使う。起動・port・終了はHub側の単一 `tests/browser/hub_server.mjs` を再利用する。既定は隣の `moyAI-Hub` checkoutとEdgeで、必要な場合だけscenario configにabsolute `hubRepository` / `hubBinary`、`browserChannel`（`msedge`/`chrome`/`chromium`）、`headed`を指定する。通常のDesktopシナリオはHub checkoutやPlaywrightをロードしない。
 
 `output.history-navigation` は小さなscripted providerでtool実行中を保持し、「会話履歴の詳細へ」をpointerで操作する。既存detailsが開き、canonical destinationへfocus/scrollが移ることを確認し、未送信日本語draft・選択範囲・同じeditorを保持したまま周期更新を配送する。完了後は実行中専用の出力ボタンが消え、会話内の同じcanonical履歴の開示をTab/Enterで操作できることを確認する。Main送信1回、停止0回、Side送信0回と固定応答を照合する。typed Rust draftと編集中のTypeScript draftは別に比較する。画面の目視は `manual_pending` としてexecutionに紐付くreviewへ残す。
@@ -218,6 +227,8 @@ Hubの管理画面はブラウザーへ移行したため、旧Hubネイティ�
 `mcp.receiver-live` は同じブラウザーHubへの参加後、実Desktopでtemp受付を有効にし、ブラウザーで送信者fixtureの承認・方向付き接続ルールを設定する。送信者fixtureは実grant/mTLS/MCPを通して受信Desktopへtaskを依頼し、scripted providerで実行中を保持する。Desktopの赤い活動strip・実行履歴・完了、Hubから取得した同一jobの履歴を比較する。DesktopのMarkdown保存はnativeダイアログ表示と取消までを自動操作し、保存確定と配色の目視は未完了として `manual_pending` に残す。送信者はNodeのprotocol fixtureなので、Desktop側の「MCP指示」画面や物理端末間の合格は含めない。scenario configは `hub.browser-enrollment` と共通である。
 
 native pickerの絶対パス入力は、実測したdialog→ComboBoxEx32→ComboBox→EditとOpenボタンのPID/start/executable/HWND/thread/親/control-IDを再検証し、WM_SETTEXTを1回、WM_GETTEXT一致後のみBM_CLICKを1回配送する。外部foregroundへのthread attachや、曖昧な配送の再送・別方式fallbackは行わない。これはnative controlを通るGUI操作の証拠であり、OS物理キーボード・IMEの証明ではない（`foreground_required:false`、`os_keyboard_ime_evidence:false`）。dialog閉鎖とDesktopの参加申請状態まで確認して成功を判定する。既存UIAの項目選択・取消やSendInputのforeground契約とは別adapterである。
+
+同シナリオは、手動接続の詳細を閉じたままモデル情報を更新し、接続後のカードから共有仕事へ直接移動する操作も確認する。共有仕事のボタンがスクロール前の画面内にあり、設定ファイルを再読込せずに接続が引き継がれること、人のログインは自動成立せず本人入力を待つことを照合する。
 
 `hub.browser-enrollment` のモデル割当成功は、Main/Side生成、再起動後の復元、実MCP委任、物理別端末の受入を含まない。各caseの機械判定と目視結果は実行記録を参照する。旧ウィンドウ構成の過去の合格で代用しない。同じDesktop exeを操作するGUI試験と、そのexeの再ビルドは並行させない。
 
@@ -251,3 +262,5 @@ native pickerの絶対パス入力は、実測したdialog→ComboBoxEx32→Comb
 root `logs/` はprocess出力先だが、final hash / sizeをcleanup eventへ収録する。DB / sidecarを読むのは全task-owned processとprofile WebViewが0になり、scenario固有resourceをquiesceした後のcleanup ownerだけとし、seal後は再度開かない。
 
 cleanupは、scenario固有のambiguous input / probeを各scenarioの`finally`で解放し、必要なら`requestGracefulExit`でnative resourceをsettleしてから、Desktop zero → profile WebView zero → `scenario.quiesce` → closed SQLite audit → log close / identity → admission releaseの順に進む。orchestratorは続いて`scenario.cleanup`の最終検証、exact-cleanup event、result / sealを一度だけ確定する。
+
+共有のnative path helperでは、実フォルダ選択画面で観測したroot直下のEdit/1152とButton/1をdirectory intent専用の照合対象とする。save_newでは一意なEdit/1001からComboBox/0→FloatNotifySink/0→DirectUIHWND/0→DUIViewWndClassName/0→rootという実測したnative親階層を照合する。file openのComboBoxEx32/1148配下と混用せず、異なるcontrol構造では入力前に停止する。どの意図も同じowner・thread・root・親・control identityと一回配送を再検証する。共有設定のkeyboard取得はfocus済みでも中心がスクロール外なら、一度だけ隣接controlへ移って戻る。対象が下側ならTab→Shift+Tab、上側ならShift+Tab→Tabとし、その後の同一対象・可視性・hit test・trusted clickを再検証する。これでも可視性を取得できない場合は入力前に停止する。

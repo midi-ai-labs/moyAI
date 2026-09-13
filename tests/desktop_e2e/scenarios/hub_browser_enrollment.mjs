@@ -46,21 +46,38 @@ export async function wait(label, sample, accept, timeoutMs = 30_000) {
     throw error;
   }
 }
-export async function trustedClick(input, cdp, target, sink) {
+export async function trustedFocus(input, cdp, target) {
   await wait("Desktop control is available", () => cdp.evaluate(`(() => {
     const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
     return nodes.length === 1 && !nodes[0].disabled && nodes[0].closest('[hidden]') === null;
   })()`), value => value === true, 10_000);
   // Keyboard navigation lets the product bring off-screen settings into view.
-  let focused = false;
+  let focused = false, reentered = false;
   for (let count = 0; count < 100; ++count) {
     const observation = await cdp.evaluate(`(() => { const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
       return { count: nodes.length, focused: nodes.length === 1 && document.activeElement === nodes[0] }; })()`);
     if (observation.count !== 1) throw fail("Desktop control is not unique", { target, observation });
-    if (observation.focused) { focused = true; break; }
+    if (observation.focused) {
+      const { observation: geometry } = await input.observeExactTarget(target);
+      if ((!geometry.center_in_viewport || !geometry.center_in_scroll_clip) && !reentered) {
+        // Native Tab can reveal only a textarea's first caret line. Visit the
+        // adjacent control beyond the clipped edge, then return once by keyboard.
+        reentered = true;
+        const below = geometry.center.y >= geometry.scroll_clip.bottom;
+        if (below) await input.pressKey("Tab");
+        await input.keyDown("Shift");
+        try { await input.pressKey("Tab"); } finally { await input.keyUp("Shift"); }
+        if (!below) await input.pressKey("Tab");
+        continue;
+      }
+      focused = true; break;
+    }
     await input.pressKey("Tab");
   }
   if (!focused) throw new DesktopE2eError("harness", "hub-browser-focus-unreachable", "Desktop control cannot be reached by keyboard", { target });
+}
+export async function trustedClick(input, cdp, target, sink) {
+  await trustedFocus(input, cdp, target);
   const start = (await input.snapshotProbe()).sequence;
   await input.click(target, { stableHitSamples: 3 });
   const probe = assertTrustedProbeSequence(await input.snapshotProbe(start), { afterSequence: start, expected: [
@@ -118,6 +135,15 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         const rows = [...document.querySelectorAll('input[data-hub-field*="model:"]')];
         return rows.length === 4 && rows.every(row => !row.disabled);
       })()`), value => value === true);
+      if (await cdp.evaluate(`document.querySelector('#hub-manual-connection')?.open`)) {
+        throw fail("Managed model refresh must be reachable with manual connection closed", {});
+      }
+      await trustedClick(input, cdp, action("hub-refresh"), sink);
+      await wait("Model refresh finishes without opening manual connection settings", () => cdp.evaluate(`(() => {
+        const refresh = document.querySelector('button[data-action="hub-refresh"]');
+        return Boolean(refresh && !refresh.disabled && !document.querySelector('#hub-manual-connection')?.open);
+      })()`), value => value === true);
+      await captureScenarioScreenshot({ cdp, sink, name: "hub-models-visible-refresh", owner: OWNER });
       const selected = Object.fromEntries([["main", "Enrollment Main"], ["side_chat", "Enrollment Side"]].map(([name, label]) => {
         const matches = connected.catalog.models.filter(model => model.label === label);
         if (matches.length !== 1) throw fail("Desktop catalog does not match browser registration", { label });
@@ -160,6 +186,24 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         prompt_enabled: shell.prompt_enabled, prompt_center_hit: shell.prompt_center_hit, blocking_dialogs: shell.blocking_dialogs,
       }, { phase: "executing", owner: OWNER });
       await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-desktop-finished", owner: OWNER });
+      await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
+      await trustedClick(input, cdp, byId("hub-tab-devices"), sink);
+      const sharedShortcut = await wait("Connected device panel has rendered its shared-work shortcut", async () =>
+        (await input.observeExactTarget(byId("device-network-open-shared"))).observation, value => value.visible);
+      if (!sharedShortcut.center_in_viewport || !sharedShortcut.center_in_scroll_clip) {
+        throw fail("Connected Desktop exposes the shared-work shortcut without scrolling", sharedShortcut);
+      }
+      await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-next-steps", owner: OWNER });
+      await trustedClick(input, cdp, byId("device-network-open-shared"), sink);
+      const sharedEntry = await wait("Connection card opens shared work without reimport or automatic human login", () => cdp.evaluate(`(async () => {
+        const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
+        const shared = await window.__TAURI_INTERNALS__.invoke('shared_work_projection');
+        const login = document.querySelector('#shared-username');
+        return { overlay: state.overlay, connected: shared.connected, principal: shared.principal,
+          login_visible: Boolean(login && login.getClientRects().length && !login.closest('[hidden], [inert]')) };
+      })()`), value => value.overlay === "shared_work" && value.connected && value.principal === null && value.login_visible);
+      await sink.record("hub-connection-shared-entry", sharedEntry, { phase: "executing", owner: OWNER });
+      await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-shared-login", owner: OWNER });
       return { acquisition: "pass", oracle: "pass", manual: "not_required" };
       } finally {
         try { await input.cleanup(); } catch (error) { state.inputFailures.push(error?.code ?? "input-cleanup-failed"); }
@@ -181,7 +225,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
 }
 
 export async function importDesktopHubParticipationFile({ context, runtime, cdp, input, sink, nativeState: state, importPath, entry = "hub" }) {
-  if (!["hub", "initial-setup"].includes(entry)) throw new TypeError("Unknown Hub participation GUI entry");
+  if (!["hub", "initial-setup", "shared-work"].includes(entry)) throw new TypeError("Unknown Hub participation GUI entry");
   if (entry === "hub") {
     await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
     await trustedClick(input, cdp, byId("hub-tab-devices"), sink);
@@ -190,7 +234,7 @@ export async function importDesktopHubParticipationFile({ context, runtime, cdp,
   state.nativeOwner = { executionRoot: context.root, ownerPath: runtime.desktop_owner_path, expectedOwner: runtime.desktop_owner };
   state.nativeBefore = await snapshotOwnedTopLevelWindows(state.nativeOwner);
   state.importDispatched = true;
-  await trustedClick(input, cdp, byId(entry === "initial-setup" ? "initial-setup-hub" : "device-network-import"), sink);
+  await trustedClick(input, cdp, entry === "shared-work" ? action("shared-import", ".shared-work") : byId(entry === "initial-setup" ? "initial-setup-hub" : "device-network-import"), sink);
   const native = await wait("Exact Desktop native config picker", async () => {
     const windows = await snapshotOwnedTopLevelWindows(state.nativeOwner);
     try { return selectFreshOwnedRootWindow(state.nativeBefore, windows, runtime.desktop_owner, { expectedClassName: "#32770" }); }
@@ -206,20 +250,25 @@ export async function importDesktopHubParticipationFile({ context, runtime, cdp,
 }
 
 /** GUI enrollment shared by combined Desktop scenarios; nativeState owns interrupted picker cleanup. */
-export async function enrollDesktopFromHubBrowser({ resource, context, runtime, cdp, input, sink, nativeState: state, entry = "hub" }) {
+export async function enrollDesktopFromHubBrowser({ resource, context, runtime, cdp, input, sink, nativeState: state, entry = "hub", onEnrollmentError = null }) {
   const { page, hub } = resource;
   const downloading = page.waitForEvent("download");
-  await page.getByRole("button", { name: "設定ファイルを保存", exact: true }).click();
+  await page.locator("#network-save-config").click();
   const download = await downloading;
-  if (download.suggestedFilename() !== "hub-participation.toml") throw fail("Unexpected Hub config download filename", {});
-  const importPath = path.join(context.paths.workspace, "hub-participation.toml");
+  if (download.suggestedFilename() !== "hub-config.toml") throw fail("Unexpected Hub config download filename", {});
+  const importPath = path.join(context.paths.workspace, "hub-config.toml");
   await download.saveAs(importPath);
   const config = await readFile(importPath, "utf8");
   if (!config.includes("BEGIN CERTIFICATE") || config.includes("PRIVATE KEY") || !config.includes(`127.0.0.1:${hub.networkPort}`)) {
     throw fail("Downloaded participation config must contain this Hub URL and public CA only", {});
   }
   await importDesktopHubParticipationFile({ context, runtime, cdp, input, sink, nativeState: state, importPath, entry });
-  const pending = await wait("Desktop displays pending enrollment before approval", () => invokeDesktopCommand(cdp, "device_network_projection"), value => value.enrollment === "pending");
+  const requested = await wait("Desktop finishes its enrollment request", () => invokeDesktopCommand(cdp, "device_network_projection"), value => value.enrollment === "error" || value.enrollment === "pending" && value.request_id);
+  if (requested.enrollment === "error") {
+    if (!onEnrollmentError) throw fail("Desktop enrollment was rejected", { error: requested.error });
+    await onEnrollmentError(requested);
+  }
+  const pending = await wait("Desktop displays pending enrollment before approval", () => invokeDesktopCommand(cdp, "device_network_projection"), value => value.enrollment === "pending" && value.request_id);
   await wait("Desktop visible approval pending status", () => cdp.evaluate(`document.querySelector('[data-settings-passive="device-network-enrollment"]')?.textContent`), value => value?.includes("承認待ち"));
   await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-desktop-pending", owner: OWNER });
   await page.locator('nav a[href="#clients"]').click();

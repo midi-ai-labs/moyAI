@@ -533,6 +533,17 @@ struct AgentTreeRuntime {
     metadata: Mutex<HashMap<AgentPath, AgentNodeMetadata>>,
 }
 
+impl AgentRuntime {
+    pub(crate) fn retain_resource_drain<F, Fut>(&self, factory: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.worker_runtime.spawn(0, factory)?.detach();
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AgentTreeLimits {
     max_concurrent_agents: usize,

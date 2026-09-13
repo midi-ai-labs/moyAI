@@ -135,6 +135,39 @@ pub(crate) async fn resolve_path(
     requested: &Utf8Path,
     access: AccessKind,
 ) -> Result<ResolvedPath, ToolError> {
+    if matches!(access, AccessKind::Read | AccessKind::Search) {
+        let absolute = crate::workspace::project::normalize_path(&ctx.workspace.cwd, requested)?;
+        if let Some((local, expected)) = ctx
+            .services
+            .store
+            .session_repo()
+            .shared_history_file(ctx.session.session.id, &absolute)?
+        {
+            use sha2::{Digest, Sha256};
+            use std::io::{Read, Seek, SeekFrom};
+            let Some((mut opened, _)) =
+                open_internal_truncation_path(&local, &ctx.services.storage_paths.truncation_dir)?
+            else {
+                return Err(ToolError::Message(
+                    "shared history output is outside its local storage boundary".into(),
+                ));
+            };
+            let mut bytes = Vec::new();
+            opened
+                .file
+                .by_ref()
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 8 * 1024 * 1024 || format!("{:x}", Sha256::digest(&bytes)) != expected
+            {
+                return Err(ToolError::Message(
+                    "shared history output checksum changed".into(),
+                ));
+            }
+            opened.file.seek(SeekFrom::Start(0))?;
+            return Ok(ResolvedPath(ResolvedPathKind::InternalTruncation(opened)));
+        }
+    }
     match PathGuard::require_path(ctx.workspace, requested, access) {
         Ok(guarded) => Ok(ResolvedPath(ResolvedPathKind::Normal(guarded))),
         Err(boundary_error) => {

@@ -4,6 +4,8 @@
 
 <h1 align="center">moyAI</h1>
 
+Development includes an [independent Windows Runner](docs/runner-local.md) and a [shared Runner](docs/runner-shared.md) for Hub-managed jobs. [Shared work in Desktop](docs/shared-work-desktop.md) supports project membership, shared resource status, start deadlines, approval, cancellation, handover, shared inputs and artifacts, and conversation continuation without configuring a local model or Project. Hub and Runner own the work independently of the Desktop connection. Existing private local work remains available without a Hub account. The Runner operates in the same Windows user's logged-in session; service operation and physical multi-host deployment require separate validation.
+
 <p align="center">
   <strong>A local-first coding agent for private workspaces, local LLMs, and closed-network development.</strong>
 </p>
@@ -104,7 +106,7 @@ moyAI is designed around those constraints:
 
 - Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, provider discovery, and a tool-less session-scoped Side Chat that can use a model separate from the main task. Immediately before each Side Chat POST, moyAI captures the exact owning session's active canonical history and append fence; an optional quote is bound to one stable transcript/artifact row and must still match that snapshot. Storage work is bounded to 65,536 append-only source items, 16,384 derived active items, and 8,192 eligible semantic units, failing before provider transport when any bound is exceeded. Untrusted quote and canonical evidence text is XML-entity encoded before it enters the owner-context envelope, so evidence cannot forge its structural delimiters. The quote is added to the Side draft without auto-send, and Side Chat never reads live workspace state or changes the main composer.
 - Desktop renders canonical history as a continuous conversation: user bubbles and plain assistant responses have no display-only step numbers, completed work history is collapsible without swallowing the root Agent's final response, and older bounded chunks prepend in place with a left-side hover/jump rail instead of replacing the page.
-- One Desktop instance per user; launching it again restores the existing window.
+- One Desktop instance per user; launching it again restores the existing window and shows an already-running notice.
 - Desktop Stop validates the projected workspace, root session, run generation, and Agent Tree epoch, so stale UI actions cannot cancel a later run. Settings values, baseline, dirty state, and monotonic revision exist only in one frontend-local draft owner. Rust projects typed clean/dirty capability variants and statelessly validates a complete draft plus a decimal-string config-generation target before Apply, Save, Reset, or another config-owner mutation. Commit builds one complete temporary `ResolvedConfig`, preserving cleared optional values instead of re-layering them. Active-turn steer clears input only after durable acceptance.
 - CLI and TUI for terminal-centered workflows.
 - OpenAI-compatible local LLM connection with explicit model availability diagnostics. moyAI connects to the configured external HTTP endpoint; it does not launch or supervise the provider process.
@@ -142,6 +144,7 @@ The Windows release zip includes:
 
 - `bin/moyai.exe` for CLI / TUI workflows
 - `bin/moyai-desktop.exe` for the Desktop app
+- `bin/moyai-runner.exe` for independent execution and shared environments
 - `bin/moyai-cleanup.exe` for resetting user-wide moyAI AppData to first-run state
 - bundled `ui/desktop-web/dist/` assets
 - README files, license, release notes, config example, getting-started guide, and in-package SHA256 checksums
@@ -157,6 +160,10 @@ On the target Windows machine, you do not need npm, the Rust toolchain, internet
 3. Launch `bin/moyai-desktop.exe`.
 4. On first launch, complete the fullscreen Initial Setup flow. Enter or import the provider, model, permission, and optional-tool settings, review the local validation result, then choose **Finish and open moyAI**. Model loading and provider/Docling diagnostics run only when you explicitly request them; an unavailable endpoint is reported as a warning and does not block a locally valid setup.
 5. Use Quick Chat, or select a project workspace and start a development chat.
+
+Closing the Desktop window keeps moyAI in the system tray. Launch it again to show
+the existing window, including when it is minimized, and see the already-running
+notice below the chat title. To stop Desktop completely, choose **終了** from its tray menu.
 
 CLI examples:
 

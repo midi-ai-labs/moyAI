@@ -540,10 +540,11 @@ export async function selectFileInOwnedNativeDialog(
 
 /** Exact native-control input. This does not establish physical keyboard or IME behavior. */
 export async function openFilePathInOwnedNativeDialog(
-  { executionRoot, ownerPath, candidate, selectedPath },
+  { executionRoot, ownerPath, candidate, selectedPath, intent = "open" },
   { invoke = invokeWindowsNativeInput } = {},
 ) {
   const fingerprint = requireInteractiveCandidate(candidate);
+  if (!["open", "save_new", "directory"].includes(intent)) throw new TypeError("Native file path intent must be open, save_new or directory");
   if (fingerprint.className !== "#32770") throw new TypeError("An exact native file dialog is required");
   if (typeof selectedPath !== "string" || !path.win32.isAbsolute(selectedPath)
     || selectedPath.includes("\0") || selectedPath.length >= 32768) {
@@ -552,11 +553,22 @@ export async function openFilePathInOwnedNativeDialog(
   const result = await invoke("OpenFilePath", {
     ExecutionRoot: executionRoot, OwnerPath: ownerPath, WindowHandle: fingerprint.hwnd,
     ExpectedThreadId: fingerprint.threadId, ExpectedClassName: fingerprint.className, SelectedPath: selectedPath,
+    ...(intent === "open" ? {} : { SelectedPathIntent: intent }),
   });
   const hwnd = value => typeof value === "string" && /^0x[0-9a-f]+$/i.test(value) && BigInt(value) !== 0n
     ? BigInt(value).toString(16) : null;
   const dialogHwnd = hwnd(fingerprint.hwnd);
-  const identities = [
+  const identities = intent === "directory" ? [
+    ["edit", dialogHwnd, "Edit", 1152],
+    ["button", dialogHwnd, "Button", 1],
+  ] : intent === "save_new" ? [
+    ["view", dialogHwnd, "DUIViewWndClassName", 0],
+    ["direct", hwnd(result?.controls?.view?.hwnd), "DirectUIHWND", 0],
+    ["sink", hwnd(result?.controls?.direct?.hwnd), "FloatNotifySink", 0],
+    ["combo", hwnd(result?.controls?.sink?.hwnd), "ComboBox", 0],
+    ["edit", hwnd(result?.controls?.combo?.hwnd), "Edit", 1001],
+    ["button", dialogHwnd, "Button", 1],
+  ] : [
     ["combo_ex", dialogHwnd, "ComboBoxEx32", 1148],
     ["combo", hwnd(result?.controls?.combo_ex?.hwnd), "ComboBox", 1148],
     ["edit", hwnd(result?.controls?.combo?.hwnd), "Edit", 1148],
@@ -569,7 +581,7 @@ export async function openFilePathInOwnedNativeDialog(
       && control?.thread_id === candidate.thread_id && control?.class_name === className
       && control?.control_id === id && control?.visible === true && control?.enabled === true;
   }) && new Set(identities.map(([name]) => hwnd(result?.controls?.[name]?.hwnd))).size === identities.length;
-  if (!exactControls || hwnd(result?.window?.hwnd) !== dialogHwnd
+  if ((result?.selected_path_intent ?? "open") !== intent || !exactControls || hwnd(result?.window?.hwnd) !== dialogHwnd
     || hwnd(result?.window?.root_hwnd) !== dialogHwnd || result?.window?.is_root !== true
     || result?.window?.visible !== true || result?.window?.enabled !== true
     || result?.window?.process_id !== candidate.process_id || result?.window?.thread_id !== candidate.thread_id

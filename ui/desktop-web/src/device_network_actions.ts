@@ -20,7 +20,7 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     if ((pending === "import" || pending === "join") && projection.enrollment === "pending") {
       local.notice = "参加申請を送信しました。Hub管理者の承認を待っています。承認後は自動で接続します。";
     } else if ((pending === "import" || pending === "join") && projection.enrollment === "active") {
-      local.notice = "Hubに接続しました。「モデル割当」を確認してください。この端末の受付は、公開対象と権限を確認してから開始します。";
+      local.notice = "Hubに接続しました。「共有仕事を開く」から利用者としてログインできます。通常チャットのモデルは「モデル割当」で選びます。";
     } else if (pending === "receiver") local.notice = projection.receiver.enabled ? "受付設定を保存しました。稼働状態を確認してください。" : "受付をOFFにしました。実行中タスクの停止完了は経路の状態を確認してください。";
     else if (pending === "select") {
       const peer = projection.peers.find(row => devicePeerKey(row) === local.selectionKey);

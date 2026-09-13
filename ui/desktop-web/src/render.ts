@@ -12,6 +12,7 @@ import {
 import { icon } from "./icons.ts";
 import { renderMcpPeers } from "./mcp_peer.ts";
 import { renderHubOverlay } from "./hub_render.ts";
+import { renderSharedWork } from "./shared_work_render.ts";
 import { renderMcpHistoryOverlay } from "./mcp_history_render.ts";
 import { renderMcpActivityStrip } from "./mcp_activity.ts";
 import { hubExecutionRoute } from "./hub_state.ts";
@@ -181,6 +182,9 @@ export function renderDesktopMarkup(
 ): string {
   const state = model.view;
   const local = model.local;
+  if (state.overlay === "shared_work") {
+    return applyActionAvailabilityToButtons(`<div class="app-frame initial-setup-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">${renderTitlebar(local.windowMaximized, true, "")}${renderSharedWork(local.sharedWork)}</div>`, model);
+  }
   if (startupSetupRequired(state) && state.overlay === "initial_setup") {
     const setupMarkup = `
       <div class="app-frame initial-setup-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">
@@ -457,6 +461,11 @@ function renderInitialSetupStartStep(
         <dd title="${escapeHtml(configPath)}">${escapeHtml(configPath || "保存先を取得できませんでした")}</dd>
       </dl>
       <div class="initial-setup-choice-row">
+        <div>
+          <strong>共有仕事を利用する</strong>
+          <p>このPCにモデルやローカルプロジェクトを用意せず、Hubの実行環境に仕事を依頼できます。</p>
+          <button id="initial-setup-shared-work" data-action="show-shared-work">共有仕事を開く</button>
+        </div>
         <div>
           <strong>Hubでモデルを割り当てる構成で開始</strong>
           <p>Hub管理者の共通設定ファイルを保存し、端末の参加へ進みます。このPCのモデル接続設定を先に入力する必要はありません。</p>
@@ -1020,6 +1029,9 @@ export function renderSidebar(state: DesktopWebState): string {
       </div>
       <button class="rail-item" data-action="show-hub" title="Hubに接続してモデルを確認">
         <span class="rail-icon">${icon("plug")}</span><span>moyAI Hub</span>
+      </button>
+      <button class="rail-item" data-action="show-shared-work" title="Hubの共有仕事を確認・依頼">
+        <span class="rail-icon">${icon("archive")}</span><span>共有仕事</span>
       </button>
       <button class="rail-item" data-action="show-mcp-history" title="他端末への指示と、この端末での実行履歴を確認">
         <span class="rail-icon">${icon("archive")}</span><span>MCP履歴</span>

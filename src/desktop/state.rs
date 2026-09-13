@@ -102,6 +102,7 @@ pub enum DesktopOverlay {
     ProjectMenu,
     ConfigEditor,
     HubConnection,
+    SharedWork,
     McpHistory,
     SessionSettings,
     ProviderEditor,
@@ -1691,6 +1692,15 @@ impl DesktopState {
         true
     }
 
+    pub fn show_shared_work(&mut self) -> bool {
+        if self.prompt_review_owns_overlay() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::SharedWork;
+        true
+    }
+
     pub fn show_hub_editor(&mut self) -> bool {
         if !self.begin_unscoped_overlay_transition() {
             return false;
@@ -2249,6 +2259,9 @@ impl DesktopState {
     }
 
     fn apply_startup_overlay(&mut self) {
+        if self.view.overlay == DesktopOverlay::SharedWork && !self.prompt_review_owns_overlay() {
+            return;
+        }
         if !self.begin_unscoped_overlay_transition() {
             return;
         }
@@ -4366,6 +4379,20 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("Finish"))
         );
+    }
+
+    #[test]
+    fn shared_work_entry_does_not_require_or_finish_local_setup() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+        assert!(state.startup.requires_initial_setup());
+        assert!(state.show_shared_work());
+        state.apply_startup_overlay();
+        assert_eq!(state.view.overlay, DesktopOverlay::SharedWork);
+        assert!(state.startup.requires_initial_setup());
+        state.hide_overlay();
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
+        assert!(state.startup.requires_initial_setup());
     }
 
     #[test]

@@ -12,6 +12,8 @@ mod outgoing;
 mod peer_connections;
 mod receiver;
 mod service;
+mod shared_work;
+pub use shared_work::{SharedWorkCommand, SharedWorkProjection};
 mod settings;
 mod wait;
 pub(crate) use client::{DeviceClient, DeviceGrant, DirectoryPeer};

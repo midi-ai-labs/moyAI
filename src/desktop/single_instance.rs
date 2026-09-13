@@ -255,4 +255,33 @@ mod tests {
 
         DesktopInstanceGuard::try_acquire_at(&path).expect("lease over stale file");
     }
+
+    #[test]
+    fn simultaneous_launches_have_exactly_one_live_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join(LOCK_FILE_NAME)).expect("utf8 lock path");
+        let start = std::sync::Barrier::new(8);
+        let acquired = std::sync::Barrier::new(8);
+        let owners = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let guard = DesktopInstanceGuard::try_acquire_at(&path);
+                        let owns_lease = guard.is_ok();
+                        acquired.wait();
+                        drop(guard);
+                        owns_lease
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().expect("launch thread"))
+                .filter(|owns_lease| *owns_lease)
+                .count()
+        });
+        assert_eq!(owners, 1);
+        DesktopInstanceGuard::try_acquire_at(&path).expect("lease after all launches exit");
+    }
 }

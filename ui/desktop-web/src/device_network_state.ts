@@ -115,7 +115,7 @@ export function acceptDeviceNetworkProjection(
     || BigInt(projection.revision) < BigInt(previous.revision))) return false;
   state.projection = projection;
   if (previous && previous.enrollment !== "active" && projection.enrollment === "active") {
-    state.notice = "Hubへの参加が承認され、接続しました。現在のモデルと送信先は「モデル割当」で確認できます。";
+    state.notice = "Hubへの参加が承認され、接続しました。「共有仕事を開く」から利用者としてログインできます。通常チャットのモデルは「モデル割当」で選びます。";
   }
   for (const [key, result] of Object.entries(state.diagnostics)) {
     if (result.revision !== projection.revision || result.generation !== projection.generation

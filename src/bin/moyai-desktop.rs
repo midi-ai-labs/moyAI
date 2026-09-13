@@ -55,6 +55,7 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
     let Some(_desktop_instance) =
         desktop::DesktopInstanceGuard::acquire_or_notify().map_err(|error| (4, error))?
     else {
+        println!("moyAI Desktop is already running; showing the existing window.");
         return Ok(());
     };
     let command = CliCommand::Desktop(CliDesktopArgs {

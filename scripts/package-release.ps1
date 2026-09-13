@@ -223,7 +223,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
       throw "Desktop web release build failed with exit code $LASTEXITCODE"
     }
-    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
+    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-runner --bin moyai-cleanup
     if ($LASTEXITCODE -ne 0) {
       throw "Rust release build failed with exit code $LASTEXITCODE"
     }
@@ -257,12 +257,16 @@ try {
 
   $cliExe = Join-Path $repoRoot "target\release\moyai.exe"
   $desktopExe = Join-Path $repoRoot "target\release\moyai-desktop.exe"
+  $runnerExe = Join-Path $repoRoot "target\release\moyai-runner.exe"
   $cleanupExe = Join-Path $repoRoot "target\release\moyai-cleanup.exe"
   if (-not (Test-Path -LiteralPath $cliExe -PathType Leaf)) {
     throw "release CLI binary not found: $cliExe"
   }
   if (-not (Test-Path -LiteralPath $desktopExe -PathType Leaf)) {
     throw "release Desktop binary not found: $desktopExe"
+  }
+  if (-not (Test-Path -LiteralPath $runnerExe -PathType Leaf)) {
+    throw "release Runner binary not found: $runnerExe"
   }
   if (-not (Test-Path -LiteralPath $cleanupExe -PathType Leaf)) {
     throw "release cleanup binary not found: $cleanupExe"
@@ -291,12 +295,16 @@ try {
 
   Copy-RequiredFile $cliExe (Join-Path $releaseRoot "bin\moyai.exe")
   Copy-RequiredFile $desktopExe (Join-Path $releaseRoot "bin\moyai-desktop.exe")
+  Copy-RequiredFile $runnerExe (Join-Path $releaseRoot "bin\moyai-runner.exe")
   Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "bin\moyai-cleanup.exe")
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
   Copy-RequiredFile (Join-Path $repoRoot "config.example.toml") (Join-Path $releaseRoot "config.example.toml")
   Copy-RequiredFile (Join-Path $repoRoot "docs\user\getting-started.md") (Join-Path $releaseRoot "docs\user\getting-started.md")
+  foreach ($runnerGuide in @("runner-local.md", "runner-shared.md", "shared-work-desktop.md")) {
+    Copy-RequiredFile (Join-Path $repoRoot "docs\$runnerGuide") (Join-Path $releaseRoot "docs\$runnerGuide")
+  }
   if ($manualGuiStResultsResolved) {
     Copy-RequiredFile $manualGuiStResultsResolved (Join-Path $releaseRoot "docs\release\manual-gui-st-results.md")
   }

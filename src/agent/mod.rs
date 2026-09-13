@@ -4,6 +4,7 @@ mod compaction;
 pub mod context_manager;
 pub(crate) mod goal_steering;
 pub mod mode;
+pub mod shared;
 pub mod step_context;
 pub mod turn_context;
 
@@ -286,6 +287,7 @@ pub struct AgentLoop {
     tool_services: Arc<Mutex<ToolServices>>,
     managed_shell_lifetime: Option<CancellationToken>,
     model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
+    shared_run: Option<shared::SharedRunContext>,
     #[cfg(test)]
     provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
     #[cfg(test)]
@@ -293,6 +295,13 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    pub(crate) fn managed_shells(&self) -> crate::tool::shell::ManagedShells {
+        self.tool_services
+            .lock()
+            .expect("tool services poisoned")
+            .managed_shells
+            .clone()
+    }
     pub(crate) fn with_managed_shell_lifetime(mut self, lifetime: CancellationToken) -> Self {
         self.managed_shell_lifetime = Some(lifetime);
         self
@@ -320,6 +329,7 @@ impl AgentLoop {
             tool_services: Arc::new(Mutex::new(tool_services)),
             managed_shell_lifetime: None,
             model_request_gate: None,
+            shared_run: None,
             #[cfg(test)]
             provider_api_key_resolver: None,
             #[cfg(test)]
@@ -388,12 +398,40 @@ impl AgentLoop {
         Ok(turn_services)
     }
 
+    pub(crate) fn with_shared_run(&self, context: shared::SharedRunContext) -> Self {
+        let mut agent = self.clone();
+        agent.registry = agent
+            .registry
+            .with_shared_environments(&context.job_id, &context.allowed_child_environments);
+        agent.shared_run = Some(context);
+        agent
+    }
+
     pub async fn run(
+        &self,
+        request: AgentRunRequest,
+        prompt: &mut dyn ConfirmationPrompt,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<RunSummary, AgentError> {
+        if self.shared_run.is_some() {
+            return Err(AgentError::Message(
+                "shared execution requires its nonterminal outcome boundary".into(),
+            ));
+        }
+        match self.run_inner(request, prompt, sink).await? {
+            shared::AgentRunOutcome::Completed(summary) => Ok(summary),
+            shared::AgentRunOutcome::Yielded(_) => {
+                unreachable!("ordinary runs cannot yield a shared child")
+            }
+        }
+    }
+
+    pub(crate) async fn run_inner(
         &self,
         mut request: AgentRunRequest,
         prompt: &mut dyn ConfirmationPrompt,
         sink: &mut dyn RunEventSink,
-    ) -> Result<RunSummary, AgentError> {
+    ) -> Result<shared::AgentRunOutcome, AgentError> {
         ensure_admission_active(&self.store, &request).await?;
         let tool_services =
             self.tool_services_for_turn(&request.turn.resolved_config().runtime_config().mcp)?;
@@ -406,14 +444,23 @@ impl AgentLoop {
             )));
         }
 
+        let progress = self
+            .shared_run
+            .as_ref()
+            .map(|shared| shared.checkpoint())
+            .transpose()
+            .map_err(AgentError::Message)?
+            .flatten()
+            .map(|checkpoint| checkpoint.progress)
+            .unwrap_or_default();
         let started_at = Instant::now();
-        let mut tool_call_count = 0usize;
-        let mut failed_tool_count = 0usize;
-        let mut change_count = 0usize;
-        let mut model_request_count = 0usize;
-        let mut tool_calls_by_name = BTreeMap::<String, usize>::new();
-        let mut failed_tool_calls_by_name = BTreeMap::<String, usize>::new();
-        let mut latest_usage: Option<TokenUsage> = None;
+        let mut tool_call_count = progress.tool_call_count;
+        let mut failed_tool_count = progress.failed_tool_count;
+        let mut change_count = progress.change_count;
+        let mut model_request_count = progress.model_request_count;
+        let mut tool_calls_by_name = progress.tool_calls_by_name;
+        let mut failed_tool_calls_by_name = progress.failed_tool_calls_by_name;
+        let mut latest_usage: Option<TokenUsage> = progress.latest_usage;
         let goal_snapshot = request.turn.goal().cloned();
         let active_goal_id_for_turn = goal_snapshot
             .as_ref()
@@ -422,14 +469,17 @@ impl AgentLoop {
         let mut compaction_unavailable_at_revision: Option<String> = None;
         // Live-loop continuation authority only. Stale running turns are
         // terminalized during recovery and must never be inferred from history.
-        let mut model_needs_follow_up = false;
+        let mut model_needs_follow_up = self
+            .shared_run
+            .as_ref()
+            .is_some_and(|shared| shared.resume.is_some());
         let mut mailbox_delivery_phase = MailboxDeliveryPhase::CurrentTurnAll;
         let mut pre_turn_compaction_item_id = request.initial_user_history_item_id;
         let mut can_drain_pending_input = pre_turn_compaction_item_id.is_none();
         let mut must_sample_without_compaction = false;
         let mut active_context_tokens = context_manager::ActiveContextTokenState::default();
 
-        let outcome: Result<RunSummary, AgentError> = async {
+        let outcome: Result<shared::AgentRunOutcome, AgentError> = async {
             'model_round: loop {
                 if request.run_control.is_cancelled() {
                     return self
@@ -447,7 +497,7 @@ impl AgentLoop {
                             active_goal_id_for_turn.as_deref(),
                             sink,
                         )
-                        .await;
+                        .await.map(shared::AgentRunOutcome::Completed);
                 }
                 ensure_admission_active(&self.store, &request).await?;
 
@@ -468,7 +518,13 @@ impl AgentLoop {
                     continue;
                 }
                 let step_config = request.turn.resolved_config().runtime_config();
-                let step_registry = self.registry.with_config_overlays(step_config);
+                let mut step_registry = self.registry.with_config_overlays(step_config);
+                if self.shared_run.is_some() {
+                    step_registry.retain_tools(|name| !matches!(name,
+                        "mcp_call" | "wait_remote_tasks" | "spawn_agent" | "send_message"
+                        | "followup_task" | "wait_agent" | "interrupt_agent" | "list_agents"
+                    ));
+                }
                 let skills = tool_services
                     .skills
                     .snapshot_for_workspace(&request.session.workspace.root);
@@ -692,7 +748,7 @@ impl AgentLoop {
                             active_goal_id_for_turn.as_deref(),
                             sink,
                         )
-                        .await;
+                        .await.map(shared::AgentRunOutcome::Completed);
                 };
                 ensure_admission_active(&self.store, &request).await?;
                 let response = match response_result {
@@ -742,7 +798,7 @@ impl AgentLoop {
                             active_goal_id_for_turn.as_deref(),
                             sink,
                         )
-                        .await;
+                        .await.map(shared::AgentRunOutcome::Completed);
                 }
                 if request.run_control.is_cancelled() {
                     return self
@@ -760,7 +816,7 @@ impl AgentLoop {
                             active_goal_id_for_turn.as_deref(),
                             sink,
                         )
-                        .await;
+                        .await.map(shared::AgentRunOutcome::Completed);
                 }
 
                 let has_tool_calls = !collector.tool_calls.is_empty();
@@ -912,7 +968,7 @@ impl AgentLoop {
                                 active_goal_id_for_turn.as_deref(),
                                 sink,
                             )
-                            .await;
+                            .await.map(shared::AgentRunOutcome::Completed);
                     };
                     #[cfg(test)]
                     if let Some(hook) = self.before_success_terminal_commit.as_ref() {
@@ -941,7 +997,7 @@ impl AgentLoop {
                                         success_commit,
                                         &summary,
                                     );
-                                    return Ok(summary);
+                                    return Ok(shared::AgentRunOutcome::Completed(summary));
                                 }
                                 Ok(None) => {
                                     let message = format!(
@@ -985,7 +1041,7 @@ impl AgentLoop {
                                 success_commit,
                                 &summary,
                             );
-                            return Ok(summary);
+                            return Ok(shared::AgentRunOutcome::Completed(summary));
                         }
                         success_commit
                             .abandon_with_cancellation(RunCancellationCause::Superseded);
@@ -1008,10 +1064,36 @@ impl AgentLoop {
                             terminal: Box::new(effective_terminal),
                         });
                     }
-                    return Ok(summary);
+                    return Ok(shared::AgentRunOutcome::Completed(summary));
                 }
 
                 mailbox_delivery_phase = mailbox_delivery_phase.after_model_tool_call();
+                if let Some(shared) = self.shared_run.as_ref()
+                    && prepared_tool_calls.len() == 1
+                    && prepared_tool_calls[0].tool == crate::tool::ToolName::SharedDelegate
+                    && prepared_tool_calls[0].validation_error.is_none()
+                    && !tool_services.managed_shells.has_local_work(request.session.session.id)
+                    && !request.run_control.is_cancelled()
+                {
+                    let call = &prepared_tool_calls[0];
+                    if let Ok(child) = crate::tool::shared_delegate::parse_child(
+                        call.arguments.clone(), &shared.allowed_child_environments,
+                    ) {
+                        ensure_admission_active(&self.store, &request).await?;
+                        tool_call_count += 1;
+                        *tool_calls_by_name.entry("shared_delegate".into()).or_default() += 1;
+                        return Ok(shared::AgentRunOutcome::Yielded(shared::SharedYieldProposal {
+                            tool_call_id: call.id,
+                            child,
+                            progress: shared::SharedProgress {
+                                tool_call_count, failed_tool_count, change_count, model_request_count,
+                                tool_calls_by_name: tool_calls_by_name.clone(),
+                                failed_tool_calls_by_name: failed_tool_calls_by_name.clone(),
+                                latest_usage: latest_usage.clone(),
+                            },
+                        }));
+                    }
+                }
                 let mut prior_guardian_tool_results = Vec::new();
                 for call in prepared_tool_calls {
                     if request.run_control.is_cancelled() {
@@ -1030,7 +1112,7 @@ impl AgentLoop {
                                 active_goal_id_for_turn.as_deref(),
                                 sink,
                             )
-                            .await;
+                            .await.map(shared::AgentRunOutcome::Completed);
                     }
                     ensure_admission_active(&self.store, &request).await?;
                     if let Some(agent) = request.agent_context.as_ref() {
@@ -1099,7 +1181,7 @@ impl AgentLoop {
                                     active_goal_id_for_turn.as_deref(),
                                     sink,
                                 )
-                                .await;
+                                .await.map(shared::AgentRunOutcome::Completed);
                         }
                     };
                     ensure_admission_active(&self.store, &request).await?;
@@ -1115,7 +1197,7 @@ impl AgentLoop {
             Ok(summary) => Ok(summary),
             Err(error) => {
                 if let Some(summary) = self.durable_terminal_summary(&request).await? {
-                    return Ok(summary);
+                    return Ok(shared::AgentRunOutcome::Completed(summary));
                 }
                 // The RunControl classification is the in-process terminal owner. A durable
                 // tree-stop fence intentionally makes the admission look unavailable so no new
@@ -1137,7 +1219,8 @@ impl AgentLoop {
                             active_goal_id_for_turn.as_deref(),
                             sink,
                         )
-                        .await;
+                        .await
+                        .map(shared::AgentRunOutcome::Completed);
                 }
                 if matches!(&error, AgentError::RunSuperseded { .. }) {
                     return Err(error);
@@ -1152,7 +1235,9 @@ impl AgentLoop {
                 {
                     AdmittedRunState::OwnedRunning => {}
                     AdmittedRunState::Terminal(terminal) => {
-                        return Ok(run_summary_from_terminal(&request, terminal));
+                        return Ok(shared::AgentRunOutcome::Completed(
+                            run_summary_from_terminal(&request, terminal),
+                        ));
                     }
                     AdmittedRunState::StopFenced(outcome) => {
                         classify_run_control_for_terminal_outcome(&request.run_control, &outcome);
@@ -1171,7 +1256,8 @@ impl AgentLoop {
                                 active_goal_id_for_turn.as_deref(),
                                 sink,
                             )
-                            .await;
+                            .await
+                            .map(shared::AgentRunOutcome::Completed);
                     }
                     AdmittedRunState::SupersededOrExpired => {
                         request.run_control.supersede();
@@ -1200,7 +1286,8 @@ impl AgentLoop {
                                 active_goal_id_for_turn.as_deref(),
                                 sink,
                             )
-                            .await;
+                            .await
+                            .map(shared::AgentRunOutcome::Completed);
                     }
                     return Err(error);
                 }
@@ -1243,10 +1330,12 @@ impl AgentLoop {
                     {
                         return Err(error);
                     }
-                    return Ok(run_summary_from_terminal(&request, effective_terminal));
+                    return Ok(shared::AgentRunOutcome::Completed(
+                        run_summary_from_terminal(&request, effective_terminal),
+                    ));
                 }
                 if let Some(summary) = self.durable_terminal_summary(&request).await? {
-                    return Ok(summary);
+                    return Ok(shared::AgentRunOutcome::Completed(summary));
                 }
                 request.run_control.supersede();
                 Err(run_superseded_error(&request))

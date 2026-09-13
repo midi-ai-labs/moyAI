@@ -210,7 +210,7 @@ test("joined devices use the model owner with manual connection folded; leaving 
   const local = deviceUiFixture();
   const hub = createHubUiState();
   const html = renderHubOverlay(hub, deviceNetworkPresentation(local));
-  assert.match(html, /端末連携で参加したHubからモデルを取得/);
+  assert.match(html, /接続済みのHubからモデルを取得/);
   assert.match(html, /<details id="hub-manual-connection"[^>]*>/);
   assert.doesNotMatch(html.match(/<details id="hub-manual-connection"[^>]*>/)![0], /\bopen\b/);
   assert.doesNotMatch(html, /class="modal-backdrop"[^>]*data-action/);
@@ -240,12 +240,12 @@ test("pending approval updates the connected model help through retained setting
   const draft = structuredClone(local.target);
   const hub = createHubUiState();
   const current = retainedHelp(renderHubOverlay(hub, deviceNetworkPresentation(local)));
-  assert.match(current.region.textContent, /手動接続は同じPC/);
+  assert.match(current.region.textContent, /管理者から受け取った設定ファイル/);
   acceptDeviceNetworkProjection(local, deviceProjection({ generation: "8" }));
   const next = retainedHelp(renderHubOverlay(hub, deviceNetworkPresentation(local)));
   synchronizeRetainedSettingsSurface(current as unknown as HTMLElement, next as unknown as HTMLElement, false);
-  assert.match(current.region.textContent, /端末連携で参加したHubからモデルを取得/);
-  assert.doesNotMatch(current.region.textContent, /手動接続は同じPC/);
+  assert.match(current.region.textContent, /接続済みのHubからモデルを取得/);
+  assert.doesNotMatch(current.region.textContent, /管理者から受け取った設定ファイル/);
   assert.deepEqual(local.target, draft);
 });
 

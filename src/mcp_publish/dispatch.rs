@@ -422,6 +422,42 @@ impl ReadDispatcherInner {
         cancel: CancellationToken,
         control: RunControl,
     ) -> Result<Value, PublishCallError> {
+        let _publication = crate::runtime::resource_admission::PublicationGuard::acquire()
+            .map_err(|_| PublishCallError::Unavailable)?;
+        let directory = self
+            .target
+            .workspace()
+            .map(|workspace| &workspace.root)
+            .unwrap_or(&self.store.paths().data_dir)
+            .clone();
+        let resource = crate::runner::shared::external::LocalResourceLease::acquire(
+            &directory,
+            &self.store,
+            &control,
+            &format!("MCP {name}"),
+            crate::runner::shared::external::ResourceCaller::LegacyRemote,
+        )
+        .await
+        .map_err(|_| PublishCallError::Unavailable)?;
+        let result = self.execute_inner(name, arguments, cancel, control).await;
+        if let Some(resource) = resource {
+            resource
+                .finish(
+                    result.is_ok(),
+                    json!({"version":1,"source":"legacy_mcp","tool":name}),
+                )
+                .await
+                .map_err(|_| PublishCallError::Unavailable)?;
+        }
+        result
+    }
+    async fn execute_inner(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancel: CancellationToken,
+        control: RunControl,
+    ) -> Result<Value, PublishCallError> {
         if cancel.is_cancelled() {
             return Err(PublishCallError::Cancelled);
         }

@@ -50,7 +50,7 @@ function channelMarkup(local: HubPresentation, context: HubContext): string {
       <strong>${escapeHtml(routeStatus)}</strong><span>${escapeHtml(routeBlocker ?? "切り替えは次の依頼から適用します。Hub利用時に直接接続へ自動では切り替えません。")}</span>
     </div>
     <div data-settings-passive="hub-${context}-catalog-comparison">${renderHubCatalogComparison(context === "main" ? projection?.main_catalog_comparison : projection?.side_chat_catalog_comparison, context)}</div>
-    <p class="hub-help">利用候補に含めるモデルを選びます。${context === "main" ? "Main" : "Side"}の選択と比較元は独立して保存されます。</p>
+    <p class="hub-help">このチャットで使ってよいモデルを選びます。メインとサイドの設定は別々に保存します。</p>
     ${context === "main" ? `<button data-action="hub-main-recommendation" ${hubCanUseRecommendation(local) ? "" : "disabled"}>Hubの推奨候補を選ぶ</button><p class="hub-help">候補を選んで確認・保存し、「Hubを利用」で送信先を切り替えます。直接接続の設定は保持します。</p>` : ""}
     <div class="hub-model-list" data-settings-passive="hub-${context}-models" data-settings-preserve-focused-region>
       ${candidates.length ? candidates.map((model) => `<label class="hub-model-row ${missing.includes(model.id) ? "is-missing" : ""}">
@@ -65,7 +65,7 @@ function channelMarkup(local: HubPresentation, context: HubContext): string {
     <label class="hub-field">優先モデルが空いていない場合<select id="hub-${context}-wait" class="settings-control" data-hub-field="${context}:wait" ${enabled ? "" : "disabled"}>
       <option value="wait_for_preferred" ${draft.selection.wait_policy === "wait_for_preferred" ? "selected" : ""}>優先モデルが空くまで待つ</option>
       <option value="allow_selected_fallback" ${draft.selection.wait_policy === "allow_selected_fallback" ? "selected" : ""}>選択した別のモデルを許可する</option></select></label>
-    <details class="hub-advanced" id="hub-${context}-advanced" data-details-key="hub-${context}-advanced"><summary>機能条件と継続ターン数</summary>
+    <details class="hub-advanced" id="hub-${context}-advanced" data-details-key="hub-${context}-advanced"><summary>詳細設定（必要な機能・モデルの継続）</summary>
       <label class="hub-field">必要な機能<input id="hub-${context}-capabilities" class="settings-control" data-hub-field="${context}:capabilities" value="${escapeHtml(draft.capabilitiesText)}" placeholder="例: tools, vision" ${enabled ? "" : "disabled"} /></label>
       <label class="hub-field">同じモデルを継続するターン数<input id="hub-${context}-affinity" class="settings-control" data-hub-field="${context}:affinity" inputmode="numeric" value="${escapeHtml(draft.affinityText)}" ${enabled ? "" : "disabled"} /></label>
       <p class="hub-help">1〜100。ユーザーが送信した依頼を1ターンとして数えます。</p></details>
@@ -82,20 +82,21 @@ export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetwor
   const locked = Boolean(local.pending) || connected || status === "connecting";
   const managed = network?.projection?.enrollment === "active";
   return `<div class="modal-backdrop"><section class="modal settings-modal hub-modal" data-modal="hub" data-surface="hub" role="dialog" aria-modal="true" aria-labelledby="hub-dialog-title" aria-describedby="hub-dialog-help" tabindex="-1">
-    <header class="hub-modal-header"><div><span class="hub-eyebrow">LYNX · CONNECTIONS</span><h2 id="hub-dialog-title">moyAI Hub</h2><p id="hub-dialog-help">端末の参加とタスク委任、Main・Sideのモデル割当を管理します。</p></div><button class="icon-button" data-action="close-overlay" aria-label="閉じる" title="閉じる">${icon("x")}</button></header>
+    <header class="hub-modal-header"><div><span class="hub-eyebrow">接続と共有</span><h2 id="hub-dialog-title">moyAI Hub</h2><p id="hub-dialog-help">このPCをHubにつなぎ、共有仕事やチャットで使えるようにします。</p></div><button class="icon-button" data-action="close-overlay" aria-label="閉じる" title="閉じる">${icon("x")}</button></header>
     <nav class="hub-tabs" aria-label="Hub設定の分類"><button id="hub-tab-devices" data-action="hub-tab-devices" aria-controls="hub-panel-devices" aria-pressed="${local.tab === "devices"}">端末連携</button><button id="hub-tab-models" data-action="hub-tab-models" aria-controls="hub-panel-models" aria-pressed="${local.tab === "models"}">モデル割当</button></nav>
     <div class="hub-modal-body settings-content">
       <div id="hub-panel-devices" data-hub-panel="devices" ${local.tab === "devices" ? "" : "hidden"}>${renderDeviceNetwork(network)}</div>
       <div id="hub-panel-models" data-hub-panel="models" ${local.tab === "models" ? "" : "hidden"}>
-      <p id="hub-scope-help" class="hub-scope-note" data-settings-passive="hub-scope-help">${managed ? "端末連携で参加したHubからモデルを取得します。" : "Hubを使う場合は、接続してモデルを取得します。手動接続は同じPCのHub向けです。"} 利用モデルを確認・保存し、Main・Sideそれぞれの送信先を切り替えます。Chat Completions / Responses対応モデルを利用します。「依頼を整える」はMainで選択したモデルを使います。子エージェントも同じ確認済みモデル選択を使い、実行枠と停止は独立します。旧Hubでは更新を案内します。</p>
+      <p id="hub-scope-help" class="hub-scope-note" data-settings-passive="hub-scope-help">${managed ? "接続済みのHubからモデルを取得します。" : "最初に「端末連携」で管理者から受け取った設定ファイルを読み込んでください。"} 候補を選んで保存し、メイン・サイドそれぞれで「Hubを利用」に切り替えます。共有仕事で使うモデルは、仕事を実行するPCで設定します。</p>
       <div class="hub-identity" data-settings-passive="hub-model-connection" role="status">モデル接続: ${statusText[status]}${projection?.catalog ? ` · 登録 ${projection.catalog.models.length} モデル · 更新 ${escapeHtml(projection.catalog.revision)}` : ""}${error ? `<p>${escapeHtml(error)}</p>` : ""}</div>
-      <details id="hub-manual-connection" data-details-key="hub-manual-connection"><summary>手動のHub接続（既存構成との互換用）</summary>
+      <div class="hub-connection-actions"><button data-action="hub-refresh" ${local.pending ? "disabled" : ""}>${local.pending === "refresh" ? "取得しています…" : "最新情報を取得"}</button></div>
+      <details id="hub-manual-connection" data-details-key="hub-manual-connection"><summary>同じPCのHubへ手動接続（従来の方式）</summary>
       <section class="hub-connection" aria-labelledby="hub-connection-title"><div class="hub-section-heading"><h3 id="hub-connection-title">Hubに接続</h3><span class="hub-connection-status" data-settings-passive="hub-connection-status" data-status="${status}">${statusText[status]}</span></div>
         <div class="hub-connection-fields"><label class="hub-field">接続先<input id="hub-endpoint" class="settings-control" data-hub-field="endpoint" value="${escapeHtml(local.endpoint)}" placeholder="127.0.0.1:9470" autocomplete="off" spellcheck="false" ${locked ? "disabled" : ""} /></label>
         <label class="hub-field">端末の表示名<input id="hub-label" class="settings-control" data-hub-field="label" value="${escapeHtml(local.label)}" autocomplete="off" ${locked ? "disabled" : ""} /></label>
         <label class="hub-field">接続用トークン<input id="hub-token" class="settings-control" data-hub-field="token" type="password" autocomplete="off" aria-describedby="hub-connection-feedback" placeholder="Hubの管理画面で設定したトークン" ${locked ? "disabled" : ""} /></label></div>
         <div class="hub-connection-actions"><button class="hub-primary" data-action="hub-connect" aria-describedby="hub-connection-feedback" ${projection && !locked ? "" : "disabled"}>${local.pending === "connect" ? "接続しています…" : "Hubに接続"}</button>
-        <button data-action="hub-refresh" ${local.pending ? "disabled" : ""}>${local.pending === "refresh" ? "取得しています…" : "最新情報を取得"}</button><button data-action="hub-disconnect" ${projection && status !== "disconnected" && !local.pending ? "" : "disabled"}>接続を解除</button></div>
+        <button data-action="hub-disconnect" ${projection && status !== "disconnected" && !local.pending ? "" : "disabled"}>接続を解除</button></div>
         <div id="hub-connection-feedback" class="hub-feedback" data-settings-passive="hub-error" role="status" aria-live="polite" ${error ? "" : "hidden"}>${escapeHtml(error)}</div>
         <p class="hub-help">この手動接続は同じPCのHub向けです。トークンは保存しません。Desktopのウィンドウを閉じると接続を解除し、次回はトークンを入力して再接続します。</p>
         <div class="hub-identity" data-settings-passive="hub-identity">${projection?.hub_id ? `<span>Hub <code>${escapeHtml(projection.hub_id)}</code></span><span>バージョン ${escapeHtml(projection.catalog?.software_version ?? "—")} · 更新番号 ${escapeHtml(projection.catalog?.revision ?? "—")}</span>` : "接続するとHubの識別情報を表示します。"}</div>

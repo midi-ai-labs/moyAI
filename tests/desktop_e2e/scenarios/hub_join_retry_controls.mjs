@@ -63,10 +63,10 @@ export function createHubJoinRetryControlsScenario(options={}){
         await page.locator('#network-start').click();await page.locator('#network-stop').waitFor();
         const original=await wait('Real Hub network is running',()=>hub.observeNetwork(),s=>s.server.running===true);
         const downloadPromise=page.waitForEvent('download');
-        await page.getByRole('button',{name:'設定ファイルを保存',exact:true}).click();
+        await page.locator('#network-save-config').click();
         const download=await downloadPromise;
-        if(download.suggestedFilename()!=='hub-participation.toml')throw product('Unexpected public config filename',{});
-        const importPath=path.join(context.paths.workspace,'hub-participation.toml');await download.saveAs(importPath);
+        if(download.suggestedFilename()!=='hub-config.toml')throw product('Unexpected public config filename',{});
+        const importPath=path.join(context.paths.workspace,'hub-config.toml');await download.saveAs(importPath);
         const config=await readFile(importPath,'utf8'),url=`https://127.0.0.1:${hub.networkPort}`;
         if(!config.includes(url)||!config.includes('BEGIN CERTIFICATE')||config.includes('PRIVATE KEY'))throw product('Browser must download only this Hub endpoint and public CA',{});
         await page.locator('#network-stop').click();await page.locator('#network-start').waitFor();

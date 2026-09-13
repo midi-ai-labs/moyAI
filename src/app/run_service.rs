@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::context_manager::ContextManager;
 use crate::agent::mode::CollaborationMode;
+use crate::agent::shared::{AgentRunOutcome, SharedRunContext, SharedRunOutcome, SharedYield};
 use crate::agent::turn_context::TurnContext as RuntimeTurnContext;
 use crate::agent::{AgentLoop, AgentRunRequest};
 use crate::app::agent_runtime::{AgentRuntimeContinuationOutcome, AgentRuntimeExecution};
@@ -70,6 +71,7 @@ const WORKFLOW_ARGUMENT_PLACEHOLDER: &str = "{{args}}";
 
 enum SingleRunOutcome {
     Turn(RunSummary),
+    Yielded(SharedYield),
     ControlCompleted,
     IdleGoalInactive,
 }
@@ -253,6 +255,7 @@ pub struct RunService {
     session_event_hub: SessionRuntimeEventHub,
     agent_runtime: Weak<crate::app::AgentRuntime>,
     hub_route: Option<crate::hub::HubTurnRoute>,
+    shared_run: Option<SharedRunContext>,
 }
 
 impl RunService {
@@ -274,6 +277,7 @@ impl RunService {
             session_event_hub,
             agent_runtime: Arc::downgrade(&agent_runtime),
             hub_route: None,
+            shared_run: None,
         }
     }
 
@@ -612,6 +616,16 @@ impl RunService {
             Ok(RootExecutionStopRequestOutcome::TargetChanged)
         } else {
             Ok(RootExecutionStopRequestOutcome::Rejected)
+        }
+    }
+
+    /// The resource lease retains this root's lifetime until its monitor has acknowledged stop.
+    /// Terminal turns may still own processes after ordinary turn cancellation is sealed.
+    pub(crate) fn stop_local_resource_processes(&self, control: &RunControl) {
+        if let Some(receipt) = control.root_admission_snapshot().last_admitted {
+            self.agent_loop
+                .managed_shells()
+                .cancel_local(receipt.session_id);
         }
     }
 
@@ -993,7 +1007,125 @@ impl RunService {
         Ok(context)
     }
 
+    /// Execute one Hub-issued attempt. Checkpoints resume only their exact local canonical turn.
+    /// The caller owns Hub admission and waits for real process drain before reporting a yield.
+    pub async fn execute_shared(
+        self: &Arc<Self>,
+        mut request: RunRequest,
+        shared: SharedRunContext,
+        renderer: &mut dyn EventRenderer,
+        prompt: &mut dyn ConfirmationPrompt,
+    ) -> Result<SharedRunOutcome, AppRunError> {
+        shared.validate().map_err(AppRunError::Message)?;
+        if request.session_id.is_some()
+            || request.continue_last
+            || !matches!(&request.config, RunConfigInput::Resolved(_))
+            || request.agent_context.is_some()
+            || request.prompt_dispatch.is_some()
+            || request.editor_context.is_some()
+            || request.review_request.is_some()
+            || !request.image_paths.is_empty()
+            || !matches!(request.admission_kind, RunAdmissionKind::NewUserRun)
+        {
+            return Err(AppRunError::Message(
+                "shared execution requires resolved Runner configuration and cannot borrow a private session or local input context".into(),
+            ));
+        }
+        if shared.resume.is_some() {
+            if let Some(archive) = shared
+                .resume
+                .as_ref()
+                .and_then(|resume| resume.archive.as_ref())
+            {
+                self.store.session_repo().restore_shared_archive(
+                    &shared,
+                    archive,
+                    &self.workspace,
+                    &self.config,
+                    self.store.paths(),
+                )?;
+            }
+            let checkpoint = self.store.session_repo().validate_shared_resume(&shared)?;
+            request.session_id = Some(checkpoint.session_id);
+            request.prompt.clear();
+            request.title = None;
+        } else if request.prompt.trim().is_empty() {
+            return Err(AppRunError::Message(
+                "new shared execution requires a prompt".into(),
+            ));
+        }
+        let mut service = (**self).clone();
+        service.agent_loop = service.agent_loop.with_shared_run(shared.clone());
+        service.shared_run = Some(shared);
+        match Arc::new(service)
+            .execute_single_run(request, renderer, prompt, None)
+            .await?
+        {
+            SingleRunOutcome::Turn(summary) => Ok(SharedRunOutcome::Completed(summary)),
+            SingleRunOutcome::Yielded(yielded) => Ok(SharedRunOutcome::Yielded(yielded)),
+            _ => Err(AppRunError::Message(
+                "shared execution did not produce a run outcome".into(),
+            )),
+        }
+    }
+
     async fn execute_run(
+        self: &Arc<Self>,
+        request: RunRequest,
+        renderer: &mut dyn EventRenderer,
+        prompt: &mut dyn ConfirmationPrompt,
+    ) -> Result<AppCommandOutcome, AppRunError> {
+        if request.agent_context.is_some() {
+            return self.execute_run_inner(request, renderer, prompt).await;
+        }
+        let publication = crate::runtime::resource_admission::PublicationGuard::acquire()
+            .map_err(|e| AppRunError::Message(e.to_string()))?;
+        let resource = crate::runner::shared::external::LocalResourceLease::acquire(
+            &self.workspace.root,
+            &self.store,
+            &request.run_control,
+            request.title.as_deref().unwrap_or(&request.prompt),
+            if matches!(request.admission_kind, RunAdmissionKind::RemoteTask { .. }) {
+                crate::runner::shared::external::ResourceCaller::LegacyRemote
+            } else {
+                crate::runner::shared::external::ResourceCaller::Local
+            },
+        )
+        .await
+        .map_err(|e| AppRunError::Message(e.to_string()))?;
+        let control = request.run_control.clone();
+        if let Some(resource) = &resource {
+            let watch = resource.watch(self.clone(), control.clone());
+            self.agent_runtime()?
+                .retain_resource_drain(move || watch)
+                .map_err(AppRunError::Message)?;
+        }
+        let result = self.execute_run_inner(request, renderer, prompt).await;
+        let session = match &result {
+            Ok(AppCommandOutcome::Turn(summary)) => Some(summary.session_id()),
+            _ => control
+                .root_admission_snapshot()
+                .last_admitted
+                .map(|receipt| receipt.session_id),
+        };
+        let success = matches!(&result,Ok(AppCommandOutcome::Turn(summary)) if summary.status()==SessionStatus::Completed);
+        let service = self.clone();
+        self.agent_runtime()?.retain_resource_drain(move || async move {
+            let _publication=publication;
+            if let Some(session)=session {
+                let tree=service.wait_for_agent_tree_quiescence(session).await;
+                let shells=service.agent_loop.managed_shells();
+                while shells.has_local_work(session) {tokio::time::sleep(std::time::Duration::from_millis(100)).await;}
+                if let Err(error)=tree {eprintln!("Resource drain could not prove agent-tree completion: {error}");return;}
+            }
+            if let Some(resource)=resource {
+                if let Err(error)=resource.finish(success,serde_json::json!({"version":1,"session_id":session,"source":"local","success":success})).await {eprintln!("Resource completion requires reconciliation: {error}");}
+            }
+        }).map_err(AppRunError::Message)?;
+        result
+    }
+
+    async fn execute_run_inner(
         self: &Arc<Self>,
         request: RunRequest,
         renderer: &mut dyn EventRenderer,
@@ -1009,6 +1141,9 @@ impl RunService {
             .await?
         {
             SingleRunOutcome::Turn(summary) => summary,
+            SingleRunOutcome::Yielded(_) => {
+                unreachable!("ordinary execution cannot yield shared work")
+            }
             SingleRunOutcome::ControlCompleted => {
                 return Ok(AppCommandOutcome::ControlCompleted);
             }
@@ -1079,6 +1214,9 @@ impl RunService {
                 .await?
             {
                 SingleRunOutcome::Turn(next_summary) => summary = next_summary,
+                SingleRunOutcome::Yielded(_) => {
+                    unreachable!("ordinary continuation cannot yield shared work")
+                }
                 SingleRunOutcome::ControlCompleted => break 'continuations,
                 SingleRunOutcome::IdleGoalInactive => break 'continuations,
             }
@@ -1110,6 +1248,10 @@ impl RunService {
             .await;
         let terminal_control = turn_run_control.as_ref().unwrap_or(&root_scope_control);
         match result {
+            Ok(SingleRunOutcome::Yielded(yielded)) => {
+                debug_assert!(root_agent_execution.is_none());
+                Ok(SingleRunOutcome::Yielded(yielded))
+            }
             Ok(SingleRunOutcome::IdleGoalInactive) => {
                 let execution = root_agent_execution.take().ok_or_else(|| {
                     AppRunError::Message(
@@ -1176,12 +1318,13 @@ impl RunService {
             .unwrap_or(false);
         let requires_active_goal =
             root_agent_execution.is_some() && !continuation_has_agent_updates;
-        let slash_goal_command =
-            if matches!(request.admission_kind, RunAdmissionKind::RemoteTask { .. }) {
-                None
-            } else {
-                parse_goal_slash_command(&request.prompt)?
-            };
+        let slash_goal_command = if self.shared_run.is_some()
+            || matches!(request.admission_kind, RunAdmissionKind::RemoteTask { .. })
+        {
+            None
+        } else {
+            parse_goal_slash_command(&request.prompt)?
+        };
         let selector = match (request.session_id, request.continue_last) {
             (Some(id), false) => SessionSelector::ById(id),
             (None, true) => SessionSelector::Latest,
@@ -1247,6 +1390,15 @@ impl RunService {
             session_settings.as_ref(),
             &request.config,
         );
+        if self.shared_run.is_some()
+            && session_settings.as_ref().is_some_and(|session| {
+                session.access_mode != effective_config.permissions.access_mode
+            })
+        {
+            return Err(AppRunError::Message(
+                "shared checkpoint access mode differs from the current Runner environment".into(),
+            ));
+        }
         let should_generate_session_title = matches!(&selector, SessionSelector::New)
             && request
                 .title
@@ -1254,7 +1406,14 @@ impl RunService {
                 .is_none_or(is_placeholder_session_title)
             && !request.prompt.trim().is_empty();
         let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
-        let prepared = prepare_run_turn(&self.workspace, &request)?;
+        let prepared = if self.shared_run.is_some() {
+            PreparedRunTurn {
+                prompt: request.prompt.clone(),
+                prompt_dispatch: Some(PromptDispatchPart::raw(&request.prompt)),
+            }
+        } else {
+            prepare_run_turn(&self.workspace, &request)?
+        };
         let mut runtime_config = self
             .hub_route
             .as_ref()
@@ -1285,9 +1444,28 @@ impl RunService {
                 self.workspace.clone(),
             )
             .await?;
-        let collaboration_mode =
+        let collaboration_mode = {
+            if let Some(shared) = self.shared_run.as_ref() {
+                if shared.continuation.is_some() {
+                    self.store.session_repo().seed_shared_continuation(
+                        shared,
+                        session_context.session.id,
+                        self.store.paths(),
+                    )?;
+                    // This newly created session now contains imported turn identities. Admit
+                    // after that exact canonical state, rather than expecting an empty session.
+                    request.expected_active_turn = self
+                        .session_service
+                        .active_turn_expectation_for_session(session_context.session.id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppRunError::Message("shared continuation session is missing".into())
+                        })?;
+                }
+            }
             resolve_session_collaboration_mode(&self.session_service, session_context.session.id)
-                .await?;
+                .await?
+        };
         if let Some(network) = self.store.device_network() {
             network
                 .augment_runtime_config(&mut runtime_config, session_context.session.id)
@@ -1338,7 +1516,17 @@ impl RunService {
         } else {
             None
         };
-        let protocol_turn_id = crate::protocol::TurnId::new();
+        let shared_checkpoint = self
+            .shared_run
+            .as_ref()
+            .map(|shared| shared.checkpoint())
+            .transpose()
+            .map_err(AppRunError::Message)?
+            .flatten();
+        let protocol_turn_id = shared_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.turn_id)
+            .unwrap_or_else(crate::protocol::TurnId::new);
         let initial_user_turn = build_initial_user_turn(
             protocol_turn_id,
             &prepared,
@@ -1375,74 +1563,82 @@ impl RunService {
             ),
             RunAdmissionKind::AgentTrigger { .. } | RunAdmissionKind::OwnerResume { .. } => None,
         };
-        let admission = match request.admission_kind {
-            RunAdmissionKind::RemoteTask { job_id } => {
-                self.store
-                    .session_repo()
-                    .admit_remote_task(
-                        session_context.session.id,
-                        protocol_turn_id,
-                        job_id,
-                        initial_user_turn.as_ref().ok_or_else(|| {
-                            AppRunError::Message("remote task omitted its initial input".into())
-                        })?,
-                    )
-                    .await?
-            }
-            RunAdmissionKind::AgentTrigger { history_item_id } => {
-                self.store
-                    .session_repo()
-                    .admit_agent_triggered_turn(
-                        session_context.session.id,
-                        protocol_turn_id,
-                        history_item_id,
-                    )
-                    .await?
-            }
-            RunAdmissionKind::OwnerResume { request_id } => {
-                self.store
-                    .session_repo()
-                    .admit_owner_resume_turn(
-                        session_context.session.id,
-                        protocol_turn_id,
-                        request_id,
-                    )
-                    .await?
-            }
-            RunAdmissionKind::RootContinuation {
-                predecessor_turn_id,
-                predecessor_revision,
-            } => {
-                if slash_goal_command.is_some() {
-                    return Err(AppRunError::Message(
-                        "an automatic root continuation cannot execute a slash command".to_string(),
-                    ));
+        let admission = if let Some(shared) = self
+            .shared_run
+            .as_ref()
+            .filter(|shared| shared.resume.is_some())
+        {
+            Some(self.store.session_repo().resume_shared_run(shared)?)
+        } else {
+            match request.admission_kind {
+                RunAdmissionKind::RemoteTask { job_id } => {
+                    self.store
+                        .session_repo()
+                        .admit_remote_task(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            job_id,
+                            initial_user_turn.as_ref().ok_or_else(|| {
+                                AppRunError::Message("remote task omitted its initial input".into())
+                            })?,
+                        )
+                        .await?
                 }
-                match self
-                    .store
-                    .session_repo()
-                    .admit_root_continuation_turn_with_initial_user_turn(
-                        session_context.session.id,
-                        protocol_turn_id,
-                        initial_user_turn.as_ref(),
-                        predecessor_turn_id,
-                        predecessor_revision,
-                        requires_active_goal,
-                    )
-                    .await?
-                {
-                    ActiveGoalTurnAdmission::Admitted(snapshot) => Some(snapshot),
-                    ActiveGoalTurnAdmission::GoalInactive => {
-                        drop(root_admission_guard.take());
-                        drop(process_run_lease);
-                        return Ok(SingleRunOutcome::IdleGoalInactive);
+                RunAdmissionKind::AgentTrigger { history_item_id } => {
+                    self.store
+                        .session_repo()
+                        .admit_agent_triggered_turn(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            history_item_id,
+                        )
+                        .await?
+                }
+                RunAdmissionKind::OwnerResume { request_id } => {
+                    self.store
+                        .session_repo()
+                        .admit_owner_resume_turn(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            request_id,
+                        )
+                        .await?
+                }
+                RunAdmissionKind::RootContinuation {
+                    predecessor_turn_id,
+                    predecessor_revision,
+                } => {
+                    if slash_goal_command.is_some() {
+                        return Err(AppRunError::Message(
+                            "an automatic root continuation cannot execute a slash command"
+                                .to_string(),
+                        ));
                     }
-                    ActiveGoalTurnAdmission::Unavailable => None,
+                    match self
+                        .store
+                        .session_repo()
+                        .admit_root_continuation_turn_with_initial_user_turn(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            initial_user_turn.as_ref(),
+                            predecessor_turn_id,
+                            predecessor_revision,
+                            requires_active_goal,
+                        )
+                        .await?
+                    {
+                        ActiveGoalTurnAdmission::Admitted(snapshot) => Some(snapshot),
+                        ActiveGoalTurnAdmission::GoalInactive => {
+                            drop(root_admission_guard.take());
+                            drop(process_run_lease);
+                            return Ok(SingleRunOutcome::IdleGoalInactive);
+                        }
+                        ActiveGoalTurnAdmission::Unavailable => None,
+                    }
                 }
-            }
-            RunAdmissionKind::NewUserRun => match slash_goal_command.as_ref() {
-                Some(GoalSlashCommand::SetObjective(objective)) => {
-                    match request.expected_active_turn {
+                RunAdmissionKind::NewUserRun => match slash_goal_command.as_ref() {
+                    Some(GoalSlashCommand::SetObjective(objective)) => {
+                        match request.expected_active_turn {
                         ActiveTurnExpectation::Idle {
                             latest_turn_id,
                             revision,
@@ -1463,28 +1659,29 @@ impl RunService {
                             "active-turn Run requests are rejected before admission"
                         ),
                     }
-                }
-                _ => match request.expected_active_turn {
-                    ActiveTurnExpectation::Idle {
-                        latest_turn_id,
-                        revision,
-                    } => {
-                        self.store
-                            .session_repo()
-                            .admit_session_turn_with_initial_user_turn_after_latest(
-                                session_context.session.id,
-                                protocol_turn_id,
-                                initial_user_turn.as_ref(),
-                                latest_turn_id,
-                                revision,
-                            )
-                            .await?
                     }
-                    ActiveTurnExpectation::Turn { .. } => {
-                        unreachable!("active-turn Run requests are rejected before admission")
-                    }
+                    _ => match request.expected_active_turn {
+                        ActiveTurnExpectation::Idle {
+                            latest_turn_id,
+                            revision,
+                        } => {
+                            self.store
+                                .session_repo()
+                                .admit_session_turn_with_initial_user_turn_after_latest(
+                                    session_context.session.id,
+                                    protocol_turn_id,
+                                    initial_user_turn.as_ref(),
+                                    latest_turn_id,
+                                    revision,
+                                )
+                                .await?
+                        }
+                        ActiveTurnExpectation::Turn { .. } => {
+                            unreachable!("active-turn Run requests are rejected before admission")
+                        }
+                    },
                 },
-            },
+            }
         };
         let Some(admission) = admission else {
             if let Some(guard) = root_admission_guard.take() {
@@ -1641,6 +1838,9 @@ impl RunService {
                 *turn_run_control = Some(request.run_control.clone());
             }
             Some(context)
+        } else if self.shared_run.is_some() {
+            *turn_run_control = Some(request.run_control.clone());
+            None
         } else if let Some(confirmation) = root_confirmation {
             let execution = match self
                 .agent_runtime()?
@@ -1705,6 +1905,7 @@ impl RunService {
                 SingleRunOutcome::Turn(summary.with_admission_revision(admission_revision))
             });
         };
+        admitted_run_control.inherit_effect_authority(&request.run_control);
         request.run_control = admitted_run_control;
         if let Some(route) = &self.hub_route {
             route.bind_run_control(request.run_control.token());
@@ -1750,8 +1951,20 @@ impl RunService {
             goal: admitted_goal,
             current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
         });
-        let admitted_result: Result<RunSummary, AppRunError> =
+        let admitted_result: Result<AgentRunOutcome, AppRunError> =
             run_admitted_inner_with_cancel_grace(&request.run_control, async {
+                if let Some(shared) = self
+                    .shared_run
+                    .as_ref()
+                    .filter(|shared| shared.resume.is_none())
+                {
+                    self.store.session_repo().bind_shared_run(
+                        shared,
+                        session_id,
+                        protocol_turn_id,
+                        admission_id,
+                    )?;
+                }
                 if let Some(context) = agent_context.as_ref() {
                     context
                         .bind_durable_turn_owner(admission_id, protocol_turn_id, admission_revision)
@@ -1814,7 +2027,7 @@ impl RunService {
                 };
                 let summary = self
                     .agent_loop
-                    .run(
+                    .run_inner(
                         AgentRunRequest {
                             session: session_context,
                             turn: turn_context,
@@ -1831,10 +2044,48 @@ impl RunService {
                 Ok(summary)
             })
             .await;
-        let renderer_finish_required = admitted_result.is_ok();
+        let renderer_finish_required = matches!(admitted_result, Ok(AgentRunOutcome::Completed(_)));
         heartbeat_stop.cancel();
         let heartbeat_result = match heartbeat_task {
             Ok(task) => task.stop_and_wait().await,
+            Err(error) => Err(error),
+        };
+        let admitted_result = match admitted_result {
+            Ok(AgentRunOutcome::Completed(summary)) => Ok(summary),
+            Ok(AgentRunOutcome::Yielded(proposal)) => {
+                if heartbeat_result.is_ok() && !request.run_control.is_cancelled() {
+                    if let Some(reservation) = request.run_control.begin_tool_effect_commit() {
+                        let checkpoint = self.store.session_repo().checkpoint_shared_run(
+                            self.shared_run
+                                .as_ref()
+                                .expect("shared outcome requires shared context"),
+                            session_id,
+                            protocol_turn_id,
+                            admission_id,
+                            proposal,
+                        );
+                        drop(reservation);
+                        match checkpoint {
+                            Ok(yielded) => {
+                                drop(sink);
+                                drop(harness_sink);
+                                drop(renderer_sink);
+                                drop(process_run_lease);
+                                return Ok(SingleRunOutcome::Yielded(yielded));
+                            }
+                            Err(error) => Err(AppRunError::from(error)),
+                        }
+                    } else {
+                        Err(AppRunError::Message(
+                            "shared yield was stopped before checkpoint commit".into(),
+                        ))
+                    }
+                } else {
+                    Err(AppRunError::Message(
+                        "shared yield requires a live owner through checkpoint commit".into(),
+                    ))
+                }
+            }
             Err(error) => Err(error),
         };
         let result = finish_admitted_run_with_terminal_fanout(
@@ -3770,6 +4021,8 @@ impl<'a> RunEventSink for RendererSink<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod shared_artifact_tests;
+    mod shared_tests;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4370,6 +4623,31 @@ mod tests {
         crate::workspace::Workspace,
         Arc<crate::app::AgentRuntime>,
     ) {
+        run_service_fixture_with_llm(config, Arc::new(UnreachableLlm)).await
+    }
+
+    async fn run_service_fixture_with_llm(
+        config: ResolvedConfig,
+        llm: Arc<dyn crate::llm::LlmClient>,
+    ) -> (
+        Arc<super::RunService>,
+        StoreBundle,
+        crate::workspace::Workspace,
+        Arc<crate::app::AgentRuntime>,
+    ) {
+        run_service_fixture_with_llm_and_shells(config, llm, Default::default()).await
+    }
+
+    async fn run_service_fixture_with_llm_and_shells(
+        config: ResolvedConfig,
+        llm: Arc<dyn crate::llm::LlmClient>,
+        managed_shells: crate::tool::shell::ManagedShells,
+    ) -> (
+        Arc<super::RunService>,
+        StoreBundle,
+        crate::workspace::Workspace,
+        Arc<crate::app::AgentRuntime>,
+    ) {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
         std::fs::create_dir_all(data_dir.as_std_path()).expect("data dir");
@@ -4403,10 +4681,10 @@ mod tests {
             truncator: crate::tool::truncate::ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
-            managed_shells: Default::default(),
+            managed_shells,
         };
         let agent_loop = crate::agent::AgentLoop::new(
-            Arc::new(UnreachableLlm),
+            llm,
             crate::tool::registry::ToolRegistry::core_agent_for_config(&config),
             store.clone(),
             crate::agent::PromptBuilder,
