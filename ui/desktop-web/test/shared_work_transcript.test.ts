@@ -91,14 +91,14 @@ test("submission and continuation expose separate deadline drafts and show the a
     environment_id: "env-a", title: "Finished", input: {}, result: "done", state: "succeeded", awaiting_child_id: null,
     revision: 1, created_at_ms: 1, updated_at_ms: 2, can_continue: true, start_before_ms: deadline };
   let html = renderSharedWork(sharedWorkPresentation(local));
-  assert.match(html, /data-shared-field="draft:startBefore" type="datetime-local" value="2030-09-14T10:00"/);
+  assert.doesNotMatch(html, /data-shared-field="draft:startBefore"/);
   assert.match(html, /data-shared-field="draft:followupStartBefore" type="datetime-local" value="2030-09-15T11:00"/);
   assert.match(html, /開始期限（空欄は投入から24時間）/);
   assert.match(html, /開始済みの処理を打ち切る期限ではありません/);
   assert.ok(html.includes(`開始期限: ${new Date(deadline).toLocaleString("ja-JP")}`));
   local.pending = "submit";
   html = renderSharedWork(sharedWorkPresentation(local));
-  assert.match(html, /data-shared-field="draft:startBefore"[^>]* disabled/);
+  assert.doesNotMatch(html, /data-shared-field="draft:startBefore"/);
   assert.match(html, /data-shared-field="draft:followupStartBefore"[^>]* disabled/);
   local.projection!.projects[0].can_submit = false;
   local.projection!.detail.can_continue = false;

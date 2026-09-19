@@ -5,6 +5,7 @@ import { open, readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { waitForObservation } from "../core/deadline.mjs";
+import { prepareDesktopFixtureEnvironment, desktopLaunchEnvironment } from "../core/desktop_isolation.mjs";
 
 const execute = promisify(execFile);
 export async function startSharedWorkflowProvider() {
@@ -63,8 +64,11 @@ export async function startSharedWorkflowRunner({ context, deviceId, hubId, runn
       { environment_id: "solver", directory: child, access_mode: "default", allowed_child_environments: [] },
     ] }, null, 2), { flag: "wx" });
   const logPath = path.join(root, "runner.log"), log = await open(logPath, "wx");
-  const env = { ...process.env, MOYAI_CONFIG_PATH: context.paths.config_file, MOYAI_DATA_DIR: context.paths.data };
-  const registry = path.join(root, "isolated-machine-registry"); await mkdir(registry);
+  const fixture = context.desktopIsolation === "fixture" ? await prepareDesktopFixtureEnvironment(context) : null;
+  const env = fixture ? desktopLaunchEnvironment({ context, processTemp: fixture.temp })
+    : { ...process.env, MOYAI_CONFIG_PATH: context.paths.config_file, MOYAI_DATA_DIR: context.paths.data };
+  const registry = fixture?.registry ?? path.join(root, "isolated-machine-registry");
+  if (!fixture) await mkdir(registry);
   const args = ["--exact", "runner::shared::process_fixture::isolated_runner_process", "--ignored", "--nocapture", "--test-threads=1"];
   const testBytes = await readFile(runnerTestBinary), cliBytes = await readFile(runnerBinary);
   const processChild = spawn(runnerTestBinary, args, { env: { ...env, MOYAI_TEST_RESOURCE_REGISTRY: registry, MOYAI_TEST_SHARED_SETTINGS: settings }, windowsHide: true, stdio: ["ignore", log.fd, log.fd] });

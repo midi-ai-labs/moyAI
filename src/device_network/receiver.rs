@@ -140,6 +140,26 @@ impl DeviceRequestAuthenticator for ReceiverAuthentication {
 
 impl DeviceNetworkService {
     pub(super) async fn start_receiver(&self) -> Result<(), DeviceError> {
+        // A listener may only finish servicing work already owned by this process.
+        // New Desktop receiver activation is retired in favor of Hub project execution.
+        let profile = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .settings
+            .receiver
+            .profile_id;
+        if !self.inner.jobs.has_active_profile(profile) {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            state.receiver_requested = false;
+            state.receiver_status = "paused";
+            return Err(DeviceError::SharedWorkRequired);
+        }
         let result = self.start_receiver_inner().await;
         if let Err(error) = result {
             let profile = {

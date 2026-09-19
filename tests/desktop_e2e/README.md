@@ -38,6 +38,43 @@ tests/desktop_e2e/
 - `WindowsTauriHost` はscenarioが明示するboundedな `MOYAI_*` config overrideだけをprocess environmentへ追加できる。config / data / preferences pathは常にharness ownerであり、scenarioから上書きできない。missing-config試験は `prepareDesktopFixture({ configMode: "absent" })` を使い、空のplaceholder configを作らない。
 - product `src/harness/` のeventやreplay resultはread-only補助証拠であり、GUI PASSのoracleにしない。
 
+## Desktop の起動範囲
+
+省略時の `--desktop-isolation user-wide` は、既存の Desktop があると起動前に停止する従来の試験である。実利用中の Desktop と共存させる場合だけ、`desktop-e2e` feature 付きの専用 Desktop と `--desktop-isolation fixture` を明示する。通常配布版は隔離用の環境変数が渡された起動を拒否する。どちらのモードでも共通の GUI admission を一つだけ取得し、別 execution の GUI 操作を並行させない。
+
+fixture モードでは共通 host が、仮想端末の `config/config.toml`、`data/`、`prefs/desktop.toml`、`webview/`、`temp/`、`resource-admission/` を束ねる。`MOYAI_DESKTOP_E2E_ROOT` はその端末の config フォルダーの親であり、scenario が上書きしない。起動前の既存 Desktop は PID・起動時刻・実行ファイルを保存し、launch、restart、cleanup の境界でも一致を要求する。終了対象は今回起動した exact owner と WebView profile だけである。隔離モードの `shell.single-instance` は同じ端末 root 内の二重起動拒否を確認し、user-wide 排他の証明とは区別する。manifest にもモードを保存する。
+
+同時に別端末を起動する scenario は `createCompanionContext(context, "desktop-b")` と `host.openCompanion({ context, scenario, sink })` を使う。戻り値は子の `context / host / driver / runtime / sink` であり、親が二つの driver を順に操作する。子の sink は同じ最終 seal に入る名前空間付きの窓口で、同名画像や owner file を上書きしない。子の終了処理を直接呼ばず、親 host が逆順に全 Desktop と profile を停止してから共通 Hub 等を quiesce し、各 DB を閉鎖状態で検査し、最後に admission を解放する。同時起動中の restart は扱わず、単独 Desktop の既存 restart は同じ root または同一 execution 内の別端末 root で継続する。
+
+```powershell
+npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --artifact-parent <absolute-task-root> --desktop-isolation fixture --scenario shell.single-instance
+npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --artifact-parent <absolute-task-root> --desktop-isolation fixture --scenario settings.shared-work-isolation --scenario-config <absolute-hub-scenario-config.json>
+```
+
+`settings.shared-work-isolation` は同時に稼働する A/B と一つの Hub を使い、別々の端末鍵・人のログイン・所属プロジェクトと、一方の logout 後も他方が継続することを確認する。Hub options だけを使い、Runner や仕事は起動しない。実行機能を試す `settings.device-execution` では、明示した current libtest を `MOYAI_DESKTOP_E2E_RUNNER` で接続し、同じ端末の `resource-admission/` と一時フォルダーを共有する。別端末 root と通常の ProgramData へ資源登録を混ぜない。
+
+### GUI を手動で操作するセッション
+
+`manual_session.mjs` は、隔離 Desktop A/B、一つの Hub、固定応答 provider の準備と終了だけを共通 owner へ接続する。Hub の初回管理者設定、端末参加、利用者・プロジェクト設定、実行許可、仕事の投入・承認はすべて GUI から手動で行う。Hub の認証やプロジェクトを API で事前作成しない。A/B のローカルモデル設定だけは fixture として用意する。
+
+`moyAI/` で次を実行する。五つのパスはすべて絶対パスで指定し、stdin を保持する。Desktop は `desktop-e2e` 専用 build、`runner-test-binary` は同じ source の libtest を使う。この入口は常に fixture 隔離で起動する。
+
+```powershell
+node tests/desktop_e2e/manual_session.mjs --binary <absolute-desktop-e2e-binary> --hub-binary <absolute-hub-binary> --runner-binary <absolute-runner-cli> --runner-test-binary <absolute-libtest> --artifact-parent <absolute-task-root>
+```
+
+最初は A だけが起動する。stdout の `ready` JSON に Hub URL、ポート、A の exact process owner、設定・証跡パスが出た後、stdin へ次の JSON を一行ずつ送る。
+
+```jsonl
+{"command":"start-b"}
+{"command":"capture-runner","pc":"b"}
+{"command":"finish","verdict":"pending","observations":["GUI で確認した操作と未確認項目を記録する"]}
+```
+
+`start-b` は同じ execution に B を一度だけ追加する。GUI で実行機能を有効にしたら、直後にその PC（`a` または `b`）へ `capture-runner` を送り、同じ設定の Runner の本人性と exact process owner を記録する。固定応答の承認・ファイル作成を試す依頼には `desktop-transfer-child` を含める。この provider は手順確認用であり、外部 LLM や物理別 PC の検証にはならない。
+
+確認を終えたら、ウィンドウを閉じずに `finish` を送る。`verdict` は `pass` / `fail` / `pending`、`observations` は手動所見の配列で、`pass` には一件以上の所見が必要である。共通 host が Desktop、捕捉済み Runner、Hub/provider を終了し、DB の閉鎖確認と証跡の seal を行って `finished` JSON を返す。手動判定と cleanup の成否は別に保存する。EOF や捕捉失敗は未完了として扱うため、通常終了には Ctrl+C やプロセス強制終了を使わない。
+
 ## Execution state machine
 
 ```text
@@ -116,7 +153,7 @@ Windowsの初期adapterは、製品binaryをtest pluginで変更しない外部b
 - `agent.interrupt` はtool-enabled scripted providerのbounded 3-request flowでrootの`spawn_agent`、root final、exact child request holdを再現する。右output paneのexact child list→execution inspectorをcanonical操作経路とし、trusted pointerが実際に発行した唯一の`interrupt_agent.expectedTarget`を`DesktopCommandProbe`で取得して直前control ownerと照合する。response後のpollではdurable `AgentInterrupted` row、child cancelled history、agent tree Idle、root turn不変、newer root turn 0、provider replay 0、error overlay 0、共通cleanup / SQLite auditを束ねる。collapsed work summaryの可視性やprivate表示文言は合否ownerにしない。sibling/descendant non-cascadeはこの代表scenarioへ追加stateを注入せず、Rustのdeterministic owner testへ委ねる。
 - `agent.interrupt` の任意scenario config `{"childToolCalls":42}` は同じ子へ有限回のcurrent_time続行を行い、80 canonical item境界を越える。実GUIの「以前の実行履歴」で先頭のSystem指示と同じsummaryへ範囲を広げ、元Mainを保持してexact childを停止する。System行はstable identityを持たないため、全行のID増加は要求せず、記事順・元summary identity・指示本文・集約件数を検証する。configは41～64の整数のみ、defaultは従来3requestを保持する。
 - `navigation.external-rejoin` / `navigation.external-sidebar-stop` は、通常GUIで元会話を作成し、同じisolated config/data/workspaceを使う実CLI rootを別processとして起動する。実Refresh→exact active rowのhover→RejoinまたはStopを操作し、CLI取消exit130、子process0、元Main履歴/draft保持、停止後のexact rowの非稼働表示と古いStop入口の消失を確認する。CLIのbinaryはDesktopの隣の`moyai.exe`が既定で、任意scenario config `cliBinary`だけで変更できる。MCP受入sessionは通常一覧から除外されるため、このactive row fixtureへ流用しない。
-- `hub.outgoing-controls` は許可済みprotocol peerに対し、表示名一致・無一致・clearの実検索で一覧だけが変わり選択設定が保持されることも確認する。その後のpeer ON/OFF、診断、Desktopからの委任・停止・成果物参照/保存とは証跡を分ける。単一fixture peerの確認を複数実端末や全検索条件へ広げない。
+- `hub.outgoing-controls` は退役した個別PC選択の旧GUI試験であり、現在のHubプロジェクトの合格条件には使わない。旧版では許可済みprotocol peerの実検索と選択設定の保持を確認した。新しいPC選択はHubのプロジェクト管理画面で確認する。
 - `history.restart-prepend` はbounded scripted providerでprevious-page transitionが2回以上必要な履歴を作り、live modelを使わずexact Desktop restart後の履歴復元を検証する。trusted command-palette inputからsemantic previous-page targetの再出現・exact cardinality・enabled settlementを待ち、`load_previous_turn_page` のexact mutation target、canonical offset / range transition、offset 0までの2回以上のprepend、provider replay 0、共通cleanup / closed SQLite auditを一つのbounded executionで判定する。`manual.case5_2` 内で発見されたrestart後のsemantic target / DOM settlement regressionはこのscenarioを通常のactual-Tauri再試験先とする。
 - `history.terminal-reconcile` はtool-enabled scripted providerで存在しない相対pathへの`read`を一度だけ発行し、durable Errorの後にstrict prefix streamから完全文Assistantへ完了する2-request flowを作る。Send直後のfrontend `desktop_state` pollをexact 1件保持し、provider完了まで未配送のまま維持してからfresh responseを配達する。live GUIとexact Desktop restart後の双方で同一session / Turn / admission revision / page owner、`User → Error → Assistant`の順序と本文、completed work summary、provider replay 0を要求し、長時間caseでしか表面化しなかったlive/canonical terminal ownerの混在をboundedな短時間actual-Tauri regressionへ縮約する。
 - `settings.preferences` は一つのloopback ledgerをmain providerとDoclingへ共有し、implicit HTTP 0を全stageとrestart後の安定観測で要求する。exact HWND native titlebar dragの後、統合Settingsでcontext limitとMain専用system prompt markerを編集して`save_global_config`を1回実行する。scroll-content内の入力は、Tabで対象を取得してASCII markerをkeyboard入力、Ctrl+Aで数字を置換、SpaceでDocling checkboxを切り替える。各入力は同じcontrolへのtrustedイベントと変更後の完全な値を照合する。固定header/navと確認dialogのbuttonsは厳密なpointer取得を使う。Doclingのdirty explicit close / Escape guardでSettings dialogがinertかつ可視dialogがexact 2となること、Cancelとbaseline reset→close、再度Doclingを変更して同じMain system promptを保持した2回目の`save_global_config`、clean explicit close、exact process/profile zeroを挟むrestart後のprompt復元を一つのbounded executionで検証する。keyboard経路の合格から、各入力中のviewport内表示や未撮影の下部設定を目視済みとは扱わない。native adapterはPID/start/executableとcurrent Tauri native classからmain HWND/thread/class fingerprintを取得し、同一processの補助rootをmain候補にしない。dragではforeground、physical LEFTのinitial-up、driver-owned DOWNだけに対応するUP、driverがcursorを移動した場合だけのrestore、移動前後rectを所有し、scenarioはwindow移動・size不変と`start_window_drag` command 1回をproduct oracleにする。scenario固有のprocess/profile/SQLite cleanup ownerは作らない。
@@ -212,19 +249,27 @@ npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe -
 
 Hubの管理画面はブラウザーへ移行したため、旧Hubネイティブウィンドウを起動・操作するdriverと結合シナリオは削除した。現在は[HubのPlaywright試験](../../../moyAI-Hub/tests/browser/README.md)と、このharnessのDesktop試験を使用する。`hub.connection-settings`はHTTP fixtureを使って実Desktopの接続設定を確認する現役シナリオとして維持する。
 
-`settings.shared-work` はconfig/model/local Projectを用意せず起動し、共有入口、native共通設定import、Hubブラウザーの端末承認、人のlogin、所属projectと占有の秘匿、仕事の投入・詳細・取消、logout、別利用者のloginを実Tauriで操作する。初期設定は未完了のまま維持する。Hubのfixture専用mTLS参加者が2人の所属と共通資源上の待機仕事を実APIで用意する。製品GUIからの投入とfixture準備を証跡で区別し、solver実行・物理別PC・受付応答喪失の実通信試験はこのシナリオの範囲へ含めない。共通Hub browser resourceは初回管理者設定を実ブラウザーで行い、人のパスワードを証跡へ記録しない。
+`settings.shared-work` はconfig/model/local Projectを用意せず起動し、共有入口、native共通設定import、Hubブラウザーの端末承認、人のlogin、所属projectと占有の秘匿、通常プロジェクトのサイドバーとチャットから投入・詳細・取消、logout、別利用者のloginを実Tauriで操作する。同じ保存先でのDesktop再起動後にlogin操作なしで本人と既存仕事が戻ること、明示logout後の再起動では戻らないことも確認する。初回の未設定状態から共有入口を開けることを確認する。共通設定の保存・再起動後はHub設定によって準備済みになり得るため、設定画面の開閉ではその時点の初期設定判定を保持することを確認する。Hubのfixture専用mTLS参加者が2人の所属と共通資源上の待機仕事を実APIで用意する。製品GUIからの投入とfixture準備を証跡で区別し、solver実行・物理別PC・受付応答喪失の実通信試験はこのシナリオの範囲へ含めない。共通Hub browser resourceは初回管理者設定を実ブラウザーで行い、人のパスワードを証跡へ記録しない。
 
-`settings.shared-work-continuation` は同じHubと実Runnerを保ち、Desktop Aのnative入力添付・投入・担当引継ぎ要求、Aの通常終了、設定のない別端末登録のDesktop Bからの実操作承認・成果保存・担当交代・会話を引き継ぐ追加依頼を実行する。Aでは人のログイン前にも実Runnerの受付停止・再開をGUIで確認する。scenario configには共通Hubの `hubBinary` / `hubRepository` と製品 `runnerBinary` に加え、現在sourceから作ったlibtest実行ファイルの絶対pathを `runnerTestBinary` で指定する。RunnerHost / LocalListener / SharedWorkerを実行する `cfg(test)` 専用入口でmachine資源registryだけをexecution directoryへ注入し、製品のProgramData設定を変更しない。証跡には両binaryのidentityと注入範囲を記録する。同一Windows上の独立した端末設定であり、物理別PC、別Windowsアカウント、外部solverの試験ではない。最終画像の目視は自動判定とは別に記録する。
+`settings.device-execution` は、nativeフォルダー選択と1回の実行許可、Desktopによる実行機能の自動起動、標準ひな形の自動通知、Hubのプロジェクト画面で人・操作PC・実行PCを1回保存する操作、実フォルダー作成を確認する。Desktopを通常終了・再起動しても同じ独立Runnerが継続し、再同意や手動起動を要求しないことを確認する。共通のHubブラウザー・native picker・Desktop再起動・exact process cleanupを使う。
 
-提供設定は名前だけを入力してnativeフォルダ選択へ進み、生成された識別名と標準の権限・共有範囲を追加設定から確認する。公開済みひな形の選択で入力値を再利用し、編集後の古いフォルダ確認では公開できないこと、選び直したフォルダの確認後に更新できることを操作する。Hubでは同じひな形のカードから端末・共有枠・名前を引き継ぎ、公開先プロジェクトの選択と1回の保存でフォルダ作成まで依頼し、実Runnerが作成したパスを確認する。native SELECTは既存のclick / Home / ArrowDown / Enterに加え、exact対象のtrusted input/changeと要求した値の読戻しを要求し、入力を再送して成功するまで繰り返す動作はしない。
+実行機能の試験には `cargo build --offline --features desktop-e2e --bin moyai-desktop` の専用Desktopに加えてcurrent libtestを使う。通常の配布buildには実行先の差し替え処理を含めない。scenario configの `runnerTestBinary` にcurrent libtest、`runnerBinary` に通常Runner CLI、`hubBinary` にcurrent Hubの絶対pathを指定する。共通scenario environmentの `MOYAI_DESKTOP_E2E_RUNNER` は、この専用buildが既存の `cfg(test)` RunnerHostへ起動をつなぐためのものである。fixtureモードの `MOYAI_TEST_RESOURCE_REGISTRY` は共通hostが端末root内に固定し、ProgramData本体へ書かない。専用buildの投影markerがない場合は、GUIの実行許可操作前に試験を拒否する。通常Runner CLIの実プロセスgateは別途実行し、専用buildと配布buildのidentityを区別して記録する。
 
-同シナリオではnative親フォルダ選択によるテンプレート公開、Hub管理画面からの環境作成・配置依頼、実Runnerによる領域作成、公開停止後の既存mapping保持も確認する。共通native path helperは既存fileを選ぶ `open`、execution配下の既存folderを選ぶ `directory`、execution配下の既存parentへ新fileを保存する `save_new` の意図を明示する。対象HWND・controlの照合とfile名のreadbackを経て確認buttonを一度だけ押し、別意図のdelivery evidenceや上書き確認への暗黙fallbackを受理しない。
+```powershell
+npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --artifact-parent <absolute-task-root> --desktop-isolation fixture --scenario settings.device-execution --scenario-config <absolute-scenario-config.json>
+```
+
+`settings.shared-work-continuation` は同じHubと実Runnerを保ち、Desktop Aのnative入力添付・投入・担当引継ぎ要求、Aの通常終了、設定のない別端末登録のDesktop Bからの実操作承認・成果保存・担当交代・会話を引き継ぐ追加依頼を実行する。PCの初回実行設定・自動起動は別の `settings.device-execution` が担当し、このシナリオは既存の実Runnerと2つの実行環境を使う。scenario configには共通Hubの `hubBinary` / `hubRepository` と製品 `runnerBinary` に加え、現在sourceから作ったlibtest実行ファイルの絶対pathを `runnerTestBinary` で指定する。RunnerHost / LocalListener / SharedWorkerを実行する `cfg(test)` 専用入口でmachine資源registryだけをexecution directoryへ注入し、製品のProgramData設定を変更しない。証跡には両binaryのidentityと注入範囲を記録する。同一Windows上の独立した端末設定であり、物理別PC、別Windowsアカウント、外部solverの試験ではない。最終画像の目視は自動判定とは別に記録する。
+
+新規チャットの実行先を選び、添付ファイルと必要な追加設定を確認して送信する。仕事の詳細は通常のサイドバーから開き、アカウントのログアウトと期限は各詳細欄を開いて操作する。native SELECTは既存のclick / Home / ArrowDown / Enterに加え、exact対象のtrusted input/changeと要求した値の読戻しを要求し、入力を再送して成功するまで繰り返す動作はしない。
+
+共通native path helperは既存fileを選ぶ `open`、execution配下の既存folderを選ぶ `directory`、execution配下の既存parentへ新fileを保存する `save_new` の意図を明示する。対象HWND・controlの照合とfile名のreadbackを経て確認buttonを一度だけ押し、別意図のdelivery evidenceや上書き確認への暗黙fallbackを受理しない。
 
 `hub.browser-enrollment` は実Hubを公開CLIからisolated data directoryで起動し、headed Edge/Chromeのモデル登録・ネットワーク開始・共通設定download・端末承認と、実Desktopのnative pickerによるimport・Main/Side別モデル選択/確認/Hub送信先切替を通す。管理側のmutationはブラウザーGUI、Desktop側は実Tauri上のtrusted WebView inputと、下記の検証済みnative picker control入力を使う。起動・port・終了はHub側の単一 `tests/browser/hub_server.mjs` を再利用する。既定は隣の `moyAI-Hub` checkoutとEdgeで、必要な場合だけscenario configにabsolute `hubRepository` / `hubBinary`、`browserChannel`（`msedge`/`chrome`/`chromium`）、`headed`を指定する。通常のDesktopシナリオはHub checkoutやPlaywrightをロードしない。
 
 `output.history-navigation` は小さなscripted providerでtool実行中を保持し、「会話履歴の詳細へ」をpointerで操作する。既存detailsが開き、canonical destinationへfocus/scrollが移ることを確認し、未送信日本語draft・選択範囲・同じeditorを保持したまま周期更新を配送する。完了後は実行中専用の出力ボタンが消え、会話内の同じcanonical履歴の開示をTab/Enterで操作できることを確認する。Main送信1回、停止0回、Side送信0回と固定応答を照合する。typed Rust draftと編集中のTypeScript draftは別に比較する。画面の目視は `manual_pending` としてexecutionに紐付くreviewへ残す。
 
-`mcp.receiver-live` は同じブラウザーHubへの参加後、実Desktopでtemp受付を有効にし、ブラウザーで送信者fixtureの承認・方向付き接続ルールを設定する。送信者fixtureは実grant/mTLS/MCPを通して受信Desktopへtaskを依頼し、scripted providerで実行中を保持する。Desktopの赤い活動strip・実行履歴・完了、Hubから取得した同一jobの履歴を比較する。DesktopのMarkdown保存はnativeダイアログ表示と取消までを自動操作し、保存確定と配色の目視は未完了として `manual_pending` に残す。送信者はNodeのprotocol fixtureなので、Desktop側の「MCP指示」画面や物理端末間の合格は含めない。scenario configは `hub.browser-enrollment` と共通である。
+`mcp.receiver-live` と同じ新規MCP受付から始める派生試験は、退役した経路の旧GUI試験として保持する。現行版の新規受付は拒否されるため、これらの陽性シナリオを現行版の合格条件には使わない。旧版の証跡は、temp受付・方向付き接続ルール・実grant/mTLS/MCPによる依頼、活動strip・実行履歴・完了の比較を記録している。既存仕事の読取と停止の互換性、新しい共有仕事の実行は、それぞれのcurrent API試験とHubプロジェクトのシナリオで確認する。
 
 native pickerの絶対パス入力は、実測したdialog→ComboBoxEx32→ComboBox→EditとOpenボタンのPID/start/executable/HWND/thread/親/control-IDを再検証し、WM_SETTEXTを1回、WM_GETTEXT一致後のみBM_CLICKを1回配送する。外部foregroundへのthread attachや、曖昧な配送の再送・別方式fallbackは行わない。これはnative controlを通るGUI操作の証拠であり、OS物理キーボード・IMEの証明ではない（`foreground_required:false`、`os_keyboard_ime_evidence:false`）。dialog閉鎖とDesktopの参加申請状態まで確認して成功を判定する。既存UIAの項目選択・取消やSendInputのforeground契約とは別adapterである。
 

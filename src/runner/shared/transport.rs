@@ -185,7 +185,7 @@ impl SharedClient {
         &self,
         entry: &super::journal::Entry,
         id: &str,
-    ) -> Result<Option<super::protocol::ApprovalDecision>, RunnerError> {
+    ) -> Result<Option<super::protocol::ApprovalConsumeResult>, RunnerError> {
         if !crate::device_network::stable_id(id) {
             return Err(RunnerError::new("Invalid approval identity"));
         }

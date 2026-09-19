@@ -24,7 +24,7 @@ import {
 const OWNER = "scenario:native-dialog.cancel";
 const NATIVE_FOLDER_DIALOG_CLASS = "#32770";
 const PICKER = Object.freeze({
-  selector: 'button[data-action="create-project-from-picker"][aria-label="プロジェクトを作成"]',
+  selector: 'button[data-action="create-project-from-picker"][aria-label="このPCにローカルプロジェクトを作成"]',
   identity: { tag: "BUTTON", action: "create-project-from-picker" },
 });
 

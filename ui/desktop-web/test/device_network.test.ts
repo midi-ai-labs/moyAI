@@ -17,7 +17,7 @@ test("approval enrollment never grants reception or selects peers automatically"
   acceptDeviceNetworkProjection(local, deviceProjection({ device_id: null, enrollment: "pending", can_join: false, request_id: "request-a" }));
   assert.equal(deviceCanJoin(local), false);
   const pendingHtml = renderDeviceNetwork(local);
-  assert.match(pendingHtml, /Hub管理者の承認待ち/);
+  assert.match(pendingHtml, /管理者の参加承認待ち/);
   assert.doesNotMatch(pendingHtml, /id="device-network-code"|id="device-network-join-confirmed"/);
   assert.equal(deviceCanReceive(local, true), false);
   acceptDeviceNetworkProjection(local, deviceProjection());
@@ -130,28 +130,23 @@ test("directory announcements do not infer connection history and mixed absence 
   peer.selected = true;
   assert.equal(devicePeerAvailability(peer).label, "受付申告あり");
   assert.doesNotMatch(devicePeerAvailability(peer).label, /利用可能|接続済み|接続確認前/);
-  assert.match(renderDeviceNetwork(local), /接続は実際の依頼時に確認します/);
+  assert.doesNotMatch(renderDeviceNetwork(local), /data-action="device-network-select"/);
   peer.online = false; peer.can_use = false; peer.reason = "not_available_or_not_allowed";
   assert.match(devicePeerAvailability(peer).label, /状態・許可/);
   const html = renderDeviceNetwork(local);
   assert.doesNotMatch(html, /not_available_or_not_allowed/);
-  assert.match(html, /受付・接続、またはHubの許可/);
+  assert.match(html, /操作・実行に使うPCはHub管理者が設定/);
   editDeviceNetworkField(local, "search", "開発", false);
   assert.deepEqual(visibleDevicePeers(local).map(peer => peer.device_id), ["device-20"]);
 });
 
-test("receiver status follows the actual Rust receiving and paused projection without claiming an unknown state is stopped", () => {
+test("retired receiver and individual peer controls stay absent even with old saved settings", () => {
   const local = deviceUiFixture();
-  for (const [status, enabled, label] of [["receiving", true, "受付 ON · 受付中"], ["paused", false, "受付 OFF · 停止中"],
-    ["starting", true, "受付 ON · 受付を準備中"], ["stopping", false, "受付 OFF · 停止を確認中"],
-    ["error", true, "受付 ON · 受付できません"], ["future-state", true, "受付 ON · 状態を確認しています"]] as const) {
-    const projection = deviceProjection();
-    projection.receiver = { ...projection.receiver, status, enabled, confirmed: true };
-    acceptDeviceNetworkProjection(local, projection);
-    const markup = renderDeviceNetwork(local);
-    const shown = markup.match(/data-settings-passive="device-network-receiver-status">([^<]*)</)![1];
-    assert.equal(shown, label);
-  }
+  local.projection.receiver.enabled = true;
+  local.projection.peers[0].selected = true;
+  const html = renderDeviceNetwork(local);
+  assert.doesNotMatch(html, /data-action="device-network-(?:receiver-on|receiver-off|select)"/);
+  assert.match(html, /id="device-execution"/);
 });
 
 test("successful participation feedback is a notice while local and projected failures retain their error tone", () => {
@@ -179,12 +174,12 @@ test("temporary disconnect preserves registration and selected targets with an e
   local.projection!.peers[0].selected = true;
   local.projection!.enrollment = "disconnected";
   const html = renderDeviceNetwork(local);
-  assert.match(html, /id="device-network-refresh"[^>]*>再接続</);
-  assert.match(html, /登録ID・公開対象・実行権限・利用先の選択は保持/);
-  assert.match(html, /受付は手動でON/);
+  assert.match(html, /id="device-network-refresh"[^>]*>再接続・最新情報を取得</);
+  assert.match(html, /PCの登録を保持して接続を解除/);
+  assert.match(html, /同じ設定で再接続/);
   assert.match(html, /data-action="device-network-leave"[^>]*>接続を一時解除</);
   assert.doesNotMatch(html, /参加を解除/);
-  assert.match(html, /data-network-visible="join" hidden/);
+  assert.match(html, /id="device-network-join"[^>]*disabled/);
   assert.equal(local.projection!.device_id, "device-00");
   assert.equal(local.projection!.peers[0].selected, true);
 });
@@ -279,7 +274,7 @@ test("administrator stop and credential revocation stay distinct while pending a
   editDeviceNetworkField(local,"target","project:project-a",false);
   const target = structuredClone(local.target);
   acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"stopped",error:"device_stopped",generation:"8"}));
-  assert.match(renderDeviceNetwork(local),/Hub管理者による利用停止中/);
+  assert.match(renderDeviceNetwork(local),/管理者が利用を停止中/);
   assert.equal(deviceCanReceive(local,true),false);
   acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"revoked",error:"device_revoked",generation:"9"}));
   assert.match(renderDeviceNetwork(local),/端末の認証が失効しています/);

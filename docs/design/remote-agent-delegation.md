@@ -1,5 +1,7 @@
 # 複数端末へのエージェント委任
 
+2026-09-13時点の扱い: WinAの個別MCP接続を起点とする新規受付は退役した。新しい複数端末の仕事は [Hubプロジェクト](../shared-work-desktop.md) から開始し、Hubの永続状態と独立した実行機能で継続する。本書は旧エンジンと保存済み仕事の互換契約・設計経緯を残すもので、現在の導入手順ではない。
+
 2026-09-07。`REC-DESKTOP-REMOTE-ORCHESTRATION-01` の採用要件と設計方針。**WinA→WinBの中間実装と同一PCでの動作確認を実施。物理2端末の中間受入は未実施**。追加した対話承認・診断・成果物書き出し等の統合・実画面検証は進行中で、本書の最終要件すべてが実装済み・受入済みであるとは扱わない。既存の固定読み取り配信は [MCP配信](mcp-publish-foundation.md) と current code / tests を正とする。
 
 第1〜6節はWinA＋WinB/WinC以降を含む最終要件、第7節はcurrent owner、第8節は段階別の受入条件である。手動MCP経路は受入側のGlobal Main Direct設定を開始時にcaptureし、Bのローカル子agent・outbound MCPとAの親停止からの遠隔一括停止には対応しない。追加した [Hub管理経路](hub-device-network.md) はHubの受入モデル割当、認可された再委任、親に属する遠隔作業の停止と確認を所有する。受入側の対話承認は両経路で同じjob ownerを使う。同一PCで確認した実GUI・実oMLXのtempへのCPU/端末名調査、結果返却、進捗表示、実shellの個別停止は `project_sandbox/lynx-remote-agent-intermediate-20260906/RESULTS.md` を参照し、今回追加した操作の受入とは区別する。

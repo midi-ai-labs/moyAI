@@ -27,7 +27,7 @@ impl Tool for McpCallTool {
         ToolSpec {
             name: ToolName::McpCall,
             effect: crate::tool::ToolEffectPolicy::McpCall,
-            description: "Inspect tools and their input schemas from a configured MCP server, or call a tool. Configured moyAI remote-agent servers can execute tasks on other devices. Omit tool_name to inspect the server first.",
+            description: "Inspect tools and their input schemas from a configured external MCP server, or call a tool. Omit tool_name to inspect the server first.",
             input_schema: json!({
                 "type": "object",
                 "required": ["server_id"],
@@ -48,6 +48,7 @@ impl Tool for McpCallTool {
         let effect =
             crate::tool::ToolEffectPolicy::McpCall.resolve(&raw_arguments, &ctx.config.mcp);
         let mut input = serde_json::from_value::<McpCallInput>(raw_arguments)?;
+        reject_retired_delegation(&ctx.config.mcp, &input)?;
         prepare_remote_task_arguments(
             &ctx.config.mcp,
             &mut input,
@@ -221,6 +222,21 @@ fn configured_remote_agent(config: &crate::config::McpConfig, server_id: &str) -
             .servers
             .iter()
             .any(|server| server.id == server_id && server.enabled && server.remote_agent)
+}
+fn reject_retired_delegation(
+    config: &crate::config::McpConfig,
+    input: &McpCallInput,
+) -> Result<(), ToolError> {
+    if input.tool_name.as_deref().map(str::trim) == Some("delegate_task")
+        && (input.server_id.starts_with("hub-device-")
+            || configured_remote_agent(config, &input.server_id))
+    {
+        return Err(ToolError::Message(
+            "Individual moyAI task delegation is retired. Use a Hub project and its execution PCs."
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_remote_task_arguments(
@@ -485,6 +501,22 @@ mod tests {
                 tool_routes: Vec::new(),
                 headers: Default::default(),
             }],
+        }
+    }
+
+    #[test]
+    fn retired_moyai_delegation_is_rejected_without_affecting_external_mcp_or_saved_control() {
+        let mut config = config();
+        let input = |name: &str| super::McpCallInput {
+            server_id: "fixture".into(),
+            tool_name: Some(name.into()),
+            arguments: Some(json!({})),
+        };
+        assert!(super::reject_retired_delegation(&config, &input("delegate_task")).is_ok());
+        config.servers[0].remote_agent = true;
+        assert!(super::reject_retired_delegation(&config, &input(" delegate_task ")).is_err());
+        for name in ["task_status", "cancel_task", "task_artifacts"] {
+            assert!(super::reject_retired_delegation(&config, &input(name)).is_ok());
         }
     }
 

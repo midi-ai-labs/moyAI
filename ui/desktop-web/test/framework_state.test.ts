@@ -673,7 +673,7 @@ test("child-only activity preserves the authoritative Rust new-request gate", ()
   for (const [label, pattern] of [
     ["session search", /<input id="session-search"[^>]*>/],
     ["new root chat", /<button class="row-action add-session" data-action="new-project-session"[^>]*>/],
-    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat" data-focus-key="quick-chat:new-session"[^>]*>/],
+    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat" data-value="local" data-focus-key="quick-chat:new-session"[^>]*>/],
     ["open session", /<button class="nav-row" data-action="session" data-index="1"[^>]*>/],
     ["rejoin session", /<button class="row-action row-rejoin" data-action="rejoin-session" data-index="1"[^>]*>/],
   ] as const) {
@@ -3144,7 +3144,7 @@ test("global action shortcuts ignore key-repeat activation", () => {
 test("every visible new-chat route exposes one exact typed focus identity", () => {
   assert.match(
     renderSidebar(projection()),
-    /data-action="new-chat" data-focus-key="quick-chat:new-session"/,
+    /data-action="new-chat" data-value="local" data-focus-key="quick-chat:new-session"/,
   );
   assert.match(
     renderOverlay(projection({ overlay: "file_menu" })),
@@ -5401,7 +5401,7 @@ test("every Settings field has unique connected help, validation, and explicit l
     html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*settings-control[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 27, "twenty-three config controls plus four remote peer connection fields");
+  assert.equal(controls.length, 23, "all current Settings controls retain connected help and labels");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];

@@ -2,7 +2,6 @@ const REGULAR_MODAL_OVERLAYS = new Set([
   "provider",
   "config",
   "hub",
-  "shared_work",
   "mcp_history",
   "session_settings",
   "workspace",
@@ -80,7 +79,6 @@ export function overlayPrimaryFocusSelectors(overlay: string): readonly string[]
   if (overlay === "provider") return ["#provider-url"];
   if (overlay === "config") return [".settings-control"];
   if (overlay === "hub") return ["#hub-tab-devices:not(:disabled)", ".hub-modal"];
-  if (overlay === "shared_work") return ["#shared-username:not(:disabled)", ".shared-work"];
   if (overlay === "mcp_history") return [
     ".mcp-history-modal [data-action='mcp-history-direction'][aria-pressed='true']:not(:disabled)",
     ".mcp-history-modal",

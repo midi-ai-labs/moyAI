@@ -1,15 +1,14 @@
 import { command } from "./api.ts";
-import { openSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
+import { openHubProject, openSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
 import { sharedWorkActionEnabled } from "./shared_work_state.ts";
+import { deviceExecutionAction, deviceExecutionActionEnabled } from "./device_execution.ts";
 import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
-import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "./device_network_actions.ts";
-import { deviceCanJoin, deviceCanReceive, deviceCanSelect, deviceCanStopJob } from "./device_network_state.ts";
+import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork } from "./device_network_actions.ts";
+import { deviceCanJoin } from "./device_network_state.ts";
 import { deviceCanDiagnose, diagnoseDeviceNetwork } from "./device_network_diagnostics.ts";
-import { deviceCanInspectArtifacts, deviceCanExportArtifacts, inspectDeviceArtifacts, exportDeviceArtifacts } from "./device_network_artifacts.ts";
 import { hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, useHubRecommendation } from "./hub_state.ts";
 import { openMcpHistory, reloadMcpHistory, selectMcpHistoryDirection, selectMcpHistory, pageMcpHistory, operateMcpHistory } from "./mcp_history_actions.ts";
 import { selectedMcpHistoryRow } from "./mcp_history_state.ts";
-import { checkMcpPeer, mcpPeerDraftValid, mutateMcpPeer, refreshMcpPeers } from "./mcp_peer.ts";
 import { snapshotAgentInterruptTarget } from "./agent_interrupt_contract.ts";
 import { snapshotPromptReviewMutationTarget } from "./composer_target_contract.ts";
 import {
@@ -227,6 +226,8 @@ function targetSessionIndex(state: DesktopWebState, payload: ActionPayload): num
 }
 
 function targetSessionAvailable(state: DesktopWebState, payload: ActionPayload): boolean {
+  // A sidebar row is explicit; palette fallback must not select a hidden local session.
+  if (state.hub_project_open === true && payload.index < 0) return false;
   const index = targetSessionIndex(state, payload);
   return sessionRowActionAvailable(
     state.session_rows.length,
@@ -1448,8 +1449,10 @@ const ACTION_DEFINITIONS = [
     label: "送信",
     shortcut: "Ctrl+Enter",
     palette: true,
-    enabled: canSubmit,
-    run: (state, context) => context.mutate("submit_prompt", {
+    enabled: (state, _payload, model) => state.hub_project_open === true
+      ? sharedWorkActionEnabled(model.local.sharedWork, model.local.sharedWork.projection?.detail ? "continue" : "submit", "") : canSubmit(state),
+    run: (state, context) => state.hub_project_open === true
+      ? sharedWorkAction(context, context.uiState.sharedWork.projection?.detail ? "continue" : "submit") : context.mutate("submit_prompt", {
       text: state.draft_prompt,
       expectedTarget: draftMutationTarget(state),
       expectedRunTarget: state.run_target,
@@ -1459,7 +1462,7 @@ const ACTION_DEFINITIONS = [
     id: "cancel-run",
     label: "実行停止",
     palette: true,
-    enabled: (state, _payload, model) => runCanBeCancelled(state)
+    enabled: (state, _payload, model) => state.hub_project_open !== true && runCanBeCancelled(state)
       && model.local.modal.permissionDecision?.phase !== "submitting",
     run: (state, context) => context.submitRunStop(state),
   },
@@ -1469,7 +1472,7 @@ const ACTION_DEFINITIONS = [
     menu: "view",
     palette: true,
     enabled: always,
-    run: (_state, context) => context.mutate("refresh_desktop"),
+    run: (state, context) => state.hub_project_open === true ? sharedWorkAction(context, "refresh") : context.mutate("refresh_desktop"),
   },
   {
     id: "new-chat",
@@ -1477,8 +1480,8 @@ const ACTION_DEFINITIONS = [
     shortcut: "Ctrl+N",
     menu: "file",
     palette: true,
-    enabled: navigationIsIdle,
-    run: (_state, context, payload) => context.mutate(
+    enabled: (state, payload, model) => state.hub_project_open === true && payload.value !== "local" ? sharedWorkActionEnabled(model.local.sharedWork, "new-conversation", "") : navigationIsIdle(state),
+    run: (state, context, payload) => state.hub_project_open === true && payload.value !== "local" ? sharedWorkAction(context, "new_conversation") : context.mutate(
       "new_chat",
       undefined,
       payload.activationSource,
@@ -1510,26 +1513,24 @@ const ACTION_DEFINITIONS = [
     run: (_state, context) => context.mutate("show_config_editor"),
   },
   { id: "show-hub", label: "moyAI Hub", menu: "view", palette: true, enabled: always, run: (_state, context) => openHub(context) },
-  { id: "show-shared-work", label: "共有仕事", menu: "view", palette: true, enabled: always, run: (_state, context) => openSharedWork(context) },
-  ...["login", "logout", "refresh", "project", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "latest", "reconnect", "import", "approve", "deny", "stop", "continue", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest", "provider-status", "provider-start", "provider-prepare", "provider-install", "provider-pause", "provider-resume", "provider-drain", "provider-maintenance", "provider-provision", "provider-reconcile", "provider-autostart", "provider-no-autostart", "provider-remove-template"].map(kind => ({
+  { id: "show-shared-work", label: "Hubのプロジェクト", menu: "view", palette: true, enabled: always, run: (_state, context) => openSharedWork(context) },
+  { id: "open-hub-project", label: "Hubのプロジェクトを開く", enabled: (state, payload, model) => navigationIsIdle(state) && !model.local.sharedWork.pending && !model.local.sharedWork.conceal && Boolean(model.local.sharedWork.projection?.projects.some(row => row.id === payload.value)), run: (_state, context, payload) => openHubProject(context, payload.value) },
+  ...["login", "logout", "new-conversation", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "continue", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
     id: `shared-${kind}`, label: "共有仕事の操作",
-    enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.overlay === "shared_work" && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
+    enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
     run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => sharedWorkAction(context, kind.replaceAll("-", "_"), payload.value),
   })),
   { id: "hub-tab-devices", label: "Hubの端末連携", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "devices") },
+  ...["prepare", "enable", "pause", "resume", "reconcile"].map(kind => ({
+    id: `device-execution-${kind}`, label: "このPCの実行設定",
+    enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.overlay === "hub" && deviceExecutionActionEnabled(model.local.deviceNetwork, kind, payload.value),
+    run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => deviceExecutionAction(context, kind, payload.value),
+  })),
   { id: "hub-tab-models", label: "Hubのモデル割当", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "models") },
   { id: "device-network-import", label: "Hub共通設定を読み込む", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection), run: (_state, context) => importDeviceNetwork(context) },
   { id: "device-network-refresh", label: "端末ネットワークを更新", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending, run: (_state, context) => refreshDeviceNetwork(context) },
   { id: "device-network-diagnose-hub", label: "Hubへの接続を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "hub"), run: (_state, context) => diagnoseDeviceNetwork(context, "hub") },
-  { id: "device-network-diagnose-receiver", label: "保存済みの受付を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "receiver"), run: (_state, context) => diagnoseDeviceNetwork(context, "receiver") },
-  { id: "device-network-diagnose-peer", label: "この端末への接続を診断", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "peer", payload.value), run: (_state, context, payload) => diagnoseDeviceNetwork(context, "peer", payload.value) },
   { id: "device-network-join", label: "参加申請を再試行", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanJoin(model.local.deviceNetwork), run: (_state, context) => joinDeviceNetwork(context) },
-  { id: "device-network-receiver-on", label: "端末の受付を開始・保存", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanReceive(model.local.deviceNetwork, true), run: (_state, context) => setDeviceReceiver(context, true) },
-  { id: "device-network-receiver-off", label: "端末の受付を停止", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanReceive(model.local.deviceNetwork, false), run: (_state, context) => setDeviceReceiver(context, false) },
-  { id: "device-network-select", label: "端末を利用先に選択", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanSelect(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => selectDevicePeer(context, payload.value) },
-  { id: "device-network-stop-job", label: "委任タスクを停止", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanStopJob(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => stopDeviceNetworkJob(context, payload.value) },
-  { id: "device-network-artifacts", label: "委任タスクの成果物を確認", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanInspectArtifacts(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => inspectDeviceArtifacts(context, payload.value) },
-  { id: "device-network-export-artifacts", label: "委任タスクの成果物を書き出す", enabled: (state, payload, model) => state.overlay === "hub" && deviceCanExportArtifacts(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => exportDeviceArtifacts(context, payload.value) },
   { id: "device-network-leave", label: "Hub接続を一時解除", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection?.can_leave && model.local.deviceNetwork.leaveConfirmed), run: (_state, context) => leaveDeviceNetwork(context) },
   { id: "show-mcp-history", label: "MCP履歴", menu: "view", palette: true, enabled: always, run: (_state, context) => openMcpHistory(context) },
   { id: "show-mcp-execution-history", label: "MCP実行履歴", enabled: always, run: (_state, context) => openMcpHistory(context, "execution") },
@@ -1540,10 +1541,6 @@ const ACTION_DEFINITIONS = [
   { id: "mcp-history-previous", label: "MCP履歴の前のページ", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && model.local.mcpHistory.previousOffsets.length > 0, run: (_state, context) => pageMcpHistory(context, false) },
   { id: "mcp-history-export", label: "MCP履歴をMarkdownで保存", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)), run: (_state, context) => operateMcpHistory(context, "export") },
   { id: "mcp-history-stop", label: "MCPタスクの停止を要求", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)?.can_stop), run: (_state, context) => operateMcpHistory(context, "stop") },
-  { id: "mcp-peer-refresh", label: "登録済みmoyAI端末を更新", enabled: (state, _payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending, run: (_state, context) => refreshMcpPeers(context) },
-  { id: "mcp-peer-add", label: "moyAI端末の接続を保存", enabled: (state, _payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && !state.config_draft.dirty && mcpPeerDraftValid(model.local.mcpPeers), run: (_state, context) => mutateMcpPeer(context) },
-  { id: "mcp-peer-remove", label: "moyAI端末の接続を削除", enabled: (state, payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && !state.config_draft.dirty && model.local.mcpPeers.rows.some((row) => row.id === payload.value), run: (_state, context, payload) => mutateMcpPeer(context, payload.value) },
-  { id: "mcp-peer-check", label: "moyAI端末への接続を確認", enabled: (state, payload, model) => state.overlay === "config" && !model.local.mcpPeers.pending && !model.local.configMutationPending && model.local.mcpPeers.rows.some((row) => row.id === payload.value), run: (_state, context, payload) => checkMcpPeer(context, payload.value) },
   {
     id: "hub-connect", label: "Hubに接続",
     enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending
@@ -1567,7 +1564,7 @@ const ACTION_DEFINITIONS = [
     id: "show-session-settings",
     label: "このセッションの設定",
     palette: true,
-    enabled: (state) => state.session_settings?.available === true
+    enabled: (state) => !state.hub_project_open && state.session_settings?.available === true
       && state.session_settings.target !== null
       && (state.overlay !== "config" || !state.config_draft.dirty),
     run: (_state, context) => context.mutate("show_session_settings"),
@@ -1673,7 +1670,7 @@ const ACTION_DEFINITIONS = [
     label: "現在のフォルダーを開く",
     menu: "file",
     palette: true,
-    enabled: always,
+    enabled: (state) => !state.hub_project_open,
     run: (_state, context) => runWithoutRender("open_workspace_folder", context),
   },
   {
@@ -1688,7 +1685,7 @@ const ACTION_DEFINITIONS = [
     label: "プロンプトを推敲",
     menu: "edit",
     palette: true,
-    enabled: (state) => state.enhance_enabled,
+    enabled: (state) => !state.hub_project_open && state.enhance_enabled,
     run: (state, context) => context.mutate("enhance_prompt", {
       text: state.draft_prompt,
       expectedTarget: draftMutationTarget(state),
@@ -1699,7 +1696,7 @@ const ACTION_DEFINITIONS = [
     id: "review-uncommitted",
     label: "未コミット差分をレビュー",
     palette: true,
-    enabled: (state) => composerCapabilities(state, state.draft_prompt).canReviewUncommitted,
+    enabled: (state) => !state.hub_project_open && composerCapabilities(state, state.draft_prompt).canReviewUncommitted,
     run: (state, context) => context.mutate("review_uncommitted", {
       text: state.draft_prompt,
       expectedTarget: draftMutationTarget(state),
@@ -1711,7 +1708,7 @@ const ACTION_DEFINITIONS = [
     label: "アクセスモード切替",
     shortcut: "F8",
     palette: true,
-    enabled: (state, _payload, model) => state.config_draft.access_mode_mutation_enabled
+    enabled: (state, _payload, model) => !state.hub_project_open && state.config_draft.access_mode_mutation_enabled
       && !model.local.configMutationPending,
     run: (state, context) => context.mutate("toggle_access_mode", {
       expectedTarget: state.access_target,
@@ -1730,7 +1727,7 @@ const ACTION_DEFINITIONS = [
     label: "アーカイブ済みを含める",
     shortcut: "Ctrl+I",
     palette: true,
-    enabled: navigationIsIdle,
+    enabled: (state) => !state.hub_project_open && navigationIsIdle(state),
     run: (state, context) => context.mutate("set_session_search_include_archived", {
       includeArchived: !state.session_search_include_archived,
       expectedTarget: {
@@ -1744,14 +1741,14 @@ const ACTION_DEFINITIONS = [
     label: "表示中 Transcript を Markdown 保存",
     shortcut: "F9",
     palette: true,
-    enabled: (state) => state.history_export_enabled && navigationIsIdle(state),
+    enabled: (state) => !state.hub_project_open && state.history_export_enabled && navigationIsIdle(state),
     run: (state, context, payload) => runSessionRowMutation("export_transcript_markdown", state, context, payload),
   },
   {
     id: "export-history",
     label: "選択セッション履歴を Markdown 保存",
     palette: true,
-    enabled: (state) => state.history_export_enabled && selectedSessionAvailable(state) && navigationIsIdle(state),
+    enabled: (state) => !state.hub_project_open && state.history_export_enabled && selectedSessionAvailable(state) && navigationIsIdle(state),
     run: (state, context, payload) => runSessionRowMutation("export_history_markdown", state, context, payload),
   },
   {
@@ -1818,13 +1815,13 @@ const ACTION_DEFINITIONS = [
     id: "load-previous-turn-page",
     label: "以前の履歴を読み込む",
     palette: true,
-    enabled: (state) => state.turn_page_admission_open && !turnPageLoadPending(state) && state.turn_page_offset > 0,
+    enabled: (state) => !state.hub_project_open && state.turn_page_admission_open && !turnPageLoadPending(state) && state.turn_page_offset > 0,
     run: (state, context) => runTurnPageMutation("load_previous_turn_page", state, context),
   },
   {
     id: "load-next-turn-page",
     label: "新しい履歴へ移動",
-    enabled: (state) => state.turn_page_admission_open && !turnPageLoadPending(state) && state.turn_page_has_more,
+    enabled: (state) => !state.hub_project_open && state.turn_page_admission_open && !turnPageLoadPending(state) && state.turn_page_has_more,
     run: (state, context) => runTurnPageMutation("load_next_turn_page", state, context),
   },
   {
@@ -1846,7 +1843,7 @@ const ACTION_DEFINITIONS = [
     id: "show-side-chat-pane",
     label: "サイドチャットを表示",
     palette: true,
-    enabled: (state, _payload, model) => sideChatOwnerSessionId(state) !== null
+    enabled: (state, _payload, model) => !state.hub_project_open && sideChatOwnerSessionId(state) !== null
       && model.local.sideChat.operationsOpen
       && !model.local.sideChat.mutationPending,
     run: (state, context) => showSideChatPane(state, context),
@@ -2147,9 +2144,9 @@ const ACTION_DEFINITIONS = [
   { id: "open-typed-path", label: "入力パスを開く", palette: true, enabled: always, run: (state, context) => context.mutate("open_typed_path", { text: state.workspace_input, expectedTarget: draftMutationTarget(state) }) },
   { id: "open-global-config-folder", label: "設定フォルダーを開く", palette: true, enabled: always, run: (_state, context) => runWithoutRender("open_global_config_folder", context) },
   { id: "open-user-data-folder", label: "データフォルダーを開く", palette: true, enabled: always, run: (_state, context) => runWithoutRender("open_user_data_folder", context) },
-  { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("attach_image", { text: state.image_input, expectedTarget: draftMutationTarget(state) }) },
-  { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
-  { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },
+  { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => !state.hub_project_open && state.image_input_enabled, run: (state, context) => context.mutate("attach_image", { text: state.image_input, expectedTarget: draftMutationTarget(state) }) },
+  { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => !state.hub_project_open && state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
+  { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => !state.hub_project_open && state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },
   { id: "approve-permission", label: "確認した操作を実行", enabled: (state, _payload, model) => state.confirmation_visible && model.local.modal.permissionDecision?.phase !== "submitting", run: (_state, context) => context.submitPermissionDecision("approved") },
   { id: "deny-permission", label: "確認した操作を許可しない", enabled: (state, _payload, model) => state.confirmation_visible && Boolean(state.confirmation?.remote) && model.local.modal.permissionDecision?.phase !== "submitting", run: (_state, context) => context.submitPermissionDecision("denied") },
   { id: "abort-permission", label: "操作を実行せず指示を変更", enabled: (state, _payload, model) => state.confirmation_visible && model.local.modal.permissionDecision?.phase !== "submitting", run: (_state, context) => context.submitPermissionDecision("abort") },
@@ -2347,7 +2344,7 @@ const ACTION_DEFINITIONS = [
   {
     id: "send-review-enhanced",
     label: "改善した依頼文を送信",
-    enabled: (state) => state.send_enhanced_enabled
+    enabled: (state) => !state.hub_project_open && state.send_enhanced_enabled
       && snapshotPromptReviewMutationTarget(state.review_target) !== null,
     run: async (state, context) => {
       const expectedTarget = snapshotPromptReviewMutationTarget(state.review_target);
@@ -2363,7 +2360,7 @@ const ACTION_DEFINITIONS = [
   {
     id: "send-review-raw",
     label: "元の依頼文を送信",
-    enabled: (state) => state.send_raw_enabled
+    enabled: (state) => !state.hub_project_open && state.send_raw_enabled
       && snapshotPromptReviewMutationTarget(state.review_target) !== null,
     run: async (state, context) => {
       const expectedTarget = snapshotPromptReviewMutationTarget(state.review_target);
@@ -2446,7 +2443,7 @@ const ACTION_DEFINITIONS = [
   {
     id: "insert-command",
     label: "コマンドを挿入",
-    enabled: (state, payload) => state.command_rows[payload.index] !== undefined,
+    enabled: (state, payload) => !state.hub_project_open && state.command_rows[payload.index] !== undefined,
     run: (state, context, payload) => context.insertCommandFromPalette(state, payload.index),
   },
   { id: "minimize-window", label: "最小化", enabled: always, run: () => command("minimize_window") },

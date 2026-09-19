@@ -11357,6 +11357,8 @@ impl DesktopController {
             return false;
         };
         if path == self.app.workspace.root {
+            self.state.view.hub_project_open = false;
+            self.state.hide_overlay();
             return true;
         }
         self.invalidate_session_target_requests();
@@ -13220,6 +13222,7 @@ impl DesktopController {
 
     fn start_new_chat_with_global_access(&mut self) {
         self.state.start_new_chat();
+        self.state.view.hub_project_open = false;
         if self.state.app_state.current_session_id.is_none() {
             let access_mode = self.app.config.permissions.access_mode;
             self.state.provider_config.update_access_mode(access_mode);
@@ -15055,6 +15058,8 @@ impl DesktopController {
                 let loaded = result.loaded;
                 let loaded_status = loaded.read.session.status;
                 self.state.load_open_session(&loaded.read);
+                self.state.view.hub_project_open = false;
+                self.state.hide_overlay();
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;

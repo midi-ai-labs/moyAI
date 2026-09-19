@@ -118,7 +118,7 @@ mod lifecycle_tests {
                     &changed.generation
                 )
                 .await,
-            Err(DeviceError::ConfirmationRequired)
+            Err(DeviceError::SharedWorkRequired)
         ));
     }
     #[tokio::test]
@@ -217,7 +217,7 @@ mod lifecycle_tests {
         service.shutdown().await;
     }
     #[tokio::test]
-    async fn failed_receiver_start_keeps_explicit_off_and_retry_available() {
+    async fn retired_receiver_start_rejects_new_work_and_keeps_explicit_off_available() {
         let (_temp, service) = fixture().await;
         {
             let mut state = service.inner.state.lock().unwrap();
@@ -226,11 +226,11 @@ mod lifecycle_tests {
         }
         assert_eq!(
             service.start_receiver().await,
-            Err(DeviceError::Unavailable)
+            Err(DeviceError::SharedWorkRequired)
         );
         let projection = service.projection_now();
-        assert_eq!(projection.receiver.status, "error");
-        assert!(projection.receiver.enabled);
+        assert_eq!(projection.receiver.status, "paused");
+        assert!(!projection.receiver.enabled);
         assert!(projection.receiver.can_change);
         let off = service
             .receiver(
@@ -380,6 +380,7 @@ pub(super) struct DeviceNetworkInner {
     pub receiver: AsyncMutex<Option<super::receiver::ManagedReceiver>>,
     pub outgoing: super::outgoing::OutgoingOwner,
     pub shared_work: super::shared_work::SharedWorkOwner,
+    pub execution: super::execution::ExecutionOwner,
 }
 pub(super) struct DeviceState {
     pub settings: DeviceSettings,
@@ -591,6 +592,7 @@ impl DeviceNetworkService {
                 shared_work: super::shared_work::SharedWorkOwner::new(
                     directory.join("shared-submissions.json"),
                 ),
+                execution: super::execution::ExecutionOwner::default(),
             }),
         };
         store.attach_device_network(service.downgrade());
@@ -1002,7 +1004,7 @@ impl DeviceNetworkService {
     }
     async fn resume_with_startup(
         &self,
-        startup: bool,
+        _startup: bool,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
         let join = {
             let state = self
@@ -1059,14 +1061,7 @@ impl DeviceNetworkService {
         drop(_lane);
         let result = self.refresh_connected().await;
         self.start_heartbeat();
-        if result.is_ok() {
-            let settings = self.inner.state.lock().unwrap().settings.clone();
-            if startup && settings.receiver.enabled && settings.receiver.start_on_launch {
-                let _lane = self.inner.lane.lock().await;
-                self.inner.state.lock().unwrap().receiver_requested = true;
-                self.start_receiver().await?;
-            }
-        }
+        // Saved receiver settings remain historical; project jobs use the shared execution host.
         result
     }
     fn projection_without_lock(
@@ -1232,6 +1227,9 @@ impl DeviceNetworkService {
         revision: &str,
         generation: &str,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
+        if enabled {
+            return Err(DeviceError::SharedWorkRequired);
+        }
         let _lane = self.inner.lane.lock().await;
         let mut state = self
             .inner
@@ -1309,6 +1307,9 @@ impl DeviceNetworkService {
         revision: &str,
         generation: &str,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
+        if enabled {
+            return Err(DeviceError::SharedWorkRequired);
+        }
         bind.validate()?;
         let _lane = self.inner.lane.lock().await;
         let old = {

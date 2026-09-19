@@ -462,6 +462,7 @@ export interface DesktopWebState {
   post_run_refresh_pending: boolean;
   background_mutation_pending: boolean;
   overlay: string;
+  hub_project_open?: boolean;
   about: DesktopAboutProjection;
   side_chat: SideChatProjection;
   project_rows: ProjectRow[];

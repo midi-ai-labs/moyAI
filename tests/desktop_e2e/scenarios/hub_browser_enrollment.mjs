@@ -14,6 +14,7 @@ const DIALOG = '[role="dialog"][data-modal="hub"]';
 const fail = (message, evidence) => new DesktopE2eError("product", "hub-browser-enrollment-mismatch", message, evidence);
 export const byId = (id, tag = "BUTTON") => ({ selector: `[id=${JSON.stringify(id)}]`, identity: { tag, id } });
 export const action = (name, scope = DIALOG) => ({ selector: `${scope} button[data-action="${name}"]`, identity: { tag: "BUTTON", action: name } });
+export const hubSettingsCloseTarget = action("close-overlay", `${DIALOG} .hub-modal-footer`);
 
 export function enrollmentAccepted(network, snapshot) {
   return network?.enrollment === "active" && typeof network.device_id === "string"
@@ -166,7 +167,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       await sink.record("hub-browser-independent-model-selection", { hub_id: accepted.hub_id, revision: accepted.catalog.revision,
         main: accepted.main_review, side_chat: accepted.side_chat_review }, { phase: "executing", owner: OWNER });
       if (resource.pageErrors().length) throw fail("Hub browser reported page errors", resource.pageErrors());
-      await trustedClick(input, cdp, action("close-overlay", `${DIALOG} .hub-modal-footer`), sink);
+      await trustedClick(input, cdp, hubSettingsCloseTarget, sink);
       const shell = await wait("The enrolled Desktop returns to an interactive shell", () => cdp.evaluate(`(async () => {
         const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
         const prompts = document.querySelectorAll('textarea#prompt');
@@ -199,9 +200,9 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
         const shared = await window.__TAURI_INTERNALS__.invoke('shared_work_projection');
         const login = document.querySelector('#shared-username');
-        return { overlay: state.overlay, connected: shared.connected, principal: shared.principal,
+        return { overlay: state.overlay, hub_project_open: state.hub_project_open, connected: shared.connected, principal: shared.principal,
           login_visible: Boolean(login && login.getClientRects().length && !login.closest('[hidden], [inert]')) };
-      })()`), value => value.overlay === "shared_work" && value.connected && value.principal === null && value.login_visible);
+      })()`), value => value.hub_project_open === true && value.overlay === "none" && value.connected && value.principal === null && value.login_visible);
       await sink.record("hub-connection-shared-entry", sharedEntry, { phase: "executing", owner: OWNER });
       await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-shared-login", owner: OWNER });
       return { acquisition: "pass", oracle: "pass", manual: "not_required" };
@@ -274,15 +275,19 @@ export async function enrollDesktopFromHubBrowser({ resource, context, runtime, 
   await page.locator('nav a[href="#clients"]').click();
   const row = page.locator(`[data-id="request:${pending.request_id}"]`);
   await row.waitFor();
+  const request = (await hub.observeNetwork()).join_requests.find(value => value.request_id === pending.request_id);
   await resource.screenshot("hub-browser-pending-device");
   await row.locator("button[data-network-action]").click();
   const active = await wait("Approved Desktop enrolls without a code or restart", async () => ({
     network: await invokeDesktopCommand(cdp, "device_network_projection"), snapshot: await hub.observeNetwork(),
   }), value => enrollmentAccepted(value.network, value.snapshot), 45_000);
-  await wait("Desktop visible enrolled status", () => cdp.evaluate(`document.querySelector('[data-settings-passive="device-network-enrollment"]')?.textContent`), value => value?.includes("参加済み"));
+  await wait("Desktop visible enrolled status", () => cdp.evaluate(entry === "shared-work"
+    ? `Boolean(document.querySelector('.shared-work #shared-username')?.getClientRects().length)`
+    : `document.querySelector('[data-settings-passive="device-network-enrollment"]')?.textContent?.includes('Hubに接続済み')`), value => value === true);
   await sink.record("hub-browser-desktop-approved", { device_id: active.network.device_id,
     request_id: pending.request_id, hub_device_count: active.snapshot.devices.length }, { phase: "executing", owner: OWNER });
-  return { network: active.network, requestId: pending.request_id };
+  const device = active.snapshot.devices.find(value => value.device_id === active.network.device_id);
+  return { network: active.network, requestId: pending.request_id, keySha256: request?.key_sha256, certificateSha256: device?.certificate_sha256 };
 }
 
 export async function requestHubEnrollmentExit(cdp, state) {

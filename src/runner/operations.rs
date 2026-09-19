@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use ulid::Ulid;
 
+#[cfg(test)]
+mod tests;
+
 use super::provision::ProvisionTemplate;
 use super::{
     RunnerError, RunnerHost,
@@ -23,6 +26,11 @@ pub enum RunnerOperation {
     InstallSettings {
         settings: SharedSettings,
         templates: Vec<ProvisionTemplate>,
+    },
+    InstallDesktop {
+        settings: SharedSettings,
+        template: ProvisionTemplate,
+        binding: String,
     },
     UpdateTemplates {
         templates: Vec<ProvisionTemplate>,
@@ -84,6 +92,7 @@ pub struct RunnerOperationsProjection {
     pub active_attempts: Vec<super::shared::SharedAttemptProjection>,
     pub unknown_attempts: Vec<super::shared::SharedAttemptProjection>,
     pub error: Option<String>,
+    pub desktop_binding: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +115,8 @@ pub(crate) struct Installed {
     pub templates: Vec<ProvisionTemplate>,
     #[serde(default)]
     pub provisions: Vec<super::shared::provisioning::ProvisionDelivery>,
+    #[serde(default)]
+    pub desktop_binding: Option<String>,
 }
 
 impl Default for Installed {
@@ -117,6 +128,31 @@ impl Default for Installed {
             settings: None,
             templates: vec![],
             provisions: vec![],
+            desktop_binding: None,
+        }
+    }
+}
+impl Installed {
+    pub(crate) fn child_environments(
+        &self,
+        mapping: &EnvironmentMapping,
+        hub_allowed: &[String],
+    ) -> Vec<String> {
+        if self.desktop_binding.is_some()
+            && self
+                .provisions
+                .iter()
+                .any(|receipt| receipt.desktop_environment(&mapping.environment_id))
+        {
+            // One-time Desktop consent covers delegation only within current Hub project authority.
+            hub_allowed.to_vec()
+        } else {
+            mapping
+                .allowed_child_environments
+                .iter()
+                .filter(|id| hub_allowed.contains(id))
+                .cloned()
+                .collect()
         }
     }
 }
@@ -243,6 +279,7 @@ impl RunnerHost {
                 .filter(|value| value.state == "unknown")
                 .collect(),
             error: shared.and_then(|value| value.error.clone()),
+            desktop_binding: store.installed.desktop_binding.clone(),
         })
     }
 
@@ -300,6 +337,64 @@ impl RunnerHost {
                 // The task owns the host until explicit shutdown; dropping this join handle
                 // does not cancel already accepted work.
                 let _worker = super::shared::SharedWorker::start(self.clone(), settings).await?;
+            }
+            RunnerOperation::InstallDesktop {
+                mut settings,
+                template,
+                binding,
+            } => {
+                if binding.is_empty()
+                    || binding.len() > 4096
+                    || !matches!(
+                        settings.resource_scope,
+                        super::shared::ResourceScope::Device
+                    )
+                    || !settings.environments.is_empty()
+                    || template.id != super::provision::DESKTOP_TEMPLATE_ID
+                    || !template.allowed_child_environments.is_empty()
+                {
+                    return Err(RunnerError::new("Invalid Desktop execution consent"));
+                }
+                settings.resolve()?;
+                let mut templates = vec![template];
+                super::provision::validate_templates(&mut templates)?;
+                let shared = {
+                    let state = self.inner.state.lock().map_err(error)?;
+                    if state.closing || (!state.shared_mode && !state.runs.is_empty()) {
+                        return Err(RunnerError::new(
+                            "Wait for local execution to finish before enabling this PC",
+                        ));
+                    }
+                    state.shared_mode
+                };
+                {
+                    let mut store = self.inner.operations.lock().map_err(error)?;
+                    let mut next = store.installed.clone();
+                    if shared {
+                        let current = next.settings.as_ref().ok_or_else(|| {
+                            RunnerError::new("Execution settings are unavailable")
+                        })?;
+                        if current.hub_id != settings.hub_id
+                            || current.device_id != settings.device_id
+                            || current.resource_scope != settings.resource_scope
+                        {
+                            return Err(RunnerError::new(
+                                "Existing execution authority belongs to another Hub, device, or resource scope",
+                            ));
+                        }
+                    } else {
+                        next.settings = Some(settings.clone());
+                    }
+                    next.templates
+                        .retain(|value| value.id != super::provision::DESKTOP_TEMPLATE_ID);
+                    next.templates.extend(templates);
+                    next.desktop_binding = Some(binding);
+                    store.update(next)?;
+                }
+                if !shared {
+                    let _worker =
+                        super::shared::SharedWorker::start(self.clone(), settings).await?;
+                }
             }
             RunnerOperation::UpdateTemplates {
                 mut templates,
@@ -364,13 +459,46 @@ impl RunnerHost {
 
 /// Launch the adjacent product Runner in the current OS account, without a shell or elevation.
 pub fn launch() -> Result<(), RunnerError> {
+    launch_process().map(|_| ())
+}
+
+fn launch_process() -> Result<std::process::Child, RunnerError> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         let executable = std::env::current_exe()
             .map_err(error)?
             .with_file_name("moyai-runner.exe");
-        if !executable.is_file() {
+        #[cfg(feature = "desktop-e2e")]
+        let fixture = std::env::var_os("MOYAI_DESKTOP_E2E_RUNNER");
+        #[cfg(feature = "desktop-e2e")]
+        let fixture_registry = if let Some(instance) =
+            crate::desktop_test::current().map_err(error)?
+        {
+            if fixture.is_none() {
+                return Err(RunnerError::new(
+                    "An isolated Desktop must use its dedicated E2E Runner; normal machine startup is not permitted",
+                ));
+            }
+            Some(instance.resource_directory())
+        } else if fixture.is_some() {
+            Some(
+                std::env::var_os("MOYAI_TEST_RESOURCE_REGISTRY")
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.is_absolute() && path.is_dir())
+                    .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+                    .ok_or_else(|| {
+                        RunnerError::new("Desktop E2E requires its isolated machine registry")
+                    })?,
+            )
+        } else {
+            None
+        };
+        #[cfg(feature = "desktop-e2e")]
+        let executable = fixture
+            .as_ref()
+            .map_or(executable, std::path::PathBuf::from);
+        if !executable.is_absolute() || !executable.is_file() {
             return Err(RunnerError::new("The adjacent moyai-runner.exe is missing"));
         }
         let paths = crate::storage::StoragePaths::discover().map_err(error)?;
@@ -380,18 +508,74 @@ pub fn launch() -> Result<(), RunnerError> {
             .append(true)
             .open(paths.data_dir.join("runner.log"))
             .map_err(error)?;
-        std::process::Command::new(executable)
-            .args(["serve", "--background"])
+        let mut command = std::process::Command::new(executable);
+        #[cfg(feature = "desktop-e2e")]
+        if let Some(registry) = fixture_registry {
+            command
+                .args([
+                    "--exact",
+                    "runner::shared::process_fixture::isolated_runner_process",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MOYAI_TEST_RESOURCE_REGISTRY", registry)
+                .env_remove("MOYAI_TEST_SHARED_SETTINGS");
+        } else {
+            command.args(["serve", "--background"]);
+        }
+        #[cfg(not(feature = "desktop-e2e"))]
+        command.args(["serve", "--background"]);
+        command
             .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().map_err(error)?)
             .stderr(log)
             .spawn()
-            .map_err(error)?;
-        Ok(())
+            .map_err(error)
     }
     #[cfg(not(windows))]
     {
         Err(RunnerError::new("Runner launch supports Windows only"))
+    }
+}
+
+/// Read-only readiness after at most one launch. Accepted work is never replayed here.
+pub(crate) fn ensure_started() -> Result<super::RunnerIdentity, RunnerError> {
+    #[cfg(windows)]
+    {
+        let mut child = if !super::windows::endpoint_present()? {
+            Some(launch_process()?)
+        } else {
+            None
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            if super::windows::endpoint_present()? {
+                return match super::windows::request(&super::RunnerCommand::Identity)? {
+                    super::RunnerResponse::Identity { identity } => Ok(identity),
+                    _ => Err(RunnerError::new(
+                        "Unexpected execution host identity response",
+                    )),
+                };
+            }
+            if let Some(child) = &mut child {
+                if let Some(status) = child.try_wait().map_err(error)? {
+                    return Err(RunnerError::new(format!(
+                        "Execution host could not start ({status}); see runner.log"
+                    )));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(RunnerError::new(
+                    "Execution host startup is still unconfirmed; see runner.log",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err(RunnerError::new("Desktop execution supports Windows only"))
     }
 }

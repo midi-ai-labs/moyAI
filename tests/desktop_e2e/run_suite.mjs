@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { classifyExecution } from "./core/execution.mjs";
 import { runCli, freshExecutionId } from "./run_scenario.mjs";
+import { normalizeDesktopIsolation } from "./core/desktop_isolation.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const smoke = Object.freeze([
@@ -21,7 +22,7 @@ export const GUI_SUITES = Object.freeze({
 
 export function parseSuiteArguments(argv) {
   const result = { suite: "smoke", automationOnly: false, list: false };
-  const values = new Map([["--suite", "suite"], ["--binary", "binary"], ["--artifact-parent", "artifactParent"]]);
+  const values = new Map([["--suite", "suite"], ["--binary", "binary"], ["--artifact-parent", "artifactParent"], ["--desktop-isolation", "desktopIsolation"]]);
   const flags = new Map([["--automation-only", "automationOnly"], ["--list", "list"]]);
   const seen = new Set();
   for (let i = 0; i < argv.length; i++) {
@@ -36,6 +37,7 @@ export function parseSuiteArguments(argv) {
     } else throw new TypeError(`unknown option: ${name}`);
   }
   if (!Object.hasOwn(GUI_SUITES, result.suite)) throw new TypeError(`unknown GUI suite: ${result.suite}`);
+  if (result.desktopIsolation !== undefined) normalizeDesktopIsolation(result.desktopIsolation);
   return result;
 }
 
@@ -57,6 +59,7 @@ export function summarizeExecution(result, manifest) {
     elapsed_ms: result.elapsed_ms,
     binary_sha256: manifest.binary.sha256,
     harness_sha256: manifest.harness.tree_sha256,
+    desktop_isolation: normalizeDesktopIsolation(manifest.desktop_isolation),
     diagnostic_codes: (result.diagnostics ?? []).map(row => row.code)
       .filter(code => typeof code === "string" && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(code)),
   };
@@ -95,10 +98,12 @@ export function suiteDecision(rows, expected, automationOnly = false) {
   };
 }
 
-export async function executeSuiteCases({ ids, binary, artifactParent, execute = runCli, readResult = readSealedExecution, onCase = () => {} }) {
+export async function executeSuiteCases({ ids, binary, artifactParent, desktopIsolation, execute = runCli, readResult = readSealedExecution, onCase = () => {} }) {
+  if (desktopIsolation !== undefined) normalizeDesktopIsolation(desktopIsolation);
   const rows = [];
   for (const id of ids) {
-    const outcome = await execute(["--scenario", id, "--binary", binary, "--artifact-parent", artifactParent]);
+    const outcome = await execute(["--scenario", id, "--binary", binary, "--artifact-parent", artifactParent,
+      ...(desktopIsolation === undefined ? [] : ["--desktop-isolation", desktopIsolation])]);
     const row = await readResult(outcome);
     if (row.scenario !== id) throw new Error("runner returned a different scenario");
     rows.push(row);
@@ -112,6 +117,7 @@ export async function executeSuiteCases({ ids, binary, artifactParent, execute =
 
 export async function runSuite(options = {}, { execute, readResult, output = console.log } = {}) {
   const suite = options.suite ?? "smoke";
+  const desktopIsolation = normalizeDesktopIsolation(options.desktopIsolation);
   if (!Object.hasOwn(GUI_SUITES, suite)) throw new TypeError(`unknown GUI suite: ${suite}`);
   const ids = GUI_SUITES[suite];
   if (options.list) {
@@ -131,6 +137,7 @@ export async function runSuite(options = {}, { execute, readResult, output = con
     if (failure !== null) Object.assign(decision, { status: "failed", automation: "fail", exit_code: 1 });
     const summary = {
       schema_version: "desktop-gui-suite.v1", product: "moyai-desktop", suite,
+      desktop_isolation: desktopIsolation,
       phase: "actual_gui_automation", started_at: started, updated_at: new Date().toISOString(),
       build: "prebuilt_binary; source-to-binary correspondence is established only by verify:gui build stages",
       automation_only_requested: options.automationOnly === true,
@@ -149,7 +156,7 @@ export async function runSuite(options = {}, { execute, readResult, output = con
   };
   await report();
   try {
-    await executeSuiteCases({ ids, binary, artifactParent: root, execute, readResult,
+    await executeSuiteCases({ ids, binary, artifactParent: root, desktopIsolation: options.desktopIsolation, execute, readResult,
       onCase: async row => { rows.push(row); await report(); output(`${row.scenario}: automation=${row.automation}, sealed=${row.classification}, manual=${row.manual}`); },
     });
   } catch (error) {

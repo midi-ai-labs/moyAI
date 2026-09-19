@@ -665,7 +665,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
       return;
     }
     if (target.dataset.sharedField !== undefined) {
-      if (context.getViewState()?.overlay !== "shared_work") return;
+      if (context.getViewState()?.hub_project_open !== true) return;
       editSharedWork(context.uiState.sharedWork, target.dataset.sharedField, target.value);
       context.rerender();
       return;

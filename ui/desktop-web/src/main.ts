@@ -5,8 +5,10 @@ import { acceptDeviceNetworkProjection, deviceNetworkPresentation } from "./devi
 import { synchronizeDeviceNetworkControls } from "./device_network_dom.ts";
 import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
 import { refreshSharedWork } from "./shared_work_actions.ts";
+import { refreshDeviceExecution } from "./device_execution.ts";
 import { sharedWorkPresentation } from "./shared_work_state.ts";
 import { retainSharedWorkSurface } from "./shared_work_render.ts";
+import { shouldRetainSharedWorkMain } from "./shared_work_retention.ts";
 import "./shared_work.css";
 import { refreshMcpHistory } from "./mcp_history_actions.ts";
 import { invalidateMcpHistory, mcpHistoryPresentation } from "./mcp_history_state.ts";
@@ -248,6 +250,7 @@ const refresh = createSnapshotRefresh(async () => {
     acceptState(await command<DesktopWebState>("desktop_state"), false);
     await refreshDeviceNetworkJobs(eventContext);
     await refreshSharedWork(eventContext);
+    await refreshDeviceExecution(eventContext);
     await refreshMcpHistory(eventContext);
   } catch (error) {
     reportError(error);
@@ -358,7 +361,7 @@ installWindowMaximizedSync();
 void refresh();
 installRuntimePolling(window, document, () => Boolean(
     currentState
-    && (currentState.overlay === "shared_work" || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
+    && (currentState.hub_project_open === true || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || Boolean(uiState.sharedWork.projection?.hub_url) || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
     && shouldAutoRefresh(currentState)
 ), refresh);
 
@@ -1335,12 +1338,19 @@ function renderCommitted(
   });
   let retainedConnectedSettings = false;
   let retainedConnectedPrompt = false;
-  if (state.overlay === "shared_work") {
+  if (shouldRetainSharedWorkMain(lastRenderedState, state, lastRenderedLocalModalIdentity, renderedLocalModalIdentity, backgroundInert)) {
     const currentShared = appRoot.querySelector<HTMLElement>(".shared-work");
     const template = document.createElement("template");
     template.innerHTML = renderedMarkup;
     const nextShared = template.content.querySelector<HTMLElement>(".shared-work");
-    if (currentShared && nextShared) retainedConnectedSettings = retainSharedWorkSurface(currentShared, nextShared);
+    if (currentShared && nextShared) {
+      retainedConnectedSettings = retainSharedWorkSurface(currentShared, nextShared);
+      if (retainedConnectedSettings) {
+        const sidebar = appRoot.querySelector<HTMLElement>(".sidebar");
+        const nextSidebar = template.content.querySelector<HTMLElement>(".sidebar");
+        if (sidebar && nextSidebar && !sidebar.isEqualNode(nextSidebar)) sidebar.replaceWith(nextSidebar);
+      }
+    }
   }
   if (currentSettingsModal && retainingInitialSetup) {
     const template = document.createElement("template");

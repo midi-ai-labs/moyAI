@@ -20,6 +20,9 @@ use super::{RunnerCommand, RunnerError, RunnerHost, RunnerResponse};
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
+mod tests;
+
 struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -208,6 +211,20 @@ pub fn endpoint_name() -> Result<String, RunnerError> {
     Ok(pipe_name(&current_identity()?))
 }
 
+/// Only an absent pipe permits automatic startup. Busy or inaccessible endpoints are
+/// existing authority, never evidence to bypass identity verification with a new host.
+pub(crate) fn endpoint_present() -> Result<bool, RunnerError> {
+    let name = wide(&pipe_name(&current_identity()?));
+    if unsafe { WaitNamedPipeW(name.as_ptr(), 0) } != 0 {
+        return Ok(true);
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY => Ok(true),
+        _ => Err(last_error()),
+    }
+}
+
 /// Bind before opening the store: FIRST_PIPE_INSTANCE prevents competing Runner startup recovery.
 pub struct LocalListener {
     pipe: Handle,
@@ -353,26 +370,37 @@ pub(crate) fn request_for_config(
 ) -> Result<RunnerResponse, RunnerError> {
     let identity = current_identity()?;
     let name = wide(&pipe_name_in(&identity, config.as_str()));
-    if unsafe { WaitNamedPipeW(name.as_ptr(), 2000) } == 0 {
-        return Err(RunnerError::new(
-            "Local Runner is unavailable; start moyai-runner serve first",
-        ));
-    }
-    let pipe = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
-            null_mut(),
-        )
+    let connect_deadline = Instant::now() + Duration::from_secs(2);
+    let pipe = loop {
+        let remaining = connect_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || unsafe { WaitNamedPipeW(name.as_ptr(), remaining.as_millis().max(1) as u32) } == 0
+        {
+            return Err(RunnerError::new(
+                "Local Runner is unavailable; start moyai-runner serve first",
+            ));
+        }
+        let pipe = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
+                null_mut(),
+            )
+        };
+        if pipe != INVALID_HANDLE_VALUE {
+            break Handle(pipe);
+        }
+        let error = io::Error::last_os_error();
+        // Availability is not a reservation: another client can open the only
+        // instance first. Retry only that pre-delivery race within the same bound.
+        if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(RunnerError::new(error.to_string()));
+        }
     };
-    if pipe == INVALID_HANDLE_VALUE {
-        return Err(last_error());
-    }
-    let pipe = Handle(pipe);
     let mut server_pid = 0;
     if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut server_pid) } == 0 {
         return Err(last_error());

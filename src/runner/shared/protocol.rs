@@ -133,9 +133,16 @@ pub enum ReportOutcome {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ApprovalDecision {
-    pub approval_id: String,
-    pub decision: super::super::LocalApprovalDecision,
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum ApprovalConsumeResult {
+    Answer {
+        approval_id: String,
+        decision: super::super::LocalApprovalDecision,
+    },
+    ReconfirmationRequired {
+        approval_id: String,
+        reconfirmation_required: bool,
+    },
 }
 
 impl Report {

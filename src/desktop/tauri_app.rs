@@ -109,6 +109,8 @@ macro_rules! desktop_command_manifest {
             show_shared_work,
             shared_work_projection,
             shared_work_command,
+            device_execution_projection,
+            device_execution_command,
             hub_projection,
             hub_connect,
             hub_refresh,
@@ -409,6 +411,9 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
     controller.state.device_network = Some(device_network.clone());
     let managed_shells = controller.app.process_runtime.managed_shells();
     let shared: SharedController = Arc::new(Mutex::new(controller));
+    let mut context = tauri::generate_context!();
+    context.config_mut().identifier =
+        super::single_instance::desktop_identifier().map_err(AppRunError::Message)?;
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             restore_main_window(app);
@@ -431,6 +436,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             let network = app.state::<DeviceNetworkService>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 let _ = network.resume().await;
+                network.start_execution_management();
             });
             Ok(())
         })
@@ -442,7 +448,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!());
+        .run(context);
     managed_shells.shutdown().await;
     result.map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
 }
@@ -3349,6 +3355,22 @@ async fn show_hub_editor(
         Ok(())
     })
     .await
+}
+
+#[tauri::command]
+async fn device_execution_projection(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::DeviceExecutionProjection, String> {
+    Ok(service.execution_projection())
+}
+
+#[tauri::command]
+async fn device_execution_command(
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    request: crate::device_network::DeviceExecutionCommand,
+) -> Result<crate::device_network::DeviceExecutionProjection, String> {
+    Ok(service.execution_command(&expected_revision, request).await)
 }
 
 #[tauri::command]

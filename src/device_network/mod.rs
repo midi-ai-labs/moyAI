@@ -5,7 +5,12 @@
 
 mod client;
 mod diagnostics;
+mod execution;
 pub use diagnostics::{DeviceDiagnostic, DiagnosticScope};
+pub use execution::{
+    DeviceExecutionCommand, DeviceExecutionProjection, DeviceExecutionState, DeviceProject,
+    ExecutionReview,
+};
 mod http;
 mod identity;
 mod outgoing;
@@ -118,6 +123,8 @@ pub enum DeviceError {
     GrantDenied,
     #[error("authority_retired")]
     AuthorityRetired,
+    #[error("shared_work_required")]
+    SharedWorkRequired,
     #[error("recovery_required")]
     RecoveryRequired,
     #[error("artifacts_unavailable")]

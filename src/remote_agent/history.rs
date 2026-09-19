@@ -13,7 +13,9 @@ use super::store::{RemoteJobStore, StoredDeviceReference, StoredRemoteJob, query
 use crate::error::StorageError;
 use crate::mcp_publish::dispatch::PublishCallError;
 use crate::protocol::{ContentPart, HistoryItemPayload, TurnId, TurnItemPayload};
-use crate::session::{SessionId, SessionRepository};
+use crate::session::SessionId;
+#[cfg(test)]
+use crate::session::SessionRepository;
 
 const MAX_PAGE: usize = 100;
 const EDGE_ITEMS: usize = 128;

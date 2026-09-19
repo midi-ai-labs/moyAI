@@ -1,6 +1,7 @@
 import type { PublishJob, PublishTarget } from "./mcp_publish_state.ts";
 import type { DeviceDiagnosticResult } from "./device_network_diagnostics.ts";
 import type { DeviceArtifactView } from "./device_network_artifacts.ts";
+import type { DeviceExecutionProjection } from "./device_execution.ts";
 
 export type DeviceTarget = Exclude<PublishTarget, { kind: "legacy_session" }>;
 export type DeviceAccessMode = "default" | "auto_review" | "full_access";
@@ -58,6 +59,15 @@ export interface DeviceOutgoingJob {
 }
 export interface DeviceNetworkJobs { incoming: DeviceIncomingJob[]; outgoing: DeviceOutgoingJob[] }
 export interface DeviceNetworkUiState {
+  execution: DeviceExecutionProjection | null;
+  executionPending: string | null;
+  executionSerial: number;
+  executionAccess: DeviceAccessMode;
+  executionError: string;
+  executionRecoveryTarget: string;
+  executionRecoveryReason: string;
+  executionEffectsReviewed: boolean;
+  executionProcessesStopped: boolean;
   projection: DeviceNetworkProjection | null;
   pending: "load" | "import" | "join" | "receiver" | "select" | "refresh" | "leave" | "cancel_job" | null;
   selectionKey: string | null;
@@ -89,9 +99,9 @@ export interface DeviceNetworkUiState {
   artifactPending: { referenceId: string; operation: "inspect" | "export" } | null;
   artifactSerial: number;
 }
-export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial">;
+export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial" | "executionSerial">;
 export function createDeviceNetworkUiState(): DeviceNetworkUiState {
-  return { projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
+  return { execution: null, executionPending: null, executionSerial: 0, executionAccess: "default", executionError: "", executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
     receiverConfirmed: false, target: { kind: "temp" }, accessMode: "default", modelMode: "hub",
     dirty: false, draftTarget: null, leaveConfirmed: false, error: "", notice: "", startOnLaunch: false, keepWhenHidden: false,
     bindIp: "", port: "",
@@ -100,7 +110,7 @@ export function createDeviceNetworkUiState(): DeviceNetworkUiState {
     artifacts: {}, artifactErrors: {}, artifactNotices: {}, artifactPending: null, artifactSerial: 0 };
 }
 export function deviceNetworkPresentation(state: DeviceNetworkUiState): DeviceNetworkPresentation {
-  const { requestSerial: _serial, jobsSerial: _jobsSerial, diagnosticSerial: _diagnosticSerial, artifactSerial: _artifactSerial, ...presentation } = state;
+  const { requestSerial: _serial, jobsSerial: _jobsSerial, diagnosticSerial: _diagnosticSerial, artifactSerial: _artifactSerial, executionSerial: _executionSerial, ...presentation } = state;
   return presentation;
 }
 export function deviceNetworkTarget(projection: DeviceNetworkProjection): DeviceNetworkTarget {
@@ -113,9 +123,15 @@ export function acceptDeviceNetworkProjection(
   const previous = state.projection;
   if (previous && (BigInt(projection.generation) < BigInt(previous.generation)
     || BigInt(projection.revision) < BigInt(previous.revision))) return false;
+  if (previous && (previous.hub_url !== projection.hub_url || previous.device_id !== projection.device_id
+    || previous.enrollment === "active" && projection.enrollment !== "active")) {
+    ++state.executionSerial;
+    state.execution = null; state.executionPending = null; state.executionError = "";
+    resetExecutionRecovery(state);
+  }
   state.projection = projection;
   if (previous && previous.enrollment !== "active" && projection.enrollment === "active") {
-    state.notice = "Hubへの参加が承認され、接続しました。「共有仕事を開く」から利用者としてログインできます。通常チャットのモデルは「モデル割当」で選びます。";
+    state.notice = "Hubへの参加が承認され、接続しました。初回ログイン後、割り当てられたプロジェクトが通常の一覧に表示されます。";
   }
   for (const [key, result] of Object.entries(state.diagnostics)) {
     if (result.revision !== projection.revision || result.generation !== projection.generation
@@ -142,7 +158,31 @@ export function acceptDeviceNetworkProjection(
 export function deviceTargetKey(target: DeviceTarget): string {
   return target.kind === "temp" ? "temp" : `project:${target.project_id}`;
 }
+export function executionRecoveryKey(attempt: { attempt_id: string; generation: number }): string {
+  return JSON.stringify([attempt.attempt_id, attempt.generation]);
+}
+export function resetExecutionRecovery(state: DeviceNetworkPresentation): void {
+  state.executionRecoveryTarget = ""; state.executionRecoveryReason = "";
+  state.executionEffectsReviewed = false; state.executionProcessesStopped = false;
+}
 export function editDeviceNetworkField(state: DeviceNetworkUiState, field: string, value: string, checked: boolean): void {
+  if (field.startsWith("execution_recovery_")) {
+    if (state.executionPending) return;
+    if (field === "execution_recovery_target") {
+      if (value && !state.execution?.unknown_attempts.some(row => executionRecoveryKey(row) === value)) return;
+      if (value !== state.executionRecoveryTarget) { resetExecutionRecovery(state); state.executionRecoveryTarget = value; }
+      return;
+    }
+    if (!state.execution?.unknown_attempts.some(row => executionRecoveryKey(row) === state.executionRecoveryTarget)) return;
+    if (field === "execution_recovery_reason") state.executionRecoveryReason = value;
+    if (field === "execution_recovery_effects") state.executionEffectsReviewed = checked;
+    if (field === "execution_recovery_stopped") state.executionProcessesStopped = checked;
+    return;
+  }
+  if (field === "execution_access") {
+    if (!state.executionPending && ["default", "auto_review", "full_access"].includes(value)) state.executionAccess = value as DeviceAccessMode;
+    return;
+  }
   if (state.pending) return;
   if (field === "search") { state.search = value; return; }
   if (field === "receiver_confirmed") { state.receiverConfirmed = checked; return; }
@@ -238,6 +278,7 @@ export function deviceNetworkError(error: unknown): string {
     join_superseded: "この参加申請の証明書は更新済みです。既存の端末設定を確認してください。別の端末として自動登録はしません。",
     device_revoked: "この端末の認証はHubで失効しています。管理者へ確認してください。",
     policy_denied: "この端末への接続は許可されていません。Hub管理者へ確認してください。",
+    shared_work_required: "個別のmoyAI接続は終了しました。Hubのプロジェクトを選んで依頼してください。",
     stale_revision: "設定または接続状態が変わりました。最新情報を取得し、入力内容を確認してから保存してください。",
     network_unavailable: "Hubへ接続できません。ネットワークとHubの稼働状況を確認してください。",
     invalid_configuration: "Hubが出力した共通設定ファイルを確認してください。",

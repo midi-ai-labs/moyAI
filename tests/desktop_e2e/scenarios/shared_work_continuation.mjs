@@ -7,6 +7,7 @@ import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/
 import { startSharedWorkflowProvider, startSharedWorkflowRunner } from "../drivers/shared_work_runner_fixture.mjs";
 import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
 import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathInOwnedNativeDialog, probeExactOwnedWindow } from "../drivers/windows_native_input.mjs";
+import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget } from "./shared_work_navigation.mjs";
 import { auditClosedSqlite } from "../drivers/sqlite_cleanup.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
@@ -37,14 +38,11 @@ export function createSharedWorkContinuationScenario(options = {}) {
       async function attach() {
         await cdp.call("Runtime.enable"); await cdp.call("DOM.enable");
         state.input = new WebviewInput(cdp, { probeId: `${ID}-${currentRuntime.generation}` }); await state.input.installProbe();
-        const view = await invokeDesktopCommand(cdp, "desktop_state");
-        if (view.overlay === "initial_setup") await trustedClick(state.input, cdp, byId("initial-setup-shared-work"), sink);
-        else await trustedClick(state.input, cdp, action("show-shared-work", "aside.sidebar"), sink);
-        await wait("Shared entry opens", () => invokeDesktopCommand(cdp, "desktop_state"), p => p.overlay === "shared_work");
+        await openHubProjectSurface(state.input, cdp, sink);
       }
       async function click(kind, value = "") {
-        const target = value ? { selector: `.shared-work button[data-action="shared-${kind}"][data-value=${JSON.stringify(value)}]`, identity: { tag: "BUTTON", action: `shared-${kind}` } } : action(`shared-${kind}`, ".shared-work");
-        await trustedClick(state.input, cdp, target, sink);
+        if (kind === "logout") await openSharedDisclosure(state.input, cdp, sink, "hub-project-account");
+        await trustedClick(state.input, cdp, sharedActionTarget(kind, value), sink);
       }
       async function fill(id, value, tag = "INPUT") {
         const target = byId(id, tag); await trustedClick(state.input, cdp, target, sink);
@@ -104,6 +102,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
         }
       }
       async function nativeFile(kind, selectedPath, value = "") {
+        if (kind === "upload-inputs") await openSharedDisclosure(state.input, cdp, sink, "hub-inputs");
         state.nativeOwner = { executionRoot: currentContext.root, ownerPath: currentRuntime.desktop_owner_path, expectedOwner: currentRuntime.desktop_owner };
         state.nativeBefore = await snapshotOwnedTopLevelWindows(state.nativeOwner); state.importDispatched = true;
         await click(kind, value);
@@ -112,7 +111,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
           catch (error) { if (error?.code === "native-window-cardinality" && error.evidence?.fresh_windows?.length === 0) return null; throw error; }
         }, Boolean);
         state.nativeCandidate = native;
-        const nativeResult = await openFilePathInOwnedNativeDialog({ ...state.nativeOwner, candidate: native, selectedPath, intent: kind === "save-asset" ? "save_new" : kind === "provider-prepare" ? "directory" : "open" });
+        const nativeResult = await openFilePathInOwnedNativeDialog({ ...state.nativeOwner, candidate: native, selectedPath, intent: kind === "save-asset" ? "save_new" : "open" });
         await sink.record("shared-native-path-selection", { action: kind, result: nativeResult }, { phase: "executing", owner: OWNER });
         await wait("Shared native picker closes", () => probeExactOwnedWindow({ ...state.nativeOwner, candidate: native }), value => !value.live);
         state.nativeCandidate = null; state.importDispatched = false;
@@ -136,65 +135,19 @@ export function createSharedWorkContinuationScenario(options = {}) {
         for (const user of [alice, bob]) await actor.sharedCall("membership", { project_id: "workflow", user_id: user.user_id, role: "contributor" });
         for (const [id, label] of [["analysis", "親の解析"], ["solver", "子の解析"]]) await actor.sharedCall("environment", { id, label, resource_id: "workflow-device", runner_id: enrolled.network.device_id, capacity: 1, project_ids: ["workflow"] });
         state.runner = await startSharedWorkflowRunner({ context, deviceId: enrolled.network.device_id, hubId: network.hub_id, runnerBinary: runnerBinary ?? path.join(path.dirname(context.binary), "moyai-runner.exe"), runnerTestBinary, sink });
-        await click("provider-status"); await wait("A observes its actual local Runner", projection, p => p.provider?.runner_id === state.runner.incarnation);
-        await click("provider-pause"); await wait("OS-local providing can pause before human login", projection, p => p.principal === null && p.provider?.accepting === false);
-        await click("provider-resume");
-        await wait("The actual Runner applies its resumed mode", () => state.runner.command(["operations", "--runner", state.runner.incarnation]), value => value.projection?.accepting === true);
-        await click("provider-status"); await wait("The same actual Runner resumes accepting", projection, p => p.provider?.accepting === true);
-        await captureScenarioScreenshot({ cdp, sink, name: "shared-a-provider-resumed", owner: OWNER });
-        const provisionRoot = path.join(state.runner.root, "operator-approved-root"); await mkdir(provisionRoot);
-        await fill("shared-templateLabel", "共有作業の領域");
-        await nativeFile("provider-prepare", provisionRoot);
-        const prepared = await wait("A name and native folder selection prepare the preset with a stable generated ID", projection, p => p.provider_draft?.label === "共有作業の領域" && p.provider_draft.access_mode === "default" && path.resolve(p.provider_draft.base_root) === provisionRoot);
-        const templateId = prepared.provider_draft.id;
-        if (!/^folder-[0-9a-f-]{36}$/.test(templateId)) throw fail("A new preset must receive its generated stable draft ID");
-        const optionsKey = await cdp.evaluate(`document.querySelector('[data-shared-region="provider"] details[data-details-key^="shared-provider-options:"]')?.dataset.detailsKey`);
-        const optionsSummary = { selector: '[data-shared-region="provider"] details[data-details-key^="shared-provider-options:"] > summary', identity: { tag: "DETAILS", detailsKey: optionsKey } };
-        await trustedClick(state.input, cdp, optionsSummary, sink);
-        const presetDefaults = await cdp.evaluate(`({ id: document.getElementById('shared-templateId').value, access: document.getElementById('shared-accessMode').value, scope: document.getElementById('shared-resourceScope').value })`);
-        if (presetDefaults.id !== templateId || presetDefaults.access !== "default" || presetDefaults.scope !== "device") throw fail("The preset review must show the generated ID and existing safe defaults");
-        await trustedClick(state.input, cdp, optionsSummary, sink);
-        await captureScenarioScreenshot({ cdp, sink, name: "shared-provider-preset-review", owner: OWNER });
-        await click("provider-install"); await wait("The real Runner publishes the prepared template", projection, p => p.provider?.templates.some(t => t.id === templateId));
-        await selectValue("shared-editTemplateId", templateId);
-        const copied = await cdp.evaluate(`({ label: document.getElementById('shared-templateLabel').value, id: document.getElementById('shared-templateId').value })`);
-        if (copied.id !== templateId || copied.label !== "共有作業の領域") throw fail("Existing preset selection must reuse its current fields");
-        await fill("shared-templateLabel", "共有作業の領域（確認済み）");
-        await wait("Edited fields invalidate the earlier folder preview", () => cdp.evaluate(`document.querySelector('[data-action="shared-provider-install"]')?.disabled`), disabled => disabled === true);
-        if ((await projection()).provider_draft.label !== "共有作業の領域") throw fail("Editing the frontend draft must not mutate the native-folder preview");
-        await nativeFile("provider-prepare", provisionRoot);
-        await wait("Native folder confirmation adopts the edited preset", projection, p => p.provider_draft?.id === templateId && p.provider_draft.label === "共有作業の領域（確認済み）");
-        await click("provider-install"); await wait("The same preset is updated explicitly", projection, p => p.provider?.templates.some(t => t.id === templateId && t.label === "共有作業の領域（確認済み）"));
-        await sink.record("shared-provider-simple-setup", { template_id: templateId, generated_id: true, default_access: presetDefaults.access, default_scope: presetDefaults.scope, existing_fields_reused: true, stale_preview_blocked: true }, { phase: "executing", owner: OWNER });
-        await page.locator('nav a[href="#shared-administration"]').click();
-        await page.locator('[data-sa-tab="environments"]').click();
-        await page.locator("#shared-admin-content .shared-admin-row").filter({ hasText: "共有作業の領域（確認済み）" })
-          .locator(`button[data-sa-template="${templateId}"][data-sa-runner="${enrolled.network.device_id}"]`).click();
-        const adminSave = async () => { await page.locator("#shared-admin-save").click(); await page.locator("#shared-admin-form").waitFor({ state: "detached" }); };
-        const environmentPreset = await page.locator('#shared-admin-form').evaluate(form => ({ id: form.querySelector('#shared-admin-id').value, label: form.querySelector('#shared-admin-label').value, runner: form.querySelector('#shared-admin-runner_id').value, template: form.querySelector('#shared-admin-template_id').value, resource: form.querySelector('#shared-admin-resource_id').value, capacity: form.querySelector('#shared-admin-capacity').value }));
-        if (environmentPreset.runner !== enrolled.network.device_id || environmentPreset.template !== templateId || environmentPreset.resource !== "workflow-device" || environmentPreset.capacity !== "1") throw fail("The Hub preset must retain its exact Runner, template and current shared resource");
-        if (!environmentPreset.id.startsWith("environment-") || environmentPreset.label !== "共有作業の領域（確認済み）") throw fail("The Hub preset must generate the environment ID and reuse the display name");
-        const createdEnvironmentId = environmentPreset.id;
-        await page.locator('input[name="project_ids"][value="workflow"]').check(); await adminSave();
-        await page.locator("#shared-admin-content .shared-admin-row").filter({ hasText: environmentPreset.label }).filter({ hasText: "フォルダの準備完了" }).waitFor({ timeout: 30000 });
-        await state.resource.screenshot("shared-hub-provisioned-environment");
-        await click("provider-status");
-        const provisioned = await wait("Desktop sees the Runner-created environment", projection, p => p.provider?.environments.some(e => e.environment_id === createdEnvironmentId));
-        const createdDirectory = path.resolve(provisioned.provider.environments.find(e => e.environment_id === createdEnvironmentId).directory);
-        const relativeCreated = path.relative(path.toNamespacedPath(provisionRoot), path.toNamespacedPath(createdDirectory));
-        if (path.isAbsolute(relativeCreated) || relativeCreated.startsWith("..") || !relativeCreated || !(await stat(createdDirectory)).isDirectory()) throw fail("Provisioning escaped the operator-approved root or did not create a directory");
-        await captureScenarioScreenshot({ cdp, sink, name: "shared-a-provisioned-local-environment", owner: OWNER });
-        await click("provider-remove-template", templateId);
-        await wait("Stopping template publication retains its created environment", projection, p => !p.provider?.templates.some(t => t.id === templateId) && p.provider?.environments.some(e => e.environment_id === createdEnvironmentId));
-        await sink.record("shared-provisioning-actual-consumer", { environment_id: createdEnvironmentId, created_directory: createdDirectory, approved_root: provisionRoot, template_unpublished_mapping_retained: true }, { phase: "executing", owner: OWNER });
+        // This scenario owns real parent/child execution and cross-device conversation.
+        // Initial PC execution permission and automatic folder provisioning have their
+        // own device-execution scenario; no retired provider controls are invoked here.
         await fill("shared-username", "workflow-alice"); await fill("shared-password", password); await click("login");
-        await wait("Alice can submit to the real Runner", projection, p => p.principal?.user_id === alice.user_id && ["analysis", "solver", createdEnvironmentId].every(id => p.status?.environments.some(e => e.id === id)));
+        await wait("Alice can submit to the real Runner", projection, p => p.principal?.user_id === alice.user_id && ["analysis", "solver"].every(id => p.status?.environments.some(e => e.id === id)));
+        await trustedClick(state.input, cdp, { selector: '.sidebar button[data-action="open-hub-project"][data-value="workflow"]', identity: { tag: "BUTTON", action: "open-hub-project" } }, sink);
+        await click("new-conversation");
         const inputPath = path.join(context.paths.workspace, "input.txt"); await writeFile(inputPath, "input snapshot 日本語\n", { flag: "wx" });
         await nativeFile("upload-inputs", inputPath);
         const firstInput = await wait("Input upload is visible", projection, p => p.inputs.length === 1);
         await nativeFile("upload-inputs", inputPath);
         await wait("Selecting the same file replaces the draft attachment with a fresh upload intent", projection, p => p.inputs.length === 1 && p.inputs[0].id !== firstInput.inputs[0].id && p.feedback?.includes("置き換えました"));
-        await selectValue("shared-environment", "analysis"); await fill("shared-title", "端末 A から依頼した親の仕事"); await fill("shared-prompt", "desktop-transfer-parent: 子の解析を待って結果をまとめてください。", "TEXTAREA");
+        await selectValue("shared-environment", "analysis"); await openSharedDisclosure(state.input, cdp, sink, "hub-new-chat-options"); await fill("shared-title", "端末 A から依頼した親の仕事"); await fill("shared-prompt", "desktop-transfer-parent: 子の解析を待って結果をまとめてください。", "TEXTAREA");
         await focusDefaultDeadline("shared-startBefore"); const submittedAt = Date.now(); await click("submit");
         const parentView = await wait("Parent releases its slot while the actual child is running", projection, p => p.detail?.state === "waiting_child" && provider.requests.some(r => JSON.stringify(r.messages.filter(m => m.role === "user")).includes("desktop-transfer-child")), 60000);
         const parentId = parentView.detail.id, childId = parentView.detail.awaiting_child_id;
@@ -222,7 +175,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
           await page.locator('nav a[href="#clients"]').click();
           await page.locator("#network-clients-refresh").click();
           const firstDevice = page.locator(`[data-id="device:${enrolled.network.device_id}"]`);
-          await firstDevice.locator("summary").click();
+          await firstDevice.locator("details[data-device-identity] > summary").click();
           await firstDevice.getByRole("button", { name: /を管理$/ }).click();
           await page.locator("#network-device-label").fill("共有 Runner A");
           await page.locator("#network-device-save").click();
@@ -231,6 +184,8 @@ export function createSharedWorkContinuationScenario(options = {}) {
           await click("reconnect");
         } });
         if (second.network.device_id === enrolled.network.device_id) throw fail("B reused the same device identity");
+        const beforeLogin = await projection();
+        if (beforeLogin.principal !== null || beforeLogin.projects.length !== 0) throw fail("A different device/profile inherited another device's human login");
         await fill("shared-username", "workflow-alice"); await fill("shared-password", password); await click("login");
         await wait("Fresh B sees the same parent job", projection, p => p.status?.jobs.some(j => j.id === parentId));
         provider.releaseChild();
@@ -255,13 +210,15 @@ export function createSharedWorkContinuationScenario(options = {}) {
         await wait("Opening the notification marks it read and restores the Hub conversation", projection, p => p.detail?.id === parentId && p.detail.can_continue && p.transcript?.items.length && p.inbox?.items.some(i => i.id === notification.id && i.read_at_ms !== null));
         await checkReadableTranscript();
         await fill("shared-followup", "desktop-followup: 元の解析結果を参照して追加の説明をしてください。", "TEXTAREA");
+        await openSharedDisclosure(state.input, cdp, sink, "hub-followup-options");
         await focusDefaultDeadline("shared-followupStartBefore"); const continuedAt = Date.now(); await click("continue");
         const continued = await wait("Continuation finishes from Hub canonical history", projection, p => p.detail?.id !== parentId && p.detail?.state === "succeeded", 60000);
         if (!Number.isFinite(continued.detail.start_before_ms) || continued.detail.start_before_ms < continuedAt + 86400000 || continued.detail.start_before_ms > Date.now() + 86400000) throw fail("Continued job deadline was not fixed to 24 hours");
         await sink.record("shared-accepted-start-deadlines", { parent: { job_id: parentId, requested_after_ms: submittedAt, start_before_ms: parentView.detail.start_before_ms }, continuation: { job_id: continued.detail.id, requested_after_ms: continuedAt, start_before_ms: continued.detail.start_before_ms }, default_hours: 24 }, { phase: "executing", owner: OWNER });
         await wait("The new job has its own collapsed technical details", () => cdp.evaluate(`(() => { const region = document.querySelector('[data-shared-region="transcript"]'); return { owner: region?.dataset.sharedRecordOwner, open: [...document.querySelectorAll('[data-shared-region="transcript"] details, [data-shared-region="detail"] details')].some(d => d.open) }; })()`), value => decodeURIComponent(value.owner ?? "").includes(continued.detail.id) && !value.open);
-        const resultKey = await cdp.evaluate(`document.querySelector('[data-shared-region="detail"] details')?.dataset.detailsKey`);
-        await trustedFocus(state.input, cdp, { selector: `[data-shared-region="detail"] details > summary`, identity: { tag: "DETAILS", detailsKey: resultKey } });
+        const resultKey = await cdp.evaluate(`document.querySelector('[data-shared-region="detail"] details[data-details-key^="shared-result:"]')?.dataset.detailsKey`);
+        if (!resultKey) throw fail("The completed conversation has no result disclosure");
+        await trustedFocus(state.input, cdp, { selector: `[data-shared-region="detail"] details[data-details-key=${JSON.stringify(resultKey)}] > summary`, identity: { tag: "DETAILS", detailsKey: resultKey } });
         if (provider.failures.length) throw fail(provider.failures.join("; "));
         await captureScenarioScreenshot({ cdp, sink, name: "shared-b-canonical-continuation-result", owner: OWNER });
         await sink.record("shared-a-to-b-actual-runner-complete", { parent_id: parentId, child_id: childId, continued_id: continued.detail.id, device_a: enrolled.network.device_id, device_b: second.network.device_id, no_local_setup_on_b: true, runner_incarnation: state.runner.incarnation, artifact: { id: asset.id, sha256: asset.sha256, saved }, provider_calls: provider.requests.length, scope: "Two isolated Desktop device identities on one Windows account; actual Runner, Hub, native input/save, human approval and canonical continuation. Physical different PCs and external solver are not exercised." }, { phase: "executing", owner: OWNER });

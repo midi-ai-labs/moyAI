@@ -44,7 +44,9 @@ import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_doc
 import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial_setup.mjs";
 import { createInitialSetupHubScenario } from "./scenarios/settings_initial_setup_hub.mjs";
 import { createSharedWorkEntryScenario } from "./scenarios/shared_work_entry.mjs";
+import { createSharedWorkIsolationScenario } from "./scenarios/shared_work_isolation.mjs";
 import { createSharedWorkContinuationScenario } from "./scenarios/shared_work_continuation.mjs";
+import { createDeviceExecutionScenario } from "./scenarios/device_execution.mjs";
 import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
 import { createSettingsMcpPeerControlsScenario } from "./scenarios/settings_mcp_peers.mjs";
@@ -66,7 +68,9 @@ const factories = new Map([
   ["hub.connection-settings", createHubConnectionSettingsScenario],
   ["hub.browser-enrollment", createHubBrowserEnrollmentScenario],
   ["settings.shared-work", createSharedWorkEntryScenario],
+  ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
   ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
+  ["settings.device-execution", createDeviceExecutionScenario],
   ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
   ["hub.receiver-settings-controls", createHubReceiverSettingsScenario],
   ["hub.outgoing-controls", createOutgoingControlsScenario],
@@ -136,7 +140,9 @@ const factories = new Map([
 ]);
 const configurableScenarios = new Set([
   "settings.shared-work",
+  "settings.shared-work-isolation",
   "settings.shared-work-continuation",
+  "settings.device-execution",
   "agent.interrupt",
   "navigation.external-rejoin",
   "navigation.external-sidebar-stop",

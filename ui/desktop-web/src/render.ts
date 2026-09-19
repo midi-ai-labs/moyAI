@@ -10,7 +10,6 @@ import {
   type ActionPayload,
 } from "./actions.ts";
 import { icon } from "./icons.ts";
-import { renderMcpPeers } from "./mcp_peer.ts";
 import { renderHubOverlay } from "./hub_render.ts";
 import { renderSharedWork } from "./shared_work_render.ts";
 import { renderMcpHistoryOverlay } from "./mcp_history_render.ts";
@@ -182,8 +181,19 @@ export function renderDesktopMarkup(
 ): string {
   const state = model.view;
   const local = model.local;
-  if (state.overlay === "shared_work") {
-    return applyActionAvailabilityToButtons(`<div class="app-frame initial-setup-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">${renderTitlebar(local.windowMaximized, true, "")}${renderSharedWork(local.sharedWork)}</div>`, model);
+  const localConfirmationPending = local.modal.localConfirmation !== null;
+  const settingsClosePending = local.modal.localConfirmation?.kind === "settings_close"
+    || local.modal.localConfirmation?.kind === "session_settings_close";
+  const sideChatDeletePending = local.sideChat.deleteConfirmation !== null;
+  const localModalObscuresOverlay = (localConfirmationPending && !settingsClosePending)
+    || sideChatDeletePending;
+  if (state.hub_project_open === true) {
+    return applyActionAvailabilityToButtons(`<div class="app-frame hub-project-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}<div class="shell hub-project-shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>${renderSidebar(state, local.sharedWork)}${renderSharedWork(local.sharedWork)}</div></div>
+      ${state.confirmation_visible ? renderConfirmation(state, local.modal.permissionDecision) : ""}
+      ${!state.confirmation_visible && !localModalObscuresOverlay && state.overlay !== "none" ? renderOverlay(state, local, model) : ""}
+      ${!state.confirmation_visible && local.modal.localConfirmation ? renderLocalConfirmation(local.modal.localConfirmation, local.modal.localDecisionPending, local.modal.localDecisionError) : ""}
+      ${!state.confirmation_visible && !localConfirmationPending && sideChatDeletePending ? renderSideChatDeleteConfirmation(state, local) : ""}
+      ${options.backgroundInert ? "" : renderRecoverableError(local.recoverableError)}`, model);
   }
   if (startupSetupRequired(state) && state.overlay === "initial_setup") {
     const setupMarkup = `
@@ -195,17 +205,11 @@ export function renderDesktopMarkup(
     `;
     return applyActionAvailabilityToButtons(setupMarkup, model);
   }
-  const localConfirmationPending = local.modal.localConfirmation !== null;
-  const settingsClosePending = local.modal.localConfirmation?.kind === "settings_close"
-    || local.modal.localConfirmation?.kind === "session_settings_close";
-  const sideChatDeletePending = local.sideChat.deleteConfirmation !== null;
-  const localModalObscuresOverlay = (localConfirmationPending && !settingsClosePending)
-    || sideChatDeletePending;
   const markup = `
     <div class="app-frame ${local.artifactPane.collapsed ? "artifact-collapsed" : ""} ${!local.artifactPane.collapsed && local.artifactPane.mode === "side_chat" ? "side-chat-open" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}; --task-activity-delay: ${options.taskActivityDelay}; --mcp-activity-delay: ${options.mcpActivityDelay ?? "0ms"}">
       ${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}
       <div class="shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>
-        ${renderSidebar(state)}
+        ${renderSidebar(state, local.sharedWork)}
         <main class="conversation">
           ${renderTopbar(state, local)}
           <div class="run-activity-stack">${renderRunStatusStrip(state)}</div>
@@ -1019,8 +1023,10 @@ function sessionRowSubtitle(
   return fallback;
 }
 
-export function renderSidebar(state: DesktopWebState): string {
+export function renderSidebar(state: DesktopWebState, shared?: import("./shared_work_state.ts").SharedWorkPresentation): string {
   const navigationDisabled = !navigationIsIdle(state);
+  const hub = shared?.conceal ? null : shared?.projection;
+  const localState = state.hub_project_open ? { ...state, selected_project_index: -1, selected_session_index: -1 } : state;
   return `
     <aside class="sidebar">
       <div class="window-actions">
@@ -1030,26 +1036,21 @@ export function renderSidebar(state: DesktopWebState): string {
       <button class="rail-item" data-action="show-hub" title="Hubに接続してモデルを確認">
         <span class="rail-icon">${icon("plug")}</span><span>moyAI Hub</span>
       </button>
-      <button class="rail-item" data-action="show-shared-work" title="Hubの共有仕事を確認・依頼">
-        <span class="rail-icon">${icon("archive")}</span><span>共有仕事</span>
-      </button>
-      <button class="rail-item" data-action="show-mcp-history" title="他端末への指示と、この端末での実行履歴を確認">
-        <span class="rail-icon">${icon("archive")}</span><span>MCP履歴</span>
-      </button>
       <div class="rail-section row-heading">
         <span>プロジェクト</span>
-        <button class="tiny-button icon-only" data-action="create-project-from-picker" title="プロジェクトを作成" aria-label="プロジェクトを作成" ${navigationDisabled ? "disabled" : ""}>${icon("folder-plus")}</button>
+        <button class="tiny-button icon-only" data-action="create-project-from-picker" title="このPCにローカルプロジェクトを作成" aria-label="このPCにローカルプロジェクトを作成" ${navigationDisabled ? "disabled" : ""}>${icon("folder-plus")}</button>
       </div>
       <div class="row-list project-list">
+        ${hub?.principal ? hub.projects.map(project => `<div class="hub-project-row"><button class="rail-item ${state.hub_project_open === true && hub.selected_project_id === project.id ? "active" : ""}" data-action="open-hub-project" data-value="${escapeHtml(project.id)}" title="Hubのプロジェクト"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small>Hub</small></button>${state.hub_project_open === true && hub.selected_project_id === project.id ? `<div class="hub-project-chats">${hub.status?.jobs.map(job => `<button data-action="shared-detail" data-value="${escapeHtml(job.id)}" class="${hub.selected_job_id === job.id ? "active" : ""}" title="${escapeHtml(job.requestor.display_name + " · " + job.environment_label)}">${escapeHtml(job.title)}</button>`).join("") ?? ""}${hub.status?.next_before ? '<button data-action="shared-next-jobs">以前のチャット</button>' : ""}<button data-action="shared-new-conversation">＋ 新しいチャット</button></div>` : ""}</div>`).join("") : hub?.hub_url ? `<button class="rail-item" data-action="show-shared-work">${hub.connected ? "Hubにログイン" : "Hubへの参加状況"}</button>` : ""}
         ${state.project_rows
-          .map((row, index) => renderProjectRowWithSessions(state, row, index))
+          .map((row, index) => renderProjectRowWithSessions(localState, row, index))
           .join("")}
       </div>
       <div class="rail-section row-heading">
-        <span class="section-label">チャット</span>
-        <button class="tiny-button icon-only" data-action="new-chat" data-focus-key="quick-chat:new-session" title="新しい通常チャット" aria-label="新しい通常チャット" ${navigationDisabled ? "disabled" : ""}>${icon("plus")}</button>
+        <span class="section-label">このPCのチャット</span>
+        <button class="tiny-button icon-only" data-action="new-chat" data-value="local" data-focus-key="quick-chat:new-session" title="このPCで新しいチャット" aria-label="このPCで新しいチャット" ${navigationDisabled ? "disabled" : ""}>${icon("plus")}</button>
       </div>
-      <div class="row-list chat-list">${renderChatRows(state)}</div>
+      <div class="row-list chat-list">${renderChatRows(localState)}</div>
       <button class="settings" data-action="show-config" title="設定"><span class="rail-icon">${icon("settings")}</span><span>設定</span></button>
     </aside>
   `;
@@ -2293,7 +2294,7 @@ function renderConfigOverlay(
                   ${renderConfigToggleField(state, "mcp.enabled", "有効")}
                 </div>
                 ${renderConfigJsonField(state, "mcp.servers_json", "MCP servers JSON")}
-                ${renderMcpPeers(local.mcpPeers, local.configMutationPending, state.config_draft.dirty)}
+                <p>moyAI同士の連携はHubのプロジェクトで管理します。以前の個別接続による記録は<button data-action="show-mcp-history">過去の連携履歴</button>から確認できます。</p>
               </div>
             </section>
             <section id="settings-files" class="settings-section" aria-labelledby="settings-files-title" aria-describedby="settings-files-help">

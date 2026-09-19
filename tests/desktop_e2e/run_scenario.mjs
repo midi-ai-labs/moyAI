@@ -6,11 +6,12 @@ import { fileURLToPath } from "node:url";
 
 import { executeDesktopScenario } from "./core/desktop_execution.mjs";
 import { createDesktopRunContext } from "./core/run_context.mjs";
+import { normalizeDesktopIsolation } from "./core/desktop_isolation.mjs";
 import { WindowsTauriHost } from "./drivers/windows_tauri_host.mjs";
 import { createScenario, scenarioIds } from "./scenario_registry.mjs";
 
 const harnessRoot = path.dirname(fileURLToPath(import.meta.url));
-const ALLOWED_ARGUMENTS = new Set(["binary", "artifact-parent", "execution-id", "scenario", "scenario-config"]);
+const ALLOWED_ARGUMENTS = new Set(["binary", "artifact-parent", "execution-id", "scenario", "scenario-config", "desktop-isolation"]);
 
 export function parseArguments(argv) {
   const result = {};
@@ -25,6 +26,7 @@ export function parseArguments(argv) {
     result[name] = value;
     index += 1;
   }
+  if (result["desktop-isolation"] !== undefined) normalizeDesktopIsolation(result["desktop-isolation"]);
   return result;
 }
 
@@ -67,6 +69,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     executionId: args["execution-id"] ?? freshExecutionId(),
     scenarioId: scenario.id,
     scenarioConfig: scenarioConfig.identity,
+    desktopIsolation: args["desktop-isolation"],
     harnessRoot,
   });
   return executeDesktopScenario({

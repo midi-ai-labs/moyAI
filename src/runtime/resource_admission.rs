@@ -27,6 +27,15 @@ pub(super) fn error(value: impl std::fmt::Display) -> RunnerError {
     }
 }
 pub(crate) fn registry_directory() -> Result<Utf8PathBuf, RunnerError> {
+    // Dedicated Runner process tests retain their explicit, process-local override.
+    #[cfg(test)]
+    if let Some(directory) = TEST_REGISTRY.get() {
+        return Ok(directory.clone());
+    }
+    #[cfg(feature = "desktop-e2e")]
+    if let Some(instance) = crate::desktop_test::current().map_err(error)? {
+        return Ok(instance.resource_directory());
+    }
     #[cfg(test)]
     return Ok(test_registry().clone());
     #[cfg(all(not(test), windows))]
@@ -45,6 +54,12 @@ pub(crate) fn registry_directory() -> Result<Utf8PathBuf, RunnerError> {
 }
 
 fn ensure_directory(directory: &Utf8Path) -> Result<(), RunnerError> {
+    // This build-only scope was validated before startup; it must not create or
+    // amend the real machine policy ACL when a local Desktop entry joins its Runner.
+    #[cfg(all(feature = "desktop-e2e", not(test)))]
+    if crate::desktop_test::current().map_err(error)?.is_some() {
+        return std::fs::create_dir_all(directory).map_err(error);
+    }
     #[cfg(all(windows, not(test)))]
     return super::resource_admission_windows::ensure(directory);
     #[cfg(any(test, not(windows)))]
@@ -452,3 +467,6 @@ mod tests {
         assert!(!request_is_live(id).unwrap());
     }
 }
+
+#[cfg(all(test, feature = "desktop-e2e"))]
+mod desktop_test;

@@ -320,39 +320,14 @@ impl DeviceNetworkService {
     pub(crate) async fn augment_runtime_config(
         &self,
         config: &mut ResolvedConfig,
-        session: SessionId,
+        _session: SessionId,
     ) {
-        // No credentials or private TLS material enter even this ephemeral model configuration.
-        if self
-            .inner
-            .store
-            .remote_job_store()
-            .job_id_for_session(session)
-            .ok()
-            .flatten()
-            .is_some()
-            && !self
-                .inner
-                .outgoing
-                .inbound
-                .lock()
-                .unwrap()
-                .contains_key(&session)
-        {
-            return;
-        }
-        let Ok(peers) = self.selected_directory(session).await else {
-            return;
-        };
-        for peer in peers {
-            let server = server_config(&peer);
-            if !config.mcp.servers.iter().any(|old| old.id == server.id) {
-                config.mcp.servers.push(server);
-            }
-        }
-        if config.mcp.servers.iter().any(|server| server.enabled) {
-            config.mcp.enabled = true;
-        }
+        // Preserve saved peer configuration/history, but never advertise a new individual
+        // moyAI execution route. Generic external MCP servers remain available.
+        config
+            .mcp
+            .servers
+            .retain(|server| !server.remote_agent && !self.owns_server(&server.id));
     }
     pub(crate) fn owns_server(&self, id: &str) -> bool {
         id.starts_with("hub-device-")
@@ -563,6 +538,9 @@ impl DeviceNetworkService {
                 .ok_or_else(|| safe_error(DeviceError::GrantDenied))?;
             checkpoint()?;
             return self.control_reference(row, name.unwrap(), checkpoint).await;
+        }
+        if name == Some("delegate_task") {
+            return Err(safe_error(DeviceError::SharedWorkRequired));
         }
         if name.is_some_and(|name| name != "delegate_task") {
             return Err(safe_error(DeviceError::PolicyDenied));

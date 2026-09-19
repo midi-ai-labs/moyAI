@@ -175,13 +175,13 @@ test("peer switch keeps its saved checked state while saving and blocks repeated
     assert.equal(local.pending, "select");
     assert.equal(local.selectionKey, key);
     assert.equal(local.projection!.peers[0].selected, false);
-    assert.match(renderDeviceNetwork(local), /role="switch"[^>]*aria-checked="false"[^>]*aria-busy="true"[^>]*disabled/);
+    assert.doesNotMatch(renderDeviceNetwork(local), /data-action="device-network-select"/);
     await selectDevicePeer(context, key);
     assert.equal(calls, 1);
     const next = deviceProjection({ revision: "4", generation: "8" }); next.peers[0].selected = true;
     saved.resolve(next); await selection;
     assert.equal(local.pending, null);
-    assert.match(renderDeviceNetwork(local), /role="switch"[^>]*aria-checked="true"[^>]*aria-busy="false"/);
+    assert.equal(local.projection.peers[0].selected, true);
     assert.match(local.notice, /利用をONで保存/);
   });
 });
@@ -198,10 +198,8 @@ test("failed peer save recovers the actual selection, preserves receiver drafts,
     assert.equal(local.pending, null);
     assert.equal(local.projection!.peers[0].selected, false);
     assert.equal(local.bindIp, "192.168.2.22");
-    const button = html.match(/<button[^>]*role="switch"[^>]*>/)![0];
-    assert.match(button, /aria-checked="false"/);
-    assert.doesNotMatch(button, /disabled/);
-    assert.match(html, /利用先に選択していません。端末設定を保存できませんでした/);
+    assert.doesNotMatch(html, /data-action="device-network-select"/);
+    assert.match(local.error, /端末設定を保存できませんでした/);
   });
 });
 

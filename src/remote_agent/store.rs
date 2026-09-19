@@ -443,6 +443,7 @@ impl RemoteJobStore {
 
     /// The session and deduplication receipt commit together, before a worker starts.
     /// A replay returns the original receipt and never creates another session.
+    #[cfg(test)]
     pub(crate) fn accept(
         &self,
         principal: &str,

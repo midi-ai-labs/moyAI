@@ -211,6 +211,7 @@ pub(crate) fn managed_peer_http(
 /// CSR SANs with the observed device IP. Validate the endpoint IP AND this role.
 pub(crate) const HUB_TLS_ROLE_NAME: &str = "hub.moyai.invalid";
 
+#[cfg(test)]
 pub(crate) fn managed_hub_http(
     identity: Option<(&str, &str)>,
     ca_certificate_pem: &str,

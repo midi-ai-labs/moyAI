@@ -1,5 +1,44 @@
 use super::*;
 
+#[test]
+fn approval_consume_wire_distinguishes_answers_reconfirmation_and_invalid_responses() {
+    use super::protocol::ApprovalConsumeResult;
+    assert!(
+        serde_json::from_value::<Option<ApprovalConsumeResult>>(json!(null))
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        serde_json::from_value::<ApprovalConsumeResult>(
+            json!({"approval_id":"approval","decision":"approve"})
+        )
+        .unwrap(),
+        ApprovalConsumeResult::Answer { .. }
+    ));
+    assert!(matches!(
+        serde_json::from_value::<ApprovalConsumeResult>(
+            json!({"approval_id":"approval","reconfirmation_required":true})
+        )
+        .unwrap(),
+        ApprovalConsumeResult::ReconfirmationRequired {
+            reconfirmation_required: true,
+            ..
+        }
+    ));
+    for invalid in [
+        json!({"approval_id":"approval","decision":"approve","reconfirmation_required":true}),
+        json!({"approval_id":"approval"}),
+        json!({"error":"conflict"}),
+        json!({"approval_id":"approval","decision":"invalidated"}),
+        json!({"approval_id":"approval","reconfirmation_required":"true"}),
+    ] {
+        assert!(
+            serde_json::from_value::<ApprovalConsumeResult>(invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
 pub(super) fn fixture() -> (tempfile::TempDir, SharedSettings, camino::Utf8PathBuf) {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../project_sandbox/runner-shared-tests");

@@ -4,6 +4,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub const DESKTOP_TEMPLATE_ID: &str = "desktop-default";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProvisionTemplate {

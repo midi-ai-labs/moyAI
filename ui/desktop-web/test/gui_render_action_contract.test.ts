@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { deviceUiFixture } from "./device_network_fixture.ts";
-import { deviceNetworkPresentation } from "../src/device_network_state.ts";
+import { executionRecoveryKey, deviceNetworkPresentation } from "../src/device_network_state.ts";
+import { renderDeviceExecution } from "../src/device_execution.ts";
 import { sharedWorkPresentation } from "../src/shared_work_state.ts";
 import { renderSharedWork } from "../src/shared_work_render.ts";
 import { sharedUiFixture } from "./shared_work_fixture.ts";
@@ -39,6 +40,15 @@ import type {
 } from "../src/types.ts";
 import type { AgentExecutionCacheEntry } from "../src/ui_state.ts";
 import { rootStopTarget, turnStopTarget } from "./stop_target_fixture.ts";
+
+test("the local sidebar creates a local chat while Hub is selected", async () => {
+  const state = representativeState({ overlay: "none", confirmation_visible: false, hub_project_open: true });
+  const calls: string[] = [];
+  const context = { mutate: async (name: string) => { calls.push(name); } } as unknown as import("../src/actions.ts").ActionContext;
+  await actionById("new-chat")!.run(state, context, { value: "local" });
+  assert.deepEqual(calls, ["new_chat"]);
+  assert.match(renderSidebar(state), /data-action="new-chat" data-value="local"/);
+});
 
 interface RenderedSurface {
   name: string;
@@ -530,6 +540,25 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
   };
 }
 
+test("Hub conversation disables actions that implicitly target the hidden local draft and history", () => {
+  const base = representativeState({ confirmation_visible: false, overlay: "none", run_status_key: "idle" });
+  const local = defaultRenderLocal();
+  const localModel = createDesktopRenderModel(base, local);
+  const hubModel = createDesktopRenderModel({ ...base, hub_project_open: true }, local);
+  for (const id of ["enhance-prompt", "review-uncommitted", "toggle-session-archived-search", "export-history", "archive-session", "rollback-session", "fork-session", "load-previous-turn-page", "set-image", "browse-image", "clear-images", "insert-command"]) {
+    const payload = id === "insert-command" ? { index: 0, value: "" } : { index: -1, value: "" };
+    assert.equal(actionEnabledById(id, localModel, payload), true, `${id} stays available on the local surface`);
+    assert.equal(actionEnabledById(id, hubModel, payload), false, `${id} must not use a hidden local target`);
+  }
+  for (const id of ["project", "session", "new-project-session"]) {
+    assert.equal(actionEnabledById(id, hubModel, { index: 0, value: "" }), true, `${id} explicitly selects a local target`);
+  }
+  for (const id of ["show-hub", "show-config", "create-project-from-picker"]) {
+    assert.equal(actionEnabledById(id, hubModel), true, `${id} remains available`);
+  }
+  assert.equal(actionEnabledById("archive-session", hubModel, { index: 0, value: "" }), true, "an explicit local row retains its own action");
+});
+
 function defaultRenderLocal(overrides: {
   artifactPane?: Partial<DesktopRenderLocalPresentation["artifactPane"]>;
   attachmentTrayOpen?: boolean;
@@ -587,6 +616,8 @@ function representativeSurfaces(): RenderedSurface[] {
     state: "running", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
     root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: true, state_source: "last_observed", result_received: false }] };
   local.deviceNetwork = deviceNetworkPresentation(deviceUiFixture());
+  local.deviceNetwork.execution = { revision: "1", state: "ready", projects: [], review: { id: "review", directory: "C:/shared", access_mode: "default" }, directory: "C:/shared", access_mode: "default", accepting: true, can_pause: true, can_resume: false, error: null, unknown_attempts: [{ attempt_id: "unknown", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }] };
+  local.deviceNetwork.executionRecoveryTarget = executionRecoveryKey(local.deviceNetwork.execution.unknown_attempts[0]);
   local.deviceNetwork.jobs.outgoing[0].state = "completed";
   local.deviceNetwork.jobs.outgoing[0].can_stop = false;
   local.mcpPeers = { ...local.mcpPeers, rows: [{ id: "WinB", base_url: "https://192.168.10.22/mcp", enabled: true, credential_configured: true, certificate_sha256: null }] };
@@ -609,6 +640,8 @@ function representativeSurfaces(): RenderedSurface[] {
       job_id: "job-b", profile_id: "profile-b", session_id: "session-b", requester_label: "WinA", target_label: "Temp",
     } } }) },
   ];
+  surfaces.push({ name: "device-execution-ready", html: renderDeviceExecution(local.deviceNetwork) });
+  surfaces.push({ name: "device-execution-paused", html: renderDeviceExecution({ ...local.deviceNetwork, execution: { ...local.deviceNetwork.execution, state: "paused", accepting: false, can_pause: false, can_resume: true } }) });
 
   for (const overlay of [
     "provider",
@@ -839,23 +872,18 @@ function representativeSurfaces(): RenderedSurface[] {
   shared.projection!.approval = { id: "approval-a", attempt_id: "attempt-a", request: { access: "shell", summary: "実行の確認", details: [], targets: [], outside_workspace: false, risks: [] }, status: "pending", decision: null, can_decide: true, expires_at_ms: 9999999999999 };
   shared.projection!.submission_uncertain = true;
   const asset = { id: "asset-a", project_id: "project-a", job_id: "job-a", kind: "artifact", name: "result.txt", sha256: "a".repeat(64), byte_length: 4, created_at_ms: 1, version: 1, base_sha256: null, purged_at_ms: null };
-  const template = { id: "workspace", label: "作業領域", base_root: "C:/fixture", access_mode: "default", allowed_child_environments: [] };
   shared.projection!.inputs = [asset]; shared.projection!.assets = [asset];
   shared.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a", title: "終了した仕事", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: true };
   shared.projection!.handover = { candidates: [{ user_id: "user-b", display_name: "次の担当" }], pending: null, can_handover: true };
   shared.projection!.inbox = { items: [{ id: "finished:job-a", project_id: "project-a", job_id: "job-a", kind: "finished", title: "完了", created_at_ms: 1, read_at_ms: null, can_act: true, approval_id: null }], unread_count: 1, next_before: "older" };
   shared.projection!.transcript = { items: [], next_after: 100 };
-  shared.projection!.provider = { runner_id: "runner-a", mode: "shared", state: "paused", accepting: false, maintenance_until_ms: null, autostart: false, templates: [template], environments: [], active_attempts: [], unknown_attempts: [{ attempt_id: "attempt-a", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }], error: null };
-  shared.projection!.provider_draft = template;
   surfaces.push({ name: "shared-work-authenticated", html: renderSharedWork(sharedWorkPresentation(shared)) });
-  shared.projection!.provider.autostart = true;
-  surfaces.push({ name: "shared-work-provider-autostart", html: renderSharedWork(sharedWorkPresentation(shared)) });
-  shared.projection!.provider.state = "available";
-  shared.projection!.provider.accepting = true;
-  surfaces.push({ name: "shared-work-provider-accepting", html: renderSharedWork(sharedWorkPresentation(shared)) });
-  shared.projection!.provider = null;
-  shared.projection!.provider_draft = null;
-  surfaces.push({ name: "shared-work-provider-not-started", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.status!.next_before = "older";
+  surfaces.push({ name: "shared-work-sidebar", html: renderSidebar({ ...base, hub_project_open: true }, sharedWorkPresentation(shared)) });
+  shared.projection!.detail = null;
+  shared.projection!.selected_job_id = null;
+  shared.projection!.submission_uncertain = false;
+  surfaces.push({ name: "shared-work-new-conversation", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.principal = null;
   surfaces.push({ name: "shared-work-login", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.connected = false;
@@ -1511,7 +1539,8 @@ test("the sidebar separates Hub preparation from ordinary Settings", () => {
 
   assert.match(html, /class="rail-item" data-action="show-hub"/);
   assert.match(html, />moyAI Hub<\/span>/);
-  assert.match(html, /class="rail-item" data-action="show-mcp-history"/);
+  assert.doesNotMatch(html, /class="rail-item" data-action="show-mcp-history"/);
+  assert.match(renderOverlay(representativeState({ overlay: "config" }), defaultRenderLocal()), /data-action="show-mcp-history"/);
   assert.doesNotMatch(html, /data-action="show-mcp-publish"/);
   assert.match(html, /class="settings" data-action="show-config"/);
   assert.doesNotMatch(html, /class="rail-item" data-action="show-provider"/);
@@ -1785,7 +1814,7 @@ test("quick-chat activity uses the selected chat identity and keeps background r
   assert.match(html, /data-task-activity-row="finalizing"/);
   assert.match(html, /data-task-activity-row="running"/);
   assert.doesNotMatch(html, /class="task-activity-indicator[^>]*aria-label=/);
-  assert.match(html, /<span class="section-label">チャット<\/span>/);
+  assert.match(html, /<span class="section-label">このPCのチャット<\/span>/);
   assert.equal(Array.from(html.matchAll(/class="task-activity-indicator/g)).length, 2);
 });
 

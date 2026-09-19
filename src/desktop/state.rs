@@ -102,7 +102,6 @@ pub enum DesktopOverlay {
     ProjectMenu,
     ConfigEditor,
     HubConnection,
-    SharedWork,
     McpHistory,
     SessionSettings,
     ProviderEditor,
@@ -1675,7 +1674,7 @@ impl DesktopState {
             self.view.overlay = DesktopOverlay::PromptReview;
             return false;
         }
-        if self.startup.requires_initial_setup() {
+        if self.startup.requires_initial_setup() && !self.view.hub_project_open {
             self.view.overlay = DesktopOverlay::InitialSetup;
             self.view.startup_overlay_forced = true;
             return false;
@@ -1693,11 +1692,15 @@ impl DesktopState {
     }
 
     pub fn show_shared_work(&mut self) -> bool {
-        if self.prompt_review_owns_overlay() {
+        if self.prompt_review_owns_overlay()
+            || self.navigation_loading()
+            || self.background_mutation_pending()
+        {
             return false;
         }
         self.view.startup_overlay_forced = false;
-        self.view.overlay = DesktopOverlay::SharedWork;
+        self.view.hub_project_open = true;
+        self.view.overlay = DesktopOverlay::None;
         true
     }
 
@@ -2259,7 +2262,7 @@ impl DesktopState {
     }
 
     fn apply_startup_overlay(&mut self) {
-        if self.view.overlay == DesktopOverlay::SharedWork && !self.prompt_review_owns_overlay() {
+        if self.view.hub_project_open && !self.prompt_review_owns_overlay() {
             return;
         }
         if !self.begin_unscoped_overlay_transition() {
@@ -4388,11 +4391,33 @@ mod tests {
         assert!(state.startup.requires_initial_setup());
         assert!(state.show_shared_work());
         state.apply_startup_overlay();
-        assert_eq!(state.view.overlay, DesktopOverlay::SharedWork);
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(state.view.hub_project_open);
         assert!(state.startup.requires_initial_setup());
         state.hide_overlay();
-        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(state.view.hub_project_open);
         assert!(state.startup.requires_initial_setup());
+    }
+
+    #[test]
+    fn shared_work_entry_waits_for_local_owner_mutations_but_allows_an_active_run() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let deletion = state.begin_session_delete_mutation();
+        assert!(!state.show_shared_work());
+        assert!(!state.view.hub_project_open);
+        assert!(state.finish_session_delete_mutation(deletion));
+        let archive = state.begin_session_archive_mutation();
+        assert!(!state.show_shared_work());
+        assert!(!state.view.hub_project_open);
+        assert!(state.finish_session_archive_mutation(archive));
+        state.app_state.run_status = RunStatus::Running;
+        assert!(state.is_busy());
+        assert!(state.show_shared_work());
+        state.show_hub_editor();
+        state.hide_overlay();
+        assert!(state.view.hub_project_open);
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
     }
 
     #[test]

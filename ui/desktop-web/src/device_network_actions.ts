@@ -1,4 +1,5 @@
 import { command } from "./api.ts";
+import { refreshDeviceExecution } from "./device_execution.ts";
 import type { ActionContext } from "./actions.ts";
 import { acceptDeviceNetworkProjection, deviceCanJoin, deviceCanReceive, deviceCanSelect, deviceNetworkError,
   deviceNetworkTarget, devicePeerKey, deviceCanStopJob, deviceReceiverConfirmed, type DeviceIncomingJob, type DeviceNetworkJobs,
@@ -20,7 +21,7 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     if ((pending === "import" || pending === "join") && projection.enrollment === "pending") {
       local.notice = "参加申請を送信しました。Hub管理者の承認を待っています。承認後は自動で接続します。";
     } else if ((pending === "import" || pending === "join") && projection.enrollment === "active") {
-      local.notice = "Hubに接続しました。「共有仕事を開く」から利用者としてログインできます。通常チャットのモデルは「モデル割当」で選びます。";
+      local.notice = "Hubに接続しました。初回ログイン後、割り当てられたプロジェクトが通常の一覧に表示されます。";
     } else if (pending === "receiver") local.notice = projection.receiver.enabled ? "受付設定を保存しました。稼働状態を確認してください。" : "受付をOFFにしました。実行中タスクの停止完了は経路の状態を確認してください。";
     else if (pending === "select") {
       const peer = projection.peers.find(row => devicePeerKey(row) === local.selectionKey);
@@ -42,10 +43,12 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
 }
 export async function loadDeviceNetwork(context: ActionContext): Promise<void> {
   await request(context, "load", "device_network_projection");
+  await refreshDeviceExecution(context);
   await refreshDeviceNetworkJobs(context);
 }
 export async function refreshDeviceNetwork(context: ActionContext): Promise<void> {
   await request(context, "refresh", "device_network_refresh");
+  await refreshDeviceExecution(context);
   await refreshDeviceNetworkJobs(context);
 }
 export async function importDeviceNetwork(context: ActionContext): Promise<void> {

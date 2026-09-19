@@ -1,3 +1,4 @@
+// These fixtures exercise already-admitted legacy execution beneath the retired public adapter.
 use super::*;
 use crate::config::{AccessMode, ProviderProfile};
 use crate::mcp_publish::PublishAuthentication;
@@ -8,6 +9,101 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod artifact_runtime_tests;
 #[path = "network_fixture.rs"]
 mod network_fixture;
+
+#[tokio::test]
+async fn retired_public_receiver_rejects_new_work_but_keeps_saved_status_and_stop() {
+    let (endpoint, count, _, server) = provider(false).await;
+    let (_temp, app, profile) = fixture(&endpoint).await;
+    let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
+    let public = jobs
+        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .await
+        .unwrap();
+    assert!(
+        !public
+            .tool_descriptors()
+            .iter()
+            .any(|value| value["name"] == "delegate_task")
+    );
+    assert_eq!(
+        public
+            .call("delegate_task", task("new"), CancellationToken::new())
+            .await
+            .unwrap_err(),
+        PublishCallError::ToolUnavailable
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(
+        app.store
+            .remote_job_store()
+            .find_request(&profile.id.0.to_string(), "new")
+            .unwrap()
+            .is_none()
+    );
+    // Populate an old accepted job through the private engine fixture, then use
+    // only the shipped compatibility dispatcher to inspect and stop its receipt.
+    jobs.cancel_profile(profile.id);
+    assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    let legacy = jobs
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
+        .await
+        .unwrap();
+    let accepted = call(&legacy, "delegate_task", task("historical")).await;
+    let id = accepted["job_id"].as_str().unwrap();
+    terminal(&legacy, id).await;
+    jobs.cancel_profile(profile.id);
+    assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    let public = jobs
+        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&public, "task_status", json!({"job_id":id})).await["job_id"],
+        id
+    );
+    assert_eq!(
+        call(&public, "cancel_task", json!({"job_id":id})).await["job_id"],
+        id
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    jobs.cancel_profile(profile.id);
+    assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    server.abort();
+}
+
+#[tokio::test]
+async fn retired_managed_receiver_rejects_even_a_verified_new_delegate() {
+    let (_temp, app, profile) = fixture("http://127.0.0.1:1/v1").await;
+    let (network, jobs, _legacy, authority, peer) = managed_fixture(&app, &profile).await;
+    jobs.cancel_profile(profile.id);
+    assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    let public = jobs
+        .dispatcher_network(
+            profile.clone(),
+            app.config.clone(),
+            vec![],
+            network.downgrade(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        public
+            .call_authorized(
+                "delegate_task",
+                task("new"),
+                CancellationToken::new(),
+                authority
+            )
+            .await
+            .unwrap_err(),
+        PublishCallError::ToolUnavailable
+    );
+    assert!(!jobs.has_active_jobs());
+    network.shutdown().await;
+    jobs.cancel_profile(profile.id);
+    assert!(jobs.drain_profile(profile.id, Duration::from_secs(2)).await);
+    drop(peer);
+}
 
 #[tokio::test]
 async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop() {
@@ -56,7 +152,7 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
         });
         let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
         let dispatcher = jobs
-            .dispatcher(profile.clone(), app.config.clone(), vec![])
+            .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
             .await
             .unwrap();
         let accepted = call(&dispatcher, "delegate_task", task("reviewed-request")).await;
@@ -226,11 +322,11 @@ async fn managed_fixture(
         .await
         .unwrap();
     let dispatcher = jobs
-        .dispatcher_network(
+        .dispatcher_with_network(
             profile.clone(),
             app.config.clone(),
             vec![],
-            network.downgrade(),
+            Some(network.downgrade()),
         )
         .await
         .unwrap();
@@ -565,7 +661,7 @@ async fn remote_job_runs_real_runservice_and_replay_never_reexecutes() {
         super::super::RemoteActivityProjection::default()
     );
     let dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     let accepted = call(&dispatcher, "delegate_task", task("one")).await;
@@ -612,7 +708,7 @@ async fn remote_job_runs_real_runservice_and_replay_never_reexecutes() {
     let mut other_profile = profile.clone();
     other_profile.id = PublishProfileId(Ulid::new());
     let other = jobs
-        .dispatcher(other_profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(other_profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     assert!(
@@ -647,7 +743,7 @@ async fn remote_job_cancel_owns_running_work_and_stopped_profile_cannot_accept()
     let (_temp, app, profile) = fixture(&endpoint).await;
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     let accepted = call(&dispatcher, "delegate_task", task("blocked")).await;
@@ -745,7 +841,7 @@ async fn completed_remote_server_survives_workspace_rebuild_and_profile_stop_dra
     };
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     let accepted = call(&dispatcher, "delegate_task", task("managed-server")).await;
@@ -846,7 +942,7 @@ async fn remote_temp_has_its_own_workspace_and_rejects_ambiguous_status() {
     profile.target = PublishTarget::Temp {};
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     {
@@ -891,7 +987,7 @@ async fn remote_pre_admission_stop_and_replacement_runtime_never_execute_the_rec
     let (_temp, app, profile) = fixture(&endpoint).await;
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     let id = profile.id;
@@ -934,7 +1030,7 @@ async fn remote_pre_admission_stop_and_replacement_runtime_never_execute_the_rec
     drop(jobs);
     let reopened = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let dispatcher = reopened
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     let receipt = call(&dispatcher, "delegate_task", task("before-start")).await;
@@ -951,7 +1047,7 @@ async fn remote_individual_cancel_before_admission_starts_no_provider_request() 
     let (_temp, app, profile) = fixture(&endpoint).await;
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let _dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     let profile_id = profile.id;
@@ -1002,7 +1098,7 @@ async fn remote_job_survives_mcp_session_termination_and_returns_canonical_tool_
     let (_temp, app, profile) = fixture(&endpoint).await;
     let jobs = RemoteJobService::new(app.process_runtime.clone()).unwrap();
     let dispatcher = jobs
-        .dispatcher(profile.clone(), app.config.clone(), vec![])
+        .dispatcher_with_network(profile.clone(), app.config.clone(), vec![], None)
         .await
         .unwrap();
     const TOKEN: &str = "remote-agent-fixture-token-for-http-lifetime-01";

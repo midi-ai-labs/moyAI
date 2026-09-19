@@ -4,6 +4,8 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod desktop;
+#[cfg(feature = "desktop-e2e")]
+pub(crate) mod desktop_test;
 pub mod device_network;
 pub mod docling;
 pub mod edit;

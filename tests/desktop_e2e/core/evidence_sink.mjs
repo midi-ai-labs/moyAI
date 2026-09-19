@@ -72,6 +72,16 @@ export class EvidenceSink {
     return this.#files.map((entry) => ({ ...entry }));
   }
 
+  scope(prefix) {
+    const exact = normalizedRelative(prefix);
+    return Object.freeze({
+      root: this.root,
+      writeJson: (relative, value) => this.writeJson(`${exact}/${normalizedRelative(relative)}`, value),
+      writeBytes: (relative, value) => this.writeBytes(`${exact}/${normalizedRelative(relative)}`, value),
+      record: (kind, payload, meta) => this.record(kind, payload, meta),
+    });
+  }
+
   async #write(relativePath, bytes) {
     if (this.#sealed) throw new Error("evidence sink is already sealed");
     const relative = normalizedRelative(relativePath);

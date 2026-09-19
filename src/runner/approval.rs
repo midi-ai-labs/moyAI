@@ -26,9 +26,10 @@ pub enum LocalApprovalDecision {
 }
 
 struct Pending {
+    wait_id: Ulid,
     projection: LocalApproval,
     control: RunControl,
-    response: mpsc::SyncSender<LocalApprovalDecision>,
+    response: mpsc::SyncSender<(Ulid, LocalApprovalDecision)>,
 }
 
 #[derive(Clone, Default)]
@@ -55,7 +56,20 @@ impl LocalApprovals {
             return false;
         }
         let entry = pending.remove(&run).expect("matched approval");
-        entry.response.try_send(decision).is_ok()
+        entry.response.try_send((id, decision)).is_ok()
+    }
+
+    /// Replace only the invalidated external identity. The same tool stays suspended
+    /// on its original channel; neither a model retry nor a permission decision occurs.
+    pub fn reconfirm(&self, run: Ulid, id: Ulid) -> Option<Ulid> {
+        let mut pending = self.0.lock().ok()?;
+        let entry = pending.get_mut(&run)?;
+        if entry.projection.approval_id != id || entry.control.is_cancelled() {
+            return None;
+        }
+        let replacement = Ulid::new();
+        entry.projection.approval_id = replacement;
+        Some(replacement)
     }
 
     pub fn prompt(&self, run: Ulid) -> LocalConfirmation {
@@ -77,7 +91,7 @@ impl Drop for PendingGuard {
         if let Ok(mut pending) = self.0.0.lock() {
             if pending
                 .get(&self.1)
-                .is_some_and(|entry| entry.projection.approval_id == self.2)
+                .is_some_and(|entry| entry.wait_id == self.2)
             {
                 pending.remove(&self.1);
             }
@@ -113,6 +127,7 @@ impl ConfirmationPrompt for LocalConfirmation {
             pending.insert(
                 self.run,
                 Pending {
+                    wait_id: id,
                     projection: LocalApproval {
                         approval_id: id,
                         request: request.clone(),
@@ -129,20 +144,22 @@ impl ConfirmationPrompt for LocalConfirmation {
                 return Ok(ConfirmationOutcome::Interrupted);
             }
             match decision {
-                Ok(LocalApprovalDecision::Approve) => {
+                Ok((id, LocalApprovalDecision::Approve)) => {
                     control.record_approval_identity(id.to_string());
                     return Ok(ConfirmationOutcome::Resolved(
                         ToolApprovalDecision::Approved,
                     ));
                 }
-                Ok(LocalApprovalDecision::Deny) => {
+                Ok((_, LocalApprovalDecision::Deny)) => {
                     return Ok(ConfirmationOutcome::Resolved(
                         ToolApprovalDecision::Denied {
                             reason: "permission denied by the approving user".into(),
                         },
                     ));
                 }
-                Ok(LocalApprovalDecision::Stop) => return Ok(ConfirmationOutcome::AbortRequested),
+                Ok((_, LocalApprovalDecision::Stop)) => {
+                    return Ok(ConfirmationOutcome::AbortRequested);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(CliPromptError::Message(

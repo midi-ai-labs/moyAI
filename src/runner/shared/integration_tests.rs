@@ -634,6 +634,31 @@ async fn real_hub_scenario() {
         json!({"project_id":"project","user_id":alice["user_id"],"role":"contributor"}),
     )
     .await;
+    let bob = shared_post(
+        http,
+        &url,
+        admin,
+        "admin/users",
+        json!({"username":"bob","display_name":"Bob","password":PASSWORD,"administrator":false}),
+    )
+    .await;
+    shared_post(
+        http,
+        &url,
+        admin,
+        "admin/memberships",
+        json!({"project_id":"project","user_id":bob["user_id"],"role":"contributor"}),
+    )
+    .await;
+    let bob_login = body(
+        http.post(format!("{url}/v1/shared/login"))
+            .json(&json!({"username":"bob","password":PASSWORD}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let bob_token = bob_login["token"].as_str().unwrap();
     for (index, id) in [(0, "analysis"), (1, "solver")] {
         shared_post(http,&url,admin,"admin/environments",json!({"id":id,"label":id,"resource_id":format!("resource-{id}"),"runner_id":identities[index].device_id,"capacity":1,"project_ids":["project"]})).await;
     }
@@ -958,6 +983,82 @@ async fn real_hub_scenario() {
             !local_reply.status.success(),
             "Shared approval must not be authorized through local IPC"
         );
+        assert!(!child_workspace.join(filename).exists());
+        let old_approval_id = approval_id.to_owned();
+        let before_handover = job(http, &url, token, id).await;
+        let model_requests = provider.requests.lock().unwrap().len();
+        shared_post(
+            http,
+            &url,
+            token,
+            &format!("jobs/{id}/handover"),
+            json!({"expected_revision":before_handover["revision"],"new_assignee_id":bob["user_id"]}),
+        ).await;
+        let renewed = wait_approval(http, &url, token, id).await;
+        let approval_id = renewed["id"].as_str().unwrap();
+        assert_ne!(approval_id, old_approval_id);
+        assert_eq!(renewed["attempt_id"], approval["attempt_id"]);
+        assert_eq!(renewed["request"], approval["request"]);
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            model_requests,
+            "Reconfirmation must not replay the model or tool"
+        );
+        assert!(!child_workspace.join(filename).exists());
+        let after_handover = job(http, &url, token, id).await;
+        assert_eq!(after_handover["state"], "running");
+        assert_eq!(after_handover["assignee_id"], alice["user_id"]);
+        assert_eq!(
+            after_handover["authority_generation"],
+            before_handover["authority_generation"]
+        );
+        let capacity = body(
+            http.get(format!("{url}/v1/shared/environments?project_id=project"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            capacity
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|environment| environment["id"] == "solver")
+                .unwrap()["occupied"],
+            1
+        );
+        let renewed_runs: Value = serde_json::from_slice(
+            &workers[1]
+                .command(&["list", "--runner", &workers[1].incarnation])
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(
+            renewed_runs["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|run| run["approval"]["approval_id"] == approval_id)
+                .unwrap()["run_id"],
+            run_id
+        );
+        for (credential, request) in [(token, old_approval_id.as_str()), (bob_token, approval_id)] {
+            let rejected = http
+                .post(format!(
+                    "{url}/v1/shared/jobs/{id}/approvals/{request}/decision"
+                ))
+                .bearer_auth(credential)
+                .json(&json!({"decision":"approve"}))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                !rejected.status().is_success(),
+                "Invalidated approval and pending new assignee cannot authorize the operation"
+            );
+        }
         assert!(!child_workspace.join(filename).exists());
         if decision == "approve" {
             shared_post(

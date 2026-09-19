@@ -7,6 +7,7 @@ license = "MIT"
 
 [features]
 default = ["tauri-desktop"]
+desktop-e2e = ["tauri-desktop"]
 tauri-desktop = [
     "dep:tauri",
     "tauri/custom-protocol",
@@ -73,6 +74,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Globalization",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",

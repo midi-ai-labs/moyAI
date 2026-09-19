@@ -2,7 +2,19 @@
 .shared-header { display:flex; align-items:start; justify-content:space-between; gap:24px; margin-bottom:16px; }
 .shared-header h1 { margin:0 0 8px; font-size:24px; }
 .shared-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
-.shared-columns { display:grid; grid-template-columns:minmax(280px, 1fr) minmax(340px, 1.4fr); gap:20px; }
+.shared-columns { display:grid; grid-template-columns:minmax(300px, 1fr) minmax(230px, 300px); gap:20px; }
+.shell.hub-project-shell { grid-template-columns:260px minmax(0, 1fr); }
+.hub-project-row > button { width:100%; text-align:left; }
+.hub-project-row small { margin-left:auto; opacity:.65; }
+.hub-project-chats { display:grid; gap:4px; margin:4px 8px 12px 22px; }
+.hub-project-chats button { text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:transparent; border:0; padding:8px; color:inherit; }
+.hub-project-chats button.active, .hub-project-row > .active { background:var(--bg-hover, #303846); border-radius:6px; }
+.shared-conversation-column, .shared-project-status { min-width:0; }
+.shared-conversation-record { border:0!important; padding-left:0!important; padding-right:0!important; }
+.shared-user-message { padding:16px; border-radius:12px; background:var(--bg-hover, #303846); margin:20px 0; }
+.shared-composer details { margin:12px 0; }
+.shared-composer > button { margin-top:12px; padding:10px 24px; }
+.shared-header details { min-width:120px; }
 .shared-card { border:1px solid var(--border-color, #444); border-radius:10px; padding:20px; margin:18px 0; }
 .shared-card h2 { margin:0 0 16px; font-size:18px; }
 .shared-card h3 { font-size:14px; margin:10px 0; }

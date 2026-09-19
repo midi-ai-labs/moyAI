@@ -1,5 +1,7 @@
 # Hubで管理する端末接続とタスク受付
 
+2026-09-13時点の扱い: 本文の個別接続先選択・受付ONによる新規moyAI間依頼は退役した。現在の通常運用は [Hub接続ガイド](../hub-device-network-guide.md) と [Hubプロジェクト](../shared-work-desktop.md) を参照する。本書の端末証明書・更新・既存遠隔仕事の照会と停止の契約はcurrent code / testsと併せて互換境界を確認する資料として保持する。
+
 2026-09-07。ユーザーが採用した設定簡略化と部分結合・再委任の設計。実装済みの範囲と同一Windowsで確認した操作、残る受入条件を末尾の実装状況とtask-local evidenceで区別する。元の分散実行要件は [remote-agent-delegation.md](remote-agent-delegation.md)、既存の手動MCP配信は [mcp-publish-foundation.md](mcp-publish-foundation.md) を参照する。
 
 ## 1. 利用体験

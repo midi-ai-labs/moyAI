@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { renderWorkDetails } from "../src/shared_work_details.ts";
+import { renderSidebar } from "../src/render.ts";
 import test from "node:test";
 import type { ActionContext } from "../src/actions.ts";
 import { refreshSharedWork, sharedWorkAction } from "../src/shared_work_actions.ts";
@@ -41,7 +43,7 @@ test("continuation requires the Hub capability and sends the selected job revisi
   let sent: unknown;
   Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (_name: string, args: unknown) => { sent = args; return { ...local.projection, revision: "2" }; } } } });
   try {
-    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "shared_work" }), rerender: () => {} } as unknown as ActionContext;
+    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
     await sharedWorkAction(context, "continue");
     assert.deepEqual(sent, { expectedGeneration: "1", request: { kind: "continue", project_id: "project-a", job_id: "finished-a", expected_revision: 7, prompt: "追加の分析", start_before_ms: null } });
   } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
@@ -55,7 +57,7 @@ test("a chosen start deadline crosses the command boundary unchanged and invalid
     calls.push(args); return { ...local.projection, revision: "2", submission_uncertain: true };
   } } } });
   try {
-    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "shared_work" }), rerender: () => {} } as unknown as ActionContext;
+    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
     for (const deadline of ["invalid-date", "2000-01-01T00:00"]) {
       local.draft.startBefore = deadline;
       await sharedWorkAction(context, "submit");
@@ -93,13 +95,13 @@ test("retained metadata shows deleted content and cannot save or import it", () 
   const view = sharedWorkPresentation(local);
   assert.equal(sharedWorkActionEnabled(view, "save-asset", "expired-artifact"), false);
   assert.equal(sharedWorkActionEnabled(view, "import-asset", "expired-artifact"), false);
-  const html = renderSharedWork(view);
+  const html = renderWorkDetails(view, "support");
   assert.match(html, /保持期限により内容は削除済みです/);
   assert.match(html, /data-action="shared-save-asset"[^>]*disabled/);
   assert.match(html, /data-action="shared-import-asset"[^>]*disabled/);
 });
 test("shared surface shows restricted occupancy only as a count and escapes returned work text", () => {
-  const local = sharedUiFixture(); local.projection!.status!.jobs[0].title = "<script>alert(1)</script>";
+  const local = sharedUiFixture(); local.projection!.status!.environments[0].label = "<script>alert(1)</script>";
   const html = renderSharedWork(sharedWorkPresentation(local));
   assert.match(html, /他のプロジェクトで 1 件使用中/);
   assert.match(html, /&lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
@@ -117,8 +119,8 @@ test("retaining an active login form synchronizes native and accessible button a
   const attributes = new Map([["aria-disabled", "true"]]);
   const button = { dataset: { action: "shared-login" }, disabled: true, textContent: "ログイン", setAttribute: (name: string, value: string) => attributes.set(name, value) };
   const replacement = { disabled: false, textContent: "ログイン", getAttribute: () => "false" };
-  const region = { contains: () => true, querySelectorAll: (selector: string) => selector.startsWith("button") ? [button] : [] };
-  const nextRegion = { dataset: { sharedRegion: "login" }, querySelector: () => replacement };
+  const region = { contains: () => true, isEqualNode: () => false, querySelectorAll: (selector: string) => selector.startsWith("button") ? [button] : [] };
+  const nextRegion = { dataset: { sharedRegion: "login" }, querySelector: () => replacement, querySelectorAll: () => [] };
   const current = { dataset: { sharedOwner: "same-person" }, querySelector: () => region };
   const next = { dataset: { sharedOwner: "same-person" }, querySelectorAll: () => [nextRegion] };
   const original = Object.getOwnPropertyDescriptor(globalThis, "document");
@@ -140,7 +142,7 @@ test("logout conceals prior data immediately and discards an already running pol
     assert.doesNotMatch(renderSharedWork(sharedWorkPresentation(local)), /試験の仕事|利用者 A/);
     return sharedProjection({ generation: "2", revision: "3", principal: null, projects: [], status: null, selected_project_id: null });
   } } } });
-  const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "shared_work" }), rerender() {} } as unknown as ActionContext;
+  const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender() {} } as unknown as ActionContext;
   try {
     const poll = refreshSharedWork(context);
     await sharedWorkAction(context, "logout");

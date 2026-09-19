@@ -19,6 +19,13 @@ pub(crate) struct ProvisionDelivery {
     success: bool,
     error: Option<String>,
 }
+impl ProvisionDelivery {
+    pub(crate) fn desktop_environment(&self, environment_id: &str) -> bool {
+        self.environment_id == environment_id
+            && self.success
+            && self.template_id == crate::runner::provision::DESKTOP_TEMPLATE_ID
+    }
+}
 #[derive(Deserialize)]
 struct Request {
     environment_id: String,

@@ -1,5 +1,6 @@
 //! Human sessions and shared-work snapshots belong to the registered device runtime.
-//! Tokens remain in memory here; the webview receives only a typed projection.
+//! Remembered human credentials are Windows-user protected; the webview receives
+//! only a typed projection, never access or refresh credentials.
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use super::{DeviceClient, DeviceNetworkService};
+mod auth_store;
+mod authentication;
 mod collaboration;
 mod files;
 mod providing;
@@ -56,6 +59,8 @@ pub struct WorkSummary {
     pub state: String,
     pub environment_id: String,
     pub environment_label: String,
+    #[serde(default)]
+    pub device_label: Option<String>,
     pub requestor: WorkPerson,
     pub assignee: WorkPerson,
     pub wait_reason: Option<String>,
@@ -88,6 +93,8 @@ pub struct WorkEnvironment {
     pub label: String,
     pub resource_id: String,
     pub runner_id: String,
+    #[serde(default)]
+    pub device_label: Option<String>,
     pub enabled: bool,
     pub capacity: u32,
     pub occupied: u32,
@@ -98,10 +105,20 @@ pub struct WorkEnvironment {
     pub runner_contact: Option<WorkRunnerContact>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkExecutionDevice {
+    pub device_id: String,
+    pub device_label: Option<String>,
+    pub environment_id: Option<String>,
+    pub preparation_state: String,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkStatus {
     pub project_id: String,
     pub jobs: Vec<WorkSummary>,
     pub environments: Vec<WorkEnvironment>,
+    #[serde(default)]
+    pub execution_devices: Vec<WorkExecutionDevice>,
     pub next_before: Option<String>,
     pub next_environment_before: Option<String>,
 }
@@ -188,6 +205,9 @@ pub enum SharedWorkCommand {
     RetrySubmission,
     Refresh,
     Project {
+        project_id: String,
+    },
+    NewConversation {
         project_id: String,
     },
     Detail {
@@ -296,11 +316,13 @@ pub enum WorkDecision {
     Deny,
     Stop,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct LoginSession {
     token: String,
     principal: WorkPrincipal,
     expires_at_ms: u64,
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 #[derive(Deserialize)]
 struct Session {
@@ -311,6 +333,7 @@ pub(super) struct SharedWorkOwner(Mutex<Runtime>);
 impl SharedWorkOwner {
     pub fn new(path: camino::Utf8PathBuf) -> Self {
         Self(Mutex::new(Runtime {
+            auth_store: auth_store::AuthStore::new(path.with_file_name("shared-human-auth.dpapi")),
             receipts: ReceiptStore::new(path),
             ..Runtime::default()
         }))
@@ -324,6 +347,8 @@ struct Runtime {
     binding: String,
     hub_binding: String,
     token: Option<String>,
+    remembered_refresh: Option<String>,
+    auth_store: auth_store::AuthStore,
     view: SharedWorkProjection,
     before: Option<String>,
     environment_before: Option<String>,
@@ -349,6 +374,7 @@ impl Runtime {
         self.generation += 1;
         self.query += 1;
         self.token = None;
+        self.remembered_refresh = None;
         self.view = SharedWorkProjection::default();
         self.before = None;
         self.environment_before = None;
@@ -399,8 +425,14 @@ struct Connection {
     binding: String,
     hub_binding: String,
 }
+impl Connection {
+    fn auth_binding(&self) -> String {
+        format!("{}|{}", self.hub_binding, self.client.device_id)
+    }
+}
 #[derive(Debug)]
 enum RequestError {
+    SignInRequired,
     Local(&'static str),
     Http(u16),
     Unavailable,
@@ -410,6 +442,7 @@ enum RequestError {
 impl RequestError {
     fn message(&self) -> &str {
         match self {
+            Self::SignInRequired => "Hubの利用者アカウントでログインしてください。",
             Self::Local(message) => message,
             Self::Filesystem(message) => message,
             Self::Http(401) => {
@@ -490,6 +523,20 @@ impl DeviceNetworkService {
         let connection = self.shared_connection();
         let network = self.projection_now();
         let mut runtime = self.inner.shared_work.0.lock().unwrap();
+        if let Some(refresh) = runtime.remembered_refresh.clone() {
+            match runtime.auth_store.load() {
+                Ok(doc)
+                    if doc
+                        .active
+                        .as_ref()
+                        .is_some_and(|a| a.refresh_token == refresh) => {}
+                Ok(_) => runtime.clear(),
+                Err(error) => {
+                    runtime.clear();
+                    runtime.view.error = Some(error.message().into());
+                }
+            }
+        }
         // A lost/replaced device identity must never expose the prior user's cached data.
         if (connection.as_ref().map(|c| c.binding.as_str()) != Some(runtime.binding.as_str())
             && runtime.token.is_some())
@@ -531,6 +578,9 @@ impl DeviceNetworkService {
     ) -> SharedWorkProjection {
         // Synchronize expiry/device identity before admitting any command.
         self.shared_work_projection();
+        if matches!(command, SharedWorkCommand::Logout) {
+            return self.shared_logout(expected_generation).await;
+        }
         if matches!(
             &command,
             SharedWorkCommand::ProviderStatus
@@ -554,22 +604,6 @@ impl DeviceNetworkService {
             }
             runtime.begin_command(&command)
         };
-        if matches!(command, SharedWorkCommand::Logout) {
-            // Invalidate the local owner immediately; revocation does not cancel Hub jobs.
-            if let Some(token) = token {
-                tokio::spawn(async move {
-                    let _ = request::<Value>(
-                        &connection.client,
-                        "logout",
-                        Some(&token),
-                        Some(json!({})),
-                        &[],
-                    )
-                    .await;
-                });
-            }
-            return self.shared_work_projection();
-        }
         let result = self
             .shared_execute(&connection, generation, query, token.as_deref(), command)
             .await;
@@ -601,45 +635,21 @@ impl DeviceNetworkService {
         command: SharedWorkCommand,
     ) -> Result<(), RequestError> {
         if let SharedWorkCommand::Login { username, password } = command {
-            if username.trim().is_empty() || password.is_empty() || password.len() > 1024 {
-                return Err(RequestError::Local(
-                    "利用者名とパスワードを入力してください。",
-                ));
-            }
-            let session: LoginSession = request(
-                &connection.client,
-                "login",
-                None,
-                Some(json!({"username":username,"password":password})),
-                &[],
-            )
-            .await?;
-            if !self.shared_current(connection, generation, query) {
-                let _ = request::<Value>(
-                    &connection.client,
-                    "logout",
-                    Some(&session.token),
-                    Some(json!({})),
-                    &[],
-                )
+            return self
+                .shared_login(connection, generation, query, username, password)
                 .await;
-                return Ok(());
-            }
-            let mut runtime = self.inner.shared_work.0.lock().unwrap();
-            if runtime.generation != generation || runtime.query != query {
-                return Ok(());
-            }
-            runtime.clear();
-            runtime.binding = connection.binding.clone();
-            runtime.hub_binding = connection.hub_binding.clone();
-            runtime.token = Some(session.token);
-            runtime.view.principal = Some(session.principal);
-            runtime.view.expires_at_ms = Some(session.expires_at_ms);
-            return Ok(());
         }
-        let token = token.ok_or(RequestError::Local(
-            "Hubの利用者アカウントでログインしてください。",
-        ))?;
+        let current_token = match self
+            .shared_authenticate(connection, generation, query, token)
+            .await
+        {
+            Ok(token) => token,
+            Err(RequestError::SignInRequired) if matches!(command, SharedWorkCommand::Refresh) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let token = current_token.as_str();
         match command {
             SharedWorkCommand::Project { project_id } => {
                 let mut runtime = self.inner.shared_work.0.lock().unwrap();
@@ -659,6 +669,18 @@ impl DeviceNetworkService {
                 runtime.transcript_after = 0;
                 runtime.before = None;
                 runtime.environment_before = None;
+            }
+            SharedWorkCommand::NewConversation { project_id } => {
+                let mut runtime = self.inner.shared_work.0.lock().unwrap();
+                runtime.require_project(&project_id, generation, query)?;
+                runtime.view.selected_job_id = None;
+                runtime.view.detail = None;
+                runtime.view.approval = None;
+                runtime.view.inputs.clear();
+                runtime.view.assets.clear();
+                runtime.view.transcript = None;
+                runtime.view.handover = None;
+                runtime.transcript_after = 0;
             }
             SharedWorkCommand::Detail { project_id, job_id } => {
                 let mut runtime = self.inner.shared_work.0.lock().unwrap();
@@ -706,6 +728,18 @@ impl DeviceNetworkService {
                 start_before_ms,
             } => {
                 let start_before_ms = submission_start_deadline(start_before_ms, now_ms())?;
+                let title = if title.trim().is_empty() {
+                    prompt
+                        .trim()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(64)
+                        .collect::<String>()
+                } else {
+                    title
+                };
                 if title.trim().is_empty()
                     || title.len() > 256
                     || prompt.trim().is_empty()

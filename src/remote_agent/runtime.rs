@@ -288,6 +288,7 @@ impl RemoteJobService {
     ) -> Result<Arc<dyn PublishToolDispatcher>, PublishCallError> {
         self.dispatcher_with_network(profile, config, protected_roots, None)
             .await
+            .map(|inner| Arc::new(RetiredRemoteDispatcher(inner)) as Arc<dyn PublishToolDispatcher>)
     }
 
     pub(crate) async fn dispatcher_network(
@@ -299,6 +300,7 @@ impl RemoteJobService {
     ) -> Result<Arc<dyn PublishToolDispatcher>, PublishCallError> {
         self.dispatcher_with_network(profile, config, protected_roots, Some(network))
             .await
+            .map(|inner| Arc::new(RetiredRemoteDispatcher(inner)) as Arc<dyn PublishToolDispatcher>)
     }
 
     async fn dispatcher_with_network(
@@ -1131,6 +1133,44 @@ struct CancelRequest {
 struct ArtifactsRequest {
     job_id: Ulid,
     version: Option<String>,
+}
+
+/// Compatibility transport for saved jobs. Admission belongs exclusively to Hub projects.
+struct RetiredRemoteDispatcher(Arc<dyn PublishToolDispatcher>);
+#[async_trait]
+impl PublishToolDispatcher for RetiredRemoteDispatcher {
+    fn tool_descriptors(&self) -> Vec<Value> {
+        self.0
+            .tool_descriptors()
+            .into_iter()
+            .filter(|value| value["name"] != "delegate_task")
+            .collect()
+    }
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, PublishCallError> {
+        if name == "delegate_task" {
+            return Err(PublishCallError::ToolUnavailable);
+        }
+        self.0.call(name, arguments, cancel).await
+    }
+    async fn call_authorized(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancel: CancellationToken,
+        authority: crate::device_network::VerifiedGrant,
+    ) -> Result<Value, PublishCallError> {
+        if name == "delegate_task" {
+            return Err(PublishCallError::ToolUnavailable);
+        }
+        self.0
+            .call_authorized(name, arguments, cancel, authority)
+            .await
+    }
 }
 
 #[async_trait]

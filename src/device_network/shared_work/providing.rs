@@ -138,6 +138,7 @@ impl DeviceNetworkService {
                 if matches!(
                     operation,
                     RunnerOperation::InstallSettings { .. }
+                        | RunnerOperation::InstallDesktop { .. }
                         | RunnerOperation::UpdateTemplates { .. }
                 ) {
                     return Err(RequestError::Local(

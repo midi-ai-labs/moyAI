@@ -29,7 +29,7 @@ pub struct SharedProjection {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedAttemptProjection {
     pub attempt_id: String,
     pub generation: u64,
@@ -557,16 +557,46 @@ impl Controller {
             .report(report)
             .await
             .map_err(RunnerError::from)?;
-        if let Some(decision) = self.client.consume_approval(entry, &approval_id).await? {
-            if decision.approval_id != approval_id {
+        if let Some(reply) = self.client.consume_approval(entry, &approval_id).await? {
+            use protocol::ApprovalConsumeResult;
+            let (ApprovalConsumeResult::Answer {
+                approval_id: reply_id,
+                ..
+            }
+            | ApprovalConsumeResult::ReconfirmationRequired {
+                approval_id: reply_id,
+                ..
+            }) = &reply;
+            if *reply_id != approval_id {
                 return Err(RunnerError::new("Hub approval reply names another request"));
             }
-            // The broker checks both exact IDs and cancellation immediately before delivery.
-            // A consumed answer cannot be delivered to a replacement request or execution.
-            self.host
-                .inner
-                .approvals
-                .answer(entry.run_id, pending.approval_id, decision.decision);
+            // The broker checks exact IDs and cancellation for both transitions. A late
+            // answer cannot authorize the replacement or a different suspended tool.
+            match reply {
+                ApprovalConsumeResult::Answer { decision, .. } => {
+                    self.host
+                        .inner
+                        .approvals
+                        .answer(entry.run_id, pending.approval_id, decision);
+                }
+                ApprovalConsumeResult::ReconfirmationRequired {
+                    reconfirmation_required: true,
+                    ..
+                } => {
+                    self.host
+                        .inner
+                        .approvals
+                        .reconfirm(entry.run_id, pending.approval_id);
+                }
+                ApprovalConsumeResult::ReconfirmationRequired {
+                    reconfirmation_required: false,
+                    ..
+                } => {
+                    return Err(RunnerError::new(
+                        "Hub returned an invalid reconfirmation response",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -644,13 +674,17 @@ impl Controller {
                 .preparation_failed(entry, "Execution authorization changed before startup")
                 .await;
         }
-        let allowed_child_environments = entry
-            .mapping
-            .allowed_child_environments
-            .iter()
-            .filter(|id| status.assignment.allowed_child_environments.contains(id))
-            .cloned()
-            .collect();
+        let allowed_child_environments = self
+            .host
+            .inner
+            .operations
+            .lock()
+            .map_err(|_| RunnerError::new("Execution settings are unavailable"))?
+            .installed
+            .child_environments(
+                &entry.mapping,
+                &status.assignment.allowed_child_environments,
+            );
         self.journal.executing(entry)?;
         if let Err(error) = self.client.authorize(&status.assignment, None).await {
             return self.preparation_failed(entry, &error.message).await;
