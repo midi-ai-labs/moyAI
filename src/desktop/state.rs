@@ -38,6 +38,7 @@ pub enum DesktopStatusCode {
     ImageAttachmentInvalid,
     PermissionPolicyDenied,
     ConfigImportFailed,
+    InitialSetupPreferencesSaveFailed,
     ApprovalAborted,
     UserStopped,
     AgentInterrupted,
@@ -816,8 +817,8 @@ impl DesktopState {
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
                     .to_string(),
                 run_status_text: "待機中".to_string(),
-                session_usage_label: "セッション累計: 未計測".to_string(),
-                session_usage_title: "完了済みturnのcanonical terminal telemetryはまだありません。"
+                session_usage_label: "このチャットの累計: 未計測".to_string(),
+                session_usage_title: "完了した依頼のトークン使用量は、まだ記録されていません。"
                     .to_string(),
                 session_usage_state: "missing".to_string(),
                 artifacts: Vec::new(),
@@ -1826,7 +1827,7 @@ impl DesktopState {
         if !self.begin_unscoped_overlay_transition() {
             if self.startup.requires_initial_setup() {
                 self.set_status_message(
-                    "初期設定が必要です。各ステップを確認し、Finish で設定を保存してください。",
+                    "初回設定が必要です。画面に沿って入力し、最後に設定を保存してください。",
                 );
             }
             return false;
@@ -1837,6 +1838,8 @@ impl DesktopState {
     }
 
     pub(crate) fn complete_initial_setup_after_persist(&mut self) {
+        let configure_execution = self.startup.onboarding_intent
+            == Some(super::preferences::DesktopOnboardingIntent::Execution);
         self.startup.complete_after_persist();
         if !self.startup.requires_initial_setup()
             && let Some(session) = self
@@ -1847,6 +1850,9 @@ impl DesktopState {
             self.apply_root_session_config(&session);
         }
         self.apply_startup_overlay();
+        if configure_execution && !self.startup.requires_initial_setup() {
+            self.show_hub_editor();
+        }
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
@@ -1860,7 +1866,7 @@ impl DesktopState {
         self.provider_config.provider_loaded_api_key_env = None;
         self.provider_config.set_status(
             DesktopProviderStatusKind::Loading,
-            "Provider 状態",
+            "AIの接続状態",
             "詳細は必要な場合だけ展開してください。",
             "Loading models in the background...",
         );
@@ -1966,7 +1972,7 @@ impl DesktopState {
             .unwrap_or_default();
         self.provider_config.set_status(
             DesktopProviderStatusKind::Success,
-            "Provider 設定を読み込みました",
+            "AIの接続設定を読み込みました",
             "選択したモデルとBase URLをセッションまたは設定ファイルへ適用できます。",
             format!(
                 "Loaded {} models. {}",
@@ -1989,8 +1995,8 @@ impl DesktopState {
         let message = message.into();
         self.provider_config.set_status(
             DesktopProviderStatusKind::Error,
-            "Providerモデル一覧を読み込めません",
-            "Base URL と Provider の稼働状態を確認し、もう一度モデル一覧を読み込んでください。",
+            "AIのモデル一覧を読み込めません",
+            "接続先URLとAIサーバーの稼働状態を確認し、もう一度モデル一覧を読み込んでください。",
             message,
         );
         self.provider_config.provider_models = ensure_current_model(
@@ -2014,7 +2020,7 @@ impl DesktopState {
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.set_status(
             DesktopProviderStatusKind::Idle,
-            "Provider 設定を確認できます",
+            "AIの接続先とモデルを設定できます",
             "Base URL、mode、model を選択してセッションへ適用できます。",
             "",
         );
@@ -2261,7 +2267,7 @@ impl DesktopState {
         }
     }
 
-    fn apply_startup_overlay(&mut self) {
+    pub(crate) fn apply_startup_overlay(&mut self) {
         if self.view.hub_project_open && !self.prompt_review_owns_overlay() {
             return;
         }
@@ -4238,7 +4244,7 @@ mod tests {
 
             assert_eq!(
                 state.provider_config.provider_status.title,
-                "Providerモデル一覧を読み込めません"
+                "AIのモデル一覧を読み込めません"
             );
             assert_eq!(state.provider_config.provider_status.details, message);
             assert!(
@@ -4288,6 +4294,45 @@ mod tests {
             state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
         );
+    }
+
+    #[test]
+    fn execution_setup_opens_pc_connection_only_after_valid_saved_ai_config() {
+        use super::super::preferences::DesktopOnboardingIntent;
+        for intent in [
+            DesktopOnboardingIntent::Personal,
+            DesktopOnboardingIntent::Execution,
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.model.base_url = "http://127.0.0.1:1234".to_string();
+            config.model.model = "model-a".to_string();
+            config.docling.enabled = false;
+            let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
+            state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+            state.startup.resume_onboarding(intent);
+            assert!(state.startup.requires_initial_setup());
+            state.complete_initial_setup_after_persist();
+            assert!(!state.startup.requires_initial_setup());
+            assert_eq!(state.startup.onboarding_intent, None);
+            assert_eq!(
+                state.view.overlay,
+                if intent == DesktopOnboardingIntent::Execution {
+                    DesktopOverlay::HubConnection
+                } else {
+                    DesktopOverlay::None
+                }
+            );
+        }
+        let mut config = ResolvedConfig::default();
+        config.model.base_url.clear();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
+        state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+        state
+            .startup
+            .resume_onboarding(DesktopOnboardingIntent::Execution);
+        state.complete_initial_setup_after_persist();
+        assert!(state.startup.requires_initial_setup());
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
     }
 
     #[test]
@@ -4380,7 +4425,7 @@ mod tests {
                 .app_state
                 .status_message
                 .as_deref()
-                .is_some_and(|message| message.contains("Finish"))
+                .is_some_and(|message| message.contains("最後に設定を保存してください"))
         );
     }
 
@@ -4446,7 +4491,7 @@ mod tests {
                 .app_state
                 .status_message
                 .as_deref()
-                .is_some_and(|message| message.contains("Finish"))
+                .is_some_and(|message| message.contains("最後に設定を保存してください"))
         );
     }
 

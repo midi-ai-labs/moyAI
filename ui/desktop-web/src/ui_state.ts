@@ -681,7 +681,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged: false,
       accessChanged: false,
-      reason: projection.unavailable_reason || "root sessionを選択すると変更できます。",
+      reason: projection.unavailable_reason || "メインチャットを開くと変更できます。",
     };
   }
   if (!sameSessionSettingsTarget(local.owner, projection.target)) {
@@ -690,7 +690,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: true,
       providerChanged: false,
       accessChanged: false,
-      reason: "保存済みSession Settingsが別の操作で更新されました。変更を破棄するか、panelを開き直してください。",
+      reason: "このチャットの設定が別の操作で更新されました。入力中の変更を破棄するか、設定画面を開き直してください。",
     };
   }
   const providerChanged = draft.baseUrl !== baseline.baseUrl
@@ -705,7 +705,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: "実行中はProvider・Model・moyAI local context budgetを変更できません。Access modeだけを適用できます。",
+      reason: "接続先・モデル・入力整理上限は、実行が終わってから変更してください。実行中は承認方法だけを変更できます。",
     };
   }
   if (accessChanged && !projection.access_mutation_enabled) {
@@ -714,7 +714,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: "現在のruntime ownerではAccess modeを変更できません。",
+      reason: "現在は承認方法を変更できません。実行の状態が更新されるまでお待ちください。",
     };
   }
   if (!local.dirty) {
@@ -741,7 +741,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: local.activeMutation ? "Session Settingsを適用しています…" : "現在は適用できません。",
+      reason: local.activeMutation ? "チャットの設定を適用しています…" : "現在は適用できません。",
     };
   }
   return {
@@ -749,7 +749,7 @@ export function sessionSettingsMutationAvailability(
     staleTarget: false,
     providerChanged,
     accessChanged,
-    reason: "このroot sessionへ適用できます。",
+    reason: "このチャットに適用できます。",
   };
 }
 
@@ -866,7 +866,7 @@ export function finishSideChatCatalogLoad(
       configGeneration: request.configGeneration,
       models: [],
       status: "error",
-      error: "モデル一覧の応答対象が、現在のGlobal Side Chat設定と一致しませんでした。",
+      error: "モデル一覧の応答対象が、現在のサイドチャットの共通設定と一致しませんでした。",
       requestToken: request.token,
     });
     return { catalogAccepted: false, localStateChanged: true };
@@ -957,7 +957,7 @@ function rejectStaleSideChatCatalogEntry(
     configGeneration: request.configGeneration,
     models: [],
     status: "error",
-    error: "モデル一覧の読込中にGlobal Side Chat設定が変更されました。現在の設定で、もう一度モデル一覧を読み込んでください。",
+    error: "モデル一覧の読込中にサイドチャットの共通設定が変更されました。現在の設定で、もう一度モデル一覧を読み込んでください。",
     requestToken: request.token,
   });
 }
@@ -1229,7 +1229,7 @@ export function finishAgentExecutionLoad(
       generation: request.generation,
       expectedTarget: request.expectedTarget,
       projection: cached?.projection ?? null,
-      error: "読み込み結果の対象が現在のSub Agentと一致しませんでした。",
+      error: "読み込み結果の対象が現在のサブエージェントと一致しませんでした。",
     });
     clearAsyncTransaction(uiState.agentExecutionTransaction, request);
     return true;

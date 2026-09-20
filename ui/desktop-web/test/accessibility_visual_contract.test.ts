@@ -146,9 +146,9 @@ test("provider connection profile and prompt review controls expose accessible f
     send_enhanced_enabled: true,
   }));
 
-  assert.match(provider, /<label class="field-label" for="provider-profile">Connection type<\/label>/);
+  assert.match(provider, /<label class="field-label" for="provider-profile">接続方式<\/label>/);
   assert.match(provider, /<select id="provider-profile" aria-describedby="provider-profile-help">/);
-  assert.match(provider, /<label class="field-label" for="provider-api-key-env">API key environment variable \(optional\)<\/label>/);
+  assert.match(provider, /<label class="field-label" for="provider-api-key-env">APIキーの環境変数名（任意）<\/label>/);
   assert.match(review, /<label class="sr-only" for="review-draft">推敲文<\/label>/);
   assert.match(review, /<textarea id="review-draft">推敲文<\/textarea>/);
 });
@@ -202,7 +202,7 @@ test("composer and overlay text entry controls have stable explicit labels", () 
   assert.match(workspace, /<input id="workspace-input"/);
   assert.match(review, /<label class="sr-only" for="review-draft">推敲文<\/label>/);
   assert.match(review, /<textarea id="review-draft"/);
-  assert.match(palette, /<label class="sr-only" for="local-search">アクション、セッション、コマンドを検索<\/label>/);
+  assert.match(palette, /<label class="sr-only" for="local-search">操作、チャット、コマンドを検索<\/label>/);
   assert.match(palette, /<input id="local-search"/);
 });
 
@@ -219,13 +219,13 @@ test("palette command candidates match the query and retain their original mutat
   assert.doesNotMatch(byName, /<span>\/build-local<\/span>/);
   assert.match(byName, /data-action="insert-command" data-index="1"/);
   assert.match(byName, /<span>\/review-local<\/span>/);
-  assert.doesNotMatch(byName, /実行できるアクションはありません/);
+  assert.doesNotMatch(byName, /実行できる操作はありません/);
   const byPath = palette("資料");
   assert.doesNotMatch(byPath, /<span>\/build-local<\/span>/);
   assert.match(byPath, /data-action="insert-command" data-index="1"/);
   const noMatch = palette("no-matching-command-99283");
   assert.doesNotMatch(noMatch, /data-action="insert-command"/);
-  assert.match(noMatch, /実行できるアクションはありません/);
+  assert.match(noMatch, /実行できる操作はありません/);
   assert.deepEqual(rows.map(row => row.name), ["build-local", "review-local"]);
 });
 

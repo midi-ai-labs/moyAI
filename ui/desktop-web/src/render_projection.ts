@@ -51,6 +51,7 @@ export interface DesktopRenderLocalPresentation {
   readonly doclingReadinessRequestPending: boolean;
   readonly initialSetup: {
     readonly step: InitialSetupStep;
+    readonly guided?: boolean;
     readonly finishPending: boolean;
     readonly auxiliaryPendingKind: InitialSetupAuxiliaryKind | null;
     readonly importedSourcePath: string | null;
@@ -131,7 +132,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
         staleTarget: false,
         providerChanged: false,
         accessChanged: false,
-        reason: "root sessionを選択すると変更できます。",
+        reason: "メインチャットを開くと変更できます。",
       },
     },
     sideChat: {
@@ -223,6 +224,7 @@ function snapshotLocalPresentation(
     doclingReadinessRequestPending: local.doclingReadinessRequestPending ?? false,
     initialSetup: {
       step: initialSetup.step,
+      guided: initialSetup.guided ?? false,
       finishPending: initialSetup.finishPending,
       auxiliaryPendingKind: initialSetup.auxiliaryPendingKind ?? null,
       importedSourcePath: initialSetup.importedSourcePath ?? null,

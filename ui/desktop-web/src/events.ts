@@ -446,12 +446,12 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
         if (enhance) {
           synchronizeActionButtonAvailability(enhance, context);
           const title = projection.navigation_loading
-            ? "画面の切り替え完了後にEnhanceできます"
+            ? "画面の切り替え後に依頼文を整えられます"
             : projection.busy
-              ? "実行中はEnhanceできません"
+              ? "依頼文を整える操作は、実行が終わってから使えます"
             : text.trim().length === 0
               ? "依頼文を入力してください"
-              : "Enhance";
+              : "依頼文を整える";
           enhance.title = title;
           enhance.setAttribute("aria-label", title);
         }
@@ -1371,7 +1371,7 @@ function updateSessionSettingsControls(
   const status = document.querySelector<HTMLElement>("#session-settings-status");
   if (status) {
     status.textContent = local.activeMutation
-      ? "Session Settingsを適用しています…"
+      ? "チャットの設定を適用しています…"
       : availability.reason;
     status.classList.toggle("ok", validation?.ok !== false && (availability.enabled || !local.dirty));
     status.classList.toggle("error", validation?.ok === false);
@@ -1432,7 +1432,7 @@ function synchronizeSideChatCatalogControls(
       key: field.key,
       text: field.value,
     })))
-    : { ok: false, message: "Side ChatのLLM URL設定が見つかりません。" };
+    : { ok: false, message: "サイドチャットの接続先URL設定が見つかりません。" };
   const options = sideChatModelOptions(catalog, model);
   const select = document.querySelector<HTMLSelectElement>("#side-chat-model");
   if (select) {

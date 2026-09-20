@@ -67,7 +67,7 @@ moyai-runner sign-out --runner <提供RunnerのID>
 
 ## 実プロセス検証
 
-機械単位の製品policyを試験で変更しないため、`tests/runner_host.rs`の5件は専用gateです。current libtest内の`runner::shared::process_fixture::isolated_runner_process`が同じRunnerHost・named pipe・SharedWorkerを起動し、policyの保存先だけを`cfg(test)`で隔離します。IPC consumerはcurrent製品binaryを使います。
+機械単位の製品policyを試験で変更しないため、`tests/runner_host.rs`の6件は専用gateです。current libtest内の`runner::shared::process_fixture::isolated_runner_process`が同じRunnerHost・named pipe・SharedWorkerを起動し、policyの保存先だけを`cfg(test)`で隔離します。IPC consumerはcurrent製品binaryを使います。接続先変更のケースでは、停止済みHubに接続する受付停止中のRunnerに対し、実際のDesktop helperから静止確認のIPCを送り、同じprocess handleの終了待ち・同意保持・再起動後の受付停止も検証します。
 
 ```powershell
 # 直前に cargo test --lib --no-run で生成されたcurrent libtest.exeを指定する
@@ -75,4 +75,4 @@ $env:MOYAI_TEST_RUNNER_LIB_EXE = 'C:\...\target\debug\deps\moyai-<hash>.exe'
 cargo test --offline --test runner_host -- --ignored --test-threads=1
 ```
 
-環境変数がない状態を成功扱いしません。標準full suiteとこの5件の結果を別に記録します。通常の製品binaryにはmachine policyを迂回する設定・環境変数・起動flagはありません。
+環境変数がない状態を成功扱いしません。標準full suiteとこの6件の結果を別に記録します。通常の製品binaryにはmachine policyを迂回する設定・環境変数・起動flagはありません。

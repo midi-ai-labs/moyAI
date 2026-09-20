@@ -115,12 +115,33 @@ test("uncertain submission has an independent retry control and blocks a new dra
   local.projection!.submission_storage_error = "保存できません";
   assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "retry-submission", ""), false);
 });
+
+test("pending approval precedes the conversation with exact decision controls and visible operation scope", () => {
+  const local = sharedUiFixture();
+  local.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a", title: "Long job", input: { prompt: "long conversation".repeat(100) }, result: null, state: "running", awaiting_child_id: null, revision: 1, created_at_ms: 1, updated_at_ms: 1 };
+  local.projection!.approval = { id: "exact-approval", attempt_id: "attempt-a", status: "pending", can_decide: true, decision: null, expires_at_ms: 9999999999999, request: { access: "shell", summary: "Run a command", targets: ["C:/Approved/report.md"], details: ["Command: <write report>", "Workdir: C:/Approved"], outside_workspace: true, risks: ["external_mutation"] } };
+  let html = renderSharedWork(sharedWorkPresentation(local));
+  assert.match(html, /href="#shared-approval-title"/);
+  const start = html.indexOf('data-shared-region="approval"'), record = html.indexOf('data-shared-region="detail"');
+  assert.ok(start >= 0 && start < record);
+  const approval = html.slice(start, record), details = approval.indexOf("<details");
+  assert.ok(approval.indexOf("Command: &lt;write report&gt;") < details);
+  assert.ok(approval.indexOf("C:/Approved/report.md") < details);
+  assert.ok(approval.indexOf("作業フォルダー外") < details);
+  assert.ok(approval.indexOf("外部システムの変更") < details);
+  for (const kind of ["approve", "deny", "stop"]) assert.match(approval, new RegExp(`data-action="shared-${kind}" data-value="exact-approval"`));
+  assert.equal(sharedWorkActionEnabled(local, "approve", "stale-approval"), false);
+  local.projection!.approval.can_decide = false;
+  html = renderSharedWork(sharedWorkPresentation(local));
+  assert.doesNotMatch(html, /data-action="shared-(?:approve|deny|stop)"/);
+  assert.match(html, /担当者の承認待ち/);
+});
 test("retaining an active login form synchronizes native and accessible button availability together", () => {
   const attributes = new Map([["aria-disabled", "true"]]);
   const button = { dataset: { action: "shared-login" }, disabled: true, textContent: "ログイン", setAttribute: (name: string, value: string) => attributes.set(name, value) };
-  const replacement = { disabled: false, textContent: "ログイン", getAttribute: () => "false" };
+  const replacement = { dataset: { action: "shared-login" }, disabled: false, textContent: "ログイン", getAttribute: () => "false" };
   const region = { contains: () => true, isEqualNode: () => false, querySelectorAll: (selector: string) => selector.startsWith("button") ? [button] : [] };
-  const nextRegion = { dataset: { sharedRegion: "login" }, querySelector: () => replacement, querySelectorAll: () => [] };
+  const nextRegion = { dataset: { sharedRegion: "login" }, querySelector: () => replacement, querySelectorAll: (selector: string) => selector.startsWith("button") ? [replacement] : [] };
   const current = { dataset: { sharedOwner: "same-person" }, querySelector: () => region };
   const next = { dataset: { sharedOwner: "same-person" }, querySelectorAll: () => [nextRegion] };
   const original = Object.getOwnPropertyDescriptor(globalThis, "document");
@@ -130,6 +151,47 @@ test("retaining an active login form synchronizes native and accessible button a
     assert.equal(button.disabled, false);
     assert.equal(attributes.get("aria-disabled"), "false");
   } finally { if (original) Object.defineProperty(globalThis, "document", original); else delete (globalThis as Record<string, unknown>).document; }
+});
+
+test("resolved approvals show only a Japanese result and keep their original scope in closed details", () => {
+  const local = sharedUiFixture();
+  const approval = { id: "approval-a", attempt_id: "attempt-a", status: "pending", can_decide: true, decision: null as string | null, expires_at_ms: 9999999999999, request: { access: "shell", summary: "Original operation", targets: ["C:/Approved/report.md"], details: ["Command: write report"], outside_workspace: true, risks: ["external_mutation"] } };
+  local.projection!.approval = approval;
+  const pendingKey = renderSharedWork(local).match(/<details data-details-key="(shared-approval-[^"]+)"/)?.[1];
+  for (const [status, decision, title] of [
+    ["decided", "approve", "この操作を許可しました"], ["consumed", "approve", "この操作を許可しました"],
+    ["consumed", "deny", "この操作を拒否しました"], ["decided", "stop", "仕事の停止を指示しました"],
+    ["expired", "approve", "承認の有効期限が切れました"], ["cancelled", "approve", "この承認依頼は取り消されました"],
+    ["future-status", "future-decision", "承認の記録"],
+  ]) {
+    approval.status = status; approval.decision = decision;
+    const html = renderSharedWork(local), start = html.indexOf('data-shared-region="approval"');
+    const section = html.slice(start, html.indexOf("</section>", start));
+    assert.match(section, new RegExp(`<summary[^>]*>${title}`));
+    assert.doesNotMatch(section, /<details[^>]*\sopen(?:\s|>)/);
+    const key = section.match(/<details data-details-key="([^"]+)"/)?.[1];
+    assert.notEqual(key, pendingKey, "an expanded pending explanation must not keep the settled record expanded");
+    const summaryEnd = section.indexOf("</summary>");
+    assert.doesNotMatch(section.slice(0, summaryEnd), /Original operation|Command:|C:\/Approved|consumed|approve|expired|cancelled|future-status|future-decision/);
+    for (const original of ["Original operation", "Command: write report", "C:/Approved/report.md", "作業フォルダー外", "外部システムの変更"]) assert.ok(section.indexOf(original) > summaryEnd, original);
+    assert.doesNotMatch(section, /data-action="shared-(?:approve|deny|stop)"/);
+    assert.doesNotMatch(html, /href="#shared-approval-title"/);
+  }
+});
+
+test("typing during login refresh keeps the two login method buttons distinct", () => {
+  const buttons = ["setup", "password"].map(value => ({ dataset: { action: "shared-auth-mode", value }, disabled: false, textContent: value, setAttribute() {} }));
+  const replacements = buttons.map(button => ({ ...button, textContent: `${button.dataset.value}-label` }));
+  const region = { contains: () => true, isEqualNode: () => false, querySelectorAll: (selector: string) => selector.startsWith("button") ? buttons : [] };
+  const nextRegion = { dataset: { sharedRegion: "login" }, querySelectorAll: (selector: string) => selector.startsWith("button") ? replacements : [] };
+  const current = { dataset: { sharedOwner: "same-person" }, querySelector: () => region };
+  const next = { dataset: { sharedOwner: "same-person" }, querySelectorAll: () => [nextRegion] };
+  const original = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "document", { configurable: true, value: { activeElement: { matches: () => true } } });
+  try {
+    assert.equal(retainSharedWorkSurface(current as unknown as HTMLElement, next as unknown as HTMLElement), true);
+    assert.deepEqual(buttons.map(button => button.textContent), ["setup-label", "password-label"]);
+  } finally { if (original) Object.defineProperty(globalThis, "document", original); else Reflect.deleteProperty(globalThis, "document"); }
 });
 test("logout conceals prior data immediately and discards an already running poll", async () => {
   const local = sharedUiFixture(); let finishPoll!: (value: unknown) => void;

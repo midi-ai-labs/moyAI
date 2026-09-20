@@ -116,13 +116,13 @@ export function renderLocalConfirmation(confirm: LocalConfirmation, pending = fa
     return `
       <div class="modal-backdrop">
         <section class="modal confirmation settings-close-confirmation" role="alertdialog" data-modal="session-settings-close-confirmation" aria-modal="true" aria-labelledby="session-settings-close-confirm-title" aria-describedby="session-settings-close-confirm-summary" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
-          <h2 id="session-settings-close-confirm-title">このセッションの変更を破棄しますか？</h2>
-          <div class="confirm-summary" id="session-settings-close-confirm-summary">Session Settingsを閉じると、未適用の入力は破棄されます。</div>
+          <h2 id="session-settings-close-confirm-title">このチャットの未適用の変更を破棄しますか？</h2>
+          <div class="confirm-summary" id="session-settings-close-confirm-summary">チャットの設定を閉じると、未適用の入力は破棄されます。</div>
           <dl class="confirm-details">
             <dt>対象</dt><dd>${escapeHtml(confirm.expectedTarget.rootSessionId)}</dd>
-            <dt>影響</dt><dd>保存済みのroot session設定とGlobal Settingsには影響しません。</dd>
+            <dt>影響</dt><dd>保存済みのチャット設定と共通設定はそのまま残ります。</dd>
           </dl>
-          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Session Settingsを閉じています。" : escapeHtml(error)}</div>
+          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "チャットの設定を閉じています。" : escapeHtml(error)}</div>
           <div class="modal-actions">
             <button data-action="cancel-local-confirm" ${pending ? "disabled" : "autofocus"}>キャンセル</button>
             <button class="danger-button" data-action="confirm-session-settings-discard-close" ${pending ? "disabled" : ""}>${pending ? "閉じています…" : "変更を破棄して閉じる"}</button>
@@ -139,12 +139,12 @@ export function renderLocalConfirmation(confirm: LocalConfirmation, pending = fa
       <div class="modal-backdrop">
         <section class="modal confirmation settings-close-confirmation" role="alertdialog" data-modal="settings-close-confirmation" aria-modal="true" aria-labelledby="settings-close-confirm-title" aria-describedby="settings-close-confirm-summary" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
           <h2 id="settings-close-confirm-title">未保存の変更を破棄しますか？</h2>
-          <div class="confirm-summary" id="settings-close-confirm-summary">Settingsを閉じると、入力中の変更は破棄されます。この操作は元に戻せません。</div>
+          <div class="confirm-summary" id="settings-close-confirm-summary">設定画面を閉じると、入力中の変更は破棄されます。この操作は元に戻せません。</div>
           <dl class="confirm-details">
             <dt>設定対象</dt><dd>${escapeHtml(target)}</dd>
-            <dt>影響</dt><dd>保存済みの設定と現在の実行中セッションには影響しません。</dd>
+            <dt>影響</dt><dd>保存済みの設定と実行中のチャットはそのまま残ります。</dd>
           </dl>
-          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Settingsを閉じています。" : escapeHtml(error)}</div>
+          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "設定画面を閉じています。" : escapeHtml(error)}</div>
           <div class="modal-actions">
             <button data-action="cancel-local-confirm" ${pending ? "disabled" : "autofocus"}>キャンセル</button>
             <button class="danger-button" data-action="confirm-settings-discard-close" ${pending ? "disabled" : ""}>${pending ? "閉じています…" : "変更を破棄して閉じる"}</button>
@@ -157,16 +157,16 @@ export function renderLocalConfirmation(confirm: LocalConfirmation, pending = fa
   const unarchive = confirm.kind === "unarchive_session";
   const rollback = confirm.kind === "rollback_session";
   const target = confirm.kind === "project" ? "プロジェクト" : "チャット";
-  const verb = archive ? "アーカイブ" : unarchive ? "復元" : rollback ? "ロールバック" : "削除";
+  const verb = archive ? "アーカイブ" : unarchive ? "復元" : rollback ? "巻き戻し" : "削除";
   const consequence = archive
-    ? "このチャットを通常の一覧から隠します。履歴、実行証跡、ワークスペース内の実ファイルは削除しません。"
+    ? "このチャットを通常の一覧から隠します。履歴、実行記録、作業フォルダー内のファイルは削除しません。"
     : unarchive
-      ? "このチャットを通常の一覧に戻します。履歴、実行証跡、ワークスペース内の実ファイルは変更しません。"
+      ? "このチャットを通常の一覧に戻します。履歴、実行記録、作業フォルダー内のファイルは変更しません。"
     : rollback
-      ? "canonical history の最新 turn を削除し、session lifecycle と表示projectionを残った履歴から再構成します。ワークスペース内の実ファイルは変更しません。"
+      ? "最後の実行で送った最初の依頼、途中の追加指示、回答・実行記録をまとめて履歴から削除し、その実行前の会話に戻します。作業フォルダー内のファイルは元に戻りません。"
     : confirm.kind === "project"
-      ? "履歴とセッション情報を削除します。ワークスペース内の実ファイルは削除しません。"
-      : "このチャット履歴を削除します。ワークスペース内の実ファイルは削除しません。";
+      ? "チャットと履歴を削除します。作業フォルダー内のファイルは残ります。"
+      : "このチャットの履歴を削除します。作業フォルダー内のファイルは残ります。";
   const archiveStateChange = archive || unarchive;
   const historyMutation = rollback;
   return `

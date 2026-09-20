@@ -18,6 +18,38 @@ function fixture(p = projection()) {
   const context = { uiState: { deviceNetwork: local }, getViewState: () => view, rerender() {} } as unknown as ActionContext;
   return { local, view, context };
 }
+test("local consent hands off to the administrator without claiming AI or project readiness", () => {
+  const { local } = fixture(projection({ state: "not_selected" }));
+  let html = renderDeviceExecution(local);
+  assert.match(html, /data-details-key="device-execution-setup" open/);
+  assert.doesNotMatch(html, /このPCの実行設定は保存済みです/);
+  local.execution!.review = { id: "review-a", directory: "C:/NotYetConsented", access_mode: "default" };
+  assert.doesNotMatch(renderDeviceExecution(local), /このPCの実行設定は保存済みです/);
+  local.execution = projection({ state: "not_selected", directory: "C:/Approved", access_mode: "default" });
+  html = renderDeviceExecution(local);
+  assert.match(html, /このPCの実行設定は保存済みです/);
+  assert.match(html, /次はHub管理者の操作です/);
+  assert.ok(html.indexOf("次はHub管理者") < html.indexOf('data-details-key="device-execution-setup"'));
+  assert.doesNotMatch(html, /data-details-key="device-execution-setup" open/);
+  assert.doesNotMatch(html, /実行するPCとしての割り当てはありません|実行機能が動作中/);
+  local.execution.state = "unavailable";
+  local.execution.error = "起動を確認できません";
+  assert.doesNotMatch(renderDeviceExecution(local), /次はHub管理者の操作です/);
+});
+test("sign-in autostart is explicit, limited to a consented PC and sent with its revision", async () => {
+  const { local, context } = fixture();
+  assert.equal(deviceExecutionActionEnabled(local, "install-autostart"), false);
+  local.execution = projection({ directory: "C:/Approved", autostart: false, state: "ready" });
+  assert.equal(deviceExecutionActionEnabled(local, "install-autostart"), true);
+  const calls: unknown[] = [];
+  await withInvoke(async (_name, args) => { calls.push(args); return projection({ revision: "2", directory: "C:/Approved", autostart: true, state: "ready" }); }, async () => {
+    await deviceExecutionAction(context, "install-autostart");
+  });
+  assert.deepEqual(calls, [{ expectedRevision: "1", request: { kind: "install_autostart" } }]);
+  assert.equal(deviceExecutionActionEnabled(local, "install-autostart"), false);
+  assert.equal(deviceExecutionActionEnabled(local, "remove-autostart"), true);
+  assert.match(renderDeviceExecution(local), /サインアウト中/);
+});
 async function withInvoke(invoke: (name: string, args: Record<string, unknown>) => Promise<unknown>, run: () => Promise<void>) {
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke } } });

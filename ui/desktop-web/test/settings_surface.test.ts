@@ -329,7 +329,7 @@ test("settings surface preserves the live subtree only for the same exact owner 
       model: "gemma-side",
       can_send: true,
     },
-  })), true, "runtime Side Chat creation must preserve browser-owned Global Settings editors");
+  })), true, "runtime サイドチャット creation must preserve browser-owned 共通設定 editors");
   const configured = settingsState({
     side_chat: {
       ...before.side_chat,
@@ -341,7 +341,7 @@ test("settings surface preserves the live subtree only for the same exact owner 
   });
   assert.equal(sameSettingsSurface(configured, settingsState({
     side_chat: { ...configured.side_chat, system_prompt: "new prompt" },
-  })), true, "captured Side Chat prompt changes are outside the Global Settings owner");
+  })), true, "captured サイドチャット prompt changes are outside the 共通設定 owner");
   assert.equal(sameSettingsSurface(configured, settingsState({
     side_chat: {
       ...configured.side_chat,
@@ -349,10 +349,10 @@ test("settings surface preserves the live subtree only for the same exact owner 
       can_send: false,
       can_cancel: true,
     },
-  })), true, "runtime Side Chat activity does not replace Global Settings controls");
+  })), true, "runtime サイドチャット activity does not replace 共通設定 controls");
   assert.equal(sameSettingsSurface(configured, settingsState({
     side_chat: { ...configured.side_chat, deleting: true, can_send: false },
-  })), true, "runtime Side Chat deletion does not replace Global Settings controls");
+  })), true, "runtime サイドチャット deletion does not replace 共通設定 controls");
   assert.equal(settingsSurfaceIdentity(settingsState({ confirmation_visible: true })), null);
 });
 

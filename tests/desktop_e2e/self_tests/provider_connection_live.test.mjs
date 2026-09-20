@@ -512,12 +512,12 @@ test("live terminal helper classifies deterministic pass, pending, and product f
   assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
     projection: {
       selected_session_title: "接続確認 [実行中] 01M0TEST",
-      status_message: "Provider応答受信中",
+      status_message: "AIの回答を受信中",
     },
     surface: {
       terminal_dom: {
         topbar_title: { count: 1, visible: true, text: "接続確認 [実行中] 01M0TEST" },
-        topbar_status: { count: 1, visible: true, text: "Provider応答受信中" },
+        topbar_status: { count: 1, visible: true, text: "AIの回答を受信中" },
       },
     },
   })), "fail");
@@ -535,7 +535,7 @@ test("live terminal helper classifies deterministic pass, pending, and product f
     surface: {
       terminal_dom: {
         topbar_title: { count: 1, visible: true, text: "接続確認 [実行中] 01M0TEST" },
-        topbar_status: { count: 1, visible: true, text: "Provider応答受信中" },
+        topbar_status: { count: 1, visible: true, text: "AIの回答を受信中" },
         visible_run_strip_count: 1,
         visible_task_activity_indicator_count: 2,
         visible_selected_activity_row_count: 1,

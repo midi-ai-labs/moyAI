@@ -144,7 +144,7 @@ import {
   type DesktopRenderModel,
 } from "./render_projection";
 import { isRegularModalOverlay, localModalIdentity, modalIdentity, modalIsOpen } from "./modal_state";
-import { autoRefreshAllowed, createSnapshotRefresh, installRuntimePolling, runtimePollingRequired } from "./polling_state";
+import { autoRefreshAllowed, createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation, runtimePollingRequired } from "./polling_state";
 import {
   reconcileTaskActivityAnimationEpoch,
   taskActivityAnimationDelay,
@@ -359,6 +359,10 @@ installInteractionEventGate({
 installComposerFocusInteractionInvalidation();
 installWindowMaximizedSync();
 void refresh();
+void installSnapshotInvalidation(
+  onChanged => desktopWindow.listen("desktop-state-changed", onChanged),
+  refresh,
+).catch(reportError);
 installRuntimePolling(window, document, () => Boolean(
     currentState
     && (currentState.hub_project_open === true || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || Boolean(uiState.sharedWork.projection?.hub_url) || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
@@ -921,6 +925,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     doclingReadinessRequestPending: doclingReadinessRequestPending(uiState),
     initialSetup: {
       step: uiState.initialSetup.step,
+      guided: uiState.initialSetup.guided,
       finishPending: initialSetupFinishPending(uiState.initialSetup),
       auxiliaryPendingKind: initialSetupAuxiliaryPendingKind(
         uiState.initialSetupAuxiliary,
@@ -984,7 +989,7 @@ function reconcileSettingsFlowState(state: DesktopWebState): void {
     state.config_target,
   );
   if (state.startup.initial_setup_required && setupTarget !== null) {
-    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget);
+    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget, state.startup.onboarding_intent === "personal" || state.startup.onboarding_intent === "execution");
   }
 
   const sessionProjection = state.session_settings;

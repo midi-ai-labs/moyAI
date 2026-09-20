@@ -146,7 +146,8 @@ export interface StartupProjection {
   detail: string;
   action_overlay: string;
   initial_setup_required: boolean;
-  initial_setup_reason: "config_missing" | "provider_invalid" | "optional_tool_invalid" | null;
+  initial_setup_reason: "config_missing" | "setup_unfinished" | "provider_invalid" | "optional_tool_invalid" | null;
+  onboarding_intent?: "welcome" | "personal" | "execution" | "team" | "hosting" | null;
   global_config_path: string | null;
   setup_target: InitialSetupMutationTarget | null;
   checks: StartupCheckProjection[];
@@ -301,6 +302,7 @@ export type DesktopStatusCode =
   | "image_attachment_invalid"
   | "permission_policy_denied"
   | "config_import_failed"
+  | "initial_setup_preferences_save_failed"
   | "approval_aborted"
   | "user_stopped"
   | "agent_interrupted"

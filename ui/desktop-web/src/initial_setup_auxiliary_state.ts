@@ -7,7 +7,7 @@ import type {
   InitialSetupMutationTarget,
 } from "./types.ts";
 
-export type InitialSetupAuxiliaryKind = "import" | "docling_readiness";
+export type InitialSetupAuxiliaryKind = "import" | "docling_readiness" | "purpose";
 
 export interface InitialSetupAuxiliaryRequest {
   readonly token: bigint;

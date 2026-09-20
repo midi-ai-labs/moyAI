@@ -9,6 +9,7 @@ import {
   TAURI_MAIN_WINDOW_CLASS,
   captureOwnedWindowPng,
   closeOwnedNativeDialog,
+  invokeOwnedNativeDialogButton,
   closeOwnedWindowForCleanup,
   dragExactOwnedWindow,
   exactOwnedWindowDragObserved,
@@ -55,6 +56,33 @@ function snapshot(windows, foregroundRoot = null, overrides = {}) {
     ...overrides,
   };
 }
+
+test("standard native review buttons require exact owner, displayed trust and single delivery evidence", async () => {
+  const candidate = windowRow("0x1234", { class_name: "#32770" });
+  const args = { executionRoot: "C:\\execution", ownerPath: "C:\\execution\\owner.json", candidate,
+    buttonId: 1, expectedTitle: "Review", expectedText: ["https://hub:9471", "sha256-value"] };
+  const accepted = { window: candidate, button: { process_id: owner.process_id, control_id: 1, class_name: "Button",
+    thread_id: candidate.thread_id, parent_hwnd: candidate.hwnd, root_hwnd: candidate.hwnd, enabled: true, visible: true }, dialog_title: "Review", dialog_text: "https://hub:9471\nsha256-value",
+    attempt_count: 1, call_returned: true, native_control_verified: true, representative_input: true, cleanup_only: false, fallback_used: false };
+  const calls = [];
+  const result = await invokeOwnedNativeDialogButton(args, { invoke: async (action, parameters) => { calls.push({ action, parameters }); return accepted; } });
+  assert.equal(result.attempt_count, 1);
+  assert.equal(calls[0].action, "InvokeDialogButton");
+  assert.equal(calls[0].parameters.WindowHandle, candidate.hwnd);
+  assert.deepEqual(JSON.parse(calls[0].parameters.ExpectedDialogTextJson), args.expectedText);
+  for (const mutate of [
+    x => { x.window.process_id++; }, x => { x.window.hwnd = "0x9999"; }, x => { x.dialog_title = "Other"; },
+    x => { x.dialog_text = "https://hub:9471"; }, x => { x.button.control_id = 2; },
+    x => { x.button.process_id++; }, x => { x.button.visible = false; }, x => { x.button.parent_hwnd = "0x9999"; }, x => { x.attempt_count = 2; },
+    x => { x.fallback_used = true; }, x => { x.call_returned = false; },
+  ]) {
+    const changed = structuredClone(accepted); mutate(changed);
+    await assert.rejects(() => invokeOwnedNativeDialogButton(args, { invoke: async () => changed }), error => error.code === "native-dialog-button-invalid");
+  }
+  let invoked = false;
+  await assert.rejects(() => invokeOwnedNativeDialogButton({ ...args, buttonId: 6 }, { invoke: async () => { invoked = true; } }), /IDOK or IDCANCEL/);
+  assert.equal(invoked, false);
+});
 
 test("fresh native dialog selection requires the exact-owner visible foreground root and tolerates auxiliary roots", () => {
   const main = windowRow("0x100", { class_name: "TauriMain", thread_id: 700 });

@@ -221,7 +221,7 @@ function heldSample() {
           "作業中",
           "実行中",
           "フェーズ",
-          "Provider要求処理中",
+          "AIの応答待ち",
           "手順",
           "Provider request",
           "request_in_flight",

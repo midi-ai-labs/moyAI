@@ -67,7 +67,7 @@ use super::async_ops::{
 use super::models::{DesktopSnapshot, DesktopTranscriptRow, DesktopTranscriptRowKind};
 use super::navigation::NavigationRequestId;
 use super::open_session::OpenSessionView;
-use super::preferences::DesktopPreferences;
+use super::preferences::{DesktopOnboardingIntent, DesktopPreferences};
 use super::query::{
     DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, LoadedSessionDetail,
     load_latest_session_detail, load_session_detail, load_snapshot, load_snapshot_continue_last,
@@ -1960,6 +1960,199 @@ mod command_projection_owner_tests {
         assert!(controller.state.navigation_loading());
         assert_eq!(controller.state.app_state.current_session_id, None);
         assert!(controller.next_web_state().unwrap().hub.is_some());
+    }
+
+    #[tokio::test]
+    async fn initial_setup_purpose_restores_team_without_replacing_direct_config() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &project_root);
+        let before = serde_json::to_value(controller.state.global_config()).unwrap();
+        controller
+            .choose_initial_setup_purpose(DesktopOnboardingIntent::Team)
+            .unwrap();
+        assert!(controller.state.view.hub_project_open);
+        assert_eq!(
+            serde_json::to_value(controller.state.global_config()).unwrap(),
+            before
+        );
+        let preferences = controller.preferences.clone();
+        let app = build_test_app(&project_root, controller.app.store.clone()).await;
+        let args = DesktopArgs {
+            directory: Some(project_root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let restarted =
+            DesktopController::new_with_preferences_and_persistence(app, args, preferences, false)
+                .await
+                .unwrap();
+        assert!(restarted.state.view.hub_project_open);
+        assert_eq!(
+            restarted.state.view.overlay,
+            super::super::state::DesktopOverlay::None
+        );
+        assert_eq!(
+            restarted.preferences.onboarding_intent,
+            Some(DesktopOnboardingIntent::Team)
+        );
+    }
+
+    #[test]
+    fn initial_setup_saved_connection_survives_preferences_failure() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../project_sandbox/desktop-preferences-persistence-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::tempdir_in(base).unwrap();
+        let config = temp.path().join("config.toml");
+        let blocked_preferences = temp.path().join("preferences-file-is-a-directory");
+        std::fs::write(&config, "").unwrap();
+        std::fs::create_dir(&blocked_preferences).unwrap();
+        // Use a dedicated child so process-wide config/preferences paths never
+        // alter another test or the real Windows user's profile.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "desktop::app::command_projection_owner_tests::initial_setup_saved_connection_preferences_failure_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOYAI_CONFIG_PATH", &config)
+            .env("MOYAI_DESKTOP_PREFS_PATH", &blocked_preferences)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Dedicated child process for isolated config/preferences persistence failure"]
+    async fn initial_setup_saved_connection_preferences_failure_fixture() {
+        let config = Utf8PathBuf::from(std::env::var("MOYAI_CONFIG_PATH").unwrap());
+        let preferences = Utf8PathBuf::from(std::env::var("MOYAI_DESKTOP_PREFS_PATH").unwrap());
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../project_sandbox/desktop-preferences-persistence-tests")
+            .canonicalize()
+            .unwrap();
+        assert!(
+            config
+                .as_std_path()
+                .canonicalize()
+                .unwrap()
+                .starts_with(&base)
+        );
+        assert_eq!(
+            preferences,
+            config.with_file_name("preferences-file-is-a-directory")
+        );
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        controller.preferences.onboarding_intent = Some(DesktopOnboardingIntent::Personal);
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &root);
+        controller.persist_preferences_to_disk = true;
+        let service = crate::device_network::DeviceNetworkService::for_workspace(
+            root.join("device-network"),
+            root.clone(),
+            controller.app.store.clone(),
+            controller.state.global_config().clone(),
+        )
+        .await
+        .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let shared = crate::device_network::SharedHubConfig {
+            hub_url: "https://127.0.0.1:19471".into(),
+            ca_certificate_pem: params.self_signed(&key).unwrap().pem(),
+        };
+        let before = service.projection_now();
+        let prepared = service
+            .prepare_configuration(shared.clone(), &before.revision, &before.generation)
+            .await
+            .unwrap();
+        let result = service
+            .commit_configuration(prepared, |saved| {
+                controller
+                    .save_device_network_config(saved, true)
+                    .map_err(|_| crate::device_network::DeviceError::Storage)
+            })
+            .await;
+        let persisted: toml::Value =
+            toml::from_str(&std::fs::read_to_string(global_config_path().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted["device_network"]["hub_url"].as_str(),
+            Some(shared.hub_url.as_str())
+        );
+        assert_eq!(controller.state.global_config().device_network, shared);
+        assert!(
+            result.is_ok(),
+            "the connection is already persisted; preferences failure cannot turn its commit into an error: {result:?}"
+        );
+        assert_eq!(service.projection_now().hub_url, shared.hub_url);
+        assert!(
+            controller
+                .finish_initial_setup_after_device_network_persist()
+                .is_err()
+        );
+        assert_eq!(
+            controller.preferences.onboarding_intent,
+            Some(DesktopOnboardingIntent::Personal)
+        );
+        assert!(controller.state.startup.requires_initial_setup());
+        assert_eq!(service.projection_now().hub_url, shared.hub_url);
+        // The failed completion is retryable without rolling back or importing
+        // the already committed connection again.
+        std::fs::remove_dir(&preferences).unwrap();
+        controller
+            .finish_initial_setup_after_device_network_persist()
+            .unwrap();
+        assert!(!controller.state.startup.requires_initial_setup());
+        assert_eq!(controller.preferences.onboarding_intent, None);
+        assert_eq!(service.projection_now().hub_url, shared.hub_url);
+    }
+
+    #[tokio::test]
+    async fn initial_setup_purpose_restores_personal_review_after_config_creation() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &project_root);
+        controller
+            .choose_initial_setup_purpose(DesktopOnboardingIntent::Personal)
+            .unwrap();
+        let app = build_test_app(&project_root, controller.app.store.clone()).await;
+        let args = DesktopArgs {
+            directory: Some(project_root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let restarted = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            controller.preferences.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(restarted.state.startup.requires_initial_setup());
+        assert_eq!(
+            restarted.state.view.overlay,
+            super::super::state::DesktopOverlay::InitialSetup
+        );
+        assert_eq!(
+            restarted.state.startup.onboarding_intent,
+            Some(DesktopOnboardingIntent::Personal)
+        );
     }
 
     #[tokio::test]
@@ -10274,6 +10467,10 @@ impl DesktopController {
             global_config_path().ok(),
             &app.workspace.root,
         );
+        if let Some(intent) = preferences.onboarding_intent {
+            state.startup.resume_onboarding(intent);
+            state.apply_startup_overlay();
+        }
         if let Some(opacity) = preferences.window_opacity_percent {
             state.set_window_opacity_percent(opacity);
         }
@@ -10329,6 +10526,9 @@ impl DesktopController {
             authorized_attachment_assets: BTreeSet::new(),
         };
         controller.reconcile_runtime_listener_with_open_session();
+        if controller.preferences.onboarding_intent == Some(DesktopOnboardingIntent::Team) {
+            controller.state.show_shared_work();
+        }
         controller.persist_preferences();
         Ok(controller)
     }
@@ -10604,7 +10804,7 @@ impl DesktopController {
                 provider_profile: defaults.provider_profile.as_str().to_string(),
                 enabled: valid && !deleting && active.is_none() && durable.status != SessionStatus::Running,
                 reason: if valid { "この会話はHubで作成されました。履歴を保持したまま、下記のDirect設定をこの会話へ一度だけ登録します。" }
-                    else { "Side ChatのDirect接続先とモデルを設定してください。既存の会話履歴は保持されます。" }.to_string(),
+                    else { "サイドチャットの直接接続先とモデルを設定してください。会話履歴はそのまま残ります。" }.to_string(),
             }
         });
         DesktopSideChatProjection {
@@ -10700,7 +10900,7 @@ impl DesktopController {
             .map_err(|error| error.to_string())?
         {
             if existing.delete_requested_at_ms.is_some() {
-                return Err("Side Chatの削除完了を待ってください。".into());
+                return Err("サイドチャットの削除が終わるまでお待ちください。".into());
             }
             self.side_chat_errors.remove(&owner_session_id);
             return Ok(());
@@ -10722,11 +10922,13 @@ impl DesktopController {
         if hub_origin {
             let hub = hub.expect("Hub mode");
             if !hub.can_enable_side_chat_hub {
-                return Err("Hubの接続とSide Chatのモデル選択を確認・保存してください。".into());
+                return Err(
+                    "Hubに接続し、サイドチャットで使うモデルを選んで保存してください。".into(),
+                );
             }
             let review = hub
                 .side_chat_review
-                .ok_or_else(|| "Side ChatのHubモデルを確認してください。".to_string())?;
+                .ok_or_else(|| "サイドチャットで使うHubのモデルを選んでください。".to_string())?;
             defaults.base_url = hub.endpoint;
             defaults.model = review.selection.preferred_model_id;
             defaults.provider_profile = ProviderProfile::OpenAiCompatible;
@@ -10759,7 +10961,10 @@ impl DesktopController {
                 hub.projection_now().side_chat_mode != crate::hub::HubRouteMode::Direct
             })
         {
-            return Err("Side ChatをDirectに切り替え、実行完了後に設定を適用してください。".into());
+            return Err(
+                "サイドチャットを直接接続に切り替え、実行が終わってから設定を適用してください。"
+                    .into(),
+            );
         }
         self.app
             .store
@@ -13187,7 +13392,7 @@ impl DesktopController {
     pub(crate) fn save_device_network_config(
         &mut self,
         shared: &crate::device_network::SharedHubConfig,
-        finish_setup: bool,
+        validate_initial_setup: bool,
     ) -> Result<(), String> {
         let path =
             crate::config::loader::global_config_path().map_err(|_| "storage_error".to_string())?;
@@ -13196,7 +13401,7 @@ impl DesktopController {
             &self.state.global_config().device_network,
             shared,
             |candidate| {
-                if finish_setup
+                if validate_initial_setup
                     && super::startup::DesktopStartupState::begin(
                         true,
                         Some(path.clone()),
@@ -13212,11 +13417,18 @@ impl DesktopController {
         )?;
         self.app.config = config.clone();
         self.adopt_global_config_without_network(config);
-        if finish_setup {
-            self.pending_initial_setup_config_import = None;
-            self.state.complete_initial_setup_after_persist();
-            self.state.show_hub_editor();
-        }
+        Ok(())
+    }
+
+    /// The connection has its own completed commit. Failure here leaves the
+    /// first-use latch pending without reporting that saved connection as lost.
+    pub(crate) fn finish_initial_setup_after_device_network_persist(
+        &mut self,
+    ) -> Result<(), String> {
+        self.persist_onboarding_intent(None)?;
+        self.pending_initial_setup_config_import = None;
+        self.state.complete_initial_setup_after_persist();
+        self.state.show_hub_editor();
         Ok(())
     }
 
@@ -13771,6 +13983,11 @@ impl DesktopController {
                 return false;
             }
         };
+        if let Err(error) = self.persist_onboarding_intent(None) {
+            self.state
+                .set_status_message(format!("初回案内を保存できませんでした: {error}"));
+            return false;
+        }
         self.pending_initial_setup_config_import = None;
         self.state.complete_initial_setup_after_persist();
         if self.state.startup.requires_initial_setup() {
@@ -14434,6 +14651,32 @@ impl DesktopController {
                 ),
             ],
         )
+    }
+
+    fn persist_onboarding_intent(
+        &mut self,
+        intent: Option<DesktopOnboardingIntent>,
+    ) -> Result<(), String> {
+        let mut candidate = self.preferences.clone();
+        candidate.onboarding_intent = intent;
+        if self.persist_preferences_to_disk {
+            candidate.save()?;
+        }
+        self.preferences = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn choose_initial_setup_purpose(
+        &mut self,
+        intent: DesktopOnboardingIntent,
+    ) -> Result<(), String> {
+        self.persist_onboarding_intent(Some(intent))?;
+        // Choosing a route does not replace the config draft/import owner.
+        self.state.startup.onboarding_intent = Some(intent);
+        if intent == DesktopOnboardingIntent::Team {
+            self.state.show_shared_work();
+        }
+        Ok(())
     }
 
     fn persist_preferences(&mut self) {

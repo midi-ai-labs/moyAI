@@ -37,6 +37,12 @@ impl AppBootstrap {
         let sqlite = SqliteStore::open(&storage_paths)?;
         sqlite.migrate()?;
         let store = StoreBundle::new(sqlite);
+        #[cfg(feature = "tauri-desktop")]
+        if matches!(command, CliCommand::Desktop(_)) {
+            let config_exists = crate::config::loader::global_config_path()?.exists();
+            crate::desktop::preferences::DesktopPreferences::prepare_initial_setup(config_exists)
+                .map_err(AppBootstrapError::Message)?;
+        }
         ConfigLoader::ensure_default_global_config()?;
         let restored = restore_run_session_directory(start_dir, run_args, &store).await?;
         let root_mode = restored

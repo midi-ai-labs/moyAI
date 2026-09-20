@@ -161,7 +161,7 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       max_output_tokens_inherited: true,
       provider_mutation_enabled: false,
       access_mutation_enabled: false,
-      unavailable_reason: "root sessionを選択すると変更できます。",
+      unavailable_reason: "メインチャットを開くと変更できます。",
       target: null,
     },
     config_draft_capabilities: {
@@ -209,8 +209,8 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
     token_meter_label: "12%",
     token_meter_title: "Context use 12%",
     token_meter_level: "low",
-    session_usage_label: "セッション累計: 1.2k token（一部）",
-    session_usage_title: "canonical terminal telemetry: 2 / 3 turn計測",
+    session_usage_label: "このチャットの累計: 1.2k トークン（一部）",
+    session_usage_title: "完了した依頼のうち 2 / 3件を計測",
     session_usage_state: "partial",
     confirmation_visible: true,
     confirmation_id: PERMISSION_ID,
@@ -641,7 +641,7 @@ function representativeSurfaces(): RenderedSurface[] {
     } } }) },
   ];
   surfaces.push({ name: "device-execution-ready", html: renderDeviceExecution(local.deviceNetwork) });
-  surfaces.push({ name: "device-execution-paused", html: renderDeviceExecution({ ...local.deviceNetwork, execution: { ...local.deviceNetwork.execution, state: "paused", accepting: false, can_pause: false, can_resume: true } }) });
+  surfaces.push({ name: "device-execution-paused", html: renderDeviceExecution({ ...local.deviceNetwork, execution: { ...local.deviceNetwork.execution, state: "paused", accepting: false, can_pause: false, can_resume: true, autostart: true } }) });
 
   for (const overlay of [
     "provider",
@@ -886,6 +886,8 @@ function representativeSurfaces(): RenderedSurface[] {
   surfaces.push({ name: "shared-work-new-conversation", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.principal = null;
   surfaces.push({ name: "shared-work-login", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.loginMode = "password";
+  surfaces.push({ name: "shared-work-password-login", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.connected = false;
   surfaces.push({ name: "shared-work-enrollment", html: renderSharedWork(sharedWorkPresentation(shared)) });
   return surfaces;
@@ -974,27 +976,27 @@ test("composer exposes the exact frontend-owned run target for settlement checks
   assert.deepEqual(JSON.parse(decodeHtmlAttribute(encoded ?? "")), state.run_target);
 });
 
-test("initial setup is a six-step blocking shell and session settings exposes stable root-only locators", () => {
+test("initial setup retains advanced setup and session settings exposes stable root-only locators", () => {
   const surfaces = new Map(representativeSurfaces().map((surface) => [surface.name, surface.html]));
   const setup = surfaces.get("initial-setup-start") ?? "";
   assert.match(setup, /data-surface="initial-setup" data-current-step="start"/);
-  assert.equal(Array.from(setup.matchAll(/\bdata-step="(?:start|provider|model|permissions|tools|finish)"/g)).length, 6);
+  assert.equal(Array.from(setup.matchAll(/\bdata-step="(?:start|provider|model|permissions|tools|finish)"/g)).length, 1);
   assert.equal(
     Array.from(setup.matchAll(/<li data-step="(?:start|provider|model|permissions|tools|finish)"[^>]*aria-label="[1-6]\. [^"]+"/g)).length,
-    6,
+    1,
   );
   assert.doesNotMatch(setup, /<div class="shell"/);
   assert.doesNotMatch(setup, /class="modal-backdrop"/);
   assert.match(setup, /data-action="import-config-toml"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
-  assert.match(setup, /ディスクへの保存とruntime reloadはFinishまで行いません/);
+  assert.match(setup, /最後に保存するまで、現在の設定は変わりません/);
   assert.match(surfaces.get("initial-setup-tools") ?? "", /data-action="check-docling-readiness"/);
   assert.match(surfaces.get("initial-setup-finish") ?? "", /data-action="finish-initial-setup"/);
 
   const session = surfaces.get("overlay-session_settings") ?? "";
   assert.match(session, /class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings"/);
-  assert.match(session, /data-session-scope="root-only">このセッションだけ/);
-  assert.equal(Array.from(session.matchAll(/placeholder="Global Settingsを継承"/g)).length, 1);
-  assert.match(session, /保存後の次のpermission decisionからrootと子Agentへ反映/);
+  assert.match(session, /data-session-scope="root-only">このチャットだけ/);
+  assert.equal(Array.from(session.matchAll(/placeholder="共通設定を継承"/g)).length, 1);
+  assert.match(session, /次に承認が必要になる操作から適用/);
   for (const field of [
     "base-url",
     "model",
@@ -1013,6 +1015,34 @@ test("initial setup is a six-step blocking shell and session settings exposes st
     surfaces.get("local-confirm-session-settings-close") ?? "",
     /data-modal="session-settings-close-confirmation"/,
   );
+});
+
+test("initial welcome offers execution separately and guided review keeps permissions visible without requiring a workspace", () => {
+  const baseline = representativeState();
+  const state = representativeState({
+    confirmation_visible: false, overlay: "initial_setup",
+    startup: { ...baseline.startup, action_overlay: "initial_setup", initial_setup_required: true },
+    config_fields: [...baseline.config_fields, {
+      key: "permissions.access_mode", value: "default", value_type: "enum", required: true,
+      min_value: null, max_value: null, options: ["default", "auto_review", "full_access"],
+      env_override: null, sensitive: false, configured: true,
+    }],
+  });
+  const welcome = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal()), { backgroundInert: false, taskActivityDelay: "0ms" });
+  for (const purpose of ["personal", "execution", "team", "hosting"]) assert.match(welcome, new RegExp(`data-action="initial-setup-${purpose}"`));
+  assert.doesNotMatch(welcome, /<li data-step="(?:provider|model|permissions|tools|finish)"/);
+  assert.match(welcome, /作業フォルダーは後から選べます/);
+  assert.match(welcome, /依頼と結果の閲覧は、このPCにAIを設定せずに利用できます/);
+  const review = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step: "finish", guided: true } })), { backgroundInert: false, taskActivityDelay: "0ms" });
+  assert.match(review, /data-config-key="permissions.access_mode"/);
+  assert.match(review, /未接続でも設定を保存できます/);
+  assert.match(review, /<details data-details-key="initial-setup-optional-tools"/);
+  assert.doesNotMatch(review, /<li data-step="(?:permissions|tools)"/);
+  state.startup.onboarding_intent = "execution";
+  const executionReview = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step: "finish", guided: true } })), { backgroundInert: false, taskActivityDelay: "0ms" });
+  assert.match(executionReview, /AI設定を保存してPCの接続へ/);
+  assert.doesNotMatch(executionReview, /data-config-key="permissions.access_mode"/);
+  assert.match(executionReview, /仕事を実行する保存先と承認方法は、その後にこのPCで設定/);
 });
 
 test("Initial Setup exposes both system prompts as multiline editors without losing draft line breaks", () => {
@@ -1140,7 +1170,7 @@ test("Session Settings keeps an Apply failure visible inside the exact dirty pan
       },
     }),
     recoverableError: {
-      title: "Session Settingsを適用できませんでした",
+      title: "チャットの設定を適用できませんでした",
       hint: "入力内容を保持したまま、もう一度お試しください。",
       details: "storage transaction failed",
     },
@@ -1151,7 +1181,7 @@ test("Session Settings keeps an Apply failure visible inside the exact dirty pan
   );
 
   assert.match(html, /data-settings-passive="session-settings-recoverable-error"/);
-  assert.match(html, /Session Settingsを適用できませんでした/);
+  assert.match(html, /チャットの設定を適用できませんでした/);
   assert.match(html, /storage transaction failed/);
   assert.match(html, /data-session-setting="model"[^>]*value="locally-edited-model"/);
   assert.match(html, /data-action="apply-session-settings"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
@@ -1257,7 +1287,7 @@ test("Wizard Advanced sections enumerate typed hidden fields and open at the rep
   for (const key of ["model.supports_tools", "model.supports_images", "model.parallel_tool_calls"]) {
     assert.match(model, new RegExp(`data-config-key="${key.replace(".", "\\.")}"`));
   }
-  assert.match(model, /sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
+  assert.match(model, /回答の長さや思考の設定には、AIサーバー側の設定を使います。/);
   assert.match(tools, /data-config-key="docling\.headers_json"/);
   assert.match(
     finish,
@@ -1319,7 +1349,7 @@ test("a stale session-settings owner disables editors while keeping Discard and 
         staleTarget: true,
         providerChanged: false,
         accessChanged: false,
-        reason: "保存済みSession Settingsが別の操作で更新されました。",
+        reason: "保存済みチャットの設定が別の操作で更新されました。",
       },
     },
   });
@@ -1378,7 +1408,7 @@ test("an unavailable Session Settings underlay becomes inert below its dirty-clo
         staleTarget: true,
         providerChanged: false,
         accessChanged: false,
-        reason: "root sessionを選択すると変更できます。",
+        reason: "メインチャットを開くと変更できます。",
       },
     },
   });
@@ -1581,8 +1611,8 @@ test("composer shows canonical session usage separately from the context meter",
 
   assert.match(html, /class="token-meter low"/);
   assert.match(html, /class="session-usage partial"/);
-  assert.match(html, /セッション累計: 1\.2k token（一部）/);
-  assert.match(html, /canonical terminal telemetry: 2 \/ 3 turn計測/);
+  assert.match(html, /このチャットの累計: 1\.2k トークン（一部）/);
+  assert.match(html, /完了した依頼のうち 2 \/ 3件を計測/);
 });
 
 test("Initial Setup Finish and Session Settings Apply render as text-sized primary actions", () => {
@@ -1600,7 +1630,7 @@ test("Initial Setup Finish and Session Settings Apply render as text-sized prima
   assert.ok(sessionSettings);
   assert.match(
     sessionSettings,
-    /<button class="send wide-send" data-action="apply-session-settings"[^>]*>このセッションに適用<\/button>/,
+    /<button class="send wide-send" data-action="apply-session-settings"[^>]*>このチャットに適用<\/button>/,
   );
 });
 
@@ -1729,7 +1759,7 @@ test("dirty Settings close layers an inert retained dialog below the alertdialog
 
 test("Main and Side Stop are named visibly and an idle Side has no misleading Stop control", () => {
   const running = representativeState();
-  assert.match(renderRunStatusStrip(running), />Mainを停止<\/span>/);
+  assert.match(renderRunStatusStrip(running), />メインチャットを停止<\/span>/);
   const local = defaultRenderLocal({ artifactPane: { mode: "side_chat" } });
   assert.match(renderArtifactPane(running, local), />Sideを停止<\/span>/);
   const completed = representativeState({

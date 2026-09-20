@@ -24,6 +24,16 @@ struct Download {
     content_base64: String,
 }
 impl SharedWorkProjection {
+    fn can_prepare_sample(&self, project_id: &str) -> bool {
+        self.selected_job_id.is_none()
+            && self.inputs.is_empty()
+            && !self.submission_uncertain
+            && self.submission_storage_error.is_none()
+            && self
+                .projects
+                .iter()
+                .any(|p| p.id == project_id && p.can_submit)
+    }
     fn input_slot(&self, name: &str) -> Result<Option<usize>, RequestError> {
         // Match the Hub's portable, case-insensitive input-name collision rule.
         let name = name.to_lowercase();
@@ -56,6 +66,61 @@ impl SharedWorkProjection {
     }
 }
 impl DeviceNetworkService {
+    /// Explicitly attach public sample data through the ordinary project asset API.
+    /// Submission still requires the user's normal Send action and durable receipt.
+    pub(super) async fn shared_prepare_sample(
+        &self,
+        connection: &Connection,
+        generation: u64,
+        query: u64,
+        token: &str,
+        project_id: &str,
+    ) -> Result<(), RequestError> {
+        {
+            let runtime = self.inner.shared_work.0.lock().unwrap();
+            runtime.require_project(project_id, generation, query)?;
+            if !runtime.view.can_prepare_sample(project_id) {
+                return Err(RequestError::Local(
+                    "添付のない新しいチャットで、依頼できるプロジェクトを選んでください。",
+                ));
+            }
+        }
+        let bytes = b"value\n10\n20\n30\n";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let asset: WorkAsset = request(
+            &connection.client,
+            &format!("projects/{project_id}/assets"),
+            Some(token),
+            Some(json!({
+                "request_id": format!("sample-{}", ulid::Ulid::new()),
+                "name": "moyai-sample-numbers.csv", "sha256": sha256,
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes)
+            })),
+            &[],
+        )
+        .await?;
+        if asset.project_id != project_id
+            || asset.name != "moyai-sample-numbers.csv"
+            || asset.sha256 != sha256
+            || asset.byte_length != bytes.len() as u64
+            || asset.kind != "input"
+            || asset.purged_at_ms.is_some()
+        {
+            return Err(RequestError::Invalid);
+        }
+        if !self.shared_current(connection, generation, query) {
+            return Ok(());
+        }
+        let mut runtime = self.inner.shared_work.0.lock().unwrap();
+        runtime.require_project(project_id, generation, query)?;
+        if !runtime.view.can_prepare_sample(project_id) {
+            return Err(RequestError::Invalid);
+        }
+        runtime.view.attach_input(asset)?;
+        runtime.view.feedback =
+            Some("サンプルを添付しました。依頼内容と実行PCを確認して送信してください。".into());
+        Ok(())
+    }
     pub(super) async fn shared_upload_inputs(
         &self,
         connection: &Connection,
@@ -286,6 +351,29 @@ async fn pick_destination(_: String, _: bool) -> Result<Option<std::path::PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sample_is_only_prepared_for_an_empty_authorized_new_conversation() {
+        let mut view = SharedWorkProjection::default();
+        view.projects.push(WorkProject {
+            id: "p".into(),
+            label: "P".into(),
+            role: "contributor".into(),
+            can_submit: true,
+        });
+        assert!(view.can_prepare_sample("p"));
+        assert!(!view.can_prepare_sample("another-project"));
+        view.projects[0].can_submit = false;
+        assert!(!view.can_prepare_sample("p"));
+        view.projects[0].can_submit = true;
+        view.submission_uncertain = true;
+        assert!(!view.can_prepare_sample("p"));
+        view.submission_uncertain = false;
+        view.selected_job_id = Some("existing-job".into());
+        assert!(!view.can_prepare_sample("p"));
+        view.selected_job_id = None;
+        view.submission_storage_error = Some("unreadable receipt".into());
+        assert!(!view.can_prepare_sample("p"));
+    }
     #[test]
     fn shared_feedback_survives_background_refresh_but_not_user_or_identity_changes() {
         let mut runtime = Runtime::default();

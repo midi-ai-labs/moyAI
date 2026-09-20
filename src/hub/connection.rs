@@ -313,6 +313,11 @@ impl HubConnection {
         self.projection_now()
     }
 
+    pub(crate) fn has_active_turns(&self) -> bool {
+        let state = self.inner.state.lock().expect("Hub state lock poisoned");
+        state.active.iter().any(Option::is_some) || !state.delegated_active.is_empty()
+    }
+
     fn persisted_store(&self) -> Result<&HubSettingsStore, HubError> {
         self.inner.store.as_ref().ok_or(HubError::SettingsInvalid)
     }
@@ -396,7 +401,7 @@ impl HubConnection {
         let endpoint = validated_endpoint(endpoint)?.to_string();
         let generation = {
             let mut state = self.inner.state.lock().unwrap();
-            if state.active.iter().any(Option::is_some) {
+            if state.active.iter().any(Option::is_some) || !state.delegated_active.is_empty() {
                 return Err(HubError::RouteBusy);
             }
             Self::revoke(state.advance()?);

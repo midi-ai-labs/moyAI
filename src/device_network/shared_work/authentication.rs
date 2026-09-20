@@ -12,6 +12,19 @@ impl DeviceNetworkService {
         username: String,
         password: String,
     ) -> Result<(), RequestError> {
+        self.shared_password_auth(connection, generation, query, username, password, None)
+            .await
+    }
+
+    pub(super) async fn shared_password_auth(
+        &self,
+        connection: &Connection,
+        generation: u64,
+        query: u64,
+        username: String,
+        password: String,
+        setup_code: Option<String>,
+    ) -> Result<(), RequestError> {
         if username.trim().is_empty() || password.is_empty() || password.len() > 1024 {
             return Err(RequestError::Local(
                 "利用者名とパスワードを入力してください。",
@@ -27,14 +40,15 @@ impl DeviceNetworkService {
             .auth_store
             .load()?
             .revision;
-        let session: LoginSession = request(
-            &connection.client,
-            "login",
-            None,
-            Some(json!({"username":username,"password":password})),
-            &[],
-        )
-        .await?;
+        let (route, body) = match setup_code {
+            Some(code) => (
+                "setup-password",
+                json!({"username":username,"password":password,"code":code}),
+            ),
+            None => ("login", json!({"username":username,"password":password})),
+        };
+        let session: LoginSession =
+            request(&connection.client, route, None, Some(body), &[]).await?;
         let install = if self.shared_current(connection, generation, query) {
             let mut runtime = self.inner.shared_work.0.lock().unwrap();
             runtime.require_current(generation, query).and_then(|()| {

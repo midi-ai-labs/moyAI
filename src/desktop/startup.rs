@@ -4,6 +4,7 @@ use crate::config::ResolvedConfig;
 use crate::docling::normalize_docling_base_url;
 use crate::llm::normalize_provider_base_url;
 
+use super::preferences::DesktopOnboardingIntent;
 use super::state::DesktopOverlay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub enum DesktopStartupCheckStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopInitialSetupReason {
     ConfigMissing,
+    SetupUnfinished,
     ProviderInvalid,
     OptionalToolInvalid,
 }
@@ -31,6 +33,7 @@ impl DesktopInitialSetupReason {
     pub const fn key(self) -> &'static str {
         match self {
             Self::ConfigMissing => "config_missing",
+            Self::SetupUnfinished => "setup_unfinished",
             Self::ProviderInvalid => "provider_invalid",
             Self::OptionalToolInvalid => "optional_tool_invalid",
         }
@@ -86,6 +89,7 @@ pub struct DesktopStartupState {
     pub setup_generation: u64,
     pub initial_setup_reason: Option<DesktopInitialSetupReason>,
     setup_completion_pending: bool,
+    pub onboarding_intent: Option<DesktopOnboardingIntent>,
 }
 
 impl Default for DesktopStartupState {
@@ -107,6 +111,7 @@ impl DesktopStartupState {
             setup_generation: 0,
             initial_setup_reason: None,
             setup_completion_pending: false,
+            onboarding_intent: None,
         }
     }
 
@@ -164,17 +169,29 @@ impl DesktopStartupState {
             status: DesktopStartupStatus::Ready,
             title: "moyAI".to_string(),
             message: "ローカル設定を確認しました。".to_string(),
-            detail: "起動時に provider や Docling への network request は送信しません。"
-                .to_string(),
+            detail:
+                "起動時は保存された設定を読み込みます。AIや文書変換サービスへの接続は未確認です。"
+                    .to_string(),
             action_overlay: None,
             checks,
             global_config_path,
             setup_generation: 1,
             initial_setup_reason,
             setup_completion_pending: initial_setup_reason.is_some(),
+            onboarding_intent: None,
         };
         state.recompute();
         state
+    }
+
+    pub fn resume_onboarding(&mut self, intent: DesktopOnboardingIntent) {
+        self.onboarding_intent = Some(intent);
+        self.setup_completion_pending = true;
+        if self.initial_setup_reason.is_none() {
+            self.initial_setup_reason = Some(DesktopInitialSetupReason::SetupUnfinished);
+        }
+        self.setup_generation = self.setup_generation.saturating_add(1);
+        self.recompute();
     }
 
     pub fn refresh_config(&mut self, config: &ResolvedConfig) {
@@ -196,6 +213,7 @@ impl DesktopStartupState {
         } else {
             self.setup_completion_pending = false;
             self.initial_setup_reason = None;
+            self.onboarding_intent = None;
         }
         self.recompute();
     }
@@ -217,22 +235,26 @@ impl DesktopStartupState {
             return DesktopStartupCheck::pass(
                 "provider",
                 "Hub設定",
-                "Hubの共通設定を確認しました。端末連携から参加してください。モデルの接続はまだ確認していません。",
+                "Hubの接続設定があります。「PCの接続」から参加してください。AIへの接続は未確認です。",
             );
         }
         let base_url = normalize_provider_base_url(&config.model.base_url);
         let model = config.model.model.trim();
         if base_url.is_empty() {
-            return DesktopStartupCheck::fail("provider", "LLM 設定", "LLM URL が未設定です。");
+            return DesktopStartupCheck::fail(
+                "provider",
+                "AIの設定",
+                "AIの接続先URLが未設定です。",
+            );
         }
         if model.is_empty() {
-            return DesktopStartupCheck::fail("provider", "LLM 設定", "model が未設定です。");
+            return DesktopStartupCheck::fail("provider", "AIの設定", "モデルが未設定です。");
         }
         DesktopStartupCheck::pass(
             "provider",
-            "LLM 設定",
+            "AIの設定",
             format!(
-                "設定済み: {base_url} / {model}。接続は依頼実行時または明示的なモデル読込で確認します。"
+                "設定値あり（接続は未確認）: {base_url} / {model}。モデル一覧の取得、または依頼の送信時に接続します。"
             ),
         )
     }
@@ -242,7 +264,7 @@ impl DesktopStartupState {
             return DesktopStartupCheck::pass(
                 "docling",
                 "Docling 設定",
-                "無効です。structured document 処理が必要な場合は設定から有効化してください。",
+                "無効です。PDF・Wordなどの文書を変換する場合は、設定から有効にしてください。",
             );
         }
         let base_url = normalize_docling_base_url(&config.docling.base_url);
@@ -250,13 +272,13 @@ impl DesktopStartupState {
             return DesktopStartupCheck::fail(
                 "docling",
                 "Docling 設定",
-                "Docling Serve URL が未設定です。",
+                "Doclingの接続先URLが未設定です。",
             );
         }
         DesktopStartupCheck::pass(
             "docling",
             "Docling 設定",
-            format!("設定済み: {base_url}。接続はDocling利用時に確認します。"),
+            format!("設定値あり（接続は未確認）: {base_url}。文書の変換時に接続します。"),
         )
     }
 
@@ -286,26 +308,32 @@ impl DesktopStartupState {
                 .unwrap_or(DesktopInitialSetupReason::ConfigMissing);
             self.initial_setup_reason = Some(reason);
             match reason {
+                DesktopInitialSetupReason::SetupUnfinished => {
+                    self.status = DesktopStartupStatus::RequiresConfig;
+                    self.title = "初回設定を再開します".to_string();
+                    self.message = "前回選んだ使い方から設定を再開できます。".to_string();
+                    self.detail = "画面に沿って入力し、最後に設定を保存してください。".to_string();
+                }
                 DesktopInitialSetupReason::ConfigMissing => {
                     self.status = DesktopStartupStatus::RequiresConfig;
                     self.title = "設定の確認が必要です".to_string();
                     self.message =
                         "初回起動用の設定を作成しました。初期設定を完了してください。".to_string();
-                    self.detail =
-                        "LLM、権限、任意ツールを確認して設定ファイルへ保存します。".to_string();
+                    self.detail = "使い方を選び、必要な設定を保存してください。".to_string();
                 }
                 DesktopInitialSetupReason::ProviderInvalid => {
                     self.status = DesktopStartupStatus::RequiresProvider;
-                    self.title = "LLM 設定の確認が必要です".to_string();
-                    self.message = "初期設定で LLM URL と model を確認してください。".to_string();
-                    self.detail = "外部接続の成功は保存の前提ではありません。".to_string();
+                    self.title = "AIの接続設定を修正してください".to_string();
+                    self.message =
+                        "初回設定でAIの接続先URLとモデルを確認してください。".to_string();
+                    self.detail = "まだ接続できなくても設定は保存できます。".to_string();
                 }
                 DesktopInitialSetupReason::OptionalToolInvalid => {
                     self.status = DesktopStartupStatus::RequiresConfig;
                     self.title = "Docling 設定の確認が必要です".to_string();
                     self.message = "初期設定で任意ツールの設定を確認してください。".to_string();
                     self.detail =
-                        "Doclingを無効にするか、有効なbase URLを入力してください。".to_string();
+                        "Doclingを無効にするか、有効な接続先URLを入力してください。".to_string();
                 }
             }
             self.action_overlay = Some(DesktopOverlay::InitialSetup);
@@ -316,8 +344,7 @@ impl DesktopStartupState {
         self.title = "moyAI".to_string();
         self.message = "ローカル設定を確認しました。".to_string();
         self.detail =
-            "provider catalogとavailability diagnosticsは明示操作時だけnetworkへ接続します。"
-                .to_string();
+            "モデル一覧の取得や接続テストは、必要なときに設定画面から実行できます。".to_string();
         self.action_overlay = None;
         self.initial_setup_reason = None;
     }
@@ -326,6 +353,27 @@ impl DesktopStartupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_setup_remains_pending_after_default_config_exists() {
+        let config = ResolvedConfig::default();
+        let mut restarted = DesktopStartupState::begin(true, None, Utf8Path::new("."), &config);
+        assert!(
+            !restarted.requires_initial_setup(),
+            "file presence alone loses unfinished setup"
+        );
+        restarted.resume_onboarding(DesktopOnboardingIntent::Personal);
+        assert!(restarted.requires_initial_setup());
+        assert_eq!(
+            restarted.onboarding_intent,
+            Some(DesktopOnboardingIntent::Personal)
+        );
+        restarted.refresh_config(&config);
+        assert!(restarted.requires_initial_setup());
+        restarted.complete_after_persist();
+        assert!(!restarted.requires_initial_setup());
+        assert_eq!(restarted.onboarding_intent, None);
+    }
 
     #[test]
     fn public_hub_config_allows_enrollment_without_a_direct_provider() {

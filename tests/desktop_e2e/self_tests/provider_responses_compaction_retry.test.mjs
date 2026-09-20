@@ -345,7 +345,7 @@ function heldSurface() {
   value.projection.run_status_key = "running";
   value.projection.task_activity_state = "running";
   value.projection.busy = true;
-  value.projection.run_phase = "Provider応答受信中";
+  value.projection.run_phase = "AIの回答を受信中";
   value.projection.post_run_refresh_pending = false;
   value.projection.async_polling_required = true;
   value.projection.pending_async_operations = ["run_poll"];

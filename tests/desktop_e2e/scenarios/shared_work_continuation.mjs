@@ -7,7 +7,7 @@ import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/
 import { startSharedWorkflowProvider, startSharedWorkflowRunner } from "../drivers/shared_work_runner_fixture.mjs";
 import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
 import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathInOwnedNativeDialog, probeExactOwnedWindow } from "../drivers/windows_native_input.mjs";
-import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget } from "./shared_work_navigation.mjs";
+import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
 import { auditClosedSqlite } from "../drivers/sqlite_cleanup.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
@@ -138,6 +138,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
         // This scenario owns real parent/child execution and cross-device conversation.
         // Initial PC execution permission and automatic folder provisioning have their
         // own device-execution scenario; no retired provider controls are invoked here.
+        await setSharedLoginMode(state.input, cdp, sink, "password");
         await fill("shared-username", "workflow-alice"); await fill("shared-password", password); await click("login");
         await wait("Alice can submit to the real Runner", projection, p => p.principal?.user_id === alice.user_id && ["analysis", "solver"].every(id => p.status?.environments.some(e => e.id === id)));
         await trustedClick(state.input, cdp, { selector: '.sidebar button[data-action="open-hub-project"][data-value="workflow"]', identity: { tag: "BUTTON", action: "open-hub-project" } }, sink);
@@ -186,6 +187,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
         if (second.network.device_id === enrolled.network.device_id) throw fail("B reused the same device identity");
         const beforeLogin = await projection();
         if (beforeLogin.principal !== null || beforeLogin.projects.length !== 0) throw fail("A different device/profile inherited another device's human login");
+        await setSharedLoginMode(state.input, cdp, sink, "password");
         await fill("shared-username", "workflow-alice"); await fill("shared-password", password); await click("login");
         await wait("Fresh B sees the same parent job", projection, p => p.status?.jobs.some(j => j.id === parentId));
         provider.releaseChild();
@@ -203,7 +205,8 @@ export function createSharedWorkContinuationScenario(options = {}) {
         const asset = (await projection()).assets.find(a => a.name === "result.txt" && a.kind === "artifact");
         const saved = path.join(currentContext.paths.workspace, "downloaded-result.txt"); await nativeFile("save-asset", saved, asset.id);
         await wait("B saves verified artifact bytes", () => readFile(saved).catch(() => null), bytes => bytes !== null && createHash("sha256").update(bytes).digest("hex") === asset.sha256 && bytes.toString("utf8").replaceAll("\r\n", "\n") === "shared solver result 日本語\n");
-        await click("logout"); await fill("shared-username", "workflow-bob"); await fill("shared-password", password); await click("login");
+        await click("logout"); await setSharedLoginMode(state.input, cdp, sink, "password");
+        await fill("shared-username", "workflow-bob"); await fill("shared-password", password); await click("login");
         const notified = await wait("New assignee receives a handover notification", projection, p => p.principal?.user_id === bob.user_id && p.inbox?.items.some(i => i.kind === "handover" && i.job_id === parentId));
         const notification = notified.inbox.items.find(i => i.kind === "handover" && i.job_id === parentId);
         await click("inbox-open", notification.id);

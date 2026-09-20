@@ -43,7 +43,7 @@ test("recent contact does not claim new admission and unconfirmed environments d
   // Hub owns recency, so even an old numeric timestamp must not be reclassified by the UI clock.
   Object.assign(env, { runner_contact: { state: "recent", last_contact_ms: 1 } });
   const html = region(renderSharedWork(sharedWorkPresentation(local)), "environments");
-  assert.match(html, /最近の応答あり/);
+  assert.match(html, /PCからの応答あり/);
   assert.match(html, /受付停止/);
   assert.doesNotMatch(html, /状態不明|空きがあります|受付中/);
 });

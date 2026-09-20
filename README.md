@@ -140,26 +140,26 @@ also extends exact tool-less AutoReview Guardian transport to every current prov
 including OpenAI-compatible endpoints such as oMLX, and adds fail-closed hardening around executable
 identity, MCP origins, provider diagnostics, secrets, and Windows sandbox admission.
 
-The Windows release zip includes:
+Current development Windows packages use the following layout (the published v2.1.1 ZIP keeps its original layout):
 
-- `bin/moyai.exe` for CLI / TUI workflows
-- `bin/moyai-desktop.exe` for the Desktop app
-- `bin/moyai-runner.exe` for independent execution and shared environments
-- `bin/moyai-cleanup.exe` for resetting user-wide moyAI AppData to first-run state
-- bundled `ui/desktop-web/dist/` assets
+- `Setup-moyAI.cmd` for offline installation or update at `%LOCALAPPDATA%\Programs\moyAI`, with a Start menu shortcut
+- `Start-moyAI.cmd` as the portable Desktop entry point, with prerequisite checks before startup
+- internal Desktop, CLI and Runner binaries in `app/bin/`, and assets in `app/ui/desktop-web/dist/`
+- `app/maintenance/moyai-cleanup.exe`, which only previews reset targets unless both explicit reset arguments are supplied
+- a recorded optional Hub component, and either bundled runtimes or an explicit requirement for centrally installed runtimes
 - README files, license, release notes, config example, getting-started guide, and in-package SHA256 checksums
 
 The GitHub Release publishes the zip together with its external manifest and zip SHA256 sidecar.
 
-On the target Windows machine, you do not need npm, the Rust toolchain, internet access, or a local web dev server.
+On the target Windows machine, you do not need npm, the Rust toolchain, internet access, or a local web dev server. Setup never downloads prerequisites. Missing runtimes are reported with an administrator action. Installation, update and uninstall preserve user profiles, credentials and history. See [Windows setup and packaging](docs/user/windows-setup.md) for offline runtime inputs, the Hub compatibility evidence requirement and the limits of fresh-PC verification.
 
 ## Quick Start
 
-1. Start, or connect to, an OpenAI-compatible LLM server reachable at the URL you plan to configure.
-2. Download and extract the latest release zip.
-3. Launch `bin/moyai-desktop.exe`.
-4. On first launch, complete the fullscreen Initial Setup flow. Enter or import the provider, model, permission, and optional-tool settings, review the local validation result, then choose **Finish and open moyAI**. Model loading and provider/Docling diagnostics run only when you explicitly request them; an unavailable endpoint is reported as a warning and does not block a locally valid setup.
-5. Use Quick Chat, or select a project workspace and start a development chat.
+1. Obtain the distribution ZIP and extract the whole folder.
+2. For current development packages, run `Setup-moyAI.cmd` and open **moyAI** from the Start menu, or use `Start-moyAI.cmd` for portable use. For the published v2.1.1 ZIP, launch `bin/moyai-desktop.exe`.
+3. The current development version first asks whether you will use your own PC, join a team, or prepare a team environment. See [first use and resuming setup](docs/desktop-first-use.md) for each route.
+4. For personal use, configure the AI endpoint and model, review operation approvals, and save. Model loading and diagnostics run only on request; an unavailable endpoint does not block locally valid settings. To operate team work, this PC needs no local AI or execution folder: use the administrator's connection file and personal setup instructions, then confirm PC approval, your account, and project access. Preparing a team opens the bundled Hub management interface.
+5. Start personal conversations in Quick Chat and choose a workspace when working with existing files. For team work, open an available Hub project to submit or view work. Unsaved input is lost when you exit; your selected setup purpose is retained for the next launch.
 
 Closing the Desktop window keeps moyAI in the system tray. Launch it again to show
 the existing window, including when it is minimized, and see the already-running

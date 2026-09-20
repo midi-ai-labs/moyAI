@@ -301,13 +301,13 @@ export function permissionRestartGuardianTerminalFailures(
     if (projection?.session_usage_state !== "partial") {
       failures.push("session-reasoning-usage-state-mismatch");
     }
-    if (!projection?.session_usage_label?.includes("reasoning未計測")) {
+    if (!projection?.session_usage_label?.includes("思考分は未計測")) {
       failures.push("session-reasoning-usage-label-mismatch");
     }
-    if (!projection?.session_usage_title?.includes("reasoning 未計測")) {
+    if (!projection?.session_usage_title?.includes("思考分は未計測")) {
       failures.push("session-reasoning-usage-title-mismatch");
     }
-    if (/reasoning\s+0(?:\D|$)/.test(projection?.session_usage_title ?? "")) {
+    if (/思考分\s+0(?:\D|$)/.test(projection?.session_usage_title ?? "")) {
       failures.push("session-reasoning-usage-misreported-zero");
     }
   } else if (apiMode === RESPONSES_API_MODE) {

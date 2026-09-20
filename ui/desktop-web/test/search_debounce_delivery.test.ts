@@ -66,7 +66,7 @@ function fixture() {
 
 test("a palette search is discarded before IPC after its dialog closes or draft owner changes", async () => {
   for (const change of ["dialog", "workspace", "generation"] as const) await withSearchInput(async f => {
-    f.local.input("ワークスペースを切り替え");
+    f.local.input("作業フォルダーを切り替える");
     if (change === "dialog") f.current = { ...f.current, overlay: "workspace" };
     else if (change === "workspace") f.current = { ...f.current, workspace_path: "C:/alternate",
       draft_target: { ...f.current.draft_target, workspacePath: "C:/alternate" } };

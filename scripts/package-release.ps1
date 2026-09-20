@@ -5,6 +5,13 @@ param(
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [string]$ManualGuiStResultsPath = "",
+  [ValidateSet('Bundled', 'Installed')]
+  [string]$RuntimeMode = 'Bundled',
+  [string]$WebView2FixedRuntimePath = '',
+  [string]$VcRuntimePath = '',
+  [string]$HubBinaryPath = '',
+  [string]$HubBuildIdentityPath = '',
+  [string]$HubCompatibilityResultsPath = '',
   [switch]$SkipManualGuiStGate,
   [switch]$SkipBuild,
   [switch]$AllowDirtySource
@@ -115,6 +122,7 @@ function Remove-ReleaseOutputDirectory([string]$OutputRootPath, [string]$Path, [
 }
 
 $repoRoot = Resolve-RepoRoot
+. (Join-Path $repoRoot 'scripts\deployment\common.ps1')
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
   $OutputRoot = Join-Path (Split-Path -Parent $repoRoot) "project_sandbox\releases"
 }
@@ -128,6 +136,28 @@ $zipShaPath = Assert-ReleaseOutputPath $OutputRoot "$zipPath.sha256" "release ch
 
 Push-Location $repoRoot
 try {
+  if ($Target -ne 'windows-x86_64') { throw 'The current deployment scripts support only windows-x86_64.' }
+  if ($RuntimeMode -eq 'Bundled') {
+    if (-not $WebView2FixedRuntimePath -or -not $VcRuntimePath -or -not (Test-Path -LiteralPath $WebView2FixedRuntimePath -PathType Container) -or -not (Test-Path -LiteralPath $VcRuntimePath -PathType Container)) {
+      throw 'The offline package requires -WebView2FixedRuntimePath (extracted x64 fixed runtime) and -VcRuntimePath (licensed x64 app-local VC++ DLLs). No download is performed. Use -RuntimeMode Installed only for machines with centrally installed prerequisites.'
+    }
+    foreach ($name in @('msedgewebview2.exe', 'icudtl.dat', 'resources.pak')) {
+      if (-not (Test-Path -LiteralPath (Join-Path $WebView2FixedRuntimePath $name) -PathType Leaf)) { throw "Fixed WebView2 runtime is incomplete: $name" }
+    }
+    Assert-MoyaiX64Pe (Join-Path $WebView2FixedRuntimePath 'msedgewebview2.exe')
+    foreach ($name in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+      $path = Join-Path $VcRuntimePath $name
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "App-local VC++ runtime is incomplete: $name" }
+      Assert-MoyaiX64Pe $path
+    }
+    foreach ($runtimeRoot in @($WebView2FixedRuntimePath, $VcRuntimePath)) {
+      foreach ($item in Get-ChildItem -LiteralPath $runtimeRoot -Recurse -Force) {
+        Assert-MoyaiRegularPath $runtimeRoot $item.FullName
+      }
+    }
+  } elseif ($WebView2FixedRuntimePath -or $VcRuntimePath) {
+    throw 'Runtime inputs cannot be combined with -RuntimeMode Installed.'
+  }
   $commit = (git rev-parse HEAD).Trim()
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commit)) {
     throw "failed to resolve the release source commit"
@@ -157,6 +187,26 @@ try {
   $packageJson = Get-Content -Raw -Encoding UTF8 "package.json" | ConvertFrom-Json
   if ($packageJson.version -ne $Version) {
     throw "package.json version is $($packageJson.version), expected $Version"
+  }
+
+  $hubIdentity = $null
+  $hubCompatibilityVerified = $false
+  if ($HubBinaryPath -or $HubBuildIdentityPath -or $HubCompatibilityResultsPath) {
+    if (-not $HubBinaryPath -or -not $HubBuildIdentityPath -or -not (Test-Path -LiteralPath $HubBinaryPath -PathType Leaf) -or -not (Test-Path -LiteralPath $HubBuildIdentityPath -PathType Leaf)) { throw 'A Hub bundle requires both -HubBinaryPath and -HubBuildIdentityPath.' }
+    $hubIdentity = Get-Content -LiteralPath $HubBuildIdentityPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $hubIdentity.version -or $hubIdentity.git_commit -notmatch '^[a-f0-9]{40}$' -or $hubIdentity.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Hub identity requires version, git_commit, sha256, and source_clean.' }
+    Assert-MoyaiX64Pe $HubBinaryPath
+    if ((Get-FileHash -LiteralPath $HubBinaryPath -Algorithm SHA256).Hash -ine $hubIdentity.sha256) { throw 'Hub binary does not match its build identity checksum.' }
+    if (-not $AllowDirtySource -and $hubIdentity.source_clean -ne $true) { throw 'A published Hub bundle requires a clean Hub source identity.' }
+    if ($HubCompatibilityResultsPath) {
+      $hubResults = Get-Content -LiteralPath $HubCompatibilityResultsPath -Raw -Encoding UTF8
+      foreach ($marker in @('Desktop Hub Gate: PASS', "Desktop Git Commit: $commit", "Hub Git Commit: $($hubIdentity.git_commit)", "Hub SHA256: $($hubIdentity.sha256)")) {
+        if (-not (Test-ExactMarkerLine $hubResults $marker)) { throw "Hub compatibility evidence is missing the exact identity marker: $marker" }
+      }
+      $hubCompatibilityVerified = $true
+    } elseif (-not $SkipManualGuiStGate) {
+      throw 'A published Hub bundle requires -HubCompatibilityResultsPath with actual Desktop/Hub compatibility evidence for this exact pair.'
+    }
   }
 
   $releaseNotesSource = Join-Path $repoRoot "docs\release\v$Version.md"
@@ -293,10 +343,35 @@ try {
   Remove-ReleaseOutputFile $OutputRoot $zipShaPath "release checksum"
   New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
 
-  Copy-RequiredFile $cliExe (Join-Path $releaseRoot "bin\moyai.exe")
-  Copy-RequiredFile $desktopExe (Join-Path $releaseRoot "bin\moyai-desktop.exe")
-  Copy-RequiredFile $runnerExe (Join-Path $releaseRoot "bin\moyai-runner.exe")
-  Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "bin\moyai-cleanup.exe")
+  Copy-RequiredFile $cliExe (Join-Path $releaseRoot "app\bin\moyai.exe")
+  Copy-RequiredFile $desktopExe (Join-Path $releaseRoot "app\bin\moyai-desktop.exe")
+  Copy-RequiredFile $runnerExe (Join-Path $releaseRoot "app\bin\moyai-runner.exe")
+  Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup.exe")
+  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1')) {
+    Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$script") (Join-Path $releaseRoot "scripts\$script")
+  }
+  foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd')) {
+    Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$launcher") (Join-Path $releaseRoot $launcher)
+  }
+  Copy-RequiredFile (Join-Path $repoRoot 'docs\user\windows-setup.md') (Join-Path $releaseRoot 'docs\user\windows-setup.md')
+  if ($RuntimeMode -eq 'Bundled') {
+    New-Item -ItemType Directory -Path (Join-Path $releaseRoot 'runtime\webview2') -Force | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $WebView2FixedRuntimePath -Force) { Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $releaseRoot 'runtime\webview2') -Recurse -Force }
+    $vcFiles = @(Get-ChildItem -LiteralPath $VcRuntimePath -Filter '*.dll' -File)
+    foreach ($item in $vcFiles) {
+      Assert-MoyaiX64Pe $item.FullName
+      foreach ($destination in @('app\bin', 'app\maintenance')) { Copy-RequiredFile $item.FullName (Join-Path $releaseRoot "$destination\$($item.Name)") }
+      if ($hubIdentity) { Copy-RequiredFile $item.FullName (Join-Path $releaseRoot "hub\bin\$($item.Name)") }
+    }
+    foreach ($notice in Get-ChildItem -LiteralPath $VcRuntimePath -File | Where-Object { $_.Extension -ine '.dll' }) {
+      Copy-RequiredFile $notice.FullName (Join-Path $releaseRoot "runtime\visual-cpp-notices\$($notice.Name)")
+    }
+  }
+  if ($hubIdentity) {
+    Copy-RequiredFile $HubBinaryPath (Join-Path $releaseRoot 'hub\bin\moyai-hub.exe')
+    Copy-RequiredFile $HubBuildIdentityPath (Join-Path $releaseRoot 'hub\build-identity.json')
+    if ($HubCompatibilityResultsPath) { Copy-RequiredFile $HubCompatibilityResultsPath (Join-Path $releaseRoot 'docs\release\desktop-hub-results.md') }
+  }
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
@@ -308,12 +383,31 @@ try {
   if ($manualGuiStResultsResolved) {
     Copy-RequiredFile $manualGuiStResultsResolved (Join-Path $releaseRoot "docs\release\manual-gui-st-results.md")
   }
-  $desktopDistDestination = Join-Path $releaseRoot "ui\desktop-web\dist"
+  $desktopDistDestination = Join-Path $releaseRoot "app\ui\desktop-web\dist"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $desktopDistDestination) | Out-Null
   Copy-Item -LiteralPath $desktopDist -Destination $desktopDistDestination -Recurse -Force
-  Copy-Item -LiteralPath (Join-Path $repoRoot "logo") -Destination (Join-Path $releaseRoot "logo") -Recurse -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "logo") -Destination (Join-Path $releaseRoot "app\logo") -Recurse -Force
 
   Write-Utf8File (Join-Path $releaseRoot "RELEASE_NOTES.md") $notes
+
+  $deployment = [ordered]@{
+    schema = 1
+    product = 'moyai-windows-user'
+    target = $Target
+    version = $Version
+    desktop = $buildIdentity
+    hub = $hubIdentity
+    hub_compatibility_verified = $hubCompatibilityVerified
+    runtime = [ordered]@{
+      webview2 = if ($RuntimeMode -eq 'Bundled') { 'bundled-fixed' } else { 'system-installed' }
+      visual_cpp = if ($RuntimeMode -eq 'Bundled') { 'app-local' } else { 'system-installed' }
+    }
+    files = @(Get-ChildItem -LiteralPath $releaseRoot -Recurse -File | Sort-Object FullName | ForEach-Object {
+      [ordered]@{path=(Get-RelativePathForRelease $releaseRoot $_.FullName).Replace('\', '/'); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+    })
+  }
+  Write-Utf8File (Join-Path $releaseRoot 'deployment.json') ($deployment | ConvertTo-Json -Depth 8)
+  [void](Read-MoyaiDeployment $releaseRoot -VerifyHashes)
 
   $fileHashes = Get-ChildItem -LiteralPath $releaseRoot -Recurse -File |
     Sort-Object FullName |
@@ -342,13 +436,20 @@ try {
     }
     cli_version_output = $cliVersionOutput
     desktop_build_identity = [ordered]@{
-      path = "ui/desktop-web/dist/build-identity.json"
+      path = "app/ui/desktop-web/dist/build-identity.json"
       version = $buildIdentity.version
       git_commit = $buildIdentity.git_commit
       source_clean = $buildIdentity.source_clean
       built_at_utc = $buildIdentity.built_at_utc
     }
     built_at_utc = [DateTime]::UtcNow.ToString("o")
+    deployment = [ordered]@{
+      manifest = 'deployment.json'
+      runtime = $deployment.runtime
+      hub = $hubIdentity
+      hub_compatibility_verified = $hubCompatibilityVerified
+      fresh_pc_verified = $false
+    }
     artifacts = [ordered]@{
       directory = $releaseRoot
       zip = $zipPath

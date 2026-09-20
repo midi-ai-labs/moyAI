@@ -485,6 +485,39 @@ export async function closeOwnedNativeDialog(
   return result;
 }
 
+/** Standard OK/Cancel buttons, scoped to the exact dialog and displayed review text. */
+export async function invokeOwnedNativeDialogButton(
+  { executionRoot, ownerPath, candidate, buttonId, expectedTitle, expectedText },
+  { invoke = invokeWindowsNativeInput } = {},
+) {
+  const fingerprint = requireInteractiveCandidate(candidate);
+  if (![1, 2].includes(buttonId)) throw new TypeError("buttonId must be standard IDOK or IDCANCEL");
+  if (typeof expectedTitle !== "string" || !expectedTitle || expectedTitle.length > 256 || expectedTitle.includes("\0")) {
+    throw new TypeError("expectedTitle must be bounded dialog text");
+  }
+  if (!Array.isArray(expectedText) || expectedText.length < 1 || expectedText.length > 8
+    || expectedText.some(text => typeof text !== "string" || !text || text.length > 4096 || text.includes("\0"))) {
+    throw new TypeError("expectedText must contain bounded nonempty review text");
+  }
+  const result = await invoke("InvokeDialogButton", {
+    ExecutionRoot: executionRoot, OwnerPath: ownerPath, WindowHandle: fingerprint.hwnd,
+    ExpectedThreadId: fingerprint.threadId, ExpectedClassName: fingerprint.className,
+    DialogButtonId: buttonId, ExpectedDialogTitle: expectedTitle, ExpectedDialogTextJson: JSON.stringify(expectedText),
+  });
+  const button = result?.button;
+  if (result?.attempt_count !== 1 || result?.call_returned !== true || result?.native_control_verified !== true
+    || result?.representative_input !== true || result?.cleanup_only !== false || result?.fallback_used !== false
+    || result?.window?.process_id !== candidate.process_id || result.window.hwnd?.toLowerCase() !== fingerprint.hwnd.toLowerCase()
+    || result?.dialog_title !== expectedTitle || !expectedText.every(text => result?.dialog_text?.includes(text))
+    || button?.process_id !== candidate.process_id || button?.control_id !== buttonId
+    || button?.class_name !== "Button" || button?.enabled !== true || button?.visible !== true
+    || button?.thread_id !== candidate.thread_id || button?.parent_hwnd?.toLowerCase() !== fingerprint.hwnd.toLowerCase()
+    || button?.root_hwnd?.toLowerCase() !== fingerprint.hwnd.toLowerCase()) {
+    throw new NativeInputError("native-dialog-button-invalid", "The exact native review dialog button was not invoked once", result);
+  }
+  return result;
+}
+
 export async function selectFileInOwnedNativeDialog(
   { executionRoot, ownerPath, candidate, selectedPath },
   { invoke = invokeWindowsNativeInput } = {},

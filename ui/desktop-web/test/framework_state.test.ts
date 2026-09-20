@@ -48,6 +48,7 @@ import {
 import {
   renderArtifactPane,
   renderComposer,
+  renderDesktopMarkup,
   renderLocalConfirmation,
   renderOverlay,
   renderSidebar,
@@ -396,7 +397,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       max_output_tokens_inherited: true,
       provider_mutation_enabled: false,
       access_mutation_enabled: false,
-      unavailable_reason: "root sessionを選択すると変更できます。",
+      unavailable_reason: "メインチャットを開くと変更できます。",
       target: null,
     },
     config_draft_capabilities: {
@@ -717,7 +718,7 @@ test("active root steering keeps an enabled send control labeled as additional i
       /data-action="send" title="実行中のタスクへ追加指示を送信" aria-label="実行中のタスクへ追加指示を送信"/,
       agentTreeActive ? "active child retention" : "active root",
     );
-    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+    assert.doesNotMatch(rendered, /実行中は送信できません|サブエージェントの完了または停止後に送信できます/);
   }
 });
 
@@ -739,7 +740,7 @@ test("active root steering with an empty draft asks for input instead of claimin
       /data-action="send" title="依頼文を入力してください" aria-label="依頼文を入力してください"[^>]*disabled/,
       agentTreeActive ? "active child retention" : "active root",
     );
-    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+    assert.doesNotMatch(rendered, /実行中は送信できません|サブエージェントの完了または停止後に送信できます/);
   }
 });
 
@@ -2983,7 +2984,7 @@ test("frontend provider URL validation mirrors the Rust ProviderEndpoint boundar
   }
 });
 
-test("Docling base URL validation follows the enabled value in the same complete draft", () => {
+test("Doclingの接続先URL validation follows the enabled value in the same complete draft", () => {
   const field = (
     key: string,
     value: string,
@@ -4281,7 +4282,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
   const rejectedHtml = renderOverlay(view);
   assert.match(
     rejectedHtml,
-    /data-action="apply-provider-session" >UIセッションに適用/,
+    /data-action="apply-provider-session" >設定ファイルに保存せず適用/,
   );
   assert.match(
     rejectedHtml,
@@ -4329,7 +4330,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
   const reloadedHtml = renderOverlay(reloadedView);
   assert.match(
     reloadedHtml,
-    /data-action="apply-provider-session" >UIセッションに適用/,
+    /data-action="apply-provider-session" >設定ファイルに保存せず適用/,
   );
   assert.match(
     reloadedHtml,
@@ -4623,7 +4624,7 @@ test("initial setup renders typed config import failures inside the active modal
     assert.match(html, /role="alert" aria-live="assertive"/);
     assert.match(html, /設定ファイルをImportできませんでした。/);
     assert.match(html, /invalid &lt;model\.request_timeout_ms&gt;/);
-    assert.match(html, /TOML設定をImport/);
+    assert.match(html, /TOML設定を読み込む/);
     assert.doesNotMatch(html, /invalid <model\.request_timeout_ms>/);
   }
 
@@ -4633,6 +4634,20 @@ test("initial setup renders typed config import failures inside the active modal
     status_message: "stale import failure",
   });
   assert.doesNotMatch(renderOverlay(preferences), /role="alert"/);
+});
+
+test("initial setup shows a saved-connection completion warning inside the current dialog", () => {
+  const state = projection({
+    overlay: "initial_setup",
+    status_code: "initial_setup_preferences_save_failed",
+    status_message: "接続情報は保存済みです。初回設定の完了状態を保存できませんでした。",
+    status_detail: "",
+  });
+  state.startup = { ...state.startup, initial_setup_required: true, action_overlay: "initial_setup" };
+  const html = renderDesktopMarkup(createDesktopRenderModel(state, renderLocal()), { backgroundInert: false, taskActivityDelay: "" });
+  assert.match(html, /class="initial-setup-status"[\s\S]*role="alert"/);
+  assert.match(html, /接続情報は保存済みです。初回設定の完了状態を保存できませんでした。/);
+  assert.doesNotMatch(html, /設定ファイルをImportできませんでした/);
 });
 
 test("initial setup makes durable save primary and explains its blocking alternatives", () => {
@@ -4656,21 +4671,21 @@ test("initial setup makes durable save primary and explains its blocking alterna
     );
     assert.match(
       html,
-      new RegExp(`class="setup-secondary-action" data-action="${applyAction}"[^>]*>この起動中だけ適用</button>`),
+      new RegExp(`class="setup-secondary-action" data-action="${applyAction}"[^>]*>設定ファイルに保存せず適用</button>`),
     );
     assert.match(html, /role="group" aria-label="初期設定の完了方法" aria-describedby="initial-setup-action-help"/);
     assert.match(html, /TOMLのファイル選択をキャンセルしても設定は変わりません。/);
-    assert.match(html, /保存または一時適用が完了するまで閉じません。/);
+    assert.match(html, /保存または適用が完了するまで閉じません。/);
     assert.doesNotMatch(html, /data-action="close-overlay"/);
   }
 
   const preferences = renderOverlay(projection({ overlay: "config" }), local);
-  assert.match(preferences, /data-action="apply-session-config"[^>]*>UIセッションに適用</);
+  assert.match(preferences, /data-action="apply-session-config"[^>]*>設定ファイルに保存せず適用</);
   assert.match(preferences, /data-action="save-global-config"[^>]*>設定ファイルに保存</);
   assert.doesNotMatch(preferences, /setup-primary-action/);
 
   const provider = renderOverlay(projection({ overlay: "provider" }), local);
-  assert.match(provider, /data-action="apply-provider-session"[^>]*>UIセッションに適用</);
+  assert.match(provider, /data-action="apply-provider-session"[^>]*>設定ファイルに保存せず適用</);
   assert.match(provider, /data-action="save-provider-global"[^>]*>設定ファイルに保存</);
   assert.doesNotMatch(provider, /setup-primary-action/);
 
@@ -4989,7 +5004,7 @@ test("Docling readiness stays an explicit clean-config action with typed section
   );
   const dirtyHtml = renderOverlay(dirty, renderLocal());
   assert.match(dirtyHtml, /未保存の設定があります/);
-  assert.match(dirtyHtml, /保存してから Test Docling/);
+  assert.match(dirtyHtml, /保存してから「Doclingへの接続を試す」/);
 });
 
 test("dirty Settings close confirmation is modal, target-scoped, and has no backdrop action", () => {
@@ -5743,7 +5758,7 @@ test("durable Sub Agent events stay inside their turn history and the root final
       row_kind: "user" as const,
       step: "01",
       title: "ユーザー依頼",
-      body: "2つのSub Agentで確認してください",
+      body: "2つのサブエージェントで確認してください",
       file_changes: [],
     },
     {
@@ -5832,7 +5847,7 @@ test("durable Sub Agent events stay inside their turn history and the root final
   assert.match(firstSummaryHtml, /&lt;script&gt;alert\(&#0?39;x&#0?39;\)&lt;\/script&gt;/);
   assert.doesNotMatch(firstSummaryHtml, /https:\/\/secret\.invalid|<script>/);
   assert.match(html, /<strong><code>navigation_review<\/code> の最終結果<\/strong>/);
-  assert.match(html, /class="work-history-event"[\s\S]*Sub Agentの完了を待ちました/);
+  assert.match(html, /class="work-history-event"[\s\S]*サブエージェントの完了を待ちました/);
   assert.doesNotMatch(html, /出力: 2件完了/);
   assert.doesNotMatch(html, /RAW CHILD REPORT|example\.invalid|message sub_agent_|agent-inline-activity/);
   assert.equal(html.match(/data-action="jump-history-anchor"/g)?.length, 6);
@@ -6127,18 +6142,18 @@ test("incomplete canonical turn is rendered as nonterminal evidence", () => {
 });
 
 test("Settings Main and Provider present typed model-load failure and recover on retry", () => {
-  const failure = { kind: "error" as const, title: "Providerモデル一覧を読み込めません", hint: "接続先を確認して再試行してください。", details: "connection refused <diagnostic>" };
+  const failure = { kind: "error" as const, title: "AIのモデル一覧を読み込めません", hint: "接続先を確認して再試行してください。", details: "connection refused <diagnostic>" };
   for (const overlay of ["config", "provider"] as const) {
     const current = projection({ overlay, provider_status: failure, provider_catalog_base_url: null, provider_catalog_profile: null });
     const id = overlay === "config" ? "main-provider-model-catalog-status" : "provider-status";
     const html = renderOverlay(current);
     assert.match(html, new RegExp(`id="${id}" class="provider-status error"[^>]*data-settings-passive="${id}"[^>]*data-settings-preserve-focused-region`));
-    assert.match(html, /<strong data-provider-status-title>Providerモデル一覧を読み込めません<\/strong>/);
+    assert.match(html, /<strong data-provider-status-title>AIのモデル一覧を読み込めません<\/strong>/);
     assert.match(html, /<p data-provider-status-hint>接続先を確認して再試行してください。<\/p>/);
     assert.match(html, /<pre data-provider-status-details>connection refused &lt;diagnostic&gt;<\/pre>/);
     assert.doesNotMatch(html, new RegExp(`data-details-key="${id}-details"[^>]*\\bopen`));
-    assert.doesNotMatch(renderOverlay({ ...current, provider_loading: true, provider_status: { kind: "loading", title: "読込中", hint: "", details: "" } }), /connection refused|Providerモデル一覧を読み込めません/);
-    assert.doesNotMatch(renderOverlay({ ...current, provider_status: { kind: "success", title: "読み込みました", hint: "選択できます", details: "" } }), /connection refused|Providerモデル一覧を読み込めません/);
+    assert.doesNotMatch(renderOverlay({ ...current, provider_loading: true, provider_status: { kind: "loading", title: "読込中", hint: "", details: "" } }), /connection refused|AIのモデル一覧を読み込めません/);
+    assert.doesNotMatch(renderOverlay({ ...current, provider_status: { kind: "success", title: "読み込みました", hint: "選択できます", details: "" } }), /connection refused|AIのモデル一覧を読み込めません/);
   }
 });
 

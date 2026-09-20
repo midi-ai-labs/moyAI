@@ -68,8 +68,8 @@ function projection(overrides = {}) {
     composer_submit_mode: "new_request",
     can_submit: true,
     status_message: "完了",
-    session_usage_label: "セッション累計: 42 token",
-    session_usage_title: "canonical terminal telemetry: 2 / 2 turn計測。入力 30、出力 12、reasoning 0、合計 42 token。完了済みturnの累計です。",
+    session_usage_label: "このチャットの累計: 42 トークン",
+    session_usage_title: "完了した依頼のうち 2 / 2件を計測。入力 30、出力 12、思考分 0、合計 42 トークン。完了した依頼の累計です。",
     session_usage_state: "complete",
     draft_target: { sessionId: SESSION_ID },
     run_target: {
@@ -202,8 +202,8 @@ test("permission restart Guardian terminal requires settled status, exact histor
 
 test("permission restart Guardian Chat terminal preserves missing reasoning as unmeasured", () => {
   const chatSurface = surface({
-    session_usage_label: "セッション累計: 42 token（reasoning未計測）",
-    session_usage_title: "canonical terminal telemetry: 2 / 2 turn計測。入力 30、出力 12、reasoning 未計測（2 turnすべて未報告）、合計 42 token。",
+    session_usage_label: "このチャットの累計: 42 トークン（思考分は未計測）",
+    session_usage_title: "完了した依頼のうち 2 / 2件を計測。入力 30、出力 12、思考分は未計測（2件すべて未報告）、合計 42 トークン。",
     session_usage_state: "partial",
   });
   assert.deepEqual(permissionRestartGuardianTerminalFailures(
@@ -213,7 +213,7 @@ test("permission restart Guardian Chat terminal preserves missing reasoning as u
   ), []);
 
   const misreported = structuredClone(chatSurface);
-  misreported.projection.session_usage_title = "reasoning 0";
+  misreported.projection.session_usage_title = "思考分 0";
   const failures = permissionRestartGuardianTerminalFailures(
     misreported,
     seedOwner,

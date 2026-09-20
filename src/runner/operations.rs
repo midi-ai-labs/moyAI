@@ -20,6 +20,9 @@ pub enum RunnerOperation {
     Pause,
     Resume,
     Drain,
+    QuiescentShutdown {
+        expected_desktop_binding: String,
+    },
     Maintenance {
         until_ms: Option<u64>,
     },
@@ -131,6 +134,37 @@ impl Default for Installed {
             desktop_binding: None,
         }
     }
+}
+
+/// Saved execution consent follows the authenticated Hub/device trust identity.
+/// Transient reviews and async targets continue to compare the complete binding.
+pub(crate) fn desktop_consent_matches(saved: &str, current: &str) -> bool {
+    fn identity(value: &str) -> Option<(&str, &str, &str)> {
+        let parts = value.split('|').collect::<Vec<_>>();
+        if parts.len() != 4
+            || !crate::device_network::stable_id(parts[0])
+            || !crate::device_network::stable_id(parts[1])
+            || parts[3].len() != 64
+            || !parts[3]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        let url = reqwest::Url::parse(parts[2]).ok()?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        Some((parts[0], parts[1], parts[3]))
+    }
+    matches!((identity(saved), identity(current)), (Some(a), Some(b)) if a == b)
 }
 impl Installed {
     pub(crate) fn child_environments(
@@ -294,6 +328,11 @@ impl RunnerHost {
             | RunnerOperation::Drain
             | RunnerOperation::Maintenance { .. } => {
                 let mut store = self.inner.operations.lock().map_err(error)?;
+                if self.inner.state.lock().map_err(error)?.closing {
+                    return Err(RunnerError::new(
+                        "Runner is stopping; its saved acceptance mode cannot change",
+                    ));
+                }
                 let mut next = store.installed.clone();
                 next.maintenance_until_ms = None;
                 next.mode = match operation {
@@ -414,6 +453,7 @@ impl RunnerHost {
             RunnerOperation::InstallAutostart => super::autostart::install()?,
             RunnerOperation::RemoveAutostart => super::autostart::remove()?,
             operation @ (RunnerOperation::Provision { .. }
+            | RunnerOperation::QuiescentShutdown { .. }
             | RunnerOperation::ReconcileUnknown { .. }
             | RunnerOperation::LocalSignIn { .. }
             | RunnerOperation::LocalSignOut) => {

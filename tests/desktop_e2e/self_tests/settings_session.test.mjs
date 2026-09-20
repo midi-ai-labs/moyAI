@@ -121,7 +121,7 @@ function surface({
       inert: false,
       scope_count: 1,
       scope_visible: true,
-      scope_text: "このセッションだけ",
+      scope_text: "このチャットだけ",
       base_url: panelField("http://127.0.0.1:43111"),
       model: panelField("e2e/scripted-responses"),
       provider_profile: panelField(SESSION_PROVIDER_PROFILE, [...SESSION_PROVIDER_PROFILE_OPTIONS]),

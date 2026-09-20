@@ -1,6 +1,6 @@
 import { command } from "./api.ts";
-import { openHubProject, openSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
-import { sharedWorkActionEnabled } from "./shared_work_state.ts";
+import { openHubProject, openSharedWork, refreshSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
+import { sharedWorkActionEnabled, selectSharedLoginMode } from "./shared_work_state.ts";
 import { deviceExecutionAction, deviceExecutionActionEnabled } from "./device_execution.ts";
 import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
 import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork } from "./device_network_actions.ts";
@@ -188,7 +188,7 @@ function doclingReadinessCheckEnabled(
   if (state.overlay === "initial_setup") {
     return startupSetupRequired(state)
       && state.startup.setup_target !== null
-      && model.local.initialSetup.step === "tools"
+      && (model.local.initialSetup.step === "tools" || (model.local.initialSetup.guided === true && model.local.initialSetup.step === "finish"))
       && enabled
       && validateInitialSetupStep(
         "finish",
@@ -385,7 +385,7 @@ async function loadInitialSetupConfigToml(
       result.values,
     )) {
       context.rerender();
-      context.reportError("選択したTOMLを完全な設定draftとして読み込めませんでした。");
+      context.reportError("選択したTOMLファイルの設定を読み込めませんでした。");
       return;
     }
     const importedView = context.getViewState();
@@ -412,6 +412,43 @@ async function loadInitialSetupConfigToml(
       current?.config_target ?? request.configTarget,
       context.uiState.configDraftRevision,
     );
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  }
+}
+
+async function chooseInitialSetupPurpose(
+  state: DesktopViewState,
+  context: ActionContext,
+  purpose: "personal" | "execution" | "team" | "hosting",
+): Promise<void> {
+  const target = state.startup.setup_target;
+  if (!target || !initialSetupNavigationEnabled(state, context) || context.uiState.initialSetup.step !== "start") return;
+  const request = beginInitialSetupAuxiliaryRequest(context.uiState.initialSetupAuxiliary, "purpose",
+    target, state.config_target, context.uiState.configDraftRevision);
+  if (!request) return;
+  context.rerender();
+  try {
+    const next = await command<DesktopWebState>("choose_initial_setup_purpose", {
+      purpose, expectedSetupTarget: request.setupTarget, expectedConfigTarget: request.configTarget,
+    });
+    const current = context.getViewState();
+    const accepted = finishInitialSetupAuxiliaryRequest(context.uiState.initialSetupAuxiliary, request,
+      current?.startup.setup_target ?? null, current?.config_target ?? request.configTarget, context.uiState.configDraftRevision);
+    if (!accepted) return context.rerender();
+    context.acceptProjection(next);
+    if (purpose === "personal" || purpose === "execution") {
+      context.uiState.initialSetup.guided = true;
+      context.uiState.initialSetup.step = "provider";
+      context.rerender();
+    } else if (purpose === "team") {
+      await refreshSharedWork(context);
+    }
+  } catch (error) {
+    const current = context.getViewState();
+    finishInitialSetupAuxiliaryRequest(context.uiState.initialSetupAuxiliary, request,
+      current?.startup.setup_target ?? null, current?.config_target ?? request.configTarget, context.uiState.configDraftRevision);
     if (context.recoverCommandConflict(error)) return;
     context.rerender();
     context.reportError(error);
@@ -470,7 +507,7 @@ async function checkInitialSetupDoclingReadiness(
   if (
     !startupSetupRequired(state)
     || state.overlay !== "initial_setup"
-    || context.uiState.initialSetup.step !== "tools"
+    || !(context.uiState.initialSetup.step === "tools" || (context.uiState.initialSetup.guided && context.uiState.initialSetup.step === "finish"))
     || setupTarget === null
     || readinessEndpoint === null
     || !validateInitialSetupStep("finish", state.config_fields, values).ok
@@ -545,6 +582,7 @@ function initialSetupNavigationEnabled(
 
 function moveInitialSetupForward(state: DesktopViewState, context: ActionContext): void {
   if (!initialSetupNavigationEnabled(state, context)) return;
+  if (context.uiState.initialSetup.step === "start") context.uiState.initialSetup.guided = false;
   advanceInitialSetupStep(
     context.uiState.initialSetup,
     state.config_fields,
@@ -615,7 +653,13 @@ async function finishInitialSetupFlow(
       nextState.config_target,
       currentTarget,
     );
+    if (setupAccepted && configAccepted && state.startup.onboarding_intent === "execution" && nextState.overlay === "hub") {
+      context.uiState.hub.tab = "devices";
+    }
     context.acceptProjection(nextState);
+    if (setupAccepted && configAccepted && state.startup.onboarding_intent === "execution" && nextState.overlay === "hub") {
+      await selectHubTab(context, "devices");
+    }
     if (!setupAccepted || !configAccepted) {
       context.reportError("初期設定の保存中に設定対象が変更されました。現在の内容を確認してください。");
     }
@@ -704,7 +748,7 @@ async function applySessionSettings(
     }
     context.acceptProjection(nextState);
     if (!accepted) {
-      context.reportError("Session Settingsの保存対象が変更されました。現在のroot sessionを確認してください。");
+      context.reportError("設定対象のチャットが変わりました。変更したいチャットの設定を開き直してください。");
     }
   } catch (error) {
     finishSessionSettingsMutation(context.uiState.sessionSettings, request, {
@@ -764,7 +808,7 @@ async function confirmSessionSettingsDiscardClose(context: ActionContext): Promi
   try {
     const nextState = await command<DesktopWebState>("close_overlay");
     if (nextState.overlay === "session_settings") {
-      failLocalDecision(context.uiState, "Session Settingsを閉じられませんでした。もう一度お試しください。");
+      failLocalDecision(context.uiState, "チャットの設定を閉じられませんでした。もう一度お試しください。");
       context.acceptProjection(nextState);
       return;
     }
@@ -773,7 +817,7 @@ async function confirmSessionSettingsDiscardClose(context: ActionContext): Promi
     context.uiState.pendingLocalConfirmation = null;
     context.acceptProjection(nextState);
   } catch (error) {
-    failLocalDecision(context.uiState, "Session Settingsを閉じられませんでした。もう一度お試しください。");
+    failLocalDecision(context.uiState, "チャットの設定を閉じられませんでした。もう一度お試しください。");
     if (context.recoverCommandConflict(error)) {
       context.rerender();
       return;
@@ -1498,7 +1542,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "show-provider",
-    label: "LLM / Provider 設定",
+    label: "AIの接続設定",
     menu: "view",
     palette: true,
     enabled: (state) => state.config_draft.external_owner_mutation_open,
@@ -1514,14 +1558,15 @@ const ACTION_DEFINITIONS = [
   },
   { id: "show-hub", label: "moyAI Hub", menu: "view", palette: true, enabled: always, run: (_state, context) => openHub(context) },
   { id: "show-shared-work", label: "Hubのプロジェクト", menu: "view", palette: true, enabled: always, run: (_state, context) => openSharedWork(context) },
+  { id: "shared-auth-mode", label: "ログイン方法を選ぶ", enabled: (state, payload, model) => state.hub_project_open === true && state.overlay === "none" && !model.local.sharedWork.pending && !model.local.sharedWork.projection?.principal && ["setup", "password"].includes(payload.value), run: (_state, context, payload) => { if (selectSharedLoginMode(context.uiState.sharedWork, payload.value)) context.rerender(); } },
   { id: "open-hub-project", label: "Hubのプロジェクトを開く", enabled: (state, payload, model) => navigationIsIdle(state) && !model.local.sharedWork.pending && !model.local.sharedWork.conceal && Boolean(model.local.sharedWork.projection?.projects.some(row => row.id === payload.value)), run: (_state, context, payload) => openHubProject(context, payload.value) },
-  ...["login", "logout", "new-conversation", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "continue", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
+  ...["login", "setup-password", "logout", "new-conversation", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "continue", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
     id: `shared-${kind}`, label: "共有仕事の操作",
     enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
     run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => sharedWorkAction(context, kind.replaceAll("-", "_"), payload.value),
   })),
-  { id: "hub-tab-devices", label: "Hubの端末連携", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "devices") },
-  ...["prepare", "enable", "pause", "resume", "reconcile"].map(kind => ({
+  { id: "hub-tab-devices", label: "HubのPCの接続", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "devices") },
+  ...["prepare", "enable", "pause", "resume", "install-autostart", "remove-autostart", "reconcile"].map(kind => ({
     id: `device-execution-${kind}`, label: "このPCの実行設定",
     enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.overlay === "hub" && deviceExecutionActionEnabled(model.local.deviceNetwork, kind, payload.value),
     run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => deviceExecutionAction(context, kind, payload.value),
@@ -1530,6 +1575,7 @@ const ACTION_DEFINITIONS = [
   { id: "device-network-import", label: "Hub共通設定を読み込む", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection), run: (_state, context) => importDeviceNetwork(context) },
   { id: "device-network-refresh", label: "端末ネットワークを更新", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending, run: (_state, context) => refreshDeviceNetwork(context) },
   { id: "device-network-diagnose-hub", label: "Hubへの接続を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "hub"), run: (_state, context) => diagnoseDeviceNetwork(context, "hub") },
+  { id: "device-network-diagnose-gateway", label: "このPCからHubのAIへの接続を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "gateway"), run: (_state, context) => diagnoseDeviceNetwork(context, "gateway") },
   { id: "device-network-join", label: "参加申請を再試行", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanJoin(model.local.deviceNetwork), run: (_state, context) => joinDeviceNetwork(context) },
   { id: "device-network-leave", label: "Hub接続を一時解除", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection?.can_leave && model.local.deviceNetwork.leaveConfirmed), run: (_state, context) => leaveDeviceNetwork(context) },
   { id: "show-mcp-history", label: "MCP履歴", menu: "view", palette: true, enabled: always, run: (_state, context) => openMcpHistory(context) },
@@ -1553,16 +1599,16 @@ const ACTION_DEFINITIONS = [
     enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && model.local.hub.projection !== null && model.local.hub.projection.status !== "disconnected",
     run: (_state, context) => disconnectHub(context),
   },
-  { id: "hub-save-main", label: "MainのHubモデル選択を保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
+  { id: "hub-save-main", label: "メインチャットのHubモデルを保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
   { id: "hub-main-recommendation", label: "Hubの推奨候補を選ぶ", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanUseRecommendation(model.local.hub), run: (_state, context) => { useHubRecommendation(context.uiState.hub); context.rerender(); } },
-  { id: "hub-save-side", label: "SideのHubモデル選択を保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
-  { id: "hub-main-direct", label: "Mainを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "direct"), run: (_state, context) => setHubRouteMode(context, "main", "direct") },
-  { id: "hub-main-hub", label: "MainをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "hub"), run: (_state, context) => setHubRouteMode(context, "main", "hub") },
-  { id: "hub-side-direct", label: "Sideを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "direct"), run: (_state, context) => setHubRouteMode(context, "side_chat", "direct") },
-  { id: "hub-side-hub", label: "SideをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "hub"), run: (_state, context) => setHubRouteMode(context, "side_chat", "hub") },
+  { id: "hub-save-side", label: "サイドチャットのHubモデルを保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
+  { id: "hub-main-direct", label: "メインチャットを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "direct"), run: (_state, context) => setHubRouteMode(context, "main", "direct") },
+  { id: "hub-main-hub", label: "メインチャットをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "hub"), run: (_state, context) => setHubRouteMode(context, "main", "hub") },
+  { id: "hub-side-direct", label: "サイドチャットを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "direct"), run: (_state, context) => setHubRouteMode(context, "side_chat", "direct") },
+  { id: "hub-side-hub", label: "サイドチャットをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "hub"), run: (_state, context) => setHubRouteMode(context, "side_chat", "hub") },
   {
     id: "show-session-settings",
-    label: "このセッションの設定",
+    label: "このチャットの設定",
     palette: true,
     enabled: (state) => !state.hub_project_open && state.session_settings?.available === true
       && state.session_settings.target !== null
@@ -1586,6 +1632,15 @@ const ACTION_DEFINITIONS = [
       ).ok,
     run: (state, context) => moveInitialSetupForward(state, context),
   },
+  ...(["personal", "execution", "team", "hosting"] as const).map((purpose) => ({
+    id: `initial-setup-${purpose}`,
+    label: ({ personal: "自分のPCで使う", execution: "チームの仕事をこのPCで実行する", team: "チームに参加する", hosting: "チーム環境を用意する" })[purpose],
+    enabled: (state: DesktopViewState, _payload: ActionPayload, model: DesktopRenderModel) => startupSetupRequired(state)
+      && state.overlay === "initial_setup" && state.startup.setup_target !== null
+      && model.local.initialSetup.step === "start" && !model.local.initialSetup.finishPending
+      && model.local.initialSetup.auxiliaryPendingKind === null && !model.local.configMutationPending,
+    run: (state: DesktopViewState, context: ActionContext) => chooseInitialSetupPurpose(state, context, purpose),
+  })),
   {
     id: "initial-setup-back",
     label: "前へ",
@@ -1616,7 +1671,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "apply-session-settings",
-    label: "このセッションに適用",
+    label: "このチャットに適用",
     enabled: (state, _payload, model) => state.overlay === "session_settings"
       && state.session_settings?.target != null
       && model.local.sessionSettings.availability.enabled
@@ -1626,7 +1681,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "discard-session-settings",
-    label: "Session Settingsの変更を破棄",
+    label: "チャットの設定の変更を破棄",
     enabled: (state, _payload, model) => state.overlay === "session_settings"
       && state.session_settings?.target != null
       && model.local.sessionSettings.dirty
@@ -1635,7 +1690,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "open-preferences-from-session-settings",
-    label: "Global Settingsを開く",
+    label: "共通設定を開く",
     enabled: (state, _payload, model) => state.overlay === "session_settings"
       && !model.local.sessionSettings.dirty
       && !model.local.sessionSettings.mutationPending,
@@ -1675,14 +1730,14 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "show-workspace-picker",
-    label: "ワークスペースを切り替え",
+    label: "作業フォルダーを切り替える",
     palette: true,
     enabled: navigationIsIdle,
     run: (_state, context) => context.mutate("show_workspace_picker"),
   },
   {
     id: "enhance-prompt",
-    label: "プロンプトを推敲",
+    label: "依頼文を整える",
     menu: "edit",
     palette: true,
     enabled: (state) => !state.hub_project_open && state.enhance_enabled,
@@ -1705,7 +1760,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "toggle-access",
-    label: "アクセスモード切替",
+    label: "承認方法を切り替える",
     shortcut: "F8",
     palette: true,
     enabled: (state, _payload, model) => !state.hub_project_open && state.config_draft.access_mode_mutation_enabled
@@ -1738,7 +1793,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "export-transcript",
-    label: "表示中 Transcript を Markdown 保存",
+    label: "表示中の会話をMarkdownで保存",
     shortcut: "F9",
     palette: true,
     enabled: (state) => !state.hub_project_open && state.history_export_enabled && navigationIsIdle(state),
@@ -1746,56 +1801,56 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "export-history",
-    label: "選択セッション履歴を Markdown 保存",
+    label: "選択したチャットをMarkdownで保存",
     palette: true,
     enabled: (state) => !state.hub_project_open && state.history_export_enabled && selectedSessionAvailable(state) && navigationIsIdle(state),
     run: (state, context, payload) => runSessionRowMutation("export_history_markdown", state, context, payload),
   },
   {
     id: "rejoin-session",
-    label: "実行中セッションに再参加",
+    label: "実行中のチャットを開く",
     palette: true,
     enabled: targetSessionActive,
     run: (state, context, payload) => runSessionRowMutation("rejoin_session", state, context, payload),
   },
   {
     id: "archive-session",
-    label: "セッションをアーカイブ",
+    label: "チャットを一覧から隠す",
     palette: true,
     enabled: targetSessionArchiveable,
     run: (state, context, payload) => requestLocalArchiveState("archive_session", targetSessionIndex(state, payload), state, context),
   },
   {
     id: "unarchive-session",
-    label: "セッションを復元",
+    label: "チャットを一覧に戻す",
     palette: true,
     enabled: targetSessionRestorable,
     run: (state, context, payload) => requestLocalArchiveState("unarchive_session", targetSessionIndex(state, payload), state, context),
   },
   {
     id: "rollback-session",
-    label: "最新 turn を戻す",
+    label: "最後の実行前に戻す",
     palette: true,
     enabled: targetSessionInactive,
     run: (state, context, payload) => requestLocalRollback(targetSessionIndex(state, payload), state, context),
   },
   {
     id: "fork-session",
-    label: "セッションを fork",
+    label: "会話を引き継いで新しいチャットを作る",
     palette: true,
     enabled: targetSessionInactive,
     run: (state, context, payload) => runSessionRowMutation("fork_session", state, context, payload),
   },
   {
     id: "interrupt-session",
-    label: "実行中セッションを interrupt",
+    label: "実行中のチャットを停止",
     palette: true,
     enabled: targetSessionInterruptable,
     run: (state, context, payload) => runSessionRowMutation("interrupt_session", state, context, payload),
   },
   {
     id: "delete-session",
-    label: "セッションを削除",
+    label: "チャットを削除",
     enabled: targetSessionInactive,
     run: (state, context, payload) => requestLocalDelete("session", targetSessionIndex(state, payload), state, context),
   },
@@ -1826,7 +1881,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "toggle-artifact-pane",
-    label: "アーティファクトペイン切替",
+    label: "成果物パネルの表示切替",
     palette: true,
     enabled: always,
     run: (_state, context) => {
@@ -1850,7 +1905,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "capture-side-chat-direct-provider",
-    label: "この会話にDirect設定を適用",
+    label: "この会話に直接接続の設定を適用",
     enabled: (state, _payload, model) => Boolean(state.side_chat.direct_provider_capture?.enabled)
       && model.local.sideChat.operationsOpen && !model.local.sideChat.mutationPending,
     run: async (state, context) => {
@@ -1873,7 +1928,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "quote-selection-to-side-chat",
-    label: "選択範囲をSide Chatで引用",
+    label: "選択範囲をサイドチャットで引用",
     enabled: (state, _payload, model) => !state.side_chat.deleting
       && sideChatOwnerSessionId(state) !== null
       && model.local.sideChat.operationsOpen
@@ -1887,7 +1942,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "load-side-chat-models",
-    label: "Side Chat モデル読込",
+    label: "サイドチャットのモデル一覧を読み込む",
     enabled: (_state, _payload, model) => model.local.sideChat.catalogLoadEnabled,
     run: (state, context) => loadSideChatModels(state, context),
   },
@@ -1945,7 +2000,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "show-agent-pane",
-    label: "Sub Agent履歴を表示",
+    label: "サブエージェント履歴を表示",
     enabled: (state) => state.agent_activity_rows.length > 0,
     run: async (state, context, payload) => {
       if (!openAgentPane(context.uiState, state, payload.value)) return;
@@ -1956,7 +2011,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "show-agent-list",
-    label: "Sub Agent一覧に戻る",
+    label: "サブエージェント一覧に戻る",
     enabled: always,
     run: (_state, context) => {
       showAgentList(context.uiState);
@@ -1965,7 +2020,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "interrupt-agent",
-    label: "Sub Agentを停止",
+    label: "サブエージェントを停止",
     enabled: (state, payload) => state.agent_activity_rows.some(
       (row) => row.agent_path === payload.value
         && snapshotAgentInterruptTarget(row.interrupt_target) !== null,
@@ -1981,7 +2036,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "show-output-pane",
-    label: "出力ペインに戻る",
+    label: "出力パネルに戻る",
     enabled: always,
     run: (_state, context) => {
       showOutputPane(context.uiState, true);
@@ -2004,7 +2059,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "open-artifact-folder",
-    label: "アーティファクトフォルダーを開く",
+    label: "成果物のフォルダーを開く",
     palette: true,
     enabled: (state) => selectedArtifactAvailable(state) && navigationIsIdle(state),
     run: (state, context) => {
@@ -2015,7 +2070,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "load-provider-models",
-    label: "Provider モデル読込",
+    label: "AIのモデル一覧を読み込む",
     palette: true,
     enabled: (state, _payload, model) => (
       state.overlay === "initial_setup"
@@ -2065,7 +2120,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "apply-provider-session",
-    label: "Provider 設定を UI セッションに適用",
+    label: "接続設定を設定ファイルに保存せず適用",
     palette: true,
     enabled: (state, _payload, model) => state.provider_apply_enabled
       && !model.local.configMutationPending,
@@ -2080,7 +2135,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "save-provider-global",
-    label: "Provider 設定をファイルに保存",
+    label: "接続設定をファイルに保存",
     palette: true,
     enabled: (state, _payload, model) => state.provider_apply_enabled
       && !model.local.configMutationPending,
@@ -2095,7 +2150,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "apply-session-config",
-    label: "編集中の設定を UI セッションに適用",
+    label: "入力中の設定を設定ファイルに保存せず適用",
     palette: true,
     enabled: (state, _payload, model) => state.config_draft.commit_enabled
       && !model.local.configMutationPending,
@@ -2111,7 +2166,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "select-provider-model",
-    label: "Provider model 選択",
+    label: "AIモデルを選ぶ",
     enabled: (state, payload) => state.provider_model_ids[payload.index] !== undefined,
     run: (state, context, payload) => {
       const modelId = state.provider_model_ids[payload.index];
@@ -2123,7 +2178,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "switch-workspace",
-    label: "ワークスペース切替",
+    label: "作業フォルダーを切り替える",
     palette: true,
     enabled: navigationIsIdle,
     run: (state, context) => context.mutate("switch_workspace", {
@@ -2133,7 +2188,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "browse-workspace",
-    label: "ワークスペース参照",
+    label: "作業フォルダーを選ぶ",
     palette: true,
     enabled: always,
     run: (state, context) => context.mutate("browse_workspace", {
@@ -2178,7 +2233,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "new-project-session",
-    label: "プロジェクトに新しいセッションを作成",
+    label: "プロジェクトに新しいチャットを作成",
     enabled: (state, payload) => navigationIsIdle(state)
       && indexedRowMutationAvailable(state, payload.index, state.project_rows[payload.index]?.project_id),
     run: (state, context, payload) => runIndexedMutation(
@@ -2204,7 +2259,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "session",
-    label: "セッションを選択",
+    label: "チャットを選択",
     enabled: (state, payload) => navigationIsIdle(state)
       && indexedRowMutationAvailable(state, payload.index, state.session_rows[payload.index]?.session_id),
     run: (state, context, payload) => runIndexedMutation(
@@ -2276,7 +2331,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "confirm-local-rollback",
-    label: "ロールバックを確認",
+    label: "最後の実行の取り消しを確認",
     enabled: (_state, _payload, model) => model.local.modal.localConfirmation?.kind === "rollback_session"
       && !model.local.modal.localDecisionPending,
     run: (_state, context) => confirmLocalRollback(context),
@@ -2295,7 +2350,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "confirm-session-settings-discard-close",
-    label: "Session Settingsの変更を破棄して閉じる",
+    label: "チャットの設定の変更を破棄して閉じる",
     enabled: (state, _payload, model) => {
       const confirmation = model.local.modal.localConfirmation;
       const target = state.session_settings?.target ?? null;
@@ -2311,7 +2366,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "artifact",
-    label: "アーティファクトを選択",
+    label: "成果物を選択",
     enabled: (state, payload) => indexedRowMutationAvailable(
       state,
       payload.index,
@@ -2375,7 +2430,7 @@ const ACTION_DEFINITIONS = [
   },
   {
     id: "cancel-review",
-    label: "Prompt Reviewをキャンセル",
+    label: "依頼文の推敲をキャンセル",
     enabled: (state) => snapshotPromptReviewMutationTarget(state.review_target) !== null,
     run: async (state, context) => {
       const expectedTarget = snapshotPromptReviewMutationTarget(state.review_target);

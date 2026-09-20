@@ -9,6 +9,7 @@ use std::time::Duration;
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticScope {
     Hub,
+    Gateway,
     Receiver,
     Peer,
 }
@@ -251,25 +252,27 @@ impl DeviceNetworkService {
                     client.request("/v1/network/diagnostics", None).await;
                 match probe {
                     Ok(probe) if Some(&probe.hub_id) == settings.hub_id.as_ref() => {
-                        result.stage("hub_identity", "HubのTLS・端末認可", "pass", "登録したHubと端末資格を確認しました。", None);
+                        result.stage("hub_identity", "Hubの証明書とこのPCの認証", "pass", "接続先が登録済みのHubであることと、このPCの認証を確認しました。", None);
                         let now = crate::runtime::SystemClock::now_ms() as u64;
                         result.server_certificate("hub_certificate", "Hub証明書の自動更新", probe.certificate.as_ref(), now);
-                        if scope == DiagnosticScope::Hub {
-                            result.server_certificate("gateway_certificate", "Gateway証明書の自動更新", probe.gateway_certificate.as_ref(), now);
+                        if scope == DiagnosticScope::Gateway {
+                            result.server_certificate("gateway_certificate", "AI中継サーバーの証明書更新", probe.gateway_certificate.as_ref(), now);
                             if let Some(endpoint) = probe.gateway_endpoint.filter(|_| probe.gateway_ready) {
                                 let http = client.http().acquire().await;
                                 let tls_endpoint = reqwest::Url::parse(&endpoint).is_ok_and(|url| url.scheme() == "https" && url.username().is_empty() && url.password().is_none());
                                 let ok = tls_endpoint && tokio::time::timeout(Duration::from_secs(5), http.http.get(&endpoint).send()).await.is_ok_and(|response| response.is_ok_and(|response| !response.status().is_redirection() && !response.status().is_server_error()));
-                                result.stage("gateway", "モデルGatewayへのTLS接続", if ok {"pass"} else {"fail"}, endpoint, (!ok).then_some("HubでGatewayの起動状態と待受ポートを確認してください。"));
+                                result.stage("gateway", "AI中継サーバーへの暗号化接続", if ok {"pass"} else {"fail"}, endpoint, (!ok).then_some("Hubの管理画面でAIの配信状態とポート番号を確認してください。"));
                             } else {
-                                result.stage("gateway", "モデルGatewayへのTLS接続", "skipped", "HubのGatewayは待受していません。", Some("Hubでモデル配信を開始してください。"));
+                                result.stage("gateway", "AI中継サーバーへの暗号化接続", "fail", "HubのAI中継サーバーが起動していません。", Some("Hub経由のAIをこのPCで使う場合は、管理者にモデル配信の開始を依頼してください。"));
                             }
-                        } else {
+                        } else if scope == DiagnosticScope::Peer {
                             self.diagnose_peer(&client, &settings.hub_id, &mut result).await;
+                        } else {
+                            result.stage("shared_work", "共有仕事の接続", "pass", "PCの接続を確認しました。利用者のログインとプロジェクトへの参加は、チャット画面で確認してください。", None);
                         }
                     },
-                    Ok(_) => result.stage("hub_identity", "HubのTLS・端末認可", "fail", "Hubの識別が登録情報と一致しません。", Some("共通設定と参加先Hubを確認してください。")),
-                    Err(error) => result.stage("hub_identity", "HubのTLS・端末認可", "fail", error.to_string(), Some("共通config.tomlのHub証明書、端末の参加状態・失効状態を確認してください。")),
+                    Ok(_) => result.stage("hub_identity", "Hubの証明書とこのPCの認証", "fail", "Hubの識別が登録情報と一致しません。", Some("共通設定と参加先Hubを確認してください。")),
+                    Err(error) => result.stage("hub_identity", "Hubの証明書とこのPCの認証", "fail", error.to_string(), Some("接続設定のHub証明書と、このPCの参加・失効状態を管理者に確認してください。")),
                 }
             }
         }

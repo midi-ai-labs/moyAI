@@ -85,6 +85,7 @@ pub struct DesktopStartupProjection {
     pub action_overlay: String,
     pub initial_setup_required: bool,
     pub initial_setup_reason: Option<String>,
+    pub onboarding_intent: Option<super::preferences::DesktopOnboardingIntent>,
     pub global_config_path: Option<String>,
     pub setup_target: Option<DesktopInitialSetupMutationTargetProjection>,
     pub checks: Vec<DesktopStartupCheckProjection>,
@@ -1092,8 +1093,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 steps: plan.steps.clone(),
             }),
         progress_text: if pre_admission_active {
-            "実行準備中\nフェーズ: 実行準備\n手順: durable run admissionを確定しています"
-                .to_string()
+            "実行準備中\n処理: 依頼の受付\n手順: 依頼を保存しています".to_string()
         } else {
             detail.progress_text
         },
@@ -1419,8 +1419,8 @@ fn session_settings_projection(
             context_window_inherited: true,
             provider_mutation_enabled: false,
             access_mutation_enabled: false,
-            unavailable_reason:
-                "root sessionを選択すると、このセッションだけの設定を変更できます。".to_string(),
+            unavailable_reason: "メインチャットを開くと、そのチャットだけの設定を変更できます。"
+                .to_string(),
             target: None,
         };
     };
@@ -1507,6 +1507,7 @@ fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
             .unwrap_or("none")
             .to_string(),
         initial_setup_required: state.startup.requires_initial_setup(),
+        onboarding_intent: state.startup.onboarding_intent,
         initial_setup_reason: state
             .startup
             .initial_setup_reason
@@ -1627,17 +1628,13 @@ fn provider_model_labels(state: &DesktopState) -> Vec<String> {
 
 fn provider_status_details(state: &DesktopState) -> String {
     let profile = match state.provider_config.provider_profile_input {
-        ProviderProfile::LmStudio => "Connection type: LM Studio (Responses API).",
-        ProviderProfile::OpenAiCompatible => {
-            "Connection type: OpenAI-compatible (Chat Completions)."
-        }
-        ProviderProfile::OpenAiResponses => "Connection type: OpenAI Responses API.",
-        ProviderProfile::LmStudioChatCompletions => {
-            "Connection type: LM Studio (Chat Completions)."
-        }
+        ProviderProfile::LmStudio => "接続方式: LM Studio (Responses API).",
+        ProviderProfile::OpenAiCompatible => "接続方式: OpenAI-compatible (Chat Completions).",
+        ProviderProfile::OpenAiResponses => "接続方式: OpenAI Responses API.",
+        ProviderProfile::LmStudioChatCompletions => "接続方式: LM Studio (Chat Completions).",
     };
     let limits = format!(
-        "moyAI local context budget: {}. Output length and generation behavior use the Provider host settings.",
+        "moyAIの入力整理上限: {}。回答の長さや生成方法には、AIサーバー側の設定を使います。",
         state.provider_config.provider_context_window_input,
     );
     [
@@ -1653,59 +1650,59 @@ fn provider_status_details(state: &DesktopState) -> String {
 
 fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
     let Some(info) = state.selected_provider_model_info() else {
-        return vec!["選択中のモデル metadata はまだありません。".to_string()];
+        return vec!["選択したモデルの詳細情報はまだ読み込んでいません。".to_string()];
     };
     let mut lines = vec![
-        format!("Model: {}", info.id),
-        format!("Metadata source: {}", info.source),
+        format!("モデル: {}", info.id),
+        format!("情報の取得元: {}", info.source),
         format!(
-            "Load state: {}",
+            "モデルの読み込み: {}",
             match info.load_state {
-                ProviderModelLoadState::Loaded => "loaded",
-                ProviderModelLoadState::NotLoaded => "not loaded",
-                ProviderModelLoadState::Unknown => "unknown",
+                ProviderModelLoadState::Loaded => "読み込み済み",
+                ProviderModelLoadState::NotLoaded => "未読み込み",
+                ProviderModelLoadState::Unknown => "不明",
             }
         ),
         format!(
-            "Context: {}",
+            "入力容量: {}",
             info.context_window
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "Provider metadata max output: {}",
+            "AIサーバーが報告した出力上限: {}",
             info.max_output_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "Metadata images: {}",
+            "画像入力: {}",
             metadata_capability_label(info.supports_images)
         ),
         format!(
-            "Metadata tools: {}",
+            "ツール利用: {}",
             metadata_capability_label(info.supports_tools)
         ),
         format!(
-            "Metadata reasoning: {}",
+            "思考機能: {}",
             metadata_capability_label(info.supports_reasoning)
         ),
     ];
     lines.push(format!(
-        "Parallel prediction: {}",
+        "同時生成数: {}",
         info.max_parallel_predictions
             .filter(|value| *value > 1)
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "none/reported as serial".to_string())
+            .unwrap_or_else(|| "未報告、または逐次実行".to_string())
     ));
     lines
 }
 
 fn metadata_capability_label(value: Option<bool>) -> &'static str {
     match value {
-        Some(true) => "reported supported",
-        Some(false) => "not reported as supported",
-        None => "not reported",
+        Some(true) => "対応との報告あり",
+        Some(false) => "対応なしとの報告あり",
+        None => "未報告",
     }
 }
 
@@ -1740,7 +1737,7 @@ fn token_meter_projection(
             level_label
         ),
         title: format!(
-            "概算 token 使用量: {} / {} ({}%). configured overflow margin: {}、残り推定: {}。出力量はProvider側の設定を使用します。",
+            "入力容量の使用量（概算）: {} / {} トークン（{}%）。設定した余裕枠: {}、残りの目安: {}。出力量にはAIサーバー側の設定を使います。",
             status.active_context_tokens,
             status.full_context_window_limit,
             percent,
@@ -1831,6 +1828,7 @@ fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String,
             );
         }
         DesktopStatusCode::Plain
+        | DesktopStatusCode::InitialSetupPreferencesSaveFailed
         | DesktopStatusCode::ApprovalAborted
         | DesktopStatusCode::UserStopped
         | DesktopStatusCode::AgentInterrupted
@@ -2121,8 +2119,8 @@ mod tests {
         let details = provider_status_details(&state);
 
         assert!(details.contains("OpenAI-compatible (Chat Completions)"));
-        assert!(details.contains("moyAI local context budget"));
-        assert!(details.contains("Provider host settings"));
+        assert!(details.contains("moyAIの入力整理上限"));
+        assert!(details.contains("AIサーバー側の設定"));
         assert!(!details.contains("max_output_tokens"));
         assert!(!details.contains("language"));
         assert!(!details.contains("no-thinking"));
@@ -3457,14 +3455,10 @@ mod tests {
         assert!(
             projection
                 .title
-                .contains("出力量はProvider側の設定を使用します")
+                .contains("出力量にはAIサーバー側の設定を使います")
         );
         assert!(!projection.title.contains("設定output上限"));
-        assert!(
-            projection
-                .title
-                .contains("configured overflow margin: 1024")
-        );
+        assert!(projection.title.contains("設定した余裕枠: 1024"));
         assert!(!projection.title.contains("出力予約"));
     }
 
@@ -3489,27 +3483,18 @@ mod tests {
     #[test]
     fn provider_phase_projection_labels_every_current_transport_boundary() {
         let current = [
-            (
-                crate::llm::ProviderPhase::AttemptStarted,
-                "Provider要求開始",
-            ),
-            (
-                crate::llm::ProviderPhase::RequestInFlight,
-                "Provider要求処理中",
-            ),
+            (crate::llm::ProviderPhase::AttemptStarted, "AIへの送信開始"),
+            (crate::llm::ProviderPhase::RequestInFlight, "AIの応答待ち"),
             (
                 crate::llm::ProviderPhase::HeadersReceived,
-                "Provider応答ヘッダー受信",
+                "AIからの応答開始",
             ),
-            (
-                crate::llm::ProviderPhase::FirstProgress,
-                "Provider応答受信中",
-            ),
+            (crate::llm::ProviderPhase::FirstProgress, "AIの回答を受信中"),
             (
                 crate::llm::ProviderPhase::LastProgress,
-                "Provider最終応答受信",
+                "AIの最終応答を受信",
             ),
-            (crate::llm::ProviderPhase::ProviderTerminal, "Provider完了"),
+            (crate::llm::ProviderPhase::ProviderTerminal, "AIの応答完了"),
         ];
 
         for (phase, expected) in current {
@@ -3544,8 +3529,8 @@ mod tests {
 
         let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
 
-        assert_eq!(projection.run_phase, "Provider要求処理中");
-        assert!(projection.progress_text.contains("Provider要求処理中"));
+        assert_eq!(projection.run_phase, "AIの応答待ち");
+        assert!(projection.progress_text.contains("AIの応答待ち"));
         assert!(!projection.run_phase.contains("request_in_flight"));
         assert!(!projection.progress_text.contains("request_in_flight"));
     }

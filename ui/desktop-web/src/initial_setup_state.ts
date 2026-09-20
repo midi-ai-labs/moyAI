@@ -26,6 +26,7 @@ export interface InitialSetupFinishRequest {
 export interface InitialSetupState {
   owner: InitialSetupMutationTarget | null;
   step: InitialSetupStep;
+  guided: boolean;
   nextFinishToken: bigint;
   activeFinish: InitialSetupFinishRequest | null;
 }
@@ -59,6 +60,7 @@ export function createInitialSetupState(): InitialSetupState {
   return {
     owner: null,
     step: "start",
+    guided: false,
     nextFinishToken: 1n,
     activeFinish: null,
   };
@@ -74,10 +76,12 @@ export function createInitialSetupState(): InitialSetupState {
 export function reconcileInitialSetupOwner(
   state: InitialSetupState,
   target: InitialSetupMutationTarget,
+  personal = false,
 ): boolean {
   if (sameInitialSetupTarget(state.owner, target)) return true;
   state.owner = { ...target };
-  state.step = "start";
+  state.step = personal ? "provider" : "start";
+  state.guided = personal;
   state.activeFinish = null;
   return false;
 }
@@ -105,6 +109,10 @@ export function initialSetupStepIndex(step: InitialSetupStep): number {
   return INITIAL_SETUP_STEPS.indexOf(step);
 }
 
+export function initialSetupSteps(guided: boolean): readonly InitialSetupStep[] {
+  return guided ? ["start", "provider", "model", "finish"] : INITIAL_SETUP_STEPS;
+}
+
 export function advanceInitialSetupStep(
   state: InitialSetupState,
   fields: readonly ConfigFieldProjection[],
@@ -112,16 +120,19 @@ export function advanceInitialSetupStep(
 ): InitialSetupStepValidation {
   const validation = validateInitialSetupStep(state.step, fields, values);
   if (!validation.ok || state.activeFinish !== null) return validation;
-  const index = initialSetupStepIndex(state.step);
-  if (index < INITIAL_SETUP_STEPS.length - 1) state.step = INITIAL_SETUP_STEPS[index + 1];
+  const steps = initialSetupSteps(state.guided);
+  const index = steps.indexOf(state.step);
+  if (index < steps.length - 1) state.step = steps[index + 1];
   return validation;
 }
 
 export function retreatInitialSetupStep(state: InitialSetupState): boolean {
   if (state.activeFinish !== null) return false;
-  const index = initialSetupStepIndex(state.step);
+  const steps = initialSetupSteps(state.guided);
+  const index = steps.indexOf(state.step);
   if (index <= 0) return false;
-  state.step = INITIAL_SETUP_STEPS[index - 1];
+  state.step = steps[index - 1];
+  if (state.step === "start") state.guided = false;
   return true;
 }
 

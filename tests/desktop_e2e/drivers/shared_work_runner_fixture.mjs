@@ -6,6 +6,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { waitForObservation } from "../core/deadline.mjs";
 import { prepareDesktopFixtureEnvironment, desktopLaunchEnvironment } from "../core/desktop_isolation.mjs";
+import { onboardingImplementationReply } from "../fixtures/onboarding_implementation.mjs";
 
 const execute = promisify(execFile);
 export async function startSharedWorkflowProvider() {
@@ -23,7 +24,22 @@ export async function startSharedWorkflowProvider() {
       const tool = id => messages.filter(m => m.role === "tool" && m.tool_call_id === id);
       const call = (id, name, args) => ({ role: "assistant", tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] });
       let delta, finish = "stop";
-      if (task.includes("desktop-followup")) {
+      const implementation = onboardingImplementationReply(messages);
+      if (implementation) {
+        ({ delta, finish } = implementation);
+      } else if (task.includes("moyai-sample-numbers.csv")) {
+        if (tool("sample-output").length) {
+          delta = { role: "assistant", content: "件数は3、合計は60です。moyai-sample-result.md に結果を保存しました。" };
+        } else if (tool("sample-read").length) {
+          const contents = tool("sample-read")[0].content;
+          if (!["10", "20", "30"].every(value => contents.includes(value))) throw new Error("Sample input did not traverse the shared asset path");
+          delta = call("sample-output", "apply_patch", { patch_text: "*** Begin Patch\n*** Add File: moyai-sample-result.md\n+件数: 3\n+合計: 60\n*** End Patch" }); finish = "tool_calls";
+        } else {
+          const input = task.match(/\.moyai-shared-inputs-[^/]+\/moyai-sample-numbers\.csv/);
+          if (!input) throw new Error("Sample has no materialized input snapshot");
+          delta = call("sample-read", "read", { path: input[0] }); finish = "tool_calls";
+        }
+      } else if (task.includes("desktop-followup")) {
         if (tool("parent-child").length !== 1) throw new Error("Continuation lost or duplicated the original child result");
         delta = { role: "assistant", content: "追加依頼でも元の子の結果を一度だけ参照しました。" };
       } else if (task.includes("desktop-transfer-child")) {

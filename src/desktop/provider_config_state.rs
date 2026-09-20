@@ -80,8 +80,8 @@ impl DesktopProviderConfigState {
         let provider_context_window_input = effective_config.model.context_window.to_string();
         let provider_selected_model_id_input = effective_config.model.model.clone();
         let provider_status = DesktopProviderStatus::idle(
-            "Provider 設定を確認できます",
-            "Connection type、Base URL、credential reference、model を選択して適用できます。",
+            "AIの接続先とモデルを設定できます",
+            "接続方式、接続先URL、APIキーの環境変数名、モデルを指定してください。",
         );
         Self {
             effective_config,
@@ -137,8 +137,8 @@ impl DesktopProviderConfigState {
         self.provider_loading = false;
         self.provider_status = retained_status.unwrap_or_else(|| {
             DesktopProviderStatus::idle(
-                "Provider 設定を確認できます",
-                "Connection type、Base URL、credential reference、model を選択して適用できます。",
+                "AIの接続先とモデルを設定できます",
+                "接続方式、接続先URL、APIキーの環境変数名、モデルを指定してください。",
             )
         });
     }

@@ -217,8 +217,8 @@ function renderSideChatQuoteAction(historyItemId: string): string {
       <button type="button" class="message-quote-action"
         data-action="quote-selection-to-side-chat"
         data-source-history-item-id="${escapeHtml(historyItemId)}"
-        title="この履歴行内のテキストを選択してSide Chatで引用"
-        aria-label="選択したテキストをSide Chatで引用">Side Chatで引用</button>
+        title="この履歴行内のテキストを選択してサイドチャットで引用"
+        aria-label="選択したテキストをサイドチャットで引用">サイドチャットで引用</button>
     </div>
   `;
 }
@@ -330,7 +330,7 @@ function renderAgentHistoryEvents(
       - (firstEventIndexes.get(right.agentPath) ?? 0);
   });
   return `
-    <div class="work-summary-agent-events" aria-label="Sub Agentの作業履歴">
+    <div class="work-summary-agent-events" aria-label="サブエージェントの作業履歴">
       ${presentedEvents.map((event) => {
         const activity = activityByPath.get(event.agentPath);
         const visual = stableAgentVisual(event.agentPath);
@@ -347,7 +347,7 @@ function renderAgentHistoryEvents(
               : "updated");
         const selected = options.selectedAgentPath === event.agentPath;
         const ariaLabel = [
-          `${label}のSub Agent履歴を表示`,
+          `${label}のサブエージェント履歴を表示`,
           description,
           status,
         ].filter(Boolean).join(" · ");
@@ -477,7 +477,7 @@ function presentedWorkHistoryItems(
     const waitCompleted = /^(?:wait_agent|Agent wait completed)$/i.test(item.label);
     const detail = normalizedWorkHistoryDetail(item.detail);
     const candidate = waitCompleted
-      ? { label: "Sub Agentの完了を待ちました", detail: "", status: item.status || "完了" }
+      ? { label: "サブエージェントの完了を待ちました", detail: "", status: item.status || "完了" }
       : { ...item, detail };
     const previous = presented.at(-1);
     if (
@@ -596,13 +596,13 @@ function agentEventStatus(
 }
 
 function agentNameFromPath(path: string): string {
-  const name = path.split("/").filter(Boolean).pop()?.trim() || "Sub Agent";
+  const name = path.split("/").filter(Boolean).pop()?.trim() || "サブエージェント";
   return name.replace(/[_-]+/g, " ");
 }
 
 function humanizeAgentName(value: string): string {
   const spaced = value.trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
-  if (!spaced) return "Sub Agent";
+  if (!spaced) return "サブエージェント";
   return `${spaced.charAt(0).toUpperCase()}${spaced.slice(1)}`;
 }
 

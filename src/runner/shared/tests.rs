@@ -1,5 +1,108 @@
 use super::*;
 
+#[tokio::test]
+async fn endpoint_change_shutdown_rechecks_the_worker_journal_after_a_stale_idle_observation() {
+    use crate::runner::operations::{ProvisionMode, RunnerOperation};
+    for case in [
+        "empty",
+        "claimed_after_observation",
+        "unknown",
+        "resumed",
+        "wrong_consent",
+    ] {
+        let (_temp, settings, journal_path) = fixture();
+        let root = journal_path.parent().unwrap();
+        let paths = crate::storage::StoragePaths {
+            data_dir: root.join("data"),
+            database_path: root.join("data/db.sqlite3"),
+            truncation_dir: root.join("data/output"),
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let process = crate::app::AppBootstrap::create_process_runtime(
+            crate::storage::StoreBundle::new(sqlite),
+        )
+        .await
+        .unwrap();
+        let host = RunnerHost::from_process(process).unwrap();
+        let binding = format!("hub|device|https://old.example:9471|{}", "a".repeat(64));
+        {
+            let mut store = host.inner.operations.lock().unwrap();
+            let mut next = store.installed.clone();
+            next.mode = ProvisionMode::Paused;
+            next.desktop_binding = Some(binding.clone());
+            store.update(next).unwrap();
+        }
+        let journal = Journal::open(&journal_path, &settings).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::default();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let client = crate::device_network::DeviceClient::new(
+            &crate::device_network::SharedHubConfig {
+                hub_url: "https://127.0.0.1:1".into(),
+                ca_certificate_pem: ca.self_signed(&key).unwrap().pem(),
+            },
+            None,
+            "device".into(),
+        )
+        .unwrap();
+        let mut controller = Controller {
+            host: host.clone(),
+            settings: settings.clone(),
+            client: SharedClient::for_test(client),
+            journal,
+            checkpoint_cursor: String::new(),
+            commands: None,
+            external: None,
+            local_human: None,
+        };
+        assert!(controller.journal.active().unwrap().is_empty());
+        // This is the race a frontend status-read then ordinary Shutdown misses.
+        if matches!(case, "claimed_after_observation" | "unknown") {
+            let mut entry = controller
+                .journal
+                .intent(assignment(), settings.environments[0].clone())
+                .unwrap();
+            if case == "unknown" {
+                controller.journal.executing(&mut entry).unwrap();
+                controller
+                    .journal
+                    .uncertain(&mut entry, "uncertain execution")
+                    .unwrap();
+            }
+        }
+        if case == "resumed" {
+            let mut store = host.inner.operations.lock().unwrap();
+            let mut next = store.installed.clone();
+            next.mode = ProvisionMode::Available;
+            store.update(next).unwrap();
+        }
+        let result = controller
+            .operator_request(RunnerOperation::QuiescentShutdown {
+                expected_desktop_binding: if case == "wrong_consent" {
+                    "other".into()
+                } else {
+                    binding
+                },
+            })
+            .await;
+        assert_eq!(result.is_ok(), case == "empty", "{case}");
+        assert_eq!(controller.closing(), case == "empty", "{case}");
+        if case == "empty" {
+            assert!(host.operate(RunnerOperation::Resume).await.is_err());
+            assert_eq!(
+                host.inner.operations.lock().unwrap().installed.mode,
+                ProvisionMode::Paused
+            );
+        }
+        if matches!(case, "claimed_after_observation" | "unknown") {
+            assert_eq!(controller.journal.active().unwrap().len(), 1);
+        }
+        host.begin_shutdown().unwrap();
+        host.wait_stopped().await;
+    }
+}
+
 #[test]
 fn approval_consume_wire_distinguishes_answers_reconfirmation_and_invalid_responses() {
     use super::protocol::ApprovalConsumeResult;

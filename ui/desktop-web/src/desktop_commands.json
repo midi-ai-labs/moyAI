@@ -76,6 +76,7 @@
   "apply_session_config",
   "save_global_config",
   "finish_initial_setup",
+  "choose_initial_setup_purpose",
   "apply_session_settings",
   "toggle_access_mode",
   "preview_window_opacity",

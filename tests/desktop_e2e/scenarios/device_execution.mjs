@@ -12,6 +12,7 @@ import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathI
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { action, byId, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
+import { sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
 
 const ID = "settings.device-execution", OWNER = `scenario:${ID}`;
 const fail = message => new DesktopE2eError("product", "device-execution-mismatch", message);
@@ -24,15 +25,55 @@ export function oneTimeExecutionSetup(calls) {
   const commands = calls.filter(call => call.command === "device_execution_command").map(call => call.args?.request?.kind);
   return commands.length === 2 && commands[0] === "prepare" && commands[1] === "enable";
 }
+export async function observeConnectionDiagnosis(cdp, scope) {
+  const key = `device-network-diagnostic-${JSON.stringify([scope, ""])}`;
+  return cdp.evaluate(`([...document.querySelectorAll('.device-network-diagnostic[data-settings-passive]')]
+    .find(element => element.getAttribute('data-settings-passive') === ${JSON.stringify(key)})?.textContent ?? '')`);
+}
+
+export async function quiesceDeviceExecutionResources({ runner, provider, resource }) {
+  const result = { pass: true, failures: [] };
+  // Preserve the Runner-before-store ordering, but always close the independent
+  // provider and Hub even if the exact Runner owner cannot be settled.
+  for (const [name, close] of [
+    ["runner", () => runner ? runner.quiesce() : { pass: true, not_started: true }],
+    ["provider", async () => { await provider?.close(); return { pass: true }; }],
+    ["hub", () => resource ? resource.close() : { pass: true }],
+  ]) {
+    try {
+      result[name] = await close();
+      if (result[name]?.pass !== true) {
+        result.pass = false;
+        result.failures.push({ resource: name, code: "resource-not-settled" });
+      }
+    } catch (error) {
+      const failure = { resource: name, code: error?.code ?? "resource-close-failed", message: error instanceof Error ? error.message : String(error) };
+      result[name] = { pass: false, error: failure };
+      result.failures.push(failure);
+      result.pass = false;
+    }
+  }
+  return result;
+}
 export function createDeviceExecutionScenario(options = {}) {
   const { runnerBinary, runnerTestBinary, ...hubOptions } = options;
   for (const value of [runnerBinary, runnerTestBinary]) if (value && !path.isAbsolute(value)) throw new TypeError("Runner fixture paths must be absolute");
   const settings = normalizeHubBrowserOptions(hubOptions);
   const state = { resource: null, provider: null, input: null, commands: null, context: null, environment: {}, runner: null,
-    nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false, close: null, priorCalls: [] };
+    nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false, consentRequested: false, consentParentProcessId: null, close: null, priorCalls: [], inputFailures: [] };
   async function settleInput() {
-    if (state.commands) { state.priorCalls.push(...(await state.commands.snapshot()).calls); await state.commands.remove(); state.commands = null; }
-    if (state.input) { await state.input.cleanup(); state.input = null; }
+    if (state.commands) {
+      try { state.priorCalls.push(...(await state.commands.snapshot()).calls); }
+      catch (error) { state.inputFailures.push({ resource: "command-snapshot", message: String(error) }); }
+      try { await state.commands.remove(); }
+      catch (error) { state.inputFailures.push({ resource: "command-probe", message: String(error) }); }
+      state.commands = null;
+    }
+    if (state.input) {
+      try { await state.input.cleanup(); }
+      catch (error) { state.inputFailures.push({ resource: "input-probe", message: String(error) }); }
+      state.input = null;
+    }
   }
   return Object.freeze({ id: ID, productOracle: "pass", manualGate: "pending", databaseRequired: true,
     get environment() { return state.environment; },
@@ -76,6 +117,16 @@ export function createDeviceExecutionScenario(options = {}) {
         await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
         await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
         const enrolled = await enrollDesktopFromHubBrowser({ resource: state.resource, context, runtime, cdp, input: state.input, sink, nativeState: state });
+        const connectionDetails = { selector: '#device-network-details > summary', identity: { tag: 'DETAILS', id: 'device-network-details' } };
+        if (!await cdp.evaluate(`document.querySelector('#device-network-details')?.open`)) await trustedClick(state.input, cdp, connectionDetails, sink);
+        await trustedClick(state.input, cdp, action('device-network-diagnose-hub'), sink);
+        const hubDiagnosis = await wait('Controller connection diagnosis excludes optional AI gateway', () => observeConnectionDiagnosis(cdp, "hub"), text => text.includes('共有仕事の接続'));
+        if (hubDiagnosis.includes('モデルGateway')) throw fail('Controller diagnosis incorrectly requires the AI gateway');
+        await trustedClick(state.input, cdp, { selector: 'details[data-details-key="device-network-gateway"] > summary', identity: { tag: 'DETAILS', detailsKey: 'device-network-gateway' } }, sink);
+        await trustedClick(state.input, cdp, action('device-network-diagnose-gateway'), sink);
+        await wait('Explicit AI diagnosis uses the gateway scope', () => observeConnectionDiagnosis(cdp, "gateway"), text => text.includes('モデルGatewayへのTLS接続'));
+        await captureScenarioScreenshot({ cdp, sink, name: 'onboarding-connection-scopes', owner: OWNER });
+        await trustedClick(state.input, cdp, connectionDetails, sink);
         const approvedRoot = path.join(context.root, "approved-execution-root"); await mkdir(approvedRoot);
         const detail = { selector: '#device-execution details[data-details-key="device-execution-setup"] > summary', identity: { tag: "DETAILS", detailsKey: "device-execution-setup" } };
         if (!await cdp.evaluate(`document.querySelector('#device-execution details[data-details-key="device-execution-setup"]')?.open`)) await trustedClick(state.input, cdp, detail, sink);
@@ -91,6 +142,8 @@ export function createDeviceExecutionScenario(options = {}) {
         state.nativeCandidate = null; state.importDispatched = false;
         const prepared = await wait("Native review identifies the requested scope", projection, p => p.review?.access_mode === "default" && path.resolve(p.review.directory) === approvedRoot);
         await captureScenarioScreenshot({ cdp, sink, name: "execution-one-time-consent", owner: OWNER });
+        state.consentRequested = true;
+        state.consentParentProcessId = runtime.desktop_process_id;
         await trustedClick(state.input, cdp, action("device-execution-enable"), sink);
         await wait("Desktop automatically starts and configures execution without a Runner control", projection, p => p.directory && p.review === null && p.can_pause, 45000);
         const started = await state.runner.capture(runtime.desktop_process_id);
@@ -117,6 +170,34 @@ export function createDeviceExecutionScenario(options = {}) {
         if (!relative || path.isAbsolute(relative) || relative.startsWith("..") || !(await stat(directory)).isDirectory()) throw fail("Automatic provisioning did not remain within the explicitly approved folder");
         await captureScenarioScreenshot({ cdp, sink, name: "execution-project-automatically-ready", owner: OWNER });
         await state.resource.screenshot("execution-hub-project-ready");
+        // The same Windows user may explicitly use a human project membership;
+        // Runner consent above deliberately did not require that login.
+        await trustedClick(state.input, cdp, byId("device-network-open-shared"), sink);
+        await setSharedLoginMode(state.input, cdp, sink, "password");
+        for (const [id, value] of [["shared-username", state.resource.administrator.username], ["shared-password", state.resource.administrator.password]]) {
+          const target = byId(id, "INPUT"); await trustedClick(state.input, cdp, target, sink); await state.input.insertText(target, value);
+        }
+        await trustedClick(state.input, cdp, sharedActionTarget("login"), sink);
+        const sharedProjection = () => invokeDesktopCommand(cdp, "shared_work_projection");
+        await wait("The explicit human member can submit in the prepared project", sharedProjection, p => p.selected_project_id === projectId && p.projects.some(row => row.id === projectId && row.can_submit));
+        await trustedClick(state.input, cdp, sharedActionTarget("prepare-sample"), sink);
+        const sample = await wait("Sample preparation attaches only public data without submitting", sharedProjection, p => p.inputs.some(a => a.name === "moyai-sample-numbers.csv"));
+        if (sample.status.jobs.length) throw fail("Preparing the sample submitted a job without Send");
+        await captureScenarioScreenshot({ cdp, sink, name: "onboarding-sample-before-send", owner: OWNER });
+        await trustedClick(state.input, cdp, sharedActionTarget("submit"), sink);
+        const reviewedApprovals = new Set();
+        await wait("Ordinary sample work finishes with a shared output asset", async () => {
+          const p = await sharedProjection();
+          if (p.approval?.status === "pending" && p.approval.can_decide && !reviewedApprovals.has(p.approval.id)) {
+            reviewedApprovals.add(p.approval.id);
+            await trustedClick(state.input, cdp, sharedActionTarget("approve"), sink);
+          }
+          return p;
+        }, p => p.detail?.state === "succeeded" && p.assets.some(a => a.name === "moyai-sample-result.md" && a.kind === "artifact"), 90000);
+        const completed = await sharedProjection();
+        if (state.provider.failures.length || !JSON.stringify(completed.detail.result).includes("60")) throw fail("The sample did not return the expected result through the normal job path");
+        await captureScenarioScreenshot({ cdp, sink, name: "onboarding-first-result", owner: OWNER });
+        await sink.record("onboarding-first-job", { job_id: completed.detail.id, state: completed.detail.state, asset: completed.assets.find(a => a.name === "moyai-sample-result.md"), provider_calls: state.provider.requests.length }, { phase: "executing", owner: OWNER });
         await settleInput();
         const restart = await host.restart({ context, scenario: this, sink, driver: cdp });
         cdp = restart.driver; currentRuntime = restart.runtime; await attach(); await openSetup();
@@ -132,16 +213,16 @@ export function createDeviceExecutionScenario(options = {}) {
       } catch (error) {
         await sink.record("device-execution-failure", { desktop: await invokeDesktopCommand(cdp, "desktop_state"), execution: await projection() }, { phase: "executing", owner: OWNER }).catch(() => {});
         await captureScenarioScreenshot({ cdp, sink, name: "execution-failure", owner: OWNER }).catch(() => {});
-        if (!state.runner.identity) await state.runner.capture().catch(() => {});
+        if (state.consentRequested && !state.runner.identity) await state.runner.capture(state.consentParentProcessId).catch(() => {});
         throw error;
       } finally { await settleInput(); }
     },
     async quiesce() {
       if (!state.close) {
-        const runner = state.runner ? await state.runner.quiesce() : { pass: true, not_started: true };
-        await state.provider?.close();
-        const hub = state.resource ? await state.resource.close() : { pass: true };
-        state.close = { pass: runner.pass && hub.pass, runner, hub };
+        await settleInput();
+        state.close = await quiesceDeviceExecutionResources(state);
+        state.close.input_failures = [...state.inputFailures];
+        state.close.pass &&= state.inputFailures.length === 0;
       }
       return { input: state.close.pass ? "pass" : "fail", resources: [{ kind: ID, ...state.close }] };
     },

@@ -1,15 +1,16 @@
-import { readFile, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rename, rmdir, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { DesktopE2eError } from '../core/execution.mjs';
+import { desktopFixtureRoot } from '../core/desktop_isolation.mjs';
 import { DesktopCommandProbe, assertExactDesktopCommandSequence } from '../drivers/desktop_command_probe.mjs';
 import { normalizeHubBrowserOptions, startHubBrowserResource } from '../drivers/hub_browser_resource.mjs';
 import { WebviewInput } from '../drivers/webview_input.mjs';
 import { prepareDesktopFixture } from './fixture.mjs';
 import { captureScenarioScreenshot } from './observations.mjs';
 import { observeInitialSetupSurface } from './settings_initial_setup.mjs';
-import { action, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from './hub_browser_enrollment.mjs';
+import { action, trustedClick, wait, enrollDesktopFromHubBrowser, importDesktopHubParticipationFile, requestHubEnrollmentExit } from './hub_browser_enrollment.mjs';
 
-const ID = 'settings.initial-setup-hub', OWNER = `scenario:${ID}`;
 const WATCHED = ['device_network_initial_setup_import', 'finish_initial_setup', 'submit_prompt', 'submit_side_chat'];
 const failure = (message, evidence) => new DesktopE2eError('product', 'initial-setup-hub-mismatch', message, evidence);
 
@@ -67,7 +68,40 @@ async function observeShell(cdp) {
   })()`);
 }
 
-export function createInitialSetupHubScenario(options = {}) {
+export async function withBlockedInitialPreferences(context, operation) {
+  desktopFixtureRoot(context);
+  const target = context.paths.prefs_file, backup = path.join(context.paths.prefs, 'desktop.before-save-failure.toml');
+  const original = await lstat(target);
+  if (!original.isFile() || original.isSymbolicLink()) throw new TypeError('Preferences failure fixture requires an ordinary owned file');
+  try { await lstat(backup); throw new TypeError('Preferences failure backup already exists'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  await rename(target, backup);
+  let blocked = false;
+  try {
+    await mkdir(target); blocked = true;
+    return await operation();
+  } finally {
+    // Only this empty fixture directory may be removed. Unexpected contents fail
+    // cleanup and preserve the original backup rather than being recursively deleted.
+    if (blocked) await rmdir(target);
+    await rename(backup, target);
+  }
+}
+
+export function initialHubPreferencesFailureAccepted(value, { workspace, url, warningCode }) {
+  const p = value?.surface?.projection, network = value?.network;
+  return p?.workspace_path === workspace && p.overlay === 'initial_setup'
+    && p.startup?.initial_setup_required === true && p.startup.setup_target?.workspacePath === workspace
+    && value.surface.wizard?.count === 1 && value.surface.wizard.visible === true
+    && p.status_code === warningCode && value.visibleWarning === true
+    && network?.hub_url === url && network.enrollment === 'pending' && Boolean(network.request_id)
+    && value.hubPending === true && value.configSaved === true && value.preferencesBlocked === true
+    && value.surface.visible_fatal_count === 0 && value.surface.visible_recoverable_error_count === 0;
+}
+
+export function createInitialSetupHubScenario(options = {}, preferencesFailure = false) {
+  const ID = preferencesFailure ? 'settings.initial-setup-hub-preferences-failure' : 'settings.initial-setup-hub';
+  const OWNER = `scenario:${ID}`;
   const settings = normalizeHubBrowserOptions(options);
   const state = { resource:null, input:null, commands:null, nativeOwner:null, nativeCandidate:null,
     nativeBefore:null, importDispatched:false, failures:[], close:null };
@@ -92,7 +126,11 @@ export function createInitialSetupHubScenario(options = {}) {
       const commands = state.commands = new DesktopCommandProbe(cdp, { probeId:ID, commands:WATCHED });
       try {
         await input.installProbe(); await commands.install();
-        const before = await wait('Missing config shows the actual Initial Hub entry', () => observeEntry(cdp), v => initialHubEntryReady(v, context.paths.workspace));
+        await trustedClick(input, cdp, {
+          selector: '[data-surface="initial-setup"] details[data-details-key="initial-setup-model-relay"] > summary',
+          identity: { tag:'DETAILS', detailsKey:'initial-setup-model-relay' },
+        }, sink);
+        const before = await wait('The advanced model-relay choice shows the actual Initial Hub entry', () => observeEntry(cdp), v => initialHubEntryReady(v, context.paths.workspace));
         await captureScenarioScreenshot({ cdp, sink, name:'initial-hub-start-entry', owner:OWNER });
         await page.goto(hub.url); await page.locator('#management-status').filter({ hasText:'Hub本体に接続中' }).waitFor();
         await page.locator('nav a[href="#models"]').click();
@@ -107,6 +145,42 @@ export function createInitialSetupHubScenario(options = {}) {
         await page.locator('#network-ip').fill('127.0.0.1'); await page.locator('#network-port').fill(String(hub.networkPort));
         await page.locator('#network-start').click(); await page.locator('#network-stop').waitFor();
         await hub.observeNetwork();
+        if (preferencesFailure) {
+          const downloading = page.waitForEvent('download'); await page.locator('#network-save-config').click();
+          const download = await downloading;
+          if (download.suggestedFilename() !== 'hub-config.moyai-join') throw failure('Unexpected public connection filename', {});
+          const importPath = path.join(context.paths.workspace, 'preferences-failure.moyai-join');
+          await download.saveAs(importPath);
+          const originalPreferences = await readFile(context.paths.prefs_file);
+          const url = `https://127.0.0.1:${hub.networkPort}`;
+          await withBlockedInitialPreferences(context, async () => {
+            await importDesktopHubParticipationFile({ context, runtime, cdp, input, sink, nativeState:state, importPath, entry:'initial-setup' });
+            const observed = await wait('Saved connection submits enrollment while initial completion preferences cannot be saved', async () => {
+              const surface = await observeInitialSetupSurface(cdp);
+              const network = await cdp.evaluate(`window.__TAURI_INTERNALS__.invoke('device_network_projection')`);
+              const snapshot = await hub.observeNetwork();
+              const config = await readFile(context.paths.config_file, 'utf8');
+              const visibleWarning = await cdp.evaluate(`(() => {
+                const e = document.querySelector('[data-surface="initial-setup"] .initial-setup-status [role="alert"]');
+                return Boolean(e?.getClientRects().length && getComputedStyle(e).visibility !== 'hidden' && Number(getComputedStyle(e).opacity) !== 0 && !e.closest('[hidden],[inert]')
+                  && e.textContent.includes('接続情報は保存') && e.textContent.includes('初回'));
+              })()`);
+              return { surface, network, visibleWarning, configSaved:config.includes(url) && config.includes('BEGIN CERTIFICATE') && !config.includes('PRIVATE KEY'),
+                preferencesBlocked:(await lstat(context.paths.prefs_file)).isDirectory(),
+                hubPending:snapshot.join_requests.some(value => value.request_id === network.request_id) };
+            }, value => initialHubPreferencesFailureAccepted(value, { workspace:context.paths.workspace, url, warningCode:'initial_setup_preferences_save_failed' }));
+            assertExactDesktopCommandSequence(await commands.snapshot(), { expected:[{
+              command:'device_network_initial_setup_import', args:{ expectedSetupTarget:before.surface.projection.startup.setup_target,
+                expectedConfigTarget:before.surface.projection.config_target },
+            }] });
+            await captureScenarioScreenshot({ cdp, sink, name:'initial-hub-saved-preferences-warning', owner:OWNER });
+            await sink.record('initial-hub-preferences-save-failed', observed, { phase:'executing', owner:OWNER });
+          });
+          if (!(await readFile(context.paths.prefs_file)).equals(originalPreferences)) throw failure('Preferences fixture was not restored exactly', {});
+          if (resource.pageErrors().length || provider.requests.some(request => request.method !== 'GET')) throw failure('Failure fixture raised browser errors or generated content', {});
+          await sink.record('initial-hub-preferences-restored', { path:context.paths.prefs_file, exact_bytes:true, non_recursive:true }, { phase:'executing', owner:OWNER });
+          return { acquisition:'pass', oracle:'pass', manual:'pending' };
+        }
         // Entry choice changes only the real Initial Setup activation. Download, exact native owner,
         // picker selection, pending/approval UI and lifecycle remain the shared enrollment path.
         const enrolled = await enrollDesktopFromHubBrowser({ resource, context, runtime, cdp, input, sink, nativeState:state, entry:'initial-setup' });
@@ -141,3 +215,5 @@ export function createInitialSetupHubScenario(options = {}) {
     async cleanup() { return { input:state.close?.pass && state.failures.length === 0 ? 'pass':'fail', resources:[] }; },
   });
 }
+
+export const createInitialSetupHubPreferencesFailureScenario = options => createInitialSetupHubScenario(options, true);

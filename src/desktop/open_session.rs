@@ -886,12 +886,12 @@ mod tests {
         assert_eq!(view.stored_detail().session_usage_state, "complete");
         assert_eq!(
             view.stored_detail().session_usage_label,
-            "セッション累計: 250 token"
+            "このチャットの累計: 250 トークン"
         );
 
         let live = view.live_detail(&AppState::default(), None);
         assert_eq!(live.session_usage_state, "complete");
-        assert_eq!(live.session_usage_label, "セッション累計: 250 token");
+        assert_eq!(live.session_usage_label, "このチャットの累計: 250 トークン");
     }
 
     fn transcript_row(

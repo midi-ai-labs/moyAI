@@ -8,7 +8,7 @@ import { DesktopCommandProbe } from "../drivers/desktop_command_probe.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { action, byId, hubSettingsCloseTarget, trustedClick, trustedFocus, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { hubProjectReady, openHubProjectSurface, openSharedDisclosure, rememberedRestartAccepted, sharedActionTarget } from "./shared_work_navigation.mjs";
+import { hubProjectReady, observeSharedWorkSurface, sharedWorkSurfaceMatches, openHubProjectSurface, openSharedDisclosure, rememberedRestartAccepted, sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
 
 const ID = "settings.shared-work", OWNER = `scenario:${ID}`;
 const failure = (message, evidence) => new DesktopE2eError("product", "shared-work-mismatch", message, evidence);
@@ -44,7 +44,9 @@ export function createSharedWorkEntryScenario(options = {}) {
       async function restart() {
         await settle();
         const result = await host.restart({ context, scenario: thisScenario, sink, driver: cdp });
-        cdp = result.driver; await attach(); await openHubProjectSurface(input, cdp, sink);
+        cdp = result.driver; await attach();
+        await wait("Team entry resumes automatically without local model setup", () => invokeDesktopCommand(cdp, "desktop_state"), hubProjectReady);
+        await openHubProjectSurface(input, cdp, sink);
         return result.restart;
       }
       const thisScenario = this;
@@ -63,10 +65,26 @@ export function createSharedWorkEntryScenario(options = {}) {
         const participant = await createDeviceParticipant(network, "Shared fixture runner");
         await page.locator('nav a[href="#clients"]').click(); await page.locator("#network-clients-refresh").click();
         await page.locator(`[data-id="request:${participant.requestId}"] button[data-network-action]`).click();
+        await page.locator("#join-project-save").click();
+        await page.locator("#join-project-dialog").waitFor({ state: "hidden" });
         const approved = await participant.collectApproval(); await participant.presence();
         await participant.sharedLogin(resource.administrator.username, resource.administrator.password);
-        const password = randomUUID();
-        const alice = await participant.sharedCall("createUser", { username: "shared-alice", display_name: "利用者 Alice", password, administrator: false });
+        const password = randomUUID(), alicePassword = randomUUID();
+        await page.locator('nav a[href="#shared-administration"]').click();
+        await page.locator('[data-sa-tab="users"]').click();
+        await page.locator('[data-sa-operation="create_user_with_setup_code"]').click();
+        await page.locator("#shared-admin-username").fill("shared-alice");
+        await page.locator("#shared-admin-display_name").fill("利用者 Alice");
+        await page.locator("#shared-admin-save").click();
+        await page.locator("#shared-admin-form").waitFor({ state: "detached" });
+        await page.locator("#shared-admin-setup-code").waitFor({ state: "visible" });
+        // Keep the one-time code in this process only; never attach its display or value as evidence.
+        const setupCode = await page.locator("#shared-admin-setup-code-value").inputValue();
+        if (!/^[0-9a-f]{64}$/.test(setupCode)) throw failure("Hub did not issue a valid initial password setup code", {});
+        const alice = { user_id: await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "利用者 Alice", exact: true }) }).locator('[data-sa-operation="update_user"]').getAttribute("data-sa-id") };
+        if (!alice.user_id) throw failure("The new person was not added to Hub administration", {});
+        await page.locator("#shared-admin-setup-code-close").click();
+        if (await page.locator("#shared-admin-setup-code-value").inputValue()) throw failure("Closing the one-time code retained the displayed secret", {});
         const bob = await participant.sharedCall("createUser", { username: "shared-bob", display_name: "利用者 Bob", password, administrator: false });
         for (const [id, label, user] of [["project-a", "解析プロジェクト A", alice], ["project-b", "解析プロジェクト B", bob]]) {
           await participant.sharedCall("createProject", { id, label });
@@ -98,10 +116,15 @@ export function createSharedWorkEntryScenario(options = {}) {
           }
           await trustedClick(input, cdp, sharedActionTarget(name, value), sink);
         }
-        await fill("shared-username", "shared-alice"); await fill("shared-password", password);
-        await sink.record("shared-login-before", await cdp.evaluate("({ username:document.querySelector('#shared-username')?.value, password_length:document.querySelector('#shared-password')?.value.length, disabled:document.querySelector('[data-action=shared-login]')?.disabled, active:document.activeElement?.id })"), { phase: "executing", owner: OWNER });
-        await click("login");
+        await setSharedLoginMode(input, cdp, sink, "setup");
+        await fill("shared-username", "shared-alice"); await fill("shared-password", alicePassword);
+        await fill("shared-setup-code", setupCode); await fill("shared-setup-confirm", alicePassword);
+        await click("setup-password");
         const aliceView = await wait("Alice sees only her project and redacted occupied resource", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.principal?.user_id === alice.user_id && p.projects.length === 1 && p.status?.environments[0]?.other_occupants === 1);
+        const setupCalls = (await state.commands.snapshot()).calls.filter(call => call.args?.request?.kind === "setup_password");
+        if (setupCalls.length !== 1 || setupCalls[0].args.request.password !== "[redacted]" || setupCalls[0].args.request.code !== "[redacted]") throw failure("Password setup was not single-flight or its diagnostic arguments were not redacted", { setup_command_count: setupCalls.length });
+        if ([setupCode, alicePassword].some(secret => JSON.stringify(aliceView).includes(secret))) throw failure("A password setup secret reached the webview projection", {});
+        await sink.record("shared-first-password-setup", { user_id: alice.user_id, code_issued_in_hub_ui: true, password_chosen_in_desktop: true, setup_commands: 1, diagnostic_secrets_redacted: true }, { phase: "executing", owner: OWNER });
         const aliceText = await cdp.evaluate("document.querySelector('.shared-work').textContent");
         if (aliceText.includes("Bobだけが見える仕事") || aliceText.includes("利用者 Bob")) throw failure("Unauthorized occupancy details leaked", {});
         await captureScenarioScreenshot({ cdp, sink, name: "shared-alice-occupancy", owner: OWNER });
@@ -127,9 +150,9 @@ export function createSharedWorkEntryScenario(options = {}) {
         const restartProof = await restart();
         const restored = await wait("Same-profile restart restores Alice and her project without a login command", async () => ({
           desktop: await invokeDesktopCommand(cdp, "desktop_state"), shared: await invokeDesktopCommand(cdp, "shared_work_projection"),
-          login_visible: await cdp.evaluate("Boolean(document.querySelector('#shared-username')?.getClientRects().length)"), calls: (await state.commands.snapshot()).calls,
+          surface: await observeSharedWorkSurface(cdp), calls: (await state.commands.snapshot()).calls,
         }), value => rememberedRestartAccepted(value, beforeRestart));
-        await sink.record("shared-remembered-person-restart", { ...beforeRestart, restart: restartProof, connected: restored.shared.connected, login_visible: restored.login_visible, login_commands: 0 }, { phase: "executing", owner: OWNER });
+        await sink.record("shared-remembered-person-restart", { ...beforeRestart, restart: restartProof, connected: restored.shared.connected, surface: restored.surface, login_commands: 0 }, { phase: "executing", owner: OWNER });
         await captureScenarioScreenshot({ cdp, sink, name: "shared-person-restored-after-restart", owner: OWNER });
         await click("detail", job.id);
         await click("cancel", job.id);
@@ -139,8 +162,12 @@ export function createSharedWorkEntryScenario(options = {}) {
         const loggedOutText = await cdp.evaluate("document.querySelector('.shared-work').textContent");
         if (loggedOutText.includes(prompt) || loggedOutText.includes("解析プロジェクト A")) throw failure("Logout retained old user's display", {});
         const logoutRestart = await restart();
-        await wait("Explicit logout survives restart", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.connected && p.principal === null && p.projects.length === 0 && p.status === null && p.detail === null);
-        await sink.record("shared-logout-survives-restart", { restart: logoutRestart, principal: null, protected_projects: 0 }, { phase: "executing", owner: OWNER });
+        const signedOut = await wait("Explicit logout survives restart and the login form is visible", async () => ({
+          shared: await invokeDesktopCommand(cdp, "shared_work_projection"), surface: await observeSharedWorkSurface(cdp),
+        }), ({ shared, surface }) => shared.connected && shared.principal === null && shared.projects.length === 0 && shared.status === null && shared.detail === null && sharedWorkSurfaceMatches(surface, shared));
+        await sink.record("shared-logout-survives-restart", { restart: logoutRestart, principal: null, protected_projects: 0, surface: signedOut.surface }, { phase: "executing", owner: OWNER });
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-login-after-logout-restart", owner: OWNER });
+        await setSharedLoginMode(input, cdp, sink, "password");
         const username = byId("shared-username", "INPUT"); await trustedClick(input, cdp, username, sink); await input.keyDown("Control"); await input.pressKey("a"); await input.keyUp("Control"); await input.insertText(username, "shared-bob");
         await fill("shared-password", password); await click("login");
         const bobView = await wait("Another human sees their own shared job", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.principal?.user_id === bob.user_id && p.projects.length === 1 && p.status?.jobs.some(j => j.id === occupied.id));

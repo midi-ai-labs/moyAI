@@ -29,7 +29,7 @@ test("catalog comparison displays additions, removals and label/capability/softw
   assert.match(html, /<td>chat<\/td><td>chat, vision<\/td>/);
   assert.doesNotMatch(html, /<name>/);
   assert.match(html, /data-details-key="hub-main-catalog-diff"/);
-  assert.match(html, /tabindex="0" role="region" aria-label="Mainのカタログ変更内容"/);
+  assert.match(html, /tabindex="0" role="region" aria-label="メインチャットのモデル設定の変更内容"/);
 });
 
 test("missing legacy, disconnected and invalid baselines never claim unchanged", () => {
@@ -37,7 +37,7 @@ test("missing legacy, disconnected and invalid baselines never claim unchanged",
     const html = renderHubCatalogComparison(comparison({ status, models: [] }), "side_chat");
     assert.doesNotMatch(html, /差分はありません/);
     if (status === "baseline_unavailable") assert.match(html, /更新番号 3 の比較元は保存されていません/);
-    if (status === "invalid") assert.match(html, /不整合があり、差分を表示できません/);
+    if (status === "invalid") assert.match(html, /情報が一致しないため、変更点を表示できません/);
   }
   const policyOnly = renderHubCatalogComparison(comparison({ models: [], software_after: "0.1.0" }), "main");
   assert.match(policyOnly, /モデル・表示名・機能・Hubバージョンの差分はありません/);

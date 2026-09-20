@@ -5,6 +5,7 @@
 .device-network-content { display: grid; gap: 18px; }
 .device-network-content .hub-feedback[data-error="false"] { color: #d4e4ff; background: #22334d; border-color: #44618a; }
 .device-network-card { min-width: 0; border: 1px solid var(--line); border-radius: 14px; padding: 20px; background: var(--bg); }
+.device-execution-handoff { border-left: 3px solid var(--accent); padding: 8px 14px; background: var(--panel-soft); border-radius: 6px; }
 .device-network-status { font-size: 12px; color: var(--text); }
 .device-network-status.ready { color: var(--ok); }
 .device-network-status.warning { color: #eac37a; }

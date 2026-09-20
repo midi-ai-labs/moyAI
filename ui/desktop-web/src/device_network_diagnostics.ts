@@ -3,7 +3,7 @@ import type { ActionContext } from "./actions.ts";
 import { deviceNetworkError, deviceNetworkTarget, devicePeerKey, type DeviceNetworkPresentation } from "./device_network_state.ts";
 import { escapeHtml } from "./utils.ts";
 
-export type DeviceDiagnosticScope = "hub" | "receiver" | "peer";
+export type DeviceDiagnosticScope = "hub" | "gateway" | "receiver" | "peer";
 export interface DeviceDiagnosticResult {
   scope: DeviceDiagnosticScope;
   device_id: string | null;
@@ -19,7 +19,7 @@ export function deviceDiagnosticKey(scope: DeviceDiagnosticScope, peerKey = ""):
 }
 export function deviceCanDiagnose(local: DeviceNetworkPresentation, scope: DeviceDiagnosticScope, peerKey = ""): boolean {
   if (local.pending || local.diagnosticPending || !local.projection) return false;
-  if (scope === "hub") return Boolean(local.projection.hub_url);
+  if (scope === "hub" || scope === "gateway") return Boolean(local.projection.hub_url);
   if (scope === "receiver") return Boolean(local.projection.device_id);
   return local.projection.peers.some(peer => devicePeerKey(peer) === peerKey);
 }

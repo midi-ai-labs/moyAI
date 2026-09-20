@@ -29,11 +29,42 @@ export async function openSharedDisclosure(input, cdp, sink, key) {
   if (isOpen !== true) await trustedClick(input, cdp, { selector: `${selector} > summary`, identity: { tag: "DETAILS", detailsKey: key } }, sink);
 }
 
-export function rememberedRestartAccepted({ desktop, shared, login_visible, calls }, expected) {
+export async function setSharedLoginMode(input, cdp, sink, mode) {
+  if (!["setup", "password"].includes(mode)) throw new TypeError("Unknown shared login mode");
+  const target = { selector: `.shared-work button[data-action="shared-auth-mode"][data-value=${JSON.stringify(mode)}]`, identity: { tag: "BUTTON", action: "shared-auth-mode" } };
+  const selected = () => cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.getAttribute('aria-pressed') === 'true'`);
+  if (!await selected()) await trustedClick(input, cdp, target, sink);
+  await wait("Selected human login method is visible", selected, Boolean);
+}
+
+export async function observeSharedWorkSurface(cdp) {
+  return cdp.evaluate(`(() => {
+    const visible = element => Boolean(element?.isConnected && element.getClientRects().length
+      && getComputedStyle(element).display !== 'none' && getComputedStyle(element).visibility !== 'hidden'
+      && !element.closest('[hidden],[inert],[aria-hidden="true"]'));
+    const roots = [...document.querySelectorAll('main.shared-work')].filter(visible), root = roots[0];
+    const login = root?.querySelector('#shared-username');
+    return { count:roots.length, splash_visible:[...document.querySelectorAll('.splash-screen')].some(visible),
+      heading:root?.querySelector('#shared-heading')?.textContent?.trim() ?? '',
+      account_text:root?.querySelector('[data-shared-region="account"]')?.innerText ?? '',
+      login_visible:visible(login), login_enabled:Boolean(login && !login.disabled) };
+  })()`);
+}
+
+export function sharedWorkSurfaceMatches(surface, shared) {
+  if (surface?.count !== 1 || surface.splash_visible !== false) return false;
+  if (!shared?.principal) return surface.login_visible === true && surface.login_enabled === true;
+  const project = shared.projects?.find(row => row.id === shared.selected_project_id);
+  return surface.login_visible === false && Boolean(shared.principal.display_name)
+    && surface.account_text.includes(shared.principal.display_name)
+    && Boolean(project) && surface.heading === project.label;
+}
+
+export function rememberedRestartAccepted({ desktop, shared, surface, calls }, expected) {
   return hubProjectReady(desktop) && shared?.connected === true
     && shared.principal?.user_id === expected.user_id
     && shared.selected_project_id === expected.project_id
     && shared.status?.jobs.some(job => job.id === expected.job_id)
-    && login_visible === false && Array.isArray(calls)
+    && sharedWorkSurfaceMatches(surface, shared) && Array.isArray(calls)
     && !calls.some(call => call.command === "shared_work_command" && call.args?.request?.kind === "login");
 }

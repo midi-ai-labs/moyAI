@@ -65,7 +65,7 @@ export function agentActivitySummary(rows: readonly AgentActivityRow[], treeActi
   if (counts.completed > 0) parts.push(`${counts.completed}件完了`);
   if (counts.attention > 0) parts.push(`${counts.attention}件要確認`);
   if (counts.stopped > 0) parts.push(`${counts.stopped}件停止`);
-  if (parts.length === 0 && treeActive) return "Sub Agentを準備中";
+  if (parts.length === 0 && treeActive) return "サブエージェントを準備中";
   return parts.join(" · ");
 }
 
@@ -96,7 +96,7 @@ export function agentDisplayName(row: Pick<AgentActivityRow, "agent_path" | "tas
   const taskName = row.task_name.trim();
   if (taskName.length > 0) return taskName;
   const pathName = row.agent_path.split("/").filter(Boolean).pop()?.trim();
-  return pathName || "Sub Agent";
+  return pathName || "サブエージェント";
 }
 
 export function stableAgentVisual(agentPath: string): AgentVisual {

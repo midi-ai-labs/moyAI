@@ -27,6 +27,7 @@ export interface SharedWorkProjection {
   revision: string; generation: string; connected: boolean; hub_url: string; enrollment: string; enrollment_error: string | null;
   principal: (WorkPerson & { administrator: boolean }) | null; expires_at_ms: number | null;
   projects: WorkProject[]; selected_project_id: string | null; selected_job_id: string | null;
+  project_access?: "no_membership" | "device_not_allowed" | "ready" | null;
   status: { project_id: string; jobs: WorkSummary[]; environments: WorkEnvironment[]; execution_devices?: WorkExecutionDevice[]; next_before: string | null; next_environment_before: string | null } | null;
   detail: { id: string; project_id: string; root_id: string; parent_id: string | null; environment_id: string; title: string; input: unknown; result: unknown; state: string; awaiting_child_id: string | null; revision: number; created_at_ms: number; updated_at_ms: number; start_before_ms?: number | null; continued_from_id?: string | null; can_continue?: boolean; can_handover?: boolean; wait_reason?: string | null; uncertainty_reason?: string | null; runner_contact?: WorkRunnerContact | null } | null;
   approval: { id: string; attempt_id: string; request: { access: string; summary: string; details: string[]; targets: string[]; outside_workspace: boolean; risks: string[]; agent_path?: string; agent_task_name?: string }; status: string; decision: string | null; expires_at_ms: number; can_decide: boolean } | null;
@@ -39,21 +40,25 @@ export interface SharedWorkProjection {
 export interface SharedWorkUiState {
   projection: SharedWorkProjection | null;
   username: string; password: string; title: string; prompt: string; environmentId: string;
+  setupCode: string; setupPasswordConfirm: string;
+  loginMode: "setup" | "password";
   pending: string | null; serial: number; polling: boolean; error: string; conceal: boolean;
   draft: Record<string, string>;
 }
 export type SharedWorkPresentation = Omit<SharedWorkUiState, "serial" | "polling">;
 export function createSharedWorkUiState(): SharedWorkUiState {
-  return { projection: null, username: "", password: "", title: "", prompt: "", environmentId: "", pending: null, serial: 0, polling: false, error: "", conceal: false, draft: {} };
+  return { projection: null, username: "", password: "", setupCode: "", setupPasswordConfirm: "", loginMode: "setup", title: "", prompt: "", environmentId: "", pending: null, serial: 0, polling: false, error: "", conceal: false, draft: {} };
 }
 export function sharedWorkPresentation(local: SharedWorkUiState): SharedWorkPresentation {
   return { projection: local.projection, username: local.username, password: local.password, title: local.title,
+    setupCode: local.setupCode, setupPasswordConfirm: local.setupPasswordConfirm, loginMode: local.loginMode,
     prompt: local.prompt, environmentId: local.environmentId, pending: local.pending, error: local.error, conceal: local.conceal, draft: local.draft };
 }
 export function acceptSharedWork(local: SharedWorkUiState, projection: SharedWorkProjection): boolean {
   const previous = local.projection;
   if (previous && BigInt(projection.revision) < BigInt(previous.revision)) return false;
   if (previous?.generation !== projection.generation) {
+    local.setupCode = ""; local.setupPasswordConfirm = "";
     local.password = ""; local.title = ""; local.prompt = ""; local.environmentId = "";
     local.draft = {};
   } else if (previous?.selected_project_id !== projection.selected_project_id) {
@@ -68,11 +73,18 @@ export function acceptSharedWork(local: SharedWorkUiState, projection: SharedWor
 }
 export function editSharedWork(local: SharedWorkUiState, field: string, value: string): void {
   if (local.pending) return;
-  if (field === "username" || field === "password" || field === "title" || field === "prompt" || field === "environmentId") local[field] = value;
+  if (field === "username" || field === "password" || field === "setupCode" || field === "setupPasswordConfirm" || field === "title" || field === "prompt" || field === "environmentId") local[field] = value;
   else if (field.startsWith("draft:")) local.draft[field.slice(6)] = value;
 }
+export function selectSharedLoginMode(local: SharedWorkUiState, mode: string): boolean {
+  if (local.pending || local.projection?.principal || local.conceal || (mode !== "setup" && mode !== "password")) return false;
+  if (local.loginMode === mode) return false;
+  local.loginMode = mode;
+  local.password = ""; local.setupCode = ""; local.setupPasswordConfirm = "";
+  return true;
+}
 export function workStateLabel(state: string): string {
-  return ({ queued: "順番待ち", assigned: "実行準備中", running: "実行中", waiting_child: "子の結果待ち", succeeded: "完了", failed: "失敗", cancelling: "取消処理中", cancelled: "取消済み" } as Record<string, string>)[state] ?? state;
+  return ({ queued: "順番待ち", assigned: "実行準備中", running: "実行中", waiting_child: "サブエージェントの結果待ち", succeeded: "完了", failed: "失敗", cancelling: "取消処理中", cancelled: "取消済み" } as Record<string, string>)[state] ?? state;
 }
 export function sharedWorkActionEnabled(local: SharedWorkPresentation, kind: string, value: string): boolean {
   if (local.pending || !local.projection) return false;
@@ -80,8 +92,13 @@ export function sharedWorkActionEnabled(local: SharedWorkPresentation, kind: str
   if (local.conceal) return kind === "logout";
   if (kind === "logout") return p.principal !== null;
   if (kind === "login") return p.connected && !p.principal && Boolean(local.username.trim() && local.password);
+  if (kind === "setup-password") return p.connected && !p.principal && Boolean(local.username.trim()
+    && /^[0-9a-f]{64}$/.test(local.setupCode.trim()) && local.password.length >= 12 && local.password === local.setupPasswordConfirm);
   if (kind === "reconnect" || kind === "import") return !p.principal;
   if (!p.principal) return false;
+  if (kind === "prepare-sample") return Boolean(p.projects.some(row => row.id === p.selected_project_id && row.can_submit)
+    && !p.selected_job_id && !p.submission_uncertain && !p.submission_storage_error
+    && !p.inputs.length && !local.prompt.trim() && !local.title.trim());
   if (kind === "continue") return Boolean(p.detail?.can_continue && local.draft.followup?.trim() && !p.submission_uncertain && !p.submission_storage_error);
   if (kind === "handover") return Boolean(p.handover?.can_handover && p.handover.candidates.some(u => u.user_id === local.draft.assigneeId));
   if (kind === "upload-inputs") return Boolean(p.projects.some(row => row.id === p.selected_project_id && row.can_submit) && !p.submission_uncertain);

@@ -681,7 +681,7 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     ? {
       kind: "warning" as const,
       title: "モデル一覧の対象が変更されました",
-      hint: "現在のBase URLとConnection typeで、もう一度モデル一覧を読み込んでください。",
+      hint: "現在の接続先URLと接続方式で、もう一度モデル一覧を読み込んでください。",
       details: "編集中の接続先と一致しないモデル一覧は表示・適用されません。",
     }
     : state.provider_status;

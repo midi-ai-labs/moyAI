@@ -55,8 +55,8 @@ test("preparation state is distinct from assignment and ready capacity, includin
   ];
   acceptSharedWork(local, p); local.prompt = "解析";
   const html = renderSharedWork(local);
-  assert.match(html, /実行場所を準備中/);
-  assert.match(html, /実行場所の準備に失敗しました/);
+  assert.match(html, /作業フォルダーを作成中/);
+  assert.match(html, /作業フォルダーを作成できませんでした/);
   assert.match(html, /&lt;PC C&gt;/);
   assert.match(html, /&lt;保存先の確認が必要&gt;/);
   assert.equal((html.match(/<h3>PC B<\/h3>/g) ?? []).length, 1);
@@ -79,7 +79,7 @@ test("an empty environment page still identifies assigned ready PCs without inve
   acceptSharedWork(local, p);
   const html = renderSharedWork(local);
   assert.match(html, /<h3>PC B<\/h3>/);
-  assert.match(html, /準備完了/);
+  assert.match(html, /作業フォルダー作成済み（AIの動作は未確認）/);
   assert.match(html, /利用状況は別のページに表示されています。/);
   assert.doesNotMatch(html, /管理者が実行するPCを割り当てると|枠を使用中/);
   assert.equal(local.environmentId, "");
@@ -108,7 +108,7 @@ test("Hub projects and chats occupy the normal sidebar and logout removes them",
   assert.match(html, /data-action="open-hub-project" data-value="project-a"/);
   assert.match(html, /data-action="shared-detail" data-value="job-a"/);
   assert.match(html, /&lt;private-job&gt;/);
-  assert.doesNotMatch(html, /<private-job>|<span>共有仕事<\/span>|<span>MCP履歴<\/span>/);
+  assert.doesNotMatch(html, /<private-job>|<span>共有仕事<\/span>|<span>過去の連携履歴<\/span>/);
   local.conceal = true;
   assert.doesNotMatch(renderSidebar(state, local), /project-a|job-a|private-job/);
 });

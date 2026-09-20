@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tauri::{
-    Manager, State, WindowEvent,
+    Emitter, Manager, State, WindowEvent,
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
 };
@@ -45,6 +45,9 @@ type SharedController = Arc<Mutex<DesktopController>>;
 
 #[derive(Default)]
 struct McpHistoryExportGate(Mutex<()>);
+
+#[derive(Default)]
+struct JoinConfigActivationGate(Mutex<()>);
 
 // Keep the wire-visible Desktop command registry in one place. The handler
 // and its contract tests consume this same identifier list, so a renamed or
@@ -167,6 +170,7 @@ macro_rules! desktop_command_manifest {
             apply_session_config,
             save_global_config,
             finish_initial_setup,
+            choose_initial_setup_purpose,
             apply_session_settings,
             toggle_access_mode,
             preview_window_opacity,
@@ -264,6 +268,7 @@ enum DesktopCommandErrorCode {
     ModelUnavailable,
     ImageUnsupported,
     PermissionPolicyDenied,
+    TeamSetupUnavailable,
     RuntimeFailure,
     StorageFailure,
 }
@@ -299,6 +304,16 @@ impl DesktopCommandError {
             kind: "internal",
             category: DesktopCommandErrorCategory::Storage,
             code: DesktopCommandErrorCode::StorageFailure,
+            message: message.into(),
+            state: None,
+        }
+    }
+
+    fn team_setup_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: "internal",
+            category: DesktopCommandErrorCategory::Runtime,
+            code: DesktopCommandErrorCode::TeamSetupUnavailable,
             message: message.into(),
             state: None,
         }
@@ -415,10 +430,14 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
     context.config_mut().identifier =
         super::single_instance::desktop_identifier().map_err(AppRunError::Message)?;
     let result = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             restore_main_window(app);
             let shared = app.state::<SharedController>().inner().clone();
+            let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                if handle_join_config_activation(&app, &argv, &cwd).await {
+                    return;
+                }
                 shared.lock().await.state.set_status_message(
                     "moyAI は既に起動しています。既存のウィンドウを表示しました。",
                 );
@@ -429,14 +448,22 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .manage(mcp_publish)
         .manage(remote_jobs)
         .manage(McpHistoryExportGate::default())
+        .manage(JoinConfigActivationGate::default())
         .manage(device_network)
         .manage(managed_shells.clone())
         .setup(|app| {
             install_tray(app.handle())?;
             let network = app.state::<DeviceNetworkService>().inner().clone();
+            let handle = app.handle().clone();
+            let arguments = std::env::args().collect::<Vec<_>>();
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             tauri::async_runtime::spawn(async move {
                 let _ = network.resume().await;
                 network.start_execution_management();
+                handle_join_config_activation(&handle, &arguments, &cwd).await;
             });
             Ok(())
         })
@@ -451,6 +478,163 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .run(context);
     managed_shells.shutdown().await;
     result.map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
+}
+
+async fn handle_join_config_activation(
+    app: &tauri::AppHandle,
+    arguments: &[String],
+    cwd: &str,
+) -> bool {
+    let path = match super::join_config::from_launch_args(arguments, cwd) {
+        Ok(None) => return false,
+        Ok(Some(path)) => path,
+        Err(error) => {
+            show_join_config_error(app, &error).await;
+            return true;
+        }
+    };
+    let gate = app.state::<JoinConfigActivationGate>();
+    let Ok(_lease) = gate.0.try_lock() else {
+        show_join_config_error(app,
+            "別の接続ファイルを確認中です。確認を終えてから、開きたい接続ファイルをもう一度開いてください。"
+        ).await;
+        return true;
+    };
+    if let Err(error) = review_join_config_activation(app, path).await {
+        show_join_config_error(app, &error).await;
+    }
+    // Native activation has no command response. Invalidate the ordinary
+    // snapshot after settlement, including when idle polling has stopped.
+    let _ = app.emit_to("main", "desktop-state-changed", ());
+    true
+}
+
+async fn show_join_config_error(app: &tauri::AppHandle, message: &str) {
+    app.state::<SharedController>()
+        .lock()
+        .await
+        .state
+        .set_status_message(message);
+    let mut dialog = rfd::AsyncMessageDialog::new()
+        .set_title("moyAI: 接続ファイル")
+        .set_description(message)
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok);
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    let _ = dialog.show().await;
+}
+
+async fn review_join_config_activation(
+    app: &tauri::AppHandle,
+    path: camino::Utf8PathBuf,
+) -> Result<(), String> {
+    let shared_controller = app.state::<SharedController>().inner().clone();
+    let service = app.state::<DeviceNetworkService>().inner().clone();
+    let (target, before, current) = {
+        let mut controller = shared_controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_unscoped_prompt_review_action(&mut controller, "Hub connection file")
+            .map_err(|_| "現在の確認操作を終えてから、接続ファイルをもう一度開いてください。")?;
+        let target = DesktopConfigMutationTarget {
+            workspace_path: controller.app.workspace.authority_root().to_string(),
+            session_id: controller
+                .state
+                .app_state
+                .current_session_id
+                .map(|id| id.to_string()),
+            config_generation: controller
+                .state
+                .provider_config
+                .config_generation
+                .to_string(),
+        };
+        (
+            target,
+            service.projection_now(),
+            controller.state.global_config().device_network.clone(),
+        )
+    };
+    let shared = tokio::task::spawn_blocking(move || super::join_config::load(&path))
+        .await
+        .map_err(|_| "接続ファイルを読み取れません。")??;
+    let mut dialog = rfd::AsyncMessageDialog::new()
+        .set_title("moyAI: チームの接続先を確認")
+        .set_description(super::join_config::review_text(
+            &shared,
+            &current,
+            before.device_id.is_some(),
+        )?)
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::OkCancel);
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    if dialog.show().await != rfd::MessageDialogResult::Ok {
+        return Ok(());
+    }
+    let prepared = service
+        .prepare_configuration(shared, &before.revision, &before.generation)
+        .await
+        .map_err(|error| super::join_config::configuration_error(error).to_string())?;
+    let endpoint_changed = prepared.endpoint_changed();
+    let mut controller = shared_controller.lock().await;
+    controller.drain_runtime_messages();
+    let changed = if endpoint_changed {
+        super::join_config::ENDPOINT_NOT_SAVED
+    } else {
+        "確認中に画面や接続設定が変更されました。接続ファイルをもう一度開いて確認してください。"
+    };
+    ensure_config_mutation_target(&controller, &target).map_err(|_| changed)?;
+    ensure_unscoped_prompt_review_action(&mut controller, "Hub connection file")
+        .map_err(|_| changed)?;
+    service
+        .check_target(&before.revision, &before.generation)
+        .map_err(|_| changed)?;
+    let mut persist_error = None;
+    let result = service
+        .commit_configuration(prepared, |saved| {
+            controller
+                .save_device_network_config(saved, false)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    if let Some(error) = persist_error {
+        if endpoint_changed {
+            return Err(super::join_config::ENDPOINT_NOT_SAVED.into());
+        }
+        return Err(error);
+    }
+    let result = result.map_err(|error| {
+        if endpoint_changed {
+            super::join_config::ENDPOINT_NOT_SAVED.into()
+        } else {
+            error.to_string()
+        }
+    })?;
+    // A failed candidate never changes the existing navigation intent.
+    controller.choose_initial_setup_purpose(super::preferences::DesktopOnboardingIntent::Team)?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    controller.state.set_status_message(
+        "接続情報を保存しました。PC参加と本人設定の続きは共有仕事画面で確認できます。",
+    );
+    drop(controller);
+    if endpoint_changed {
+        service.reconnect_model_after_endpoint_change().await;
+    }
+    if let Err(error) = service
+        .request_join(&result.revision, &result.generation)
+        .await
+    {
+        return Err(format!(
+            "接続情報は保存済みです。共有仕事画面で接続状態を確認し、再接続してください。\n{error}"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3738,8 +3922,14 @@ async fn pick_shared_hub_config(
     start: camino::Utf8PathBuf,
 ) -> Result<Option<SharedHubConfig>, String> {
     tokio::task::spawn_blocking(move || {
-        let selected = DesktopController::pick_initial_setup_config_toml_dialog(&start)
-            .map_err(|_| "storage_error".to_string())?;
+        let selected = rfd::FileDialog::new()
+            .set_title("Hubの接続ファイルを選択")
+            .add_filter("moyAI Hub connection", &["moyai-join", "toml"])
+            .set_directory(start.as_std_path())
+            .pick_file()
+            .map(camino::Utf8PathBuf::from_path_buf)
+            .transpose()
+            .map_err(|_| "invalid_configuration".to_string())?;
         selected
             .map(|path| {
                 let text = crate::config::loader::read_toml_utf8_bounded(&path)
@@ -3752,6 +3942,25 @@ async fn pick_shared_hub_config(
     .map_err(|_| "storage_error".to_string())?
 }
 
+async fn confirm_registered_endpoint_change(
+    shared: &SharedHubConfig,
+    current: &SharedHubConfig,
+    registered: bool,
+) -> Result<bool, String> {
+    if !registered || shared == current {
+        return Ok(true);
+    }
+    let review = super::join_config::review_text(shared, current, true)?;
+    Ok(rfd::AsyncMessageDialog::new()
+        .set_title("moyAI: 登録済みHubの接続先変更")
+        .set_description(review)
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show()
+        .await
+        == rfd::MessageDialogResult::Ok)
+}
+
 #[tauri::command]
 async fn device_network_import(
     controller: State<'_, SharedController>,
@@ -3759,7 +3968,7 @@ async fn device_network_import(
     expected_revision: String,
     expected_generation: String,
 ) -> Result<DeviceNetworkProjection, String> {
-    let (start, target) = {
+    let (start, target, current, registered) = {
         let mut controller = controller.lock().await;
         controller.drain_runtime_messages();
         ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
@@ -3780,26 +3989,48 @@ async fn device_network_import(
                 .config_generation
                 .to_string(),
         };
-        (controller.app.workspace.root.clone(), target)
+        (
+            controller.app.workspace.root.clone(),
+            target,
+            controller.state.global_config().device_network.clone(),
+            service.projection_now().device_id.is_some(),
+        )
     };
-    let loaded = pick_shared_hub_config(start).await;
-    let mut controller = controller.lock().await;
-    controller.drain_runtime_messages();
-    ensure_config_mutation_target(&controller, &target).map_err(|_| "connection_changed")?;
-    ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
-        .map_err(|_| "connection_changed")?;
-    service
-        .check_target(&expected_revision, &expected_generation)
-        .map_err(|error| error.to_string())?;
-    let Some(shared) = loaded? else {
+    let Some(shared) = pick_shared_hub_config(start).await? else {
         return Ok(service.projection_now());
     };
-    let saved = shared.clone();
+    if !confirm_registered_endpoint_change(&shared, &current, registered).await? {
+        return Ok(service.projection_now());
+    }
+    let prepared = service
+        .prepare_configuration(shared, &expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())?;
+    let endpoint_changed = prepared.endpoint_changed();
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let changed = if endpoint_changed {
+        "endpoint_change_not_saved"
+    } else {
+        "connection_changed"
+    };
+    ensure_config_mutation_target(&controller, &target).map_err(|_| changed)?;
+    ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
+        .map_err(|_| changed)?;
+    service
+        .check_target(&expected_revision, &expected_generation)
+        .map_err(|error| {
+            if endpoint_changed {
+                "endpoint_change_not_saved".into()
+            } else {
+                error.to_string()
+            }
+        })?;
     let mut persist_error = None;
     let result = service
-        .configure_with_commit(shared, &expected_revision, &expected_generation, || {
+        .commit_configuration(prepared, |saved| {
             controller
-                .save_device_network_config(&saved, false)
+                .save_device_network_config(saved, false)
                 .map_err(|error| {
                     persist_error = Some(error);
                     crate::device_network::DeviceError::Storage
@@ -3807,11 +4038,23 @@ async fn device_network_import(
         })
         .await;
     if let Some(error) = persist_error {
+        if endpoint_changed {
+            return Err("endpoint_change_not_saved".into());
+        }
         return Err(error);
     }
-    let result = result.map_err(|error| error.to_string())?;
+    let result = result.map_err(|error| {
+        if endpoint_changed {
+            "endpoint_change_not_saved".into()
+        } else {
+            error.to_string()
+        }
+    })?;
     service.update_runtime_config(controller.state.global_config().clone());
     drop(controller);
+    if endpoint_changed {
+        service.reconnect_model_after_endpoint_change().await;
+    }
     service
         .request_join(&result.revision, &result.generation)
         .await
@@ -3835,30 +4078,71 @@ async fn device_network_initial_setup_import(
             .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
         service.projection_now()
     };
+    let current = {
+        controller
+            .lock()
+            .await
+            .state
+            .global_config()
+            .device_network
+            .clone()
+    };
     let loaded = pick_shared_hub_config(camino::Utf8PathBuf::from(
         &expected_setup_target.workspace_path,
     ))
     .await;
+    let prepared = match loaded {
+        Ok(Some(shared)) => {
+            match confirm_registered_endpoint_change(&shared, &current, before.device_id.is_some())
+                .await
+            {
+                Ok(true) => Some(
+                    service
+                        .prepare_configuration(shared, &before.revision, &before.generation)
+                        .await
+                        .map_err(|error| {
+                            super::join_config::configuration_error(error).to_string()
+                        }),
+                ),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    };
+    let endpoint_changed = prepared
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|value| value.endpoint_changed());
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
     ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
         .and_then(|()| ensure_config_mutation_target(&controller, &expected_config_target))
         .and_then(|()| ensure_config_draft_commit_admission(&controller))
-        .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
-    let Some(shared) = loaded.map_err(|error| {
-        command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
-    })?
-    else {
+        .map_err(|conflict| {
+            command_conflict_error(
+                &mut controller,
+                if endpoint_changed {
+                    DesktopCommandConflict::new(super::join_config::ENDPOINT_NOT_SAVED)
+                } else {
+                    conflict
+                },
+            )
+        })?;
+    let Some(prepared) = prepared else {
         return controller
             .next_web_state()
             .map_err(DesktopCommandError::internal);
     };
-    let saved = shared.clone();
+    let prepared = prepared.map_err(|error| {
+        command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+    })?;
     let mut persist_error = None;
     let result = service
-        .configure_with_commit(shared, &before.revision, &before.generation, || {
+        .commit_configuration(prepared, |saved| {
             controller
-                .save_device_network_config(&saved, true)
+                .save_device_network_config(saved, true)
                 .map_err(|error| {
                     persist_error = Some(error);
                     crate::device_network::DeviceError::Storage
@@ -3870,16 +4154,38 @@ async fn device_network_initial_setup_import(
         Err,
     );
     outcome.map_err(|error| {
-        command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+        command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::new(if endpoint_changed {
+                super::join_config::ENDPOINT_NOT_SAVED.into()
+            } else {
+                error
+            }),
+        )
     })?;
     service.update_runtime_config(controller.state.global_config().clone());
+    let completion_error = controller
+        .finish_initial_setup_after_device_network_persist()
+        .err();
     service.enable_default_model_on_join();
     let target = service.projection_now();
     drop(controller);
+    if endpoint_changed {
+        service.reconnect_model_after_endpoint_change().await;
+    }
     let _ = service
         .request_join(&target.revision, &target.generation)
         .await;
     let mut controller = shared_controller.lock().await;
+    if completion_error.is_some() {
+        return Err(command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::with_status(
+                DesktopStatusCode::InitialSetupPreferencesSaveFailed,
+                "接続情報は保存済みです。初回設定の完了状態を保存できませんでした。設定の保存先を確認し、同じ接続ファイルを読み込み直してください。実行受付は自動再開しません。",
+            ),
+        ));
+    }
     controller
         .next_web_state()
         .map_err(DesktopCommandError::internal)
@@ -5323,6 +5629,49 @@ async fn save_global_config(
             .map_err(DesktopCommandError::internal)?,
         saved,
     ))
+}
+
+#[tauri::command]
+async fn choose_initial_setup_purpose(
+    controller: State<'_, SharedController>,
+    purpose: super::preferences::DesktopOnboardingIntent,
+    expected_config_target: DesktopConfigMutationTarget,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    {
+        let mut owner = controller.lock().await;
+        owner.drain_runtime_messages();
+        ensure_unscoped_prompt_review_action(&mut owner, "initial setup purpose")
+            .and_then(|()| ensure_initial_setup_mutation_target(&owner, &expected_setup_target))
+            .and_then(|()| ensure_config_mutation_target(&owner, &expected_config_target))
+            .and_then(|()| ensure_config_draft_commit_admission(&owner))
+            .map_err(|conflict| command_conflict_error(&mut owner, conflict))?;
+        owner
+            .choose_initial_setup_purpose(purpose)
+            .map_err(DesktopCommandError::internal)?;
+        if purpose != super::preferences::DesktopOnboardingIntent::Hosting {
+            return owner
+                .next_web_state()
+                .map_err(DesktopCommandError::internal);
+        }
+    }
+    tokio::task::spawn_blocking(super::team_setup::launch_team_setup)
+        .await
+        .map_err(|error| DesktopCommandError::team_setup_unavailable(error.to_string()))?
+        .map_err(DesktopCommandError::team_setup_unavailable)?;
+    let mut owner = controller.lock().await;
+    owner.drain_runtime_messages();
+    if ensure_initial_setup_mutation_target(&owner, &expected_setup_target).is_ok()
+        && ensure_config_mutation_target(&owner, &expected_config_target).is_ok()
+        && owner.state.startup.onboarding_intent == Some(purpose)
+    {
+        owner.state.set_status_message(
+            "チーム管理画面を開きました。Hubの利用準備後、このPCもチームへ参加できます。",
+        );
+    }
+    owner
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 #[tauri::command]
@@ -8137,6 +8486,13 @@ mod tests {
         let json = serde_json::to_value(error).expect("serialize command error");
         assert_eq!(json["category"], "unknown");
         assert_eq!(json["code"], "unknown");
+        let team = serde_json::to_value(DesktopCommandError::team_setup_unavailable(
+            "opaque process diagnostic",
+        ))
+        .expect("serialize team setup error");
+        assert_eq!(team["category"], "runtime");
+        assert_eq!(team["code"], "team_setup_unavailable");
+        assert_eq!(team["message"], "opaque process diagnostic");
         assert_eq!(
             serde_json::to_string(&DesktopCommandErrorCode::ProviderTransport)
                 .expect("provider code"),

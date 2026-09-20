@@ -32,14 +32,14 @@ export function renderMcpHistoryOverlay(input?: McpHistoryPresentation, legacyPr
   const direction = local.direction;
   return `<div class="modal-backdrop">
     <section class="modal settings-modal mcp-history-modal" data-modal="mcp_history" data-surface="mcp_history" data-history-page="${direction}:${local.offset}" data-history-detail-owner="${direction}:${escapeHtml(local.selectedId ?? "")}" role="dialog" aria-modal="true" aria-labelledby="mcp-history-title" tabindex="-1">
-      <header class="mcp-history-header"><div><span class="hub-eyebrow">LYNX · MCP HISTORY</span><h2 id="mcp-history-title">MCP履歴</h2><p>他端末への指示と、この端末で受け付けた実行を確認できます。</p></div><button id="mcp-history-close-top" class="icon-button" data-action="close-overlay" aria-label="閉じる" title="閉じる">${icon("x")}</button></header>
+      <header class="mcp-history-header"><div><span class="hub-eyebrow">過去のPC間連携</span><h2 id="mcp-history-title">過去の連携履歴</h2><p>ほかのPCに送った依頼と、このPCで受け付けた仕事の記録を表示します。</p></div><button id="mcp-history-close-top" class="icon-button" data-action="close-overlay" aria-label="閉じる" title="閉じる">${icon("x")}</button></header>
       <div class="mcp-history-toolbar"><nav aria-label="履歴の種類">
         <button id="mcp-history-instruction" data-action="mcp-history-direction" data-value="instruction" aria-pressed="${direction === "instruction"}">${icon("send")}MCP指示</button>
         <button id="mcp-history-execution" data-action="mcp-history-direction" data-value="execution" aria-pressed="${direction === "execution"}">${icon("download")}MCP実行</button></nav>
         <button id="mcp-history-refresh" data-action="mcp-history-refresh" title="最新の履歴を取得し、1ページ目に戻る" ${disabled(local.listPending || local.detailPending || local.operation === "stop")}>${icon("refresh")}更新</button></div>
       <p class="mcp-history-scope" data-history-region="scope">${direction === "instruction"
-        ? "Hub経由の委任について、この端末が保存した最終確認状態を表示します。実行先へ状態を問い合わせる操作ではありません。新しい履歴は「更新」で取得できます。"
-        : "この端末に保存された受付・実行の記録を表示します。指示側の結果受信状況とは異なります。"}</p>
+        ? "依頼先から最後に受け取った状態を表示します。現在の稼働状態とは異なる場合があります。「更新」で、このPCに保存された新しい記録を読み込みます。"
+        : "このPCで受け付けた仕事と実行結果を表示します。依頼元が結果を受け取ったかどうかは、この記録では分かりません。"}</p>
       <div class="mcp-history-feedback" data-history-region="list-error" role="status">${escapeHtml(local.error)}</div>
       <div class="mcp-history-body">
         <aside class="mcp-history-sidebar" aria-label="MCP履歴の一覧"><div class="mcp-history-list" data-history-list tabindex="0" aria-label="履歴一覧">

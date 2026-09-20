@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { acceptDeviceNetworkProjection, createDeviceNetworkUiState, deviceCanJoin, deviceCanReceive, deviceCanSelect,
-  deviceCanStopJob, deviceDraftCurrent, deviceNetworkPresentation, devicePeerAvailability, devicePeerKey,
+  deviceCanStopJob, deviceDraftCurrent, deviceNetworkError, deviceNetworkPresentation, devicePeerAvailability, devicePeerKey,
   editDeviceNetworkField, visibleDevicePeers } from "../src/device_network_state.ts";
 import { renderDeviceNetwork } from "../src/device_network_render.ts";
 import { devicePathLabel, renderDeviceNetworkJobs } from "../src/device_network_jobs.ts";
@@ -9,6 +9,14 @@ import { renderHubOverlay } from "../src/hub_render.ts";
 import { createHubUiState } from "../src/hub_state.ts";
 import { synchronizeRetainedSettingsSurface } from "../src/settings_surface.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
+
+test("endpoint change failures distinguish retained trust, busy execution and an unconfirmed shutdown", () => {
+  assert.match(deviceNetworkError("different_hub"), /別Hubや公開CAの変更には対応していません/);
+  assert.match(deviceNetworkError("endpoint_change_busy"), /受付を一時停止/);
+  assert.match(deviceNetworkError("endpoint_change_runner_unconfirmed"), /安全な終了を確認できません/);
+  assert.match(deviceNetworkError("endpoint_change_not_saved"), /接続先は変更していません/);
+  assert.match(deviceNetworkError("endpoint_change_not_saved"), /自動再開しません/);
+});
 
 test("approval enrollment never grants reception or selects peers automatically", () => {
   const local = createDeviceNetworkUiState();
@@ -277,7 +285,7 @@ test("administrator stop and credential revocation stay distinct while pending a
   assert.match(renderDeviceNetwork(local),/管理者が利用を停止中/);
   assert.equal(deviceCanReceive(local,true),false);
   acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"revoked",error:"device_revoked",generation:"9"}));
-  assert.match(renderDeviceNetwork(local),/端末の認証が失効しています/);
+  assert.match(renderDeviceNetwork(local),/このPCの認証が失効しています/);
   assert.deepEqual(local.target,target);
   acceptDeviceNetworkProjection(local,deviceProjection({enrollment:"active",generation:"10"}));
   assert.match(local.notice,/承認され、接続しました/);

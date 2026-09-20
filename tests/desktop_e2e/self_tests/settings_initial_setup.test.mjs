@@ -17,6 +17,8 @@ import {
   initialSetupImportConfig,
   initialSetupImportedPublicOverrides,
   initialSetupStepReady,
+  initialSetupHostingUnavailableReady,
+  initialSetupPurposeButtonsReady,
 } from "../scenarios/settings_initial_setup.mjs";
 
 const workspace = "C:\\e2e\\workspace";
@@ -161,6 +163,29 @@ test("Initial Setup rejects a visible enabled primary action with wrapped or ove
       assert.equal(initialSetupStepReady(candidate, [], step, workspace), false);
     }
   }
+});
+
+test("missing Hub guidance must be normally visible while every initial purpose remains actionable", () => {
+  const value = {
+    surface: { projection: { overlay: "initial_setup", startup: { initial_setup_required: true, onboarding_intent: "hosting" } }, wizard: { current_step: "start" }, visible_fatal_count: 0 },
+    notice: { visible: true, details_open: false, text: "Hub同梱版を導入するか、既存の管理PCでHubを起動してください。", purposes: ["personal", "team", "hosting"].map(kind => ({ action: `initial-setup-${kind}`, enabled: true })) },
+  };
+  assert.equal(initialSetupHostingUnavailableReady(value), true);
+  assert.equal(initialSetupHostingUnavailableReady({ ...value, notice: { ...value.notice, text: "技術詳細を参照" } }), false);
+  assert.equal(initialSetupHostingUnavailableReady({ ...value, notice: { ...value.notice, details_open: true } }), false);
+  value.notice.purposes[0].enabled = false;
+  assert.equal(initialSetupHostingUnavailableReady(value), false);
+});
+
+test("all three purpose labels fit the visible action without wrapping or clipping", () => {
+  const button = { count: 1, visible: true, enabled: true, label_contained: true, label_line_count: 1 };
+  const value = { wizard: { current_step: "start", purposes: [{ ...button }, { ...button }, { ...button }] } };
+  assert.equal(initialSetupPurposeButtonsReady(value), true);
+  value.wizard.purposes[0].label_line_count = 6;
+  assert.equal(initialSetupPurposeButtonsReady(value), false);
+  value.wizard.purposes[0].label_line_count = 1;
+  value.wizard.purposes[0].label_contained = false;
+  assert.equal(initialSetupPurposeButtonsReady(value), false);
 });
 
 test("Initial Setup Finish expectation carries all values and both exact targets", () => {

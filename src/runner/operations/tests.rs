@@ -2,6 +2,25 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn saved_desktop_consent_follows_identity_but_rejects_ambiguous_legacy_bindings() {
+    let hash = "a".repeat(64);
+    let old = format!("hub|device|https://old.example:9471|{hash}");
+    let new = format!("hub|device|https://new.example:9471|{hash}");
+    assert!(desktop_consent_matches(&old, &new));
+    for invalid in [
+        format!("other|device|https://new.example:9471|{hash}"),
+        format!("hub|other|https://new.example:9471|{hash}"),
+        format!("hub|device|https://new.example:9471|{}", "b".repeat(64)),
+        format!("hub|device|http://new.example:9471|{hash}"),
+        format!("hub|device|https://new.example:9471/path|{hash}"),
+        format!("hub|device|https://new.example:9471|{hash}|extra"),
+        "hub/device/trust".into(),
+    ] {
+        assert!(!desktop_consent_matches(&old, &invalid), "{invalid}");
+    }
+}
+
+#[test]
 fn desktop_consent_is_forward_compatible_and_scopes_delegation_to_confirmed_provisioning() {
     let mut installed: Installed = serde_json::from_value(json!({
         "version":1,"mode":"available","maintenance_until_ms":null,"settings":null,"templates":[]

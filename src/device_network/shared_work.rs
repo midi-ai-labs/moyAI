@@ -174,6 +174,7 @@ pub struct SharedWorkProjection {
     pub principal: Option<WorkPrincipal>,
     pub expires_at_ms: Option<u64>,
     pub projects: Vec<WorkProject>,
+    pub project_access: Option<String>,
     pub selected_project_id: Option<String>,
     pub selected_job_id: Option<String>,
     pub status: Option<WorkStatus>,
@@ -199,6 +200,11 @@ pub struct SharedWorkProjection {
 pub enum SharedWorkCommand {
     Login {
         username: String,
+        password: String,
+    },
+    SetupPassword {
+        username: String,
+        code: String,
         password: String,
     },
     Logout,
@@ -240,6 +246,9 @@ pub enum SharedWorkCommand {
         start_before_ms: Option<u64>,
     },
     UploadInputs {
+        project_id: String,
+    },
+    PrepareSample {
         project_id: String,
     },
     RemoveInput {
@@ -328,6 +337,8 @@ struct LoginSession {
 struct Session {
     principal: WorkPrincipal,
     expires_at_ms: u64,
+    #[serde(default)]
+    project_access: Option<String>,
 }
 pub(super) struct SharedWorkOwner(Mutex<Runtime>);
 impl SharedWorkOwner {
@@ -639,6 +650,28 @@ impl DeviceNetworkService {
                 .shared_login(connection, generation, query, username, password)
                 .await;
         }
+        if let SharedWorkCommand::SetupPassword {
+            username,
+            code,
+            password,
+        } = command
+        {
+            if code.len() != 64 || !code.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(RequestError::Local(
+                    "管理者から受け取った本人設定コードを入力してください。",
+                ));
+            }
+            return self
+                .shared_password_auth(
+                    connection,
+                    generation,
+                    query,
+                    username,
+                    password,
+                    Some(code),
+                )
+                .await;
+        }
         let current_token = match self
             .shared_authenticate(connection, generation, query, token)
             .await
@@ -837,6 +870,10 @@ impl DeviceNetworkService {
             }
             SharedWorkCommand::UploadInputs { project_id } => {
                 self.shared_upload_inputs(connection, generation, query, token, &project_id)
+                    .await?;
+            }
+            SharedWorkCommand::PrepareSample { project_id } => {
+                self.shared_prepare_sample(connection, generation, query, token, &project_id)
                     .await?;
             }
             SharedWorkCommand::RemoveInput {
@@ -1069,6 +1106,7 @@ impl DeviceNetworkService {
             }
             runtime.view.principal = Some(session.principal);
             runtime.view.expires_at_ms = Some(session.expires_at_ms);
+            runtime.view.project_access = session.project_access;
             if !projects
                 .iter()
                 .any(|p| Some(&p.id) == runtime.view.selected_project_id.as_ref())

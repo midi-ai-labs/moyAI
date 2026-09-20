@@ -21,6 +21,10 @@ struct Runner {
 
 impl Runner {
     fn new(endpoint: &str) -> Self {
+        Self::new_with_consent(endpoint, false)
+    }
+
+    fn new_with_consent(endpoint: &str, desktop_consent: bool) -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../project_sandbox/shared-work-completion-20260913/runner-process-gate");
         std::fs::create_dir_all(&base).unwrap();
@@ -30,6 +34,18 @@ impl Runner {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(&config, format!("[model]\nbase_url = {endpoint:?}\nmodel = \"runner-fixture\"\nprovider_profile = \"openai_compatible\"\nmax_retries = 0\n[multi_agent]\nenabled = true\n")).unwrap();
+        if desktop_consent {
+            let prepared =
+                Self::fixture_command(&config, &data, "prepare_endpoint_change_configuration")
+                    .output()
+                    .unwrap();
+            assert!(
+                prepared.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&prepared.stdout),
+                String::from_utf8_lossy(&prepared.stderr)
+            );
+        }
         let log = std::fs::File::create(temp.path().join("runner.log")).unwrap();
         let child = Self::host_command(&config, &data)
             .stdout(log.try_clone().unwrap())
@@ -77,6 +93,10 @@ impl Runner {
         command
     }
     fn host_command(config: &std::path::Path, data: &std::path::Path) -> Command {
+        Self::fixture_command(config, data, "isolated_runner_process")
+    }
+
+    fn fixture_command(config: &std::path::Path, data: &std::path::Path, test: &str) -> Command {
         use std::os::windows::process::CommandExt;
         let executable=std::env::var_os("MOYAI_TEST_RUNNER_LIB_EXE").expect("Runner process gate requires current MOYAI_TEST_RUNNER_LIB_EXE; see docs/runner-local.md");
         let mut command = Command::new(executable);
@@ -90,7 +110,7 @@ impl Runner {
             .env_remove("MOYAI_TEST_SHARED_SETTINGS")
             .args([
                 "--exact",
-                "runner::shared::process_fixture::isolated_runner_process",
+                &format!("runner::shared::process_fixture::{test}"),
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
@@ -553,4 +573,72 @@ async fn legacy_configuration_preserves_common_local_admission_stop_and_status()
     assert_eq!(count.load(Ordering::SeqCst), 3);
     runner.shutdown();
     server.abort();
+}
+
+#[test]
+#[ignore = "Required Runner process gate: current MOYAI_TEST_RUNNER_LIB_EXE and --ignored"]
+fn endpoint_change_quiescent_shutdown_waits_for_exact_exit_and_preserves_paused_consent() {
+    let mut runner = Runner::new_with_consent("http://127.0.0.1:1", true);
+    let status = runner.value(&["operations", "--runner", &runner.id]);
+    assert_eq!(status["projection"]["state"], "paused", "{status}");
+    let binding = status["projection"]["desktop_binding"].as_str().unwrap();
+    let replacement = binding.replace("https://127.0.0.1:1", "https://127.0.0.1:2");
+    let client = |runner: &Runner| {
+        Runner::fixture_command(&runner.config, &runner.data, "endpoint_change_client")
+            .env("MOYAI_TEST_ENDPOINT_BINDING", &replacement)
+            .output()
+            .unwrap()
+    };
+    let wrong = json!({"operation":"quiescent_shutdown","expected_desktop_binding":"different"})
+        .to_string();
+    assert!(
+        !runner
+            .command(&["operations", "--runner", &runner.id, &wrong])
+            .status
+            .success()
+    );
+    assert!(runner.child.try_wait().unwrap().is_none());
+    runner.value(&[
+        "operations",
+        "--runner",
+        &runner.id,
+        r#"{"operation":"resume"}"#,
+    ]);
+    assert!(
+        !client(&runner).status.success(),
+        "available mode cannot move"
+    );
+    assert!(runner.child.try_wait().unwrap().is_none());
+    runner.value(&[
+        "operations",
+        "--runner",
+        &runner.id,
+        r#"{"operation":"pause"}"#,
+    ]);
+    let consent_path = runner.data.join("runner-operations.json");
+    let consent = std::fs::read(&consent_path).unwrap();
+    let started = Instant::now();
+    let result = client(&runner);
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(25));
+    assert!(
+        runner.child.try_wait().unwrap().is_some(),
+        "helper must wait for the original process handle to exit"
+    );
+    assert_eq!(std::fs::read(&consent_path).unwrap(), consent);
+    assert!(
+        !client(&runner).status.success(),
+        "an absent Runner cannot prove a durable empty journal"
+    );
+    runner.reopen();
+    let reopened = runner.value(&["operations", "--runner", &runner.id]);
+    assert_eq!(reopened["projection"]["state"], "paused", "{reopened}");
+    assert_eq!(reopened["projection"]["accepting"], false);
+    assert_eq!(reopened["projection"]["desktop_binding"], binding);
+    runner.shutdown();
 }

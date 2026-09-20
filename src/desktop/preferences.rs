@@ -8,15 +8,49 @@ use tempfile::NamedTempFile;
 
 const DESKTOP_PREFS_ENV: &str = "MOYAI_DESKTOP_PREFS_PATH";
 
+/// The user's unfinished entry route, not connection or permission readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopOnboardingIntent {
+    Welcome,
+    Personal,
+    Execution,
+    Team,
+    Hosting,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DesktopPreferences {
     pub last_workspace: Option<Utf8PathBuf>,
     pub window_opacity_percent: Option<i32>,
     #[serde(default)]
     pub deleted_project_roots: Vec<Utf8PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_intent: Option<DesktopOnboardingIntent>,
 }
 
 impl DesktopPreferences {
+    /// Persist before creating default config so an interrupted first launch
+    /// cannot be mistaken for an existing user's completed setup.
+    pub fn prepare_initial_setup(global_config_exists: bool) -> Result<(), String> {
+        if global_config_exists {
+            return Ok(());
+        }
+        let mut preferences = Self::load()?;
+        if preferences.begin_initial_setup(global_config_exists) {
+            preferences.save()?;
+        }
+        Ok(())
+    }
+
+    fn begin_initial_setup(&mut self, global_config_exists: bool) -> bool {
+        if global_config_exists || self.onboarding_intent.is_some() {
+            return false;
+        }
+        self.onboarding_intent = Some(DesktopOnboardingIntent::Welcome);
+        true
+    }
+
     pub fn load_or_default() -> Self {
         Self::load().unwrap_or_default()
     }
@@ -97,6 +131,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interrupted_initial_setup_survives_default_config_creation_and_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("desktop.toml")).unwrap();
+        let mut first = DesktopPreferences::default();
+        assert!(first.begin_initial_setup(false));
+        first
+            .save_to_path(&path)
+            .expect("persist before bootstrap creates config");
+        let mut restarted: DesktopPreferences =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!restarted.begin_initial_setup(true));
+        assert_eq!(
+            restarted.onboarding_intent,
+            Some(DesktopOnboardingIntent::Welcome)
+        );
+        for intent in [
+            DesktopOnboardingIntent::Personal,
+            DesktopOnboardingIntent::Execution,
+            DesktopOnboardingIntent::Team,
+            DesktopOnboardingIntent::Hosting,
+        ] {
+            restarted.onboarding_intent = Some(intent);
+            restarted.save_to_path(&path).unwrap();
+            let loaded: DesktopPreferences =
+                toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(loaded.onboarding_intent, Some(intent));
+        }
+    }
+
+    #[test]
+    fn existing_users_are_not_returned_to_onboarding() {
+        let mut legacy: DesktopPreferences =
+            toml::from_str("window_opacity_percent = 95\n").unwrap();
+        assert!(!legacy.begin_initial_setup(true));
+        assert_eq!(legacy.onboarding_intent, None);
+        let loaded: DesktopPreferences =
+            toml::from_str(&toml::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.onboarding_intent, None);
+        assert_eq!(loaded.window_opacity_percent, Some(95));
+    }
+
+    #[test]
     fn project_delete_tombstone_clears_nested_restore_state() {
         let root = Utf8Path::new("C:/workspace/deleted");
         let nested_workspace = root.join("bbb");
@@ -104,6 +180,7 @@ mod tests {
             last_workspace: Some(nested_workspace),
             window_opacity_percent: Some(95),
             deleted_project_roots: Vec::new(),
+            onboarding_intent: None,
         };
 
         preferences.mark_project_deleted(root);
@@ -126,6 +203,7 @@ mod tests {
             last_workspace: Some(sibling.clone()),
             window_opacity_percent: Some(95),
             deleted_project_roots: Vec::new(),
+            onboarding_intent: None,
         };
 
         preferences.mark_project_deleted(root);

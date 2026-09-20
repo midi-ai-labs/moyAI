@@ -829,10 +829,10 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
       && panel.context_inherited_badge.visible === false, { count: 1, visible: false }, panel?.context_inherited_badge ?? null),
     settingsGate("scope", "restart-panel-scope-mismatch", panel?.scope_count === 1
       && panel.scope_visible === true
-      && panel.scope_text === "このセッションだけ", {
+      && panel.scope_text === "このチャットだけ", {
       count: 1,
       visible: true,
-      text: "このセッションだけ",
+      text: "このチャットだけ",
     }, {
       count: panel?.scope_count ?? null,
       visible: panel?.scope_visible ?? null,
@@ -1110,7 +1110,7 @@ export function sessionSettingsPanelReady(surface, {
     && surface.panel.inert === false
     && surface.panel.scope_count === 1
     && surface.panel.scope_visible === true
-    && surface.panel.scope_text === "このセッションだけ"
+    && surface.panel.scope_text === "このチャットだけ"
     && surface.panel.base_url.count === 1
     && surface.panel.base_url.visible === true
     && surface.panel.base_url.value === projection.base_url

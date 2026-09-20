@@ -5,6 +5,7 @@ use crate::runner::{
     RunnerCommand, RunnerResponse,
     operations::{
         OperationsStore, ReconciliationEvidence, RunnerOperation, RunnerOperationsProjection,
+        desktop_consent_matches,
     },
     provision::{DESKTOP_TEMPLATE_ID, ProvisionTemplate},
     shared::{ResourceScope, SharedAttemptProjection, SharedSettings},
@@ -64,6 +65,8 @@ pub struct DeviceExecutionProjection {
     pub directory: Option<Utf8PathBuf>,
     pub access_mode: Option<AccessMode>,
     pub accepting: bool,
+    #[serde(default)]
+    pub autostart: bool,
     pub can_pause: bool,
     pub can_resume: bool,
     pub unknown_attempts: Vec<SharedAttemptProjection>,
@@ -80,6 +83,8 @@ pub enum DeviceExecutionCommand {
     },
     Pause,
     Resume,
+    InstallAutostart,
+    RemoveAutostart,
     Reconcile {
         attempt_id: String,
         generation: u64,
@@ -90,7 +95,7 @@ pub enum DeviceExecutionCommand {
 #[derive(Default)]
 pub(super) struct ExecutionOwner {
     started: AtomicBool,
-    lane: tokio::sync::Mutex<()>,
+    pub(super) lane: std::sync::Arc<tokio::sync::Mutex<()>>,
     state: Mutex<ExecutionRuntime>,
 }
 #[derive(Default)]
@@ -119,6 +124,7 @@ impl ExecutionRuntime {
         view.projects = projects;
         if !consented {
             view.accepting = false;
+            view.autostart = false;
             view.can_pause = false;
             view.can_resume = false;
             view.unknown_attempts.clear();
@@ -152,6 +158,63 @@ struct Connection {
 }
 
 impl DeviceNetworkService {
+    pub(super) async fn quiesce_endpoint_change(&self) -> Result<(), super::DeviceError> {
+        let installed = OperationsStore::open(&self.inner.store.paths().data_dir)
+            .map_err(|_| super::DeviceError::Storage)?
+            .installed;
+        if installed.settings.is_none() {
+            return Ok(());
+        }
+        let binding = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| super::DeviceError::Unavailable)?;
+            format!(
+                "{}|{}|{}|{:x}",
+                state
+                    .settings
+                    .hub_id
+                    .as_deref()
+                    .ok_or(super::DeviceError::InvalidIdentity)?,
+                state
+                    .settings
+                    .device_id
+                    .as_deref()
+                    .ok_or(super::DeviceError::InvalidIdentity)?,
+                state.shared.validate()?.as_str().trim_end_matches('/'),
+                Sha256::digest(state.shared.ca_certificate_pem.as_bytes())
+            )
+        };
+        if !installed
+            .desktop_binding
+            .as_deref()
+            .is_some_and(|saved| desktop_consent_matches(saved, &binding))
+            || matches!(
+                installed.mode,
+                crate::runner::operations::ProvisionMode::Available
+            )
+            || installed.maintenance_until_ms.is_some()
+        {
+            return Err(super::DeviceError::EndpointChangeBusy);
+        }
+        tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            {
+                crate::runner::windows::quiesce_desktop_for_endpoint_change(&binding)
+                    .map_err(|_| super::DeviceError::EndpointChangeRunnerUnconfirmed)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = binding;
+                Err(super::DeviceError::EndpointChangeRunnerUnconfirmed)
+            }
+        })
+        .await
+        .map_err(|_| super::DeviceError::EndpointChangeRunnerUnconfirmed)?
+    }
+
     /// Desktop calls this once. Runner transport never recursively manages another Runner.
     pub fn start_execution_management(&self) {
         if self.inner.execution.started.swap(true, Ordering::AcqRel) {
@@ -254,8 +317,10 @@ impl DeviceNetworkService {
         {
             let mut state = self.inner.execution.state.lock().unwrap();
             state.bind(&connection.binding);
-            let consented =
-                installed.desktop_binding.as_deref() == Some(connection.binding.as_str());
+            let consented = installed
+                .desktop_binding
+                .as_deref()
+                .is_some_and(|saved| desktop_consent_matches(saved, &connection.binding));
             state.refresh_projects(projects.projects, consented);
             if !consented {
                 return Ok(());
@@ -263,7 +328,11 @@ impl DeviceNetworkService {
         }
         let mut status = ensure_status().await?;
         self.require_execution_binding(&connection.binding)?;
-        if status.desktop_binding.as_deref() != Some(&connection.binding) {
+        if !status
+            .desktop_binding
+            .as_deref()
+            .is_some_and(|saved| desktop_consent_matches(saved, &connection.binding))
+        {
             return Err("起動中の実行機能と、保存済みのPC設定が一致しません。".into());
         }
         // Consent may already be durable when the first worker startup failed.
@@ -310,6 +379,7 @@ impl DeviceNetworkService {
             view.access_mode = Some(template.access_mode);
         }
         view.accepting = status.accepting;
+        view.autostart = status.autostart;
         view.can_pause = status.mode == "shared" && status.state == "available";
         view.can_resume = status.mode == "shared"
             && matches!(status.state.as_str(), "paused" | "draining" | "maintenance");
@@ -410,15 +480,23 @@ impl DeviceNetworkService {
             }
             DeviceExecutionCommand::Pause
             | DeviceExecutionCommand::Resume
+            | DeviceExecutionCommand::InstallAutostart
+            | DeviceExecutionCommand::RemoveAutostart
             | DeviceExecutionCommand::Reconcile { .. } => {
                 let status = ensure_status().await?;
                 self.require_execution_binding(&connection.binding)?;
-                if status.desktop_binding.as_deref() != Some(connection.binding.as_str()) {
+                if !status
+                    .desktop_binding
+                    .as_deref()
+                    .is_some_and(|saved| desktop_consent_matches(saved, &connection.binding))
+                {
                     return Err("現在のHubに対する実行許可を確認できません。".into());
                 }
                 let operation = match command {
                     DeviceExecutionCommand::Pause => RunnerOperation::Pause,
                     DeviceExecutionCommand::Resume => RunnerOperation::Resume,
+                    DeviceExecutionCommand::InstallAutostart => RunnerOperation::InstallAutostart,
+                    DeviceExecutionCommand::RemoveAutostart => RunnerOperation::RemoveAutostart,
                     DeviceExecutionCommand::Reconcile {
                         attempt_id,
                         generation,

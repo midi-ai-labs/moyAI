@@ -77,6 +77,18 @@ export function normalizeScenarioEnvironment(value) {
   return normalized;
 }
 
+export function desktopLaunchArguments(context, joinConfigPath = null) {
+  const args = ["--dir", context.paths.workspace];
+  if (joinConfigPath === null || joinConfigPath === undefined) return args;
+  if (typeof joinConfigPath !== "string" || joinConfigPath.includes("\0") || joinConfigPath.length > 32767
+    || !path.win32.isAbsolute(joinConfigPath)) throw new TypeError("joinConfigPath must be a bounded absolute Windows path");
+  const relative = path.win32.relative(context.paths.workspace, joinConfigPath);
+  if (!relative || relative === ".." || relative.startsWith("..\\") || path.win32.isAbsolute(relative)) {
+    throw new TypeError("joinConfigPath must belong to the scenario workspace");
+  }
+  return [...args, "--join-config", joinConfigPath];
+}
+
 export function selectActiveCleanupDriver(currentDriver, initialDriver, { restartBegan }) {
   if (typeof restartBegan !== "boolean") throw new TypeError("restartBegan must be boolean");
   return currentDriver ?? (restartBegan ? null : initialDriver);
@@ -227,7 +239,7 @@ export class WindowsTauriHost {
     this.#stderrHandle = await open(stderr, "wx");
     this.#logPaths.push(stdout, stderr);
     this.#launchEnvironment = desktopLaunchEnvironment({ context, scenarioEnvironment: normalizeScenarioEnvironment(scenario.environment), processTemp });
-    this.#desktop = spawn(context.binary, ["--dir", context.paths.workspace], {
+    this.#desktop = spawn(context.binary, desktopLaunchArguments(context, scenario.joinConfigPath), {
       cwd: context.paths.workspace,
       env: this.#launchEnvironment,
       windowsHide: false,
@@ -290,7 +302,7 @@ export class WindowsTauriHost {
     }
   }
 
-  async launchDuplicate({ context, sink, phase = "executing" }) {
+  async launchDuplicate({ context, sink, phase = "executing", joinConfigPath = null }) {
     if (this.#desktop === null || this.#driver === null || this.#launchEnvironment === null) {
       throw new DesktopE2eError("harness", "duplicate-owner-missing", "duplicate launch requires an attached live Desktop");
     }
@@ -302,7 +314,7 @@ export class WindowsTauriHost {
     // Reuse the live generation's config, data, WebView profile and temp owners.
     const processResult = await runWindowsExternalProcess({
       executionRoot: context.root, executable: context.binary,
-      args: ["--dir", context.paths.workspace], cwd: context.paths.workspace,
+      args: desktopLaunchArguments(context, joinConfigPath), cwd: context.paths.workspace,
       env: this.#launchEnvironment, stdoutPath: stdout, stderrPath: stderr,
       timeoutMs: 10_000, label,
     });

@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn endpoint_move_preserves_saved_consent_but_invalidates_native_review_and_async_target() {
+    let old = format!("hub|device|https://old.example:9471|{}", "a".repeat(64));
+    let new = format!("hub|device|https://new.example:9471|{}", "a".repeat(64));
+    assert!(desktop_consent_matches(&old, &new));
+    let mut state = ExecutionRuntime::default();
+    state.bind(&old);
+    let mut view = state.view.clone();
+    view.review = Some(ExecutionReview {
+        id: "review".into(),
+        directory: "C:/fixture".into(),
+        access_mode: AccessMode::Default,
+    });
+    state.revise(view);
+    let old_revision = state.view.revision.clone();
+    state.bind(&new);
+    assert_ne!(state.binding, old);
+    assert_ne!(state.view.revision, old_revision);
+    assert!(state.view.review.is_none());
+}
+
 fn executable_project() -> DeviceProject {
     DeviceProject {
         id: "project".into(),

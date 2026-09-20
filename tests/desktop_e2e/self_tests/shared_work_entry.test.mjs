@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { sharedEntryReady, sharedSettingsClosed } from "../scenarios/shared_work_entry.mjs";
-import { rememberedRestartAccepted, sharedActionTarget } from "../scenarios/shared_work_navigation.mjs";
+import { rememberedRestartAccepted, sharedActionTarget, sharedWorkSurfaceMatches } from "../scenarios/shared_work_navigation.mjs";
 import { action, hubSettingsCloseTarget } from "../scenarios/hub_browser_enrollment.mjs";
 test("Hub projects occupy main while local model setup can remain unfinished", () => {
   const projection = { hub_project_open: true, overlay: "none", startup: { initial_setup_required: true }, busy: false };
@@ -26,12 +26,22 @@ test("closing settings preserves the current Hub-config readiness after restart"
 });
 test("restart oracle needs the exact person/project/job without an interactive login", () => {
   const expected = { user_id: "alice", project_id: "analysis", job_id: "job-1" };
-  const value = { desktop: { hub_project_open: true, overlay: "none", busy: false }, shared: { connected: true, principal: { user_id: "alice" }, selected_project_id: "analysis", status: { jobs: [{ id: "job-1" }] } }, login_visible: false, calls: [{ command: "shared_work_command", args: { request: { kind: "refresh" } } }] };
+  const value = { desktop: { hub_project_open: true, overlay: "none", busy: false }, shared: { connected: true, principal: { user_id: "alice", display_name: "Alice" }, projects: [{ id: "analysis", label: "Analysis" }], selected_project_id: "analysis", status: { jobs: [{ id: "job-1" }] } }, surface: { count: 1, splash_visible: false, heading: "Analysis", account_text: "Alice · Analysis", login_visible: false, login_enabled: false }, calls: [{ command: "shared_work_command", args: { request: { kind: "refresh" } } }] };
   assert.equal(rememberedRestartAccepted(value, expected), true);
-  assert.equal(rememberedRestartAccepted({ ...value, login_visible: true }, expected), false);
+  for (const patch of [{ count: 0 }, { splash_visible: true }, { login_visible: true }, { heading: "Other project" }, { account_text: "Bob" }]) {
+    assert.equal(rememberedRestartAccepted({ ...value, surface: { ...value.surface, ...patch } }, expected), false);
+  }
   assert.equal(rememberedRestartAccepted({ ...value, calls: [{ command: "shared_work_command", args: { request: { kind: "login" } } }] }, expected), false);
   for (const shared of [{ ...value.shared, principal: { user_id: "bob" } }, { ...value.shared, selected_project_id: "other" }, { ...value.shared, status: { jobs: [] } }, { ...value.shared, connected: false }]) {
     assert.equal(rememberedRestartAccepted({ ...value, shared }, expected), false);
+  }
+});
+
+test("logged-out restart requires the actual enabled login form, not an empty splash", () => {
+  const surface = { count: 1, splash_visible: false, login_visible: true, login_enabled: true };
+  assert.equal(sharedWorkSurfaceMatches(surface, { principal: null }), true);
+  for (const patch of [{ count: 0 }, { splash_visible: true }, { login_visible: false }, { login_enabled: false }]) {
+    assert.equal(sharedWorkSurfaceMatches({ ...surface, ...patch }, { principal: null }), false);
   }
 });
 test("job navigation uses the sidebar while explicit job mutation uses the conversation", () => {

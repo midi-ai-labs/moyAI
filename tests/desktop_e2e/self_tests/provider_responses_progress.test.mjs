@@ -71,7 +71,7 @@ function runningSurface() {
       run_status_key: "running",
       task_activity_state: "running",
       busy: true,
-      run_phase: "Provider応答受信中",
+      run_phase: "AIの回答を受信中",
       run_active_step: "Provider request req-1 first_progress via http://127.0.0.1 (attempt 1, 1205 ms)",
       transcript_rows: [{ row_kind: "user", body: PROVIDER_RESTART_PROMPT }],
     },
@@ -152,8 +152,8 @@ test("progress oracle accepts a live GUI stream beyond total timeout but rejects
   assert.equal(providerResponsesProgressDecision(beforeBoundary), "pending");
 
   const wrongVisiblePhase = structuredClone(sample);
-  wrongVisiblePhase.surface.projection.run_phase = "Provider応答ヘッダー受信";
-  wrongVisiblePhase.surface.projection.run_active_step = "Provider応答受信中";
+  wrongVisiblePhase.surface.projection.run_phase = "AIからの応答開始";
+  wrongVisiblePhase.surface.projection.run_active_step = "AIの回答を受信中";
   assert.equal(providerResponsesProgressDecision(wrongVisiblePhase), "pending");
 
   const replayed = structuredClone(sample);

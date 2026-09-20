@@ -3,9 +3,20 @@ import test from "node:test";
 
 import {
   normalizeScenarioEnvironment,
+  desktopLaunchArguments,
   releaseResourcesThenAuditClosedStore,
   selectActiveCleanupDriver,
 } from "../drivers/windows_tauri_host.mjs";
+
+test("cold and duplicate activation use the same bounded fixture argv without shell quoting", () => {
+  const context = { paths: { workspace: "C:\\fixture\\workspace" } };
+  const config = "C:\\fixture\\workspace\\team config 日本語.toml";
+  assert.deepEqual(desktopLaunchArguments(context), ["--dir", context.paths.workspace]);
+  assert.deepEqual(desktopLaunchArguments(context, config), ["--dir", context.paths.workspace, "--join-config", config]);
+  for (const value of ["relative.toml", "C:\\fixture\\workspace", "C:\\fixture\\workspace2\\other.toml", "C:\\fixture\\workspace\\..\\other.toml", config + "\0"]) {
+    assert.throws(() => desktopLaunchArguments(context, value), /joinConfigPath/);
+  }
+});
 
 test("scenario environment permits only bounded product config overrides", () => {
   assert.deepEqual(normalizeScenarioEnvironment({

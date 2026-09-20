@@ -15,6 +15,7 @@ export type DesktopCommandErrorCode =
   | "model_unavailable"
   | "image_unsupported"
   | "permission_policy_denied"
+  | "team_setup_unavailable"
   | "runtime_failure"
   | "storage_failure";
 
@@ -106,6 +107,7 @@ function commandErrorCode(value: unknown): DesktopCommandErrorCode {
     case "model_unavailable":
     case "image_unsupported":
     case "permission_policy_denied":
+    case "team_setup_unavailable":
     case "runtime_failure":
     case "storage_failure":
       return value;

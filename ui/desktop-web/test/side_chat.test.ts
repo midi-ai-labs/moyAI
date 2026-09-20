@@ -1108,7 +1108,7 @@ test("an unrelated invalid Main field does not replace the Global Side Chat cata
 
 test("Global Settings settlement blocks Side conversation controls without replacing Settings editors", () => {
   const renderer = useSidePane({
-    draft: "wait for Global Settings",
+    draft: "wait for 共通設定",
     baseUrl: "http://replacement.test/v1/",
     model: "gemma-replacement",
     catalogLoadEnabled: true,
@@ -1131,7 +1131,7 @@ test("Global Settings settlement blocks Side conversation controls without repla
   assert.match(runningPane, /data-action="cancel-side-chat"[^>]*disabled/);
 
   const confirmationRenderer = useSidePane({
-    draft: "wait for Global Settings",
+    draft: "wait for 共通設定",
     configPending: true,
     configDraftEditOpen: false,
     confirmingDelete: true,
@@ -1547,7 +1547,7 @@ test("Hub-origin Side Chat captures Direct only on an explicit targeted action a
     enabled: true, reason: "この会話と履歴を保持して、最初のDirect設定を適用します。",
   } });
   const html = useSidePane().artifactPane(initial);
-  assert.match(html, /この会話にDirect設定を適用/);
+  assert.match(html, /この会話に直接接続の設定を適用/);
   assert.match(html, /http:\/\/direct.test\/v1/);
   assert.match(html, /direct-model/);
   const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
@@ -1612,7 +1612,7 @@ test("settled canonical transcript and artifact rows expose one native quote act
   assert.equal((html.match(/data-action="quote-selection-to-side-chat"/g) ?? []).length, 3);
   assert.match(html, /data-history-identity="01J00000000000000000000001"[\s\S]*data-side-chat-quote-source-kind="transcript"/);
   assert.match(html, /data-history-identity="01J00000000000000000000003"[\s\S]*data-side-chat-quote-source-kind="artifact"/);
-  assert.match(html, /<button type="button" class="message-quote-action"[\s\S]*>Side Chatで引用<\/button>/);
+  assert.match(html, /<button type="button" class="message-quote-action"[\s\S]*>サイドチャットで引用<\/button>/);
   assert.doesNotMatch(html, /data-source-history-item-id="turn:synthetic:work-summary"/);
 });
 

@@ -688,6 +688,7 @@ async fn delegated_routes_survive_parent_finish_with_independent_heartbeat_permi
     let child_guard = child.execution_guard();
     parent.finish().await;
     assert!(service.projection_now().active_main.is_none());
+    assert!(service.has_active_turns(), "the child still owns its route");
     let next = service
         .begin_turn(HubReviewContext::Main, CancellationToken::new())
         .unwrap()
@@ -758,6 +759,7 @@ async fn delegated_routes_survive_parent_finish_with_independent_heartbeat_permi
     assert_eq!(child_close["path"], "/v1/turns/cancel");
     next.finish().await;
     sibling_guard.finish().await;
+    assert!(!service.has_active_turns());
     until(|| server.state.heartbeat_turns.lock().unwrap().last() == Some(&json!([]))).await;
     assert_eq!(server.state.registrations.load(Ordering::SeqCst), 1);
     service.shutdown().await;

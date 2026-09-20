@@ -74,7 +74,7 @@ test("agent rows retain spawn order and derive all counts from status", () => {
     updated: 1,
   });
   assert.equal(agentActivitySummary(rows, true), "3件作業中 · 1件完了 · 2件要確認 · 1件停止");
-  assert.equal(agentActivitySummary([], true), "Sub Agentを準備中");
+  assert.equal(agentActivitySummary([], true), "サブエージェントを準備中");
 });
 
 test("agent visual identity is stable and activity comparison observes visible changes", () => {
@@ -107,7 +107,7 @@ test("inline and output renderers show projected activity in spawn order without
   const inline = renderInlineAgentActivity(state);
   assert.ok(inline.indexOf("&lt;First Agent&gt;") < inline.indexOf("Later Agent"));
   assert.match(inline, /1件作業中 · 1件完了/);
-  assert.match(inline, /1件のSub Agentが更新しました/);
+  assert.match(inline, /1件のサブエージェントが更新しました/);
   assert.match(inline, /型を &lt;確認&gt; 中/);
   assert.match(inline, /<button[^>]+data-action="show-agent-pane"[^>]+data-agent-path="\/root\/first"/);
   assert.match(inline, /data-focus-key="agent-job:\/root\/first"/);
@@ -325,13 +325,13 @@ test("agent inspector separates ordered list and selected execution detail", () 
   const pane = renderArtifactPane(state, detailLocal);
   assert.match(pane, /data-pane-mode="sub-agents"/);
   assert.match(pane, /id="sub-agent-inspector"/);
-  assert.match(pane, /data-action="show-agent-list"[\s\S]*?aria-label="Sub Agent一覧に戻る"/);
-  assert.match(pane, /data-focus-key="agent-pane-back" aria-label="Sub Agent一覧に戻る"/);
+  assert.match(pane, /data-action="show-agent-list"[\s\S]*?aria-label="サブエージェント一覧に戻る"/);
+  assert.match(pane, /data-focus-key="agent-pane-back" aria-label="サブエージェント一覧に戻る"/);
   assert.match(
     pane,
     /class="agent-pane-identity[^>]*>[\s\S]*?<strong>C029 長名タスク &amp; &lt;unbroken_agent_name_abcdefghijklmnopqrstuvwxyz0123456789&gt;<\/strong>/,
   );
-  assert.match(pane, /data-action="toggle-artifact-pane"[^>]+aria-label="Sub Agentペインを閉じる"/);
+  assert.match(pane, /data-action="toggle-artifact-pane"[^>]+aria-label="サブエージェントペインを閉じる"/);
 
   const listLocal = {
     ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
@@ -345,7 +345,7 @@ test("agent inspector separates ordered list and selected execution detail", () 
   };
   const listPane = renderArtifactPane(state, listLocal);
   assert.match(listPane, /data-action="show-output-pane"/);
-  assert.match(listPane, /data-focus-key="agent-pane-back" aria-label="出力ペインに戻る"/);
+  assert.match(listPane, /data-focus-key="agent-pane-back" aria-label="出力パネルに戻る"/);
 });
 
 test("agent pane selection is frontend-local and resets at owner or row boundaries", async () => {

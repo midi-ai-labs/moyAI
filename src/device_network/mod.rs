@@ -28,7 +28,7 @@ pub(crate) use identity::{DeviceIdentity, DeviceIdentityStore};
 pub use outgoing::{DeviceDelegationRow, DeviceNetworkJobs};
 pub(crate) use outgoing::{canonical_key as history_request_key, server_id as history_server_id};
 pub(crate) use service::WeakDeviceNetwork;
-pub use service::{DeviceNetworkProjection, DeviceNetworkService};
+pub use service::{DeviceNetworkProjection, DeviceNetworkService, PreparedDeviceConfiguration};
 pub use settings::{
     DeviceSettings, DeviceSettingsStore, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
 };
@@ -47,6 +47,13 @@ pub struct SharedHubConfig {
 }
 
 impl SharedHubConfig {
+    pub fn same_ca(&self, other: &Self) -> Result<bool, DeviceError> {
+        let parse = |value: &str| {
+            crate::mcp_publish::tls::public_certificate(value)
+                .map_err(|_| DeviceError::InvalidConfiguration)
+        };
+        Ok(parse(&self.ca_certificate_pem)? == parse(&other.ca_certificate_pem)?)
+    }
     pub fn configured(&self) -> bool {
         !self.hub_url.is_empty() || !self.ca_certificate_pem.is_empty()
     }
@@ -101,6 +108,12 @@ pub enum DeviceError {
     SettingsChanged,
     #[error("connection_changed")]
     ConnectionChanged,
+    #[error("different_hub")]
+    DifferentHub,
+    #[error("endpoint_change_busy")]
+    EndpointChangeBusy,
+    #[error("endpoint_change_runner_unconfirmed")]
+    EndpointChangeRunnerUnconfirmed,
     #[error("store_busy")]
     StoreBusy,
     #[error("storage_error")]

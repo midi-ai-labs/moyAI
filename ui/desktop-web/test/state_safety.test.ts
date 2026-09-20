@@ -338,7 +338,7 @@ test("unknown and storage errors with provider model access keywords stay generi
 
 test("typed command error codes select guidance without inspecting the message", () => {
   const opaque = "opaque diagnostic";
-  assert.equal(humanizeError({ code: "provider_transport", message: opaque }).title, "LLM provider に接続できません");
+  assert.equal(humanizeError({ code: "provider_transport", message: opaque }).title, "AIに接続できません");
   assert.equal(humanizeError({ code: "model_unavailable", message: opaque }).title, "指定したモデルが見つかりません");
   assert.equal(humanizeError({ code: "image_unsupported", message: opaque }).title, "このモデルは画像入力に対応していません");
   assert.equal(humanizeError({ code: "permission_policy_denied", message: opaque }).title, "操作が許可されませんでした");
@@ -353,6 +353,16 @@ test("typed command error codes select guidance without inspecting the message",
     code: "runtime_failure",
     message: opaque,
   });
+});
+
+test("team setup failure has visible installation guidance without promoting arbitrary process output", () => {
+  const diagnostic = "private process stderr: a-token-or-private-path";
+  const human = humanizeError({ kind: "internal", category: "runtime", code: "team_setup_unavailable", message: diagnostic });
+  assert.equal(human.title, "チーム管理を起動できません");
+  assert.match(human.hint, /Hub同梱版を導入/);
+  assert.match(human.hint, /既存の管理PCでHubを起動/);
+  assert.ok(!human.hint.includes(diagnostic));
+  assert.equal(human.details, diagnostic);
 });
 
 test("a repeated-click conflict wins over the earlier command response by Rust revision", () => {

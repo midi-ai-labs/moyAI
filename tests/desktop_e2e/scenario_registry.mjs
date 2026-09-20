@@ -1,6 +1,7 @@
 import { scenario as shellBaseline } from "./scenarios/shell_baseline.mjs";
 import { createShellAboutScenario } from "./scenarios/shell_about.mjs";
 import { createShellSingleInstanceScenario } from "./scenarios/shell_single_instance.mjs";
+import { createColdJoinConfigScenario, createWarmJoinConfigScenario } from "./scenarios/hub_join_config.mjs";
 import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
 import { createShellManagedLifecycleScenario } from "./scenarios/shell_managed_lifecycle.mjs";
 import { createHubConnectionSettingsScenario } from "./scenarios/hub_connection_settings.mjs";
@@ -42,11 +43,12 @@ import { createSideChatQuoteScenario } from "./scenarios/side_chat_quote.mjs";
 import { createSideChatSessionScenario } from "./scenarios/side_chat_session.mjs";
 import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_docling_readiness.mjs";
 import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial_setup.mjs";
-import { createInitialSetupHubScenario } from "./scenarios/settings_initial_setup_hub.mjs";
+import { createInitialSetupHubScenario, createInitialSetupHubPreferencesFailureScenario } from "./scenarios/settings_initial_setup_hub.mjs";
 import { createSharedWorkEntryScenario } from "./scenarios/shared_work_entry.mjs";
 import { createSharedWorkIsolationScenario } from "./scenarios/shared_work_isolation.mjs";
 import { createSharedWorkContinuationScenario } from "./scenarios/shared_work_continuation.mjs";
 import { createDeviceExecutionScenario } from "./scenarios/device_execution.mjs";
+import { createOnboardingWinAbScenario } from "./scenarios/onboarding_winab.mjs";
 import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
 import { createSettingsMcpPeerControlsScenario } from "./scenarios/settings_mcp_peers.mjs";
@@ -63,6 +65,8 @@ const factories = new Map([
   [shellBaseline.id, () => shellBaseline],
   ["shell.about", createShellAboutScenario],
   ["shell.single-instance", createShellSingleInstanceScenario],
+  ["hub.join-config-cold", createColdJoinConfigScenario],
+  ["hub.join-config-warm", createWarmJoinConfigScenario],
   ["shell.lynx", createShellLynxScenario],
   ["shell.managed-lifecycle", createShellManagedLifecycleScenario],
   ["hub.connection-settings", createHubConnectionSettingsScenario],
@@ -71,6 +75,7 @@ const factories = new Map([
   ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
   ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
   ["settings.device-execution", createDeviceExecutionScenario],
+  ["onboarding.win-a-to-win-b", createOnboardingWinAbScenario],
   ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
   ["hub.receiver-settings-controls", createHubReceiverSettingsScenario],
   ["hub.outgoing-controls", createOutgoingControlsScenario],
@@ -120,6 +125,7 @@ const factories = new Map([
   ["settings.docling-readiness", createSettingsDoclingReadinessScenario],
   ["settings.initial-setup", createSettingsInitialSetupScenario],
   ["settings.initial-setup-hub", createInitialSetupHubScenario],
+  ["settings.initial-setup-hub-preferences-failure", createInitialSetupHubPreferencesFailureScenario],
   ["settings.preferences", createSettingsPreferencesScenario],
   ["settings.preferences-config", createSettingsPreferencesConfigScenario],
   ["settings.session", createSettingsSessionScenario],
@@ -139,10 +145,15 @@ const factories = new Map([
   ["side-chat.session", createSideChatSessionScenario],
 ]);
 const configurableScenarios = new Set([
+  "hub.join-config-cold",
+  "hub.join-config-warm",
+  "settings.initial-setup-hub",
+  "settings.initial-setup-hub-preferences-failure",
   "settings.shared-work",
   "settings.shared-work-isolation",
   "settings.shared-work-continuation",
   "settings.device-execution",
+  "onboarding.win-a-to-win-b",
   "agent.interrupt",
   "navigation.external-rejoin",
   "navigation.external-sidebar-stop",

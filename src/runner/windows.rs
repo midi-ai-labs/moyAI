@@ -364,6 +364,61 @@ pub fn request(command: &RunnerCommand) -> Result<RunnerResponse, RunnerError> {
     request_for_config(command, &config)
 }
 
+/// Stop only a paused, journal-empty Desktop Runner at its worker boundary.
+/// The process handle is acquired before the command so PID reuse cannot satisfy exit.
+pub(crate) fn quiesce_desktop_for_endpoint_change(binding: &str) -> Result<(), RunnerError> {
+    use super::operations::{RunnerOperation, desktop_consent_matches};
+    if !endpoint_present()? {
+        return Err(RunnerError::new(
+            "Runner is unavailable; its durable journal has not been verified as empty",
+        ));
+    }
+    let RunnerResponse::Identity { identity } = request(&RunnerCommand::Identity)? else {
+        return Err(RunnerError::new("Runner identity is unavailable"));
+    };
+    let RunnerResponse::Operations { projection } = request(&RunnerCommand::Operations {
+        runner_id: identity.runner_id,
+        operation: RunnerOperation::Status,
+    })?
+    else {
+        return Err(RunnerError::new("Runner status is unavailable"));
+    };
+    let saved = projection
+        .desktop_binding
+        .as_deref()
+        .ok_or_else(|| RunnerError::new("This Runner was not configured by Desktop"))?;
+    if !desktop_consent_matches(saved, binding)
+        || projection.accepting
+        || !matches!(
+            projection.state.as_str(),
+            "paused" | "maintenance" | "draining"
+        )
+        || !projection.active_attempts.is_empty()
+        || !projection.unknown_attempts.is_empty()
+    {
+        return Err(RunnerError::new(
+            "Pause this Runner and wait for all work before changing the Hub endpoint",
+        ));
+    }
+    let process = unsafe { OpenProcess(SYNCHRONIZE, 0, identity.process_id) };
+    if process.is_null() {
+        return Err(last_error());
+    }
+    let process = Handle(process);
+    request(&RunnerCommand::Operations {
+        runner_id: identity.runner_id,
+        operation: RunnerOperation::QuiescentShutdown {
+            expected_desktop_binding: saved.into(),
+        },
+    })?;
+    if unsafe { WaitForSingleObject(process.0, 12_000) } != WAIT_OBJECT_0 {
+        return Err(RunnerError::new(
+            "Runner shutdown is still unconfirmed; the old Hub configuration was retained",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn request_for_config(
     command: &RunnerCommand,
     config: &camino::Utf8Path,

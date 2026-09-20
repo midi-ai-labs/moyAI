@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createSnapshotRefresh, installRuntimePolling } from "../src/polling_state.ts";
+import { createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation } from "../src/polling_state.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -81,4 +81,78 @@ test("ordinary overlapping polling does not queue an extra snapshot without a re
   delayed.resolve();
   await Promise.all([first, second]);
   assert.equal(calls, 1);
+});
+
+test("native state invalidation refreshes an idle shell without focus or periodic polling", async () => {
+  const nativeEvents = new EventTarget();
+  let state = "personal";
+  let rendered = "personal";
+  let reads = 0;
+  const refresh = createSnapshotRefresh(async () => { reads += 1; rendered = state; });
+  const unsubscribe = await installSnapshotInvalidation(async onChanged => {
+    nativeEvents.addEventListener("changed", onChanged);
+    return () => nativeEvents.removeEventListener("changed", onChanged);
+  }, refresh);
+  await refresh();
+  let tick = () => {};
+  const stopPolling = installRuntimePolling(Object.assign(new EventTarget(), {
+    setInterval(callback: TimerHandler) { tick = callback as () => void; return 1; },
+    clearInterval(_id: number) {},
+  }), Object.assign(new EventTarget(), { hidden: false }), () => false, refresh);
+  const before = reads;
+  state = "team";
+  tick();
+  assert.equal(rendered, "personal", "idle periodic polling does not discover a native commit");
+  nativeEvents.dispatchEvent(new Event("changed"));
+  await refresh();
+  assert.equal(rendered, "team");
+  assert.equal(reads, before + 1);
+  unsubscribe();
+  nativeEvents.dispatchEvent(new Event("changed"));
+  await Promise.resolve();
+  assert.equal(reads, before + 1);
+  stopPolling();
+});
+
+test("subscription settlement catches a native commit before listener registration", async () => {
+  const subscribed = deferred<() => void>();
+  let state = "personal";
+  let rendered = state;
+  const refresh = createSnapshotRefresh(async () => { rendered = state; });
+  await refresh();
+  const installing = installSnapshotInvalidation(() => subscribed.promise, refresh);
+  state = "team";
+  subscribed.resolve(() => {});
+  await installing;
+  await refresh();
+  assert.equal(rendered, "team");
+});
+
+test("native invalidation during an old snapshot coalesces one fresh read", async () => {
+  const nativeEvents = new EventTarget();
+  const oldSnapshot = deferred<string>();
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  let observed = "";
+  const refresh = createSnapshotRefresh(async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    observed = ++calls === 1 ? await oldSnapshot.promise : "team";
+    active -= 1;
+  });
+  const unsubscribe = await installSnapshotInvalidation(async onChanged => {
+    nativeEvents.addEventListener("changed", onChanged);
+    return () => nativeEvents.removeEventListener("changed", onChanged);
+  }, refresh);
+  const pending = refresh();
+  await Promise.resolve();
+  nativeEvents.dispatchEvent(new Event("changed"));
+  nativeEvents.dispatchEvent(new Event("changed"));
+  oldSnapshot.resolve("personal");
+  await pending;
+  assert.equal(calls, 2);
+  assert.equal(maxActive, 1);
+  assert.equal(observed, "team");
+  unsubscribe();
 });

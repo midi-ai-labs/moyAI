@@ -1040,9 +1040,8 @@ pub fn build_session_detail_from_app_state_with_session(
         tool_status_text: format_tool_status_text(state),
         progress_text: format_progress_text(state),
         run_status_text: format_run_status_text(state),
-        session_usage_label: "セッション累計: 未計測".to_string(),
-        session_usage_title: "完了済みturnのcanonical terminal telemetryはまだありません。"
-            .to_string(),
+        session_usage_label: "このチャットの累計: 未計測".to_string(),
+        session_usage_title: "完了した依頼のトークン使用量は、まだ記録されていません。".to_string(),
         session_usage_state: "missing".to_string(),
         artifacts: Vec::new(),
         file_changes: Vec::new(),
@@ -1646,15 +1645,15 @@ fn format_session_usage_projection(
 ) -> (String, String, String) {
     if usage.measured_turn_count == 0 {
         let title = if usage.terminal_turn_count == 0 {
-            "完了済みturnのcanonical terminal telemetryはまだありません。".to_string()
+            "完了した依頼のトークン使用量は、まだ記録されていません。".to_string()
         } else {
             format!(
-                "完了済み{} turnにはtoken usage telemetryがありません。未計測値を0として合算していません。",
+                "完了した{}件の依頼について、AIから使用量が報告されていません。使用量は不明です。",
                 usage.terminal_turn_count
             )
         };
         return (
-            "セッション累計: 未計測".to_string(),
+            "このチャットの累計: 未計測".to_string(),
             title,
             "missing".to_string(),
         );
@@ -1666,44 +1665,44 @@ fn format_session_usage_projection(
     let label_suffix = if total_partial {
         "（一部）"
     } else if usage.reasoning_measured_turn_count == 0 {
-        "（reasoning未計測）"
+        "（思考分は未計測）"
     } else if reasoning_partial {
-        "（reasoning一部）"
+        "（思考分は一部のみ）"
     } else {
         ""
     };
     let label = format!(
-        "セッション累計: {} token{}",
+        "このチャットの累計: {} トークン{}",
         compact_session_token_count(usage.total_tokens),
         label_suffix
     );
     let reasoning = match usage.reasoning_tokens {
         None => format!(
-            "reasoning 未計測（{} turnすべて未報告）",
+            "思考分は未計測（{}件すべて未報告）",
             usage.measured_turn_count
         ),
         Some(reasoning_tokens)
             if usage.reasoning_measured_turn_count < usage.measured_turn_count =>
         {
             format!(
-                "reasoning {}（{} / {} turn計測の部分合計）",
+                "思考分 {}（{} / {}件の計測分のみ）",
                 reasoning_tokens, usage.reasoning_measured_turn_count, usage.measured_turn_count
             )
         }
-        Some(reasoning_tokens) => format!("reasoning {reasoning_tokens}"),
+        Some(reasoning_tokens) => format!("思考分 {reasoning_tokens}"),
     };
     let completeness = match (total_partial, reasoning_partial) {
         (true, true) => {
-            "usage欠損turnとreasoning未報告fieldは0として合算せず、各値は計測済み分だけの部分合計です。"
+            "使用量とそのうちの思考分は、どちらも報告された分だけの合計です。未報告分は含みません。"
         }
-        (true, false) => "usage欠損turnは0として合算せず、この値は部分合計です。",
+        (true, false) => "報告された分だけの合計です。使用量が不明な依頼は含みません。",
         (false, true) => {
-            "合計tokenは全turn計測済みですが、reasoning未報告fieldは0として合算していません。"
+            "合計使用量はすべての依頼で計測済みです。そのうち思考分は、報告された分だけを表示します。"
         }
-        (false, false) => "完了済みturnの累計です。",
+        (false, false) => "完了した依頼の累計です。",
     };
     let title = format!(
-        "canonical terminal telemetry: {} / {} turn計測。入力 {}、出力 {}、{}、合計 {} token。{}",
+        "完了した依頼のうち {} / {}件を計測。入力 {}、出力 {}、{}、合計 {} トークン。{}",
         usage.measured_turn_count,
         usage.terminal_turn_count,
         usage.prompt_tokens,
@@ -1767,28 +1766,22 @@ fn format_progress_text(state: &AppState) -> String {
 pub(crate) const fn desktop_run_phase_label(phase: RunProgressPhase) -> &'static str {
     match phase {
         RunProgressPhase::Ready => "待機",
-        RunProgressPhase::Session => "セッション開始",
+        RunProgressPhase::Session => "チャット開始",
         RunProgressPhase::User => "入力受付",
-        RunProgressPhase::Context => "コンテキスト更新",
+        RunProgressPhase::Context => "会話の整理",
         RunProgressPhase::Model => "モデル応答",
-        RunProgressPhase::Provider(crate::llm::ProviderPhase::AttemptStarted) => "Provider要求開始",
-        RunProgressPhase::Provider(crate::llm::ProviderPhase::RequestInFlight) => {
-            "Provider要求処理中"
-        }
+        RunProgressPhase::Provider(crate::llm::ProviderPhase::AttemptStarted) => "AIへの送信開始",
+        RunProgressPhase::Provider(crate::llm::ProviderPhase::RequestInFlight) => "AIの応答待ち",
         RunProgressPhase::Provider(crate::llm::ProviderPhase::HeadersReceived) => {
-            "Provider応答ヘッダー受信"
+            "AIからの応答開始"
         }
-        RunProgressPhase::Provider(crate::llm::ProviderPhase::FirstProgress) => {
-            "Provider応答受信中"
-        }
-        RunProgressPhase::Provider(crate::llm::ProviderPhase::LastProgress) => {
-            "Provider最終応答受信"
-        }
-        RunProgressPhase::Provider(crate::llm::ProviderPhase::ProviderTerminal) => "Provider完了",
+        RunProgressPhase::Provider(crate::llm::ProviderPhase::FirstProgress) => "AIの回答を受信中",
+        RunProgressPhase::Provider(crate::llm::ProviderPhase::LastProgress) => "AIの最終応答を受信",
+        RunProgressPhase::Provider(crate::llm::ProviderPhase::ProviderTerminal) => "AIの応答完了",
         RunProgressPhase::Permission => "確認",
         RunProgressPhase::Tool => "ツール実行",
         RunProgressPhase::Compaction => "圧縮",
-        RunProgressPhase::RuntimeFeedback => "実行フィードバック",
+        RunProgressPhase::RuntimeFeedback => "実行結果の反映",
         RunProgressPhase::StopRequested => "停止処理",
         RunProgressPhase::Terminal => "終了処理",
         RunProgressPhase::Loaded => "履歴読込",
@@ -1956,9 +1949,9 @@ mod tests {
     fn session_usage_projection_distinguishes_missing_partial_and_complete() {
         let (label, title, state) =
             format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage::default());
-        assert_eq!(label, "セッション累計: 未計測");
+        assert_eq!(label, "このチャットの累計: 未計測");
         assert_eq!(state, "missing");
-        assert!(title.contains("まだありません"));
+        assert!(title.contains("まだ記録されていません"));
 
         let (label, title, state) =
             format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
@@ -1970,11 +1963,11 @@ mod tests {
                 total_tokens: 1_500,
                 reasoning_tokens: Some(80),
             });
-        assert_eq!(label, "セッション累計: 1.5k token（一部）");
+        assert_eq!(label, "このチャットの累計: 1.5k トークン（一部）");
         assert_eq!(state, "partial");
-        assert!(title.contains("2 / 3 turn計測"));
-        assert!(title.contains("reasoning 80（1 / 2 turn計測の部分合計）"));
-        assert!(title.contains("reasoning未報告fieldは0として合算せず"));
+        assert!(title.contains("2 / 3件を計測"));
+        assert!(title.contains("思考分 80（1 / 2件の計測分のみ）"));
+        assert!(title.contains("どちらも報告された分だけの合計"));
 
         let (label, title, state) =
             format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
@@ -1986,11 +1979,11 @@ mod tests {
                 total_tokens: 1_000,
                 reasoning_tokens: None,
             });
-        assert_eq!(label, "セッション累計: 1k token（reasoning未計測）");
+        assert_eq!(label, "このチャットの累計: 1k トークン（思考分は未計測）");
         assert_eq!(state, "partial");
-        assert!(title.contains("reasoning 未計測（2 turnすべて未報告）"));
-        assert!(!title.contains("reasoning 0"));
-        assert!(title.contains("合計tokenは全turn計測済み"));
+        assert!(title.contains("思考分は未計測（2件すべて未報告）"));
+        assert!(!title.contains("思考分 0"));
+        assert!(title.contains("合計使用量はすべての依頼で計測済み"));
 
         let (label, title, state) =
             format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
@@ -2002,9 +1995,9 @@ mod tests {
                 total_tokens: 1_000,
                 reasoning_tokens: Some(20),
             });
-        assert_eq!(label, "セッション累計: 1k token");
+        assert_eq!(label, "このチャットの累計: 1k トークン");
         assert_eq!(state, "complete");
-        assert!(title.contains("完了済みturnの累計"));
+        assert!(title.contains("完了した依頼の累計"));
     }
 
     #[test]

@@ -228,7 +228,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
 export async function importDesktopHubParticipationFile({ context, runtime, cdp, input, sink, nativeState: state, importPath, entry = "hub" }) {
   if (!["hub", "initial-setup", "shared-work"].includes(entry)) throw new TypeError("Unknown Hub participation GUI entry");
   if (entry === "hub") {
-    await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
+    if ((await invokeDesktopCommand(cdp, "desktop_state")).overlay !== "hub") await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
     await trustedClick(input, cdp, byId("hub-tab-devices"), sink);
   }
   await wait("Desktop is ready to import Hub config", () => invokeDesktopCommand(cdp, "device_network_projection"), value => value.enrollment === "unconfigured");
@@ -256,8 +256,8 @@ export async function enrollDesktopFromHubBrowser({ resource, context, runtime, 
   const downloading = page.waitForEvent("download");
   await page.locator("#network-save-config").click();
   const download = await downloading;
-  if (download.suggestedFilename() !== "hub-config.toml") throw fail("Unexpected Hub config download filename", {});
-  const importPath = path.join(context.paths.workspace, "hub-config.toml");
+  if (download.suggestedFilename() !== "hub-config.moyai-join") throw fail("Unexpected Hub config download filename", {});
+  const importPath = path.join(context.paths.workspace, "hub-config.moyai-join");
   await download.saveAs(importPath);
   const config = await readFile(importPath, "utf8");
   if (!config.includes("BEGIN CERTIFICATE") || config.includes("PRIVATE KEY") || !config.includes(`127.0.0.1:${hub.networkPort}`)) {
@@ -278,6 +278,8 @@ export async function enrollDesktopFromHubBrowser({ resource, context, runtime, 
   const request = (await hub.observeNetwork()).join_requests.find(value => value.request_id === pending.request_id);
   await resource.screenshot("hub-browser-pending-device");
   await row.locator("button[data-network-action]").click();
+  await page.locator("#join-project-save").click();
+  await page.locator("#join-project-dialog").waitFor({ state: "hidden" });
   const active = await wait("Approved Desktop enrolls without a code or restart", async () => ({
     network: await invokeDesktopCommand(cdp, "device_network_projection"), snapshot: await hub.observeNetwork(),
   }), value => enrollmentAccepted(value.network, value.snapshot), 45_000);

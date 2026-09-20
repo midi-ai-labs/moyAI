@@ -22,6 +22,9 @@ struct DesktopLauncherArgs {
     session_id: Option<String>,
     #[arg(long)]
     continue_last: bool,
+    /// Review a public Hub connection file before requesting device admission.
+    #[arg(long = "join-config", value_name = "FILE")]
+    join_config: Option<Utf8PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -40,6 +43,14 @@ fn run_desktop_launcher() -> Result<(), (u8, String)> {
 
 fn run_on_current_thread() -> Result<(), (u8, String)> {
     let args = DesktopLauncherArgs::parse();
+    if let Some(path) = &args.join_config {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+            .ok_or_else(|| (2, "接続ファイルを開く場所を確認できません。".into()))?;
+        desktop::join_config::resolve_launch_path(path.as_str(), &cwd)
+            .map_err(|error| (2, error))?;
+    }
     if args.session_id.is_some() && args.continue_last {
         return Err((
             2,

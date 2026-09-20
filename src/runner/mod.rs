@@ -794,6 +794,34 @@ impl RunnerHost {
             }
             state.closing = true;
         }
+        self.spawn_shutdown()
+    }
+
+    /// Called at the shared worker's serialized operator boundary, after its
+    /// journal is empty. A concurrent local run must also be absent/drained.
+    pub(crate) fn begin_quiescent_shutdown(&self) -> Result<(), RunnerError> {
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| RunnerError::new("Runner unavailable"))?;
+            if state.closing
+                || state
+                    .runs
+                    .values()
+                    .any(|run| run.active() || !run.processes_drained)
+            {
+                return Err(RunnerError::new(
+                    "Execution is still active or unconfirmed; wait before changing the Hub endpoint",
+                ));
+            }
+            state.closing = true;
+        }
+        self.spawn_shutdown()
+    }
+
+    fn spawn_shutdown(&self) -> Result<(), RunnerError> {
         let host = self.clone();
         self.inner
             .executor

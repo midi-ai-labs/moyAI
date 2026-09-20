@@ -28,7 +28,9 @@ tests/desktop_e2e/
 - `executeDesktopScenario` はpreflightからsealまでを一度だけ進める共通orchestratorである。CLIは引数とscenarioをbindingするだけで、scenarioごとのrunnerを実装しない。
 - `WindowsTauriHost` はatomic admission、launch、dynamic attach、exact process/profile ownership、graceful/forced cleanup、SQLite最終auditを所有する。
 - `shell.single-instance` は完了済みsessionの未送信draftを残し、exact HWNDを非表示・最小化して同じbinaryを再起動する。`WindowsTauriHost.launchDuplicate` が現行generationのconfig/data/profileを再利用し、共通Windows Job ownerで二重起動側を終了・回収する。同一HWNDの表示/最小化解除、既存Desktop processがexact 1件、session/history/draft保持、起動側stdoutと画面の明示noticeを検証する。foreground権限と物理入力は別の確認項目である。
+- `hub.join-config-cold` / `hub.join-config-warm` は `--desktop-isolation fixture` で実 Hub の管理画面から公開接続ファイル `.moyai-join` を取得し、`--join-config` の起動引数を検証する。cold は初回プロセス起動時の OK、warm は同一 Desktop への再起動通知で Cancel → 設定・下書き保持 → 再取り込み OK を扱う。共通 native driver が exact HWND/PID・ダイアログ題名・Hub URL・CA 指紋を照合し、標準 Button の HWND・親・class・control ID を照合し、共通 native-control driver の BM_CLICK で一度だけ操作する。管理画面で PC を承認し、Direct 設定を保持した本人ログイン入口を確認する。warm は続けて通常利用者の本人初回設定、別の実在公開CAの拒否、同じHubを管理画面から別ポートで再開して再export → native確認 → 同じPC登録・本人の記憶済みログイン・Direct設定の維持も確認する。Runner停止は別のbackend gateで扱い、別Hubへの登録移行、Explorerの関連付け解決、物理入力、初回PCのランタイム導入は対象外。Hubの指定は他の複合試験と同じ `--scenario-config` の `hubBinary` または `MOYAI_HUB_TEST_BINARY` を使う。
 - `EvidenceSink` だけが append-only evidence と final seal を書く。driverはtyped observationを返すだけで、final resultを書かない。
+- `settings.initial-setup-hub-preferences-failure` は通常の初回詳細Hub取込みと同じHub・native picker・cleanup ownerを使う。初回画面の表示後に隔離preferencesだけを空directoryへ置き換え、接続情報の保存・serviceの参加申請・初回完了状態の未保存・可視警告を別々に確認する。元のpreferencesはfinallyで戻し、空directory以外を再帰削除しない。通常成功の `settings.initial-setup-hub` と同じくphysical inputのmanual gateを保持する。
 - `DesktopScenario` は操作意図、product predicate、scenario固有resourceのquiesce、input/probe cleanupを所有する。process、profile、port、SQLite、共通deadline、screenshot path、verdictは所有しない。
 - `CdpDriver` はWebView内のsemantic locator、trusted browser input、DOM/AX/event観測を所有する。native dialogはexact HWNDへ束縛したWindows UI Automation / Win32 adapterで扱い、foreground依存の`SendInput`は入力先を証明できない環境で送信しない。
 - `DesktopCommandProbe` は製品APIの単一・非干渉command observerへ短命に接続し、trusted DOM操作が実際に発行したmutation commandとpayloadを取得する。Tauri内部関数の差し替えやcommand再送を行わず、observerの例外やpayload cloneの変更は製品command deliveryへ影響させない。
@@ -39,6 +41,8 @@ tests/desktop_e2e/
 - product `src/harness/` のeventやreplay resultはread-only補助証拠であり、GUI PASSのoracleにしない。
 
 ## Desktop の起動範囲
+
+`onboarding.win-a-to-win-b` は同一Windows内の隔離された実Desktop A/Bで、Aのチーム参加・本人初回設定、Bの実行PC専用入口からAI設定・PC参加・実行同意、Hub画面の人/PC/プロジェクト割当、AのCSV添付、Bのスクリプト作成と実PowerShell実行、Aの成果2ファイル保存を通す。Hubは本人入力中に別タブで今回使うプロジェクトを作り、競合時に入力を残して比較→継続→明示保存する。承認ボタンはfocus/scroll前の可視性を記録し、Aへ保存した2成果のhashをHub・B実ファイルと照合する。共通のcompanion/managed Runner/native picker/cleanup ownerを使用する。`runnerBinary` と固定コピーした `runnerTestBinary` をHub optionsに追加する。providerは固定tool計画で、LLM品質・物理別PC・fresh Windows導入の証明ではない。画面と経過時間は自動操作の観察資料であり、初見利用者の所要時間を表さない。
 
 省略時の `--desktop-isolation user-wide` は、既存の Desktop があると起動前に停止する従来の試験である。実利用中の Desktop と共存させる場合だけ、`desktop-e2e` feature 付きの専用 Desktop と `--desktop-isolation fixture` を明示する。通常配布版は隔離用の環境変数が渡された起動を拒否する。どちらのモードでも共通の GUI admission を一つだけ取得し、別 execution の GUI 操作を並行させない。
 

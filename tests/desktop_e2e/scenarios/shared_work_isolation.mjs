@@ -6,7 +6,7 @@ import { WebviewInput } from "../drivers/webview_input.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { byId, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { hubProjectReady, openHubProjectSurface, openSharedDisclosure, sharedActionTarget } from "./shared_work_navigation.mjs";
+import { hubProjectReady, openHubProjectSurface, openSharedDisclosure, sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
 
 const ID = "settings.shared-work-isolation", OWNER = `scenario:${ID}`;
 const failure = (message, evidence = {}) => new DesktopE2eError("product", "shared-isolation-mismatch", message, evidence);
@@ -139,6 +139,7 @@ export function createSharedWorkIsolationScenario(options = {}) {
         return { user_id: person.user_id, display_name: person.displayName, project_id: projectId, project_label: label };
       }
       async function login(pc, person, expected) {
+        await setSharedLoginMode(pc.input, pc.driver, pc.sink, "password");
         for (const [id, value] of [["shared-username", person.username], ["shared-password", person.password]]) {
           const target = byId(id, "INPUT"); await trustedClick(pc.input, pc.driver, target, pc.sink); await pc.input.insertText(target, value);
         }

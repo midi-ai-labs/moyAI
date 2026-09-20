@@ -32,6 +32,17 @@ export function createSnapshotRefresh(readSnapshot: () => Promise<void>): (after
   };
 }
 
+export async function installSnapshotInvalidation(
+  subscribe: (onChanged: () => void) => Promise<() => void>,
+  refresh: (afterInFlight?: boolean) => void,
+): Promise<() => void> {
+  const unsubscribe = await subscribe(() => refresh(true));
+  // A native activation can settle before the listener is registered. Read
+  // again after registration, through the same coalescing snapshot owner.
+  refresh(true);
+  return unsubscribe;
+}
+
 export function installRuntimePolling(
   windowTarget: Pick<Window, "setInterval" | "clearInterval" | "addEventListener" | "removeEventListener">,
   documentTarget: Pick<Document, "hidden" | "addEventListener" | "removeEventListener">,

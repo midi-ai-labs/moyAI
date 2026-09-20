@@ -21,7 +21,22 @@
 .shared-card p { line-height:1.6; overflow-wrap:anywhere; }
 .shared-card label { display:flex; flex-direction:column; gap:6px; margin:14px 0; }
 .shared-card input, .shared-card textarea, .shared-card select { width:100%; box-sizing:border-box; padding:10px; color:inherit; background:var(--bg-input, #20242d); border:1px solid var(--border-color, #555); border-radius:6px; }
-.shared-login { max-width:560px; margin:32px auto; }
+.shared-login { max-width:720px; margin:12px auto; }
+.shared-auth-modes { display:flex; flex-wrap:wrap; gap:8px; }
+.shared-auth-modes [aria-pressed=true] { border-color:var(--accent-color, #729eed); background:var(--bg-hover, #303846); }
+.shared-login-fields { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.shared-login-fields label { min-width:0; margin:8px 0; }
+.shared-approval-pending { border:2px solid var(--accent-color, #729eed); margin-top:0; }
+.shared-approval-pending .shared-actions { margin:12px 0; }
+.shared-approval-record { padding:12px 16px; }
+.shared-approval-record summary { font-weight:600; cursor:pointer; }
+.shared-work-message.has-approval { position:sticky; top:0; z-index:1; background:var(--bg, #20242d); padding:1px 12px; border-radius:6px; border:1px solid var(--accent-color, #729eed); }
+.shared-approval-notice { margin:8px 0; }
+.shared-approval-notice a { color:var(--accent, #94baff); margin-left:12px; }
+#shared-approval-title { scroll-margin-top:70px; }
+.shared-approval-operation { max-height:160px; overflow:auto; border-left:3px solid var(--border-color, #555); padding:0 12px; }
+.shared-approval-operation pre { margin:8px 0; }
+@media (max-width:650px) { .shared-login-fields { grid-template-columns:1fr; gap:0; } }
 .shared-secondary { opacity:.72; font-size:12px; }
 .shared-error { color:var(--danger-color, #ed9e94); }
 .shared-environment, .shared-job { border-top:1px solid var(--border-color, #444); padding:12px 0; }

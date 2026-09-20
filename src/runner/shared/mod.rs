@@ -145,6 +145,31 @@ impl Controller {
     ) -> Result<(), RunnerError> {
         use super::operations::{ReconciliationEvidence, RunnerOperation};
         match operation {
+            RunnerOperation::QuiescentShutdown {
+                expected_desktop_binding,
+            } => {
+                // This queue runs between complete ticks: a claim in flight must
+                // settle into the journal before the following check can pass.
+                let store = self
+                    .host
+                    .inner
+                    .operations
+                    .lock()
+                    .map_err(|_| RunnerError::new("Runner operations unavailable"))?;
+                if store.installed.desktop_binding.as_deref() != Some(&expected_desktop_binding)
+                    || matches!(
+                        store.installed.mode,
+                        super::operations::ProvisionMode::Available
+                    )
+                    || store.installed.maintenance_until_ms.is_some()
+                    || !self.journal.active()?.is_empty()
+                {
+                    return Err(RunnerError::new(
+                        "Pause this Runner and wait for all work and unknown attempts before changing the Hub endpoint",
+                    ));
+                }
+                self.host.begin_quiescent_shutdown()
+            }
             RunnerOperation::LocalSignIn { credentials } => {
                 if !crate::device_network::stable_id(&credentials.project_id)
                     || credentials.username.trim().is_empty()

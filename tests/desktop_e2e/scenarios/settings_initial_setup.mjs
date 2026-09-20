@@ -279,6 +279,7 @@ export async function observeInitialSetupSurface(cdp) {
           height: rect.height,
         },
         step_rows: stepRows,
+        purposes: ["personal", "team", "hosting"].map(purpose => button('[data-surface="initial-setup"] button[data-action="initial-setup-' + purpose + '"]')),
         next: button('[data-surface="initial-setup"] button[data-action="initial-setup-next"]'),
         back: button('[data-surface="initial-setup"] button[data-action="initial-setup-back"]'),
         finish: button('[data-surface="initial-setup"] button[data-action="finish-initial-setup"]'),
@@ -318,6 +319,26 @@ export async function observeInitialSetupSurface(cdp) {
   })()`);
 }
 
+export function initialSetupPurposeButtonsReady(surface) {
+  return surface?.wizard?.current_step === "start"
+    && surface.wizard.purposes?.length === 3
+    && surface.wizard.purposes.every(button => button.count === 1 && button.visible === true
+      && button.enabled === true && button.label_contained === true && button.label_line_count === 1);
+}
+
+export function initialSetupHostingUnavailableReady(value) {
+  const surface = value?.surface, notice = value?.notice;
+  return surface?.projection?.overlay === "initial_setup"
+    && surface.projection.startup?.initial_setup_required === true
+    && surface.projection.startup.onboarding_intent === "hosting"
+    && surface.wizard?.current_step === "start"
+    && surface.visible_fatal_count === 0
+    && notice?.visible === true && notice.details_open === false
+    && notice.text.includes("Hub同梱版を導入") && notice.text.includes("既存の管理PCでHubを起動")
+    && sameValue(notice.purposes?.map(row => row.action).sort(), ["initial-setup-hosting", "initial-setup-personal", "initial-setup-team"])
+    && notice.purposes.every(row => row.enabled);
+}
+
 function errorFree(surface) {
   return surface?.visible_fatal_count === 0
     && surface?.visible_recoverable_error_count === 0
@@ -346,7 +367,7 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
     && errorFree(surface)
     && surface?.projection?.overlay === "initial_setup"
     && surface?.projection?.startup?.initial_setup_required === true
-    && surface.projection.startup.initial_setup_reason === "config_missing"
+    && ["config_missing", "setup_unfinished"].includes(surface.projection.startup.initial_setup_reason)
     && surface.projection.startup.action_overlay === "initial_setup"
     && target !== null
     && typeof target?.globalConfigPath === "string"
@@ -603,6 +624,86 @@ export function createSettingsInitialSetupScenario() {
       const provider = state.provider;
       if (provider === null) throw new Error("Initial Setup scripted provider was not prepared");
       if (state.importPath === null) throw new Error("Initial Setup import fixture was not prepared");
+      // The bootstrap has already created config.toml. A complete process
+      // restart before Finish must still return to the unfinished welcome.
+      await firstCdp.call("Runtime.enable");
+      const interrupted = (await waitForStep(firstCdp, provider, context, "start")).value.surface;
+      if (!initialSetupPurposeButtonsReady(interrupted)) {
+        await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-purpose-layout-failure", owner: OWNER });
+        throw new DesktopE2eError("product", "initial-purpose-label-layout", "The three purpose labels must fit their enabled buttons", { purposes: interrupted.wizard.purposes });
+      }
+      const purposeInput = new WebviewInput(firstCdp, { probeId: "settings-initial-purpose" });
+      try {
+        await purposeInput.installProbe();
+        await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-three-purposes", owner: OWNER });
+        const hostingClick = await trustedClick(purposeInput, {
+          selector: '[data-surface="initial-setup"] button[data-action="initial-setup-hosting"]',
+          identity: { tag: "BUTTON", action: "initial-setup-hosting" },
+        });
+        const hostingUnavailable = await waitForObservation({
+          label: "Missing bundled Hub gives ordinary visible guidance and keeps all entry actions usable", timeoutMs: 10_000, pollMs: 75,
+          sample: async () => ({
+            surface: await observeInitialSetupSurface(firstCdp),
+            notice: await firstCdp.evaluate(`(() => {
+              const e = document.querySelector('#initial-setup-recoverable-error');
+              return { visible:Boolean(e?.getClientRects().length && !e.hidden), text:e?.innerText ?? '', details_open:e?.querySelector('details')?.open === true,
+                purposes:[...document.querySelectorAll('[data-surface="initial-setup"] button[data-action="initial-setup-personal"], [data-surface="initial-setup"] button[data-action="initial-setup-team"], [data-surface="initial-setup"] button[data-action="initial-setup-hosting"]')].map(b => ({ action:b.dataset.action, enabled:!b.disabled })) };
+            })()`),
+          }),
+          accept: value => initialSetupHostingUnavailableReady(value),
+        });
+        await sink.record("initial-setup-hosting-unavailable", {
+          click: hostingClick,
+          notice: hostingUnavailable.value.notice,
+          intent: hostingUnavailable.value.surface.projection.startup.onboarding_intent,
+          responsive_after_failure: true,
+          scope: "Debug layout without bundled Hub. Successful packaged Hub launch is not exercised.",
+        }, { phase: "executing", owner: OWNER });
+        await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-hosting-unavailable", owner: OWNER });
+        await trustedClick(purposeInput, {
+          selector: '#initial-setup-recoverable-error button[data-action="dismiss-ui-error"]',
+          identity: { tag: "BUTTON", action: "dismiss-ui-error" },
+        });
+        await waitForStep(firstCdp, provider, context, "start");
+        await trustedClick(purposeInput, {
+          selector: '[data-surface="initial-setup"] button[data-action="initial-setup-personal"]',
+          identity: { tag: "BUTTON", action: "initial-setup-personal" },
+        });
+        await waitForObservation({
+          label: "Personal purpose opens the short local AI setup", timeoutMs: 10_000, pollMs: 75,
+          sample: () => observeInitialSetupSurface(firstCdp),
+          accept: surface => surface.projection.startup.onboarding_intent === "personal"
+            && surface.wizard.current_step === "provider"
+            && sameValue(surface.wizard.step_rows.map(row => row.step), ["start", "provider", "model", "finish"]),
+        });
+      } finally { await purposeInput.cleanup(); }
+      const resumed = await host.restart({ context, scenario: this, sink, driver: firstCdp, phase: "executing" });
+      firstCdp = resumed.driver;
+      runtime = resumed.runtime;
+      await firstCdp.call("Runtime.enable");
+      const restoredPurpose = await waitForObservation({
+        label: "Incomplete personal setup resumes after config exists", timeoutMs: 10_000, pollMs: 75,
+        sample: () => observeInitialSetupSurface(firstCdp),
+        accept: surface => surface.projection.startup.initial_setup_required
+          && surface.projection.startup.onboarding_intent === "personal"
+          && surface.wizard.current_step === "provider",
+      });
+      await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-personal-resumed", owner: OWNER });
+      const backInput = new WebviewInput(firstCdp, { probeId: "settings-initial-resumed-purpose" });
+      try {
+        await backInput.installProbe();
+        await trustedClick(backInput, {
+          selector: '[data-surface="initial-setup"] button[data-action="initial-setup-back"]',
+          identity: { tag: "BUTTON", action: "initial-setup-back" },
+        });
+      } finally { await backInput.cleanup(); }
+      const restoredWelcome = (await waitForStep(firstCdp, provider, context, "start")).value.surface;
+      await sink.record("initial-setup-unfinished-restart", {
+        before: interrupted.projection.startup,
+        after: restoredWelcome.projection.startup,
+        resumed_purpose: restoredPurpose.value.projection.startup.onboarding_intent,
+        config_exists: (await stat(context.paths.config_file)).isFile(),
+      }, { phase: "executing", owner: OWNER });
       state.nativeOwner = nativeOwner(context, runtime);
       await firstCdp.call("Runtime.enable");
       await firstCdp.call("DOM.enable");

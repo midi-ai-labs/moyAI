@@ -372,7 +372,8 @@ fn published_artifacts(
                     && p["success"] != false
             })
             .ok_or_else(|| error("published artifact has no canonical successful result"))?;
-        let metadata = &output["metadata"]["artifact"];
+        // Agent output metadata wraps the handler's result under `tool_metadata`.
+        let metadata = &output["metadata"]["tool_metadata"]["artifact"];
         let name = metadata["name"]
             .as_str()
             .ok_or_else(|| error("published artifact name is missing"))?;
@@ -424,19 +425,28 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(content));
         let mut archive = json!({"tables":{"protocol_history_items":[
             {"id":"call-history","payload_json":json!({"kind":"tool_call","tool_name":"shared_publish_artifact","call_id":"call"}).to_string()},
-            {"id":"result-history","payload_json":json!({"kind":"tool_output","call_id":"call","success":true,"metadata":{"artifact":{"name":"results/解.bin","sha256":hash,"byte_length":content.len()}}}).to_string()}
+            {"id":"result-history","payload_json":json!({"kind":"tool_output","call_id":"call","status":"completed","success":true,"metadata":{"success":true,"tool_metadata":{"artifact":{"name":"results/解.bin","sha256":hash,"byte_length":content.len()}}}}).to_string()}
         ],"tool_calls":[{"history_item_id":"call-history","status":"completed","truncated_output_path":"original-snapshot"}]},
             "sidecars":[{"original_path":"original-snapshot","sha256":hash,"content_base64":STANDARD.encode(content)}]});
         let uploads = published_artifacts(&archive, "attempt", 7).unwrap();
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0]["generation"], 7);
         assert_eq!(uploads[0]["upload"]["name"], "results/解.bin");
+        assert_eq!(uploads[0]["upload"]["sha256"], hash);
+        assert_eq!(
+            uploads,
+            published_artifacts(&archive, "attempt", 7).unwrap(),
+            "repeated collection must keep the immutable upload identity and bytes"
+        );
         assert_eq!(
             STANDARD
                 .decode(uploads[0]["upload"]["content_base64"].as_str().unwrap())
                 .unwrap(),
             content
         );
+        let mut missing_snapshot = archive.clone();
+        missing_snapshot["sidecars"] = json!([]);
+        assert!(published_artifacts(&missing_snapshot, "attempt", 7).is_err());
         archive["sidecars"][0]["content_base64"] = json!(STANDARD.encode(b"changed source"));
         assert!(published_artifacts(&archive, "attempt", 7).is_err());
         archive["tables"]["tool_calls"][0]["status"] = json!("failed");

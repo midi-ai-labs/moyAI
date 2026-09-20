@@ -127,26 +127,26 @@ Side Chatではownerに紐づくcontext、引用、session navigation、再起�
 AutoReview Guardianのexact transportを拡張し、実行file identity、MCP origin、provider診断、secret、
 Windows sandbox admissionのfail-closed境界を強化しました。
 
-Windows 向け release zip には、次のものが含まれています。
+現行開発版のWindows配布物は次の配置です。公開済みv2.1.1 ZIPの配置は変更されません。
 
-- CLI / TUI 用の `bin/moyai.exe`
-- Desktop App 用の `bin/moyai-desktop.exe`
-- 独立した実行と共有環境用の `bin/moyai-runner.exe`
-- user-wide moyAI AppDataを初回状態へ戻す`bin/moyai-cleanup.exe`
-- bundled `ui/desktop-web/dist/` assets
+- 閉域で導入・更新する `Setup-moyAI.cmd`。既定配置は `%LOCALAPPDATA%\Programs\moyAI`、通常起動はスタートメニューの「moyAI」
+- portable起動の入口 `Start-moyAI.cmd`。起動前に必要なランタイムを検査
+- 内部の `app/bin/` にDesktop・CLI・Runner、`app/ui/desktop-web/dist/` に画面assets
+- 保守用の `app/maintenance/moyai-cleanup.exe`。引数なしでは対象previewだけを表示し、初期化は明示的な二つの引数が必要
+- identityを記録した任意のHub同梱と、ランタイム同梱または社内導入済みランタイムの明示的な前提
 - README、LICENSE、release notes、config example、getting-started guide、package内SHA256 checksum
 
 GitHub Releaseでは、zipとあわせて外部manifestとzip SHA256 sidecarも公開します。
 
-利用先の Windows 端末に、npm、Rust toolchain、internet access、local web dev server は不要です。
+利用先のWindows端末にnpm、Rust、internet access、開発serverは不要です。セットアップはランタイムをダウンロードせず、不足時は社内担当へ渡せる案内を表示します。導入・更新・アンインストールでは設定・資格・履歴を保持します。閉域用資材とHub組合せ検証、新PC検証の範囲は[Windowsへの導入と更新](docs/user/windows-setup.md)を参照してください。
 
 ## Quick Start
 
-1. LM Studio などで OpenAI 互換の LLM server を起動するか、設定予定のendpointへ接続できる状態にします。
-2. release zip をダウンロードして展開します。
-3. `bin/moyai-desktop.exe` を起動します。
-4. 初回起動ではfullscreenのInitial Setupを進めます。provider、model、permission、optional toolを入力またはTOMLから取り込み、local validationを確認してから **Finish and open moyAI** を選びます。model読込とprovider / Docling diagnosticは明示操作時だけ実行され、endpointへ到達できない場合もwarningとして表示するだけで、localにvalidなsetup完了を妨げません。
-5. まずは Quick Chat を試します。コードを扱わせる場合は、project workspace を選択し、開発チャットを開始します。
+1. 配布ZIPを入手し、フォルダーごと展開します。
+2. 現行開発版では `Setup-moyAI.cmd` で導入してスタートメニューの「moyAI」を開くか、portable用の `Start-moyAI.cmd` を開きます。公開済みv2.1.1 ZIPでは `bin/moyai-desktop.exe` を起動します。
+3. 現行開発版の初回画面で「自分のPCで使う」「チームに参加する」「チーム環境を用意する」を選びます。[初回利用の案内](docs/desktop-first-use.md)に各経路と中断後の再開を記載しています。
+4. 個人利用ではAIの接続先とモデル、承認方式を確認して保存します。モデル読込と診断は明示操作で、接続できなくても入力が有効なら保存できます。チームの仕事を操作するだけなら、このPCのAIや作業フォルダーは不要です。管理者から接続ファイルと本人向け案内を受け取り、PCの承認・本人設定・プロジェクトの確認へ進みます。チーム環境を用意する場合は同梱Hubの管理画面を開きます。
+5. 個人利用はQuick Chatから、既存ファイルを扱う場合は作業フォルダーを選んで始めます。チーム利用は表示されたHubプロジェクトで依頼や閲覧を行います。未保存の入力は終了すると失われますが、選んだ目的は次回起動へ引き継ぎます。
 
 ウィンドウを閉じるとmoyAIはシステムトレイに残ります。もう一度起動すると、隠れている場合や
 最小化中でも既存ウィンドウを表示し、チャットタイトルの下に起動済みの案内を表示します。

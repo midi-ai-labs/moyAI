@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 param(
   [Parameter(Mandatory)]
-  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "OpenFilePath", "SelectFile", "CapturePng", "CloseCleanup")]
+  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "InvokeDialogButton", "OpenFilePath", "SelectFile", "CapturePng", "CloseCleanup")]
   [string]$Action,
   [string]$ExecutionRoot,
   [string]$OwnerPath,
@@ -13,6 +13,9 @@ param(
   [int]$DragDeltaX = 0,
   [int]$DragDeltaY = 0,
   [string]$SelectedPath,
+  [int]$DialogButtonId = 0,
+  [string]$ExpectedDialogTitle,
+  [string]$ExpectedDialogTextJson,
   [ValidateSet("open", "save_new", "directory")]
   [string]$SelectedPathIntent = "open"
 )
@@ -806,6 +809,47 @@ function Resolve-ExactUiaWindowClose {
   }
 }
 
+function Resolve-ExactNativeDialogButton {
+  param([Parameter(Mandatory)][object]$Candidate)
+  if ($DialogButtonId -notin @(1, 2) -or $Candidate.row.class_name -cne '#32770') {
+    throw "Only standard OK/Cancel buttons in an exact native dialog are supported"
+  }
+  if ([string]::IsNullOrWhiteSpace($ExpectedDialogTitle) -or $ExpectedDialogTitle.Length -gt 256) {
+    throw "The expected native dialog title is required"
+  }
+  $expected = @(ConvertFrom-Json -InputObject $ExpectedDialogTextJson)
+  if ($expected.Count -lt 1 -or $expected.Count -gt 8) { throw "Expected dialog text must contain 1 to 8 strings" }
+  $window = Resolve-ExactUiaWindowClose -Candidate $Candidate
+  if ($window.evidence.name -cne $ExpectedDialogTitle) { throw "Native dialog title changed before input" }
+  $descendants = $window.element.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  # This Windows MessageBox exposes Static/Button as UIA Pane. Use the native
+  # handles, classes and parent chain rather than treating that UIA type as authority.
+  $texts = [Collections.Generic.List[string]]::new()
+  foreach ($element in $descendants) {
+    if ($element.Current.NativeWindowHandle -eq 0) { continue }
+    [long]$value = $element.Current.NativeWindowHandle
+    if ($value -lt 0) { $value += 4294967296 }
+    $handle = [IntPtr]::new($value)
+    $row = Get-WindowRow -Handle $handle -OwnerProcessId ([int]$Candidate.row.process_id)
+    if ($null -ne $row -and $row.class_name -ceq 'Static' -and $row.root_hwnd -ceq $Candidate.row.hwnd -and
+      $row.thread_id -eq $Candidate.row.thread_id -and [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($handle) -eq $Candidate.handle) {
+      $texts.Add([Moyai.DesktopE2e.NativeWindowInterop]::WindowText($handle))
+    }
+  }
+  $text = $texts -join "`n"
+  foreach ($part in $expected) {
+    if ($part -isnot [string] -or $part.Length -eq 0 -or $part.Length -gt 4096 -or -not $text.Contains($part)) {
+      $observed = @($descendants | Select-Object -First 20 | ForEach-Object {
+        [ordered]@{ name=[string]$_.Current.Name; control_type=[string]$_.Current.ControlType.ProgrammaticName;
+          process_id=[int]$_.Current.ProcessId; automation_id=[string]$_.Current.AutomationId }
+      }) | ConvertTo-Json -Compress
+      throw "Native dialog review text does not match the intended operation; observed=$observed"
+    }
+  }
+  $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId $DialogButtonId -ClassName 'Button'
+  return [ordered]@{ handle = $button.handle; text = $text; title = $window.evidence.name; evidence = $button.row }
+}
+
 function Resolve-ExactUiaFileItem {
   param(
     [Parameter(Mandatory)][object]$Candidate,
@@ -1277,6 +1321,25 @@ switch ($Action) {
       input = "Windows UI Automation WindowPattern.Close()"
       cleanup_only = $false
       representative_input = $true
+    })
+  }
+  "InvokeDialogButton" {
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    $observed = Resolve-ExactNativeDialogButton -Candidate $candidate
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $button = Resolve-ExactNativeDialogButton -Candidate $candidate
+    if ($observed.handle -ne $button.handle) {
+      throw "Native dialog button identity changed before input"
+    }
+    # Invoke only once. Never send keys or window messages as a fallback after an uncertain result.
+    $returned = $false
+    $invokeError = $null
+    try { [Moyai.DesktopE2e.NativeWindowInterop]::ClickOpenOnce($button.handle); $returned = $true } catch { $invokeError = $_.Exception.GetType().FullName }
+    Write-Result ([ordered]@{
+      window = $candidate.row; button = $button.evidence; dialog_title = $button.title; dialog_text = $button.text
+      attempt_count = 1; call_returned = $returned; invoke_error = $invokeError; native_control_verified = $true
+      representative_input = $true; cleanup_only = $false; fallback_used = $false
+      input = "native-control: exact standard dialog Button BM_CLICK"; os_keyboard_ime_evidence = $false
     })
   }
   "OpenFilePath" {

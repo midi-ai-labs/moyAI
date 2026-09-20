@@ -18,7 +18,9 @@ use crate::mcp_publish::{PublishService, PublishTarget};
 use crate::remote_agent::RemoteJobService;
 use crate::storage::StoreBundle;
 
+mod configuration;
 mod enrollment;
+pub use configuration::PreparedDeviceConfiguration;
 #[cfg(test)]
 mod enrollment_tests;
 mod history;
@@ -786,7 +788,7 @@ impl DeviceNetworkService {
         revision: &str,
         generation: &str,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
-        self.configure_with_commit(shared, revision, generation, || Ok(()))
+        self.configure_with_commit(shared, revision, generation, |_| Ok(()))
             .await
     }
     pub async fn configure_with_commit(
@@ -794,34 +796,12 @@ impl DeviceNetworkService {
         shared: SharedHubConfig,
         revision: &str,
         generation: &str,
-        commit: impl FnOnce() -> Result<(), DeviceError>,
+        commit: impl FnOnce(&SharedHubConfig) -> Result<(), DeviceError>,
     ) -> Result<DeviceNetworkProjection, DeviceError> {
-        shared.validate()?;
-        let _lane = self.inner.lane.lock().await;
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| DeviceError::Unavailable)?;
-        state.check(revision, generation)?;
-        if state.settings.device_id.is_some() && state.shared != shared {
-            return Err(DeviceError::ConnectionChanged);
-        }
-        commit()?;
-        if state.shared != shared {
-            state.pending_join = None;
-            self.inner.outgoing.peer_connections.clear();
-        }
-        state.shared = shared;
-        state.generation += 1;
-        state.status = if state.settings.device_id.is_some() {
-            "disconnected"
-        } else {
-            "not_enrolled"
-        };
-        state.error = None;
-        drop(state);
-        Ok(self.projection_now())
+        let prepared = self
+            .prepare_configuration(shared, revision, generation)
+            .await?;
+        self.commit_configuration(prepared, commit).await
     }
     pub async fn join(
         &self,
