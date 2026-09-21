@@ -22,9 +22,9 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     if ((pending === "import" || pending === "join") && projection.enrollment === "pending") {
       local.notice = "参加申請を送信しました。Hub管理者の承認を待っています。承認後は自動で接続します。";
     } else if (pending === "import" && projection.enrollment === "active" && previousConnection?.device_id === projection.device_id && previousConnection.hub_url !== projection.hub_url) {
-      local.notice = "同じHubの接続先を変更しました。PC登録・本人ログイン・実行許可は保持しています。実行PCの受付は停止のままです。接続状態を確認して受付を再開してください。";
+      local.notice = "同じHubの接続先を変更しました。PC登録と実行許可は保持しています。実行PCの受付は停止のままです。接続状態を確認して受付を再開してください。";
     } else if ((pending === "import" || pending === "join") && projection.enrollment === "active") {
-      local.notice = "Hubに接続しました。初回ログイン後、割り当てられたプロジェクトが通常の一覧に表示されます。";
+      local.notice = "Hubに接続しました。管理者がこのPCを操作PCに指定したプロジェクトが、左の一覧に表示されます。";
     } else if (pending === "receiver") local.notice = projection.receiver.enabled ? "受付設定を保存しました。稼働状態を確認してください。" : "受付をOFFにしました。実行中タスクの停止完了は経路の状態を確認してください。";
     else if (pending === "select") {
       const peer = projection.peers.find(row => devicePeerKey(row) === local.selectionKey);

@@ -54,7 +54,7 @@ async fn endpoint_change_shutdown_rechecks_the_worker_journal_after_a_stale_idle
             checkpoint_cursor: String::new(),
             commands: None,
             external: None,
-            local_human: None,
+            local_project_id: None,
         };
         assert!(controller.journal.active().unwrap().is_empty());
         // This is the race a frontend status-read then ordinary Shutdown misses.

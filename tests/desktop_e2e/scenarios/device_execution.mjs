@@ -12,7 +12,7 @@ import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathI
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { action, byId, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
+import { sharedActionTarget } from "./shared_work_navigation.mjs";
 
 const ID = "settings.device-execution", OWNER = `scenario:${ID}`;
 const fail = message => new DesktopE2eError("product", "device-execution-mismatch", message);
@@ -153,7 +153,6 @@ export function createDeviceExecutionScenario(options = {}) {
         await page.locator('[data-sa-tab="projects"]').click();
         await page.locator('button[data-sa-operation="save_project"]').first().click();
         await page.locator("#shared-admin-label").fill("自動実行のプロジェクト");
-        await page.getByRole("combobox", { name: "Desktop fixture administrator", exact: true }).selectOption("manager");
         await page.locator(`input[name="controller_device_ids"][value="${enrolled.network.device_id}"]`).check();
         await page.locator(`input[name="runner_device_ids"][value="${enrolled.network.device_id}"]`).check();
         const sent = [];
@@ -170,14 +169,8 @@ export function createDeviceExecutionScenario(options = {}) {
         if (!relative || path.isAbsolute(relative) || relative.startsWith("..") || !(await stat(directory)).isDirectory()) throw fail("Automatic provisioning did not remain within the explicitly approved folder");
         await captureScenarioScreenshot({ cdp, sink, name: "execution-project-automatically-ready", owner: OWNER });
         await state.resource.screenshot("execution-hub-project-ready");
-        // The same Windows user may explicitly use a human project membership;
-        // Runner consent above deliberately did not require that login.
+        // The approved controller PC opens its project without a second login.
         await trustedClick(state.input, cdp, byId("device-network-open-shared"), sink);
-        await setSharedLoginMode(state.input, cdp, sink, "password");
-        for (const [id, value] of [["shared-username", state.resource.administrator.username], ["shared-password", state.resource.administrator.password]]) {
-          const target = byId(id, "INPUT"); await trustedClick(state.input, cdp, target, sink); await state.input.insertText(target, value);
-        }
-        await trustedClick(state.input, cdp, sharedActionTarget("login"), sink);
         const sharedProjection = () => invokeDesktopCommand(cdp, "shared_work_projection");
         await wait("The explicit human member can submit in the prepared project", sharedProjection, p => p.selected_project_id === projectId && p.projects.some(row => row.id === projectId && row.can_submit));
         await trustedClick(state.input, cdp, sharedActionTarget("prepare-sample"), sink);

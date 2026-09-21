@@ -29,12 +29,31 @@ export async function openSharedDisclosure(input, cdp, sink, key) {
   if (isOpen !== true) await trustedClick(input, cdp, { selector: `${selector} > summary`, identity: { tag: "DETAILS", detailsKey: key } }, sink);
 }
 
-export async function setSharedLoginMode(input, cdp, sink, mode) {
-  if (!["setup", "password"].includes(mode)) throw new TypeError("Unknown shared login mode");
-  const target = { selector: `.shared-work button[data-action="shared-auth-mode"][data-value=${JSON.stringify(mode)}]`, identity: { tag: "BUTTON", action: "shared-auth-mode" } };
-  const selected = () => cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.getAttribute('aria-pressed') === 'true'`);
-  if (!await selected()) await trustedClick(input, cdp, target, sink);
-  await wait("Selected human login method is visible", selected, Boolean);
+/** Explicit administrator association through the real Hub browser form. */
+export async function bindHubDevice(resource, deviceId, userId) {
+  const page = resource.page;
+  await page.locator('nav a[href="#shared-administration"]').click();
+  const users = page.locator('[data-sa-tab="users"]');
+  if (!await users.isVisible()) await page.getByText("既存の利用者・権限（詳細）", { exact: true }).click();
+  await users.click();
+  await page.locator(`[data-sa-operation="bind_device_principal"][data-sa-id=${JSON.stringify(deviceId)}]`).click();
+  await page.locator("#shared-admin-user_id").selectOption(userId ?? "");
+  await page.locator("#shared-admin-save").click();
+  await page.locator("#shared-admin-form").waitFor({ state: "detached" });
+}
+
+export async function deviceActor(resource, deviceId) {
+  const page = resource.page;
+  await page.locator('nav a[href="#shared-administration"]').click();
+  const users = page.locator('[data-sa-tab="users"]');
+  if (!await users.isVisible()) await page.getByText("既存の利用者・権限（詳細）", { exact: true }).click();
+  await users.click();
+  await page.locator(`[data-sa-operation="bind_device_principal"][data-sa-id=${JSON.stringify(deviceId)}]`).click();
+  const user_id = await page.locator("#shared-admin-user_id").inputValue();
+  const display_name = await page.locator("#shared-admin-user_id option:checked").innerText();
+  await page.locator("#shared-admin-close").click();
+  if (!user_id) throw new Error("Approved device has no assigned actor");
+  return { user_id, display_name };
 }
 
 export async function observeSharedWorkSurface(cdp) {
@@ -47,13 +66,13 @@ export async function observeSharedWorkSurface(cdp) {
     return { count:roots.length, splash_visible:[...document.querySelectorAll('.splash-screen')].some(visible),
       heading:root?.querySelector('#shared-heading')?.textContent?.trim() ?? '',
       account_text:root?.querySelector('[data-shared-region="account"]')?.innerText ?? '',
-      login_visible:visible(login), login_enabled:Boolean(login && !login.disabled) };
+      connection_visible:visible(root?.querySelector('[data-shared-region="connection"]')), login_visible:visible(login), login_enabled:Boolean(login && !login.disabled) };
   })()`);
 }
 
 export function sharedWorkSurfaceMatches(surface, shared) {
   if (surface?.count !== 1 || surface.splash_visible !== false) return false;
-  if (!shared?.principal) return surface.login_visible === true && surface.login_enabled === true;
+  if (!shared?.principal) return surface.connection_visible === true && surface.login_visible === false;
   const project = shared.projects?.find(row => row.id === shared.selected_project_id);
   return surface.login_visible === false && Boolean(shared.principal.display_name)
     && surface.account_text.includes(shared.principal.display_name)

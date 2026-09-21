@@ -1,7 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { onboardingImplementationReply, INPUT_NAME, SCRIPT_NAME, RESULT_NAME } from "../fixtures/onboarding_implementation.mjs";
-import { createOnboardingWinAbScenario, implementedArtifactsAccepted, approvalVisibleBeforeScroll, latestArtifactVersion } from "../scenarios/onboarding_winab.mjs";
+import { createOnboardingWinAbScenario, implementedArtifactsAccepted, approvalVisibleBeforeScroll, latestArtifactVersion, completedRequestorIdentityAccepted } from "../scenarios/onboarding_winab.mjs";
+
+test("completed requestor identity comes from the matching status summary, not the detail DTO", () => {
+  const expected = { job_id: "job-a", user_id: "actor-a", display_name: "WinA (操作PC)" };
+  const requestor = { user_id: expected.user_id, display_name: expected.display_name };
+  const detail = { id: expected.job_id, state: "succeeded" };
+  const job = { ...detail, requestor };
+  const shared = { detail, status: { jobs: [job] } };
+  assert.equal(completedRequestorIdentityAccepted(shared, expected), true);
+  for (const changed of [
+    { ...job, id: "another-job" },
+    { ...job, state: "running" },
+    { ...job, requestor: { ...requestor, user_id: "another-actor" } },
+    { ...job, requestor: { ...requestor, display_name: "Previous PC name" } },
+  ]) assert.equal(completedRequestorIdentityAccepted({ ...shared, status: { jobs: [changed] } }, expected), false);
+  assert.equal(completedRequestorIdentityAccepted({ detail, status: null }, expected), false);
+  assert.equal(completedRequestorIdentityAccepted({ ...shared, detail: { ...detail, id: "another-job" } }, expected), false);
+  assert.equal(completedRequestorIdentityAccepted({ detail: { ...detail, requestor }, status: { jobs: [] } }, expected), false);
+});
 test("live onboarding requires an explicit credential-free endpoint and model before starting any resource", () => {
   const liveProvider = { provider_base_url: "http://localhost:8119/v1", model: "test-model" };
   assert.equal(createOnboardingWinAbScenario({ liveProvider }).id, "onboarding.win-a-to-win-b");

@@ -7160,6 +7160,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             },
             source: Box::new(LlmError::Message(secret.to_string())),
         };
+        let expected_public = provider_error.public_message();
         let run = run_scripted_internal_with_pending_steers(
             ResolvedConfig::default(),
             vec![ScriptedOutcome::Error(provider_error)],
@@ -7200,7 +7201,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         let TurnTerminalOutcome::Failed { error: public } = &terminal.outcome else {
             panic!("expected failed terminal")
         };
-        assert!(public.contains("malformed response"));
+        assert_eq!(public, &expected_public);
         for private in [
             secret,
             request_id.as_str(),

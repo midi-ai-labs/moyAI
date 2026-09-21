@@ -21,7 +21,7 @@ Desktopは v3.0.0、コードネーム **LYNX**。既存のDirect接続、CLI/TU
 | provider（oMLX / LM Studio） | モデルload/unload、GPU管理、推論のキューと実行・終了 | Hubの認可・catalog revision、Desktopのtool実行・workspace権限 |
 | MCP接続者 | 明示的に許されたprofile/tool/targetへの要求 | Desktop GUIの現在選択を利用した暗黙target変更、未公開tool |
 
-HubのRustサーバーが単一のstate ownerを持ち、起動時にブラウザー管理画面を開始する。Web管理は端末TLSと別の寿命を持ち、このPCはloopback HTTP、明示公開はHTTP・HTTPSまたは同一PCproxyを使う。現在は管理者ログインを設けず、到達できる人に管理操作を公開する。Host/Origin・起動世代付きCSRF・操作allowlistを適用し、Adminの保存境界へ接続する。端末参加資格はWeb認証へ流用しない。TSは編集中の値、focus、選択、scrollを所有し、状態pollで編集中のDOMを置換しない。Webの導入は隣接Hubの [操作手順](../../moyAI-Hub/docs/web-management.md) を参照する。
+HubのRustサーバーが単一のstate ownerを持ち、起動時にブラウザー管理画面を開始する。Web管理は端末TLSと別の寿命を持つ。Hub PCのnative起動操作、または管理者へ明示的に対応付けた登録PCのDesktopから、一度だけ使えるアクセス情報を管理用cookieへ交換して開く。遠隔管理はHTTPSを必須とし、現在の端末許可・利用者との対応も確認する。ID/PW入力やURLだけでの管理アクセスは提供しない。Host/Origin・起動世代付きCSRF・操作allowlistを適用し、Adminの保存境界へ接続する。Hubの待受・モデル接続先などの変更はHub PCからの管理に限定する。TSは編集中の値、focus、選択、scrollを所有し、状態pollで編集中のDOMを置換しない。Webの導入は隣接Hubの [操作手順](../../moyAI-Hub/docs/web-management.md) を参照する。
 
 ## 2. 現在の実装範囲
 
@@ -146,7 +146,7 @@ Desktopの[接続service](../src/hub/connection.rs)はTauri managed stateとし�
 
 別endpointへの明示接続が成功した場合は、以前のMain / Sideレビューと比較元を同じatomic保存で解除し、送信先をDirectへ戻す。これは利用者が別Hubへの接続を選ぶ操作であり、Hubの障害時fallbackには使わない。同じ保存済みendpointが異なるHub identityを返した場合は接続を拒否し、以前の選択を保持する。切断・再接続はgenerationを進めて古い完了を無効にし、不要になった端末登録を期限付きのbest effortで解除する。通信不能・強制終了時は即時解除を保証せず、Hub側のheartbeat期限でも疎通不明を検出する。通常のDesktop projectionとMain / Side requestは同じ接続serviceを参照する。
 
-HubのLAN境界にはTLS、Hub fingerprintの確認、端末credentialのlocal保管、参加承認・失効、Host/Origin validation、body/connection/request limitsを実装している。Web管理は現在ログイン不要であり、端末向け相互TLSの認証境界とは区別する。変更面の最終検証と物理LANの運用受入は継続中であり、Desktop MCPのTLS試験をHub全体の受入に流用しない。端末認証は維持し、ポート競合や他Hubの保存directoryを黙って共有しない。
+HubのLAN境界にはTLS、Hub fingerprintの確認、端末credentialのlocal保管、参加承認・失効、Host/Origin validation、body/connection/request limitsを実装している。Web管理は起動操作に由来する短期アクセス情報と管理用cookieで認証し、端末向け相互TLSのtokenをブラウザーへ渡さない。遠隔管理では登録PCと管理権限の現在の対応も確認する。変更面の最終検証と物理LANの運用受入は継続中であり、Desktop MCPのTLS試験をHub全体の受入に流用しない。端末認証は維持し、ポート競合や他Hubの保存directoryを黙って共有しない。
 
 Desktop/Hubは独立したlockfileとbuild/packageを持つ。開発時の隣接checkoutをruntime依存にしない。target PCにRust/npm/dev server/internetを要求しない。Desktop v3.0.0へのversion変更を正式release完了とは扱わず、配布はclean merged commitから別途Release gateを通す。
 
@@ -161,7 +161,7 @@ Desktop/Hubは独立したlockfileとbuild/packageを持つ。開発時の隣接
 | D MCP配信 | 共通protocol・認証/target/registry/permission bridgeとHub管理受付を保持。旧手動GUI/command退役、保存データ保持・自動再開なし・停止/履歴の互換性を最終検証 |
 | E 配布 | 2 appの導入/接続説明、LAN matrix、closed-network package、upgrade/recovery、実binary identity |
 
-MCPの現行受付はHub管理の端末認証・有向許可へ集約し、共通read/agent基盤の権限を混同しない。HubのFIFO待機、capabilityの観測/明示宣言、Rustサーバー＋ブラウザー管理を実装済みである。HubのTauri管理アプリと管理キーログインは削除した。起動・保存設定復元・停止のRust試験と、Edgeを表示したPlaywrightによる直接表示・通信開始停止・保存・ダウンロードを確認した。外部HTTP/HTTPS/proxy・物理別端末の実GUI受入は未完了で、旧経路のGUI合格を変更後へ流用しない。管理者ログイン、CA root信頼の自動交換、認証付きprovider discovery、OS service等は別範囲である。旧手動MCPの第二trust、GPU memory・モデルload・provider全生成の終了保証は追加しない。
+MCPの現行受付はHub管理の端末認証・有向許可へ集約し、共通read/agent基盤の権限を混同しない。HubのFIFO待機、capabilityの観測/明示宣言、Rustサーバー＋ブラウザー管理を実装済みである。HubのTauri管理アプリと管理キーログインは削除した。起動・保存設定復元・停止のRust試験と、Edgeを表示したPlaywrightによる直接表示・通信開始停止・保存・ダウンロードを確認した。外部HTTP/HTTPS/proxy・物理別端末の実GUI受入は未完了で、旧経路のGUI合格を変更後へ流用しない。管理画面の現在の認証と開き方は[Web管理の手順](../../moyAI-Hub/docs/web-management.md)を正とする。CA root信頼の自動交換、認証付きprovider discovery、OS service等は別範囲である。旧手動MCPの第二trust、GPU memory・モデルload・provider全生成の終了保証は追加しない。
 
 現在の更新検出はheartbeatとcatalog取得を使う。配布前には、同じendpointのHubを置換する明示的な再pairing、破損設定の復旧案内、通信不能時の登録解除、接続中にDesktopを隠す場合の利用体験も検討する。現状は外部から手動編集した`hub-settings.json`を自動再読込せず、再起動を要する。古いrevisionでの保存は拒否する。
 

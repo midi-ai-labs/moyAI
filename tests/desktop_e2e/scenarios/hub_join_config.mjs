@@ -18,7 +18,7 @@ import { prepareShellBaseline, acquireInteractiveShell, requestGracefulExit } fr
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { duplicateLaunchAccepted } from "./shell_single_instance.mjs";
 import { trustedClick, wait, enrollmentAccepted, byId } from "./hub_browser_enrollment.mjs";
-import { setSharedLoginMode, sharedActionTarget, observeSharedWorkSurface } from "./shared_work_navigation.mjs";
+import { sharedActionTarget, observeSharedWorkSurface } from "./shared_work_navigation.mjs";
 
 const TITLE = "moyAI: チームの接続先を確認";
 const DRAFT = "Keep this unsent draft when cancelling team participation. 日本語";
@@ -46,8 +46,8 @@ export function cancelledActivationAccepted({ before, after, configBefore, confi
 export function joinedActivationAccepted(value, expectedDirect, url) {
   return value?.network?.enrollment === "active" && value.network.hub_url === url
     && typeof value.network.device_id === "string" && value.network.device_id.length > 0
-    && value.shared?.connected === true && value.shared.principal === null && value.shared.projects?.length === 0
-    && value.loginVisible === true && value.desktop?.startup?.onboarding_intent === "team"
+    && value.shared?.connected === true && Boolean(value.shared.principal?.user_id) && value.shared.projects?.length === 0
+    && value.loginVisible === false && value.desktop?.startup?.onboarding_intent === "team"
     && isDeepStrictEqual(directRouteIdentity(value.desktop), expectedDirect)
     && expectedDirect.main === "direct" && expectedDirect.side === "direct";
 }
@@ -182,46 +182,21 @@ function createJoinConfigScenario(mode, options) {
         await page.locator("#join-project-save").click(); await page.locator("#join-project-dialog").waitFor({ state: "hidden" });
         await wait("This approved Desktop device enrolls", async () => ({ network: await invokeDesktopCommand(cdp, "device_network_projection"), snapshot: await hub.observeNetwork() }),
           p => enrollmentAccepted(p.network, p.snapshot), 45_000);
-        const joined = await wait("Approved device shows human login with Direct settings retained", () => observe(cdp),
+        const joined = await wait("Approved device becomes usable without login with Direct settings retained", () => observe(cdp),
           p => joinedActivationAccepted(p, expectedDirect, state.url));
-        await captureScenarioScreenshot({ cdp, sink, name: `join-config-${mode}-human-login`, owner });
+        await captureScenarioScreenshot({ cdp, sink, name: `join-config-${mode}-device-ready`, owner });
         await sink.record("join-config-completed", { mode, request_id: pending.request_id, device_id: joined.network.device_id,
           direct: directRouteIdentity(joined.desktop), principal: joined.shared.principal, login_visible: joined.loginVisible,
-          scope: "Actual native review, public trust import, browser device approval and human login entry; no project membership or model generation." }, { phase: "executing", owner });
+          scope: "Actual native review, public trust import, browser device approval and automatic device access; no project membership or model generation." }, { phase: "executing", owner });
         if (mainWindow) {
           const same = await probeExactOwnedWindow({ ...native, candidate: mainWindow });
           if (!same.live || !same.exact_identity || same.window.hwnd !== mainWindow.hwnd) throw fail("Warm activation replaced the main HWND", same);
         }
         if (mode === "warm") {
-          // A normal person chooses their own password through the real shared UI.
           state.commands = new DesktopCommandProbe(cdp, { probeId: id, commands: ["shared_work_command"] });
           await state.commands.install();
-          await page.locator('nav a[href="#shared-administration"]').click();
-          await page.locator('[data-sa-tab="users"]').click();
-          await page.locator('[data-sa-operation="create_user_with_setup_code"]').click();
-          await page.locator("#shared-admin-username").fill("endpoint-alice");
-          await page.locator("#shared-admin-display_name").fill("Endpoint Alice");
-          await page.locator("#shared-admin-save").click();
-          await page.locator("#shared-admin-form").waitFor({ state: "detached" });
-          await page.locator("#shared-admin-setup-code").waitFor({ state: "visible" });
-          const setupCode = await page.locator("#shared-admin-setup-code-value").inputValue();
-          if (!/^[0-9a-f]{64}$/.test(setupCode)) throw fail("The fixture did not receive an initial password setup code", {});
-          const userId = await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "Endpoint Alice", exact: true }) })
-            .locator('[data-sa-operation="update_user"]').getAttribute("data-sa-id");
-          if (!userId) throw fail("The fixture person is absent from Hub administration", {});
-          await page.locator("#shared-admin-setup-code-close").click();
-          const password = randomUUID();
-          async function fill(id, value) {
-            const target = byId(id, "INPUT"); await trustedClick(state.input, cdp, target, sink); await state.input.insertText(target, value);
-          }
-          await setSharedLoginMode(state.input, cdp, sink, "setup");
-          await fill("shared-username", "endpoint-alice"); await fill("shared-password", password);
-          await fill("shared-setup-code", setupCode); await fill("shared-setup-confirm", password);
-          await trustedClick(state.input, cdp, sharedActionTarget("setup-password"), sink);
-          await wait("The ordinary person completes their own first password", () => invokeDesktopCommand(cdp, "shared_work_projection"), p =>
-            p.principal?.user_id === userId && p.principal.administrator === false);
-          const rememberedBytes = await readFile(path.join(path.dirname(context.paths.config_file), "device-network/shared-human-auth.dpapi"));
-          if (!rememberedBytes.length) throw fail("Remembered human credentials were not persisted", {});
+          const principal = (await wait("Approved device obtains its assigned actor without credentials", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.principal && !p.principal.administrator)).principal;
+          const userId = principal.user_id;
           const afterLogin = (await state.commands.snapshot()).sequence;
           const trustBefore = await deviceTrustIdentity(context);
           const configBeforeRejection = await readFile(context.paths.config_file, "utf8");
@@ -261,7 +236,7 @@ function createJoinConfigScenario(mode, options) {
           if (!movedConfig.includes(state.url) || sameCa !== state.expectedText[1]) throw fail("The endpoint fixture changed trust instead of only the Hub address", {});
           state.expectedText = [state.url, previousUrl, sameCa];
           await dialog(await duplicate(), 1, "same-hub-new-address");
-          const expected = { url: state.url, device_id: joined.network.device_id, user_id: userId, display_name: "Endpoint Alice", direct: expectedDirect };
+          const expected = { url: state.url, device_id: joined.network.device_id, user_id: userId, display_name: principal.display_name, direct: expectedDirect };
           const moved = await wait("Same Hub move restores the remembered person without another login", async () => ({
             ...await observe(cdp), surface: await observeSharedWorkSurface(cdp), calls: (await state.commands.snapshot(afterLogin)).calls,
           }), value => movedActivationAccepted(value, expected), 45_000);

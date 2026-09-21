@@ -7,6 +7,23 @@ use serde_json::json;
 
 use super::{DeviceError, DeviceIdentity, ManagedHubHttp, SharedHubConfig, stable_id};
 
+// Display metadata only. Authentication is the independently generated device key,
+// never this environment label (which a process or user may change).
+fn windows_username() -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let username = std::env::var("USERNAME").ok()?;
+    let mut value = String::new();
+    for character in username.trim().chars().filter(|c| !c.is_control()) {
+        if value.len() + character.len_utf8() > 256 {
+            break;
+        }
+        value.push(character);
+    }
+    (!value.is_empty()).then_some(value)
+}
+
 #[derive(Clone)]
 pub(crate) struct DeviceClient {
     http: ManagedHubHttp,
@@ -344,7 +361,7 @@ impl DeviceClient {
     ) -> Result<JoinRequestReceipt, DeviceError> {
         self.request(
             "/v1/network/join/request",
-            Some(&json!({"label":label,"csr_pem":csr_pem})),
+            Some(&json!({"label":label,"csr_pem":csr_pem,"windows_username":windows_username()})),
         )
         .await
     }

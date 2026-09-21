@@ -6,12 +6,12 @@ import { sharedWorkAction } from "../src/shared_work_actions.ts";
 import { sharedUiFixture, sharedProjection } from "./shared_work_fixture.ts";
 import type { ActionContext } from "../src/actions.ts";
 
-test("controller onboarding distinguishes enrollment, human and project without local execution requirements", () => {
+test("controller onboarding needs device approval and project assignment without another login", () => {
   const local = sharedUiFixture();
   local.projection = sharedProjection({ connected: false, enrollment: "pending", principal: null, projects: [], selected_project_id: null, status: null });
   const html = renderSharedWorkOnboarding(local);
   assert.match(html, /管理者の承認待ち/);
-  assert.match(html, /本人ログイン · 未完了/);
+  assert.doesNotMatch(html, /本人ログイン|パスワード/);
   assert.match(html, /このPCにAIや実行用フォルダーを設定する必要はありません/);
   assert.doesNotMatch(html, /data-action="shared-prepare-sample"/);
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createScenario } from "../scenario_registry.mjs";
-import { createSharedWorkIsolationScenario, isolatedDevicesAccepted, personalProjectAccepted, isolatedLogoutAccepted, sharedMainFillsShell } from "../scenarios/shared_work_isolation.mjs";
+import { createSharedWorkIsolationScenario, isolatedDevicesAccepted, personalProjectAccepted, isolatedAccessRemovalAccepted, sharedMainFillsShell } from "../scenarios/shared_work_isolation.mjs";
 
 const expected = { user_id: "bob", display_name: "Bob", project_id: "project-b", project_label: "Bob project" };
 function personal() {
@@ -9,9 +9,9 @@ function personal() {
     shared: { connected: true, principal: { user_id: "bob", administrator: false }, projects: [{ id: "project-b" }], selected_project_id: "project-b", status: { jobs: [] }, observed_at_ms: 101 },
     visible_project_ids: ["project-b"], person_text: "Bob · project", project_heading: "Bob project", login_visible: false };
 }
-function loggedOut() {
+function accessRemoved() {
   return { desktop: { hub_project_open: true, overlay: "none", busy: false },
-    shared: { connected: true, principal: null, projects: [], status: null, detail: null }, visible_project_ids: [], login_visible: true };
+    shared: { connected: true, principal: { user_id: "alice" }, projects: [], status: null, detail: null }, visible_project_ids: [], login_visible: false };
 }
 
 test("Hub main geometry rejects a vacant third column and overflowing or missing surfaces", () => {
@@ -62,21 +62,21 @@ test("person isolation requires exact membership, selected project and visible s
   }
 });
 
-test("logout proof needs another authenticated observation after A actually cleared", () => {
-  const value = { a: loggedOut(), b: personal() };
-  assert.equal(isolatedLogoutAccepted(value, expected, 100), true);
-  assert.equal(isolatedLogoutAccepted(value, expected, 101), false);
-  assert.equal(isolatedLogoutAccepted(value, expected, 102), false);
+test("project access removal needs a fresh unaffected B observation", () => {
+  const value = { a: accessRemoved(), b: personal() };
+  assert.equal(isolatedAccessRemovalAccepted(value, expected, 100), true);
+  assert.equal(isolatedAccessRemovalAccepted(value, expected, 101), false);
+  assert.equal(isolatedAccessRemovalAccepted(value, expected, 102), false);
   for (const mutate of [
-    next => { next.a.shared.principal = { user_id: "alice" }; },
+    next => { next.a.shared.principal = null; },
     next => { next.a.shared.projects = [{ id: "project-a" }]; },
     next => { next.a.shared.status = { jobs: [] }; },
     next => { next.a.shared.detail = { id: "old-job" }; },
     next => { next.a.visible_project_ids = ["project-a"]; },
-    next => { next.a.login_visible = false; },
+    next => { next.a.login_visible = true; },
     next => { next.b.shared.principal = null; },
     next => { next.b.shared.observed_at_ms = undefined; },
   ]) {
-    const next = structuredClone(value); mutate(next); assert.equal(isolatedLogoutAccepted(next, expected, 100), false);
+    const next = structuredClone(value); mutate(next); assert.equal(isolatedAccessRemovalAccepted(next, expected, 100), false);
   }
 });

@@ -39,16 +39,16 @@ test("cancel oracle rejects persisted mutation, admission, lost draft or changed
   ]) { const changed = structuredClone(value); mutate(changed); assert.equal(cancelledActivationAccepted(changed), false); }
 });
 
-test("OK requires actual device registration and a visible unauthenticated shared entry, keeping both Direct routes", () => {
+test("OK requires actual device registration and automatic device access without a login form, keeping both Direct routes", () => {
   const url = "https://127.0.0.1:9471", expected = directRouteIdentity(desktop);
   const value = { desktop: { ...desktop, startup: { onboarding_intent: "team" } },
     network: { enrollment: "active", hub_url: url, device_id: "device-1" },
-    shared: { connected: true, principal: null, projects: [] }, loginVisible: true };
+    shared: { connected: true, principal: { user_id: "device-actor" }, projects: [] }, loginVisible: false };
   assert.equal(joinedActivationAccepted(value, expected, url), true);
   for (const mutate of [
     x => { x.network.enrollment = "pending"; }, x => { x.network.hub_url = "https://other:9471"; },
-    x => { x.shared.principal = { user_id: "unexpected-auto-login" }; }, x => { x.shared.projects = [{}]; },
-    x => { x.loginVisible = false; }, x => { x.desktop.hub.side_chat_mode = "hub"; },
+    x => { x.shared.principal = null; }, x => { x.shared.projects = [{}]; },
+    x => { x.loginVisible = true; }, x => { x.desktop.hub.side_chat_mode = "hub"; },
     x => { x.desktop.provider_effective_model_id = "overwritten"; },
   ]) { const changed = structuredClone(value); mutate(changed); assert.equal(joinedActivationAccepted(changed, expected, url), false); }
 });

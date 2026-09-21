@@ -90,7 +90,7 @@ export function retainSharedWorkSurface(current: HTMLElement, next: HTMLElement)
     }
     if (region.isEqualNode(nextRegion)) continue;
     const active = region.contains(document.activeElement);
-    if (active && document.activeElement?.matches("input,textarea,select") && ["login", "draft", "followup", "handover"].includes(nextRegion.dataset.sharedRegion ?? "")) {
+    if (active && document.activeElement?.matches("input,textarea,select") && ["draft", "followup", "handover"].includes(nextRegion.dataset.sharedRegion ?? "")) {
       for (const field of region.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-shared-field]")) {
         const replacement = nextRegion.querySelector<HTMLInputElement>(`[data-shared-field="${field.dataset.sharedField}"]`);
         if (replacement) field.disabled = replacement.disabled;

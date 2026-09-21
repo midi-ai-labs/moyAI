@@ -447,7 +447,7 @@ async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_
             checkpoint_cursor: String::new(),
             commands: None,
             external: None,
-            local_human: None,
+            local_project_id: None,
         };
         if earlier_yield_committed {
             assert!(controller.flush_report(&mut entry).await.is_err());
@@ -557,7 +557,7 @@ async fn stopped_yield_keeps_checkpoint_for_canonical_settlement_after_reopen() 
             checkpoint_cursor: String::new(),
             commands: None,
             external: None,
-            local_human: None,
+            local_project_id: None,
         };
         controller.collect_outcome(&mut entry).unwrap();
         assert_eq!(entry.phase, Phase::ReportPending);

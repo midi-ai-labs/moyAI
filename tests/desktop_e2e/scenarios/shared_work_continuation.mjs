@@ -7,7 +7,7 @@ import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/
 import { startSharedWorkflowProvider, startSharedWorkflowRunner } from "../drivers/shared_work_runner_fixture.mjs";
 import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
 import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathInOwnedNativeDialog, probeExactOwnedWindow } from "../drivers/windows_native_input.mjs";
-import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
+import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget, bindHubDevice } from "./shared_work_navigation.mjs";
 import { auditClosedSqlite } from "../drivers/sqlite_cleanup.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
@@ -41,7 +41,6 @@ export function createSharedWorkContinuationScenario(options = {}) {
         await openHubProjectSurface(state.input, cdp, sink);
       }
       async function click(kind, value = "") {
-        if (kind === "logout") await openSharedDisclosure(state.input, cdp, sink, "hub-project-account");
         await trustedClick(state.input, cdp, sharedActionTarget(kind, value), sink);
       }
       async function fill(id, value, tag = "INPUT") {
@@ -132,10 +131,10 @@ export function createSharedWorkContinuationScenario(options = {}) {
         const actorApproval = await actor.collectApproval();
         if (actorApproval.status !== "approved") throw fail("The fixture participant was not approved through Hub controls");
         await actor.presence();
-        await actor.sharedLogin(state.resource.administrator.username, state.resource.administrator.password);
-        const password = randomUUID();
-        const alice = await actor.sharedCall("createUser", { username: "workflow-alice", display_name: "担当 Alice", password, administrator: false });
-        const bob = await actor.sharedCall("createUser", { username: "workflow-bob", display_name: "担当 Bob", password, administrator: false });
+        const bob = (await actor.sharedDeviceSession()).principal;
+        const alice = (await wait("Desktop A uses its approved device identity", projection, p => p.principal && !p.principal.administrator)).principal;
+        await bindHubDevice(state.resource, actorApproval.deviceId, state.resource.administrator.user_id);
+        await actor.sharedDeviceSession();
         await actor.sharedCall("createProject", { id: "workflow", label: "端末を移る共有業務" });
         for (const user of [alice, bob]) await actor.sharedCall("membership", { project_id: "workflow", user_id: user.user_id, role: "contributor" });
         for (const [id, label] of [["analysis", "親の解析"], ["solver", "子の解析"]]) await actor.sharedCall("environment", { id, label, resource_id: "workflow-device", runner_id: enrolled.network.device_id, capacity: 1, project_ids: ["workflow"] });
@@ -143,8 +142,6 @@ export function createSharedWorkContinuationScenario(options = {}) {
         // This scenario owns real parent/child execution and cross-device conversation.
         // Initial PC execution permission and automatic folder provisioning have their
         // own device-execution scenario; no retired provider controls are invoked here.
-        await setSharedLoginMode(state.input, cdp, sink, "password");
-        await fill("shared-username", "workflow-alice"); await fill("shared-password", password); await click("login");
         await wait("Alice can submit to the real Runner", projection, p => p.principal?.user_id === alice.user_id && ["analysis", "solver"].every(id => p.status?.environments.some(e => e.id === id)));
         await trustedClick(state.input, cdp, { selector: '.sidebar button[data-action="open-hub-project"][data-value="workflow"]', identity: { tag: "BUTTON", action: "open-hub-project" } }, sink);
         await click("new-conversation");
@@ -190,10 +187,9 @@ export function createSharedWorkContinuationScenario(options = {}) {
           await click("reconnect");
         } });
         if (second.network.device_id === enrolled.network.device_id) throw fail("B reused the same device identity");
-        const beforeLogin = await projection();
-        if (beforeLogin.principal !== null || beforeLogin.projects.length !== 0) throw fail("A different device/profile inherited another device's human login");
-        await setSharedLoginMode(state.input, cdp, sink, "password");
-        await fill("shared-username", "workflow-alice"); await fill("shared-password", password); await click("login");
+        const beforeAssociation = await wait("A different registered device receives its own actor", projection, p => p.principal && !p.principal.administrator);
+        if (beforeAssociation.principal.user_id === alice.user_id) throw fail("B inherited A identity without administrator association");
+        await bindHubDevice(state.resource, second.network.device_id, alice.user_id);
         await wait("Fresh B sees the same parent job", projection, p => p.status?.jobs.some(j => j.id === parentId));
         provider.releaseChild();
         await click("detail", childId);
@@ -210,8 +206,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
         const asset = (await projection()).assets.find(a => a.name === "result.txt" && a.kind === "artifact");
         const saved = path.join(currentContext.paths.workspace, "downloaded-result.txt"); await nativeFile("save-asset", saved, asset.id);
         await wait("B saves verified artifact bytes", () => readFile(saved).catch(() => null), bytes => bytes !== null && createHash("sha256").update(bytes).digest("hex") === asset.sha256 && bytes.toString("utf8").replaceAll("\r\n", "\n") === "shared solver result 日本語\n");
-        await click("logout"); await setSharedLoginMode(state.input, cdp, sink, "password");
-        await fill("shared-username", "workflow-bob"); await fill("shared-password", password); await click("login");
+        await bindHubDevice(state.resource, second.network.device_id, bob.user_id);
         const notified = await wait("New assignee receives a handover notification", projection, p => p.principal?.user_id === bob.user_id && p.inbox?.items.some(i => i.kind === "handover" && i.job_id === parentId));
         const notification = notified.inbox.items.find(i => i.kind === "handover" && i.job_id === parentId);
         await click("inbox-open", notification.id);

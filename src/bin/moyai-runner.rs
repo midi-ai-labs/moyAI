@@ -87,16 +87,15 @@ enum Command {
         #[arg(default_value = "{\"operation\":\"status\"}")]
         request: String,
     },
-    /// Authenticate local CLI/TUI/legacy work to the Hub; password is read with console echo off.
-    SignIn {
+    /// Select an allowed Hub project for local CLI/TUI work on this approved device.
+    UseProject {
         #[arg(long)]
         runner: Ulid,
         #[arg(long)]
-        username: String,
-        #[arg(long)]
         project: String,
     },
-    SignOut {
+    /// Clear the selected local Hub project; device enrollment is preserved.
+    ClearProject {
         #[arg(long)]
         runner: Ulid,
     },
@@ -172,23 +171,17 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Command::Identity => RunnerCommand::Identity,
-        Command::SignIn {
-            runner,
-            username,
-            project,
-        } => RunnerCommand::Operations {
+        Command::UseProject { runner, project } => RunnerCommand::Operations {
             runner_id: runner,
-            operation: moyai::runner::operations::RunnerOperation::LocalSignIn {
-                credentials: moyai::runner::operations::LocalCredentials {
-                    username,
-                    password: read_password()?,
-                    project_id: project,
-                },
+            operation: moyai::runner::operations::RunnerOperation::LocalProject {
+                project_id: Some(project),
             },
         },
-        Command::SignOut { runner } => RunnerCommand::Operations {
+        Command::ClearProject { runner } => RunnerCommand::Operations {
             runner_id: runner,
-            operation: moyai::runner::operations::RunnerOperation::LocalSignOut,
+            operation: moyai::runner::operations::RunnerOperation::LocalProject {
+                project_id: None,
+            },
         },
         Command::SharedStatus { runner } => RunnerCommand::SharedStatus { runner_id: runner },
         Command::Operations { runner, request } => RunnerCommand::Operations {
@@ -242,41 +235,6 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("{}", serde_json::to_string(&windows::request(&command)?)?);
     Ok(())
-}
-
-#[cfg(windows)]
-fn read_password() -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::{BufRead, Read, Write};
-    use windows_sys::Win32::{Foundation::HANDLE, System::Console::*};
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let mut mode = 0;
-    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        return Err("Hub sign-in needs an interactive console for hidden password entry".into());
-    }
-    struct Restore(HANDLE, u32);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            unsafe {
-                SetConsoleMode(self.0, self.1);
-            }
-        }
-    }
-    let _restore = Restore(handle, mode);
-    if unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) } == 0 {
-        return Err("Cannot disable password echo".into());
-    }
-    eprint!("Hub password: ");
-    std::io::stderr().flush()?;
-    let mut password = String::new();
-    std::io::stdin()
-        .lock()
-        .take(1026)
-        .read_line(&mut password)?;
-    eprintln!();
-    if password.len() > 1024 {
-        return Err("Password exceeds its bound".into());
-    }
-    Ok(password.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 #[cfg(not(windows))]

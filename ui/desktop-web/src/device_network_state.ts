@@ -131,7 +131,7 @@ export function acceptDeviceNetworkProjection(
   }
   state.projection = projection;
   if (previous && previous.enrollment !== "active" && projection.enrollment === "active") {
-    state.notice = "Hubへの参加が承認され、接続しました。初回ログイン後、割り当てられたプロジェクトが通常の一覧に表示されます。";
+    state.notice = "Hubへの参加が承認され、接続しました。管理者がこのPCを操作PCに指定したプロジェクトが、左の一覧に表示されます。";
   }
   for (const [key, result] of Object.entries(state.diagnostics)) {
     if (result.revision !== projection.revision || result.generation !== projection.generation
@@ -283,6 +283,7 @@ export function deviceNetworkError(error: unknown): string {
     network_unavailable: "Hubへ接続できません。ネットワークとHubの稼働状況を確認してください。",
     invalid_configuration: "Hubが出力した共通設定ファイルを確認してください。",
     invalid_identity: "端末の認証情報を利用できません。Hub管理者へ確認してください。",
+    identity_protection_unavailable: "このWindows利用者では端末の認証情報を開けません。登録時のWindows利用者で起動してください。PC交換などで戻せない場合は、Hub管理者へ端末の再登録を依頼してください。保存済みの認証情報は変更していません。",
     settings_corrupt: "保存された端末設定を読み込めません。設定を上書きせず、管理者へ確認してください。",
     settings_changed: "保存設定が変わりました。最新情報を取得し、入力内容を確認してから保存してください。",
       connection_changed: "接続状態が変わりました。最新情報を取得し、入力内容を確認してから保存してください。",

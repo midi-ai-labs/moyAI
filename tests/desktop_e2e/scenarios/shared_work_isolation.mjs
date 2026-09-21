@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { createCompanionContext } from "../core/run_context.mjs";
 import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/hub_browser_resource.mjs";
@@ -6,7 +5,7 @@ import { WebviewInput } from "../drivers/webview_input.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { byId, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { hubProjectReady, openHubProjectSurface, openSharedDisclosure, sharedActionTarget, setSharedLoginMode } from "./shared_work_navigation.mjs";
+import { hubProjectReady, openHubProjectSurface, openSharedDisclosure, sharedActionTarget } from "./shared_work_navigation.mjs";
 
 const ID = "settings.shared-work-isolation", OWNER = `scenario:${ID}`;
 const failure = (message, evidence = {}) => new DesktopE2eError("product", "shared-isolation-mismatch", message, evidence);
@@ -39,13 +38,13 @@ export function personalProjectAccepted(value, expected) {
     && value.login_visible === false;
 }
 
-export function isolatedLogoutAccepted(value, expectedB, observedBeforeLogout) {
+export function isolatedAccessRemovalAccepted(value, expectedB, observedBeforeRemoval) {
   const a = value?.a;
-  return hubProjectReady(a?.desktop) && a.shared?.connected === true && a.shared.principal === null
+  return hubProjectReady(a?.desktop) && a.shared?.connected === true && Boolean(a.shared.principal?.user_id)
     && a.shared.projects?.length === 0 && a.shared.status === null && a.shared.detail === null
-    && a.visible_project_ids?.length === 0 && a.login_visible === true
+    && a.visible_project_ids?.length === 0 && a.login_visible === false
     && personalProjectAccepted(value.b, expectedB)
-    && Number.isFinite(value.b.shared.observed_at_ms) && value.b.shared.observed_at_ms > observedBeforeLogout;
+    && Number.isFinite(value.b.shared.observed_at_ms) && value.b.shared.observed_at_ms > observedBeforeRemoval;
 }
 
 export function createSharedWorkIsolationScenario(options = {}) {
@@ -88,8 +87,7 @@ export function createSharedWorkIsolationScenario(options = {}) {
         });
         pc.identity = { process_id: pc.runtime.desktop_process_id, network: enrolled.network,
           key_sha256: enrolled.keySha256, certificate_sha256: enrolled.certificateSha256 };
-        const shared = await invokeDesktopCommand(pc.driver, "shared_work_projection");
-        if (!shared.connected || shared.principal !== null || shared.projects.length !== 0) throw failure("PC enrollment must not acquire a human session", { desktop: pc.name });
+        await wait("Approved PC receives its own actor without project access", () => invokeDesktopCommand(pc.driver, "shared_work_projection"), shared => shared.connected && shared.principal && !shared.principal.administrator && shared.projects.length === 0);
       }
       async function observe(pc) {
         const desktop = await invokeDesktopCommand(pc.driver, "desktop_state");
@@ -113,37 +111,19 @@ export function createSharedWorkIsolationScenario(options = {}) {
         await page.locator("#shared-admin-save").click();
         await page.locator("#shared-admin-form").waitFor({ state: "detached" });
       }
-      async function createPerson(username, displayName) {
-        const password = randomUUID();
-        await page.locator('[data-sa-tab="users"]').click();
-        await page.locator('[data-sa-operation="create_user"]').click();
-        await page.locator("#shared-admin-username").fill(username);
-        await page.locator("#shared-admin-display_name").fill(displayName);
-        await page.locator("#shared-admin-password").fill(password); await save();
-        const card = page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: displayName, exact: true }) });
-        const userId = await card.locator('[data-sa-operation="update_user"]').getAttribute("data-sa-id");
-        if (!userId) throw failure("Hub user creation did not expose the saved user identity");
-        return { username, displayName, password, user_id: userId };
-      }
-      async function createProject(person, label) {
+      async function createProject(pc, label) {
         await page.locator('[data-sa-tab="projects"]').click();
         await page.locator('[data-sa-operation="save_project"][data-sa-id=""]').click();
         await page.locator("#shared-admin-label").fill(label);
-        await page.getByRole("combobox", { name: person.displayName, exact: true }).selectOption("contributor");
-        // Both PCs can control both projects. Human membership is the only difference.
-        for (const pc of [a, b]) await page.locator(`input[name="controller_device_ids"][value=${JSON.stringify(pc.identity.network.device_id)}]`).check();
+        await page.locator(`input[name="controller_device_ids"][value=${JSON.stringify(pc.identity.network.device_id)}]`).check();
         await save();
         const card = page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: label, exact: true }) });
         const projectId = await card.locator('[data-sa-operation="save_project"]').getAttribute("data-sa-id");
         if (!projectId) throw failure("Hub project creation did not expose the saved project identity");
-        return { user_id: person.user_id, display_name: person.displayName, project_id: projectId, project_label: label };
+        const principal = (await invokeDesktopCommand(pc.driver, "shared_work_projection")).principal;
+        return { user_id: principal.user_id, display_name: principal.display_name, project_id: projectId, project_label: label };
       }
-      async function login(pc, person, expected) {
-        await setSharedLoginMode(pc.input, pc.driver, pc.sink, "password");
-        for (const [id, value] of [["shared-username", person.username], ["shared-password", person.password]]) {
-          const target = byId(id, "INPUT"); await trustedClick(pc.input, pc.driver, target, pc.sink); await pc.input.insertText(target, value);
-        }
-        await trustedClick(pc.input, pc.driver, sharedActionTarget("login"), pc.sink);
+      async function openProject(pc, expected) {
         await wait(`${pc.name} receives only its person's project`, () => invokeDesktopCommand(pc.driver, "shared_work_projection"), value =>
           value.principal?.user_id === expected.user_id && value.projects.length === 1 && value.projects[0].id === expected.project_id);
         await trustedClick(pc.input, pc.driver, { selector: `.sidebar button[data-action="open-hub-project"][data-value=${JSON.stringify(expected.project_id)}]`, identity: { tag: "BUTTON", action: "open-hub-project" } }, pc.sink);
@@ -172,10 +152,9 @@ export function createSharedWorkIsolationScenario(options = {}) {
         if (!isolatedDevicesAccepted(a.identity, b.identity)) throw failure("The simultaneous Desktops reused a process, device identity or key", { a: a.identity, b: b.identity });
         await sink.record("shared-isolation-devices", { a: a.identity, b: b.identity }, { phase: "executing", owner: OWNER });
         await page.locator('nav a[href="#shared-administration"]').click();
-        const alice = await createPerson("isolation-alice", "隔離試験 Alice"), bob = await createPerson("isolation-bob", "隔離試験 Bob");
-        const expectedA = await createProject(alice, "Alice のプロジェクト"), expectedB = await createProject(bob, "Bob のプロジェクト");
+        const expectedA = await createProject(a, "A のプロジェクト"), expectedB = await createProject(b, "B のプロジェクト");
         await resource.screenshot("shared-isolation-project-people-and-pcs");
-        await login(a, alice, expectedA); await login(b, bob, expectedB);
+        await openProject(a, expectedA); await openProject(b, expectedB);
         await wait("Both live Desktops retain independent people and project lists", async () => ({ a: await observe(a), b: await observe(b) }),
           value => personalProjectAccepted(value.a, expectedA) && personalProjectAccepted(value.b, expectedB));
         await captureScenarioScreenshot({ cdp: a.driver, sink: a.sink, name: "shared-isolation-alice", owner: OWNER });
@@ -183,19 +162,22 @@ export function createSharedWorkIsolationScenario(options = {}) {
         const geometry = { a: await layout(a), b: await layout(b) };
         await sink.record("shared-isolation-main-layout", geometry, { phase: "executing", owner: OWNER });
         if (!sharedMainFillsShell(geometry.a) || !sharedMainFillsShell(geometry.b)) throw failure("The Hub project leaves an unused column beside the main conversation", geometry);
-        await openSharedDisclosure(a.input, a.driver, a.sink, "hub-project-account");
-        await trustedClick(a.input, a.driver, sharedActionTarget("logout"), a.sink);
-        const cleared = await wait("A completes logout while B retains its person", async () => ({ a: await observe(a), b: await observe(b) }),
-          value => isolatedLogoutAccepted(value, expectedB, -1));
-        const logout = await wait("Logging out A leaves B authenticated after a fresh automatic Hub observation", async () => ({ a: await observe(a), b: await observe(b) }),
-          value => isolatedLogoutAccepted(value, expectedB, cleared.b.shared.observed_at_ms));
-        await captureScenarioScreenshot({ cdp: a.driver, sink: a.sink, name: "shared-isolation-a-logged-out", owner: OWNER });
-        await captureScenarioScreenshot({ cdp: b.driver, sink: b.sink, name: "shared-isolation-b-still-logged-in", owner: OWNER });
+        await page.locator('nav a[href="#shared-administration"]').click();
+        await page.locator('[data-sa-tab="projects"]').click();
+        await page.locator(`[data-sa-operation="save_project"][data-sa-id=${JSON.stringify(expectedA.project_id)}]`).click();
+        await page.locator(`input[name="controller_device_ids"][value=${JSON.stringify(a.identity.network.device_id)}]`).uncheck();
+        await save();
+        const cleared = await wait("Removing A from its project clears access while B remains ready", async () => ({ a: await observe(a), b: await observe(b) }),
+          value => isolatedAccessRemovalAccepted(value, expectedB, -1));
+        const removed = await wait("B still receives fresh observations after A access removal", async () => ({ a: await observe(a), b: await observe(b) }),
+          value => isolatedAccessRemovalAccepted(value, expectedB, cleared.b.shared.observed_at_ms));
+        await captureScenarioScreenshot({ cdp: a.driver, sink: a.sink, name: "shared-isolation-a-access-removed", owner: OWNER });
+        await captureScenarioScreenshot({ cdp: b.driver, sink: b.sink, name: "shared-isolation-b-still-ready", owner: OWNER });
         if (resource.provider.requests.some(request => request.method !== "GET")) throw failure("Identity isolation requested an unrelated model generation");
         await sink.record("shared-isolation-complete", { a: expectedA, b: expectedB,
-          desktop_process_ids: [a.identity.process_id, b.identity.process_id], a_logged_out: true, b_still_authenticated: true,
-          b_observed_at_logout_ms: cleared.b.shared.observed_at_ms, b_observed_after_logout_ms: logout.b.shared.observed_at_ms,
-          scope: "Two simultaneous isolated Tauri Desktops; native public configuration import, independent device keys and approvals, Hub GUI people/projects, trusted Desktop logins and logout. Both PCs can control both projects; person membership limits visibility. No solver work or private credential contents are inspected." }, { phase: "executing", owner: OWNER });
+          desktop_process_ids: [a.identity.process_id, b.identity.process_id], a_project_access_removed: true, b_still_authenticated: true,
+          b_observed_at_removal_ms: cleared.b.shared.observed_at_ms, b_observed_after_removal_ms: removed.b.shared.observed_at_ms,
+          scope: "Two simultaneous isolated Tauri Desktops; native public configuration import, independent device keys and approvals, Hub GUI project PC assignment and removal. Each approved PC sees only its assigned project without ID/PW. No solver work or private credential contents are inspected." }, { phase: "executing", owner: OWNER });
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } finally { await settle(a); await settle(b); }
     },

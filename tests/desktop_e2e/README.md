@@ -28,7 +28,7 @@ tests/desktop_e2e/
 - `executeDesktopScenario` はpreflightからsealまでを一度だけ進める共通orchestratorである。CLIは引数とscenarioをbindingするだけで、scenarioごとのrunnerを実装しない。
 - `WindowsTauriHost` はatomic admission、launch、dynamic attach、exact process/profile ownership、graceful/forced cleanup、SQLite最終auditを所有する。
 - `shell.single-instance` は完了済みsessionの未送信draftを残し、exact HWNDを非表示・最小化して同じbinaryを再起動する。`WindowsTauriHost.launchDuplicate` が現行generationのconfig/data/profileを再利用し、共通Windows Job ownerで二重起動側を終了・回収する。同一HWNDの表示/最小化解除、既存Desktop processがexact 1件、session/history/draft保持、起動側stdoutと画面の明示noticeを検証する。foreground権限と物理入力は別の確認項目である。
-- `hub.join-config-cold` / `hub.join-config-warm` は `--desktop-isolation fixture` で実 Hub の管理画面から公開接続ファイル `.moyai-join` を取得し、`--join-config` の起動引数を検証する。cold は初回プロセス起動時の OK、warm は同一 Desktop への再起動通知で Cancel → 設定・下書き保持 → 再取り込み OK を扱う。共通 native driver が exact HWND/PID・ダイアログ題名・Hub URL・CA 指紋を照合し、標準 Button の HWND・親・class・control ID を照合し、共通 native-control driver の BM_CLICK で一度だけ操作する。管理画面で PC を承認し、Direct 設定を保持した本人ログイン入口を確認する。warm は続けて通常利用者の本人初回設定、別の実在公開CAの拒否、同じHubを管理画面から別ポートで再開して再export → native確認 → 同じPC登録・本人の記憶済みログイン・Direct設定の維持も確認する。Runner停止は別のbackend gateで扱い、別Hubへの登録移行、Explorerの関連付け解決、物理入力、初回PCのランタイム導入は対象外。Hubの指定は他の複合試験と同じ `--scenario-config` の `hubBinary` または `MOYAI_HUB_TEST_BINARY` を使う。
+- `hub.join-config-cold` / `hub.join-config-warm` は `--desktop-isolation fixture` で実 Hub の管理画面から公開接続ファイル `.moyai-join` を取得し、`--join-config` の起動引数を検証する。cold は初回プロセス起動時の OK、warm は同一 Desktop への再起動通知で Cancel → 設定・下書き保持 → 再取り込み OK を扱う。共通 native driver が exact HWND/PID・ダイアログ題名・Hub URL・CA 指紋を照合し、標準 Button の HWND・親・class・control ID を照合し、共通 native-control driver の BM_CLICK で一度だけ操作する。管理画面で PC を承認し、Direct 設定を保持した登録PCによる自動認証を確認する。warm は続けてPCのプロジェクトへの割当、別の実在公開CAの拒否、同じHubを管理画面から別ポートで再開して再export → native確認 → 同じPC登録・利用者との対応・Direct設定の維持も確認する。Runner停止は別のbackend gateで扱い、別Hubへの登録移行、Explorerの関連付け解決、物理入力、初回PCのランタイム導入は対象外。Hubの指定は他の複合試験と同じ `--scenario-config` の `hubBinary` または `MOYAI_HUB_TEST_BINARY` を使う。
 - `EvidenceSink` だけが append-only evidence と final seal を書く。driverはtyped observationを返すだけで、final resultを書かない。
 - `settings.initial-setup-hub-preferences-failure` は通常の初回詳細Hub取込みと同じHub・native picker・cleanup ownerを使う。初回画面の表示後に隔離preferencesだけを空directoryへ置き換え、接続情報の保存・serviceの参加申請・初回完了状態の未保存・可視警告を別々に確認する。元のpreferencesはfinallyで戻し、空directory以外を再帰削除しない。通常成功の `settings.initial-setup-hub` と同じくphysical inputのmanual gateを保持する。
 - `DesktopScenario` は操作意図、product predicate、scenario固有resourceのquiesce、input/probe cleanupを所有する。process、profile、port、SQLite、共通deadline、screenshot path、verdictは所有しない。
@@ -42,7 +42,7 @@ tests/desktop_e2e/
 
 ## Desktop の起動範囲
 
-`onboarding.win-a-to-win-b` は同一Windows内の隔離された実Desktop A/Bで、Aのチーム参加・本人初回設定、Bの実行PC専用入口からAI設定・PC参加・実行同意、Hub画面の人/PC/プロジェクト割当、AのCSV添付、Bのスクリプト作成と実PowerShell実行、Aの成果2ファイル保存を通す。Hubは本人入力中に別タブで今回使うプロジェクトを作り、競合時に入力を残して比較→継続→明示保存する。Hubでは次の操作・担当者・PCの案内を確認する。承認ボタンはfocus/scroll前の可視性を記録し、日本語の影響説明とコマンド全文、元データの開閉保持、判断後とSHAの折畳みを確認する。Aへ保存した2成果のhashをHub・B実ファイルと照合する。共通のcompanion/managed Runner/native picker/cleanup ownerを使用する。`runnerBinary` と固定コピーした `runnerTestBinary` をHub optionsに追加する。providerは固定tool計画で、LLM品質・物理別PC・fresh Windows導入の証明ではない。画面と経過時間は自動操作の観察資料であり、初見利用者の所要時間を表さない。
+`onboarding.win-a-to-win-b` は同一Windows内の隔離された実Desktop A/Bで、Aのチーム参加・PC承認後の自動認証、Bの実行PC専用入口からAI設定・PC参加・実行同意、Hub画面のPC・プロジェクト割当、AのCSV添付、Bのスクリプト作成と実PowerShell実行、Aの成果2ファイル保存を通す。Hubはプロジェクトの編集中に別タブで設定を更新し、競合時に入力を残して比較→継続→明示保存する。Hubでは次の操作と対象PCの案内を確認する。承認ボタンはfocus/scroll前の可視性を記録し、日本語の影響説明とコマンド全文、元データの開閉保持、判断後とSHAの折畳みを確認する。Aへ保存した2成果のhashをHub・B実ファイルと照合する。共通のcompanion/managed Runner/native picker/cleanup ownerを使用する。`runnerBinary` と固定コピーした `runnerTestBinary` をHub optionsに追加する。providerは固定tool計画で、LLM品質・物理別PC・fresh Windows導入の証明ではない。画面と経過時間は自動操作の観察資料であり、初見利用者の所要時間を表さない。
 
 同scenarioのconfigに `liveProvider: { "provider_base_url": "http://host:port/v1", "model": "model-id" }` を明示すると、固定応答providerを起動せず指定済みの実LLMを使用する。外部providerは起動・停止しない。実装待ちは最大15分とし、結果の2行形式を依頼に明記する。実LLMの承認は自動許可せず、execution rootの `live-approval-N.json` に操作と実行先を保存する。担当者が内容と対象スクリプトを確認した後、同rootの `live-approval-N-decision.json` に一致する `approval_id`、`request_sha256`、`decision: "approve"` を記録した場合だけGUI承認する（各承認の確認待ちは最大5分）。このファイルは今回の隔離試験専用で、製品の権限設定を変更しない。実モデルのtool数はmock requestから推測せず、保存された実行履歴から別途確認する。
 
@@ -59,11 +59,11 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --artifact-parent <absolute-task-root> --desktop-isolation fixture --scenario settings.shared-work-isolation --scenario-config <absolute-hub-scenario-config.json>
 ```
 
-`settings.shared-work-isolation` は同時に稼働する A/B と一つの Hub を使い、別々の端末鍵・人のログイン・所属プロジェクトと、一方の logout 後も他方が継続することを確認する。Hub options だけを使い、Runner や仕事は起動しない。実行機能を試す `settings.device-execution` では、明示した current libtest を `MOYAI_DESKTOP_E2E_RUNNER` で接続し、同じ端末の `resource-admission/` と一時フォルダーを共有する。別端末 root と通常の ProgramData へ資源登録を混ぜない。
+`settings.shared-work-isolation` は同時に稼働する A/B と一つの Hub を使い、同じWindowsユーザー名でも別々の端末ID・鍵・利用者への対応・利用できるプロジェクトを持ち、一方のプロジェクト操作許可を外しても他方が継続することを確認する。Hub options だけを使い、Runner や仕事は起動しない。実行機能を試す `settings.device-execution` では、明示した current libtest を `MOYAI_DESKTOP_E2E_RUNNER` で接続し、同じ端末の `resource-admission/` と一時フォルダーを共有する。別端末 root と通常の ProgramData へ資源登録を混ぜない。
 
 ### GUI を手動で操作するセッション
 
-`manual_session.mjs` は、隔離 Desktop A/B、一つの Hub、固定応答 provider の準備と終了だけを共通 owner へ接続する。Hub の初回管理者設定、端末参加、利用者・プロジェクト設定、実行許可、仕事の投入・承認はすべて GUI から手動で行う。Hub の認証やプロジェクトを API で事前作成しない。A/B のローカルモデル設定だけは fixture として用意する。
+`manual_session.mjs` は、隔離 Desktop A/B、一つの Hub、固定応答 provider の準備と終了だけを共通 owner へ接続する。Hub の管理画面を開き、端末参加、PC・プロジェクト設定、実行許可、仕事の投入・承認を GUI から手動で行う。管理画面はHubの起動操作で得た一度だけ使えるアクセス情報で開き、プロジェクトを API で事前作成しない。A/B のローカルモデル設定だけは fixture として用意する。
 
 `moyAI/` で次を実行する。五つのパスはすべて絶対パスで指定し、stdin を保持する。Desktop は `desktop-e2e` 専用 build、`runner-test-binary` は同じ source の libtest を使う。この入口は常に fixture 隔離で起動する。
 
@@ -257,7 +257,7 @@ npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe -
 
 Hubの管理画面はブラウザーへ移行したため、旧Hubネイティブウィンドウを起動・操作するdriverと結合シナリオは削除した。現在は[HubのPlaywright試験](../../../moyAI-Hub/tests/browser/README.md)と、このharnessのDesktop試験を使用する。`hub.connection-settings`はHTTP fixtureを使って実Desktopの接続設定を確認する現役シナリオとして維持する。
 
-`settings.shared-work` はconfig/model/local Projectを用意せず起動し、共有入口、native共通設定import、Hubブラウザーの端末承認、人のlogin、所属projectと占有の秘匿、通常プロジェクトのサイドバーとチャットから投入・詳細・取消、logout、別利用者のloginを実Tauriで操作する。同じ保存先でのDesktop再起動後にlogin操作なしで本人と既存仕事が戻ること、明示logout後の再起動では戻らないことも確認する。初回の未設定状態から共有入口を開けることを確認する。共通設定の保存・再起動後はHub設定によって準備済みになり得るため、設定画面の開閉ではその時点の初期設定判定を保持することを確認する。Hubのfixture専用mTLS参加者が2人の所属と共通資源上の待機仕事を実APIで用意する。製品GUIからの投入とfixture準備を証跡で区別し、solver実行・物理別PC・受付応答喪失の実通信試験はこのシナリオの範囲へ含めない。共通Hub browser resourceは初回管理者設定を実ブラウザーで行い、人のパスワードを証跡へ記録しない。
+`settings.shared-work` はconfig/model/local Projectを用意せず起動し、共有入口、native共通設定import、Hubブラウザーの端末承認、登録PCによる自動認証、利用できるprojectと占有の秘匿、通常プロジェクトのサイドバーとチャットから投入・詳細・取消を実Tauriで操作する。同じ保存先でのDesktop再起動後にログイン操作なしでPCに対応する利用者と既存仕事が戻ること、管理者がPCを別の利用者へ明示的に対応付け直すと以前の利用者の表示や操作権限が残らないことも確認する。初回の未設定状態から共有入口を開けることを確認する。共通設定の保存・再起動後はHub設定によって準備済みになり得るため、設定画面の開閉ではその時点の初期設定判定を保持することを確認する。Hubのfixture専用mTLS参加者が2人の所属と共通資源上の待機仕事を実APIで用意する。製品GUIからの投入とfixture準備を証跡で区別し、solver実行・物理別PC・受付応答喪失の実通信試験はこのシナリオの範囲へ含めない。共通Hub browser resourceはHubの起動操作で得た一度だけ使えるアクセス情報で実ブラウザーを開く。アクセス情報は証跡へ記録しない。
 
 `settings.device-execution` は、nativeフォルダー選択と1回の実行許可、Desktopによる実行機能の自動起動、標準ひな形の自動通知、Hubのプロジェクト画面で人・操作PC・実行PCを1回保存する操作、実フォルダー作成を確認する。Desktopを通常終了・再起動しても同じ独立Runnerが継続し、再同意や手動起動を要求しないことを確認する。共通のHubブラウザー・native picker・Desktop再起動・exact process cleanupを使う。
 
@@ -281,7 +281,7 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 native pickerの絶対パス入力は、実測したdialog→ComboBoxEx32→ComboBox→EditとOpenボタンのPID/start/executable/HWND/thread/親/control-IDを再検証し、WM_SETTEXTを1回、WM_GETTEXT一致後のみBM_CLICKを1回配送する。外部foregroundへのthread attachや、曖昧な配送の再送・別方式fallbackは行わない。これはnative controlを通るGUI操作の証拠であり、OS物理キーボード・IMEの証明ではない（`foreground_required:false`、`os_keyboard_ime_evidence:false`）。dialog閉鎖とDesktopの参加申請状態まで確認して成功を判定する。既存UIAの項目選択・取消やSendInputのforeground契約とは別adapterである。
 
-同シナリオは、手動接続の詳細を閉じたままモデル情報を更新し、接続後のカードから共有仕事へ直接移動する操作も確認する。共有仕事のボタンがスクロール前の画面内にあり、設定ファイルを再読込せずに接続が引き継がれること、人のログインは自動成立せず本人入力を待つことを照合する。
+同シナリオは、手動接続の詳細を閉じたままモデル情報を更新し、接続後のカードから共有仕事へ直接移動する操作も確認する。共有仕事のボタンがスクロール前の画面内にあり、設定ファイルを再読込せずに接続が引き継がれること、登録PCに対応する利用者を自動取得し、利用者名・パスワード入力を求めないことを照合する。
 
 `hub.browser-enrollment` のモデル割当成功は、Main/Side生成、再起動後の復元、実MCP委任、物理別端末の受入を含まない。各caseの機械判定と目視結果は実行記録を参照する。旧ウィンドウ構成の過去の合格で代用しない。同じDesktop exeを操作するGUI試験と、そのexeの再ビルドは並行させない。
 

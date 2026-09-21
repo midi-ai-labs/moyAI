@@ -9,13 +9,10 @@ export function renderSharedWorkOnboarding(local: SharedWorkPresentation): strin
   const p = local.projection;
   if (!p || local.conceal) return "";
   const project = p.projects.find(row => row.id === p.selected_project_id);
-  const projectHint = p.project_access === "no_membership" ? "管理者に、あなたをプロジェクトの参加者として登録するよう依頼してください。"
-    : p.project_access === "device_not_allowed" ? "あなたの参加登録は済んでいます。管理者に、このPCをプロジェクトの操作PCへ追加するよう依頼してください。"
-    : "管理者がこの人と操作用PCをプロジェクトに登録すると表示されます。";
+  const projectHint = "管理者に、このPCをプロジェクトの操作PCへ追加するよう依頼してください。";
   if (p.detail) return "";
   const steps = [
     [p.connected ? "接続済み" : p.enrollment === "pending" ? "管理者の承認待ち" : "未接続", "このPCの参加", p.connected ? "Hubに接続しています。" : "管理者から接続ファイルを受け取り、このPCの申請を承認してもらいます。"],
-    [p.principal ? "ログイン済み" : "未完了", "本人ログイン", p.principal ? `${p.principal.display_name} として利用しています。` : "PCの承認後、管理者から案内された利用者名でログインします。初めての場合は、本人設定コードでパスワードを決めてください。"],
     [project ? "参加済み" : "未完了", "プロジェクト", project ? `${project.label} · ${project.can_submit ? "依頼できます" : "閲覧できます"}` : projectHint],
   ];
   const available = p.status?.environments.filter(row => row.enabled) ?? [];
@@ -26,7 +23,7 @@ export function renderSharedWorkOnboarding(local: SharedWorkPresentation): strin
   const sampleEnabled = project?.can_submit && !local.pending && !p.submission_uncertain
     && !p.submission_storage_error && !local.prompt.trim() && !local.title.trim() && !p.inputs.length;
   const expanded = Boolean(p.principal) && !p.status?.jobs.length;
-  return `<section data-shared-region="onboarding" class="shared-card shared-onboarding" aria-label="接続とログインの状況"><details data-details-key="shared-onboarding" ${expanded ? "open" : ""}><summary>接続状況とサンプル</summary><ol>${steps.map(([state, label, detail]) => `<li><strong>${escapeHtml(label)} · ${escapeHtml(state)}</strong><p>${escapeHtml(detail)}</p></li>`).join("")}</ol>
+  return `<section data-shared-region="onboarding" class="shared-card shared-onboarding" aria-label="接続とプロジェクトの状況"><details data-details-key="shared-onboarding" ${expanded ? "open" : ""}><summary>接続状況とサンプル</summary><ol>${steps.map(([state, label, detail]) => `<li><strong>${escapeHtml(label)} · ${escapeHtml(state)}</strong><p>${escapeHtml(detail)}</p></li>`).join("")}</ol>
     ${project?.can_submit ? `<h3>最初の仕事を試す</h3><p>${executionHint}</p><p>数値3件（10・20・30）のファイルを添付し、依頼文を入力します。内容を確認して「送信」した後、回答が件数3・合計60になっているか、成果ファイルがあるかを確認してください。</p><button data-action="shared-prepare-sample" ${sampleEnabled ? "" : "disabled"}>サンプルの依頼を入力</button>${!sampleEnabled && (local.prompt.trim() || local.title.trim() || p.inputs.length) ? "<p>入力中の内容を保持しています。サンプルを使う場合は新しいチャットを開いてください。</p>" : ""}<p class="shared-secondary">操作の承認を求められた場合は、担当者かプロジェクト管理者がこの会話で判断します。</p>` : project ? "<p>このプロジェクトの会話と結果を閲覧できます。新しい依頼は、依頼する権限のある参加者が送信します。</p>" : "<p class=\"shared-secondary\">依頼・閲覧だけのPCでは、このPCにAIや実行用フォルダーを設定する必要はありません。</p>"}
   </details></section>`;
 }

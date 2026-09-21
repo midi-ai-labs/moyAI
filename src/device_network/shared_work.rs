@@ -1,6 +1,6 @@
-//! Human sessions and shared-work snapshots belong to the registered device runtime.
-//! Remembered human credentials are Windows-user protected; the webview receives
-//! only a typed projection, never access or refresh credentials.
+//! Shared-work sessions belong to the approved device and its current Hub binding.
+//! The Hub authenticates the device certificate; the webview receives only a typed
+//! projection, never the device key or its short-lived session token.
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use super::{DeviceClient, DeviceNetworkService};
-mod auth_store;
 mod authentication;
 mod collaboration;
 mod files;
@@ -37,6 +36,11 @@ pub struct WorkProject {
     role: String,
     #[serde(default)]
     pub can_submit: bool,
+}
+impl WorkProject {
+    pub(crate) fn allows_submission(&self) -> bool {
+        matches!(self.role.as_str(), "contributor" | "manager")
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkRunnerContact {
@@ -198,16 +202,7 @@ pub struct SharedWorkProjection {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SharedWorkCommand {
-    Login {
-        username: String,
-        password: String,
-    },
-    SetupPassword {
-        username: String,
-        code: String,
-        password: String,
-    },
-    Logout,
+    OpenManagement,
     RetrySubmission,
     Refresh,
     Project {
@@ -330,8 +325,6 @@ struct LoginSession {
     token: String,
     principal: WorkPrincipal,
     expires_at_ms: u64,
-    #[serde(default)]
-    refresh_token: Option<String>,
 }
 #[derive(Deserialize)]
 struct Session {
@@ -344,7 +337,6 @@ pub(super) struct SharedWorkOwner(Mutex<Runtime>);
 impl SharedWorkOwner {
     pub fn new(path: camino::Utf8PathBuf) -> Self {
         Self(Mutex::new(Runtime {
-            auth_store: auth_store::AuthStore::new(path.with_file_name("shared-human-auth.dpapi")),
             receipts: ReceiptStore::new(path),
             ..Runtime::default()
         }))
@@ -358,8 +350,6 @@ struct Runtime {
     binding: String,
     hub_binding: String,
     token: Option<String>,
-    remembered_refresh: Option<String>,
-    auth_store: auth_store::AuthStore,
     view: SharedWorkProjection,
     before: Option<String>,
     environment_before: Option<String>,
@@ -376,16 +366,12 @@ impl Runtime {
             self.view.feedback = None;
         }
         let captured = (self.generation, self.query, self.token.clone());
-        if matches!(command, SharedWorkCommand::Logout) {
-            self.clear();
-        }
         captured
     }
     fn clear(&mut self) {
         self.generation += 1;
         self.query += 1;
         self.token = None;
-        self.remembered_refresh = None;
         self.view = SharedWorkProjection::default();
         self.before = None;
         self.environment_before = None;
@@ -436,14 +422,8 @@ struct Connection {
     binding: String,
     hub_binding: String,
 }
-impl Connection {
-    fn auth_binding(&self) -> String {
-        format!("{}|{}", self.hub_binding, self.client.device_id)
-    }
-}
 #[derive(Debug)]
 enum RequestError {
-    SignInRequired,
     Local(&'static str),
     Http(u16),
     Unavailable,
@@ -453,13 +433,14 @@ enum RequestError {
 impl RequestError {
     fn message(&self) -> &str {
         match self {
-            Self::SignInRequired => "Hubの利用者アカウントでログインしてください。",
             Self::Local(message) => message,
             Self::Filesystem(message) => message,
             Self::Http(401) => {
-                "利用者名とパスワードを確認してください。ログイン済みの場合は再度ログインしてください。"
+                "このPCの利用資格を確認できません。Hubへの接続と、管理者による端末の承認を確認してください。"
             }
-            Self::Http(403) => "この操作の権限または端末の利用許可を確認できません。",
+            Self::Http(403) => {
+                "このPCに操作が許可されていません。Hub管理者に、端末の承認・利用者の関連付けとプロジェクトの操作PC設定を確認してもらってください。"
+            }
             Self::Http(404) => "対象が見つかりません。最新の一覧を確認してください。",
             Self::Http(409) => "仕事の状態が変わりました。最新の状態を確認してください。",
             Self::Http(429) => "受付上限に達しています。しばらく待ってから再試行してください。",
@@ -534,20 +515,6 @@ impl DeviceNetworkService {
         let connection = self.shared_connection();
         let network = self.projection_now();
         let mut runtime = self.inner.shared_work.0.lock().unwrap();
-        if let Some(refresh) = runtime.remembered_refresh.clone() {
-            match runtime.auth_store.load() {
-                Ok(doc)
-                    if doc
-                        .active
-                        .as_ref()
-                        .is_some_and(|a| a.refresh_token == refresh) => {}
-                Ok(_) => runtime.clear(),
-                Err(error) => {
-                    runtime.clear();
-                    runtime.view.error = Some(error.message().into());
-                }
-            }
-        }
         // A lost/replaced device identity must never expose the prior user's cached data.
         if (connection.as_ref().map(|c| c.binding.as_str()) != Some(runtime.binding.as_str())
             && runtime.token.is_some())
@@ -589,9 +556,6 @@ impl DeviceNetworkService {
     ) -> SharedWorkProjection {
         // Synchronize expiry/device identity before admitting any command.
         self.shared_work_projection();
-        if matches!(command, SharedWorkCommand::Logout) {
-            return self.shared_logout(expected_generation).await;
-        }
         if matches!(
             &command,
             SharedWorkCommand::ProviderStatus
@@ -645,45 +609,16 @@ impl DeviceNetworkService {
         token: Option<&str>,
         command: SharedWorkCommand,
     ) -> Result<(), RequestError> {
-        if let SharedWorkCommand::Login { username, password } = command {
-            return self
-                .shared_login(connection, generation, query, username, password)
-                .await;
-        }
-        if let SharedWorkCommand::SetupPassword {
-            username,
-            code,
-            password,
-        } = command
-        {
-            if code.len() != 64 || !code.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(RequestError::Local(
-                    "管理者から受け取った本人設定コードを入力してください。",
-                ));
-            }
-            return self
-                .shared_password_auth(
-                    connection,
-                    generation,
-                    query,
-                    username,
-                    password,
-                    Some(code),
-                )
-                .await;
-        }
-        let current_token = match self
+        let current_token = self
             .shared_authenticate(connection, generation, query, token)
-            .await
-        {
-            Ok(token) => token,
-            Err(RequestError::SignInRequired) if matches!(command, SharedWorkCommand::Refresh) => {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+            .await?;
         let token = current_token.as_str();
         match command {
+            SharedWorkCommand::OpenManagement => {
+                return self
+                    .shared_open_management(connection, generation, query, token)
+                    .await;
+            }
             SharedWorkCommand::Project { project_id } => {
                 let mut runtime = self.inner.shared_work.0.lock().unwrap();
                 runtime.require_current(generation, query)?;
@@ -1045,7 +980,7 @@ impl DeviceNetworkService {
         )
         .await;
         // Only this exact submission's definitive answer can retire its receipt.
-        // Logout and unrelated failed operations leave it recoverable after restart.
+        // Identity changes and unrelated failures leave it recoverable by the same actor.
         if result.is_ok() || matches!(result, Err(RequestError::Http(400 | 404))) {
             self.inner
                 .shared_work
@@ -1089,7 +1024,7 @@ impl DeviceNetworkService {
             return Ok(());
         }
         for project in &mut projects {
-            project.can_submit = matches!(project.role.as_str(), "contributor" | "manager");
+            project.can_submit = project.allows_submission();
         }
         let (project, job, before, environment_before, transcript_after, inbox_before) = {
             let mut runtime = self.inner.shared_work.0.lock().unwrap();

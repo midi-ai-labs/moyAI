@@ -17,9 +17,9 @@ test("shared entry explains rejected device enrollment using the existing networ
 });
 
 test("a different human generation erases drafts and older snapshots cannot restore them", () => {
-  const local = sharedUiFixture(); local.title = "private"; local.prompt = "private prompt"; local.password = "private password";
+  const local = sharedUiFixture(); local.title = "private"; local.prompt = "private prompt";
   acceptSharedWork(local, sharedProjection({ generation: "2", revision: "3", principal: null, projects: [], status: null, selected_project_id: null }));
-  assert.equal(local.title + local.prompt + local.password, "");
+  assert.equal(local.title + local.prompt, "");
   assert.equal(acceptSharedWork(local, sharedProjection({ revision: "2" })), false);
   assert.equal(local.projection?.principal, null);
 });
@@ -137,12 +137,12 @@ test("pending approval precedes the conversation with exact decision controls an
   assert.doesNotMatch(html, /data-action="shared-(?:approve|deny|stop)"/);
   assert.match(html, /担当者の承認待ち/);
 });
-test("retaining an active login form synchronizes native and accessible button availability together", () => {
+test("retaining an active draft synchronizes native and accessible button availability together", () => {
   const attributes = new Map([["aria-disabled", "true"]]);
-  const button = { dataset: { action: "shared-login" }, disabled: true, textContent: "ログイン", setAttribute: (name: string, value: string) => attributes.set(name, value) };
-  const replacement = { dataset: { action: "shared-login" }, disabled: false, textContent: "ログイン", getAttribute: () => "false" };
+  const button = { dataset: { action: "shared-submit" }, disabled: true, textContent: "送信", setAttribute: (name: string, value: string) => attributes.set(name, value) };
+  const replacement = { dataset: { action: "shared-submit" }, disabled: false, textContent: "送信", getAttribute: () => "false" };
   const region = { contains: () => true, isEqualNode: () => false, querySelectorAll: (selector: string) => selector.startsWith("button") ? [button] : [] };
-  const nextRegion = { dataset: { sharedRegion: "login" }, querySelector: () => replacement, querySelectorAll: (selector: string) => selector.startsWith("button") ? [replacement] : [] };
+  const nextRegion = { dataset: { sharedRegion: "draft" }, querySelector: () => replacement, querySelectorAll: (selector: string) => selector.startsWith("button") ? [replacement] : [] };
   const current = { dataset: { sharedOwner: "same-person" }, querySelector: () => region };
   const next = { dataset: { sharedOwner: "same-person" }, querySelectorAll: () => [nextRegion] };
   const original = Object.getOwnPropertyDescriptor(globalThis, "document");
@@ -180,37 +180,12 @@ test("resolved approvals show only a Japanese result and keep their original sco
   }
 });
 
-test("typing during login refresh keeps the two login method buttons distinct", () => {
-  const buttons = ["setup", "password"].map(value => ({ dataset: { action: "shared-auth-mode", value }, disabled: false, textContent: value, setAttribute() {} }));
-  const replacements = buttons.map(button => ({ ...button, textContent: `${button.dataset.value}-label` }));
-  const region = { contains: () => true, isEqualNode: () => false, querySelectorAll: (selector: string) => selector.startsWith("button") ? buttons : [] };
-  const nextRegion = { dataset: { sharedRegion: "login" }, querySelectorAll: (selector: string) => selector.startsWith("button") ? replacements : [] };
-  const current = { dataset: { sharedOwner: "same-person" }, querySelector: () => region };
-  const next = { dataset: { sharedOwner: "same-person" }, querySelectorAll: () => [nextRegion] };
-  const original = Object.getOwnPropertyDescriptor(globalThis, "document");
-  Object.defineProperty(globalThis, "document", { configurable: true, value: { activeElement: { matches: () => true } } });
-  try {
-    assert.equal(retainSharedWorkSurface(current as unknown as HTMLElement, next as unknown as HTMLElement), true);
-    assert.deepEqual(buttons.map(button => button.textContent), ["setup-label", "password-label"]);
-  } finally { if (original) Object.defineProperty(globalThis, "document", original); else Reflect.deleteProperty(globalThis, "document"); }
-});
-test("logout conceals prior data immediately and discards an already running poll", async () => {
-  const local = sharedUiFixture(); let finishPoll!: (value: unknown) => void;
-  const waiting = new Promise(resolve => { finishPoll = resolve; });
-  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
-  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (name: string, args: { request?: { kind: string } }) => {
-    if (name === "shared_work_projection") return waiting;
-    assert.equal(args.request?.kind, "logout");
-    assert.equal(local.conceal, true);
-    assert.doesNotMatch(renderSharedWork(sharedWorkPresentation(local)), /試験の仕事|利用者 A/);
-    return sharedProjection({ generation: "2", revision: "3", principal: null, projects: [], status: null, selected_project_id: null });
-  } } } });
-  const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender() {} } as unknown as ActionContext;
-  try {
-    const poll = refreshSharedWork(context);
-    await sharedWorkAction(context, "logout");
-    finishPoll(sharedProjection({ revision: "2" })); await poll;
-    assert.equal(local.projection?.principal, null);
-    assert.equal(local.conceal, false);
-  } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
+test("a newer device generation clears drafts and a late poll cannot restore prior project data", () => {
+  const local = sharedUiFixture();
+  local.prompt = "private draft";
+  acceptSharedWork(local, sharedProjection({ generation: "2", revision: "3", principal: null, projects: [], status: null, selected_project_id: null }));
+  assert.equal(local.prompt, "");
+  assert.equal(acceptSharedWork(local, sharedProjection({ revision: "2" })), false);
+  assert.equal(local.projection?.principal, null);
+  assert.doesNotMatch(renderSharedWork(local), /試験の仕事|利用者 A/);
 });

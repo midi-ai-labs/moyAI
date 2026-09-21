@@ -18,6 +18,7 @@ mod peer_connections;
 mod receiver;
 mod service;
 mod shared_work;
+pub(crate) use shared_work::WorkProject;
 pub use shared_work::{SharedWorkCommand, SharedWorkProjection};
 mod settings;
 mod wait;
@@ -102,6 +103,8 @@ pub enum DeviceError {
     InvalidConfiguration,
     #[error("invalid_identity")]
     InvalidIdentity,
+    #[error("identity_protection_unavailable")]
+    IdentityProtectionUnavailable,
     #[error("settings_corrupt")]
     SettingsCorrupt,
     #[error("settings_changed")]

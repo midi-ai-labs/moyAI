@@ -1,6 +1,6 @@
 import { command } from "./api.ts";
 import { openHubProject, openSharedWork, refreshSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
-import { sharedWorkActionEnabled, selectSharedLoginMode } from "./shared_work_state.ts";
+import { sharedWorkActionEnabled } from "./shared_work_state.ts";
 import { deviceExecutionAction, deviceExecutionActionEnabled } from "./device_execution.ts";
 import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
 import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork } from "./device_network_actions.ts";
@@ -1558,9 +1558,8 @@ const ACTION_DEFINITIONS = [
   },
   { id: "show-hub", label: "moyAI Hub", menu: "view", palette: true, enabled: always, run: (_state, context) => openHub(context) },
   { id: "show-shared-work", label: "Hubのプロジェクト", menu: "view", palette: true, enabled: always, run: (_state, context) => openSharedWork(context) },
-  { id: "shared-auth-mode", label: "ログイン方法を選ぶ", enabled: (state, payload, model) => state.hub_project_open === true && state.overlay === "none" && !model.local.sharedWork.pending && !model.local.sharedWork.projection?.principal && ["setup", "password"].includes(payload.value), run: (_state, context, payload) => { if (selectSharedLoginMode(context.uiState.sharedWork, payload.value)) context.rerender(); } },
   { id: "open-hub-project", label: "Hubのプロジェクトを開く", enabled: (state, payload, model) => navigationIsIdle(state) && !model.local.sharedWork.pending && !model.local.sharedWork.conceal && Boolean(model.local.sharedWork.projection?.projects.some(row => row.id === payload.value)), run: (_state, context, payload) => openHubProject(context, payload.value) },
-  ...["login", "setup-password", "logout", "new-conversation", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "continue", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
+  ...["refresh", "open-management", "new-conversation", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "continue", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
     id: `shared-${kind}`, label: "共有仕事の操作",
     enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
     run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => sharedWorkAction(context, kind.replaceAll("-", "_"), payload.value),

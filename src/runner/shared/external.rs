@@ -71,6 +71,31 @@ pub(crate) struct ExternalEvidence {
 }
 
 impl Controller {
+    pub(super) async fn device_principal(
+        &mut self,
+        project: &str,
+    ) -> Result<LocalHuman, RunnerError> {
+        #[derive(Deserialize)]
+        struct DeviceSession {
+            token: String,
+        }
+        let session: DeviceSession = self.client
+            .request("/v1/shared/device-session", Some(&json!({})))
+            .await
+            .map_err(|error| match error {
+                TransportError::Rejected(status) if matches!(status.as_u16(), 404 | 405) =>
+                    RunnerError::new("Update the Hub to use this approved device without a password"),
+                TransportError::Rejected(status) if status.as_u16() == 403 =>
+                    RunnerError::new("Ask the Hub administrator to approve and associate this device before selecting a project"),
+                error => error.into(),
+            })?;
+        Ok(LocalHuman {
+            actor_device_id: self.settings.device_id.clone(),
+            principal_session: session.token,
+            project_id: project.to_owned(),
+        })
+    }
+
     pub(super) async fn process_external(&mut self) {
         if let Some(request) = self
             .external
@@ -121,7 +146,15 @@ impl Controller {
                 "Local execution has no live ownership lease",
             ));
         }
-        let human=request.human.or_else(||self.local_human.clone()).ok_or_else(||RunnerError::new("Sign in to the Hub and select the project before using this published resource"))?;
+        let human = match request.human {
+            Some(principal) => principal,
+            None => {
+                let project = self.local_project_id.clone().ok_or_else(|| RunnerError::new(
+                    "Select an allowed Hub project with moyai-runner use-project before using this published resource",
+                ))?;
+                self.device_principal(&project).await?
+            }
+        };
         let mapping = local_mapping(
             &self.settings,
             &environments,

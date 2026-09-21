@@ -37,10 +37,10 @@ test("restart oracle needs the exact person/project/job without an interactive l
   }
 });
 
-test("logged-out restart requires the actual enabled login form, not an empty splash", () => {
-  const surface = { count: 1, splash_visible: false, login_visible: true, login_enabled: true };
+test("unavailable device access shows the connection step, never a login form", () => {
+  const surface = { count: 1, splash_visible: false, login_visible: false, connection_visible: true };
   assert.equal(sharedWorkSurfaceMatches(surface, { principal: null }), true);
-  for (const patch of [{ count: 0 }, { splash_visible: true }, { login_visible: false }, { login_enabled: false }]) {
+  for (const patch of [{ count: 0 }, { splash_visible: true }, { login_visible: true }, { connection_visible: false }]) {
     assert.equal(sharedWorkSurfaceMatches({ ...surface, ...patch }, { principal: null }), false);
   }
 });

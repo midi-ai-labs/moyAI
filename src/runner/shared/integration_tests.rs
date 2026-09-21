@@ -12,8 +12,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const PASSWORD: &str = "shared-fixture-password-2026";
-
 fn command(executable: &Utf8Path) -> Command {
     let mut command = Command::new(executable);
     command.creation_flags(0x08000000).stdin(Stdio::null());
@@ -44,8 +42,9 @@ fn bounded_output(command: &mut Command) -> std::io::Result<std::process::Output
 
 async fn body(response: reqwest::Response) -> Value {
     let status = response.status();
+    let path = response.url().path().to_owned();
     let text = response.text().await.unwrap();
-    assert!(status.is_success(), "HTTP {status}: {text}");
+    assert!(status.is_success(), "HTTP {status} at {path}: {text}");
     serde_json::from_str(&text).unwrap()
 }
 
@@ -121,8 +120,53 @@ impl Hub {
         )
         .await;
         hub.csrf = session["csrf"].as_str().unwrap().into();
-        let response = hub.browser.post(format!("{}/admin/bootstrap",hub.url)).header("Origin",&hub.url).header("X-Moyai-Csrf",&hub.csrf)
-            .json(&json!({"username":"admin","display_name":"Fixture administrator","password":PASSWORD})).send().await.unwrap();
+        // Obtain the launch capability through this fixture's verified local host,
+        // exactly as the Hub launcher does. It never enters process logs.
+        let descriptor: Value = serde_json::from_slice(
+            &std::fs::read(hub.directory.join("host-control.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(descriptor["pid"].as_u64(), Some(hub.process.id() as u64));
+        assert_eq!(
+            descriptor["catalog_path"]
+                .as_str()
+                .map(std::path::PathBuf::from),
+            Some(
+                std::fs::canonicalize(&hub.directory)
+                    .unwrap()
+                    .join("catalog.json")
+            ),
+        );
+        let access = body(
+            hub.browser
+                .post(format!(
+                    "http://127.0.0.1:{}/host/command",
+                    descriptor["port"].as_u64().unwrap()
+                ))
+                .bearer_auth(descriptor["token"].as_str().unwrap())
+                .json(&json!({"command":"hub_web_open","args":{}}))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(access["ok"], true);
+        let access_url = reqwest::Url::parse(access["value"]["url"].as_str().unwrap()).unwrap();
+        assert_eq!(access_url.origin().ascii_serialization(), hub.url);
+        let ticket = access_url
+            .fragment()
+            .unwrap()
+            .strip_prefix("access=")
+            .unwrap();
+        let response = hub
+            .browser
+            .post(format!("{}/admin/access", hub.url))
+            .header("Origin", &hub.url)
+            .header("X-Moyai-Csrf", &hub.csrf)
+            .json(&json!({"ticket":ticket}))
+            .send()
+            .await
+            .unwrap();
         hub.cookie = response
             .headers()
             .get(reqwest::header::SET_COOKIE)
@@ -157,6 +201,13 @@ impl Hub {
         )
         .await["result"]
             .clone()
+    }
+
+    async fn management(&self, request: Value) {
+        let snapshot = self.admin("hub_shared_snapshot", json!({})).await;
+        self.admin("hub_shared_command", json!({
+            "request_id":ulid::Ulid::new().to_string(), "expected_revision":snapshot["revision"], "request":request,
+        })).await;
     }
 
     async fn invitation(&self, label: &str) -> String {
@@ -607,70 +658,41 @@ async fn real_hub_scenario() {
         });
         identities.push(identity);
     }
+    // Legacy invitation enrollment has no inferred human owner. Associate each
+    // device explicitly through the administrator before obtaining device sessions.
+    for (index, label) in [(0, "Alice"), (1, "Bob")] {
+        hub.management(json!({"kind":"bind_device_principal","device_id":identities[index].device_id,"user_id":null,"display_name":label})).await;
+    }
     let http = &identities[0].http;
     let login = body(
-        http.post(format!("{url}/v1/shared/login"))
-            .json(&json!({"username":"admin","password":PASSWORD}))
+        http.post(format!("{url}/v1/shared/device-session"))
+            .json(&json!({}))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    let admin = login["token"].as_str().unwrap();
-    shared_post(
-        http,
-        &url,
-        admin,
-        "admin/projects",
-        json!({"id":"project","label":"Shared fixture"}),
-    )
-    .await;
-    let alice=shared_post(http,&url,admin,"admin/users",json!({"username":"alice","display_name":"Alice","password":PASSWORD,"administrator":false})).await;
-    shared_post(
-        http,
-        &url,
-        admin,
-        "admin/memberships",
-        json!({"project_id":"project","user_id":alice["user_id"],"role":"contributor"}),
-    )
-    .await;
-    let bob = shared_post(
-        http,
-        &url,
-        admin,
-        "admin/users",
-        json!({"username":"bob","display_name":"Bob","password":PASSWORD,"administrator":false}),
-    )
-    .await;
-    shared_post(
-        http,
-        &url,
-        admin,
-        "admin/memberships",
-        json!({"project_id":"project","user_id":bob["user_id"],"role":"contributor"}),
-    )
-    .await;
-    let bob_login = body(
-        http.post(format!("{url}/v1/shared/login"))
-            .json(&json!({"username":"bob","password":PASSWORD}))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    let bob_token = bob_login["token"].as_str().unwrap();
-    for (index, id) in [(0, "analysis"), (1, "solver")] {
-        shared_post(http,&url,admin,"admin/environments",json!({"id":id,"label":id,"resource_id":format!("resource-{id}"),"runner_id":identities[index].device_id,"capacity":1,"project_ids":["project"]})).await;
-    }
-    let login = body(
-        http.post(format!("{url}/v1/shared/login"))
-            .json(&json!({"username":"alice","password":PASSWORD}))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let alice = login["principal"].clone();
     let token = login["token"].as_str().unwrap();
+    let bob_login = body(
+        identities[1]
+            .http
+            .post(format!("{url}/v1/shared/device-session"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let bob = bob_login["principal"].clone();
+    hub.management(json!({"kind":"create_project","id":"project","label":"Shared fixture"}))
+        .await;
+    for principal in [&alice, &bob] {
+        hub.management(json!({"kind":"project_member","project_id":"project","user_id":principal["user_id"],"role":"contributor"})).await;
+    }
+    for (index, id) in [(0, "analysis"), (1, "solver")] {
+        hub.management(json!({"kind":"create_environment","id":id,"label":id,"resource_id":format!("resource-{id}"),"runner_id":identities[index].device_id,"capacity":1,"project_ids":["project"]})).await;
+    }
     workers[0].start().await;
     workers[1].start().await;
     let input = json!({"request_id":"root-request","project_id":"project","environment_id":"analysis","title":"Compute with solver","input":{"version":1,"prompt":"Delegate to solver, then use its result."},"descendant_budget":2});
@@ -733,11 +755,11 @@ async fn real_hub_scenario() {
         incarnation: String::new(),
     };
     caller.start().await;
-    let signin=json!({"operation":"local_sign_in","credentials":{"username":"alice","password":PASSWORD,"project_id":"project"}}).to_string();
+    let signin = json!({"operation":"local_project","project_id":"project"}).to_string();
     let output = workers[1].command(&["operations", "--runner", &workers[1].incarnation, &signin]);
     assert!(
         output.status.success(),
-        "Local human sign-in failed: {}",
+        "Local device project selection failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let denied_id = ulid::Ulid::new().to_string();
@@ -921,10 +943,29 @@ async fn real_hub_scenario() {
         .collect::<Vec<_>>();
     assert_eq!(active.len(), 1, "{status}");
     let local_job = active[0]["job_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        job(http, &url, token, &local_job).await["assignee_id"],
+        bob["user_id"]
+    );
+    // Runner's local admissions renew bounded device sessions. Obtain this
+    // controller's current session instead of reusing the initial setup token.
+    let bob_login = body(
+        identities[1]
+            .http
+            .post(format!("{url}/v1/shared/device-session"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(bob_login["principal"]["user_id"], bob["user_id"]);
+    let bob_token = bob_login["token"].as_str().unwrap();
+    // Local work belongs to this provided device's actor, so its owner cancels it.
     shared_post(
-        http,
+        &identities[1].http,
         &url,
-        token,
+        bob_token,
         &format!("jobs/{local_job}/cancel"),
         json!({}),
     )
@@ -1044,8 +1085,11 @@ async fn real_hub_scenario() {
                 .unwrap()["run_id"],
             run_id
         );
-        for (credential, request) in [(token, old_approval_id.as_str()), (bob_token, approval_id)] {
-            let rejected = http
+        for (caller, credential, request) in [
+            (http, token, old_approval_id.as_str()),
+            (&identities[1].http, bob_token, approval_id),
+        ] {
+            let rejected = caller
                 .post(format!(
                     "{url}/v1/shared/jobs/{id}/approvals/{request}/decision"
                 ))

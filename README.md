@@ -4,7 +4,7 @@
 
 <h1 align="center">moyAI</h1>
 
-Development includes an [independent Windows Runner](docs/runner-local.md) and a [shared Runner](docs/runner-shared.md) for Hub-managed jobs. [Shared work in Desktop](docs/shared-work-desktop.md) supports project membership, shared resource status, start deadlines, approval, cancellation, handover, shared inputs and artifacts, and conversation continuation without configuring a local model or Project. Hub and Runner own the work independently of the Desktop connection. Existing private local work remains available without a Hub account. The Runner operates in the same Windows user's logged-in session; service operation and physical multi-host deployment require separate validation.
+Development includes an [independent Windows Runner](docs/runner-local.md) and a [shared Runner](docs/runner-shared.md) for Hub-managed jobs. [Shared work in Desktop](docs/shared-work-desktop.md) supports project membership, shared resource status, start deadlines, approval, cancellation, handover, shared inputs and artifacts, and conversation continuation without configuring a local model or Project. Hub and Runner own the work independently of the Desktop connection. Hub device approval and project PC assignments enable access without a moyAI username or password. Each PC keeps its own ID and key; linking an existing person for shared history is an optional administrator action. Existing private local work remains available without a Hub account. The Runner operates in the same Windows user's logged-in session; service operation and physical multi-host deployment require separate validation.
 
 <p align="center">
   <strong>A local-first coding agent for private workspaces, local LLMs, and closed-network development.</strong>

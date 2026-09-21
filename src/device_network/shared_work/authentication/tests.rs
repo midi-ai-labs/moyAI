@@ -6,9 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 struct Script {
-    login: usize,
-    refresh: usize,
-    logout: usize,
+    sessions: usize,
+    old_hub: bool,
+    pause_session: bool,
     unavailable: bool,
     deny: bool,
     projects: Vec<Value>,
@@ -18,6 +18,8 @@ struct Script {
 struct Server {
     shared: crate::device_network::SharedHubConfig,
     script: Arc<Mutex<Script>>,
+    session_started: Arc<tokio::sync::Notify>,
+    session_release: Arc<tokio::sync::Notify>,
     stop: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -59,6 +61,10 @@ impl Server {
         let cancelled = stop.clone();
         let script = Arc::new(Mutex::new(Script::default()));
         let requests = script.clone();
+        let session_started = Arc::new(tokio::sync::Notify::new());
+        let session_release = Arc::new(tokio::sync::Notify::new());
+        let started = session_started.clone();
+        let release = session_release.clone();
         let task = tokio::spawn(async move {
             loop {
                 let accepted =
@@ -101,21 +107,17 @@ impl Server {
                             json!({"user_id":"Alice","display_name":"Alice","administrator":false});
                         let session = json!({"token":"c".repeat(64),"principal":principal,"expires_at_ms":now_ms()+28_800_000});
                         match path {
-                            "/v1/shared/login" => {
-                                script.login += 1;
-                                assert_eq!(body["username"], "alice");
-                                let mut login = session;
-                                login["refresh_token"] = "b".repeat(64).into();
-                                (200, login)
-                            }
-                            "/v1/shared/refresh" => {
-                                script.refresh += 1;
-                                assert_eq!(body["refresh_token"], "b".repeat(64));
+                            "/v1/shared/device-session" => {
+                                script.sessions += 1;
+                                assert_eq!(body, json!({}));
+                                assert!(!headers.to_ascii_lowercase().contains("authorization:"));
                                 if script.unavailable {
                                     return None;
-                                };
-                                if script.deny {
-                                    (401, json!({"error":"unauthorized"}))
+                                }
+                                if script.old_hub {
+                                    (404, json!({"error":"not_found"}))
+                                } else if script.deny {
+                                    (403, json!({"error":"device_identity_required"}))
                                 } else {
                                     (200, session)
                                 }
@@ -128,13 +130,15 @@ impl Server {
                             "/v1/shared/inbox" => {
                                 (200, json!({"items":[],"next_before":null,"unread_count":0}))
                             }
-                            "/v1/shared/logout" => {
-                                script.logout += 1;
-                                (200, json!({"logged_out":true}))
-                            }
                             _ => panic!("unexpected route {path}"),
                         }
                     };
+                    let pause = path == "/v1/shared/device-session"
+                        && requests.lock().unwrap().pause_session;
+                    if pause {
+                        started.notify_one();
+                        release.notified().await;
+                    }
                     let reply = serde_json::to_vec(&reply).unwrap();
                     stream.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",reply.len()).as_bytes()).await.ok()?;
                     stream.write_all(&reply).await.ok()?;
@@ -147,6 +151,8 @@ impl Server {
         Self {
             shared,
             script,
+            session_started,
+            session_release,
             stop,
             task,
         }
@@ -197,147 +203,129 @@ async fn command(
     service.shared_work_command(&generation, command).await
 }
 fn expire(service: &DeviceNetworkService) {
-    let mut runtime = service.inner.shared_work.0.lock().unwrap();
-    let record = runtime.auth_store.load().unwrap().active.unwrap();
-    runtime
-        .auth_store
-        .update(
-            &record,
-            &LoginSession {
-                token: record.token.clone(),
-                principal: record.principal.clone(),
-                expires_at_ms: 0,
-                refresh_token: None,
-            },
-        )
-        .unwrap();
-    runtime.clear();
+    service
+        .inner
+        .shared_work
+        .0
+        .lock()
+        .unwrap()
+        .view
+        .expires_at_ms = Some(0);
 }
 
 #[tokio::test]
-async fn remembered_human_service_restores_refreshes_and_logs_out_without_password_reentry() {
+async fn approved_device_authenticates_after_restart_and_renews_without_stored_passwords() {
     let server = Server::start().await;
     let dir = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    // Saved credentials from the older human login scheme must not become an input.
+    let legacy = root.join("config/device/shared-human-auth.dpapi");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, b"unreadable old credential").unwrap();
     let first = service(&root, &server.shared, "WinA").await;
-    let login = command(
-        &first,
-        SharedWorkCommand::Login {
-            username: "alice".into(),
-            password: "a secure test password".into(),
-        },
-    )
-    .await;
-    assert_eq!(login.principal.unwrap().user_id, "Alice");
+    let ready = command(&first, SharedWorkCommand::Refresh).await;
+    assert_eq!(ready.principal.unwrap().user_id, "Alice");
     drop(first);
     let second = service(&root, &server.shared, "WinA").await;
-    let restored = command(&second, SharedWorkCommand::Refresh).await;
-    assert_eq!(restored.principal.unwrap().user_id, "Alice");
-    assert_eq!(server.script.lock().unwrap().login, 1);
+    let ready = command(&second, SharedWorkCommand::Refresh).await;
+    assert_eq!(ready.principal.unwrap().user_id, "Alice");
+    assert_eq!(server.script.lock().unwrap().sessions, 2);
     expire(&second);
     server.script.lock().unwrap().unavailable = true;
     let unavailable = command(&second, SharedWorkCommand::Refresh).await;
     assert!(unavailable.principal.is_none());
     assert!(unavailable.error.is_some());
-    assert!(
-        second
-            .inner
-            .shared_work
-            .0
-            .lock()
-            .unwrap()
-            .auth_store
-            .load()
-            .unwrap()
-            .active
-            .is_some()
-    );
     server.script.lock().unwrap().unavailable = false;
     let restored = command(&second, SharedWorkCommand::Refresh).await;
     assert_eq!(restored.principal.as_ref().unwrap().user_id, "Alice");
-    let projection = serde_json::to_string(&restored).unwrap();
-    assert!(!projection.contains(&"b".repeat(64)));
-    assert!(!projection.contains(&"c".repeat(64)));
-    // Offline logout persists before the Hub can be contacted.
-    second.inner.state.lock().unwrap().client = None;
-    let out = command(&second, SharedWorkCommand::Logout).await;
-    assert!(out.principal.is_none());
-    drop(second);
-    let third = service(&root, &server.shared, "WinA").await;
-    let out = command(&third, SharedWorkCommand::Refresh).await;
-    assert!(out.principal.is_none());
-    assert_eq!(server.script.lock().unwrap().login, 1);
-    assert_eq!(server.script.lock().unwrap().logout, 1);
     assert!(
-        third
-            .inner
-            .shared_work
-            .0
-            .lock()
+        !serde_json::to_string(&restored)
             .unwrap()
-            .auth_store
-            .load()
-            .unwrap()
-            .pending_logouts
-            .is_empty()
+            .contains(&"c".repeat(64))
     );
-    drop(third);
+    assert_eq!(
+        std::fs::read(&legacy).unwrap(),
+        b"unreadable old credential"
+    );
     server.stop().await;
 }
 
 #[tokio::test]
-async fn remembered_human_service_does_not_restore_other_device_or_rejected_identity() {
+async fn rejected_device_and_old_hub_never_restore_a_human_or_offer_password_fallback() {
     let server = Server::start().await;
     let dir = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
-    let first = service(&root, &server.shared, "WinA").await;
-    command(
-        &first,
-        SharedWorkCommand::Login {
-            username: "alice".into(),
-            password: "a secure test password".into(),
-        },
-    )
-    .await;
-    let other = service(&root, &server.shared, "WinB").await;
-    assert!(
-        command(&other, SharedWorkCommand::Refresh)
-            .await
-            .principal
-            .is_none()
-    );
-    assert_eq!(server.script.lock().unwrap().refresh, 0);
-    expire(&first);
+    let service = service(&root, &server.shared, "WinA").await;
+    command(&service, SharedWorkCommand::Refresh).await;
+    expire(&service);
     server.script.lock().unwrap().deny = true;
+    let denied = command(&service, SharedWorkCommand::Refresh).await;
+    assert!(denied.principal.is_none());
+    assert!(denied.error.unwrap().contains("関連付け"));
+    server.script.lock().unwrap().old_hub = true;
+    let legacy = command(&service, SharedWorkCommand::Refresh).await;
+    assert!(legacy.principal.is_none());
+    assert!(legacy.error.unwrap().contains("Hubを更新"));
     assert!(
-        command(&first, SharedWorkCommand::Refresh)
-            .await
-            .principal
-            .is_none()
-    );
-    assert!(
-        first
-            .inner
-            .shared_work
-            .0
+        server
+            .script
             .lock()
             .unwrap()
-            .auth_store
-            .load()
-            .unwrap()
-            .active
-            .is_none()
+            .requests
+            .iter()
+            .all(|(_, path)| {
+                !matches!(
+                    path.as_str(),
+                    "/v1/shared/login" | "/v1/shared/refresh" | "/v1/shared/setup-password"
+                )
+            })
     );
-    assert!(
-        command(&first, SharedWorkCommand::Refresh)
-            .await
-            .principal
-            .is_none()
-    );
-    assert_eq!(server.script.lock().unwrap().refresh, 1);
-    drop(first);
-    drop(other);
     server.stop().await;
+}
+
+#[tokio::test]
+async fn a_device_change_discards_an_inflight_session_and_old_project_state() {
+    let server = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    let service = service(&root, &server.shared, "WinA").await;
+    server.script.lock().unwrap().pause_session = true;
+    let refresh = command(&service, SharedWorkCommand::Refresh);
+    tokio::pin!(refresh);
+    tokio::select! {
+        _ = server.session_started.notified() => {},
+        _ = &mut refresh => panic!("session should be awaiting its reply"),
+    }
+    service.inner.state.lock().unwrap().client =
+        Some(DeviceClient::new(&server.shared, None, "WinB".into()).unwrap());
+    server.session_release.notify_one();
+    let stale = refresh.await;
+    assert!(stale.principal.is_none());
+    assert!(stale.projects.is_empty());
+    assert!(service.inner.shared_work.0.lock().unwrap().token.is_none());
+    server.stop().await;
+}
+
+#[test]
+fn remote_management_accepts_only_https_one_use_ticket_urls() {
+    let ticket = "a".repeat(64);
+    assert!(validate_management_url(&format!("https://hub.test/admin/#access={ticket}")).is_ok());
+    for url in [
+        format!("http://hub.test/admin/#access={ticket}"),
+        format!("https://user:secret@hub.test/admin/#access={ticket}"),
+        format!("https://hub.test/admin/?access={ticket}"),
+        "https://hub.test/admin/#access=bad".into(),
+        "file:///C:/Windows/cmd.exe".into(),
+    ] {
+        assert!(validate_management_url(&url).is_err());
+    }
+    assert!(
+        serde_json::from_value::<SharedWorkCommand>(
+            json!({"kind":"login","username":"old","password":"secret"})
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_value::<SharedWorkCommand>(json!({"kind":"setup_password","username":"old","password":"secret","code":"a".repeat(64)})).is_err());
 }
 
 #[tokio::test]
@@ -358,14 +346,7 @@ async fn new_shared_conversation_clears_attachments_only_for_the_current_project
     let dir = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
     let service = service(&root, &server.shared, "WinA").await;
-    let login = command(
-        &service,
-        SharedWorkCommand::Login {
-            username: "alice".into(),
-            password: "a secure test password".into(),
-        },
-    )
-    .await;
+    let login = command(&service, SharedWorkCommand::Refresh).await;
     assert_eq!(login.principal.unwrap().user_id, "Alice");
     command(&service, SharedWorkCommand::Refresh).await;
     let selected = command(
@@ -447,7 +428,7 @@ async fn new_shared_conversation_clears_attachments_only_for_the_current_project
     );
     {
         let script = server.script.lock().unwrap();
-        assert_eq!(script.login, 1);
+        assert_eq!(script.sessions, 1);
         assert!(script.requests.len() > request_count);
         assert!(
             script.requests[request_count..]

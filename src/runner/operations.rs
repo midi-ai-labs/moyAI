@@ -51,25 +51,9 @@ pub enum RunnerOperation {
     },
     InstallAutostart,
     RemoveAutostart,
-    LocalSignIn {
-        credentials: LocalCredentials,
+    LocalProject {
+        project_id: Option<String>,
     },
-    LocalSignOut,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalCredentials {
-    pub username: String,
-    pub password: String,
-    pub project_id: String,
-}
-impl std::fmt::Debug for LocalCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalCredentials")
-            .field("project_id", &self.project_id)
-            .finish_non_exhaustive()
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -455,8 +439,7 @@ impl RunnerHost {
             operation @ (RunnerOperation::Provision { .. }
             | RunnerOperation::QuiescentShutdown { .. }
             | RunnerOperation::ReconcileUnknown { .. }
-            | RunnerOperation::LocalSignIn { .. }
-            | RunnerOperation::LocalSignOut) => {
+            | RunnerOperation::LocalProject { .. }) => {
                 let sender = self
                     .inner
                     .state

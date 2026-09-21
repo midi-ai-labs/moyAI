@@ -869,6 +869,7 @@ function representativeSurfaces(): RenderedSurface[] {
   });
 
   const shared = sharedUiFixture();
+  shared.projection!.principal!.administrator = true;
   shared.projection!.approval = { id: "approval-a", attempt_id: "attempt-a", request: { access: "shell", summary: "実行の確認", details: [], targets: [], outside_workspace: false, risks: [] }, status: "pending", decision: null, can_decide: true, expires_at_ms: 9999999999999 };
   shared.projection!.submission_uncertain = true;
   const asset = { id: "asset-a", project_id: "project-a", job_id: "job-a", kind: "artifact", name: "result.txt", sha256: "a".repeat(64), byte_length: 4, created_at_ms: 1, version: 1, base_sha256: null, purged_at_ms: null };
@@ -885,9 +886,7 @@ function representativeSurfaces(): RenderedSurface[] {
   shared.projection!.submission_uncertain = false;
   surfaces.push({ name: "shared-work-new-conversation", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.principal = null;
-  surfaces.push({ name: "shared-work-login", html: renderSharedWork(sharedWorkPresentation(shared)) });
-  shared.loginMode = "password";
-  surfaces.push({ name: "shared-work-password-login", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  surfaces.push({ name: "shared-work-device-access", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.connected = false;
   surfaces.push({ name: "shared-work-enrollment", html: renderSharedWork(sharedWorkPresentation(shared)) });
   return surfaces;

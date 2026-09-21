@@ -4,7 +4,7 @@
 
 複数人で使う実行用PCを設定する場合は、[共有RunnerのGUI手順](runner-shared.md#desktopの画面から提供する)から始めてください。実行PCではDesktopで場所・権限を一度確認し、Hub管理者がプロジェクトへ操作PCと実行PCを選ぶと、自動で準備します。通常はRunnerを手動起動しません。このページはローカル投入用のCLIと、その実行・停止の契約を説明します。
 
-ローカル受付は単一Agentの実行を対象とします。専用の私用PCではHub不要です。共有提供を設定したPCでは、Desktop・CLI・TUIが実行前にHubの共通資源枠を確保します。既定のDevice範囲は、別フォルダ・別config・パス別名からの実行も同じ端末資源へ参加させます。個別moyAI接続による新しい仕事の委任は廃止したため、Hubのプロジェクトから依頼してください。保存済みの履歴・状態確認・停止と、一般の外部MCPは維持します。サーバーoperatorのログインを遠隔利用者の代わりに使いません。
+ローカル受付は単一Agentの実行を対象とします。専用の私用PCではHub不要です。共有提供を設定したPCでは、Desktop・CLI・TUIが実行前にHubの共通資源枠を確保します。既定のDevice範囲は、別フォルダ・別config・パス別名からの実行も同じ端末資源へ参加させます。個別moyAI接続による新しい仕事の委任は廃止したため、Hubのプロジェクトから依頼してください。保存済みの履歴・状態確認・停止と、一般の外部MCPは維持します。サーバー側の利用者資格を遠隔利用者の代わりに使いません。
 
 提供したOSアカウント以外からの直接実行は受け付けません。そのアカウントのDesktopからHubへ共有仕事を送信し、提供Runnerに実行させてください。ProgramDataの固定policyは全Windowsユーザーが読み、提供operator・SYSTEM・Administratorsだけが変更できます。初回設置に必要な権限がない場合は提供設定を拒否し、自動昇格しません。管理外のアプリをOS全体で停止・隔離する機能ではありません。
 
@@ -54,16 +54,18 @@ Hubからの取消も、完了ターンが保持するmanaged processまで停�
 
 同じ構成では受け付けた ID を最大 128 件保持し、古い ID を破棄して同一要求が再実行されることを防ぎます。上限後はセッション ID を保管し、実行を終了してから Runner を再起動します。構成の位置は既存の `MOYAI_CONFIG_PATH`、データの位置は `MOYAI_DATA_DIR` を使います。起動側と各クライアントで一致させてください。
 
-## 提供PCでのローカル本人確認
+## 提供PCで使うプロジェクト
 
-Desktopの共有ログインと選択projectを使うか、提供Runnerへ次の操作でログインします。パスワードは非表示のconsole入力で読み、コマンド引数や設定へ保存しません。同じOS operatorが行うCLI/TUIのためのログインをRunnerのメモリ内に保持し、再起動後は再ログインが必要です。名前の申告だけでは利用者を確定しません。無効・失効した資格から私用実行へ切り替えることもありません。
+Desktopでは、登録PCに許可されたプロジェクトを選びます。CLI/TUIからは次のコマンドで提供Runnerの対象を選びます。ユーザー名やパスワードは不要です。同じWindows利用者のIPCを通し、各実行受付で登録PCに結び付く現在の資格を取得します。
 
 ```powershell
-moyai-runner sign-in --runner <提供RunnerのID> --username alice --project analysis-project
-moyai-runner sign-out --runner <提供RunnerのID>
+moyai-runner use-project --runner <提供RunnerのID> --project <プロジェクトID>
+moyai-runner clear-project --runner <提供RunnerのID>
 ```
 
-ローカル実行の会話をHubへ自動公開しません。Hubへは担当者・project・実行先・占有・終端の記録を渡します。共有仕事の承認はHubで判断し、ローカル仕事は従来のpermission/Guardian経路で判断します。
+`clear-project`はプロジェクト選択だけを解除します。HubのPC登録や仕事の履歴を削除しません。無効・失効した資格から私用実行へ切り替えず、旧remoteの呼出人をローカル利用者の資格で代用しません。
+
+ローカル実行の会話をHubへ自動公開しません。Hubには担当者・project・実行先・占有・終端を記録します。共有仕事の承認はHubで、ローカル仕事は従来のpermission/Guardian経路で判断します。
 
 ## 実プロセス検証
 

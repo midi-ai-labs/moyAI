@@ -97,7 +97,7 @@ impl SharedWorker {
                 checkpoint_cursor: String::new(),
                 commands: Some(commands),
                 external: Some(external),
-                local_human: None,
+                local_project_id: None,
             }
             .run(),
         );
@@ -119,7 +119,7 @@ struct Controller {
     checkpoint_cursor: String,
     commands: Option<tokio::sync::mpsc::Receiver<OperatorRequest>>,
     external: Option<tokio::sync::mpsc::Receiver<external::ExternalRequest>>,
-    local_human: Option<external::LocalHuman>,
+    local_project_id: Option<String>,
 }
 
 pub(crate) struct OperatorRequest {
@@ -170,39 +170,30 @@ impl Controller {
                 }
                 self.host.begin_quiescent_shutdown()
             }
-            RunnerOperation::LocalSignIn { credentials } => {
-                if !crate::device_network::stable_id(&credentials.project_id)
-                    || credentials.username.trim().is_empty()
-                    || credentials.username.len() > 256
-                    || credentials.password.len() > 1024
-                {
-                    return Err(RunnerError::new(
-                        "Valid Hub credentials and a project ID are required",
-                    ));
-                }
-                #[derive(Deserialize)]
-                struct Login {
-                    token: String,
-                }
-                let login:Login=self.client.request("/v1/shared/login",Some(&json!({"username":credentials.username,"password":credentials.password}))).await?;
-                self.local_human = Some(external::LocalHuman {
-                    actor_device_id: self.settings.device_id.clone(),
-                    principal_session: login.token,
-                    project_id: credentials.project_id,
-                });
-                Ok(())
-            }
-            RunnerOperation::LocalSignOut => {
-                if let Some(human) = self.local_human.take() {
-                    let _: serde_json::Value = self
+            RunnerOperation::LocalProject { project_id } => {
+                if let Some(project_id) = &project_id {
+                    if !crate::device_network::stable_id(project_id) {
+                        return Err(RunnerError::new("A valid Hub project ID is required"));
+                    }
+                    let principal = self.device_principal(project_id).await?;
+                    let projects: Vec<crate::device_network::WorkProject> = self
                         .client
                         .request_as(
-                            "/v1/shared/logout",
-                            Some(&json!({})),
-                            Some(&human.principal_session),
+                            "/v1/shared/projects",
+                            None,
+                            Some(&principal.principal_session),
                         )
                         .await?;
+                    if !projects
+                        .iter()
+                        .any(|project| project.id == *project_id && project.allows_submission())
+                    {
+                        return Err(RunnerError::new(
+                            "This device is not allowed to submit work in that project",
+                        ));
+                    }
                 }
+                self.local_project_id = project_id;
                 Ok(())
             }
             RunnerOperation::Provision {

@@ -389,8 +389,9 @@ mod tests {
         });
         assert!(runtime.view.feedback.is_none());
         runtime.view.feedback = Some("Aliceの保存結果".into());
-        let (old_generation, old_query, token) = runtime.begin_command(&SharedWorkCommand::Logout);
+        let (old_generation, old_query, token) = runtime.begin_command(&SharedWorkCommand::Refresh);
         assert_eq!(token.as_deref(), Some("alice-session"));
+        runtime.clear();
         assert!(runtime.view.feedback.is_none());
         assert!(runtime.require_current(old_generation, old_query).is_err());
         runtime.view.feedback = Some("前の接続の結果".into());

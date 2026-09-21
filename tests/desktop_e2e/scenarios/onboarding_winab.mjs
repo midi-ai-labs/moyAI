@@ -33,12 +33,18 @@ export function approvalVisibleBeforeScroll(observation) {
   return observation?.count === 1 && observation.visible === true && observation.enabled === true
     && observation.center_in_viewport === true && observation.center_in_scroll_clip === true && observation.center_hit === true;
 }
+export function completedRequestorIdentityAccepted(shared, expected) {
+  const summary = shared?.status?.jobs.find(job => job.id === expected.job_id);
+  return shared?.detail?.id === expected.job_id && shared.detail.state === "succeeded"
+    && summary?.state === "succeeded" && summary.requestor?.user_id === expected.user_id
+    && summary.requestor.display_name === expected.display_name;
+}
 export function createOnboardingWinAbScenario(options = {}) {
   const { runnerBinary, runnerTestBinary, liveProvider, expectProviderFailure = false, ...hubOptions } = options;
   const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider);
   if (typeof expectProviderFailure !== "boolean" || (expectProviderFailure && !live)) throw new TypeError("expectProviderFailure requires explicit live provider options");
   const settings = normalizeHubBrowserOptions(hubOptions);
-  const a = { name: "a", input: null }, b = { name: "b", input: null };
+  const a = { name: "a", label: "WinA (操作PC)", input: null }, b = { name: "b", label: "WinB (実行PC)", input: null };
   const state = { resource: null, provider: null, runner: null, close: null, failures: [], environment: {}, consent: false };
   const prepare = args => prepareDesktopFixture({ ...args, owner: OWNER, configMode: "absent", sentinelName: null, sentinelText: "" });
   async function settle(pc) { if (pc.input) { try { await pc.input.cleanup(); } catch (error) { state.failures.push(String(error)); } pc.input = null; } }
@@ -77,10 +83,6 @@ export function createOnboardingWinAbScenario(options = {}) {
       }
       async function hubCheckpoint(name) {
         if (active && active !== "hub") switches++; active = "hub"; steps.push({ pc: "hub", name, elapsed_ms: Date.now() - started });
-        if (await page.locator("#shared-admin-setup-code").isVisible()) {
-          await sink.record("onboarding-secret-screen-not-captured", { name, reason: "one-time person setup code is displayed" }, { phase: "executing", owner: OWNER });
-          return;
-        }
         await state.resource.screenshot(`journey-hub-${name}`);
       }
       async function nextStep(title, expected) {
@@ -108,6 +110,19 @@ export function createOnboardingWinAbScenario(options = {}) {
         pc.identity = { process_id: pc.runtime.desktop_process_id, network: enrolled.network, key_sha256: enrolled.keySha256, certificate_sha256: enrolled.certificateSha256 };
         await checkpoint(pc, entry === "hub" ? "registered-before-execution" : "registered-before-person");
       }
+      async function renameDevice(pc) {
+        await page.locator("#network-clients-refresh").click();
+        const row = page.locator(`[data-id="device:${pc.identity.network.device_id}"]`);
+        await row.locator("details[data-device-identity] > summary").click(); await row.getByRole("button", { name: /を管理$/ }).click();
+        await page.locator("#network-device-label").fill(pc.label); await page.locator("#network-device-save").click(); await page.locator("#network-device-dialog").waitFor({ state: "hidden" });
+        pc.identity.network = await wait("Desktop receives its renamed PC without changing device identity", () => projection(pc, "device_network_projection"), p => p.device_id === pc.identity.network.device_id && p.display_name === pc.label);
+      }
+      async function renamedActor(userId) {
+        return wait("The same approved actor and visible account use the current PC name", async () => ({
+          shared: await projection(a),
+          account_text: await a.driver.evaluate(`document.querySelector('[data-shared-region="account"] p')?.textContent?.trim()`),
+        }), value => value.shared.principal?.user_id === userId && value.shared.principal.display_name === a.label && !value.shared.principal.administrator && value.account_text?.startsWith(`${a.label} · `));
+      }
       async function nativeFile(pc, target, selectedPath, intent) {
         pc.nativeOwner = { executionRoot: pc.context.root, ownerPath: pc.runtime.desktop_owner_path, expectedOwner: pc.runtime.desktop_owner };
         pc.nativeBefore = await snapshotOwnedTopLevelWindows(pc.nativeOwner); pc.importDispatched = true; await click(pc, target);
@@ -120,28 +135,9 @@ export function createOnboardingWinAbScenario(options = {}) {
         pc.nativeCandidate = null; pc.importDispatched = false;
         await pc.sink.record("onboarding-native-selection", { intent, selectedPath, result }, { phase: "executing", owner: OWNER });
       }
-      async function saveHubForm(expectedPerson = null) {
+      async function saveHubForm() {
         await page.locator("#shared-admin-save").click();
-        const result = await wait("Hub either saves the form or explains why it remains open", () => page.evaluate(() => ({
-          open: Boolean(document.querySelector('#shared-admin-form')),
-          error: document.querySelector('#shared-admin-form-error')?.textContent ?? '',
-          notice: document.querySelector('#shared-admin-notice')?.textContent ?? '',
-        })), value => !value.open || Boolean(value.error));
-        if (result.open) {
-          if (expectedPerson && result.error.includes("入力は残っています")) {
-            await hubCheckpoint("visible-conflict-with-inputs");
-            await page.locator("#shared-admin-review-conflict").click();
-            await page.locator("#shared-admin-comparison").waitFor({ state: "visible" });
-            const comparison = await page.locator("#shared-admin-comparison").innerText();
-            if (!comparison.includes(expectedPerson.username) || !comparison.includes(expectedPerson.displayName) || !await page.locator("#shared-admin-save").isDisabled() || await page.locator("#shared-admin-setup-code").isVisible()) throw fail("Hub comparison must retain input without saving or issuing a code");
-            await hubCheckpoint("compare-retained-person-inputs");
-            await page.locator("#shared-admin-accept-comparison").click();
-            if (await page.locator("#shared-admin-username").inputValue() !== expectedPerson.username || await page.locator("#shared-admin-display_name").inputValue() !== expectedPerson.displayName || await page.locator("#shared-admin-setup-code").isVisible()) throw fail("Accepting comparison changed the person draft or issued a code before Save");
-            await sink.record("onboarding-explicit-conflict-recovery", { ...result, comparison, inputs_retained: true, code_issued_before_save: false, actions: ["compare current settings with retained input", "accept comparison", "save once"] }, { phase: "executing", owner: OWNER });
-            return saveHubForm();
-          }
-          throw fail("Hub did not save the displayed form", result);
-        }
+        await page.locator("#shared-admin-form").waitFor({ state: "detached" });
       }
       try {
         await attach(a, { context, runtime, driver, sink }); await checkpoint(a, "first-launch");
@@ -149,10 +145,9 @@ export function createOnboardingWinAbScenario(options = {}) {
         await page.locator('nav a[href="#device-network"]').click(); await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
         await hubCheckpoint("network-before-start"); await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
         await enroll(a);
+        const actor = await wait("A uses its approved device without a login form", () => projection(a), p => p.principal && !p.principal.administrator);
         // A/B share the actual Windows computer name: this rename is a simulation prerequisite.
-        await page.locator("#network-clients-refresh").click(); const row = page.locator(`[data-id="device:${a.identity.network.device_id}"]`);
-        await row.locator("details[data-device-identity] > summary").click(); await row.getByRole("button", { name: /を管理$/ }).click();
-        await page.locator("#network-device-label").fill("WinA (操作PC)"); await page.locator("#network-device-save").click(); await page.locator("#network-device-dialog").waitFor({ state: "hidden" });
+        await renameDevice(a); await renamedActor(actor.principal.user_id); await checkpoint(a, "device-renamed");
         const companion = await host.openCompanion({ context: await createCompanionContext(context, "desktop-b"), scenario: childScenario, sink });
         await attach(b, companion); await checkpoint(b, "first-launch");
         await click(b, action("initial-setup-execution", '[data-surface="initial-setup"]'));
@@ -168,6 +163,7 @@ export function createOnboardingWinAbScenario(options = {}) {
         await wait("B's execution-purpose setup opens PC connection directly", () => projection(b, "desktop_state"), p => p.overlay === "hub" && p.startup.status === "ready" && p.startup.initial_setup_required === false);
         await wait("PC connection tab is visible after execution-purpose setup", () => b.driver.evaluate(`document.querySelector('#hub-tab-devices')?.getAttribute('aria-pressed') === 'true' && Boolean(document.querySelector('#device-network-import')?.getClientRects().length)`), Boolean);
         await enroll(b, "hub");
+        await renameDevice(b);
         if (!isolatedDevicesAccepted(a.identity, b.identity)) throw fail("A and B must have distinct live processes and credentials");
         await sink.record("onboarding-two-pcs", { a: a.identity, b: b.identity }, { phase: "executing", owner: OWNER });
         await click(b, byId("hub-tab-devices"));
@@ -184,32 +180,16 @@ export function createOnboardingWinAbScenario(options = {}) {
         const runner = await state.runner.capture(b.runtime.desktop_process_id);
         await wait("B explains that saved execution settings still need the Hub administrator's assignment", () => b.driver.evaluate(`document.querySelector('.device-execution-handoff')?.textContent`), text => text?.includes("このPCの実行設定は保存済みです") && text.includes("Hub管理者"));
         await checkpoint(b, "enabled-before-project");
-        await page.locator('nav a[href="#shared-administration"]').click(); await page.locator('[data-sa-tab="users"]').click();
-        const person = { username: "win-a-user", displayName: "WinA 利用者" };
-        await page.locator('[data-sa-operation="create_user_with_setup_code"]').click(); await page.locator("#shared-admin-username").fill(person.username); await page.locator("#shared-admin-display_name").fill(person.displayName);
-        // A second administrator tab creates the actual job project while the person draft is open.
-        // This guarantees a real revision conflict without fixture API mutation or lost user input.
-        const otherAdmin = await page.context().newPage();
-        try {
-          await otherAdmin.goto(hub.url); await otherAdmin.locator('nav a[href="#shared-administration"]').click(); await otherAdmin.locator('[data-sa-tab="projects"]').click();
-          await otherAdmin.locator('[data-sa-operation="save_project"][data-sa-id=""]').click(); await otherAdmin.locator("#shared-admin-label").fill("CSV集計の実装");
-          await otherAdmin.locator("#shared-admin-save").click(); await otherAdmin.locator("#shared-admin-form").waitFor({ state: "detached" });
-          await sink.record("onboarding-concurrent-admin-edit", { through: "second Hub browser tab", operation: "create this journey's real project while the person draft remains open", fixture_purpose: "deterministic comparison recovery" }, { phase: "executing", owner: OWNER });
-        } finally { await otherAdmin.close(); }
-        await saveHubForm(person); await page.locator("#shared-admin-setup-code").waitFor({ state: "visible" });
-        const setupCode = await page.locator("#shared-admin-setup-code-value").inputValue();
-        const userId = await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "WinA 利用者", exact: true }) }).locator('[data-sa-operation="update_user"]').getAttribute("data-sa-id");
-        await page.locator("#shared-admin-setup-code-close").click(); await hubCheckpoint("person-created");
-        await wait("Initial person setup fields are visible without opening a disclosure", () => a.driver.evaluate(`Boolean(document.querySelector('#shared-setup-code')?.getClientRects().length) && Boolean(document.querySelector('#shared-setup-confirm')?.getClientRects().length) && document.querySelector('[data-action="shared-auth-mode"][data-value="setup"]')?.getAttribute('aria-pressed') === 'true'`), Boolean);
-        await checkpoint(a, "first-person-form"); const password = randomUUID();
-        await fill(a, byId("shared-username", "INPUT"), "win-a-user"); await fill(a, byId("shared-password", "INPUT"), password);
-        await fill(a, byId("shared-setup-code", "INPUT"), setupCode); await fill(a, byId("shared-setup-confirm", "INPUT"), password); await click(a, sharedActionTarget("setup-password"));
-        await wait("A completes ordinary human setup", () => projection(a), p => p.principal?.user_id === userId && !p.principal.administrator); await checkpoint(a, "person-before-project");
+        await renamedActor(actor.principal.user_id);
+        if (await a.driver.evaluate(`Boolean(document.querySelector('#shared-password, #shared-setup-code'))`)) throw fail("Device approval still requires a password");
+        await checkpoint(a, "device-ready-before-project");
+        await page.locator('nav a[href="#shared-administration"]').click();
         await page.locator('[data-sa-tab="projects"]').click();
-        await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "CSV集計の実装", exact: true }) }).locator('[data-sa-operation="save_project"]').click();
-        await page.getByRole("combobox", { name: "WinA 利用者", exact: true }).selectOption("contributor");
+        await page.locator('[data-sa-operation="save_project"][data-sa-id=""]').click();
+        await page.locator("#shared-admin-label").fill("CSV集計の実装");
         await page.locator(`input[name="controller_device_ids"][value="${a.identity.network.device_id}"]`).check();
-        await page.locator(`input[name="runner_device_ids"][value="${b.identity.network.device_id}"]`).check(); await hubCheckpoint("project-before-save"); await saveHubForm();
+        await page.locator(`input[name="runner_device_ids"][value="${b.identity.network.device_id}"]`).check();
+        await hubCheckpoint("project-before-save"); await saveHubForm();
         const projectId = await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "CSV集計の実装", exact: true }) }).locator('[data-sa-operation="save_project"]').getAttribute("data-sa-id");
         const ready = await wait("Assigned B provisions its project execution folder", execution, p => p.projects.some(row => row.id === projectId && row.can_execute && row.preparation_state === "ready" && row.environment_id), 60000);
         const environmentId = ready.projects.find(row => row.id === projectId).environment_id;
@@ -301,6 +281,10 @@ export function createOnboardingWinAbScenario(options = {}) {
           }, value => value.count >= 2 && value.open);
           await checkpoint(a, "previous-artifact-versions"); await click(a, target);
         }
+        const finalActor = await renamedActor(actor.principal.user_id);
+        const finalJob = finalActor.shared.status?.jobs.find(job => job.id === completed.detail.id);
+        const expectedRequestor = { job_id: completed.detail.id, user_id: actor.principal.user_id, display_name: a.label };
+        if (!completedRequestorIdentityAccepted(finalActor.shared, expectedRequestor)) throw fail("Completed work must show the requestor's current PC name without replacing its actor", { expected: expectedRequestor, requestor: finalJob?.requestor });
         await checkpoint(a, "implementation-result"); await checkpoint(b, "after-implementation");
         const files = [];
         for (const name of [SCRIPT_NAME, RESULT_NAME]) {
@@ -313,9 +297,9 @@ export function createOnboardingWinAbScenario(options = {}) {
         await checkpoint(a, "saved-results");
         await hubCheckpoint("onboarding-after-result");
         await sink.record("onboarding-journey-complete", { elapsed_ms: Date.now() - started, checkpoint_role_switches: switches, explicit_desktop_actions: desktopActions, steps,
-          files, project_id: projectId, environment_id: environmentId, approvals: approvals.size, approval_visibility: approvalVisibility, provider_calls: state.provider?.requests.length ?? null,
+          files, project_id: projectId, environment_id: environmentId, device_names: { controller: a.label, executor: b.label }, requestor: finalJob.requestor, approvals: approvals.size, approval_visibility: approvalVisibility, provider_calls: state.provider?.requests.length ?? null,
           actual_tools: state.provider?.requests.flatMap(r => r.messages.filter(m => m.role === "assistant").flatMap(m => m.tool_calls ?? []).map(t => t.function.name)) ?? null,
-          caveats: ["One Windows host and account, two isolated actual Tauri processes; no VM/network installation proof.", live ? "Live provider; canonical tool counts must be audited from persisted runtime evidence, not mock request history." : "Scripted plan proves real tool/file/approval transport and execution, not LLM quality.", "Hub/A/B UI mutations use controls; fixture prepares processes and source CSV. A rename compensates for the simulated same Windows machine name. A second Hub tab creates the real project to exercise concurrent-edit comparison deliberately.", "Checkpoint switches and explicit actions are lower bounds; helper keyboard navigation, native controls and Hub browser actions are recorded separately."] }, { phase: "executing", owner: OWNER });
+          caveats: ["One Windows host and account, two isolated actual Tauri processes; no VM/network installation proof.", live ? "Live provider; canonical tool counts must be audited from persisted runtime evidence, not mock request history." : "Scripted plan proves real tool/file/approval transport and execution, not LLM quality.", "Hub/A/B UI mutations use controls; fixture prepares processes and source CSV. Both PCs are renamed after approval; the controller's current actor and completed request keep that PC name. Device approval and project PC assignment require no person/password setup.", "Checkpoint switches and explicit actions are lower bounds; helper keyboard navigation, native controls and Hub browser actions are recorded separately."] }, { phase: "executing", owner: OWNER });
         if (!approvalVisibility.length || approvalVisibility.some(row => !row.visible_before_scroll)) throw fail("Approval needed scrolling before its action could be found", { approval_visibility: approvalVisibility, artifacts_verified: true });
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {

@@ -196,15 +196,15 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       }
       await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-next-steps", owner: OWNER });
       await trustedClick(input, cdp, byId("device-network-open-shared"), sink);
-      const sharedEntry = await wait("Connection card opens shared work without reimport or automatic human login", () => cdp.evaluate(`(async () => {
+      const sharedEntry = await wait("Connection card opens shared work without reimport or password login", () => cdp.evaluate(`(async () => {
         const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
         const shared = await window.__TAURI_INTERNALS__.invoke('shared_work_projection');
         const login = document.querySelector('#shared-username');
         return { overlay: state.overlay, hub_project_open: state.hub_project_open, connected: shared.connected, principal: shared.principal,
           login_visible: Boolean(login && login.getClientRects().length && !login.closest('[hidden], [inert]')) };
-      })()`), value => value.hub_project_open === true && value.overlay === "none" && value.connected && value.principal === null && value.login_visible);
+      })()`), value => value.hub_project_open === true && value.overlay === "none" && value.connected && value.principal && !value.login_visible);
       await sink.record("hub-connection-shared-entry", sharedEntry, { phase: "executing", owner: OWNER });
-      await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-shared-login", owner: OWNER });
+      await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-shared-ready", owner: OWNER });
       return { acquisition: "pass", oracle: "pass", manual: "not_required" };
       } finally {
         try { await input.cleanup(); } catch (error) { state.inputFailures.push(error?.code ?? "input-cleanup-failed"); }
@@ -284,7 +284,7 @@ export async function enrollDesktopFromHubBrowser({ resource, context, runtime, 
     network: await invokeDesktopCommand(cdp, "device_network_projection"), snapshot: await hub.observeNetwork(),
   }), value => enrollmentAccepted(value.network, value.snapshot), 45_000);
   await wait("Desktop visible enrolled status", () => cdp.evaluate(entry === "shared-work"
-    ? `Boolean(document.querySelector('.shared-work #shared-username')?.getClientRects().length)`
+    ? `Boolean(document.querySelector('.shared-work [data-shared-region="account"]')?.getClientRects().length) && !document.querySelector('.shared-work [data-shared-region="connection"]')`
     : `document.querySelector('[data-settings-passive="device-network-enrollment"]')?.textContent?.includes('Hubに接続済み')`), value => value === true);
   await sink.record("hub-browser-desktop-approved", { device_id: active.network.device_id,
     request_id: pending.request_id, hub_device_count: active.snapshot.devices.length }, { phase: "executing", owner: OWNER });
