@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderHubCatalogComparison } from "../src/hub_catalog_render.ts";
-import { renderHubOverlay } from "../src/hub_render.ts";
+import { renderManagedAiConnection } from "../src/hub_render.ts";
 import { createHubUiState, type HubCatalogComparison, type HubProjection } from "../src/hub_state.ts";
 
 function comparison(overrides: Partial<HubCatalogComparison> = {}): HubCatalogComparison {
@@ -55,12 +55,11 @@ test("Main and Side show their own reviewed revisions inside independent retaine
     main_catalog_comparison: comparison(),
     side_chat_catalog_comparison: comparison({ reviewed_revision: "8", models: [], software_before: "0.2.0" }),
   } satisfies HubProjection;
-  const html = renderHubOverlay(state);
-  const main = html.slice(html.indexOf('aria-labelledby="hub-main-title"'), html.indexOf('aria-labelledby="hub-side_chat-title"'));
-  const side = html.slice(html.indexOf('aria-labelledby="hub-side_chat-title"'));
+  const main = renderManagedAiConnection(state, "main");
+  const side = renderManagedAiConnection(state, "side_chat");
   assert.match(main, /確認時の更新 3 → 現在の更新 8/);
-  assert.match(main, /data-settings-passive="hub-main-catalog-comparison"/);
+  assert.match(main, /data-settings-passive="ai-main-comparison"/);
   assert.match(side, /確認時の更新 8 → 現在の更新 8/);
-  assert.match(side, /data-settings-passive="hub-side_chat-catalog-comparison"/);
+  assert.match(side, /data-settings-passive="ai-side_chat-comparison"/);
   assert.doesNotMatch(side, /Former name|削除 1/);
 });

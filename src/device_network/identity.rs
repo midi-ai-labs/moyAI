@@ -107,6 +107,15 @@ pub(crate) struct DeviceIdentityStore {
 }
 
 impl DeviceIdentityStore {
+    /// Explicit local recovery retires this key; a future application gets a new key.
+    pub(crate) fn remove(&self) -> Result<(), DeviceError> {
+        let _lock = self.lock()?;
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(DeviceError::Storage),
+        }
+    }
     pub(crate) fn new(path: Utf8PathBuf) -> Self {
         Self { path }
     }

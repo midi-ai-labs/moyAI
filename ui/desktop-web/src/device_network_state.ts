@@ -68,8 +68,9 @@ export interface DeviceNetworkUiState {
   executionRecoveryReason: string;
   executionEffectsReviewed: boolean;
   executionProcessesStopped: boolean;
+  executionResetConfirmed: boolean;
   projection: DeviceNetworkProjection | null;
-  pending: "load" | "import" | "join" | "receiver" | "select" | "refresh" | "leave" | "cancel_job" | null;
+  pending: "load" | "import" | "join" | "receiver" | "select" | "refresh" | "leave" | "reset" | "cancel_job" | null;
   selectionKey: string | null;
   requestSerial: number;
   search: string;
@@ -84,6 +85,8 @@ export interface DeviceNetworkUiState {
   dirty: boolean;
   draftTarget: DeviceNetworkTarget | null;
   leaveConfirmed: boolean;
+  resetConfirmed: boolean;
+  deletePeerKey: string;
   error: string;
   notice: string;
   jobs: DeviceNetworkJobs;
@@ -101,9 +104,9 @@ export interface DeviceNetworkUiState {
 }
 export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial" | "executionSerial">;
 export function createDeviceNetworkUiState(): DeviceNetworkUiState {
-  return { execution: null, executionPending: null, executionSerial: 0, executionAccess: "default", executionError: "", executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
+  return { execution: null, executionPending: null, executionSerial: 0, executionAccess: "default", executionError: "", executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, executionResetConfirmed: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
     receiverConfirmed: false, target: { kind: "temp" }, accessMode: "default", modelMode: "hub",
-    dirty: false, draftTarget: null, leaveConfirmed: false, error: "", notice: "", startOnLaunch: false, keepWhenHidden: false,
+    dirty: false, draftTarget: null, leaveConfirmed: false, resetConfirmed: false, deletePeerKey: "", error: "", notice: "", startOnLaunch: false, keepWhenHidden: false,
     bindIp: "", port: "",
     jobs: { incoming: [], outgoing: [] }, jobsSerial: 0, jobsError: "",
     diagnostics: {}, diagnosticErrors: {}, diagnosticPending: null, diagnosticSerial: 0,
@@ -130,6 +133,10 @@ export function acceptDeviceNetworkProjection(
     resetExecutionRecovery(state);
   }
   state.projection = projection;
+  if (previous && (previous.hub_url !== projection.hub_url || previous.device_id !== projection.device_id)) {
+    state.resetConfirmed = false; state.deletePeerKey = ""; state.executionResetConfirmed = false;
+  }
+  if (!projection.peers.some(peer => peer.selected && devicePeerKey(peer) === state.deletePeerKey)) state.deletePeerKey = "";
   if (previous && previous.enrollment !== "active" && projection.enrollment === "active") {
     state.notice = "Hubへの参加が承認され、接続しました。管理者がこのPCを操作PCに指定したプロジェクトが、左の一覧に表示されます。";
   }
@@ -166,6 +173,10 @@ export function resetExecutionRecovery(state: DeviceNetworkPresentation): void {
   state.executionEffectsReviewed = false; state.executionProcessesStopped = false;
 }
 export function editDeviceNetworkField(state: DeviceNetworkUiState, field: string, value: string, checked: boolean): void {
+  if (field === "execution_reset_confirmed") {
+    if (!state.executionPending) state.executionResetConfirmed = checked;
+    return;
+  }
   if (field.startsWith("execution_recovery_")) {
     if (state.executionPending) return;
     if (field === "execution_recovery_target") {
@@ -187,6 +198,11 @@ export function editDeviceNetworkField(state: DeviceNetworkUiState, field: strin
   if (field === "search") { state.search = value; return; }
   if (field === "receiver_confirmed") { state.receiverConfirmed = checked; return; }
   if (field === "leave_confirmed") { state.leaveConfirmed = checked; return; }
+  if (field === "reset_confirmed") { state.resetConfirmed = checked; return; }
+  if (field === "delete_peer") {
+    state.deletePeerKey = checked && state.projection?.peers.some(peer => peer.selected && devicePeerKey(peer) === value) ? value : "";
+    return;
+  }
   if (field === "target") {
     const target = state.projection?.targets.find(row => deviceTargetKey(row.target) === value)?.target;
     if (!target) return;
@@ -287,7 +303,7 @@ export function deviceNetworkError(error: unknown): string {
     settings_corrupt: "保存された端末設定を読み込めません。設定を上書きせず、管理者へ確認してください。",
     settings_changed: "保存設定が変わりました。最新情報を取得し、入力内容を確認してから保存してください。",
       connection_changed: "接続状態が変わりました。最新情報を取得し、入力内容を確認してから保存してください。",
-      different_hub: "同じHubであることを確認できません。別Hubや公開CAの変更には対応していません。既存の登録・接続設定は保持しています。",
+      different_hub: "同じHubであることを確認できません。この読み込み操作では別Hubや公開CAの変更には対応していません。「接続設定をリセット」後に読み込んでください。既存の登録・接続設定は保持しています。",
       endpoint_change_busy: "実行受付を一時停止し、実行中・状態不明の仕事がなくなるまで待ってから接続先を変更してください。既存の接続設定は保持しています。",
       endpoint_change_runner_unconfirmed: "実行機能の安全な終了を確認できません。接続設定は変更していません。実行中・状態不明の仕事と停止状況を確認してください。",
       endpoint_change_not_saved: "接続先は変更していません。実行受付は自動再開しません。最新の設定を確認して再試行するか、元の接続で受付を明示的に再開してください。",
@@ -303,6 +319,8 @@ export function deviceNetworkError(error: unknown): string {
     recovery_required: "以前の依頼の受付を確認できません。自動で再実行せず、実行端末で状態を確認してから新しい依頼を送ってください。",
     artifacts_unavailable: "この版の成果物を取得できません。成果物の記録と相手の受付状態を確認してください。",
     confirmation_required: "公開対象と実行権限を確認して、確認欄を選択してください。",
+    reset_incomplete: "前回の接続リセットを完了できていません。「接続設定をリセット」をもう一度実行してください。旧Hubへの自動接続は停止しています。",
+    reset_autostart_unconfirmed: "接続設定はリセットしました。Windowsサインイン時の起動設定は解除を確認できませんでしたが、旧Hubの仕事は受け付けません。",
     connection_required: "先にHubへの参加・接続を完了してください。",
     read_tools_only: "読み取りtoolの公開対象です。エージェントへのタスク委任には使えません。",
     not_available_or_not_allowed: "相手の受付・接続、またはHubの許可を確認できません。最新情報を取得してください。",

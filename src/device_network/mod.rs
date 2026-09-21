@@ -16,6 +16,7 @@ mod identity;
 mod outgoing;
 mod peer_connections;
 mod receiver;
+pub(crate) mod reset;
 mod service;
 mod shared_work;
 pub(crate) use shared_work::WorkProject;
@@ -29,7 +30,9 @@ pub(crate) use identity::{DeviceIdentity, DeviceIdentityStore};
 pub use outgoing::{DeviceDelegationRow, DeviceNetworkJobs};
 pub(crate) use outgoing::{canonical_key as history_request_key, server_id as history_server_id};
 pub(crate) use service::WeakDeviceNetwork;
-pub use service::{DeviceNetworkProjection, DeviceNetworkService, PreparedDeviceConfiguration};
+pub use service::{
+    DeviceNetworkProjection, DeviceNetworkService, PreparedDeviceConfiguration, PreparedDeviceReset,
+};
 pub use settings::{
     DeviceSettings, DeviceSettingsStore, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
 };
@@ -155,6 +158,8 @@ pub enum DeviceError {
     ReceiverAddressUnavailable,
     #[error("confirmation_required")]
     ConfirmationRequired,
+    #[error("reset_incomplete")]
+    ResetIncomplete,
 }
 
 pub(crate) fn canonical_revision(value: &str) -> Option<u64> {

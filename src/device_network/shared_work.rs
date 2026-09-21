@@ -341,6 +341,13 @@ impl SharedWorkOwner {
             ..Runtime::default()
         }))
     }
+    pub(super) fn reset_connection(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.clear();
+            state.binding.clear();
+            state.hub_binding.clear();
+        }
+    }
 }
 #[derive(Default)]
 struct Runtime {

@@ -16,7 +16,7 @@ export const MODAL_KEYBOARD_PLAN = Object.freeze([
   { overlay:'shortcuts', action:'show-shortcuts', heading:'shortcuts-dialog-title', closes:['button[data-action="close-overlay"]'] },
   { overlay:'about', action:'show-about', heading:'about-dialog-title', closes:['.modal-header button[data-action="close-overlay"]','.modal-actions button[data-action="close-overlay"]'] },
   { overlay:'hub', action:'show-hub', heading:'hub-dialog-title', closes:['.hub-modal-header button[data-action="close-overlay"]','.hub-modal-footer button[data-action="close-overlay"]'] },
-  { overlay:'provider', action:'show-provider', heading:'provider-dialog-title', closes:['button[data-action="close-overlay"]'] },
+  { overlay:'config', action:'show-provider', heading:'config-dialog-title', closes:['button[data-action="close-overlay"]'] },
   { overlay:'config', action:'show-config', heading:'config-dialog-title', closes:['button[data-action="close-overlay"]'] },
 ]);
 const GUARDED_COMMANDS = ['new_chat','show_command_palette','toggle_access_mode','submit_prompt','submit_side_chat','cancel_run','cancel_side_chat','export_transcript_markdown','set_session_search_include_archived'];
@@ -50,8 +50,8 @@ export async function observeModalKeyboard(cdp, plan) {
       dialogs:dialogs.map(e=>e.getAttribute('aria-labelledby')),inDialog:Boolean(d?.contains(document.activeElement)),dialogFocused:document.activeElement===d,
       focus:describe(document.activeElement),focusIndex:controls.indexOf(document.activeElement),targets:controls.map(describe),
       hubReady:${JSON.stringify(plan.overlay)}!=='hub'||Boolean(d?.querySelector('#hub-tab-devices[aria-pressed="true"]')
-        &&shown(d?.querySelector('#device-network-import:not(:disabled)'))&&shown(d?.querySelector('#device-network-refresh:not(:disabled)'))
-        &&d?.querySelector('[data-settings-passive="device-network-receiver-status"]')?.textContent.trim()==='受付 OFF · 停止中'),
+        &&shown(d?.querySelector('#device-network-import:not(:disabled)'))&&shown(d?.querySelector('#device-network-open-shared:not(:disabled)'))
+        &&d?.querySelector('[data-settings-passive="device-execution-status"]')?.textContent.trim()==='Hubへの接続待ち'),
       closeTargets:${JSON.stringify(plan.closes)}.map(selector=>{const matches=d?[...d.querySelectorAll(selector)]:[];return {selector,count:matches.length,index:controls.indexOf(matches[0])};}),
       values:d?[...d.querySelectorAll('input,textarea,select')].map(e=>({id:e.id,key:e.dataset.configKey??null,value:e.value,checked:e.checked??null})):[],
       errors:[...document.querySelectorAll('.fatal,.ui-error-notice')].filter(shown).map(e=>e.textContent)};
@@ -154,7 +154,7 @@ export function createModalKeyboardControlsScenario(){
           }
           const calls=(await commands.snapshot(commandStart)).calls;
           if(calls.length)throw failure('Modal shortcuts issued a forbidden background command',{plan,calls});
-          await captureScenarioScreenshot({cdp,sink,name:`modal-keyboard-${plan.overlay}`,owner:OWNER});
+          await captureScenarioScreenshot({cdp,sink,name:`modal-keyboard-${plan.action}`,owner:OWNER});
           await key(input,{key:'Escape'});
           await wait(cdp,plan,'Escape closes the modal and preserves the draft',s=>s.p.overlay==='none'&&s.dialogs.length===0&&modalContentPreserved(baseline,s));
           const closes=[];
@@ -173,7 +173,7 @@ export function createModalKeyboardControlsScenario(){
           }
           await sink.record('modal-keyboard-verified',{plan,cycles,blocked,commands:calls,escape:true,closes},{phase:'executing',owner:OWNER});
         }
-        await sink.record('modal-keyboard-scope',{dialogs:MODAL_KEYBOARD_PLAN.map(p=>p.overlay),standaloneCommands:'No separate current commands dialog; command_palette tested',noExplicitClose:['workspace','command_palette'],excluded:['F9 suppression with an export-enabled history behind the dialog (this fixture has an empty transcript)','backdrop pointer behavior','dirty discard confirmations','Initial Setup','permission decisions','Session Settings','Prompt Review','MCP History (separate actual case)','physical OS keyboard and IME'],input:'trusted WebView keyboard and pointer; no DOM mutation or synthetic DOM events'},{phase:'executing',owner:OWNER});
+        await sink.record('modal-keyboard-scope',{dialogs:[...new Set(MODAL_KEYBOARD_PLAN.map(p=>p.overlay))],routes:MODAL_KEYBOARD_PLAN.map(({action,overlay})=>({action,overlay})),standaloneCommands:'No separate current commands dialog; command_palette tested. show-provider and show-config both open the common AI settings.',noExplicitClose:['workspace','command_palette'],excluded:['F9 suppression with an export-enabled history behind the dialog (this fixture has an empty transcript)','backdrop pointer behavior','dirty discard confirmations','Initial Setup','permission decisions','Session Settings','Prompt Review','MCP History (separate actual case)','physical OS keyboard and IME'],input:'trusted WebView keyboard and pointer; no DOM mutation or synthetic DOM events'},{phase:'executing',owner:OWNER});
         return {acquisition:'pass',oracle:'pass',manual:'pending'};
       }catch(error){primary=error;try{await captureScenarioScreenshot({cdp,sink,name:'modal-keyboard-failure',owner:OWNER});}catch{}throw error;}
       finally{

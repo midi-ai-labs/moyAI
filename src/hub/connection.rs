@@ -84,6 +84,8 @@ pub struct HubConnectionProjection {
     #[serde(default)]
     pub recommended_main_selection: Option<HubSelection>,
     pub side_chat_review: Option<ReviewedHubSelection>,
+    pub main_uses_default: bool,
+    pub side_chat_uses_default: bool,
     pub main_catalog_comparison: HubCatalogComparison,
     pub side_chat_catalog_comparison: HubCatalogComparison,
     pub main_confirmation: HubReviewConfirmation,
@@ -201,12 +203,16 @@ impl ConnectionState {
             HubReviewConfirmation::Unconfirmed
         }
     }
-    fn projection(&self) -> HubConnectionProjection {
+    // Device ownership is sampled before taking the Hub state lock. Both command receipts
+    // and polling must describe this same effective connection, not raw legacy mode fields.
+    fn projection(&self, managed_endpoint: Option<&str>) -> HubConnectionProjection {
         HubConnectionProjection {
             settings_revision: self.settings.revision.clone(),
             connection_generation: self.generation.to_string(),
             status: self.status,
-            endpoint: self.settings.endpoint.clone(),
+            endpoint: managed_endpoint
+                .unwrap_or(&self.settings.endpoint)
+                .to_owned(),
             label: self.settings.label.clone(),
             hub_id: self.settings.hub_id.clone(),
             catalog: self.catalog.clone(),
@@ -223,6 +229,8 @@ impl ConnectionState {
                 })
                 .map(|review| review.selection.clone()),
             side_chat_review: self.settings.side_chat_review.clone(),
+            main_uses_default: self.settings.main_uses_default,
+            side_chat_uses_default: self.settings.side_chat_uses_default,
             main_catalog_comparison: HubCatalogComparison::between(
                 self.settings.main_review.as_ref(),
                 self.settings.main_catalog_baseline.as_ref(),
@@ -236,8 +244,16 @@ impl ConnectionState {
             main_confirmation: self.confirmation(HubReviewContext::Main),
             side_chat_confirmation: self.confirmation(HubReviewContext::SideChat),
             error: self.error.map(HubError::code),
-            main_mode: self.settings.main_mode,
-            side_chat_mode: self.settings.side_chat_mode,
+            main_mode: if managed_endpoint.is_some() {
+                HubRouteMode::Hub
+            } else {
+                self.settings.main_mode
+            },
+            side_chat_mode: if managed_endpoint.is_some() {
+                HubRouteMode::Hub
+            } else {
+                self.settings.side_chat_mode
+            },
             active_main: self.active[0].as_ref().map(|active| active.display.clone()),
             active_side_chat: self.active[1].as_ref().map(|active| active.display.clone()),
             can_enable_main_hub: self.active[0].is_none()
@@ -245,8 +261,12 @@ impl ConnectionState {
             can_enable_side_chat_hub: self.active[1].is_none()
                 && self.confirmation(HubReviewContext::SideChat)
                     == HubReviewConfirmation::Confirmed,
-            can_change_main_mode: self.active[0].is_none() && self.storage_error.is_none(),
-            can_change_side_chat_mode: self.active[1].is_none() && self.storage_error.is_none(),
+            can_change_main_mode: managed_endpoint.is_none()
+                && self.active[0].is_none()
+                && self.storage_error.is_none(),
+            can_change_side_chat_mode: managed_endpoint.is_none()
+                && self.active[1].is_none()
+                && self.storage_error.is_none(),
         }
     }
 }
@@ -255,6 +275,7 @@ struct ConnectionInner {
     state: std::sync::Mutex<ConnectionState>,
     store: Option<HubSettingsStore>,
     network_http: std::sync::Mutex<Option<crate::device_network::ManagedHubHttp>>,
+    device_network: std::sync::Mutex<Option<crate::device_network::WeakDeviceNetwork>>,
     // A later save in the same context must not reach Hub before an earlier request completes.
     reviews: [Mutex<()>; 2],
 }
@@ -304,6 +325,7 @@ impl HubConnection {
                 }),
                 store: Some(store),
                 network_http: std::sync::Mutex::new(None),
+                device_network: std::sync::Mutex::new(None),
                 reviews: [Mutex::new(()), Mutex::new(())],
             }),
         }
@@ -311,6 +333,42 @@ impl HubConnection {
 
     pub async fn projection(&self) -> HubConnectionProjection {
         self.projection_now()
+    }
+
+    pub(crate) fn attach_device_network(&self, network: crate::device_network::WeakDeviceNetwork) {
+        *self.inner.device_network.lock().unwrap() = Some(network);
+    }
+
+    /// The device connection is the owner of configured Hub use, including outages and pending
+    /// enrollment. Never interpret the absence of a live model session as permission for Direct.
+    pub(crate) fn managed_endpoint(&self) -> Option<String> {
+        self.inner
+            .device_network
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|network| network.upgrade())
+            .map(|network| network.projection_now().hub_url)
+            .filter(|endpoint| !endpoint.is_empty())
+    }
+
+    pub(crate) async fn reset_local(&self) -> Result<HubConnectionProjection, HubError> {
+        let managed = self.managed_endpoint();
+        let mut state = self.inner.state.lock().unwrap();
+        let proposed = HubSettings {
+            revision: state.settings.revision.clone(),
+            ..HubSettings::default()
+        };
+        let saved = self.persisted_store()?.save(&proposed)?;
+        Self::revoke(state.advance()?);
+        state.settings = saved;
+        state.storage_error = None;
+        state.error = None;
+        state.status = HubConnectionStatus::Disconnected;
+        state.catalog = None;
+        state.recommendation = None;
+        *self.inner.network_http.lock().unwrap() = None;
+        Ok(state.projection(managed.as_deref()))
     }
 
     pub(crate) fn has_active_turns(&self) -> bool {
@@ -322,11 +380,26 @@ impl HubConnection {
         self.inner.store.as_ref().ok_or(HubError::SettingsInvalid)
     }
 
-    /// A remote job receives a separate model session and active-turn owner.
-    /// Its reviewed Hub default is runtime-only and never overwrites Main/Side.
+    /// A remote job captures the saved Main selection in a separate model session and
+    /// active-turn owner. Its runtime review never overwrites Desktop preferences.
     pub(crate) async fn device_worker_route(
         endpoint: &str,
         http: crate::device_network::ManagedHubHttp,
+        cancel: CancellationToken,
+    ) -> Result<HubTurnRoute, HubError> {
+        let path = crate::config::loader::global_config_path()
+            .map_err(|_| HubError::SettingsUnavailable)?
+            .with_file_name("hub-settings.json");
+        let settings = HubSettingsStore::new(path).load()?;
+        Self::device_worker_route_with_settings(endpoint, http, Some(settings), cancel).await
+    }
+
+    /// Each worker captures the same Main selection used by Desktop at admission. A missing
+    /// first selection can use the Hub default; a stale or removed saved choice cannot.
+    pub(crate) async fn device_worker_route_with_settings(
+        endpoint: &str,
+        http: crate::device_network::ManagedHubHttp,
+        settings: Option<HubSettings>,
         cancel: CancellationToken,
     ) -> Result<HubTurnRoute, HubError> {
         let (client, selection) =
@@ -338,11 +411,37 @@ impl HubConnection {
                 return Err(error);
             }
         };
-        let review = match selection {
-            Some(selection) => {
-                ReviewedHubSelection::review(&catalog, &catalog.hub_id, catalog.revision, selection)
+        let review = if let Some(saved) = settings {
+            if saved
+                .hub_id
+                .as_ref()
+                .is_some_and(|id| id != &catalog.hub_id)
+            {
+                Err(HubError::DifferentHub)
+            } else if let Some(review) = saved.main_review {
+                review.check_admission(&catalog).map(|()| review)
+            } else {
+                selection
+                    .ok_or(HubError::CapabilityMismatch)
+                    .and_then(|selection| {
+                        ReviewedHubSelection::review(
+                            &catalog,
+                            &catalog.hub_id,
+                            catalog.revision,
+                            selection,
+                        )
+                    })
             }
-            None => Err(HubError::CapabilityMismatch),
+        } else {
+            match selection {
+                Some(selection) => ReviewedHubSelection::review(
+                    &catalog,
+                    &catalog.hub_id,
+                    catalog.revision,
+                    selection,
+                ),
+                None => Err(HubError::CapabilityMismatch),
+            }
         };
         let review = match review {
             Ok(review) => review,
@@ -380,6 +479,7 @@ impl HubConnection {
                 }),
                 store: None,
                 network_http: std::sync::Mutex::new(Some(http)),
+                device_network: std::sync::Mutex::new(None),
                 reviews: [Mutex::new(()), Mutex::new(())],
             }),
         };
@@ -391,16 +491,20 @@ impl HubConnection {
     }
 
     /// Adopt the authenticated device model session without exposing its credentials.
-    /// Existing route choices survive; only a first Hub setup may opt into its default.
+    /// Existing model reviews survive; each context without a review uses the Hub default.
     pub(crate) async fn connect_device(
         &self,
         endpoint: &str,
         http: crate::device_network::ManagedHubHttp,
-        use_default: bool,
-    ) -> Result<(), HubError> {
+        _use_default: bool,
+        expected_connection_generation: Option<&str>,
+    ) -> Result<HubConnectionProjection, HubError> {
         let endpoint = validated_endpoint(endpoint)?.to_string();
         let generation = {
             let mut state = self.inner.state.lock().unwrap();
+            if let Some(expected) = expected_connection_generation {
+                state.check_generation(expected)?;
+            }
             if state.active.iter().any(Option::is_some) || !state.delegated_active.is_empty() {
                 return Err(HubError::RouteBusy);
             }
@@ -448,14 +552,27 @@ impl HubConnection {
                     confirmed[context.index()] = Some(review);
                 }
             }
-            if use_default && proposed.main_review.is_none() {
-                if let Some(review) = recommendation.clone() {
-                    client.review(HubReviewContext::Main, &review).await?;
-                    HubReviewContext::Main.set(&mut proposed, review.clone(), &catalog);
-                    proposed.main_mode = HubRouteMode::Hub;
-                    confirmed[0] = Some(review);
+            for context in [HubReviewContext::Main, HubReviewContext::SideChat] {
+                if context.review(&proposed).is_none() {
+                    if let Some(review) = recommendation.clone() {
+                        client.review(context, &review).await?;
+                        context.set(&mut proposed, review.clone(), &catalog);
+                        match context {
+                            HubReviewContext::Main => proposed.main_uses_default = true,
+                            HubReviewContext::SideChat => proposed.side_chat_uses_default = true,
+                        }
+                        confirmed[context.index()] = Some(review);
+                    }
                 }
             }
+            // Mode is derived from device configuration; keep durable legacy readers consistent.
+            if proposed.main_review.is_some() {
+                proposed.main_mode = HubRouteMode::Hub;
+            }
+            if proposed.side_chat_review.is_some() {
+                proposed.side_chat_mode = HubRouteMode::Hub;
+            }
+            let managed = self.managed_endpoint();
             let mut state = self.inner.state.lock().unwrap();
             if state.generation != generation {
                 return Err(HubError::ConnectionChanged);
@@ -470,13 +587,16 @@ impl HubConnection {
             state.status = HubConnectionStatus::Connected;
             state.error = None;
             *self.inner.network_http.lock().unwrap() = Some(http);
-            Ok(state.cancellation.clone())
+            Ok((
+                state.projection(managed.as_deref()),
+                state.cancellation.clone(),
+            ))
         }
         .await;
         match result {
-            Ok(cancel) => {
+            Ok((projection, cancel)) => {
                 self.start_heartbeat(generation, client.heartbeat_interval_ms, cancel);
-                Ok(())
+                Ok(projection)
             }
             Err(error) => {
                 client.disconnect().await;
@@ -487,11 +607,12 @@ impl HubConnection {
     }
 
     pub fn projection_now(&self) -> HubConnectionProjection {
+        let managed = self.managed_endpoint();
         self.inner
             .state
             .lock()
             .expect("Hub state lock poisoned")
-            .projection()
+            .projection(managed.as_deref())
     }
 
     fn revoke(client: Option<RegisteredHubClient>) {
@@ -567,6 +688,7 @@ impl HubConnection {
                 return Err(error);
             }
         };
+        let managed = self.managed_endpoint();
         let result = {
             let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
             (|| -> Result<_, HubError> {
@@ -603,6 +725,8 @@ impl HubConnection {
                 {
                     proposed.main_review = None;
                     proposed.side_chat_review = None;
+                    proposed.main_uses_default = false;
+                    proposed.side_chat_uses_default = false;
                     proposed.main_catalog_baseline = None;
                     proposed.side_chat_catalog_baseline = None;
                     proposed.main_mode = HubRouteMode::Direct;
@@ -618,7 +742,10 @@ impl HubConnection {
                 state.catalog = Some(catalog);
                 state.status = HubConnectionStatus::Connected;
                 state.error = None;
-                Ok((state.projection(), state.cancellation.clone()))
+                Ok((
+                    state.projection(managed.as_deref()),
+                    state.cancellation.clone(),
+                ))
             })()
         };
         match result {
@@ -638,6 +765,7 @@ impl HubConnection {
         &self,
         expected_connection_generation: String,
     ) -> Result<HubConnectionProjection, HubError> {
+        let managed = self.managed_endpoint();
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
         state.check_generation(&expected_connection_generation)?;
         Self::revoke(state.advance()?);
@@ -646,7 +774,7 @@ impl HubConnection {
         } else {
             HubConnectionStatus::Disconnected
         };
-        Ok(state.projection())
+        Ok(state.projection(managed.as_deref()))
     }
 
     /// Window close and app exit always invalidate pending work before revoking the registration.
@@ -666,6 +794,25 @@ impl HubConnection {
         &self,
         expected_connection_generation: String,
     ) -> Result<HubConnectionProjection, HubError> {
+        if let Some(endpoint) = self.managed_endpoint() {
+            self.inner
+                .state
+                .lock()
+                .unwrap()
+                .check_generation(&expected_connection_generation)?;
+            let http = self
+                .inner
+                .network_http
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(HubError::Unavailable)?;
+            // Refresh the public default as well as the catalog; the old confirmed selection
+            // remains a review gate until the user saves the new default explicitly.
+            return self
+                .connect_device(&endpoint, http, true, Some(&expected_connection_generation))
+                .await;
+        }
         let (client, generation) = {
             let state = self.inner.state.lock().expect("Hub state lock poisoned");
             state.check_generation(&expected_connection_generation)?;
@@ -675,6 +822,7 @@ impl HubConnection {
             )
         };
         let result = client.catalog().await;
+        let managed = self.managed_endpoint();
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
         state.check_generation(&generation.to_string())?;
         match result {
@@ -687,14 +835,14 @@ impl HubConnection {
                     .as_ref()
                     .is_some_and(|current| current.revision > catalog.revision)
                 {
-                    return Ok(state.projection());
+                    return Ok(state.projection(managed.as_deref()));
                 }
                 if let Some(previous) = &state.catalog {
                     catalog.diff(previous)?;
                 }
                 state.catalog = Some(catalog);
                 state.error = None;
-                Ok(state.projection())
+                Ok(state.projection(managed.as_deref()))
             }
             Err(error) => {
                 state.error = Some(error);
@@ -716,6 +864,28 @@ impl HubConnection {
         expected_settings_revision: String,
         expected_connection_generation: String,
     ) -> Result<HubConnectionProjection, HubError> {
+        self.save_review_with_source(
+            context,
+            selection,
+            expected_hub_id,
+            expected_catalog_revision,
+            expected_settings_revision,
+            expected_connection_generation,
+            false,
+        )
+        .await
+    }
+
+    pub async fn save_review_with_source(
+        &self,
+        context: HubReviewContext,
+        selection: HubSelection,
+        expected_hub_id: String,
+        expected_catalog_revision: CatalogRevision,
+        expected_settings_revision: String,
+        expected_connection_generation: String,
+        use_hub_default: bool,
+    ) -> Result<HubConnectionProjection, HubError> {
         let _context_owner = self.inner.reviews[context.index()].lock().await;
         let (client, review, generation) = {
             let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
@@ -729,6 +899,17 @@ impl HubConnection {
             }
             let client = state.client.clone().ok_or(HubError::Unavailable)?;
             let catalog = state.catalog.as_ref().ok_or(HubError::Unavailable)?;
+            let selection = if use_hub_default {
+                state
+                    .recommendation
+                    .as_ref()
+                    .filter(|review| review.reviewed_revision == catalog.revision)
+                    .ok_or(HubError::ReviewRequired)?
+                    .selection
+                    .clone()
+            } else {
+                selection
+            };
             let review = ReviewedHubSelection::review(
                 catalog,
                 &expected_hub_id,
@@ -737,6 +918,10 @@ impl HubConnection {
             )?;
             let mut proposed = state.settings.clone();
             context.set(&mut proposed, review.clone(), catalog);
+            match context {
+                HubReviewContext::Main => proposed.main_uses_default = use_hub_default,
+                HubReviewContext::SideChat => proposed.side_chat_uses_default = use_hub_default,
+            }
             // Local durability precedes remote confirmation. Failure never rolls a newer save
             // back; the durable choice remains visibly unconfirmed and can be explicitly retried.
             state.settings = self.persisted_store()?.save(&proposed)?;
@@ -744,6 +929,7 @@ impl HubConnection {
             (client, review, state.generation)
         };
         let result = client.review(context, &review).await;
+        let managed = self.managed_endpoint();
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
         state.check_generation(&generation.to_string())?;
         if context.review(&state.settings).as_ref() != Some(&review) {
@@ -757,7 +943,7 @@ impl HubConnection {
                 }
                 state.confirmed[context.index()] = Some(review);
                 state.error = None;
-                Ok(state.projection())
+                Ok(state.projection(managed.as_deref()))
             }
             Err(error) => {
                 state.record_review_rejection(review.reviewed_revision, error);

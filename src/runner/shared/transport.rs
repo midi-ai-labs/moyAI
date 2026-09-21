@@ -37,6 +37,24 @@ pub(crate) struct SharedClient {
 }
 
 impl SharedClient {
+    pub(crate) async fn model_route(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::hub::HubTurnRoute, RunnerError> {
+        if self.connection_retired()? {
+            return Err(RunnerError::new(
+                "Hub connection was reset before preparing the model",
+            ));
+        }
+        crate::hub::HubConnection::device_worker_route(
+            &self.client.endpoint(),
+            self.client.http(),
+            cancel,
+        )
+        .await
+        .map_err(|error| RunnerError::new(error.to_string()))
+    }
+
     pub(crate) fn effect_authority(
         &self,
         assignment: Assignment,
@@ -64,6 +82,11 @@ impl SharedClient {
         {
             return Err(RunnerError::new("Hub did not authorize this effect"));
         }
+        if self.connection_retired()? {
+            return Err(RunnerError::new(
+                "Hub connection was reset before this effect",
+            ));
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -89,6 +112,17 @@ impl SharedClient {
         {
             return Err(RunnerError::new(
                 "Shared settings do not match this account's enrolled Hub/device identity",
+            ));
+        }
+        if crate::device_network::reset::execution_identity_reset(
+            &directory,
+            &settings.hub_id,
+            &settings.device_id,
+        )
+        .map_err(|e| RunnerError::new(e.to_string()))?
+        {
+            return Err(RunnerError::new(
+                "This Hub connection was reset locally; enroll again and confirm new execution permission",
             ));
         }
         let identity = DeviceIdentityStore::new(directory.join("identity.json"))
@@ -125,6 +159,15 @@ impl SharedClient {
         if let Some(network) = &self.network {
             network.shutdown().await;
         }
+    }
+
+    pub(super) fn connection_retired(&self) -> Result<bool, RunnerError> {
+        let Some(network) = &self.network else {
+            return Ok(false);
+        };
+        network
+            .connection_locally_retired()
+            .map_err(|e| RunnerError::new(e.to_string()))
     }
 
     pub(crate) async fn assignments(
@@ -230,6 +273,12 @@ impl SharedClient {
         body: Option<&serde_json::Value>,
         human: Option<&str>,
     ) -> Result<T, TransportError> {
+        if self
+            .connection_retired()
+            .map_err(|_| TransportError::Unavailable)?
+        {
+            return Err(TransportError::Rejected(reqwest::StatusCode::FORBIDDEN));
+        }
         let url = format!("{}{path}", self.client.endpoint());
         let maximum = if path.contains("/assets") || path.ends_with("/archive") {
             90 * 1024 * 1024

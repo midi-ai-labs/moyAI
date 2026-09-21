@@ -616,6 +616,7 @@ function representativeSurfaces(): RenderedSurface[] {
     state: "running", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
     root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: true, state_source: "last_observed", result_received: false }] };
   local.deviceNetwork = deviceNetworkPresentation(deviceUiFixture());
+  local.deviceNetwork.projection!.peers[0].selected = true;
   local.deviceNetwork.execution = { revision: "1", state: "ready", projects: [], review: { id: "review", directory: "C:/shared", access_mode: "default" }, directory: "C:/shared", access_mode: "default", accepting: true, can_pause: true, can_resume: false, error: null, unknown_attempts: [{ attempt_id: "unknown", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }] };
   local.deviceNetwork.executionRecoveryTarget = executionRecoveryKey(local.deviceNetwork.execution.unknown_attempts[0]);
   local.deviceNetwork.jobs.outgoing[0].state = "completed";
@@ -663,6 +664,8 @@ function representativeSurfaces(): RenderedSurface[] {
       html: renderOverlay(representativeState({ overlay }), local),
     });
   }
+
+  surfaces.push({ name: "overlay-config-manual", html: renderOverlay(representativeState({ overlay: "config" }), defaultRenderLocal()) });
 
   const setup = representativeState({
     overlay: "config",
@@ -774,6 +777,10 @@ function representativeSurfaces(): RenderedSurface[] {
   surfaces.push({
     name: "overlay-session_settings",
     html: renderOverlay(sessionSettingsState, sessionSettingsLocal),
+  });
+  surfaces.push({
+    name: "overlay-session_settings-managed",
+    html: renderOverlay(sessionSettingsState, { ...sessionSettingsLocal, deviceNetwork: local.deviceNetwork }),
   });
 
   for (const kind of ["session", "archive_session", "rollback_session"] as const) {
@@ -1014,6 +1021,17 @@ test("initial setup retains advanced setup and session settings exposes stable r
     surfaces.get("local-confirm-session-settings-close") ?? "",
     /data-modal="session-settings-close-confirmation"/,
   );
+});
+
+test("Hub-managed session settings retain the local context budget without another connection editor", () => {
+  const html = representativeSurfaces().find((surface) => surface.name === "overlay-session_settings-managed")!.html;
+  assert.match(html, /<div class="settings-field">\s*<label for="session-settings-context-window"/);
+  assert.match(html, /data-session-setting="context-window"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+  for (const field of ["base-url", "provider-profile", "api-key-env", "model"]) {
+    assert.match(html, new RegExp(`<div class="settings-field" hidden>\\s*<label for="session-settings-${field}"`));
+    assert.match(html, new RegExp(`data-session-setting="${field}"[^>]*disabled`));
+  }
+  assert.match(html, /AIの接続を開く/);
 });
 
 test("initial welcome offers execution separately and guided review keeps permissions visible without requiring a workspace", () => {
@@ -1510,11 +1528,13 @@ test("each primary GUI surface retains its required action routes", () => {
       "close-overlay",
       "open-global-config-folder",
       "open-user-data-folder",
-      "load-provider-models",
-      "load-side-chat-models",
+      "hub-refresh",
+      "hub-save-main",
+      "hub-save-side",
       "show-session-settings",
     ],
-    "overlay-hub": ["close-overlay", "hub-connect", "hub-refresh", "hub-disconnect", "hub-save-main", "hub-save-side"],
+    "overlay-hub": ["close-overlay", "show-config", "device-network-reset"],
+    "overlay-config-manual": ["load-provider-models", "load-side-chat-models", "device-network-reset"],
     "overlay-mcp_history": ["close-overlay", "mcp-history-direction", "mcp-history-refresh", "mcp-history-export", "mcp-history-stop"],
     "overlay-workspace": [
       "close-overlay",

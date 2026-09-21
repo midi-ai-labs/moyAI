@@ -671,13 +671,13 @@ function installDelegatedActionEvents(context: ActionContext): void {
       return;
     }
     if (target.dataset.networkField !== undefined) {
-      if (context.getViewState()?.overlay !== "hub") return;
+      if (!["hub", "config"].includes(context.getViewState()?.overlay ?? "")) return;
       editDeviceNetworkField(context.uiState.deviceNetwork, target.dataset.networkField, target.value, target instanceof HTMLInputElement && target.checked);
       context.rerender();
       return;
     }
     if (target.dataset.hubField !== undefined) {
-      if (context.getViewState()?.overlay !== "hub") return;
+      if (!["hub", "config"].includes(context.getViewState()?.overlay ?? "")) return;
       editHubField(context.uiState.hub, target.dataset.hubField ?? "", target.value, target instanceof HTMLInputElement && target.checked);
       context.uiState.hub.error = "";
       context.rerender();

@@ -12,7 +12,7 @@ export const SHELL_MENU_ENTRY_PLAN = Object.freeze([
   {action:'new-chat',menu:'file',command:'new_chat',overlay:'none'},
   {action:'show-command-palette',menu:'edit',command:'show_command_palette',overlay:'command_palette',heading:'command-palette-dialog-title'},
   {action:'refresh',menu:'view',command:'refresh_desktop'},
-  {action:'show-provider',menu:'view',command:'show_provider_editor',overlay:'provider',heading:'provider-dialog-title'},
+  {action:'show-provider',menu:'view',command:'show_provider_editor',overlay:'config',heading:'config-dialog-title'},
   {action:'show-config',menu:'view',command:'show_config_editor',overlay:'config',heading:'config-dialog-title'},
   {action:'show-hub',menu:'view',overlay:'hub',heading:'hub-dialog-title'},
   {action:'show-mcp-history',menu:'view',overlay:'mcp_history',heading:'mcp-history-title'},

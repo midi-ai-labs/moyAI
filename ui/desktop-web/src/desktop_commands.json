@@ -120,6 +120,7 @@
   "device_network_select",
   "device_network_refresh",
   "device_network_leave",
+  "device_network_reset",
   "device_network_jobs",
   "device_network_cancel",
   "device_network_artifacts",

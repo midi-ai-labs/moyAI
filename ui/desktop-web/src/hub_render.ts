@@ -4,108 +4,60 @@ import { renderDeviceNetwork } from "./device_network_render.ts";
 import { renderHubCatalogComparison } from "./hub_catalog_render.ts";
 import type { DeviceNetworkPresentation } from "./device_network_state.ts";
 import {
-  createHubUiState, hubActiveRoute, hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, hubDraftHasChanges,
-  hubErrorText, hubRouteMode, hubRouteModeBlocker, hubSaveFeedback,
-  type HubContext, type HubPresentation,
+  createHubUiState, hubActiveRoute, hubCanSave, hubErrorText, hubModelChoice,
+  hubSaveFeedback, type HubContext, type HubPresentation,
 } from "./hub_state.ts";
 
-const statusText = {
-  disconnected: "未接続", connecting: "接続しています…", connected: "接続中", stale: "接続を確認してください", error: "接続できません",
-};
-function channelMarkup(local: HubPresentation, context: HubContext): string {
-  const projection = local.projection;
-  const catalog = projection?.catalog ?? null;
-  const draft = local.drafts[context];
-  const review = context === "main" ? projection?.main_review : projection?.side_chat_review;
-  const confirmation = context === "main" ? projection?.main_confirmation : projection?.side_chat_confirmation;
-  const models = catalog?.models ?? [];
-  const unresolved = draft.selection.allowed_model_ids.filter((id) => !models.some((model) => model.id === id));
-  const missing = catalog ? unresolved : [];
-  const candidates = [...models, ...unresolved.map((id) => ({ id, label: catalog ? "削除されたモデル" : "保存済みのモデル", capabilities: [] }))];
-  const enabled = projection?.status === "connected" && !local.pending;
-  const changed = hubDraftHasChanges(local, context);
-  const saved = !changed && confirmation === "confirmed";
-  const feedback = local.error && local.errorContext === context ? local.error : hubSaveFeedback(local, context);
-  const confirmationText = changed ? "未保存の変更" : confirmation === "confirmed" ? "保存済み・Hubで確認済み"
-    : confirmation === "review_required" ? "再確認が必要" : review ? "保存済み・Hubで未確認" : "未設定";
-  const allowed = candidates.filter((model) => draft.selection.allowed_model_ids.includes(model.id));
-  const mode = hubRouteMode(local, context);
-  const route = hubActiveRoute(local, context);
-  const routeBlocker = hubRouteModeBlocker(local, context, "hub");
-  const routeContext = context === "main" ? "main" : "side";
-  const routeStatus = route
-    ? `${route.phase === "waiting" ? "Hubの実行枠を待っています" : "Hubのモデルで実行中"}${route.logical_model_id ? ` · ${route.logical_model_id}` : ""}`
-    : mode === "direct" ? "現在は直接接続を使用します。"
-      : mode === "hub" ? "現在はHubの割当を使用します。" : "送信先を読み込んでいます。";
-  const capabilityText = (values: string[]) => values.map((value) => value === "tools" ? "ツール" : value === "vision" ? "画像" : value).join(" · ");
-  return `<section class="hub-channel" aria-labelledby="hub-${context}-title">
-    <header><div><span class="hub-eyebrow">${context === "main" ? "メイン" : "サイド"}</span><h3 id="hub-${context}-title">${context === "main" ? "メインチャット" : "サイドチャット"}</h3></div>
-      <span class="hub-review-status" data-settings-passive="hub-${context}-confirmation">${confirmationText}${review ? `<small>確認した更新番号 ${escapeHtml(review.reviewed_revision)}</small>` : ""}</span></header>
-    <div class="hub-route-selector" role="group" aria-labelledby="hub-${context}-route-label" aria-describedby="hub-${context}-route-status">
-      <span id="hub-${context}-route-label">送信先</span>
-      <button data-action="hub-${routeContext}-direct" aria-pressed="${mode === "direct"}" ${hubCanSetRouteMode(local, context, "direct") ? "" : "disabled"}>直接接続 <small>Direct</small></button>
-      <button data-action="hub-${routeContext}-hub" aria-pressed="${mode === "hub"}" ${hubCanSetRouteMode(local, context, "hub") ? "" : "disabled"}>Hubを利用</button>
-    </div>
-    <div id="hub-${context}-route-status" class="hub-route-status" data-settings-passive="hub-${context}-route-status" role="status">
-      <strong>${escapeHtml(routeStatus)}</strong><span>${escapeHtml(routeBlocker ?? "切り替えは次の依頼から適用します。Hub利用時に直接接続へ自動では切り替えません。")}</span>
-    </div>
-    <div data-settings-passive="hub-${context}-catalog-comparison">${renderHubCatalogComparison(context === "main" ? projection?.main_catalog_comparison : projection?.side_chat_catalog_comparison, context)}</div>
-    <p class="hub-help">このチャットで使ってよいモデルを選びます。メインとサイドの設定は別々に保存します。</p>
-    ${context === "main" ? `<button data-action="hub-main-recommendation" ${hubCanUseRecommendation(local) ? "" : "disabled"}>Hubの推奨候補を選ぶ</button><p class="hub-help">候補を選んで確認・保存し、「Hubを利用」で送信先を切り替えます。直接接続の設定は保持します。</p>` : ""}
-    <div class="hub-model-list" data-settings-passive="hub-${context}-models" data-settings-preserve-focused-region>
-      ${candidates.length ? candidates.map((model) => `<label class="hub-model-row ${missing.includes(model.id) ? "is-missing" : ""}">
-        <input type="checkbox" class="settings-control" data-hub-field="${context}:model:${escapeHtml(model.id)}" id="hub-${context}-model-${escapeHtml(model.id)}" ${draft.selection.allowed_model_ids.includes(model.id) ? "checked" : ""} ${enabled ? "" : "disabled"} />
-        <span><strong>${escapeHtml(model.label)}</strong><small>${escapeHtml(model.id)}</small></span><span class="hub-capability">${escapeHtml(capabilityText(model.capabilities) || "機能情報なし")}</span>
-      </label>`).join("") : `<p class="hub-empty">${catalog ? "登録モデルがありません。Hubの管理画面でモデルを登録してください。" : "接続すると、Hubの登録モデルを選択できます。"}</p>`}
-    </div>
-    <label class="hub-field">優先モデル<div data-settings-passive="hub-${context}-preferred" data-settings-preserve-focused-region>
-      <select id="hub-${context}-preferred" class="settings-control" data-hub-field="${context}:preferred" ${enabled && allowed.length ? "" : "disabled"}>
-        ${allowed.length ? allowed.map((model) => `<option value="${escapeHtml(model.id)}" ${model.id === draft.selection.preferred_model_id ? "selected" : ""}>${escapeHtml(model.label)}</option>`).join("") : '<option value="">利用候補から選択してください</option>'}
-      </select></div></label>
-    <label class="hub-field">優先モデルが空いていない場合<select id="hub-${context}-wait" class="settings-control" data-hub-field="${context}:wait" ${enabled ? "" : "disabled"}>
-      <option value="wait_for_preferred" ${draft.selection.wait_policy === "wait_for_preferred" ? "selected" : ""}>優先モデルが空くまで待つ</option>
-      <option value="allow_selected_fallback" ${draft.selection.wait_policy === "allow_selected_fallback" ? "selected" : ""}>選択した別のモデルを許可する</option></select></label>
-    <details class="hub-advanced" id="hub-${context}-advanced" data-details-key="hub-${context}-advanced"><summary>詳細設定（必要な機能・モデルの継続）</summary>
-      <label class="hub-field">必要な機能<input id="hub-${context}-capabilities" class="settings-control" data-hub-field="${context}:capabilities" value="${escapeHtml(draft.capabilitiesText)}" placeholder="例: tools, vision" ${enabled ? "" : "disabled"} /></label>
-      <label class="hub-field">同じモデルを継続するターン数<input id="hub-${context}-affinity" class="settings-control" data-hub-field="${context}:affinity" inputmode="numeric" value="${escapeHtml(draft.affinityText)}" ${enabled ? "" : "disabled"} /></label>
-      <p class="hub-help">1〜100。ユーザーが送信した依頼を1ターンとして数えます。</p></details>
-    <div id="hub-${context}-feedback" class="hub-channel-feedback" data-settings-passive="hub-${context}-feedback" role="status">${escapeHtml(feedback)}</div>
-    <button class="hub-primary" data-action="hub-save-${context === "main" ? "main" : "side"}" aria-describedby="hub-${context}-feedback" ${hubCanSave(local, context) ? "" : "disabled"}>${local.pending === context ? "確認・保存しています…" : saved ? "保存済み" : "この選択を確認して保存"}</button>
-  </section>`;
+export function aiConnectionManaged(hub?: HubPresentation, network?: DeviceNetworkPresentation): boolean {
+  return Boolean(network?.projection?.hub_url || (hub?.projection?.endpoint
+    && (hub.projection.main_mode === "hub" || hub.projection.side_chat_mode === "hub")));
 }
+
+/** One AI connection form: only the public Hub endpoint and catalog reach this surface. */
+export function renderManagedAiConnection(local: HubPresentation | undefined, context: HubContext, network?: DeviceNetworkPresentation): string {
+  const state = local ?? createHubUiState();
+  const projection = state.projection;
+  const endpoint = network?.projection?.hub_url || projection?.endpoint || "";
+  const catalog = projection?.catalog;
+  const draft = state.drafts[context];
+  const choice = hubModelChoice(state, context);
+  const route = hubActiveRoute(state, context);
+  const enabled = projection?.status === "connected" && !state.pending && !route;
+  const enrollment = network?.projection?.enrollment;
+  const status = enrollment === "pending" ? "PCの参加承認を待っています。"
+    : projection?.status !== "connected" ? "Hubへの再接続を待っています。保存済みのモデル選択は保持しています。"
+      : !catalog?.models.length ? "Hubにモデルが登録されていません。管理画面でモデルを追加してください。"
+        : route ? "実行中の仕事は現在のモデルで続けます。終了後に選択を変更できます。"
+          : "Hubが提供するモデルを選びます。接続先と接続方式はHubで管理します。";
+  const feedback = state.error && (!state.errorContext || state.errorContext === context || state.errorContext === "connection")
+    ? state.error : hubErrorText(projection?.error) || hubSaveFeedback(state, context);
+  const savedLabel = draft.selection.allowed_model_ids.map((id) => catalog?.models.find((model) => model.id === id)?.label ?? id).join("、");
+  return `<div class="ai-connection" data-ai-connection="${context}">
+    <div class="settings-grid-two">
+      <label class="hub-field" for="ai-${context}-endpoint">接続先URL<input id="ai-${context}-endpoint" class="settings-control" value="${escapeHtml(endpoint)}" readonly aria-readonly="true" aria-describedby="ai-${context}-status" /></label>
+      <label class="hub-field" for="ai-${context}-mode">接続方式<input id="ai-${context}-mode" class="settings-control" value="Hubから取得" readonly aria-readonly="true" aria-describedby="ai-${context}-status" /></label>
+      <label class="hub-field" for="ai-${context}-model">モデル<div data-settings-passive="ai-${context}-models" data-settings-preserve-focused-region>
+        <select id="ai-${context}-model" class="settings-control" data-hub-field="${context}:choice" aria-describedby="ai-${context}-status ai-${context}-feedback" ${enabled ? "" : "disabled"}>
+          <option value="" ${choice === "" ? "selected" : ""} disabled>モデルを選択してください</option>
+          ${projection?.recommended_main_selection || choice === ":hub-default" ? `<option value=":hub-default" ${choice === ":hub-default" ? "selected" : ""}>Hubの標準モデル</option>` : ""}
+          ${choice === ":saved" ? `<option value=":saved" selected>保存済みの選択: ${escapeHtml(savedLabel)}</option>` : ""}
+          ${(catalog?.models ?? []).map((model) => `<option value="${escapeHtml(model.id)}" ${choice === model.id ? "selected" : ""}>${escapeHtml(model.label)}</option>`).join("")}
+        </select></div></label>
+    </div>
+    <p id="ai-${context}-status" class="hub-help" data-settings-passive="ai-${context}-status" role="status">${escapeHtml(status)}</p>
+    <div data-settings-passive="ai-${context}-comparison">${renderHubCatalogComparison(projection?.[`${context}_catalog_comparison`], context)}</div>
+    <p id="ai-${context}-feedback" class="hub-help" data-settings-passive="ai-${context}-feedback" role="status">${escapeHtml(feedback || hubErrorText(projection?.error))}</p>
+    <div class="hub-connection-actions"><button data-action="hub-save-${context === "main" ? "main" : "side"}" ${hubCanSave(state, context) ? "" : "disabled"}>${state.pending === context ? "保存しています…" : "モデル選択を保存"}</button><button data-action="hub-refresh" ${state.pending ? "disabled" : ""}>最新情報を取得</button></div>
+    <p class="hub-help">メインとサイドは別々に保存します。共有仕事には、実行するPCのメインのモデル選択を使います。</p>
+  </div>`;
+}
+
 export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetworkPresentation): string {
   const local = input ?? createHubUiState();
-  const projection = local.projection;
-  const status = projection?.status ?? "disconnected";
-  const connected = status === "connected" || status === "stale";
-  const error = local.error && local.errorContext && local.errorContext !== "connection" ? "" : local.error || hubErrorText(projection?.error);
-  const locked = Boolean(local.pending) || connected || status === "connecting";
-  const managed = network?.projection?.enrollment === "active";
-  return `<div class="modal-backdrop"><section class="modal settings-modal hub-modal" data-modal="hub" data-surface="hub" role="dialog" aria-modal="true" aria-labelledby="hub-dialog-title" aria-describedby="hub-dialog-help" tabindex="-1">
-    <header class="hub-modal-header"><div><span class="hub-eyebrow">接続と共有</span><h2 id="hub-dialog-title">moyAI Hub</h2><p id="hub-dialog-help">このPCをHubにつなぎ、共有仕事やチャットで使えるようにします。</p></div><button class="icon-button" data-action="close-overlay" aria-label="閉じる" title="閉じる">${icon("x")}</button></header>
-    <nav class="hub-tabs" aria-label="Hub設定の分類"><button id="hub-tab-devices" data-action="hub-tab-devices" aria-controls="hub-panel-devices" aria-pressed="${local.tab === "devices"}">PCの接続</button><button id="hub-tab-models" data-action="hub-tab-models" aria-controls="hub-panel-models" aria-pressed="${local.tab === "models"}">モデル割当</button></nav>
-    <div class="hub-modal-body settings-content">
-      <div id="hub-panel-devices" data-hub-panel="devices" ${local.tab === "devices" ? "" : "hidden"}>${renderDeviceNetwork(network)}</div>
-      <div id="hub-panel-models" data-hub-panel="models" ${local.tab === "models" ? "" : "hidden"}>
-      <p id="hub-scope-help" class="hub-scope-note" data-settings-passive="hub-scope-help">${managed ? "接続済みのHubからモデルを取得します。" : "最初に「PCの接続」で管理者から受け取った設定ファイルを読み込んでください。"} 候補を選んで保存し、メイン・サイドそれぞれで「Hubを利用」に切り替えます。共有仕事で使うモデルは、仕事を実行するPCで設定します。</p>
-      <div class="hub-identity" data-settings-passive="hub-model-connection" role="status">モデル接続: ${statusText[status]}${projection?.catalog ? ` · 登録 ${projection.catalog.models.length} モデル · 更新 ${escapeHtml(projection.catalog.revision)}` : ""}${error ? `<p>${escapeHtml(error)}</p>` : ""}</div>
-      <div class="hub-connection-actions"><button data-action="hub-refresh" ${local.pending ? "disabled" : ""}>${local.pending === "refresh" ? "取得しています…" : "最新情報を取得"}</button></div>
-      <details id="hub-manual-connection" data-details-key="hub-manual-connection"><summary>同じPCのHubへ手動接続（従来の方式）</summary>
-      <section class="hub-connection" aria-labelledby="hub-connection-title"><div class="hub-section-heading"><h3 id="hub-connection-title">Hubに接続</h3><span class="hub-connection-status" data-settings-passive="hub-connection-status" data-status="${status}">${statusText[status]}</span></div>
-        <div class="hub-connection-fields"><label class="hub-field">接続先<input id="hub-endpoint" class="settings-control" data-hub-field="endpoint" value="${escapeHtml(local.endpoint)}" placeholder="127.0.0.1:9470" autocomplete="off" spellcheck="false" ${locked ? "disabled" : ""} /></label>
-        <label class="hub-field">PCの表示名<input id="hub-label" class="settings-control" data-hub-field="label" value="${escapeHtml(local.label)}" autocomplete="off" ${locked ? "disabled" : ""} /></label>
-        <label class="hub-field">接続用トークン<input id="hub-token" class="settings-control" data-hub-field="token" type="password" autocomplete="off" aria-describedby="hub-connection-feedback" placeholder="Hubの管理画面で設定したトークン" ${locked ? "disabled" : ""} /></label></div>
-        <div class="hub-connection-actions"><button class="hub-primary" data-action="hub-connect" aria-describedby="hub-connection-feedback" ${projection && !locked ? "" : "disabled"}>${local.pending === "connect" ? "接続しています…" : "Hubに接続"}</button>
-        <button data-action="hub-disconnect" ${projection && status !== "disconnected" && !local.pending ? "" : "disabled"}>接続を解除</button></div>
-        <div id="hub-connection-feedback" class="hub-feedback" data-settings-passive="hub-error" role="status" aria-live="polite" ${error ? "" : "hidden"}>${escapeHtml(error)}</div>
-        <p class="hub-help">この手動接続は同じPCのHub向けです。トークンは保存しません。Desktopのウィンドウを閉じると接続を解除し、次回はトークンを入力して再接続します。</p>
-        <div class="hub-identity" data-settings-passive="hub-identity">${projection?.hub_id ? `<span>Hub <code>${escapeHtml(projection.hub_id)}</code></span><span>バージョン ${escapeHtml(projection.catalog?.software_version ?? "—")} · 更新番号 ${escapeHtml(projection.catalog?.revision ?? "—")}</span>` : "接続するとHubの識別情報を表示します。"}</div>
-      </section>
-      </details>
-      <div class="hub-channels">${channelMarkup(local, "main")}${channelMarkup(local, "side_chat")}</div>
-      <details class="hub-history" id="hub-change-history" data-details-key="hub-change-history"><summary>モデル設定の変更履歴</summary><div data-settings-passive="hub-history">${projection?.catalog?.changes.length ? [...projection.catalog.changes].reverse().map((change) => `<p><strong>更新 ${escapeHtml(change.revision)}</strong><span>${escapeHtml(change.summary)}</span></p>`).join("") : "変更履歴はありません。"}</div></details>
-      </div>
-    </div>
-    <footer class="hub-modal-footer"><span>各項目のボタンで設定を保存します。この設定画面を閉じても接続は続きます。</span><button data-action="close-overlay">閉じる</button></footer>
+  return `<div class="modal-backdrop"><section class="modal settings-modal hub-modal" data-modal="hub" data-surface="hub" role="dialog" aria-modal="true" aria-labelledby="hub-dialog-title" tabindex="-1">
+    <header class="hub-modal-header"><div><h2 id="hub-dialog-title">moyAI Hub</h2><p>このPCをHubにつなぎ、チームの仕事に参加します。</p></div><button class="icon-button" data-action="close-overlay" aria-label="閉じる">${icon("x")}</button></header>
+    <nav class="hub-tabs" aria-label="Hub設定の分類"><button id="hub-tab-devices" data-action="hub-tab-devices" aria-controls="hub-panel-devices" aria-pressed="${local.tab === "devices"}">PCの接続</button><button data-action="show-config">AIの接続</button></nav>
+    <div class="hub-modal-body settings-content"><div id="hub-panel-devices" data-hub-panel="devices">${renderDeviceNetwork(network)}</div></div>
+    <footer class="hub-modal-footer"><span>AIの接続先とモデルは「設定」の同じ欄で確認できます。</span><button data-action="close-overlay">閉じる</button></footer>
   </section></div>`;
 }

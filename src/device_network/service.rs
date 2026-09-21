@@ -20,7 +20,7 @@ use crate::storage::StoreBundle;
 
 mod configuration;
 mod enrollment;
-pub use configuration::PreparedDeviceConfiguration;
+pub use configuration::{PreparedDeviceConfiguration, PreparedDeviceReset};
 #[cfg(test)]
 mod enrollment_tests;
 mod history;
@@ -276,6 +276,7 @@ mod lifecycle_tests {
         {
             let mut state = service.inner.state.lock().unwrap();
             state.settings.device_id = Some("device-fixture".into());
+            state.settings.hub_id = Some("hub-fixture".into());
             state.settings.certificate_pem = Some(old.pem());
             state.settings.expires_at_ms = Some(
                 (std::time::SystemTime::now()
@@ -523,12 +524,25 @@ impl DeviceNetworkService {
     ) -> Self {
         let settings_store = DeviceSettingsStore::new(directory.join("device.json"));
         let identity_store = DeviceIdentityStore::new(directory.join("identity.json"));
-        let (settings, error) = match settings_store.load() {
+        let (mut settings, mut error) = match settings_store.load() {
             Ok(settings) => (settings, None),
             Err(error) => (DeviceSettings::default(), Some(error)),
         };
-        let identity = identity_store.load();
-        let pending = if settings.device_id.is_none() {
+        let reset = super::reset::ResetState::load(&directory);
+        let reset_pending = reset.as_ref().map_or(true, |value| value.pending);
+        error = error.or(reset.err());
+        if reset_pending {
+            settings = DeviceSettings {
+                revision: settings.revision,
+                ..DeviceSettings::default()
+            };
+        }
+        let identity = if reset_pending {
+            Ok(None)
+        } else {
+            identity_store.load()
+        };
+        let pending = if !reset_pending && settings.device_id.is_none() {
             enrollment::PendingJoin::load(
                 &directory,
                 &config.device_network,
@@ -540,7 +554,11 @@ impl DeviceNetworkService {
         let error = error
             .or(identity.as_ref().err().copied())
             .or(pending.as_ref().err().copied());
-        let shared = config.device_network.clone();
+        let shared = if reset_pending {
+            SharedHubConfig::default()
+        } else {
+            config.device_network.clone()
+        };
         let status = if error.is_some() {
             "error"
         } else if !shared.configured() {
@@ -632,7 +650,7 @@ impl DeviceNetworkService {
                 || config.model.model.trim().is_empty()
         };
         if hub
-            .connect_device(&client.endpoint(), client.http(), use_default)
+            .connect_device(&client.endpoint(), client.http(), use_default, None)
             .await
             .is_ok()
         {
@@ -766,6 +784,11 @@ impl DeviceNetworkService {
         if state.closing || !matches!(state.status, "active" | "stopped") {
             return Err(DeviceError::Unavailable);
         }
+        if let (Some(hub), Some(device)) = (&state.settings.hub_id, &state.settings.device_id) {
+            if super::reset::execution_identity_reset(&self.inner.directory, hub, device)? {
+                return Err(DeviceError::Revoked);
+            }
+        }
         state.client.clone().ok_or(DeviceError::Unavailable)
     }
     pub fn update_runtime_config(&self, config: ResolvedConfig) {
@@ -869,8 +892,11 @@ impl DeviceNetworkService {
         #[serde(deny_unknown_fields)]
         struct Csr {
             ip: Ipv4Addr,
+            #[serde(default)]
+            key_sha256: Option<String>,
             csr_pem: String,
         }
+        let key_sha256 = identity.public_key_sha256()?;
         let path = self.inner.directory.join("pending-csr.json");
         if let Ok(bytes) = std::fs::read(&path) {
             if bytes.len() > 65536 {
@@ -878,7 +904,10 @@ impl DeviceNetworkService {
             }
             let old: Csr =
                 serde_json::from_slice(&bytes).map_err(|_| DeviceError::InvalidIdentity)?;
-            if old.ip == ip {
+            // An old process can finish writing after a local reset. The IP
+            // alone cannot bind its CSR to this registration's current key.
+            // Legacy caches have no binding, so regenerate them once.
+            if old.ip == ip && old.key_sha256.as_deref() == Some(key_sha256.as_str()) {
                 return Ok(old.csr_pem);
             }
         }
@@ -888,6 +917,7 @@ impl DeviceNetworkService {
         file.write_all(
             &serde_json::to_vec(&Csr {
                 ip,
+                key_sha256: Some(key_sha256),
                 csr_pem: csr_pem.clone(),
             })
             .map_err(|_| DeviceError::Storage)?,
@@ -1090,6 +1120,17 @@ impl DeviceNetworkService {
             let Some(client) = state.client.clone() else {
                 return Ok(self.projection_without_lock(state));
             };
+            if super::reset::execution_identity_reset(
+                &self.inner.directory,
+                state
+                    .settings
+                    .hub_id
+                    .as_deref()
+                    .ok_or(DeviceError::InvalidIdentity)?,
+                &client.device_id,
+            )? {
+                return Err(DeviceError::Revoked);
+            }
             (client, state.generation, state.settings.hub_id.clone())
         };
         let result = async {
@@ -1398,6 +1439,18 @@ impl DeviceNetworkService {
                 if service.inner.state.lock().unwrap().generation != generation {
                     break;
                 }
+                let registered = service
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .settings
+                    .device_id
+                    .is_some();
+                if registered && service.connection_locally_retired().unwrap_or(true) {
+                    service.begin_shutdown();
+                    break;
+                }
                 let pending = {
                     let state = service.inner.state.lock().unwrap();
                     state.settings.device_id.is_none()
@@ -1449,6 +1502,17 @@ impl DeviceNetworkService {
             let Some(client) = state.client.clone() else {
                 return Ok(false);
             };
+            if super::reset::execution_identity_reset(
+                &self.inner.directory,
+                state
+                    .settings
+                    .hub_id
+                    .as_deref()
+                    .ok_or(DeviceError::InvalidIdentity)?,
+                &client.device_id,
+            )? {
+                return Err(DeviceError::Revoked);
+            }
             (
                 client,
                 state.identity.clone().ok_or(DeviceError::InvalidIdentity)?,

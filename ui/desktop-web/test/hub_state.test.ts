@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { renderHubOverlay } from "../src/hub_render.ts";
+import { renderHubOverlay, renderManagedAiConnection, aiConnectionManaged } from "../src/hub_render.ts";
 import {
   acceptHubProjection, createHubUiState, editHubField, hubCanSave,
   hubCanSetRouteMode, hubDraftHasChanges, hubDraftTargetIsCurrent, hubExecutionRoute, hubRouteModeBlocker, hubSaveFeedback, hubSelectionError, hubSelectionFromDraft,
-  hubCanUseRecommendation, useHubRecommendation,
+  hubCanUseRecommendation, useHubRecommendation, hubModelChoice,
   type HubProjection,
 } from "../src/hub_state.ts";
 
@@ -114,7 +114,7 @@ test("Hub polling preserves an edited selection and its original revision until 
   assert.deepEqual(state.drafts.main.target, target);
   assert.equal(state.drafts.main.affinityText, "12");
   assert.equal(hubCanSave(state, "main"), false);
-  assert.match(renderHubOverlay(state), /モデル情報が更新されました/);
+  assert.match(renderManagedAiConnection(state, "main"), /モデル情報が更新されました/);
   acceptHubProjection(state, newer, { refreshTargets: true });
   assert.equal(hubCanSave(state, "main"), true);
   assert.equal(state.drafts.main.target!.expectedCatalogRevision, "8");
@@ -261,7 +261,7 @@ test("unchanged confirmed selection is saved, edits reverted to the saved value 
   acceptHubProjection(state, saved, { savedContext: "main" });
   assert.equal(hubCanSave(state, "main"), false);
   assert.match(hubSaveFeedback(state, "main"), /保存済み/);
-  assert.match(renderHubOverlay(state), /data-action="hub-save-main"[^>]*disabled>保存済み/);
+  assert.match(renderManagedAiConnection(state, "main"), /data-action="hub-save-main"[^>]*disabled>モデル選択を保存/);
   editHubField(state, "main:affinity", "4", false);
   assert.equal(hubCanSave(state, "main"), true);
   editHubField(state, "main:affinity", "1", false);
@@ -283,15 +283,16 @@ test("stale draft guidance distinguishes settings changes from catalog and conne
   assert.match(hubSaveFeedback(state, "main"), /接続状態が変わりました/);
 });
 
-test("connection authentication feedback is adjacent to the connection action and describes the token field", () => {
+test("authentication feedback keeps the managed connection readonly without credential inputs", () => {
   const state = createHubUiState();
-  acceptHubProjection(state, projection({ status: "error", error: "unauthorized" }));
-  const html = renderHubOverlay(state);
-  const connection = html.slice(html.indexOf('<section class="hub-connection"'), html.indexOf('<div class="hub-channels"'));
-  assert.match(connection, /id="hub-connection-feedback"[^>]*>Hubの認証に失敗/);
-  assert.match(connection, /id="hub-token"[^>]*aria-describedby="hub-connection-feedback"/);
-  assert.match(connection, /data-action="hub-connect"[^>]*aria-describedby="hub-connection-feedback"/);
-  assert.ok(connection.indexOf('id="hub-connection-feedback"') < connection.indexOf('<p class="hub-help">'));
+  acceptHubProjection(state, projection({ status: "error", error: "unauthorized", main_mode: "hub", side_chat_mode: "hub" }));
+  const html = renderManagedAiConnection(state, "main");
+  assert.equal(aiConnectionManaged(state), true);
+  assert.match(html, /このPCの参加許可を確認できません/);
+  assert.doesNotMatch(html, /トークンを確認/);
+  assert.match(html, /id="ai-main-endpoint"[^>]*readonly/);
+  assert.match(html, /id="ai-main-model"[^>]*disabled/);
+  assert.doesNotMatch(html, /id="hub-token"|data-action="hub-connect"|hub-main-direct/);
 });
 
 test("late old generations and old settings cannot overwrite the current connection or edited draft", () => {
@@ -366,10 +367,9 @@ test("connection drafts survive polling and tokens never enter UI state or rende
   assert.equal(state.endpoint, "127.0.0.1:5000");
   assert.equal(state.label, "編集している端末");
   assert.doesNotMatch(JSON.stringify(state), /secret-never-persist/);
-  const html = renderHubOverlay(state);
+  const html = renderManagedAiConnection(state, "main");
   assert.doesNotMatch(html, /secret-never-persist/);
-  assert.match(html, /id="hub-token"[^>]*type="password"/);
-  assert.doesNotMatch(html.match(/<input id="hub-token"[^>]*>/)![0], /value=/);
+  assert.doesNotMatch(html, /id="hub-token"/);
 });
 
 test("Hub catalog labels and IDs are escaped in markup, and disconnected reviews cannot be saved", () => {
@@ -378,7 +378,7 @@ test("Hub catalog labels and IDs are escaped in markup, and disconnected reviews
   current.catalog!.models[0] = { id: 'model-"<script>', label: '<img onerror="bad">', capabilities: ["tools"] };
   acceptHubProjection(state, current);
   editHubField(state, 'main:model:model-"<script>', "", true);
-  const html = renderHubOverlay(state);
+  const html = renderManagedAiConnection(state, "main");
   assert.doesNotMatch(html, /<script>|<img onerror/);
   assert.match(html, /&lt;img onerror=/);
   acceptHubProjection(state, { ...current, status: "disconnected" });
@@ -394,13 +394,55 @@ test("saved models remain unverified before catalog retrieval and become missing
       wait_policy: "wait_for_preferred", affinity_turns: 4,
     } },
   }));
-  const disconnected = renderHubOverlay(state);
-  assert.match(disconnected, /保存済みのモデル/);
+  const disconnected = renderManagedAiConnection(state, "main");
+  assert.match(disconnected, /保存済みの選択/);
   assert.doesNotMatch(disconnected, /削除されたモデル|hub-model-row is-missing/);
   assert.equal(hubCanSave(state, "main"), false);
   const current = projection();
   acceptHubProjection(state, { ...state.projection!, status: "connected", catalog: current.catalog });
-  assert.match(renderHubOverlay(state), /削除されたモデル/);
-  assert.match(renderHubOverlay(state), /hub-model-row is-missing/);
+  assert.match(renderManagedAiConnection(state, "main"), /選択済みモデルが削除されています/);
   assert.equal(hubCanSave(state, "main"), false);
+});
+
+
+test("Main and Side dropdowns preserve independent explicit/default choices across outages and polling", () => {
+  const state = createHubUiState();
+  const recommendation = { allowed_model_ids: ["model-a"], preferred_model_id: "model-a", required_capabilities: [], wait_policy: "wait_for_preferred" as const, affinity_turns: 3 };
+  acceptHubProjection(state, projection({ main_mode: "hub", side_chat_mode: "hub", recommended_main_selection: recommendation }));
+  editHubField(state, "main:choice", ":hub-default", false);
+  editHubField(state, "side_chat:choice", "model-b", false);
+  assert.equal(hubModelChoice(state, "main"), ":hub-default");
+  assert.equal(hubModelChoice(state, "side_chat"), "model-b");
+  assert.deepEqual(state.drafts.main.selection, recommendation);
+  const draft = structuredClone(state.drafts);
+  acceptHubProjection(state, { ...state.projection!, status: "disconnected", catalog: null });
+  editHubField(state, "main:choice", "model-b", false);
+  assert.deepEqual(state.drafts, draft);
+  assert.match(renderManagedAiConnection(state, "main"), /Hubの標準モデル/);
+  assert.equal(aiConnectionManaged(state), true);
+  const current = projection({ main_mode: "hub", side_chat_mode: "hub", recommended_main_selection: recommendation });
+  acceptHubProjection(state, current, { refreshTargets: true });
+  assert.equal(hubModelChoice(state, "side_chat"), "model-b");
+  assert.equal(hubCanSave(state, "main"), true);
+  assert.equal(hubCanSave(state, "side_chat"), true);
+  assert.doesNotMatch(renderHubOverlay(state), /data-hub-field|hub-token/);
+});
+
+test("refreshing a changed Hub default keeps the reviewed edit fenced against external settings changes", () => {
+  const state = createHubUiState();
+  const selection = { allowed_model_ids:["model-a"],preferred_model_id:"model-a",required_capabilities:[],wait_policy:"wait_for_preferred" as const,affinity_turns:3 };
+  const first = projection({ main_uses_default:true,side_chat_uses_default:true,recommended_main_selection:selection,
+    main_review:{hub_id:"hub-a",reviewed_revision:"7",selection:structuredClone(selection)},
+    side_chat_review:{hub_id:"hub-a",reviewed_revision:"7",selection:structuredClone(selection)},
+    main_confirmation:"confirmed",side_chat_confirmation:"confirmed" });
+  acceptHubProjection(state,first);
+  const changed = {...first,recommended_main_selection:{...selection,allowed_model_ids:["model-b"],preferred_model_id:"model-b"}};
+  acceptHubProjection(state,changed,{refreshTargets:true});
+  assert.equal(state.drafts.side_chat.dirty,true);
+  assert.equal(hubCanSave(state,"side_chat"),true);
+  const target = structuredClone(state.drafts.side_chat.target);
+  acceptHubProjection(state,{...changed,settings_revision:"2"});
+  assert.deepEqual(state.drafts.side_chat.target,target);
+  assert.equal(hubCanSave(state,"side_chat"),false);
+  assert.equal(state.drafts.side_chat.selection.preferred_model_id,"model-b");
 });

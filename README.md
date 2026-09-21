@@ -36,25 +36,28 @@ Development includes an [independent Windows Runner](docs/runner-local.md) and a
 
 ## What Is moyAI?
 
-This development branch targets **Desktop v3.0.0 / LYNX**. The **moyAI Hub** panel
-now includes Hub-managed device enrollment, receiving tasks, and choosing other devices.
-Import the shared Hub configuration to request enrollment automatically. After the Hub administrator
-approves the device, it connects without an enrollment code; enable receiving or select an allowed peer.
-A new worker can start with Hub configuration before setting up
-a Direct model. The shared file contains the Hub URL and public CA trust; each device generates
-its own private key. On enrolled Desktop devices, receiving IP, port, TLS credentials and short-lived
-authorization are managed by the apps.
+This development branch targets **Desktop v3.0.0 / LYNX**. Import the shared Hub
+configuration to request device enrollment. The Hub administrator approves the PC and assigns
+its control or execution role in a project. No moyAI username, password, or enrollment code is required.
+Execution PCs confirm their work folder and permission settings once; an independent Runner executes
+the work. The shared file contains the Hub URL and public CA trust, and each PC generates its own private key.
+
+AI connection settings use one form for manual and Hub-managed connections. With Hub configuration
+present, the endpoint is read-only and Main and Side each select a shared model. Shared work uses
+the execution PC's saved Main model. A Hub outage does not switch to a manual provider. An explicit
+local reset works without the old Hub, preserves manual AI settings and local history, and permits
+registration with another Hub. The new registration requires fresh execution consent.
 Earlier verification on one Windows PC covered the actual Hub/Desktop GUI and separate sender/receiver
 runtimes for shared-config setup, enrollment, temp receiving, directed permission, peer selection,
 named approval and CPU task results returned to the sender. The current MCP history screens and Markdown
 export have also been checked in the actual Windows GUI. Physical multi-PC acceptance and verification of
 the additional approval, diagnostics and artifact operations remain outstanding; see the build's release notes.
 
-Hub administrators assign groups and directed permissions. Joining a Hub does not connect every device
-to every other device. Receivers choose a project or **temp**, execution permissions and model routing.
-The receiving agent performs the task locally and retains its canonical history; a temp CPU query
-uses the agent's permitted tools on that device. Authorized redelegation retains the original caller
-and task constraints. Receiving OFF blocks new work; existing jobs have separate status and stop controls.
+Hub administrators assign project roles to approved PCs. Joining a Hub does not grant access to
+every project. Shared requests, approvals, and results are retained by Hub; execution happens on the
+assigned PC. Earlier directed MCP connections remain a compatibility boundary for saved data and
+unfinished work, and their setup forms are retired. Stopping new work and stopping an existing job
+remain separate operations.
 Startup and tray receiving are explicit preferences. See the [device-network guide](docs/hub-device-network-guide.md)
 and [design and acceptance status](docs/design/hub-device-network.md).
 
@@ -62,17 +65,20 @@ Development servers can use `shell_start`, `shell_status`, and `shell_stop` for 
 app-owned command lifetimes. Starting a process does not attest to HTTP readiness.
 See the [managed command guide](docs/managed-shell-guide.md) for time limits and ownership.
 
-The model tab retains independent Main / Side Chat model selection and review. The Hub route uses
+The common Settings screen provides independent Main / Side Chat model selection and review.
+While a Hub connection is configured, its connection details are read-only and models are chosen
+from Hub's list. Shared Runner work uses the execution PC's Main selection. The Hub route uses
 a companion Chat Completions / Responses gateway that counts its own forwarded HTTP requests,
 with no implicit Direct fallback. Per-context catalog review includes saved comparison baselines;
 Hub-only Side Chat, prompt enhancement, and independent child-agent execution are implemented
 and undergoing final verification.
-Direct settings remain available. **MCP履歴** provides **MCP指示** and **MCP実行** views of locally saved
+Saved manual connection settings are retained and become editable after **接続設定をリセット**,
+which works even when Hub is unavailable. **MCP履歴** provides **MCP指示** and **MCP実行** views of locally saved
 delegation records, results and errors, with Markdown export. A compatible Hub can also retrieve and save
 device history snapshots; update both Hub and Desktop. See the [MCP history guide](docs/mcp-history-guide.md).
 The manual publishing editor and its settings/start commands have been retired. Existing profile files,
 credentials, certificates and execution history are retained; updating or restarting Desktop does not reopen
-those listeners. Configure reception explicitly through **moyAI Hub → 端末連携**. Read-only grants and shared
+those listeners. Allow shared work explicitly through **moyAI Hub → PCの接続 → このPCで仕事を実行**. Read-only grants and shared
 tokens are never upgraded automatically to agent authority. Outbound MCP connections and the shared
 transport remain available. See [MCP compatibility](docs/design/mcp-publish-foundation.md).
 The implementation includes delegation recovery after a Hub restart, certificate renewal, approval on

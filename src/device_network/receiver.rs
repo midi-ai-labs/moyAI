@@ -412,22 +412,31 @@ impl DeviceNetworkService {
         &self,
         cancel: CancellationToken,
     ) -> Result<Option<crate::hub::HubTurnRoute>, DeviceError> {
-        let mode = self
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .settings
-            .receiver
-            .model_mode;
-        if mode == crate::hub::HubRouteMode::Direct {
+        let (managed, mode) = {
+            let state = self.inner.state.lock().unwrap();
+            (
+                state.shared.configured(),
+                state.settings.receiver.model_mode,
+            )
+        };
+        if !managed && mode == crate::hub::HubRouteMode::Direct {
             return Ok(None);
         }
         let client = self.client()?;
-        crate::hub::HubConnection::device_worker_route(&client.endpoint(), client.http(), cancel)
-            .await
-            .map(Some)
-            .map_err(|_| DeviceError::Unavailable)
+        let settings = crate::hub::HubSettingsStore::new(
+            self.inner.directory.with_file_name("hub-settings.json"),
+        )
+        .load()
+        .map_err(|_| DeviceError::Unavailable)?;
+        crate::hub::HubConnection::device_worker_route_with_settings(
+            &client.endpoint(),
+            client.http(),
+            Some(settings),
+            cancel,
+        )
+        .await
+        .map(Some)
+        .map_err(|_| DeviceError::Unavailable)
     }
 
     pub(super) fn cancel_announced_lineages(&self, lineages: &[super::client::CancelledLineage]) {

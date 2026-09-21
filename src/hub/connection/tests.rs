@@ -150,6 +150,18 @@ async fn catalog(
         ),
     )
 }
+async fn register_device(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<Value>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!("Bearer {BOOTSTRAP}").parse().unwrap(),
+    );
+    let (status, Json(mut body)) =
+        register(State(state), headers, Json(json!({"label":"worker"}))).await;
+    body["identity_scope"] = json!("device_session");
+    body["default_selection"] = serde_json::to_value(selection("fast")).unwrap();
+    (status, Json(body))
+}
 async fn heartbeat(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -360,6 +372,7 @@ impl Server {
             heartbeat_interval_ms: interval,
         });
         let router = Router::new()
+            .route("/v1/network/model-session", post(register_device))
             .route("/v1/clients/register", post(register))
             .route("/v1/catalog", get(catalog))
             .route("/v1/clients/heartbeat", post(heartbeat))
@@ -388,6 +401,172 @@ fn store(temp: &tempfile::TempDir) -> HubSettingsStore {
     HubSettingsStore::new(
         camino::Utf8PathBuf::from_path_buf(temp.path().join("hub-settings.json")).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn shared_worker_reviews_saved_main_rejects_plaintext_gateway_and_stale_selection() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    save(&service, &connected, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    let saved = store(&temp).load().unwrap();
+    let http = || {
+        crate::device_network::ManagedHubHttp::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+    };
+    let route = HubConnection::device_worker_route_with_settings(
+        &server.endpoint,
+        http(),
+        Some(saved.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(route.logical_model(), "deep");
+    *server.state.prepare_response.lock().unwrap() = grant(&server, "deep");
+    let mut output = Output::default();
+    let error = route
+        .client()
+        .stream_chat(route_request(), CancellationToken::new(), &mut output)
+        .await
+        .unwrap_err();
+    // This control-plane fixture advertises a legacy HTTP gateway. Device sessions must
+    // reject it; the selected model still reaches the authenticated prepare boundary.
+    assert!(matches!(
+        error,
+        crate::error::LlmError::Hub(HubError::InvalidCatalog)
+    ));
+    let request = server.state.prepares.lock().unwrap()[0].clone();
+    assert_eq!(request["context"], "main");
+    assert_eq!(request["reviewed_revision"], "1");
+    let key = (
+        request["id"].as_str().unwrap().to_string(),
+        "main".to_string(),
+    );
+    assert_eq!(
+        server.state.reviews.lock().unwrap()[&key]["preferred_model_id"],
+        "deep"
+    );
+    assert!(output.text.is_empty());
+    assert_eq!(server.state.gateway_requests.lock().unwrap().len(), 0);
+    route.finish().await;
+    server.state.revision.store(2, Ordering::SeqCst);
+    let error = HubConnection::device_worker_route_with_settings(
+        &server.endpoint,
+        http(),
+        Some(saved),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, HubError::ReviewRequired);
+    assert_eq!(server.state.gateway_requests.lock().unwrap().len(), 0);
+    let first = HubConnection::device_worker_route_with_settings(
+        &server.endpoint,
+        http(),
+        Some(HubSettings::default()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.logical_model(), "fast");
+    first.finish().await;
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn captured_managed_refresh_cannot_reconnect_after_local_reset() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let http = crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    let connected = service
+        .connect_device(&server.endpoint, http.clone(), true, None)
+        .await
+        .unwrap();
+    // Pause at refresh's real admission boundary, after it captured endpoint, client and
+    // expected generation. Reset wins before connect_device can advance that generation.
+    let captured_generation = connected.connection_generation;
+    let registrations = server.state.registrations.load(Ordering::SeqCst);
+    let reset = service.reset_local().await.unwrap();
+    assert_eq!(
+        service
+            .connect_device(
+                &server.endpoint,
+                http.clone(),
+                true,
+                Some(&captured_generation)
+            )
+            .await
+            .unwrap_err(),
+        HubError::ConnectionChanged
+    );
+    assert_eq!(
+        server.state.registrations.load(Ordering::SeqCst),
+        registrations
+    );
+    assert_eq!(
+        serde_json::to_value(service.projection_now()).unwrap(),
+        serde_json::to_value(reset).unwrap()
+    );
+    // A new explicit connection remains possible; only the captured old operation is stale.
+    service
+        .connect_device(&server.endpoint, http, true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        server.state.registrations.load(Ordering::SeqCst),
+        registrations + 1
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_default_sources_are_independent_durable_and_reset_without_hub_contact() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    let http = crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    service
+        .connect_device(&server.endpoint, http, true, None)
+        .await
+        .unwrap();
+    let current = service.projection_now();
+    assert_eq!(current.main_mode, HubRouteMode::Hub);
+    assert_eq!(current.side_chat_mode, HubRouteMode::Hub);
+    assert!(current.main_uses_default && current.side_chat_uses_default);
+    let explicit = save(&service, &current, HubReviewContext::SideChat, "deep")
+        .await
+        .unwrap();
+    assert!(explicit.main_uses_default);
+    assert!(!explicit.side_chat_uses_default);
+    let loaded = persisted.load().unwrap();
+    assert_eq!(loaded.schema_version, 4);
+    assert!(loaded.main_uses_default);
+    assert!(!loaded.side_chat_uses_default);
+    assert_eq!(
+        loaded
+            .side_chat_review
+            .unwrap()
+            .selection
+            .preferred_model_id,
+        "deep"
+    );
+    drop(server);
+    service.reset_local().await.unwrap();
+    let reset = persisted.load().unwrap();
+    assert!(reset.endpoint.is_empty());
+    assert!(reset.main_review.is_none() && reset.side_chat_review.is_none());
+    assert!(!reset.main_uses_default && !reset.side_chat_uses_default);
 }
 fn selection(model: &str) -> HubSelection {
     HubSelection {
@@ -476,7 +655,7 @@ fn schema_one_reads_as_direct_and_schema_two_rejects_duplicate_or_missing_modes(
     let legacy = r#"{"schema_version":1,"revision":"4","endpoint":"","label":"Desktop","hub_id":null,"main_review":null,"side_chat_review":null}"#;
     std::fs::write(&path, legacy).unwrap();
     let loaded = store.load().unwrap();
-    assert_eq!(loaded.schema_version, 3);
+    assert_eq!(loaded.schema_version, 4);
     assert_eq!(loaded.main_mode, HubRouteMode::Direct);
     assert_eq!(loaded.side_chat_mode, HubRouteMode::Direct);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);

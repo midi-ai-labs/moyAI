@@ -22,8 +22,21 @@ $ErrorActionPreference = 'Stop'
 Add-Type -OutputAssembly $Output -OutputType WindowsApplication -TypeDefinition @"
 using System;
 using System.IO;
+using System.Diagnostics;
+using System.Threading;
 public static class ActivationFixture {
   public static void Main(string[] arguments) {
+    if (arguments.Length == 1 && arguments[0] == "--worker") {
+      File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "worker-started.txt"), "started");
+      Thread.Sleep(10000);
+      File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "worker-finished.txt"), "finished");
+      return;
+    }
+    if (arguments.Length == 1 && arguments[0] == "--launch") {
+      Process.Start(new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--worker") { UseShellExecute = false, CreateNoWindow = true });
+      for (int i = 0; i < 100 && !File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "worker-started.txt")); i++) Thread.Sleep(50);
+      return;
+    }
     File.WriteAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "activation.txt"), arguments);
   }
 }
@@ -31,6 +44,7 @@ public static class ActivationFixture {
 '@
 & (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -ExecutionPolicy Bypass -File $compileFixture -Output (Join-Path $package 'app/bin/moyai-desktop.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Failed to build the argument-recording fixture.' }
+Copy-Item -LiteralPath (Join-Path $package 'app/bin/moyai-desktop.exe') -Destination (Join-Path $package 'hub/bin/moyai-hub.exe') -Force
 Write-MoyaiUtf8 (Join-Path $package 'release.txt') 'first version'
 $profile = Join-Path $EvidenceRoot 'saved-profile.txt'
 Write-MoyaiUtf8 $profile 'existing credential and history fixture'
@@ -193,6 +207,15 @@ while (-not (Test-Path -LiteralPath $record) -and [DateTime]::UtcNow -lt $deadli
 $received = @(Get-Content -LiteralPath $record -Encoding UTF8)
 Assert-That ($launched.ExitCode -eq 0 -and $received.Count -eq 2 -and $received[0] -ceq '--join-config' -and $received[1] -ceq $joinFile) 'association launch forwarding preserves spaces, Unicode, ampersand and literal dollar characters as one file argument'
 Remove-Item -LiteralPath $record
+# The launcher must wait only for --launch, not the long-running Hub child.
+$hubBin = Join-Path $destination 'hub/bin'
+$hubStart = Start-Process -FilePath $fixedPowerShell -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $launchScript + '" -TeamManagement') -WindowStyle Hidden -PassThru
+$hubStart.WaitForExit()
+Assert-That ($hubStart.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $hubBin 'worker-started.txt')) -and -not (Test-Path -LiteralPath (Join-Path $hubBin 'worker-finished.txt'))) 'Hub launcher returns after management opens while its server child continues running'
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+while (-not (Test-Path -LiteralPath (Join-Path $hubBin 'worker-finished.txt')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+Assert-That (Test-Path -LiteralPath (Join-Path $hubBin 'worker-finished.txt')) 'finite Hub child fixture exits without stopping unrelated processes'
+Remove-Item -LiteralPath (Join-Path $hubBin 'worker-started.txt'),(Join-Path $hubBin 'worker-finished.txt')
 Write-MoyaiUtf8 (Join-Path $destination 'user-added.txt') 'preserve this extra file'
 Write-MoyaiUtf8 (Join-Path $package 'release.txt') 'second version'
 Write-FixtureManifest '2.0-fixture'

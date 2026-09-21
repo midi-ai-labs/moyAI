@@ -471,7 +471,7 @@ export function preferencesReady(
     ])
     && surface.settings.navigation?.provider?.count === 1
     && surface.settings.navigation.provider.visible === true
-    && surface.settings.navigation.provider.text === "メインチャット"
+    && surface.settings.navigation.provider.text === "AIの接続・メイン"
     && surface.settings.navigation?.side_chat?.count === 1
     && surface.settings.navigation.side_chat.visible === true
     && surface.settings.navigation.side_chat.text === "サイドチャット"

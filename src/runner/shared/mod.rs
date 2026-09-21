@@ -7,7 +7,7 @@ mod process_fixture;
 mod protocol;
 pub(crate) mod provisioning;
 mod settings;
-mod transport;
+pub(super) mod transport;
 
 pub use protocol::{Assignment, AttemptStatus, Job, JobState, Report, ReportOutcome, SharedInput};
 pub use settings::{EnvironmentMapping, ResourceScope, SharedSettings};
@@ -51,13 +51,7 @@ impl SharedWorker {
     ) -> Result<Self, RunnerError> {
         settings.resolve()?;
         let client = SharedClient::load(&settings, &host)?;
-        let path = host
-            .inner
-            .process
-            .store()
-            .paths()
-            .data_dir
-            .join("runner-shared.sqlite3");
+        let path = Journal::path_for(&host.inner.process.store().paths().data_dir, &settings)?;
         let journal = Journal::open(&path, &settings)?;
         crate::runtime::resource_admission::register(&settings)?;
         let (sender, commands) = tokio::sync::mpsc::channel(16);
@@ -374,6 +368,10 @@ impl Controller {
     }
 
     async fn tick(&mut self) -> Result<(), RunnerError> {
+        let retired = self.client.connection_retired().unwrap_or(true);
+        if retired {
+            self.host.begin_shutdown()?;
+        }
         self.host.refresh_maintenance()?;
         // Durable results are saved even while the Hub is disconnected or during shutdown.
         for mut entry in self.journal.active()? {
@@ -387,6 +385,11 @@ impl Controller {
                 self.expire_approval(&entry);
                 self.collect_outcome(&mut entry)?;
             }
+        }
+        if retired {
+            return Err(RunnerError::new(
+                "Hub connection was reset on this PC. Previous work remains recorded locally and is not submitted to another Hub.",
+            ));
         }
         for mut entry in self.journal.active()? {
             if entry.phase == Phase::ReportPending {
@@ -762,6 +765,7 @@ impl Controller {
                 request,
                 Some(SharedExecution {
                     context,
+                    model_client: self.client.clone(),
                     access_mode: entry.mapping.access_mode,
                     authority: self.client.effect_authority(entry.assignment.clone()),
                     resource,

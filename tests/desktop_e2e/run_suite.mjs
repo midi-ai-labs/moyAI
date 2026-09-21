@@ -9,11 +9,12 @@ import { normalizeDesktopIsolation } from "./core/desktop_isolation.mjs";
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const smoke = Object.freeze([
   "input.pointer-keyboard", "input.command-palette-insertion", "prompt-review.raw-interaction",
-  "settings.mcp-peer-controls", "settings.preferences-config", "run.stop", "run.next-turn",
+  "settings.preferences-config", "run.stop", "run.next-turn",
 ]);
 export const GUI_SUITES = Object.freeze({
   smoke,
   regression: Object.freeze([...smoke,
+    "navigation.menu-entry-controls", "navigation.palette-entry-controls",
     "navigation.workspace-controls", "navigation.modal-keyboard-controls", "navigation.external-sidebar-stop",
     "settings.initial-field-controls", "settings.session-field-controls", "settings.temporary-apply-controls",
     "side-chat.session", "provider.chat-tool-continuation", "provider.responses-progress",

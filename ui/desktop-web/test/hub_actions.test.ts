@@ -127,6 +127,46 @@ test("acknowledged route mode save keeps a separately edited review ready withou
   });
 });
 
+test("refreshing unchanged Hub defaults leaves Side ready after a Main save and poll", async () => {
+  const recommendation: HubSelection = { allowed_model_ids: ["model-a", "model-b"], preferred_model_id: "model-a",
+    required_capabilities: ["tools"], wait_policy: "allow_selected_fallback", affinity_turns: 3 };
+  let remote = projection({ status: "connected", settings_revision: "1", connection_generation: "2", hub_id: "hub-a",
+    catalog: { hub_id: "hub-a", software_version: "0.1.0", revision: "7", changes: [], models: ["model-a", "model-b"].map(id => ({id,label:id,capabilities:["tools"]})) },
+    main_mode: "hub", side_chat_mode: "hub", main_confirmation: "confirmed", side_chat_confirmation: "confirmed",
+    main_uses_default: true, side_chat_uses_default: true, recommended_main_selection: recommendation,
+    main_review: {hub_id:"hub-a",reviewed_revision:"7",selection:structuredClone(recommendation)},
+    side_chat_review: {hub_id:"hub-a",reviewed_revision:"7",selection:structuredClone(recommendation)},
+  });
+  const calls: {name:string;args:Record<string,unknown>}[] = [];
+  let poll: (p:HubProjection)=>void = () => {};
+  await withContext(async (name,args) => {
+    calls.push({name,args});
+    if (name === "hub_refresh") return structuredClone(remote);
+    assert.equal(name,"hub_save_review");
+    assert.equal(args.expectedSettingsRevision,remote.settings_revision);
+    const channel = args.context as "main" | "side_chat";
+    remote = {...remote,settings_revision:String(BigInt(remote.settings_revision)+1n),
+      [`${channel}_review`]:{hub_id:"hub-a",reviewed_revision:"7",selection:args.selection as HubSelection},[`${channel}_uses_default`]:false};
+    poll(structuredClone(remote));
+    return structuredClone(remote);
+  },async ({context,local,view}) => {
+    view.overlay = "config";
+    acceptHubProjection(local,remote);
+    await refreshHub(context);
+    assert.equal(local.drafts.side_chat.dirty,false,"refreshing the same default is not a Side edit");
+    poll = p => acceptHubProjection(local,p);
+    editHubField(local,"main:choice","model-a",false);
+    await saveHubReview(context,"main");
+    assert.equal(local.drafts.side_chat.target?.expectedSettingsRevision,"2");
+    editHubField(local,"side_chat:choice","model-b",false);
+    assert.equal(hubCanSave(local,"side_chat"),true);
+    await saveHubReview(context,"side_chat");
+    assert.deepEqual(calls.map(call=>call.name),["hub_refresh","hub_save_review","hub_save_review"]);
+    assert.equal(local.projection?.side_chat_review?.selection.preferred_model_id,"model-b");
+    assert.equal(local.projection?.side_chat_uses_default,false);
+  });
+});
+
 test("failed review save retains both drafts and does not treat recovery as a local successful save", async () => {
   const before = projection({ status: "connected", settings_revision: "4", connection_generation: "2", hub_id: "hub-a",
     catalog: { hub_id: "hub-a", software_version: "0.1.0", revision: "7", changes: [], models: [{ id: "model-a", label: "Model A", capabilities: [] }] } });
@@ -181,7 +221,7 @@ test("failed Hub connect retains pending until the fresh owner arrives and permi
     assert.equal(local.endpoint, "127.0.0.1:9500");
     assert.equal(local.label, "編集中の端末名");
     assert.equal(token.value, "first-token");
-    assert.match(local.error, /認証/);
+    assert.match(local.error, /参加許可/);
     token.value = "corrected-token";
     await connectHub(context);
     assert.equal(calls.length, 3);
@@ -249,7 +289,7 @@ test("failed recovery retains the original connection error and input without re
     editHubField(local, "endpoint", "127.0.0.1:9500", false);
     await connectHub(context);
     assert.deepEqual(calls, ["hub_connect", "hub_projection"]);
-    assert.match(local.error, /認証/);
+    assert.match(local.error, /参加許可/);
     assert.equal(local.endpoint, "127.0.0.1:9500");
     assert.equal(token.value, "first-token");
     assert.equal(local.pending, null);

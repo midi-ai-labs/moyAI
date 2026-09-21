@@ -135,6 +135,7 @@ macro_rules! desktop_command_manifest {
             device_network_select,
             device_network_refresh,
             device_network_leave,
+            device_network_reset,
             device_network_jobs,
             device_network_diagnose,
             device_network_artifacts,
@@ -423,6 +424,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         mcp_publish.clone(),
     );
     device_network.attach_hub_connection(hub_connection.clone());
+    hub_connection.attach_device_network(device_network.downgrade());
     controller.state.device_network = Some(device_network.clone());
     let managed_shells = controller.app.process_runtime.managed_shells();
     let shared: SharedController = Arc::new(Mutex::new(controller));
@@ -1844,6 +1846,7 @@ async fn capture_side_chat_direct_provider(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     let conflict_owner = owner_session_id.clone();
     mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        ensure_manual_ai_connection(controller)?;
         let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
             DesktopCommandConflict::new(format!("invalid side chat owner: {error}"))
         })?;
@@ -1906,6 +1909,7 @@ async fn load_side_chat_models(
     let (target, probe_config) = {
         let mut controller = controller.lock().await;
         controller.drain_runtime_messages();
+        ensure_manual_ai_connection(&controller).map_err(read_only_command_conflict_error)?;
         validate_side_chat_global_config_target(
             &expected_config_generation,
             controller.state.provider_config.config_generation,
@@ -3901,6 +3905,46 @@ async fn device_network_leave(
 }
 
 #[tauri::command]
+async fn device_network_reset(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+    confirmed: bool,
+) -> Result<DeviceNetworkProjection, String> {
+    if !confirmed {
+        return Err("confirmation_required".into());
+    }
+    let prepared = service
+        .prepare_reset(&expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let mut persist_error = None;
+    let result = service
+        .reset_local_prepared(prepared, |empty| {
+            controller
+                .save_device_network_config(empty, false)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    if let Some(error) = persist_error {
+        return Err(error);
+    }
+    let mut projection = result.map_err(|error| error.to_string())?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    drop(controller);
+    if crate::runner::operations::remove_autostart_after_reset().is_err() {
+        projection.error = Some("reset_autostart_unconfirmed".into());
+    }
+    Ok(projection)
+}
+
+#[tauri::command]
 async fn device_network_jobs(
     service: State<'_, DeviceNetworkService>,
 ) -> Result<crate::device_network::DeviceNetworkJobs, String> {
@@ -4304,15 +4348,17 @@ async fn hub_save_review(
     expected_catalog_revision: CatalogRevision,
     expected_settings_revision: String,
     expected_connection_generation: String,
+    use_hub_default: Option<bool>,
 ) -> Result<HubConnectionProjection, String> {
     connection
-        .save_review(
+        .save_review_with_source(
             context,
             selection,
             expected_hub_id,
             expected_catalog_revision,
             expected_settings_revision,
             expected_connection_generation,
+            use_hub_default.unwrap_or(false),
         )
         .await
         .map_err(|error| error.code().to_string())
@@ -4376,7 +4422,7 @@ async fn show_provider_editor(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_unscoped_prompt_review_action(controller, "provider editor")?;
-        controller.state.show_provider_editor();
+        controller.state.show_config_editor();
         Ok(())
     })
     .await
@@ -4518,6 +4564,9 @@ async fn import_global_config_toml(
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_manual_ai_connection(&controller) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     if let Err(conflict) =
         ensure_unscoped_prompt_review_action(&mut controller, "configuration import")
     {
@@ -4761,6 +4810,7 @@ fn accept_provider_action_input(
     controller: &mut DesktopController,
     mut input: DesktopProviderActionInput,
 ) -> Result<(), DesktopCommandConflict> {
+    ensure_manual_ai_connection(controller)?;
     input.base_url = match crate::config::ProviderEndpoint::parse(&input.base_url) {
         Ok(endpoint) => endpoint.as_str().to_string(),
         Err(error) => {
@@ -5028,7 +5078,68 @@ fn validate_complete_config_draft(
     controller: &DesktopController,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    complete_config_draft_is_dirty(controller.state.global_config(), values)
+    let dirty = complete_config_draft_is_dirty(controller.state.global_config(), values)?;
+    validate_managed_ai_draft(
+        controller.state.global_config(),
+        values,
+        hub_manages_ai_connection(controller),
+    )?;
+    Ok(dirty)
+}
+
+const HUB_MANAGED_AI_SETTINGS: &str = "AIの接続先はHubから設定されています。モデルは「AIの接続」で選択してください。手動接続に戻す場合は接続設定をリセットしてください。";
+
+fn hub_manages_ai_connection(controller: &DesktopController) -> bool {
+    controller
+        .state
+        .device_network
+        .as_ref()
+        .is_some_and(|network| !network.projection_now().hub_url.trim().is_empty())
+}
+
+fn ensure_manual_ai_connection(
+    controller: &DesktopController,
+) -> Result<(), DesktopCommandConflict> {
+    if hub_manages_ai_connection(controller) {
+        return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
+    }
+    Ok(())
+}
+
+fn validate_managed_ai_draft(
+    config: &crate::config::ResolvedConfig,
+    values: &[DesktopConfigValueInput],
+    managed: bool,
+) -> Result<(), DesktopCommandConflict> {
+    if !managed {
+        return Ok(());
+    }
+    let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+        config,
+        values
+            .iter()
+            .map(|value| (value.key.clone(), value.text.clone()))
+            .collect(),
+    )
+    .map_err(DesktopCommandConflict::new)?;
+    use crate::config::ConfigField;
+    if editor.fields.iter().any(|field| {
+        field.dirty
+            && matches!(
+                field.key,
+                ConfigField::BaseUrl
+                    | ConfigField::Model
+                    | ConfigField::ProviderProfile
+                    | ConfigField::ApiKeyEnv
+                    | ConfigField::ExtraHeadersJson
+                    | ConfigField::SideChatBaseUrl
+                    | ConfigField::SideChatModel
+                    | ConfigField::SideChatProviderProfile
+            )
+    }) {
+        return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
+    }
+    Ok(())
 }
 
 fn complete_config_draft_is_dirty(
@@ -5451,14 +5562,22 @@ fn build_session_settings_patch(
     };
     let context_window =
         parse_optional_session_settings_u32("context window", &input.context_window, true)?;
-    Ok(session_settings_patch_for_values(
+    let (patch, changed) = session_settings_patch_for_values(
         session,
         base_url,
         model,
         provider_connection,
         input.access_mode,
         context_window,
-    ))
+    );
+    if hub_manages_ai_connection(controller)
+        && (patch.base_url.is_some()
+            || patch.model.is_some()
+            || patch.provider_connection.is_some())
+    {
+        return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
+    }
+    Ok((patch, changed))
 }
 
 fn session_settings_storage_error(
@@ -8158,6 +8277,44 @@ mod tests {
         *values.last_mut().expect("visible config field") = current_last;
         values.pop();
         assert!(complete_config_draft_is_dirty(&config, &values).is_err());
+    }
+
+    #[test]
+    fn hub_managed_ai_preserves_manual_connections_while_other_settings_remain_editable() {
+        use crate::config::ConfigField;
+        let config = crate::config::ResolvedConfig::default();
+        for field in [
+            ConfigField::BaseUrl,
+            ConfigField::Model,
+            ConfigField::ProviderProfile,
+            ConfigField::ApiKeyEnv,
+            ConfigField::ExtraHeadersJson,
+            ConfigField::SideChatBaseUrl,
+            ConfigField::SideChatModel,
+            ConfigField::SideChatProviderProfile,
+        ] {
+            let values = vec![DesktopConfigValueInput {
+                key: field.label().to_string(),
+                text: "changed-connection-value".into(),
+            }];
+            assert!(validate_managed_ai_draft(&config, &values, true).is_err());
+            assert!(validate_managed_ai_draft(&config, &values, false).is_ok());
+        }
+        let unchanged = crate::tui::config_editor::ConfigEditorState::from_config(&config)
+            .fields
+            .into_iter()
+            .filter(|field| !field.key.is_host_owned_generation())
+            .map(|field| DesktopConfigValueInput {
+                key: field.key.label().into(),
+                text: field.value,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_managed_ai_draft(&config, &unchanged, true).is_ok());
+        let prompts = vec![DesktopConfigValueInput {
+            key: ConfigField::SystemPrompt.label().into(),
+            text: "日本語で回答してください".into(),
+        }];
+        assert!(validate_managed_ai_draft(&config, &prompts, true).is_ok());
     }
 
     #[test]

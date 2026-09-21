@@ -291,8 +291,12 @@ async fn managed_fixture(
         "Win20-Worker".into()
     };
     settings.receiver.profile_id = profile.id;
-    let (shared, receipt_peer) =
-        network_fixture::receipt_peer(&path.join("device"), &mut settings).await;
+    let (shared, receipt_peer) = network_fixture::receipt_peer(
+        &path.join("device"),
+        &mut settings,
+        &app.config.model.base_url,
+    )
+    .await;
     crate::device_network::DeviceSettingsStore::new(path.join("device/device.json"))
         .save(&settings)
         .unwrap();

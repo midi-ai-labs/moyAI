@@ -16,7 +16,7 @@ Desktopは v3.0.0、コードネーム **LYNX**。既存のDirect接続、CLI/TU
 | --- | --- | --- |
 | Hubのブラウザー管理画面 | provider登録、モデルカタログ、接続端末、Hub経由の同時接続上限、maintenance、割当policy、配布revision | Desktopのworkspace、prompt、response、permission承認、providerのモデル・生成管理 |
 | Hub Rust service | カタログ保存、接続identity、lease、request permit、中継枠の待機、期限判定 | 推論本文の中継・恒常保存、provider processやモデルの起動停止 |
-| Desktop利用者・Rust runtime | Direct/Hub選択、許可モデル集合、review済みrevision、turnのimmutable target、tool権限、履歴 | Hub catalogの上書き、選択集合外への暗黙切替 |
+| Desktop利用者・Rust runtime | 端末のHub接続設定、Main/Side別のモデル選択、review済みrevision、turnのimmutable target、tool権限、履歴 | Hub catalogの上書き、選択集合外への暗黙切替 |
 | permit検証gateway | request許可の検証、本文のHTTP中継、自身の接続数と通信の終了・取消 | provider内の生成状態の判定・制御、Desktopのtool実行・workspace権限 |
 | provider（oMLX / LM Studio） | モデルload/unload、GPU管理、推論のキューと実行・終了 | Hubの認可・catalog revision、Desktopのtool実行・workspace権限 |
 | MCP接続者 | 明示的に許されたprofile/tool/targetへの要求 | Desktop GUIの現在選択を利用した暗黙target変更、未公開tool |
@@ -25,9 +25,9 @@ HubのRustサーバーが単一のstate ownerを持ち、起動時にブラウ�
 
 ## 2. 現在の実装範囲
 
-第1 incrementのHub管理GUI、永続カタログ、allocation / revision core、Desktop catalog client、MCP publish profile基盤に加え、第2 incrementではDesktopの **moyAI Hub** 接続・確認画面を実装した。接続先・端末表示名・接続用tokenを入力し、Hub identity・version・catalogを取得して、Main / Side Chatの論理モデル選択を別々に確認・保存できる。Hubは登録端末ごとのtokenでcatalog、heartbeat、各contextのreview、切断を認証する。
+標準Desktopでは **moyAI Hub** 画面で配布ファイルを読み込み、PCの参加承認後にHub identity・version・catalogを取得する。AIの接続設定は共通の「設定」に集約し、Main / Side Chatのモデルを別々に選択・保存する。Hub接続先・方式は読み取り専用であり、接続用tokenの入力やDirect/Hub切替は表示しない。旧loopback接続のtokenとroute modeのAPIは互換性試験のため保持する。Hubは登録端末ごとのtokenでcatalog、heartbeat、各contextのreview、切断を認証する。
 
-当初の第3 incrementは同一PC・loopback・Chat Completionsで独立gatewayとMain / Side runtimeを接続した。現行の範囲は次段落のTLS・Responses等を含む。各カードで「直接接続 / Direct」と「Hubを利用」を選び、次のuser turnから適用する。Hub選択中は確認済みのモデル集合でrequestごとに許可を取得し、待機とStopには既存のrun / Side lifecycleを使う。Directへ自動で戻さず、接続・review・gatewayの失敗を利用者へ示す。通常のDesktop projectionに接続と実行状態を含め、別のfrontend polling ownerを追加しない。
+当初の第3 incrementは同一PC・loopback・Chat Completionsで独立gatewayとMain / Side runtimeを接続した。現行の範囲は次段落のTLS・Responses等を含む。Hub設定のあるPCは通信状態にかかわらずHubを利用し、保存したモデル選択を次のuser turnから適用する。確認済みのモデル集合でrequestごとに許可を取得し、待機とStopには既存のrun / Side lifecycleを使う。Directへ自動で戻さず、接続・review・gatewayの失敗を利用者へ示す。通常のDesktop projectionに接続と実行状態を含め、別のfrontend polling ownerを追加しない。
 
 現行の追加実装は Hub の4 profileから Chat Completions / Responses を選び、loopback と相互TLS Gatewayの双方へ適用する。Desktop は prepare の `openai_compatible_chat` / `chat_completions` または `openai_compatible_responses` / `responses` の正しい組だけを受理し、既存adapterのimmutable targetへ変換する。Responsesは全canonical input・instructions・`store:false`で送る通常HTTP streamingで、provider会話IDの継承やAPI間fallbackを行わない。Gatewayはmodel名だけを書き換え、raw応答を中継する。profile・metadata・本文検証の正本は隣接Hubの [Gateway実行境界](../../moyAI-Hub/docs/gateway.md#認証と実要求)。追加操作の実GUI・実provider受入はfocused fixtureの合格と分けて記録する。
 
@@ -78,21 +78,21 @@ Gridには端末名、stable client ID、接続元IP、接続状態、実行/待
 
 旧手動経路のpresenceは開発用観測である。新しい端末連携では、サーバー再起動をまたぐ永続identity・pairing・管理者による個別revokeを別ownerで管理する。自端末の明示切断は現在の登録を削除しtokenを失効させる。再登録では新しいIDとtokenを取得する。
 
-### UC-04 Desktopの送信先とモデルを選ぶ
+### UC-04 AIの接続先とモデルを選ぶ
 
-1. 同じPCのHub管理画面でモデルを登録し、接続用tokenを指定してAPIと実行gatewayを明示的に開始する。
-2. Desktopの **moyAI Hub** を開く。接続先、端末の表示名、tokenを入力し「Hubに接続」を押す。接続するとHub identity・version・更新番号・登録モデルを表示する。
-3. メインチャットで利用候補を1つ以上選び、その中から優先モデルを指定する。待機方針、必要な機能、継続ターン数を確認し「この選択を確認して保存」を押す。
-4. サイドチャットも独立に選択・保存する。両方を先に編集してから順に保存でき、自分の保存が成功し、接続先・接続状態・モデル情報が同じなら、もう片方の保存のために情報を再取得する必要はない。一方の保存は他方の選択や確認を変更しない。確認済みで変更がない選択は「保存済み」と表示し、保存ボタンを無効にする。
-5. 利用するチャットの送信先を「Hubを利用」に切り替える。確認前・未接続・同じチャットの待機や実行中は変更できず、理由を表示する。Directへ戻す操作は明示的に行う。Sideは確認済みのHubモデルを選んでから開けば、Direct設定なしで会話を作成できる。
-6. 画面を閉じて通常の入力欄から送信する。MainのヘッダーとSideの情報欄はHubと優先モデルを表示し、割当後は実際の論理モデルを表示する。枠待ちは既存の実行状態欄へ表示し、既存のStopで取り消せる。
-7. 設定画面を閉じても接続とheartbeatは続く。「接続を解除」、Desktopをtrayへ隠す操作、Desktopウィンドウの×、tray Quit / アプリ終了では接続を解除する。ウィンドウの最小化は接続を維持する。
+「設定」の **AIの接続・メインチャット** と **サイドチャット** が、それぞれのAI接続欄を所有する。Hub画面の「AIの接続」も同じ設定画面を開く。
 
-設定にはHub identity、許可model集合、優先model、待機方針、N-turn affinityを持つ。model wireのProviderProfileとは独立する。DirectのURL/model/credentialはHub選択から上書きしない。Hubで作成したSide会話を初めてDirectへ切り替える場合は、会話欄に現在のSide Direct接続先・モデルを表示し、「この会話にDirect設定を適用」で一度だけ登録する。実行中・削除中・古いowner/config/会話世代では拒否する。会話ID・履歴・下書き・プロンプト・通信方針を保持し、過去turnの記録や既存Direct起点のsnapshotは変更しない。V66で旧bindingをDirectとして移行する。
+- Hub未設定では、その欄に接続先URL・接続方式・モデル等を入力する。これまでの手動設定を保持する。
+- 接続ファイルを読み込んでHubを設定したPCでは、同じ欄の接続先URLと接続方式を表示専用にし、モデルをドロップダウンから選ぶ。公開する接続先はHubのURLであり、Hub内部のprovider URLや秘密情報は配布しない。
+- モデルは「Hubの標準モデル」または登録モデルを選び「モデル選択を保存」で保存する。標準モデルを使うという選択自体を永続化する。Main/Sideは独立し、片方を保存しても他方の選択を置換しない。旧版の複数候補の選択は「保存済みの選択」として保持し、新しい候補を明示選択するまで変更しない。
+- 初回参加で未設定のMain/Sideは、認証済みHubの標準モデルを採用する。既に確認したモデルの集合・優先候補は接続時に上書きしない。手動providerの値は残し、明示的な接続設定リセット後に再利用できる。
+- Hub設定済みの通信断・承認待ちは手動入力へ戻す条件にならない。「再接続待ち」または参加承認待ちを表示し、新しいHub依頼は実行しない。Directへの自動切替を行わない。復旧はPCの接続の再接続、または旧Hubに依存しない「接続設定をリセット」を使う。
+- 標準モデルを含む確認済み選択にはcatalog revisionを保存する。Hubの更新時は最新情報を取得して変更を確認し、選択を保存する。標準モデルの変化も、この明示確認を迂回して進行中の仕事へ反映しない。
+- Main/Sideの実行中はそのcontextのモデル選択を固定する。保存された選択は次の依頼へ適用する。Sideの既存会話の履歴・指示・下書きは保持する。
 
-待機方針は「優先モデルが空くまで待つ」と「選択した別のモデルを許可する」を明示する。後者でも未選択modelを許可する設定にはならない。削除されたmodel、空集合、必要な能力と待機方針の不整合は保存を拒否する。未送信の入力とtool / permissionの表示は既存のDesktop ownerが保持し、Hub用に別の送信欄や停止処理を作らない。
+共有Runnerも同じWindows利用者の`hub-settings.json`のMain選択を、各仕事の開始時に一度だけ読み込む。認証済み端末のモデルsessionを使い、Hub identity・catalog revision・選択候補を検証してから既存の`HubTurnRoute`へ渡す。初回の未選択時だけHubの標準モデルを使用でき、保存済みの候補の削除・revision不一致・通信失敗を手動providerへの切替で隠さない。RunnerはMain/Sideの設定を書き換えず、進行中の仕事は開始時の選択を保持する。
 
-再起動時は保存した接続先・表示名・選択・送信先を表示し、Hubへ自動接続しない。カタログ未取得の選択は「保存済みのモデル」とIDを表示し、削除済みとは判定しない。Hubを選んだままなら送信を止め、tokenを再入力して明示的に接続し、各選択を再確認する。接続不能・認証失敗・heartbeat停止時も自動再登録せず、Directの設定を変えない。設定画面は編集中の値を持ち、接続と保存のownerは単一のRust serviceとする。
+接続ファイルの読込みからPCの参加承認までに、実行PCへAIサーバーのURL・モデルを手入力する必要はない。「チームの仕事をこのPCで実行する」はPCの接続から開始し、承認後に実行場所と実行許可を設定する。
 
 ### UC-05 Hub更新を確認する
 
@@ -138,13 +138,13 @@ Hubの永続catalogはversion付きatomic replace。書込み失敗時はruntime
 
 client公開catalogにはprovider endpoint、secret、管理者情報を含めない。短期credential/permit/leaseは永続設定・canonical historyに含めない。HTTP clientはredirectを追わず、deadline/body/row数をboundedにする。admin discoveryはユーザーが入力したendpointへだけ送る。
 
-Desktopの[接続service](../src/hub/connection.rs)はTauri managed stateとして置き、DesktopControllerのlockを保持したままHTTP通信しない。[catalog client](../src/hub/client.rs)は同じ接続ownerの直前の成功応答を一時保持し、同revisionの内容変更・revision逆行・Hub identity置換を投影前に拒否する。現在のcatalogとrevisionは認証したHubを正とする。[確認時の比較元](../src/hub/catalog_review.rs)は過去の公開モデル・software情報だけを保存する表示用snapshotであり、現在のcatalog、割当、review gateの代替ownerにはしない。
+Desktopの[接続service](../src/hub/connection.rs)はTauri managed stateとして置き、端末接続ownerへの弱参照からHub設定の有無を導出する。DesktopControllerのlockを保持したままHTTP通信しない。[catalog client](../src/hub/client.rs)は同じ接続ownerの直前の成功応答を一時保持し、同revisionの内容変更・revision逆行・Hub identity置換を投影前に拒否する。現在のcatalogとrevisionは認証したHubを正とする。[確認時の比較元](../src/hub/catalog_review.rs)は過去の公開モデル・software情報だけを保存する表示用snapshotであり、現在のcatalog、割当、review gateの代替ownerにはしない。
 
-[Hub設定store](../src/hub/settings.rs)は既存のアプリ用`config.toml`と同じdirectoryの`hub-settings.json`を所有する。strictなschema version 3で、独立した保存revision、canonical endpoint、表示名、Hub identity、Main / Sideのreview済みlogical selectionと各送信先`direct` / `hub`、それぞれの確認時catalog baselineを保持する。baselineはHub ID・revision・software version・公開modelsだけを持ち、reviewとのidentity・revision・選択整合を読取／保存時に検証する。最大2個の公開snapshotに対応するため設定全体を1 MiBで制限する（各snapshotは128モデル・各32機能まで）。schema 1は両送信先をDirect、schema 2は保存済み送信先のまま読み、両方ともbaselineは未保存とする。読取で既存ファイルを書き換えず、次の保存時にversion 3でatomicに書く。保存revisionは設定ファイルの競合検出用であり、Hubのcatalog revisionとは別物である。token、runtime client ID、provider endpoint、permitは保存しない。書込みはfile lock・revision CAS・atomic replaceを行い、破損や未知field / schemaを空設定へresetしない。
+[Hub設定store](../src/hub/settings.rs)は既存のアプリ用`config.toml`と同じdirectoryの`hub-settings.json`を所有する。strictなschema version 4で、独立した保存revision、canonical endpoint、表示名、Hub identity、Main / Sideのreview済みlogical selectionと各送信先`direct` / `hub`、それぞれの確認時catalog baselineを保持する。baselineはHub ID・revision・software version・公開modelsだけを持ち、reviewとのidentity・revision・選択整合を読取／保存時に検証する。最大2個の公開snapshotに対応するため設定全体を1 MiBで制限する（各snapshotは128モデル・各32機能まで）。schema 1は両送信先をDirect、schema 2は保存済み送信先のまま読み、両方ともbaselineは未保存とする。schema 3のbaselineは保持する。schema 1〜3のMain/Sideは明示選択として読み、version 4では`main_uses_default`・`side_chat_uses_default`で標準モデルの選択を保持する。端末のHub設定がある場合の有効送信先は、通信状態にかかわらずHubである。読取で旧ファイルを書き換えず、次の保存時にversion 4でatomicに書く。保存revisionは設定ファイルの競合検出用であり、Hubのcatalog revisionとは別物である。token、runtime client ID、provider endpoint、permitは保存しない。書込みはfile lock・revision CAS・atomic replaceを行い、破損や未知field / schemaを空設定へresetしない。
 
 選択の保存は、local設定のatomic保存後に端末tokenで対象contextをHubへ送る。両方の成功と同じgeneration・選択・catalogの確認が揃って初めて「Hubで確認済み」とする。remote拒否・通信失敗時は保存済みの選択を残し、未確認または再確認が必要と表示する。後続の新しい保存をrollbackしない。Hub更新による拒否は同じ旧revisionの他contextも即座に再確認対象にするが、既に新revisionを確認したcontextは維持する。
 
-別endpointへの明示接続が成功した場合は、以前のMain / Sideレビューと比較元を同じatomic保存で解除し、送信先をDirectへ戻す。これは利用者が別Hubへの接続を選ぶ操作であり、Hubの障害時fallbackには使わない。同じ保存済みendpointが異なるHub identityを返した場合は接続を拒否し、以前の選択を保持する。切断・再接続はgenerationを進めて古い完了を無効にし、不要になった端末登録を期限付きのbest effortで解除する。通信不能・強制終了時は即時解除を保証せず、Hub側のheartbeat期限でも疎通不明を検出する。通常のDesktop projectionとMain / Side requestは同じ接続serviceを参照する。
+旧loopback互換APIで別endpointへの明示接続が成功した場合は、以前のMain / Sideレビュー・標準モデル選択・比較元を同じatomic保存で解除し、保存route modeをDirectへ戻す。端末のHub接続設定がある場合の有効経路は常にHubであり、この互換動作でもDirectには切り替わらない。通常画面で別Hubへ移る際は「接続設定をリセット」後に配布ファイルを読み込む。同じ保存済みendpointが異なるHub identityを返した場合は接続を拒否し、以前の選択を保持する。切断・再接続はgenerationを進めて古い完了を無効にし、不要になった端末登録を期限付きのbest effortで解除する。通信不能・強制終了時は即時解除を保証せず、Hub側のheartbeat期限でも疎通不明を検出する。通常のDesktop projectionとMain / Side requestは同じ接続serviceを参照する。
 
 HubのLAN境界にはTLS、Hub fingerprintの確認、端末credentialのlocal保管、参加承認・失効、Host/Origin validation、body/connection/request limitsを実装している。Web管理は起動操作に由来する短期アクセス情報と管理用cookieで認証し、端末向け相互TLSのtokenをブラウザーへ渡さない。遠隔管理では登録PCと管理権限の現在の対応も確認する。変更面の最終検証と物理LANの運用受入は継続中であり、Desktop MCPのTLS試験をHub全体の受入に流用しない。端末認証は維持し、ポート競合や他Hubの保存directoryを黙って共有しない。
 
@@ -157,7 +157,7 @@ Desktop/Hubは独立したlockfileとbuild/packageを持つ。開発時の隣接
 | A 管理とcontract基盤（第1 increment） | 登録→保存→再起動→状態確認の実GUI、revision/selection/permit単体試験、public catalog client、MCP profileのnegative試験 |
 | A2 Desktop接続・確認準備（第2 increment） | 明示接続→Main / Side独立確認→変更検出→切断→再起動の実GUI、保存CAS・遅延応答・認証失敗・token非保存の試験 |
 | B provider/gateway契約（第3 incrementから着手） | request許可検証・中継・settle、Stop/切断での自接続取消と枠解放、応答不完全時のerror、停止・再開始のintegration。providerのGPU・実行容量管理とは分離 |
-| C Desktop Main/Side実routing | Direct/Hub選択、待機/Stop、request permit、Hub起点Side、依頼整形・独立子agent、確認時baselineと詳細差分の実GUI・既存Direct回帰 |
+| C Desktop Main/Side実routing | 共通AI設定・独立モデル選択、待機/Stop、request permit、Hub起点Side、依頼整形・独立子agent、確認時baselineと詳細差分の実GUI・既存Direct回帰 |
 | D MCP配信 | 共通protocol・認証/target/registry/permission bridgeとHub管理受付を保持。旧手動GUI/command退役、保存データ保持・自動再開なし・停止/履歴の互換性を最終検証 |
 | E 配布 | 2 appの導入/接続説明、LAN matrix、closed-network package、upgrade/recovery、実binary identity |
 

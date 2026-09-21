@@ -71,6 +71,8 @@ pub struct DeviceExecutionProjection {
     pub can_resume: bool,
     pub unknown_attempts: Vec<SharedAttemptProjection>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub reset_review_required: bool,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -80,6 +82,8 @@ pub enum DeviceExecutionCommand {
     },
     Enable {
         review_id: String,
+        #[serde(default)]
+        previous_execution_confirmed: bool,
     },
     Pause,
     Resume,
@@ -241,6 +245,8 @@ impl DeviceNetworkService {
     }
     pub fn execution_projection(&self) -> DeviceExecutionProjection {
         let mut value = self.inner.execution.state.lock().unwrap().view.clone();
+        value.reset_review_required = super::reset::ResetState::load(&self.inner.directory)
+            .map_or(true, |reset| reset.execution_review_required);
         #[cfg(feature = "desktop-e2e")]
         {
             value.isolated_test_host = std::env::var_os("MOYAI_DESKTOP_E2E_RUNNER").is_some()
@@ -435,7 +441,15 @@ impl DeviceNetworkService {
                 view.error = None;
                 state.revise(view);
             }
-            DeviceExecutionCommand::Enable { review_id } => {
+            DeviceExecutionCommand::Enable {
+                review_id,
+                previous_execution_confirmed,
+            } => {
+                let mut reset = super::reset::ResetState::load(&self.inner.directory)
+                    .map_err(|_| "接続リセットの記録を読み込めません。".to_string())?;
+                if reset.execution_review_required && !previous_execution_confirmed {
+                    return Err("以前の実行が停止していることと、ファイル・外部システムへの影響を確認してから、新しいHubでの実行を許可してください。".into());
+                }
                 let review = {
                     let state = self.inner.execution.state.lock().unwrap();
                     if state.binding != connection.binding {
@@ -472,6 +486,10 @@ impl DeviceNetworkService {
                 };
                 let updated = request_operation(status.runner_id, operation).await?;
                 self.require_execution_binding(&connection.binding)?;
+                reset.execution_review_required = false;
+                reset
+                    .save(&self.inner.directory)
+                    .map_err(|_| "実行前の確認結果を保存できません。".to_string())?;
                 self.accept_execution_status(&connection.binding, updated);
                 let mut state = self.inner.execution.state.lock().unwrap();
                 let mut view = state.view.clone();

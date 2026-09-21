@@ -7,13 +7,14 @@ import { acceptDeviceNetworkProjection, deviceCanJoin, deviceCanReceive, deviceC
 
 async function request(context: ActionContext, pending: NonNullable<DeviceNetworkUiState["pending"]>, name: string, args: Record<string, unknown> = {}): Promise<void> {
   const local = context.uiState.deviceNetwork;
-  if (local.pending || context.getViewState()?.overlay !== "hub") return;
+  const overlay = context.getViewState()?.overlay;
+  if (local.pending || !["hub", "config"].includes(overlay ?? "")) return;
   const serial = ++local.requestSerial;
   const previousConnection = local.projection;
   local.pending = pending; local.error = ""; local.notice = "";
   local.selectionKey = pending === "select" ? devicePeerKey({ device_id: String(args.deviceId), profile_id: String(args.profileId) }) : null;
   context.rerender();
-  const current = () => serial === local.requestSerial && context.getViewState()?.overlay === "hub";
+  const current = () => serial === local.requestSerial && context.getViewState()?.overlay === overlay;
   try {
     const projection = await command<DeviceNetworkProjection>(name, args);
     if (!current()) return;
@@ -33,6 +34,10 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     else if (pending === "leave") {
       local.leaveConfirmed = false;
       local.notice = "接続を一時解除しました。登録IDと設定は保持されています。「再接続」で接続を戻せます。";
+    }
+    else if (pending === "reset") {
+      local.resetConfirmed = false;
+      local.notice = "このPCの接続設定をリセットしました。手動でAIを設定するか、新しいHubの接続ファイルを読み込めます。履歴と成果物、以前の仕事の未確認記録は保持しています。";
     }
   } catch (error) {
     if (!current()) return;
@@ -87,6 +92,22 @@ export async function selectDevicePeer(context: ActionContext, key: string): Pro
 export async function leaveDeviceNetwork(context: ActionContext): Promise<void> {
   const local = context.uiState.deviceNetwork;
   if (local.projection?.can_leave && local.leaveConfirmed) await request(context, "leave", "device_network_leave", { ...deviceNetworkTarget(local.projection) });
+}
+export async function resetDeviceNetwork(context: ActionContext): Promise<void> {
+  const local = context.uiState.deviceNetwork;
+  if (local.projection && local.resetConfirmed) {
+    await request(context, "reset", "device_network_reset", { ...deviceNetworkTarget(local.projection), confirmed: true });
+    if (context.acceptProjection) context.acceptProjection(await command("desktop_state"));
+    await refreshDeviceExecution(context);
+  }
+}
+export async function deleteSavedDevicePeer(context: ActionContext, key: string): Promise<void> {
+  const local = context.uiState.deviceNetwork;
+  const peer = local.projection?.peers.find(row => row.selected && devicePeerKey(row) === key);
+  if (!peer || !local.projection || local.deletePeerKey !== key) return;
+  await request(context, "select", "device_network_select", { deviceId: peer.device_id, profileId: peer.profile_id,
+    enabled: false, ...deviceNetworkTarget(local.projection) });
+  if (!local.error) { local.deletePeerKey = ""; local.notice = "このPCの保存済み利用先を削除しました。Hubの許可、過去の履歴、実行中の仕事は変更していません。"; context.rerender(); }
 }
 /** Uses the application's existing snapshot cadence; no independent network timer. */
 export async function refreshDeviceNetworkJobs(context: ActionContext): Promise<void> {

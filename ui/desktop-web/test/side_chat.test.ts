@@ -451,7 +451,7 @@ test("Settings presents Main and Side LLM URL and native model selection consist
   const main = html.slice(mainStart, mainEnd);
   const side = html.slice(sideStart, sideEnd);
 
-  assert.match(main, /<h3 id="settings-provider-title">メインチャット<\/h3>/);
+  assert.match(main, /<h3 id="settings-provider-title">AIの接続・メインチャット<\/h3>/);
   assert.ok(main.indexOf("接続先URL") < main.indexOf('for="main-provider-model">モデル'));
   assert.match(main, /<select id="main-provider-model"[^>]*data-config-key="model\.model"/);
   assert.match(main, /<option value="qwen-main" selected>Qwen Main（ロード済み）<\/option>/);

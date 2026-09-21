@@ -5416,7 +5416,7 @@ test("every Settings field has unique connected help, validation, and explicit l
     html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*settings-control[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 23, "all current Settings controls retain connected help and labels");
+  assert.equal(controls.length, 24, "all current Settings controls retain connected help and labels");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];

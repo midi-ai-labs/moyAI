@@ -3,10 +3,14 @@ import test from 'node:test';
 import { MODAL_KEYBOARD_PLAN, MODAL_BLOCKED_KEYS, createModalKeyboardControlsScenario, modalFocusStep, modalContentPreserved, modalDisclosureExposesTarget } from '../scenarios/modal_keyboard_controls.mjs';
 
 const surface=()=>({prompt:'draft',p:{workspace_path:'fixture',draft_target:{sessionId:null,ownerGeneration:'1'},transcript_rows:[{row_kind:'empty_placeholder'}],run_target:{sessionId:null},access_label:'Default',access_target:{expectedAccessMode:'default'},session_settings:{access_mode:'default'},session_search_include_archived:false,busy:false,navigation_loading:false},errors:[]});
-test('modal plan separates actual dialogs and declared Close buttons',()=>{
-  assert.deepEqual(MODAL_KEYBOARD_PLAN.map(p=>p.overlay),['workspace','command_palette','shortcuts','about','hub','provider','config']);
+test('modal plan covers every entry route including the common settings alias and declared Close buttons',()=>{
+  assert.deepEqual(MODAL_KEYBOARD_PLAN.map(p=>p.overlay),['workspace','command_palette','shortcuts','about','hub','config','config']);
   assert.deepEqual(MODAL_KEYBOARD_PLAN.map(p=>p.closes.length),[0,0,1,2,2,1,1]);
-  assert.equal(new Set(MODAL_KEYBOARD_PLAN.map(p=>p.heading)).size,7);
+  assert.equal(new Set(MODAL_KEYBOARD_PLAN.map(p=>p.action)).size,7);
+  assert.equal(new Set(MODAL_KEYBOARD_PLAN.map(p=>p.heading)).size,6);
+  assert.deepEqual(MODAL_KEYBOARD_PLAN.filter(p=>p.overlay==='config').map(p=>[p.action,p.heading]),[
+    ['show-provider','config-dialog-title'],['show-config','config-dialog-title'],
+  ]);
   assert.deepEqual(MODAL_BLOCKED_KEYS.map(k=>`${k.modifier??''}:${k.key}`),['Control:n','Control:k',':F8','Control:Enter',':F9','Control:i']);
   const scenario=createModalKeyboardControlsScenario();
   assert.equal(scenario.id,'navigation.modal-keyboard-controls');assert.equal(scenario.manualGate,'pending');

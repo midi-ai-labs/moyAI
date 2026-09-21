@@ -989,7 +989,7 @@ function reconcileSettingsFlowState(state: DesktopWebState): void {
     state.config_target,
   );
   if (state.startup.initial_setup_required && setupTarget !== null) {
-    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget, state.startup.onboarding_intent === "personal" || state.startup.onboarding_intent === "execution");
+    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget, state.startup.onboarding_intent === "personal");
   }
 
   const sessionProjection = state.session_settings;
@@ -1398,12 +1398,12 @@ function renderCommitted(
         currentSettingsModal,
         nextSettingsModal,
         model.local.configMutationPending || model.local.sessionSettings.mutationPending
-          || (state.overlay === "hub" && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null)),
+          || ((state.overlay === "hub" || state.overlay === "config") && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null)),
         state.overlay === "hub" ? false : state.overlay === "session_settings"
           ? !model.local.sessionSettings.dirty
           : !uiState.configDirty,
       );
-      if (state.overlay === "hub") {
+      if (state.overlay === "hub" || state.overlay === "config") {
         synchronizeHubControlValues(currentSettingsModal, nextSettingsModal);
         synchronizeDeviceNetworkControls(currentSettingsModal, nextSettingsModal);
       }

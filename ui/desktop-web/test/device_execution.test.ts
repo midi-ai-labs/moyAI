@@ -75,6 +75,18 @@ test("execution setup sends one native review and enables only that review with 
   });
 });
 
+test("new execution after a connection reset requires a separate local stop and effects confirmation", async () => {
+  const {local, context} = fixture(projection({reset_review_required:true, review:{id:"new-review",directory:"C:/New",access_mode:"default"}}));
+  assert.equal(deviceExecutionActionEnabled(local,"enable"),false);
+  assert.match(renderDeviceExecution(local), /以前の処理の停止と影響を確認した/);
+  editDeviceNetworkField(local,"execution_reset_confirmed","",true);
+  assert.equal(deviceExecutionActionEnabled(local,"enable"),true);
+  const calls: unknown[]=[];
+  await withInvoke(async (_name,args)=>{calls.push(args);return projection({revision:"2",state:"ready",reset_review_required:false});}, async()=>{await deviceExecutionAction(context,"enable");});
+  assert.deepEqual(calls,[{expectedRevision:"1",request:{kind:"enable",review_id:"new-review",previous_execution_confirmed:true}}]);
+  assert.equal(local.executionResetConfirmed,false);
+});
+
 test("changing execution defaults describes future projects and missing capabilities do not invent Resume", () => {
   const { local } = fixture(projection({ state: "ready", directory: "C:/Approved", access_mode: "default" }));
   const html = renderDeviceExecution(local);

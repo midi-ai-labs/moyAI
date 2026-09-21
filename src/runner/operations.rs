@@ -231,14 +231,25 @@ pub(crate) fn now_ms() -> u64 {
 
 impl RunnerHost {
     pub fn installed_shared_settings(&self) -> Result<Option<SharedSettings>, RunnerError> {
-        Ok(self
+        let settings = self
             .inner
             .operations
             .lock()
             .map_err(error)?
             .installed
             .settings
-            .clone())
+            .clone();
+        if let Some(settings) = &settings {
+            if crate::device_network::reset::configured_execution_reset(
+                &settings.hub_id,
+                &settings.device_id,
+            )
+            .map_err(error)?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(settings)
     }
 
     pub(crate) fn accepting_new_shared(&self) -> bool {
@@ -407,6 +418,12 @@ impl RunnerHost {
                         }
                     } else {
                         next.settings = Some(settings.clone());
+                        // New local consent starts fresh authority. Old provisioning
+                        // receipts and pause policy must not follow a retired Hub.
+                        next.provisions.clear();
+                        next.templates.clear();
+                        next.mode = ProvisionMode::Available;
+                        next.maintenance_until_ms = None;
                     }
                     next.templates
                         .retain(|value| value.id != super::provision::DESKTOP_TEMPLATE_ID);
@@ -478,6 +495,12 @@ impl RunnerHost {
         }
         Ok(())
     }
+}
+
+/// Explicit Desktop recovery can remove the current user's login hook without
+/// requiring the old Hub or Runner IPC to answer.
+pub fn remove_autostart_after_reset() -> Result<(), RunnerError> {
+    super::autostart::remove_adjacent_runner()
 }
 
 /// Launch the adjacent product Runner in the current OS account, without a shell or elevation.

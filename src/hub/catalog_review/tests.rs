@@ -146,12 +146,16 @@ fn legacy_settings_gain_no_invented_baseline_and_upgrade_only_on_explicit_save()
     let temp = tempfile::tempdir().unwrap();
     let store = store(&temp);
     let path = temp.path().join("hub.json");
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         let mut legacy = serde_json::to_value(settings(&catalog(1))).unwrap();
         legacy["schema_version"] = json!(schema);
         let object = legacy.as_object_mut().unwrap();
-        object.remove("main_catalog_baseline");
-        object.remove("side_chat_catalog_baseline");
+        object.remove("main_uses_default");
+        object.remove("side_chat_uses_default");
+        if schema < 3 {
+            object.remove("main_catalog_baseline");
+            object.remove("side_chat_catalog_baseline");
+        }
         if schema == 1 {
             object.remove("main_mode");
             object.remove("side_chat_mode");
@@ -159,16 +163,21 @@ fn legacy_settings_gain_no_invented_baseline_and_upgrade_only_on_explicit_save()
         let bytes = serde_json::to_vec(&legacy).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         let loaded = store.load().unwrap();
-        assert_eq!(loaded.schema_version, 3);
+        assert_eq!(loaded.schema_version, 4);
         assert_eq!(loaded.main_mode, HubRouteMode::Direct);
         assert!(loaded.main_review.is_some());
-        assert!(loaded.main_catalog_baseline.is_none());
+        assert_eq!(loaded.main_catalog_baseline.is_none(), schema < 3);
+        assert!(!loaded.main_uses_default && !loaded.side_chat_uses_default);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let saved = store.save(&loaded).unwrap();
-        assert_eq!(saved.schema_version, 3);
-        assert!(saved.main_catalog_baseline.is_none());
+        assert_eq!(saved.schema_version, 4);
+        assert_eq!(saved.main_catalog_baseline.is_none(), schema < 3);
         assert_eq!(store.load().unwrap(), saved);
-        legacy["main_catalog_baseline"] = json!(null);
+        if schema == 3 {
+            legacy["main_uses_default"] = json!("invalid");
+        } else {
+            legacy["main_catalog_baseline"] = json!(null);
+        }
         let invalid = serde_json::to_vec(&legacy).unwrap();
         std::fs::write(&path, &invalid).unwrap();
         assert_eq!(store.load(), Err(HubError::SettingsInvalid));

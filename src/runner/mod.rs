@@ -240,6 +240,7 @@ struct SharedExecution {
     access_mode: crate::config::AccessMode,
     authority: Arc<dyn crate::runtime::ExternalEffectAuthority>,
     resource: Arc<crate::runtime::resource_admission::ResourceGuard>,
+    model_client: shared::transport::SharedClient,
 }
 
 impl Execution {
@@ -620,6 +621,16 @@ impl RunnerHost {
             (run.control.clone(), run.process_lifetime.clone())
         };
         app.run_service = Arc::new(app.run_service.with_managed_shell_lifetime(lifetime));
+        // Capture once for this assignment. A Desktop save affects the next job, and a Hub
+        // failure must never send this job to a retained manual provider.
+        let hub_guard = if let Some(shared) = &shared {
+            let route = shared.model_client.model_route(control.token()).await?;
+            let guard = route.execution_guard();
+            app.run_service = Arc::new(app.run_service.with_hub_turn(route));
+            Some(guard)
+        } else {
+            None
+        };
         {
             let mut state = self
                 .inner
@@ -662,7 +673,7 @@ impl RunnerHost {
             expected_active_turn,
         };
         if let Some(shared) = shared {
-            return app
+            let result = app
                 .run_service
                 .execute_shared(run, shared.context, &mut renderer, &mut confirmation)
                 .await
@@ -675,6 +686,10 @@ impl RunnerHost {
                     }
                 })
                 .map_err(|e| RunnerError::new(e.to_string()));
+            if let Some(guard) = hub_guard {
+                guard.finish().await;
+            }
+            return result;
         }
         match app
             .run_service

@@ -40,6 +40,8 @@ export interface HubProjection {
   main_review: HubReview | null;
   recommended_main_selection?: HubSelection | null;
   side_chat_review: HubReview | null;
+  main_uses_default?: boolean;
+  side_chat_uses_default?: boolean;
   main_catalog_comparison?: HubCatalogComparison;
   side_chat_catalog_comparison?: HubCatalogComparison;
   main_confirmation: "unconfirmed" | "confirmed" | "review_required";
@@ -66,6 +68,7 @@ export interface HubDraft {
   capabilitiesText: string;
   dirty: boolean;
   target: HubReviewTarget | null;
+  usesDefault: boolean;
 }
 export interface HubUiState {
   tab: "devices" | "models";
@@ -84,7 +87,7 @@ export type HubPresentation = Omit<HubUiState, "requestSerial">;
 function emptyDraft(): HubDraft {
   return {
     selection: { allowed_model_ids: [], preferred_model_id: "", required_capabilities: [], wait_policy: "wait_for_preferred", affinity_turns: 1 },
-    affinityText: "1", capabilitiesText: "", dirty: false, target: null,
+    affinityText: "1", capabilitiesText: "", dirty: false, target: null, usesDefault: false,
   };
 }
 export function createHubUiState(): HubUiState {
@@ -141,6 +144,7 @@ export function acceptHubProjection(
     if (changedHub) draft = state.drafts[context] = emptyDraft();
     if (!draft.dirty || options.savedContext === context) {
       draft.selection = structuredClone(review?.selection ?? emptyDraft().selection);
+      draft.usesDefault = projection[`${context}_uses_default`] ?? false;
       draft.affinityText = String(draft.selection.affinity_turns);
       draft.capabilitiesText = draft.selection.required_capabilities.join(", ");
       draft.dirty = false;
@@ -153,6 +157,15 @@ export function acceptHubProjection(
       // Explicit refresh lets the user review the visible draft against the new catalog.
       // Passive polling must not silently rebase an edit's mutation target.
       draft.target = hubReviewTarget(projection);
+    }
+    if (options.refreshTargets && draft.usesDefault && projection.recommended_main_selection) {
+      draft.selection = structuredClone(projection.recommended_main_selection);
+      draft.affinityText = String(draft.selection.affinity_turns);
+      draft.capabilitiesText = draft.selection.required_capabilities.join(", ");
+      // A refresh that repeats the saved default is not a local edit. Keeping
+      // it pristine lets later projections advance its normal settings owner.
+      draft.dirty = !review || !sameSelection(draft.selection, review.selection)
+        || !(projection[`${context}_uses_default`] ?? false);
     }
   }
   return true;
@@ -188,6 +201,13 @@ function sameSelection(left: HubSelection, right: HubSelection): boolean {
     && left.preferred_model_id === right.preferred_model_id
     && left.wait_policy === right.wait_policy && left.affinity_turns === right.affinity_turns;
 }
+export function hubModelChoice(state: HubPresentation, context: HubContext): string {
+  if (state.drafts[context].usesDefault) return ":hub-default";
+  const selection = state.drafts[context].selection;
+  if (!selection.allowed_model_ids.length) return "";
+  if (selection.allowed_model_ids.length === 1 && state.projection?.catalog?.models.some((model) => model.id === selection.preferred_model_id)) return selection.preferred_model_id;
+  return ":saved";
+}
 function canAdvanceDraftAfterLocalSave(
   draft: HubDraft, context: HubContext,
   save: { before: HubProjection; context: HubContext; kind: "review" | "mode" }, after: HubProjection,
@@ -205,6 +225,7 @@ function canAdvanceDraftAfterLocalSave(
   for (const channel of ["main", "side_chat"] as const) {
     if (save.kind !== "review" || channel !== save.context) {
       if (JSON.stringify(before[`${channel}_review`]) !== JSON.stringify(after[`${channel}_review`])) return false;
+      if (before[`${channel}_uses_default`] !== after[`${channel}_uses_default`]) return false;
     }
     if (save.kind !== "mode" || channel !== save.context) {
       if (before[`${channel}_mode`] !== after[`${channel}_mode`]) return false;
@@ -217,7 +238,8 @@ export function hubDraftHasChanges(state: HubPresentation, context: HubContext):
   if (!draft.dirty) return false;
   const selection = hubSelectionFromDraft(draft);
   const review = state.projection?.[`${context}_review`];
-  return !selection || !review || !sameSelection(selection, review.selection);
+  return !selection || !review || !sameSelection(selection, review.selection)
+    || draft.usesDefault !== (state.projection?.[`${context}_uses_default`] ?? false);
 }
 export function hubSelectionFromDraft(draft: HubDraft): HubSelection | null {
   if (!/^(?:[1-9][0-9]?|100)$/.test(draft.affinityText.trim())) return null;
@@ -334,7 +356,7 @@ export function useHubRecommendation(state: HubUiState): void {
   if (!hubCanUseRecommendation(state) || !state.projection?.recommended_main_selection) return;
   const selection = structuredClone(state.projection.recommended_main_selection);
   state.drafts.main = { selection, affinityText: String(selection.affinity_turns), capabilitiesText: selection.required_capabilities.join(", "),
-    dirty: true, target: hubReviewTarget(state.projection) };
+    dirty: true, target: hubReviewTarget(state.projection), usesDefault: true };
   state.error = ""; state.errorContext = null;
 }
 export function editHubField(state: HubUiState, field: string, value: string, checked: boolean): void {
@@ -348,6 +370,19 @@ export function editHubField(state: HubUiState, field: string, value: string, ch
   const [context, key, ...idParts] = field.split(":");
   if (context !== "main" && context !== "side_chat") return;
   const draft = state.drafts[context];
+  if (key === "choice") {
+    if (state.projection?.status !== "connected" || hubActiveRoute(state, context)) return;
+    const recommended = state.projection.recommended_main_selection;
+    if (value === ":hub-default" && recommended) {
+      draft.selection = structuredClone(recommended);
+      draft.usesDefault = true;
+    } else if (state.projection.catalog?.models.some((model) => model.id === value)) {
+      draft.selection = { ...draft.selection, allowed_model_ids: [value], preferred_model_id: value, wait_policy: "wait_for_preferred" };
+      draft.usesDefault = false;
+    } else return;
+    draft.affinityText = String(draft.selection.affinity_turns);
+    draft.capabilitiesText = draft.selection.required_capabilities.join(", ");
+  }
   if (!draft.dirty && state.projection) draft.target = hubReviewTarget(state.projection);
   draft.dirty = true;
   if (key === "model") {
@@ -364,8 +399,8 @@ export function editHubField(state: HubUiState, field: string, value: string, ch
 }
 export function hubErrorText(code: string | null | undefined): string {
   const messages: Record<string, string> = {
-    unauthorized: "Hubの認証に失敗しました。接続用トークンを確認してください。",
-    invalid_connection: "接続先とトークンを確認してください。HTTPはlocalhostのみ利用できます。",
+    unauthorized: "このPCの参加許可を確認できません。Hubの管理画面で接続端末の状態を確認してください。",
+    invalid_connection: "Hubの接続情報を確認できません。配布された接続ファイルを確認してください。",
     unavailable: "Hubに接続できません。Hubが起動しているか確認してください。",
     deadline: "Hubからの応答が時間内に届きませんでした。",
     different_hub: "保存済みとは異なるHubです。接続先とHubの識別情報を確認してください。",
@@ -380,8 +415,8 @@ export function hubErrorText(code: string | null | undefined): string {
     settings_busy: "別の操作がHub設定を保存しています。少し待ってから再度お試しください。",
     model_removed: "選択したモデルが削除されています。選択を見直してください。",
     capability_mismatch: "選択モデルが必要な機能を満たしていません。",
-    invalid_selection: "利用候補・優先モデル・継続ターン数を確認してください。",
-    route_busy: "このチャットの待機・実行が終了してから送信先を切り替えてください。",
+    invalid_selection: "モデルを選び直して保存してください。候補が古い場合は「最新情報を取得」を押してください。",
+    route_busy: "このチャットの待機・実行が終了してからモデル選択を変更してください。",
     delegated_execution_unsupported: "このHubは子エージェントの独立実行に未対応です。Hubを更新してください。",
     gateway_unavailable: "Hubの実行ゲートウェイを利用できません。Hubの管理画面で起動状態を確認してください。",
   };

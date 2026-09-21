@@ -10,7 +10,8 @@ import {
   type ActionPayload,
 } from "./actions.ts";
 import { icon } from "./icons.ts";
-import { renderHubOverlay } from "./hub_render.ts";
+import { aiConnectionManaged, renderManagedAiConnection, renderHubOverlay } from "./hub_render.ts";
+import { renderDeviceConnectionReset } from "./device_network_render.ts";
 import { renderSharedWork } from "./shared_work_render.ts";
 import { renderMcpHistoryOverlay } from "./mcp_history_render.ts";
 import { renderMcpActivityStrip } from "./mcp_activity.ts";
@@ -473,7 +474,7 @@ function renderInitialSetupStartStep(
       <div class="initial-setup-choice-row">
         <div>
           <strong>チームの仕事をこのPCで実行する</strong>
-          <p>ほかのPCから届いた依頼を、このPCのAIで実行します。AI設定、Hubへの接続、保存先と実行許可の順に進みます。</p>
+          <p>接続ファイルでHubに参加し、保存先と実行許可を設定します。AIはHubに登録されたモデルを使います。</p>
           <button id="initial-setup-execution" data-action="initial-setup-execution">チームの仕事をこのPCで実行する</button>
         </div>
         <div>
@@ -944,8 +945,12 @@ function renderProjectSessionRows(state: DesktopWebState): string {
     })
     .join("");
   const activeFallback = rows.length === 0 ? renderActiveProjectSessionPlaceholder(state) : "";
+  const currentChatHint = state.session_search_text.trim().length > 0
+    && (state.selected_session_index >= 0 || activeFallback.length > 0)
+    ? '<p class="empty-row">検索結果にかかわらず、現在開いているチャットも表示しています。</p>'
+    : "";
   return rows.length > 0 || activeFallback.length > 0 || state.session_search_text.trim().length > 0
-    ? `<div class="project-session-list">${search}${rows}${activeFallback}</div>`
+    ? `<div class="project-session-list">${search}${currentChatHint}${rows}${activeFallback}</div>`
     : `<div class="project-session-list">${search}</div>`;
 }
 
@@ -1094,7 +1099,7 @@ export function renderTopbar(
   const statusMessage = state.status_code === "user_stopped"
     ? "実行を停止しました。"
     : state.status_message;
-  const modelSettingsAction = hubRoute ? "show-hub" : sessionSettingsAvailable ? "show-session-settings" : "show-provider";
+  const modelSettingsAction = hubRoute ? "show-config" : sessionSettingsAvailable ? "show-session-settings" : "show-provider";
   const accessSettingsAction = sessionSettingsAvailable ? "show-session-settings" : "toggle-access";
   const accessSettingsEnabled = sessionSettingsAvailable
     || state.config_draft.access_mode_mutation_enabled;
@@ -1593,7 +1598,7 @@ function renderSideChatPane(
         </div>
         <div class="side-chat-setup" data-focus-key="artifact-pane-content" role="region" aria-label="サイドチャット設定案内" tabindex="0">
           <p>「設定」の「サイドチャット」で、新しいサイドチャットに使う既定値を変更できます。</p>
-          <p>Hubのモデルを使う場合は、先にHub画面でサイドチャット用のモデルを選んで保存してください。直接接続に切り替えても、会話の指示・履歴・下書きは残ります。</p>
+          <p>「設定」のAIの接続で、サイドチャット用のモデルを確認してください。会話の指示・履歴・下書きは保持します。</p>
           ${hubRoute ? '<p>Hubを使う場合も、サイドチャット用の指示と会話容量を「設定」で指定してください。AIモデルはHub画面で選びます。</p>' : ""}
           ${side.deleting ? renderSideChatDeletePending() : ""}
           ${renderSideChatFeedback(side)}
@@ -1853,12 +1858,15 @@ function renderSessionSettingsOverlay(
   }
 
   const validation = local.sessionSettings.validation;
+  const managed = aiConnectionManaged(local.hub, local.deviceNetwork);
   const staleTarget = local.sessionSettings.availability.staleTarget === true;
-  const providerDisabled = pending || staleTarget || !projection.provider_mutation_enabled;
+  const providerDisabled = managed || pending || staleTarget || !projection.provider_mutation_enabled;
+  const contextWindowDisabled = pending || staleTarget || !projection.provider_mutation_enabled;
   const accessDisabled = pending || staleTarget || !projection.access_mutation_enabled;
   const fieldInvalid = (field: keyof NonNullable<typeof validation>["fields"]): boolean =>
     validation?.fields[field].ok === false;
-  const providerAvailabilityHelp = projection.provider_mutation_enabled
+  const providerAvailabilityHelp = managed ? "接続先とモデルは共通設定の「AIの接続」で管理します。"
+    : projection.provider_mutation_enabled
     ? "このチャットだけに適用します。共通設定は変わりません。"
     : "実行中に変更できるのは承認方法だけです。接続先・モデル・入力整理上限は、実行が終わってから変更してください。";
   const inheritedHelp = (inherited: boolean, label: string): string => inherited
@@ -1899,32 +1907,33 @@ function renderSessionSettingsOverlay(
               </div>
               <span class="session-settings-lock" data-settings-passive="session-provider-lock" ${projection.provider_mutation_enabled ? "hidden" : ""}>実行中は固定</span>
             </div>
+            ${managed ? `<p>Hubのモデルを使用します。</p><button data-action="open-preferences-from-session-settings">AIの接続を開く</button>` : ""}
             <div class="settings-grid-two">
-              <div class="settings-field">
+              <div class="settings-field" ${managed ? "hidden" : ""}>
                 <label for="session-settings-base-url">接続先URL</label>
                 <input id="session-settings-base-url" class="session-settings-control" data-session-setting="base-url" type="url" value="${escapeHtml(draft.baseUrl)}" autocomplete="off" spellcheck="false" aria-describedby="session-settings-base-url-help session-settings-status" ${fieldInvalid("baseUrl") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
                 <small id="session-settings-base-url-help" class="settings-field-help">このチャットで使うAIの接続先です。</small>
               </div>
-              <div class="settings-field">
+              <div class="settings-field" ${managed ? "hidden" : ""}>
                 <label for="session-settings-provider-profile">接続方式</label>
                 <select id="session-settings-provider-profile" class="session-settings-control" data-session-setting="provider-profile" aria-describedby="session-settings-provider-profile-help session-settings-status" ${fieldInvalid("providerProfile") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""}>
                   ${Object.entries(PROVIDER_PROFILE_LABELS).map(([value, label]) => `<option value="${escapeHtml(value)}" ${draft.providerProfile === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
                 </select>
                 <small id="session-settings-provider-profile-help" class="settings-field-help">モデル一覧と生成APIを一つの接続方式として保存します。</small>
               </div>
-              <div class="settings-field">
+              <div class="settings-field" ${managed ? "hidden" : ""}>
                 <label for="session-settings-api-key-env">APIキーの環境変数名（任意）</label>
                 <input id="session-settings-api-key-env" class="session-settings-control" data-session-setting="api-key-env" value="${escapeHtml(draft.apiKeyEnv)}" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY" aria-describedby="session-settings-api-key-env-help session-settings-status" ${fieldInvalid("apiKeyEnv") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
                 <small id="session-settings-api-key-env-help" class="settings-field-help">秘密値ではなく、moyAI起動時に設定済みの環境変数名を入力します。</small>
               </div>
-              <div class="settings-field">
+              <div class="settings-field" ${managed ? "hidden" : ""}>
                 <label for="session-settings-model">モデル</label>
                 <input id="session-settings-model" class="session-settings-control" data-session-setting="model" value="${escapeHtml(draft.model)}" autocomplete="off" spellcheck="false" aria-describedby="session-settings-model-help session-settings-status" ${fieldInvalid("model") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
                 <small id="session-settings-model-help" class="settings-field-help">このsessionで使用するモデル IDです。</small>
               </div>
               <div class="settings-field">
                 <label for="session-settings-context-window">moyAIの入力整理上限 <span class="inherited-badge" data-settings-passive="session-context-inherited-badge" ${projection.context_window_inherited ? "" : "hidden"}>継承中</span></label>
-                <input id="session-settings-context-window" class="session-settings-control" data-session-setting="context-window" inputmode="numeric" value="${escapeHtml(draft.contextWindow)}" placeholder="共通設定を継承" aria-describedby="session-settings-context-window-help session-settings-status" ${fieldInvalid("contextWindow") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
+                <input id="session-settings-context-window" class="session-settings-control" data-session-setting="context-window" inputmode="numeric" value="${escapeHtml(draft.contextWindow)}" placeholder="共通設定を継承" aria-describedby="session-settings-context-window-help session-settings-status" ${fieldInvalid("contextWindow") ? 'aria-invalid="true"' : ""} ${contextWindowDisabled ? "disabled" : ""} />
                 <small id="session-settings-context-window-help" class="settings-field-help" data-settings-passive="session-context-inherited-help">${escapeHtml(inheritedHelp(projection.context_window_inherited, "moyAI内の入力整理上限"))} AI側の設定値は変更しません。</small>
               </div>
             </div>
@@ -2069,6 +2078,7 @@ function renderSideChatSettings(
   local: Readonly<DesktopRenderLocalPresentation>,
 ): string {
   const catalogLoading = local.sideChat.catalog.status === "loading";
+  const managed = aiConnectionManaged(local.hub, local.deviceNetwork);
   return `
     <section id="settings-side-chat" class="settings-section" aria-labelledby="settings-side-chat-title" aria-describedby="side-chat-settings-help" aria-busy="${catalogLoading ? "true" : "false"}">
       <div class="settings-section-head">
@@ -2076,16 +2086,19 @@ function renderSideChatSettings(
           <h3 id="settings-side-chat-title">サイドチャット</h3>
           <p id="side-chat-settings-help">新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません。既存の会話の設定は変わりません。</p>
         </div>
-        <button data-action="load-side-chat-models" aria-controls="side-chat-model side-chat-model-catalog-status" aria-disabled="${local.sideChat.catalogLoadEnabled ? "false" : "true"}" ${local.sideChat.catalogLoadEnabled ? "" : "disabled"}>${catalogLoading ? "読込中…" : "モデル読込"}</button>
+        ${managed ? "" : `<button data-action="load-side-chat-models" aria-controls="side-chat-model side-chat-model-catalog-status" aria-disabled="${local.sideChat.catalogLoadEnabled ? "false" : "true"}" ${local.sideChat.catalogLoadEnabled ? "" : "disabled"}>${catalogLoading ? "読込中…" : "モデル読込"}</button>`}
       </div>
-      <details class="settings-scope-details" data-details-key="side-chat-settings-scope">
+      <details class="settings-scope-details" data-details-key="side-chat-settings-scope" ${managed ? "hidden" : ""}>
         <summary id="side-chat-settings-scope-toggle">既存の会話に新しい設定を使うには</summary>
         <p>サイドチャットは、開いた時点のモデルとプロンプトを保持します。新しい設定を適用するには、上の適用または保存を押した後、サイドチャットを削除して開き直します。削除すると、その会話の履歴と下書きも失われます。</p>
       </details>
+      ${managed ? renderManagedAiConnection(local.hub, "side_chat", local.deviceNetwork) : ""}
       <div class="settings-grid-two">
+        ${managed ? "" : `
         ${renderConfigEnumField(state, "side_chat.provider_profile", "接続方式", PROVIDER_PROFILE_LABELS, { controlId: "side-chat-provider-profile" })}
         ${renderConfigTextField(state, "side_chat.base_url", "接続先URL", "url", "メインチャットとは別の接続先です。", { controlId: "side-chat-base-url" })}
         ${renderSideChatModelField(state, local.sideChat.catalog)}
+        `}
         ${renderConfigMultilineField(
           state,
           "side_chat.system_prompt",
@@ -2098,7 +2111,7 @@ function renderSideChatSettings(
         ${renderConfigTextField(state, "side_chat.connect_timeout_ms", "接続を待つ時間（ms）", "number", "モデルの接続先への待ち時間です。")}
         ${renderConfigTextField(state, "side_chat.max_retries", "再試行の上限回数", "number")}
       </div>
-      <p id="side-chat-model-catalog-status" class="side-chat-model-catalog-status ${local.sideChat.catalog.status === "error" ? "error" : ""}" data-settings-live-region="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(sideChatCatalogStatusText(local.sideChat.catalog))}</p>
+      ${managed ? "" : `<p id="side-chat-model-catalog-status" class="side-chat-model-catalog-status ${local.sideChat.catalog.status === "error" ? "error" : ""}" data-settings-live-region="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(sideChatCatalogStatusText(local.sideChat.catalog))}</p>`}
     </section>
   `;
 }
@@ -2123,6 +2136,7 @@ function renderConfigOverlay(
   local: Readonly<DesktopRenderLocalPresentation>,
 ): string {
   const setupRequired = startupSetupRequired(state);
+  const managed = aiConnectionManaged(local.hub, local.deviceNetwork);
   const title = setupRequired ? "初期設定" : "設定";
   const configValidation = validateConfigFieldValues(state.config_fields);
   const configCommitState = configCommitControlState(state.config_draft.commit_enabled, configValidation.ok);
@@ -2168,7 +2182,7 @@ function renderConfigOverlay(
         <div class="settings-layout">
           <nav class="settings-nav" aria-label="設定カテゴリ">
             <span class="settings-nav-group" role="heading" aria-level="3">共通設定</span>
-            <a href="#settings-provider">メインチャット</a>
+            <a href="#settings-provider">AIの接続・メイン</a>
             <a class="settings-nav-subitem" href="#settings-model">入力の上限・モデル機能</a>
             <a href="#settings-side-chat">サイドチャット</a>
             <a href="#settings-permissions">権限</a>
@@ -2187,11 +2201,12 @@ function renderConfigOverlay(
             <section id="settings-provider" class="settings-section" aria-labelledby="settings-provider-title" aria-describedby="main-provider-settings-help" aria-busy="${state.provider_loading ? "true" : "false"}">
               <div class="settings-section-head">
                 <div>
-                  <h3 id="settings-provider-title">メインチャット</h3>
+                  <h3 id="settings-provider-title">AIの接続・メインチャット</h3>
                   <p id="main-provider-settings-help">メインチャットの共通の既定値です。いまの会話だけを変更する場合は「現在のチャット」を開いてください。</p>
                 </div>
-                <button data-action="load-provider-models" aria-controls="main-provider-model main-provider-model-catalog-status" title="入力中の接続先からモデル一覧を取得" ${state.config_draft.edit_enabled && !state.provider_loading ? "" : "disabled"}>モデル読込</button>
+                ${managed ? "" : `<button data-action="load-provider-models" aria-controls="main-provider-model main-provider-model-catalog-status" title="入力中の接続先からモデル一覧を取得" ${state.config_draft.edit_enabled && !state.provider_loading ? "" : "disabled"}>モデル読込</button>`}
               </div>
+              ${managed ? renderManagedAiConnection(local.hub, "main", local.deviceNetwork) : `
               <div class="settings-grid-two">
                 ${renderConfigTextField(state, "model.base_url", "接続先URL", "url", "このURLと接続方式に対応するモデルを使います。")}
                 ${renderMainProviderModelField(state)}
@@ -2206,6 +2221,8 @@ function renderConfigOverlay(
                   "text",
                   "キーの値ではなく、起動前に設定した環境変数名を入力します（例: OPENAI_API_KEY）。認証不要なら空欄です。",
                 )}
+              </div>`}
+              <div class="settings-grid-two">
                 ${renderConfigMultilineField(
                   state,
                   "model.system_prompt",
@@ -2213,6 +2230,7 @@ function renderConfigOverlay(
                   `組み込みの指示に追加します。空欄は追加なしです。${USER_CONFIGURED_SYSTEM_PROMPT_MAX_CHARS.toLocaleString("ja-JP")}文字以内。`,
                 )}
               </div>
+              ${renderDeviceConnectionReset(local.deviceNetwork)}
               <div id="settings-model" class="settings-subsection" aria-labelledby="settings-model-title" aria-describedby="settings-model-help">
                 <h4 id="settings-model-title">入力の上限・モデル機能</h4>
                 <p id="settings-model-help">入力の整理と利用する機能を設定します。回答の長さや思考設定はモデルのホスト側で管理します。</p>

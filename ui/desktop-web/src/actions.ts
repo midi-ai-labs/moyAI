@@ -2,11 +2,11 @@ import { command } from "./api.ts";
 import { openHubProject, openSharedWork, refreshSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
 import { sharedWorkActionEnabled } from "./shared_work_state.ts";
 import { deviceExecutionAction, deviceExecutionActionEnabled } from "./device_execution.ts";
-import { connectHub, disconnectHub, openHub, refreshHub, saveHubReview, selectHubTab, setHubRouteMode } from "./hub_actions.ts";
-import { importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, refreshDeviceNetwork } from "./device_network_actions.ts";
+import { openHub, refreshHub, saveHubReview, selectHubTab } from "./hub_actions.ts";
+import { deleteSavedDevicePeer, importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, loadDeviceNetwork, refreshDeviceNetwork, resetDeviceNetwork } from "./device_network_actions.ts";
 import { deviceCanJoin } from "./device_network_state.ts";
 import { deviceCanDiagnose, diagnoseDeviceNetwork } from "./device_network_diagnostics.ts";
-import { hubCanSave, hubCanSetRouteMode, hubCanUseRecommendation, useHubRecommendation } from "./hub_state.ts";
+import { hubCanSave } from "./hub_state.ts";
 import { openMcpHistory, reloadMcpHistory, selectMcpHistoryDirection, selectMcpHistory, pageMcpHistory, operateMcpHistory } from "./mcp_history_actions.ts";
 import { selectedMcpHistoryRow } from "./mcp_history_state.ts";
 import { snapshotAgentInterruptTarget } from "./agent_interrupt_contract.ts";
@@ -438,10 +438,12 @@ async function chooseInitialSetupPurpose(
       current?.startup.setup_target ?? null, current?.config_target ?? request.configTarget, context.uiState.configDraftRevision);
     if (!accepted) return context.rerender();
     context.acceptProjection(next);
-    if (purpose === "personal" || purpose === "execution") {
+    if (purpose === "personal") {
       context.uiState.initialSetup.guided = true;
       context.uiState.initialSetup.step = "provider";
       context.rerender();
+    } else if (purpose === "execution") {
+      await loadDeviceNetwork(context);
     } else if (purpose === "team") {
       await refreshSharedWork(context);
     }
@@ -1576,6 +1578,8 @@ const ACTION_DEFINITIONS = [
   { id: "device-network-diagnose-hub", label: "Hubへの接続を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "hub"), run: (_state, context) => diagnoseDeviceNetwork(context, "hub") },
   { id: "device-network-diagnose-gateway", label: "このPCからHubのAIへの接続を診断", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanDiagnose(model.local.deviceNetwork, "gateway"), run: (_state, context) => diagnoseDeviceNetwork(context, "gateway") },
   { id: "device-network-join", label: "参加申請を再試行", enabled: (state, _payload, model) => state.overlay === "hub" && deviceCanJoin(model.local.deviceNetwork), run: (_state, context) => joinDeviceNetwork(context) },
+  { id: "device-network-reset", label: "接続設定をリセット", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection && model.local.deviceNetwork.resetConfirmed), run: (_state, context) => resetDeviceNetwork(context) },
+  { id: "device-network-delete-peer", label: "保存済み利用先を削除", enabled: (state, payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(payload.value && model.local.deviceNetwork.deletePeerKey === payload.value), run: (_state, context, payload) => deleteSavedDevicePeer(context, payload.value ?? "") },
   { id: "device-network-leave", label: "Hub接続を一時解除", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.deviceNetwork.pending && Boolean(model.local.deviceNetwork.projection?.can_leave && model.local.deviceNetwork.leaveConfirmed), run: (_state, context) => leaveDeviceNetwork(context) },
   { id: "show-mcp-history", label: "MCP履歴", menu: "view", palette: true, enabled: always, run: (_state, context) => openMcpHistory(context) },
   { id: "show-mcp-execution-history", label: "MCP実行履歴", enabled: always, run: (_state, context) => openMcpHistory(context, "execution") },
@@ -1586,25 +1590,9 @@ const ACTION_DEFINITIONS = [
   { id: "mcp-history-previous", label: "MCP履歴の前のページ", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.listPending && model.local.mcpHistory.previousOffsets.length > 0, run: (_state, context) => pageMcpHistory(context, false) },
   { id: "mcp-history-export", label: "MCP履歴をMarkdownで保存", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)), run: (_state, context) => operateMcpHistory(context, "export") },
   { id: "mcp-history-stop", label: "MCPタスクの停止を要求", enabled: (state, _payload, model) => state.overlay === "mcp_history" && !model.local.mcpHistory.operation && Boolean(selectedMcpHistoryRow(model.local.mcpHistory)?.can_stop), run: (_state, context) => operateMcpHistory(context, "stop") },
-  {
-    id: "hub-connect", label: "Hubに接続",
-    enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending
-      && model.local.hub.projection !== null && ["disconnected", "error"].includes(model.local.hub.projection.status),
-    run: (_state, context) => connectHub(context),
-  },
-  { id: "hub-refresh", label: "Hubの最新情報を取得", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending, run: (_state, context) => refreshHub(context) },
-  {
-    id: "hub-disconnect", label: "Hubとの接続を解除",
-    enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && model.local.hub.projection !== null && model.local.hub.projection.status !== "disconnected",
-    run: (_state, context) => disconnectHub(context),
-  },
-  { id: "hub-save-main", label: "メインチャットのHubモデルを保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
-  { id: "hub-main-recommendation", label: "Hubの推奨候補を選ぶ", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanUseRecommendation(model.local.hub), run: (_state, context) => { useHubRecommendation(context.uiState.hub); context.rerender(); } },
-  { id: "hub-save-side", label: "サイドチャットのHubモデルを保存", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
-  { id: "hub-main-direct", label: "メインチャットを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "direct"), run: (_state, context) => setHubRouteMode(context, "main", "direct") },
-  { id: "hub-main-hub", label: "メインチャットをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "main", "hub"), run: (_state, context) => setHubRouteMode(context, "main", "hub") },
-  { id: "hub-side-direct", label: "サイドチャットを直接接続に切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "direct"), run: (_state, context) => setHubRouteMode(context, "side_chat", "direct") },
-  { id: "hub-side-hub", label: "サイドチャットをHubに切り替える", enabled: (state, _payload, model) => state.overlay === "hub" && hubCanSetRouteMode(model.local.hub, "side_chat", "hub"), run: (_state, context) => setHubRouteMode(context, "side_chat", "hub") },
+  { id: "hub-refresh", label: "Hubの最新情報を取得", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && !model.local.hub.pending, run: (_state, context) => refreshHub(context) },
+  { id: "hub-save-main", label: "メインチャットのHubモデルを保存", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
+  { id: "hub-save-side", label: "サイドチャットのHubモデルを保存", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
   {
     id: "show-session-settings",
     label: "このチャットの設定",

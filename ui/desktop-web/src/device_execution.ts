@@ -6,6 +6,7 @@ import { escapeHtml } from "./utils.ts";
 export interface DeviceExecutionProjection {
   revision: string;
   autostart?: boolean;
+  reset_review_required?: boolean;
   state: "unconnected" | "not_selected" | "needs_setup" | "starting" | "ready" | "paused" | "unavailable";
   projects: { id: string; label: string; can_control: boolean; can_execute: boolean; environment_id: string | null; preparation_state: "not_selected" | "waiting_setup" | "pending" | "ready" | "failed"; error: string | null }[];
   review: { id: string; directory: string; access_mode: DeviceAccessMode } | null;
@@ -14,6 +15,7 @@ export interface DeviceExecutionProjection {
 }
 function acceptExecution(local: DeviceNetworkPresentation, projection: DeviceExecutionProjection): void {
   if (local.execution && BigInt(projection.revision) < BigInt(local.execution.revision)) return;
+  if (local.execution?.review?.id !== projection.review?.id) local.executionResetConfirmed = false;
   if (local.execution?.review?.id !== projection.review?.id
     || !projection.unknown_attempts.some(row => executionRecoveryKey(row) === local.executionRecoveryTarget)) resetExecutionRecovery(local);
   local.execution = projection; local.executionError = "";
@@ -37,6 +39,7 @@ export async function deviceExecutionAction(context: ActionContext, kind: string
   if (kind === "install-autostart" || kind === "remove-autostart") request.kind = kind.replaceAll("-", "_");
   if (kind === "prepare") request.access_mode = local.executionAccess;
   if (kind === "enable") request.review_id = p.review?.id;
+  if (kind === "enable" && p.reset_review_required) request.previous_execution_confirmed = local.executionResetConfirmed;
   if (kind === "reconcile") Object.assign(request, { attempt_id: value, generation: p.unknown_attempts.find(row => row.attempt_id === value)?.generation, reason: local.executionRecoveryReason,
     evidence: { kind: "operator_confirmed_stopped", effects_reviewed: local.executionEffectsReviewed, processes_stopped: local.executionProcessesStopped } });
   context.rerender();
@@ -50,7 +53,8 @@ export function deviceExecutionActionEnabled(local: DeviceNetworkPresentation, k
   const p = local.execution;
   if (!p || local.executionPending || p.state === "unconnected") return false;
   if (kind === "prepare") return p.state !== "starting";
-  if (kind === "enable") return Boolean(p.review && p.review.access_mode === local.executionAccess && p.state !== "starting");
+  if (kind === "enable") return Boolean(p.review && p.review.access_mode === local.executionAccess && p.state !== "starting"
+    && (!p.reset_review_required || local.executionResetConfirmed));
   if (kind === "pause") return p.can_pause;
   if (kind === "resume") return p.can_resume;
   if (kind === "install-autostart") return Boolean(p.directory && !p.autostart);
@@ -68,7 +72,7 @@ export function renderDeviceExecution(local: DeviceNetworkPresentation): string 
   return `<section class="device-network-card" id="device-execution"><h3>このPCで仕事を実行</h3><div data-settings-passive="device-execution-status">${awaitingAssignment ? `<div class="device-execution-handoff" role="status"><strong>このPCの実行設定は保存済みです</strong><p>次はHub管理者の操作です。「${esc(pcName)}」をプロジェクトの実行PCに割り当てるよう依頼してください。</p><p class="hub-help">保存先と実行許可を設定し直す必要はありません。割り当て後、作業フォルダーを自動で作成します。</p></div>` : `<p role="status">${p ? p.state === "not_selected" ? "保存先と実行許可を設定し、管理者にプロジェクトの割り当てを依頼してください" : labels[p.state] : "状態を確認しています…"}</p>`}${p?.projects.filter(row => row.can_execute).map(row => `<p>${esc(row.label)} · ${{not_selected:"未割り当て",waiting_setup:"このPCの設定待ち",pending:"作業フォルダーの準備中",ready:"作業フォルダー作成済み",failed:"作業フォルダーを作成できませんでした"}[row.preparation_state]}${row.error ? ` · ${esc(row.error)}` : ""}</p>`).join("") ?? ""}${local.executionError || p?.error ? `<p class="hub-feedback" data-error="true">${esc(local.executionError || p?.error || "")}</p>` : ""}</div>
     <p class="hub-help">仕事を依頼するだけなら設定は不要です。このPCを実行に使う場合だけ、保存先と権限を一度設定します。プロジェクトの追加と作業フォルダーの作成はHubが行います。</p>
     <div data-settings-passive="device-execution-directory">${p?.directory ? `<p>保存先: ${esc(p.directory)}<br>実行権限: ${esc(accessLabels[p.access_mode ?? "default"])}</p>` : ""}</div>
-    <details data-details-key="device-execution-setup" ${p && !p.directory && p.state !== "unconnected" ? "open" : ""}><summary>${p?.directory ? "今後追加されるプロジェクトの保存先・権限" : "保存先と実行許可を設定"}</summary>${p?.directory ? `<p class="hub-help">変更は今後追加されるプロジェクトに適用します。作成済みの作業フォルダーと実行権限は変更しません。</p>` : ""}<label class="hub-field">実行する操作の確認<select id="device-execution-access" data-network-field="execution_access" class="settings-control" ${busy ? "disabled" : ""}>${Object.entries(accessLabels).map(([value,label]) => `<option value="${value}" ${local.executionAccess === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><p class="hub-help">「承認を求める」では、確認が必要な操作を依頼の担当者が判断します。実行にはこのPCのAI設定を使います。</p><button data-action="device-execution-prepare">保存先フォルダーを選ぶ</button><div data-settings-passive="device-execution-review">${p?.review ? `<p>保存先: ${esc(p.review.directory)}<br>実行権限: ${esc(accessLabels[p.review.access_mode])}</p><p>この範囲で、Hubが許可したプロジェクトの仕事を実行します。同じプロジェクトで許可されたPCへの依頼も含みます。</p><button data-action="device-execution-enable">この設定で実行を許可</button>` : ""}</div></details>
+    <details data-details-key="device-execution-setup" ${p && !p.directory && p.state !== "unconnected" ? "open" : ""}><summary>${p?.directory ? "今後追加されるプロジェクトの保存先・権限" : "保存先と実行許可を設定"}</summary>${p?.directory ? `<p class="hub-help">変更は今後追加されるプロジェクトに適用します。作成済みの作業フォルダーと実行権限は変更しません。</p>` : ""}<label class="hub-field">実行する操作の確認<select id="device-execution-access" data-network-field="execution_access" class="settings-control" ${busy ? "disabled" : ""}>${Object.entries(accessLabels).map(([value,label]) => `<option value="${value}" ${local.executionAccess === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><p class="hub-help">「承認を求める」では、確認が必要な操作を依頼の担当者が判断します。実行にはこのPCのAI設定を使います。</p><button data-action="device-execution-prepare">保存先フォルダーを選ぶ</button><div data-settings-passive="device-execution-review">${p?.review ? `<p>保存先: ${esc(p.review.directory)}<br>実行権限: ${esc(accessLabels[p.review.access_mode])}</p><p>この範囲で、Hubが許可したプロジェクトの仕事を実行します。同じプロジェクトで許可されたPCへの依頼も含みます。</p>${p.reset_review_required ? `<p class="hub-help">以前のHubで実行した仕事の記録は保持されています。新しい実行を始める前に、このPCで以前の処理と関連プロセスが停止したこと、ファイルと外部システムへの影響を確認してください。旧仕事を完了扱いにはしません。</p><label><input id="device-execution-reset-confirmed" type="checkbox" data-network-field="execution_reset_confirmed" ${local.executionResetConfirmed ? "checked" : ""}>以前の処理の停止と影響を確認した</label>` : ""}<button data-action="device-execution-enable">この設定で実行を許可</button>` : ""}</div></details>
     <div class="device-network-actions" data-settings-passive="device-execution-actions">${p?.directory && (p.can_pause || p.can_resume) ? `<button data-action="device-execution-${p.can_pause ? "pause" : "resume"}">${p.can_pause ? "新しい仕事の受付を一時停止" : "受付を再開"}</button>` : ""}</div>
     ${renderExecutionRecovery(local)}
     <div data-settings-passive="device-execution-autostart">${p?.directory ? `<h4>このPCで仕事を受け付ける時間</h4><p>${p.autostart ? "Windowsへのサインイン時に実行機能を起動します。" : "moyAIを開くと実行機能を起動します。"} moyAIの画面を閉じても実行中の仕事は続きます。Windowsからサインアウト中・PCの電源が切れている間は実行できません。</p><button data-action="device-execution-${p.autostart ? "remove" : "install"}-autostart" ${busy ? "disabled" : ""}>${p.autostart ? "サインイン時の自動起動を解除" : "サインイン時の自動起動を有効にする"}</button>` : ""}</div>

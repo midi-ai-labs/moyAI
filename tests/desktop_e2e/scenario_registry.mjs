@@ -4,7 +4,7 @@ import { createShellSingleInstanceScenario } from "./scenarios/shell_single_inst
 import { createColdJoinConfigScenario, createWarmJoinConfigScenario } from "./scenarios/hub_join_config.mjs";
 import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
 import { createShellManagedLifecycleScenario } from "./scenarios/shell_managed_lifecycle.mjs";
-import { createHubConnectionSettingsScenario } from "./scenarios/hub_connection_settings.mjs";
+import { createHubOfflineResetScenario } from "./scenarios/hub_offline_reset.mjs";
 import { createHubBrowserEnrollmentScenario } from "./scenarios/hub_browser_enrollment.mjs";
 import { createHubJoinRetryControlsScenario } from "./scenarios/hub_join_retry_controls.mjs";
 import { createOutputHistoryNavigationScenario } from "./scenarios/output_history_navigation.mjs";
@@ -51,7 +51,6 @@ import { createDeviceExecutionScenario } from "./scenarios/device_execution.mjs"
 import { createOnboardingWinAbScenario } from "./scenarios/onboarding_winab.mjs";
 import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
-import { createSettingsMcpPeerControlsScenario } from "./scenarios/settings_mcp_peers.mjs";
 import { createMenuEntryControlsScenario, createPaletteEntryControlsScenario } from "./scenarios/shell_entry_controls.mjs";
 import { createSettingsFieldControlsScenario, createInitialSettingsFieldControlsScenario, createSessionSettingsFieldControlsScenario } from "./scenarios/settings_field_controls.mjs";
 import { createGlobalAdditionalControlsScenario, createInitialAdditionalControlsScenario, createSessionDiscardCloseScenario, createTemporaryApplyControlsScenario } from "./scenarios/settings_additional_controls.mjs";
@@ -69,8 +68,8 @@ const factories = new Map([
   ["hub.join-config-warm", createWarmJoinConfigScenario],
   ["shell.lynx", createShellLynxScenario],
   ["shell.managed-lifecycle", createShellManagedLifecycleScenario],
-  ["hub.connection-settings", createHubConnectionSettingsScenario],
   ["hub.browser-enrollment", createHubBrowserEnrollmentScenario],
+  ["hub.offline-reset", createHubOfflineResetScenario],
   ["settings.shared-work", createSharedWorkEntryScenario],
   ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
   ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
@@ -136,7 +135,6 @@ const factories = new Map([
   ["settings.temporary-apply-controls", createTemporaryApplyControlsScenario],
   ["settings.initial-field-controls", createInitialSettingsFieldControlsScenario],
   ["settings.session-field-controls", createSessionSettingsFieldControlsScenario],
-  ["settings.mcp-peer-controls", createSettingsMcpPeerControlsScenario],
   ["navigation.menu-entry-controls", createMenuEntryControlsScenario],
   ["navigation.palette-entry-controls", createPaletteEntryControlsScenario],
   ["run.next-turn", createRunNextTurnScenario],
@@ -159,6 +157,7 @@ const configurableScenarios = new Set([
   "navigation.external-sidebar-stop",
   "navigation.external-palette-rejoin",
   "hub.browser-enrollment",
+  "hub.offline-reset",
   "hub.join-retry-controls",
   "hub.receiver-settings-controls",
   "hub.outgoing-controls",

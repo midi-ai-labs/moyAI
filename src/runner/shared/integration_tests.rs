@@ -420,7 +420,12 @@ impl Provider {
                     captured.lock().unwrap().push(request.clone());
                     let task_text = request["messages"].to_string();
                     let approval_case = task_text.contains("approval-fixture") || task_text.contains("cancel-fixture");
-                    let (delta,finish) = if task_text.contains("local-managed-fixture") {
+                    let (delta,finish) = if task_text.contains("gateway-interruption-fixture") {
+                        released.notified().await;
+                        (json!({"role":"assistant","content":"Interrupted response must never become a successful job"}),"stop")
+                    } else if task_text.contains("gateway-reconnection-fixture") {
+                        (json!({"role":"assistant","content":"Gateway reconnection verified"}),"stop")
+                    } else if task_text.contains("local-managed-fixture") {
                         if request["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool"&&message["tool_call_id"]=="local-managed") {
                             (json!({"role":"assistant","content":"Local managed root completed"}),"stop")
                         } else {
@@ -617,6 +622,34 @@ async fn real_hub_scenario() {
         ca_certificate_pem: network["ca_certificate_pem"].as_str().unwrap().into(),
     };
     let provider = Provider::start().await;
+    // Register through the same admin boundary as the browser. The actual network start
+    // above owns the HTTPS Gateway; workers never receive this provider endpoint.
+    for model in ["fixture-parent", "fixture-child"] {
+        let evidence = hub
+            .admin(
+                "hub_discover",
+                json!({
+                    "endpoint": provider.endpoint, "providerProfile": "openai_compatible_chat",
+                }),
+            )
+            .await;
+        let snapshot = hub.admin("hub_snapshot", json!({})).await;
+        hub.admin(
+            "hub_register",
+            json!({"request": {
+                "revision": snapshot["store"]["revision"], "evidence_id": evidence["id"],
+                "endpoint": provider.endpoint, "provider_profile": "openai_compatible_chat",
+                "model_id": model, "label": model, "logical_model_id": null,
+                "capacity_pool_id": null, "capacity": 2, "allow_tools": true,
+            }}),
+        )
+        .await;
+    }
+    let gateway = hub.admin("hub_snapshot", json!({})).await;
+    assert_eq!(
+        gateway["gateway"]["ready"], true,
+        "real HTTPS model Gateway must be ready"
+    );
     let mut workers = Vec::new();
     let mut identities = Vec::new();
     for (name, environment, model, children) in [
@@ -629,10 +662,9 @@ async fn real_hub_scenario() {
         let config = directory.join("config/config.toml");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
-        let text = format!(
-            "[model]\nbase_url = {:?}\nmodel = {model:?}\nprovider_profile = \"openai_compatible\"\nmax_retries = 0\n[multi_agent]\nenabled = false\n",
-            provider.endpoint
-        );
+        // A retained manual profile deliberately cannot serve these jobs. Successful model
+        // calls must use the independently saved Main choice through Hub and its Gateway.
+        let text = "[model]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"must-not-use-direct\"\nprovider_profile = \"openai_compatible\"\nmax_retries = 0\n[multi_agent]\nenabled = false\n";
         std::fs::write(&config, text).unwrap();
         let invitation = hub.invitation(name).await;
         let identity = integration_fixture::enroll(
@@ -645,6 +677,49 @@ async fn real_hub_scenario() {
         )
         .await
         .unwrap();
+        let models = crate::hub::HubConnection::new(crate::hub::HubSettingsStore::new(
+            config.with_file_name("hub-settings.json"),
+        ));
+        models
+            .connect_device(
+                &url,
+                crate::device_network::ManagedHubHttp::new(identity.http.clone()),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let current = models.projection_now();
+        let catalog = current.catalog.as_ref().unwrap();
+        let selected = catalog
+            .models
+            .iter()
+            .find(|candidate| candidate.label == model)
+            .unwrap();
+        let selection = crate::hub::HubSelection {
+            allowed_model_ids: [selected.id.clone()].into_iter().collect(),
+            preferred_model_id: selected.id.clone(),
+            required_capabilities: ["tools".into()].into_iter().collect(),
+            wait_policy: crate::hub::HubWaitPolicy::WaitForPreferred,
+            affinity_turns: 1,
+        };
+        let saved = models
+            .save_review(
+                crate::hub::HubReviewContext::Main,
+                selection,
+                catalog.hub_id.clone(),
+                catalog.revision,
+                current.settings_revision,
+                current.connection_generation,
+            )
+            .await
+            .unwrap();
+        assert!(!saved.main_uses_default);
+        assert_eq!(
+            saved.main_review.unwrap().selection.preferred_model_id,
+            selected.id
+        );
+        models.shutdown().await;
         let settings = config.with_file_name("runner-shared.json");
         std::fs::write(&settings,serde_json::to_vec_pretty(&json!({"version":1,"hub_id":hub_id,"device_id":identity.device_id,"environments":[{"environment_id":environment,"directory":workspace,"access_mode":"default","allowed_child_environments":children}]})).unwrap()).unwrap();
         workers.push(Worker {
@@ -789,6 +864,17 @@ async fn real_hub_scenario() {
         "Busy local request must not reach the model"
     );
     let checkpoint = waiting["checkpoint"].clone();
+    // Hub now owns the model Gateway as well as job metadata. A live model HTTP request
+    // cannot survive its shutdown. Preserve the successful resume contract at the durable
+    // boundary: the parent is stopped with its checkpoint and the child's result is saved.
+    let old_incarnation = workers[0].incarnation.clone();
+    workers[0].stop().await;
+    provider.release_child.notify_one();
+    let child_completed = wait_job(http, &url, token, &child_id, "succeeded").await;
+    assert_eq!(child_completed["result"]["text"], "solver result");
+    assert_eq!(provider.parent_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.child_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(job(http, &url, token, root_id).await["state"], "queued");
     hub.restart().await;
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
@@ -800,7 +886,7 @@ async fn real_hub_scenario() {
         if let Ok(response) = response {
             if response.status().is_success() {
                 let restored = body(response).await;
-                assert_eq!(restored["state"], "waiting_child");
+                assert_eq!(restored["state"], "queued");
                 assert_eq!(restored["checkpoint"], checkpoint);
                 assert_eq!(restored["awaiting_child_id"], child_id);
                 break;
@@ -813,17 +899,18 @@ async fn real_hub_scenario() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(provider.parent_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(provider.child_calls.load(Ordering::SeqCst), 1);
-    let old_incarnation = workers[0].incarnation.clone();
-    workers[0].stop().await;
+    assert_eq!(provider.child_calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         job(http, &url, token, root_id).await["checkpoint"],
         checkpoint
     );
+    assert_eq!(
+        job(http, &url, token, &child_id).await["result"],
+        child_completed["result"]
+    );
     workers[0].start().await;
     assert_ne!(workers[0].incarnation, old_incarnation);
     assert_eq!(provider.parent_calls.load(Ordering::SeqCst), 1);
-    provider.release_child.notify_one();
     let completed = wait_job(http, &url, token, root_id, "succeeded").await;
     assert_eq!(
         completed["result"]["text"],
@@ -1198,6 +1285,94 @@ async fn real_hub_scenario() {
         paused_parent_calls, 1,
         "Cancellation settlement must never reenter the model"
     );
+    wait_job(http, &url, token, paused_child, "cancelled").await;
+    // Unlike the durable checkpoint case above, shutting down Hub during generation
+    // interrupts its Gateway request. Report that failure without replay or Direct fallback.
+    let interrupted = shared_post(http,&url,token,"jobs",json!({"request_id":"gateway-interruption","project_id":"project","environment_id":"solver","title":"Interrupt active Gateway request","input":{"version":1,"prompt":"gateway-interruption-fixture"},"descendant_budget":0})).await;
+    let interrupted_id = interrupted["id"].as_str().unwrap();
+    let interrupted_requests = || {
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["messages"]
+                    .to_string()
+                    .contains("gateway-interruption-fixture")
+            })
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while interrupted_requests() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "Interrupted fixture model request did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(interrupted_requests(), 1);
+    hub.restart().await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Ok(response) = http
+            .get(format!("{url}/v1/shared/jobs/{interrupted_id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Hub did not reconnect after Gateway interruption"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let interrupted_terminal = wait_job(http, &url, token, interrupted_id, "failed").await;
+    assert_eq!(
+        interrupted_terminal["result"]["summary"]["terminal"]["outcome"]["kind"],
+        "failed"
+    );
+    assert!(
+        interrupted_terminal["result"]["summary"]["terminal"]["outcome"]["error"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    assert_eq!(
+        interrupted_terminal["result"]["summary"]["terminal"]["metrics"]["model_request_count"],
+        1
+    );
+    assert_eq!(
+        interrupted_terminal["result"]["summary"]["terminal"]["tool_call_count"],
+        0
+    );
+    provider.release_child.notify_one();
+    // A separate successful job proves the worker completed reconnection and resumed
+    // admission; the failed request must remain failed and must not be sent a second time.
+    let reconnected = shared_post(http,&url,token,"jobs",json!({"request_id":"gateway-reconnection","project_id":"project","environment_id":"solver","title":"Verify Gateway reconnection","input":{"version":1,"prompt":"gateway-reconnection-fixture"},"descendant_budget":0})).await;
+    let reconnected = wait_job(
+        http,
+        &url,
+        token,
+        reconnected["id"].as_str().unwrap(),
+        "succeeded",
+    )
+    .await;
+    assert_eq!(
+        reconnected["result"]["text"],
+        "Gateway reconnection verified"
+    );
+    assert_eq!(
+        interrupted_requests(),
+        1,
+        "Reconnect must not replay the interrupted model request"
+    );
+    let after_reconnection = job(http, &url, token, interrupted_id).await;
+    assert_eq!(after_reconnection["state"], "failed");
+    assert_eq!(after_reconnection["result"], interrupted_terminal["result"]);
     let status = body(
         http.get(format!("{url}/v1/shared/status?project_id=project"))
             .bearer_auth(token)

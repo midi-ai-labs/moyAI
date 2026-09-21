@@ -95,7 +95,7 @@ async function replace(input, locator, text, sink) {
 async function openDialog(input,cdp,sink) {
   await click(input,button("show-command-palette","section.composer "),sink);
   await wait(cdp,sink,"palette opened",v=>v.p.overlay==="command_palette");
-  await replace(input,SEARCH,"ワークスペースを切り替え",sink);
+  await replace(input,SEARCH,"作業フォルダーを切り替える",sink);
   await wait(cdp,sink,"workspace picker action found",v=>v.palette.includes("show-workspace-picker"));
   await click(input,button("show-workspace-picker",".command "),sink);
   return wait(cdp,sink,"workspace dialog with four enabled controls",v=>v.dialog && v.focusInDialog

@@ -30,12 +30,16 @@ pub struct HubSettings {
     pub main_mode: HubRouteMode,
     #[serde(default)]
     pub side_chat_mode: HubRouteMode,
+    #[serde(default)]
+    pub main_uses_default: bool,
+    #[serde(default)]
+    pub side_chat_uses_default: bool,
 }
 
 impl Default for HubSettings {
     fn default() -> Self {
         Self {
-            schema_version: 3,
+            schema_version: 4,
             revision: "0".into(),
             endpoint: String::new(),
             label: "moyAI Desktop".into(),
@@ -46,6 +50,8 @@ impl Default for HubSettings {
             side_chat_catalog_baseline: None,
             main_mode: HubRouteMode::Direct,
             side_chat_mode: HubRouteMode::Direct,
+            main_uses_default: false,
+            side_chat_uses_default: false,
         }
     }
 }
@@ -59,7 +65,7 @@ pub(super) fn decimal(value: &str) -> Option<u64> {
 
 impl HubSettings {
     fn validate(&self) -> Result<(), HubError> {
-        if self.schema_version != 3
+        if self.schema_version != 4
             || decimal(&self.revision).is_none()
             || !bounded_text(&self.label, 256)
         {
@@ -159,12 +165,19 @@ impl HubSettingsStore {
                     && value.get("side_chat_mode").is_some()
                     && value.get("main_catalog_baseline").is_some()
                     && value.get("side_chat_catalog_baseline").is_some() => {}
+            Some(4)
+                if value.get("main_mode").is_some()
+                    && value.get("side_chat_mode").is_some()
+                    && value.get("main_catalog_baseline").is_some()
+                    && value.get("side_chat_catalog_baseline").is_some()
+                    && value.get("main_uses_default").is_some()
+                    && value.get("side_chat_uses_default").is_some() => {}
             _ => return Err(HubError::SettingsInvalid),
         }
         // Deserialize the original bytes so duplicate object fields remain errors.
         let mut settings: HubSettings =
             serde_json::from_slice(&bytes).map_err(|_| HubError::SettingsInvalid)?;
-        settings.schema_version = 3;
+        settings.schema_version = 4;
         settings.validate()?;
         Ok(settings)
     }

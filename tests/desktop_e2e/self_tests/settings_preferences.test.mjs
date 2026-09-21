@@ -266,7 +266,7 @@ function cleanSurface(overrides = {}) {
           visible_count: 3,
           texts: ["共通設定", "チャットごとの設定", "画面設定"],
         },
-        provider: { count: 1, visible: true, text: "メインチャット" },
+        provider: { count: 1, visible: true, text: "AIの接続・メイン" },
         side_chat: { count: 1, visible: true, text: "サイドチャット" },
         tools: { count: 1, visible: true, text: "ツール" },
         session_overrides: { count: 1, visible: true, text: "現在のチャット" },

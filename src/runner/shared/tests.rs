@@ -253,6 +253,65 @@ fn journal_reopen_distinguishes_unexecuted_intent_from_possible_effects() {
 }
 
 #[test]
+fn journal_path_recovers_only_an_empty_uninitialized_legacy_file() {
+    let (_temp, settings, fixture_path) = fixture();
+    let data = fixture_path.parent().unwrap();
+    let legacy = data.join("runner-shared.sqlite3");
+    let db = rusqlite::Connection::open(&legacy).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    drop(db);
+    assert_eq!(Journal::path_for(data, &settings).unwrap(), legacy);
+    let journal = Journal::open(&legacy, &settings).unwrap();
+    assert!(journal.active().unwrap().is_empty());
+    drop(journal);
+
+    let (_unknown_temp, settings, fixture_path) = fixture();
+    let data = fixture_path.parent().unwrap();
+    let legacy = data.join("runner-shared.sqlite3");
+    let db = rusqlite::Connection::open(&legacy).unwrap();
+    db.execute_batch(
+        "CREATE TABLE unknown_evidence(value TEXT); INSERT INTO unknown_evidence VALUES('retain');",
+    )
+    .unwrap();
+    drop(db);
+    assert!(Journal::path_for(data, &settings).is_err());
+    let db = rusqlite::Connection::open(&legacy).unwrap();
+    let evidence: String = db
+        .query_row("SELECT value FROM unknown_evidence", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(evidence, "retain");
+}
+
+#[test]
+fn new_hub_journal_keeps_old_unknown_work_separate_without_settlement() {
+    let (_temp, mut settings, fixture_path) = fixture();
+    let data = fixture_path.parent().unwrap();
+    let old_path = Journal::path_for(data, &settings).unwrap();
+    let mut old = Journal::open(&old_path, &settings).unwrap();
+    let mut entry = old
+        .intent(assignment(), settings.environments[0].clone())
+        .unwrap();
+    old.executing(&mut entry).unwrap();
+    old.uncertain(&mut entry, "previous execution remains unconfirmed")
+        .unwrap();
+    drop(old);
+    settings.hub_id = "replacement-hub".into();
+    settings.device_id = "new-device".into();
+    let new_path = Journal::path_for(data, &settings).unwrap();
+    assert_ne!(old_path, new_path);
+    let new = Journal::open(&new_path, &settings).unwrap();
+    assert!(new.active().unwrap().is_empty());
+    drop(new);
+    settings.hub_id = "hub".into();
+    settings.device_id = "device".into();
+    assert_eq!(Journal::path_for(data, &settings).unwrap(), old_path);
+    let old = Journal::open(&old_path, &settings).unwrap();
+    let preserved = old.get("attempt").unwrap().unwrap();
+    assert_eq!(preserved.phase, Phase::Uncertain);
+    assert_eq!(preserved.run_id, entry.run_id);
+}
+
+#[test]
 fn journal_keeps_exact_report_for_lost_ack_and_binds_hub_identity() {
     let (_temp, mut settings, path) = fixture();
     let mut journal = Journal::open(&path, &settings).unwrap();

@@ -13,6 +13,11 @@ pub struct PreparedDeviceConfiguration {
     authenticated: Option<(DeviceClient, SelfStatus)>,
     _execution: tokio::sync::OwnedMutexGuard<()>,
 }
+pub struct PreparedDeviceReset {
+    revision: String,
+    generation: String,
+    _execution: tokio::sync::OwnedMutexGuard<()>,
+}
 impl PreparedDeviceConfiguration {
     pub fn endpoint_changed(&self) -> bool {
         self.authenticated.is_some()
@@ -20,6 +25,148 @@ impl PreparedDeviceConfiguration {
 }
 
 impl DeviceNetworkService {
+    pub(crate) fn connection_locally_retired(&self) -> Result<bool, DeviceError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        let (Some(hub), Some(device)) = (&state.settings.hub_id, &state.settings.device_id) else {
+            return Ok(true);
+        };
+        super::super::reset::execution_identity_reset(&self.inner.directory, hub, device)
+    }
+    pub fn effective_shared_config(&self) -> SharedHubConfig {
+        self.inner.state.lock().unwrap().shared.clone()
+    }
+
+    /// Reset only this PC. No old Hub request, remote settlement or process-drain
+    /// acknowledgement is a precondition. The durable retirement fences old Runners.
+    pub async fn reset_local(
+        &self,
+        revision: &str,
+        generation: &str,
+        commit: impl FnOnce(&SharedHubConfig) -> Result<(), DeviceError>,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let prepared = self.prepare_reset(revision, generation).await?;
+        self.reset_local_prepared(prepared, commit).await
+    }
+
+    /// Acquire execution ownership before the Desktop controller, matching import.
+    pub async fn prepare_reset(
+        &self,
+        revision: &str,
+        generation: &str,
+    ) -> Result<PreparedDeviceReset, DeviceError> {
+        self.check_target(revision, generation)?;
+        let _execution = self.inner.execution.lane.clone().lock_owned().await;
+        self.check_target(revision, generation)?;
+        Ok(PreparedDeviceReset {
+            revision: revision.into(),
+            generation: generation.into(),
+            _execution,
+        })
+    }
+
+    pub async fn reset_local_prepared(
+        &self,
+        prepared: PreparedDeviceReset,
+        commit: impl FnOnce(&SharedHubConfig) -> Result<(), DeviceError>,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let _lane = self.inner.lane.lock().await;
+        self.check_target(&prepared.revision, &prepared.generation)?;
+        let mut reset = super::super::reset::ResetState::load(&self.inner.directory)?;
+        {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            reset.retire(
+                state.settings.hub_id.as_deref(),
+                state.settings.device_id.as_deref(),
+            );
+        }
+        let installed =
+            crate::runner::operations::OperationsStore::open(&self.inner.store.paths().data_dir)
+                .map_err(|_| DeviceError::Storage)?
+                .installed;
+        if let Some(settings) = &installed.settings {
+            reset.retire(Some(&settings.hub_id), Some(&settings.device_id));
+            reset.execution_review_required = true;
+        }
+        reset.save(&self.inner.directory)?;
+        // From here, even a crash cannot restore the retired registration.
+        self.clear_local_registration()?;
+        self.inner.shared_work.reset_connection();
+        let hub = self
+            .inner
+            .hub
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .clone();
+        if let Some(hub) = hub {
+            hub.reset_local().await.map_err(|_| DeviceError::Storage)?;
+        }
+        self.stop_receiver_transport().await;
+        commit(&SharedHubConfig::default())?;
+        reset.pending = false;
+        reset.save(&self.inner.directory)?;
+        Ok(self.projection_now())
+    }
+
+    fn clear_local_registration(&self) -> Result<(), DeviceError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        state.cancellation.cancel();
+        // The retired poller keeps its cancelled token; later registration on
+        // this service must start from a fresh lifecycle before its first HTTP.
+        state.cancellation = CancellationToken::new();
+        state.client = None;
+        state.identity = None;
+        state.pending_join = None;
+        state.peers.clear();
+        state.shared = SharedHubConfig::default();
+        state.status = "unconfigured";
+        state.receiver_requested = false;
+        state.receiver_status = "stopped";
+        state.receiver_endpoint = None;
+        state.generation += 1;
+        self.inner
+            .jobs
+            .cancel_profile(state.settings.receiver.profile_id);
+        self.inner.outgoing.peer_connections.clear();
+        let next = DeviceSettings {
+            revision: state.settings.revision.clone(),
+            ..DeviceSettings::default()
+        };
+        // Fence the reviewed durable registration before retiring its private key.
+        // A Runner certificate renewal may have advanced this revision on disk.
+        state.settings = match self.inner.settings.save(&next) {
+            Ok(saved) => saved,
+            Err(DeviceError::SettingsChanged) => {
+                state.settings = self.inner.settings.load()?;
+                return Err(DeviceError::SettingsChanged);
+            }
+            Err(error) => return Err(error),
+        };
+        self.inner.identity.remove()?;
+        // The CSR embeds the retired key even when the next registration uses
+        // the same LAN address. Neither enrollment cache can cross this reset.
+        for name in ["pending-join.json", "pending-csr.json"] {
+            match std::fs::remove_file(self.inner.directory.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(DeviceError::Storage),
+            }
+        }
+        state.error = None;
+        Ok(())
+    }
+
     /// Verify the candidate, then stop a proven idle Runner before persistence.
     /// Call without holding the Desktop controller.
     pub async fn prepare_configuration(
@@ -29,6 +176,11 @@ impl DeviceNetworkService {
         generation: &str,
     ) -> Result<PreparedDeviceConfiguration, DeviceError> {
         shared.validate()?;
+        // An interrupted reset must finish its local writes before a new import.
+        if super::super::reset::ResetState::load(&self.inner.directory)?.pending {
+            self.check_target(revision, generation)?;
+            return Err(DeviceError::ResetIncomplete);
+        }
         let (previous, registered) = {
             let state = self
                 .inner

@@ -303,3 +303,297 @@ async fn verified_endpoint_does_not_commit_after_target_change_or_storage_failur
     f.unchanged(&disk, &key, &registration);
     f.close().await;
 }
+
+#[tokio::test]
+async fn offline_reset_retires_identity_and_preserves_history_work_and_direct_settings() {
+    let f = Fixture::new().await;
+    let before = f.service.projection_now();
+    let old_identity = f.service.inner.identity.load().unwrap().unwrap();
+    let old_csr = f
+        .service
+        .stable_csr(&old_identity, Ipv4Addr::LOCALHOST)
+        .unwrap();
+    // A separately loaded owner models a Runner that still holds old credentials.
+    let mut old_config = f.service.inner.global_config.lock().unwrap().clone();
+    old_config.device_network = f.old.clone();
+    let old_owner = DeviceNetworkService::new(
+        f.service.inner.directory.clone(),
+        f.service.inner.store.clone(),
+        old_config,
+        f.service.inner.jobs.clone(),
+        f.service.inner.publish.clone(),
+    );
+    {
+        let mut old = old_owner.inner.state.lock().unwrap();
+        old.client = f.service.inner.state.lock().unwrap().client.clone();
+        old.status = "active";
+    }
+    assert!(!old_owner.connection_locally_retired().unwrap());
+    let data = f.service.inner.store.paths().data_dir.clone();
+    let evidence = data.join("runner-shared.sqlite3");
+    std::fs::write(&evidence, b"unresolved previous execution evidence").unwrap();
+    let receipts = f.service.inner.directory.join("shared-submissions.json");
+    std::fs::write(&receipts, b"unconfirmed previous submission").unwrap();
+    let artifact = data.join("result.txt");
+    std::fs::write(&artifact, b"local result").unwrap();
+    let mut operations = crate::runner::operations::OperationsStore::open(&data).unwrap();
+    let mut installed = operations.installed.clone();
+    installed.settings = Some(crate::runner::shared::SharedSettings {
+        version: 1,
+        hub_id: "hub".into(),
+        device_id: "device".into(),
+        environments: vec![],
+        resource_scope: crate::runner::shared::ResourceScope::Device,
+    });
+    operations.update(installed).unwrap();
+    let direct = f.service.inner.global_config.lock().unwrap().model.clone();
+    let reset = f
+        .service
+        .reset_local(&before.revision, &before.generation, |saved| {
+            assert!(!saved.configured());
+            std::fs::write(&f.config_file, toml::to_string(saved).unwrap()).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(reset.enrollment, "unconfigured");
+    assert!(reset.device_id.is_none());
+    assert!(reset.peers.is_empty());
+    assert!(!reset.receiver.confirmed);
+    assert!(!f.service.inner.directory.join("identity.json").exists());
+    assert!(!f.service.inner.directory.join("pending-csr.json").exists());
+    assert!(f.service.inner.settings.load().unwrap().device_id.is_none());
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"local result");
+    assert_eq!(
+        std::fs::read(&evidence).unwrap(),
+        b"unresolved previous execution evidence"
+    );
+    assert_eq!(
+        std::fs::read(&receipts).unwrap(),
+        b"unconfirmed previous submission"
+    );
+    assert_eq!(
+        serde_json::to_value(&f.service.inner.global_config.lock().unwrap().model).unwrap(),
+        serde_json::to_value(direct).unwrap()
+    );
+    assert!(f.service.execution_projection().reset_review_required);
+    assert!(
+        super::super::super::reset::execution_identity_reset(
+            &f.service.inner.directory,
+            "hub",
+            "device"
+        )
+        .unwrap()
+    );
+    assert!(
+        old_owner.connection_locally_retired().unwrap(),
+        "unresponsive old owners lose authority without an IPC acknowledgement"
+    );
+    assert_eq!(old_owner.client().err(), Some(DeviceError::Revoked));
+    assert_eq!(
+        old_owner.refresh_connected().await.err(),
+        Some(DeviceError::Revoked)
+    );
+    assert!(
+        f.paths.lock().unwrap().is_empty(),
+        "reset must never contact the old Hub"
+    );
+    // Re-import may use entirely different trust after local reset; approval remains required.
+    let mut replacement = f.candidate.clone();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    replacement.ca_certificate_pem = params.self_signed(&key).unwrap().pem();
+    let configured = f
+        .service
+        .configure(replacement, &reset.revision, &reset.generation)
+        .await
+        .unwrap();
+    assert!(configured.device_id.is_none());
+    assert_eq!(configured.enrollment, "not_enrolled");
+    let next_identity = f.service.inner.identity.load_or_create().unwrap();
+    let next_csr = f
+        .service
+        .stable_csr(&next_identity, Ipv4Addr::LOCALHOST)
+        .unwrap();
+    assert_ne!(
+        old_identity.public_key_sha256().unwrap(),
+        next_identity.public_key_sha256().unwrap()
+    );
+    assert_ne!(
+        old_csr, next_csr,
+        "same-IP re-enrollment must not reuse the retired key's CSR"
+    );
+    assert_eq!(
+        next_csr,
+        f.service
+            .stable_csr(&next_identity, Ipv4Addr::LOCALHOST)
+            .unwrap()
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn interrupted_local_reset_masks_old_config_after_restart_and_is_retryable() {
+    let f = Fixture::new().await;
+    let before = f.service.projection_now();
+    assert_eq!(
+        f.service
+            .reset_local(&before.revision, &before.generation, |_| Err(
+                DeviceError::Storage
+            ))
+            .await
+            .unwrap_err(),
+        DeviceError::Storage
+    );
+    let mut config = f.service.inner.global_config.lock().unwrap().clone();
+    config.device_network = f.old.clone();
+    let reopened = DeviceNetworkService::new(
+        f.service.inner.directory.clone(),
+        f.service.inner.store.clone(),
+        config,
+        f.service.inner.jobs.clone(),
+        f.service.inner.publish.clone(),
+    );
+    let projection = reopened.projection_now();
+    assert!(projection.hub_url.is_empty());
+    assert!(projection.device_id.is_none());
+    assert!(reopened.effective_shared_config().hub_url.is_empty());
+    assert_eq!(
+        reopened
+            .prepare_configuration(
+                f.candidate.clone(),
+                &projection.revision,
+                &projection.generation
+            )
+            .await
+            .err(),
+        Some(DeviceError::ResetIncomplete)
+    );
+    reopened
+        .reset_local(&projection.revision, &projection.generation, |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(
+        !super::super::super::reset::ResetState::load(&reopened.inner.directory)
+            .unwrap()
+            .pending
+    );
+    assert!(f.paths.lock().unwrap().is_empty());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn import_and_reset_serialize_before_controller_commit_and_reject_stale_targets() {
+    let f = Fixture::new().await;
+    let before = f.service.projection_now();
+    let import = f
+        .service
+        .prepare_configuration(f.candidate.clone(), &before.revision, &before.generation)
+        .await
+        .unwrap();
+    let service = f.service.clone();
+    let mut reset = tokio::spawn(async move {
+        service
+            .prepare_reset(&before.revision, &before.generation)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut reset)
+            .await
+            .is_err()
+    );
+    f.service
+        .commit_configuration(import, |_| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), reset)
+            .await
+            .unwrap()
+            .unwrap()
+            .err(),
+        Some(DeviceError::ConnectionChanged)
+    );
+    assert!(
+        !f.service
+            .inner
+            .directory
+            .join("connection-reset.json")
+            .exists()
+    );
+    let current = f.service.projection_now();
+    let prepared = f
+        .service
+        .prepare_reset(&current.revision, &current.generation)
+        .await
+        .unwrap();
+    f.service.inner.state.lock().unwrap().generation += 1;
+    assert_eq!(
+        f.service
+            .reset_local_prepared(prepared, |_| panic!("stale reset cannot write"))
+            .await
+            .err(),
+        Some(DeviceError::ConnectionChanged)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn legacy_saved_peer_removal_is_exact_persistent_and_revision_fenced() {
+    let f = Fixture::new().await;
+    {
+        let mut state = f.service.inner.state.lock().unwrap();
+        let mut settings = state.settings.clone();
+        settings.selected_peers = vec![
+            SelectedPeer {
+                device_id: "old-winb".into(),
+                profile_id: "project".into(),
+            },
+            SelectedPeer {
+                device_id: "current-winb".into(),
+                profile_id: "project".into(),
+            },
+        ];
+        state.settings = f.service.inner.settings.save(&settings).unwrap();
+    }
+    let before = f.service.projection_now();
+    let after = f
+        .service
+        .select(
+            "old-winb".into(),
+            "project".into(),
+            false,
+            &before.revision,
+            &before.generation,
+        )
+        .await
+        .unwrap();
+    let saved = f.service.inner.settings.load().unwrap();
+    assert_eq!(
+        saved.selected_peers,
+        vec![SelectedPeer {
+            device_id: "current-winb".into(),
+            profile_id: "project".into()
+        }]
+    );
+    assert_eq!(
+        f.service
+            .select(
+                "current-winb".into(),
+                "project".into(),
+                false,
+                &before.revision,
+                &before.generation
+            )
+            .await
+            .err(),
+        Some(DeviceError::SettingsChanged)
+    );
+    assert_eq!(after.device_id, before.device_id);
+    assert!(
+        f.paths.lock().unwrap().is_empty(),
+        "local cleanup must not change Hub rules or jobs"
+    );
+    f.close().await;
+}

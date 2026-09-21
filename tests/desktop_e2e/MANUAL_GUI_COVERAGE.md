@@ -1,6 +1,6 @@
 # Desktop GUI 操作・目視確認ランブック
 
-この文書は実 Tauri / WebView2 の moyAI Desktop を繰り返し検証する手順であり、実行結果ではない。2026-09-12 の [actions.ts](../../ui/desktop-web/src/actions.ts) にある固定 action ID **140件**を下表へ対応させている。140件を実行済みという意味ではない。ラベル、可用条件、保存先の正本は current Rust / TypeScript と近傍 tests とし、変更時は該当行も更新する。
+この文書は実 Tauri / WebView2 の moyAI Desktop を繰り返し検証する手順であり、実行結果ではない。[actions.ts](../../ui/desktop-web/src/actions.ts) の操作入口を下表へ対応させている。2026-09-22に統一AI設定・接続リセットと退役済み入口を同期した。表の存在は実行済みという意味ではない。ラベル、可用条件、保存先の正本は current Rust / TypeScript と近傍 tests とし、変更時は該当行も更新する。
 
 共通 driver・起動・入力・終了・証跡の正本は [Desktop E2E README](README.md)。Hub の管理画面は通常ブラウザーで別に検証し、[Hub Web管理 GUI試験の範囲](../../../moyAI-Hub/tests/browser/coverage.md) と対応させる。Hub の Playwright 成功や Desktop の TypeScript unit test を、Desktop 実画面の目視合格へ読み替えない。次ターン予約・新しい MCP 診断機能の実装は本手順の前提にしない。既存の診断ボタンは確認対象である。
 
@@ -111,7 +111,7 @@
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
-| C01 | `show-provider` | 新規空チャット、clean / 未保存config | トップバーのLLM URL、表示メニュー、パレットからProvider設定を開く | 現在の接続形式・URL・モデル・適用範囲が読める。別ownerの未保存変更中は競合しない |
+| C01 | `show-provider` | 新規空チャット、clean / 未保存config | 表示メニュー、パレットから共通設定のAI接続欄を開く | 現在の接続形式・URL・モデル・適用範囲が読める。別ownerの未保存変更中は競合しない |
 | C02 | `show-config` | 初回後 / Running / dirty再表示 | Global Settingsを開き全分類を移動 | 全項目へ到達し現在値とdirtyが区別できる。実行やdraftは消えない |
 | C03 | `show-session-settings` | S1 / S2 / 子agent選択 / 不可 | このセッションの設定を開く | root sessionの対象名と個別設定を示す。対象なしは適用不可の説明、globalと混同しない |
 | C04 | `initial-setup-next` | 各wizard step、有効 / 不正 | 初回start→各stepを次へ。不正URL・数値でも試す | 有効時だけ次へ進む。不正項目と修正方法を示し入力を保持 |
@@ -186,7 +186,7 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 
 ### D: Side Chat
 
-自動補助: `side-chat.session`, `side-chat.quote`, `hub.connection-settings` の該当assertion。Direct capture / 新routeの再起動は別途確認する。
+自動補助: `side-chat.session`, `side-chat.quote`, `hub.browser-enrollment` の該当assertion。手入力接続のcaptureとHubモデル選択を分け、再起動は別途確認する。
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
@@ -202,27 +202,25 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 
 ### U: Hubモデル接続・割当
 
-自動補助: `hub.connection-settings` は模擬HTTPカタログを使うDesktop設定回帰。実Hubへの参加、モデル推論、物理peerの証拠は別途必要。Hubがモデルserverのロード状態や生成終了を推測で所有することを受入前提にしない。
+自動補助: `hub.browser-enrollment`、`hub.offline-reset`、`onboarding.win-a-to-win-b`。実Hub、実Desktop、Runnerの役割を確認する。live providerを指定しない実行は推論品質の証拠ではない。旧token入力やDirect/Hub切替の独立画面は通常導線から退役している。
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
-| U01 | `show-hub` | 未参加 / 参加済 / error | rail、表示menu、MCP履歴の設定入口から開く | 端末連携とモデル割当を一つの画面で区別。MCP旧配信設定へ戻らない |
-| U02 | `hub-tab-devices` | モデルtab、draft / pending | 端末連携へ切替、pollを待つ | 正しいtabとpanelが表示され入力・detailsを保持。pending操作の対象を取り違えない |
-| U03 | `hub-tab-models` | 端末tab、受付設定dirty | モデル割当へ切替して元へ戻る | Main / Side割当が見え、受付draftを失わない。未保存を保存済みに見せない |
-| U04 | `hub-connect` | 同一PC互換接続、未接続 / error / 接続中 | 詳細を開きendpoint・label・必要tokenを入力、接続 | 正しいHub ID・状態・catalogを表示。不正/不通はerror、tokenは非表示。接続済みで二重接続しない |
+| U01 | `show-hub` | 未参加 / 参加済 / error | rail、表示menu、MCP履歴から開く | PC参加・実行設定へ進める。旧配信画面へ戻らない |
+| U02 | `hub-tab-devices` | PC設定draft / pending | 接続画面でpollを待つ | 入力・details・対象を保持 |
+| U03 | `show-config` | Hub設定あり / なし | Hubの「AIの接続」または通常設定へ進む | Main/Side各欄へ集約し、Hub設定中はURL編集不可、モデル選択可。未設定は手入力可 |
+| U04 | `device-network-import` | 未設定 / 承認待ち / 登録済 | 接続ファイルを読み込みHubで許可 | token/AI URL入力なしで接続情報と候補が反映される |
 | U05 | `hub-refresh` | 接続中 / stale / 未接続、dirty選択 | 最新情報取得。Hub側でmodel改訂し再取得 | 接続・revision・差分を更新。未保存選択とfocusを保持し、更新を無断承認しない |
-| U06 | `hub-disconnect` | 互換モデル接続あり / 実行中 | 接続解除、再接続 | モデル接続の解除状態を明示。端末参加の一時解除と区別し、実行中制約を説明 |
-| U07 | `hub-main-recommendation` | 推奨候補あり / なし | 推奨候補を選択 | Mainのdraft候補だけが選ばれる。保存・送信先切替・生成はまだ行わない |
-| U08 | `hub-save-main` | Main選択有効 / 空 / 削除model / dirty | 候補・優先・待機方針・機能・継続数を確認保存 | Mainのみ確認済revision・保存値へ進む。無効値は理由。Sideの比較baselineを進めない |
+| U06 | `device-network-reset` | Hub停止 / 別CA / pending | 影響を確認し、取消と実行を別に操作 | 旧Hubの応答なしで解除。手入力設定・履歴・成果を保持。新Hubは再承認が必要 |
+| U07 | モデルDDDW | 標準あり / なし / 保存候補削除 | 標準または明示モデルを選択 | 未保存を保存済みにしない。候補消失は説明し暗黙fallbackしない |
+| U08 | `hub-save-main` | Main dirty / 実行中 / stale | Mainモデルを保存、共有仕事を投入 | Main確認値だけ保存。Runnerは受付時の選択を使用し、Sideを変更しない |
 | U09 | `hub-save-side` | Side選択有効 / 不正、Mainとは別revision | Sideを確認保存 | Sideだけ保存・再確認を確定し、Mainの選択やbaselineは不変 |
-| U10 | `hub-main-direct` | Main Hub / 実行中 / 未保存 | Mainの直接接続を選び、次の短い依頼を送る | Mainの次依頼が保存済Directへ向く。Sideと実行中requestのrouteを差し替えない |
-| U11 | `hub-main-hub` | Main Direct、確認済 / 未確認 / 不通 | MainのHub利用を選び短い依頼を送る | 確認済候補を使い割当結果を表示。未確認等は説明し、無断でDirectへfallbackしない |
-| U12 | `hub-side-direct` | Side Hub、既存会話 / 実行中 | Sideの直接接続を選びSide送信 | Sideのrouteと既存会話のcapture契約が読める。Mainのroute不変 |
-| U13 | `hub-side-hub` | Side Direct、確認済 / 未確認 | SideのHub利用を選びSide送信 | Side独立の選択を使い、未確認はblock理由。Mainと異なるモデルを同時に使える |
+| U10 | 接続中断と復旧 | Hub停止 / 復旧 | AI欄を開いたままHubを停止・再開 | 再接続待ちを表示し、手入力先へ切り替えない |
+| U11 | 実行中の選択 | Main/Side/共有仕事実行中 | 設定表示と次依頼を比較 | 実行中の経路を後から変更せず、新しい保存値は次の依頼へ適用 |
 
-### N: Hub参加、MCP受付、利用先、委任
+### N: Hub参加、実行PC設定、旧仕事の保守
 
-自動補助は current device-network / diagnostics / artifacts unit tests と、registryにある実Hub browser enrollment scenarioの実際のassertion。旧Hub Tauri結合scenarioの過去PASSは転用しない。以下は実Hubブラウザーとの操作を併用し、実WinA / WinBは別receiptを残す。
+自動補助は current device-network / diagnostics / artifacts unit tests と、registryにある実Hub browser enrollment scenarioの実際のassertion。旧Hub Tauri結合scenarioの過去PASSは転用しない。以下は実Hubブラウザーとの操作を併用し、実WinA / WinBは別receiptを残す。N05–N09の旧個別受付・新規利用先選択は通常導線から退役済みであり、新規操作の合格を要求しない。保存済み仕事のN10–N12は互換保守として確認する。
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
@@ -240,6 +238,9 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | N12 | `device-network-export-artifacts` | 確認済版あり / なし / 版変化 | 保存先OS picker取消→新folderへ保存→同じ場所で再試行 | 取消は確認内容保持。確認版の新folderとreceiptを表示。既存同名folderを上書きせず、元projectへ自動適用しない |
 | N13 | `device-network-leave` | member、確認未 / 済、active jobあり | 一時解除detailsでcheckbox→解除。再接続する | ID・公開対象・権限・利用先を保持。再接続は同一端末、受付再開は手動。実行中の禁止理由を示す |
 
+| N14 | `device-network-delete-peer` | 旧保存先あり / Hub一覧に不在 / 実行中 | 詳細で対象ID・公開先を確認し取消→削除→再起動 | 指定した保存先だけ削除し、履歴・進行中job・他peer・Hub権限を保持 |
+| N15 | `device-execution-prepare` / `device-execution-enable` | 承認済 / 未割当 / 再登録 | 保存先をnative pickerで選び権限を確認 | 準備とHub用途割当を区別。リセット前の同意を新Hubへ転用しない |
+
 ### M: MCP履歴
 
 自動補助は current `mcp_history*` / `mcp_activity*` tests。実履歴の生成と、seedした多数行の表示試験は別々に記録する。指示側の最終観測、実行側の正本、Hubが取得した時点のsnapshotを区別する。
@@ -256,16 +257,9 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | M08 | `mcp-history-export` | 選択あり / なし、長い本文 | Markdown保存を取消→保存し内容を読む | 取消と保存先を表示。選択した方向/ID/相手の履歴を書き出す。選択なしは無効、本文省略の案内が明確 |
 | M09 | `mcp-history-stop` | can_stop / terminal、相手到達可 / 不可 | 詳細の停止要求を押し、双方の記録を確認 | 対象の要求受付と停止確認を分け、未確認を完了としない。別方向/別Mainは停止しない |
 
-### L: 互換用の手動MCP接続先
+### L: 退役した手動端末登録
 
-Hubによる自動参加・証明書配布を新規運用の基準とする。下表は既存の手動接続consumerを維持する試験であり、廃止された手動配信UIの復活を要求しない。fixture用公開証明書・tokenを使い、実秘密情報を証跡へ載せない。
-
-| Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
-|---|---|---|---|---|
-| L01 | `mcp-peer-refresh` | Global Settings、0件 / 複数 / pending | 登録済み端末を更新 | 現在の保存済端末と状態を表示。編集中の入力を消さず、名前とIDを取り違えない |
-| L02 | `mcp-peer-add` | 有効draft / 空 / 不正URL・証明書 / config dirty | 端末名・URL・fixture資格情報を入力し保存、再起動 | 有効な設定だけ保存、次taskから利用。無効/dirtyは理由を表示。tokenを再表示しない |
-| L03 | `mcp-peer-remove` | 登録あり、clean / config dirty | 使い捨ての1行を削除し再表示 | 対象の接続だけ削除。他peer・Hub登録・既存履歴を削除しない。dirty中の競合なし |
-| L04 | `mcp-peer-check` | 登録済、接続可 / 不可 / 認証不正 | 各行の接続を確認 | その保存済peerの結果を表示。接続不能と認証エラーを成功と扱わず、他行は保持 |
+旧L01〜L04の `mcp-peer-refresh/add/remove/check` フォームは通常設定画面から退役した。互換consumerとfixtureの検査は保持するが、旧GUIを通常suiteで実行したり復活させたりしない。一般HTTP MCP設定はFの設定操作、moyAI端末の新規参加はDNと共有プロジェクト、保存済み旧利用先の削除は `hub.offline-reset`、過去の仕事はMの履歴操作で確認する。
 
 ## 4. action ID 以外のGUI機能と横断ケース
 
@@ -278,7 +272,7 @@ Hubによる自動参加・証明書配布を新規運用の基準とする。�
 | X03 | 全modalのbackdrop / focus trap | 下のoverlay表の各画面で内部余白・外側・Tab循環・Esc・明示閉じるを試す | 下表の保持/取消に従い、背面buttonを発火しない。二段確認は背面inert、閉じた後にfocusが行方不明にならない |
 | X04 | 全設定field・分類リンク | GlobalのMain、入力上限/モデル機能、Side、権限、エージェント、ツール、ファイル、詳細、現在のチャット、ウィンドウを順に移動。表示された全fieldをキー単位で記録し、種類ごとに下記matrixを適用 | 到達不能fieldなし。label/help/継承/dirty/エラーを表示し、変更を指定scopeへ保存。画面の項目一覧をtask evidenceへ保存し、分類を開いただけで全項目PASSにしない |
 | X05 | Directモデル一覧 | profileとURLをA→B→A。0件、削除済保存ID、読込失敗、古い応答を作り、Main / Side / 初回 / Sessionを比較 | 接続先と候補が一致。保存済だが候補外のIDは状態として説明し、存在する候補へ偽装しない。外部ホストのload/unloadを勝手に変更しない |
-| X06 | Hubモデルfield・差分 | Main/Side別に候補checkbox、優先model、待機policy、機能text、継続数1/100/0/101/非数を変更。Hub側で追加/削除/機能改訂し再取得 | 各contextのbefore/after・未保存・再確認が明確。old response、poll、tab移動でdraft/focus/detailsが戻らない |
+| X06 | Hubモデルfield・差分 | Main/Side別に標準モデル・明示モデルのDDDWを変更。Hub側で追加/削除/機能改訂し再取得 | 各contextのbefore/after・未保存・再確認が明確。old response、poll、tab移動でdraft/focus/detailsが戻らない |
 | X07 | 端末受付field | temp/project、3権限、Hub/Direct model、bind空/有効IPv4/非local/IPv6、port空/有効/不正/競合、2つの起動・非表示checkbox、公開確認checkboxを操作 | 自動値と指定値、保存前後を区別。固定port競合は別portへ無断fallbackせず理由。公開対象変更後の確認を古い承認で代用しない |
 | X08 | 端末検索 / details / use switch | 名称・公開対象・IDで検索、0件、clear、日本語IME。複数peerの識別/診断detailsを展開しswitch focusでpoll | 検索と表示が一致。ON/OFFは現在値、availabilityと別。detailsの1秒周期開閉やfocus消失なし |
 | X09 | MCP活動表示 | 受入待機→実行→承認→停止→終端、複数受入、状態取得不能。Main同時実行中にchat切替 | 赤系共通indicatorと文言/件数が一致。全終了で消え、取得不能は「何も実行なし」と見せない。Mainの青表示と同時に識別可能 |
@@ -288,7 +282,7 @@ Hubによる自動参加・証明書配布を新規運用の基準とする。�
 | X13 | window / tray / opacity / zoom | タイトルバーdrag、dialog表示中のdrag、最小化復帰、最大化復元、tray復帰、opacity両端、OS DPI100/125/150%と運用zoomを試す | 誤クリックでwindow controlを発火せず、入力focusを維持。主button・close・状態文言が欠けない。環境がないDPIは未実施と明記 |
 | X14 | startup・互換データ | 新規、既存sessionあり、旧手動配信profileあり、Hub pending/停止状態を再起動 | 明瞭なsetup/通常shell。旧配信は再開せず履歴は読める。参加コードや手動鍵の入力を新版の必須手順へ戻さない |
 | X15 | 異常からの再操作 | provider断、catalog不正、Hub停止/復帰、peer停止、保存失敗、設定競合を各画面で観測して再操作 | 対処可能な通知、技術詳細に秘密なし。失敗したdraftとownerを保持し、正常復帰後の操作が一度成立 |
-| X16 | 実端末連係 | 実Hub browserでA/B承認と方向付き許可、Bでtemp/project受付ON、AでB利用ON。Aから小さい依頼、Bで承認/実行、Aへ返却、両端履歴とHub記録を見る | 人が毎回@端末を打つ前提にせず許可・対象・経路を識別。GUI選択と実行先が一致し、同じtaskを両端/Hubで追える。物理LAN/FWは別証拠 |
+| X16 | 実端末連係 | 実Hub browserでA/Bを承認しプロジェクトの操作PC/実行PCに指定。Bで保存先・実行権限を確認。Aから依頼しBで承認/実行、Aで回答と成果、Hubで仕事を確認 | 人が毎回@端末を打つ前提にせず許可・対象・経路を識別。GUI選択と実行先が一致し、同じtaskを両端/Hubで追える。物理LAN/FWは別証拠 |
 
 ### overlayごとの外側クリック契約
 

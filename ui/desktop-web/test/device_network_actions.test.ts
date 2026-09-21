@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ActionContext } from "../src/actions.ts";
-import { importDeviceNetwork, joinDeviceNetwork, loadDeviceNetwork, refreshDeviceNetworkJobs, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "../src/device_network_actions.ts";
+import { deleteSavedDevicePeer, importDeviceNetwork, joinDeviceNetwork, loadDeviceNetwork, refreshDeviceNetworkJobs, resetDeviceNetwork, selectDevicePeer, setDeviceReceiver, stopDeviceNetworkJob } from "../src/device_network_actions.ts";
 import { acceptDeviceNetworkProjection, devicePeerKey, editDeviceNetworkField, type DeviceNetworkProjection } from "../src/device_network_state.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
 import { renderDeviceNetwork } from "../src/device_network_render.ts";
@@ -43,6 +43,41 @@ test("public configuration import starts approval enrollment without caller name
     assert.equal(local.receiverConfirmed, false);
     assert.equal(local.projection?.receiver.enabled, false);
     assert.equal(local.projection?.peers.some(peer => peer.selected), false);
+  });
+});
+
+test("offline reset needs local confirmation only and sends the exact connection owner", async () => {
+  const calls: {name: string; args: Record<string, unknown>}[] = [];
+  await withContext(async (name, args) => {
+    if (name === "device_execution_projection") return { revision: "1", state: "unconnected", projects: [], review: null, unknown_attempts: [] };
+    calls.push({name, args});
+    return deviceProjection({revision: "4", generation: "8", hub_url: "", device_id: null, enrollment: "unconfigured", can_join: false});
+  }, async ({context, local}) => {
+    acceptDeviceNetworkProjection(local, deviceProjection({enrollment:"error", error:"unavailable"}));
+    await resetDeviceNetwork(context); assert.equal(calls.length, 0);
+    editDeviceNetworkField(local, "reset_confirmed", "", true);
+    await resetDeviceNetwork(context);
+    assert.deepEqual(calls, [{name:"device_network_reset",args:{expectedRevision:"3",expectedGeneration:"7",confirmed:true}}]);
+    assert.equal(local.projection?.hub_url, "");
+    assert.equal(local.resetConfirmed, false);
+    assert.match(local.notice, /未確認記録は保持/);
+  });
+});
+
+test("legacy target deletion distinguishes same-named IDs and never reenables a retired peer", async () => {
+  const calls: Record<string, unknown>[] = [];
+  await withContext(async (_name, args) => {
+    calls.push(args);
+    const p = deviceProjection({revision:"4"}); p.peers[1].selected = true; return p;
+  }, async ({context, local}) => {
+    local.projection!.peers.forEach(peer => { peer.selected = true; peer.display_name = "WinB"; });
+    const old = devicePeerKey(local.projection!.peers[0]);
+    await deleteSavedDevicePeer(context, old); assert.equal(calls.length, 0);
+    editDeviceNetworkField(local, "delete_peer", old, true);
+    await deleteSavedDevicePeer(context, old);
+    assert.deepEqual(calls, [{deviceId:"device-19",profileId:"receiver-19",enabled:false,expectedRevision:"3",expectedGeneration:"7"}]);
+    assert.equal(local.projection!.peers[1].selected, true);
+    assert.match(local.notice, /実行中の仕事は変更していません/);
   });
 });
 

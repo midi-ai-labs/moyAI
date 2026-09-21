@@ -6,6 +6,10 @@ import {
   type HubContext, type HubProjection, type HubRouteMode, type HubUiState,
 } from "./hub_state.ts";
 
+function hubSettingsOpen(context: ActionContext): boolean {
+  return ["hub", "config"].includes(context.getViewState()?.overlay ?? "");
+}
+
 async function hubRequest(
   context: ActionContext,
   pending: NonNullable<HubUiState["pending"]>,
@@ -13,7 +17,7 @@ async function hubRequest(
   args: Record<string, unknown>,
 ): Promise<void> {
   const local = context.uiState.hub;
-  if (local.pending || context.getViewState()?.overlay !== "hub") return;
+  if (local.pending || !hubSettingsOpen(context)) return;
   const serial = ++local.requestSerial;
   const before = local.projection && structuredClone(local.projection);
   local.pending = pending;
@@ -36,7 +40,7 @@ async function hubRequest(
       if (token) token.value = "";
     }
   } catch (error) {
-    if (serial !== local.requestSerial || context.getViewState()?.overlay !== "hub") return;
+    if (serial !== local.requestSerial || !hubSettingsOpen(context)) return;
     const message = hubErrorText(typeof error === "string" ? error : null)
       || "Hubの状態を読み込めませんでした。もう一度お試しください。";
     if (name !== "hub_projection") {
@@ -44,7 +48,7 @@ async function hubRequest(
         // Rejected connection attempts may already have advanced the Rust owner. Keep the
         // request locked until it is reacquired so an immediate retry uses that fresh owner.
         const projection = await command<HubProjection>("hub_projection");
-        if (serial === local.requestSerial && context.getViewState()?.overlay === "hub") {
+        if (serial === local.requestSerial && hubSettingsOpen(context)) {
           // Failure settlement is not the user's explicit review/rebase action.
           acceptHubProjection(local, projection);
         }
@@ -52,7 +56,7 @@ async function hubRequest(
         // A failed local read must not replace the actionable original error or recurse.
       }
     }
-    if (serial === local.requestSerial && context.getViewState()?.overlay === "hub") {
+    if (serial === local.requestSerial && hubSettingsOpen(context)) {
       local.error = message;
       local.errorContext = pending === "main" || pending === "main_mode" ? "main"
         : pending === "side_chat" || pending === "side_chat_mode" ? "side_chat" : "connection";
@@ -63,15 +67,15 @@ async function hubRequest(
 }
 export async function openHub(context: ActionContext): Promise<void> {
   await context.mutate("show_hub_editor");
-  if (context.uiState.hub.tab === "models") await hubRequest(context, "load", "hub_projection", {});
-  else await loadDeviceNetwork(context);
+  context.uiState.hub.tab = "devices";
+  await loadDeviceNetwork(context);
 }
 export async function selectHubTab(context: ActionContext, tab: "devices" | "models"): Promise<void> {
-  if (context.uiState.hub.pending || context.uiState.deviceNetwork.pending || context.getViewState()?.overlay !== "hub") return;
+  if (context.uiState.hub.pending || context.uiState.deviceNetwork.pending || !hubSettingsOpen(context)) return;
+  if (tab === "models") { await context.mutate("show_config_editor"); return; }
   context.uiState.hub.tab = tab;
   context.rerender();
-  if (tab === "models") await hubRequest(context, "load", "hub_projection", {});
-  else await loadDeviceNetwork(context);
+  await loadDeviceNetwork(context);
 }
 export async function connectHub(context: ActionContext): Promise<void> {
   const local = context.uiState.hub;
@@ -105,7 +109,7 @@ export async function saveHubReview(context: ActionContext, channel: HubContext)
   const selection = hubSelectionFromDraft(local.drafts[channel]);
   const target = local.drafts[channel].target;
   if (!selection || !target) return;
-  await hubRequest(context, channel, "hub_save_review", { context: channel, selection, ...target });
+  await hubRequest(context, channel, "hub_save_review", { context: channel, selection, useHubDefault: local.drafts[channel].usesDefault, ...target });
 }
 
 export async function setHubRouteMode(context: ActionContext, channel: HubContext, mode: HubRouteMode): Promise<void> {

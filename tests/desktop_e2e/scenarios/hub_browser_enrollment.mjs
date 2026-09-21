@@ -53,8 +53,11 @@ export async function trustedFocus(input, cdp, target) {
     return nodes.length === 1 && !nodes[0].disabled && nodes[0].closest('[hidden]') === null;
   })()`), value => value === true, 10_000);
   // Keyboard navigation lets the product bring off-screen settings into view.
+  // Completed histories can contain more than 100 controls. Allow one traversal
+  // of the current document's potential tab stops, plus browser/reentry steps.
+  const navigationBudget = await cdp.evaluate(`document.querySelectorAll('a[href],button,input,select,textarea,summary,iframe,[tabindex],[contenteditable]').length + 4`);
   let focused = false, reentered = false;
-  for (let count = 0; count < 100; ++count) {
+  for (let count = 0; count <= navigationBudget; ++count) {
     const observation = await cdp.evaluate(`(() => { const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
       return { count: nodes.length, focused: nodes.length === 1 && document.activeElement === nodes[0] }; })()`);
     if (observation.count !== 1) throw fail("Desktop control is not unique", { target, observation });
@@ -73,9 +76,10 @@ export async function trustedFocus(input, cdp, target) {
       }
       focused = true; break;
     }
+    if (count === navigationBudget) break;
     await input.pressKey("Tab");
   }
-  if (!focused) throw new DesktopE2eError("harness", "hub-browser-focus-unreachable", "Desktop control cannot be reached by keyboard", { target });
+  if (!focused) throw new DesktopE2eError("harness", "hub-browser-focus-unreachable", "Desktop control cannot be reached by keyboard", { target, navigationBudget });
 }
 export async function trustedClick(input, cdp, target, sink) {
   await trustedFocus(input, cdp, target);
@@ -87,6 +91,37 @@ export async function trustedClick(input, cdp, target, sink) {
     { type: "click", identity: target.identity, button: 0, buttons: 0 },
   ] });
   await sink.record("hub-browser-desktop-trusted-click", { target, probe }, { phase: "executing", owner: OWNER });
+}
+
+// Scenario-owned, bounded observation of public Hub DTOs. Keep original invoke
+// arguments, receiver, returned promise and thrown errors completely unchanged.
+async function installModelCommandObservation(cdp) {
+  await cdp.evaluate(`(() => {
+    const key = Symbol.for('moyai.e2e.hub-model-command-observation');
+    if (window[key]) throw new Error('Hub command observation already installed');
+    const bridge = window.__TAURI_INTERNALS__, original = bridge.invoke, rows = [];
+    let sequence = 0;
+    function record(row) { rows.push(row); if (rows.length > 96) rows.shift(); }
+    function wrapped(...args) {
+      const name = args[0], observed = ['hub_save_review','hub_refresh','desktop_state'].includes(name);
+      const order = observed ? ++sequence : 0;
+      const result = Reflect.apply(original, this, args);
+      if (observed) Promise.resolve(result).then(value => {
+        const hub = name === 'desktop_state' ? value?.hub : value;
+        if (!hub) return;
+        try { record({order,name,context:args[1]?.context ?? null,expectedSettingsRevision:args[1]?.expectedSettingsRevision ?? null,
+          outcome:'resolved',hub:structuredClone(hub)}); } catch {}
+      }, () => record({order,name,outcome:'rejected'}));
+      return result;
+    }
+    bridge.invoke = wrapped;
+    window[key] = { finish() { if (bridge.invoke === wrapped) bridge.invoke = original; delete window[key]; return rows; } };
+  })()`);
+}
+
+async function finishModelCommandObservation(cdp, sink) {
+  const rows = await cdp.evaluate(`(() => { const value = window[Symbol.for('moyai.e2e.hub-model-command-observation')]; return value ? value.finish() : []; })()`);
+  await sink.record("hub-model-command-observation", { rows, capacity:96 }, { phase:"executing", owner:OWNER });
 }
 
 export function createHubBrowserEnrollmentScenario(options = {}) {
@@ -126,24 +161,21 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       await page.locator('nav a[href="#device-network"]').click();
       await page.locator("#network-ip").fill("127.0.0.1");
       await page.locator("#network-port").fill(String(hub.networkPort));
-      await page.getByRole("button", { name: "ネットワークを開始", exact: true }).click();
-      await page.getByRole("button", { name: "ネットワークを停止", exact: true }).waitFor();
+      await page.locator("#network-start").click();
+      await page.locator("#network-stop").waitFor({ state: "visible" });
       await hub.observeNetwork();
       await enrollDesktopFromHubBrowser({ resource, context, runtime, cdp, input, sink, nativeState: state });
-      await trustedClick(input, cdp, byId("hub-tab-models"), sink);
+      await installModelCommandObservation(cdp);
+      await trustedClick(input, cdp, action("show-config", '[data-surface="hub"]'), sink);
       const connected = await wait("Enrollment automatically connects the model catalog", () => invokeDesktopCommand(cdp, "hub_projection"), value => value.status === "connected" && value.catalog?.models.length === 2);
-      await wait("Desktop renders the managed model catalog", () => cdp.evaluate(`(() => {
-        const rows = [...document.querySelectorAll('input[data-hub-field*="model:"]')];
-        return rows.length === 4 && rows.every(row => !row.disabled);
-      })()`), value => value === true);
-      if (await cdp.evaluate(`document.querySelector('#hub-manual-connection')?.open`)) {
-        throw fail("Managed model refresh must be reachable with manual connection closed", {});
-      }
-      await trustedClick(input, cdp, action("hub-refresh"), sink);
-      await wait("Model refresh finishes without opening manual connection settings", () => cdp.evaluate(`(() => {
-        const refresh = document.querySelector('button[data-action="hub-refresh"]');
-        return Boolean(refresh && !refresh.disabled && !document.querySelector('#hub-manual-connection')?.open);
-      })()`), value => value === true);
+      await wait("Desktop displays the unified readonly connection and model dropdowns", () => cdp.evaluate(`(() => {
+        const selects = [...document.querySelectorAll('select[data-hub-field$=":choice"]')];
+        const endpoints = [...document.querySelectorAll('.ai-connection input[readonly]')];
+        return selects.length === 2 && selects.every(row => !row.disabled) && endpoints.length === 4
+          && !document.querySelector('#hub-token');
+      })()`), Boolean);
+      await trustedClick(input, cdp, action("hub-refresh", '[data-ai-connection="main"]'), sink);
+      await wait("Model refresh finishes in the same form", () => cdp.evaluate(`!document.querySelector('[data-ai-connection="main"] button[data-action="hub-refresh"]')?.disabled`), Boolean);
       await captureScenarioScreenshot({ cdp, sink, name: "hub-models-visible-refresh", owner: OWNER });
       const selected = Object.fromEntries([["main", "Enrollment Main"], ["side_chat", "Enrollment Side"]].map(([name, label]) => {
         const matches = connected.catalog.models.filter(model => model.label === label);
@@ -151,15 +183,22 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         return [name, matches[0].id];
       }));
       for (const name of ["main", "side_chat"]) {
-        for (const model of connected.catalog.models) {
-          const target = byId(`hub-${name}-model-${model.id}`, "INPUT");
-          const checked = await cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.checked`);
-          if (checked !== (model.id === selected[name])) await trustedClick(input, cdp, target, sink);
-        }
+        const target = byId(`ai-${name}-model`, "SELECT");
+        const values = await cdp.evaluate(`Array.from(document.querySelector(${JSON.stringify(target.selector)}).options).filter(o => !o.disabled).map(o => o.value)`);
+        const index = values.indexOf(selected[name]);
+        if (index < 0) throw fail("Registered model is absent from dropdown", { name });
+        await trustedClick(input, cdp, target, sink); await input.pressKey("Home");
+        for (let i = 0; i < index; i++) await input.pressKey("ArrowDown");
+        await input.pressKey("Enter");
+        await wait("Model dropdown retains the chosen model", () => cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.value`), value => value === selected[name]);
         const route = name === "main" ? "main" : "side";
-        await trustedClick(input, cdp, action(`hub-save-${route}`), sink);
-        await wait(`Desktop ${name} saved model selection`, () => invokeDesktopCommand(cdp, "hub_projection"), value => value[`${name}_confirmation`] === "confirmed");
-        await trustedClick(input, cdp, action(`hub-${route}-hub`), sink);
+        await sink.record("hub-model-before-save", { context: name, hub: await invokeDesktopCommand(cdp, "hub_projection"),
+          form: await cdp.evaluate(`(() => { const form = document.querySelector('[data-ai-connection="${name}"]'); return { text: form?.innerText, buttons: [...(form?.querySelectorAll('button') ?? [])].map(button => ({action:button.dataset.action,disabled:button.disabled})), value: form?.querySelector('select')?.value }; })()`),
+        }, { phase: "executing", owner: OWNER });
+        await captureScenarioScreenshot({ cdp, sink, name: `hub-model-${name}-before-save`, owner: OWNER });
+        await trustedClick(input, cdp, action(`hub-save-${route}`, `[data-ai-connection="${name}"]`), sink);
+        await wait(`Desktop ${name} saves an independent explicit model`, () => invokeDesktopCommand(cdp, "hub_projection"), value => value[`${name}_confirmation`] === "confirmed"
+          && value[`${name}_uses_default`] === false && value[`${name}_review`]?.selection.preferred_model_id === selected[name]);
       }
       const accepted = await wait("Desktop Main and Side independently use Hub selections", () => invokeDesktopCommand(cdp, "hub_projection"), value => independentSelectionsAccepted(value, selected.main, selected.side_chat));
       await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-desktop-model-selection", owner: OWNER });
@@ -167,7 +206,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       await sink.record("hub-browser-independent-model-selection", { hub_id: accepted.hub_id, revision: accepted.catalog.revision,
         main: accepted.main_review, side_chat: accepted.side_chat_review }, { phase: "executing", owner: OWNER });
       if (resource.pageErrors().length) throw fail("Hub browser reported page errors", resource.pageErrors());
-      await trustedClick(input, cdp, hubSettingsCloseTarget, sink);
+      await trustedClick(input, cdp, action("close-overlay", ".settings-modal"), sink);
       const shell = await wait("The enrolled Desktop returns to an interactive shell", () => cdp.evaluate(`(async () => {
         const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
         const prompts = document.querySelectorAll('textarea#prompt');
@@ -207,6 +246,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       await captureScenarioScreenshot({ cdp, sink, name: "hub-connection-shared-ready", owner: OWNER });
       return { acquisition: "pass", oracle: "pass", manual: "not_required" };
       } finally {
+        try { await finishModelCommandObservation(cdp,sink); } catch { state.inputFailures.push("model-command-observation-cleanup-failed"); }
         try { await input.cleanup(); } catch (error) { state.inputFailures.push(error?.code ?? "input-cleanup-failed"); }
         state.input = null;
       }

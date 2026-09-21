@@ -2000,6 +2000,57 @@ mod command_projection_owner_tests {
         );
     }
 
+    #[tokio::test]
+    async fn execution_setup_opens_and_restores_hub_before_manual_ai_configuration() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &project_root);
+        let before = serde_json::to_value(controller.state.global_config()).unwrap();
+        controller
+            .choose_initial_setup_purpose(DesktopOnboardingIntent::Execution)
+            .unwrap();
+        controller.state.apply_startup_overlay();
+        let chosen = controller.next_web_state().unwrap();
+        assert_eq!(chosen.overlay, "hub");
+        assert!(chosen.hub_project_open);
+        assert!(
+            chosen.startup.initial_setup_required,
+            "choosing execution must not pretend the Hub config was saved"
+        );
+        assert_eq!(
+            serde_json::to_value(controller.state.global_config()).unwrap(),
+            before
+        );
+        let preferences = controller.preferences.clone();
+        let app = build_test_app(&project_root, controller.app.store.clone()).await;
+        let mut restarted = DesktopController::new_with_preferences_and_persistence(
+            app,
+            DesktopArgs {
+                directory: Some(project_root),
+                session_id: None,
+                continue_last: false,
+                global_config_existed_at_launch: true,
+            },
+            preferences,
+            false,
+        )
+        .await
+        .unwrap();
+        restarted.state.apply_startup_overlay();
+        let restored = restarted.next_web_state().unwrap();
+        assert_eq!(restored.overlay, "hub");
+        assert!(restored.hub_project_open && restored.startup.initial_setup_required);
+        assert_eq!(
+            restarted.preferences.onboarding_intent,
+            Some(DesktopOnboardingIntent::Execution)
+        );
+        assert_eq!(
+            serde_json::to_value(restarted.state.global_config()).unwrap(),
+            before
+        );
+    }
+
     #[test]
     fn initial_setup_saved_connection_survives_preferences_failure() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -10526,8 +10577,8 @@ impl DesktopController {
             authorized_attachment_assets: BTreeSet::new(),
         };
         controller.reconcile_runtime_listener_with_open_session();
-        if controller.preferences.onboarding_intent == Some(DesktopOnboardingIntent::Team) {
-            controller.state.show_shared_work();
+        if let Some(intent) = controller.preferences.onboarding_intent {
+            controller.show_onboarding_surface(intent);
         }
         controller.persist_preferences();
         Ok(controller)
@@ -14673,10 +14724,21 @@ impl DesktopController {
         self.persist_onboarding_intent(Some(intent))?;
         // Choosing a route does not replace the config draft/import owner.
         self.state.startup.onboarding_intent = Some(intent);
-        if intent == DesktopOnboardingIntent::Team {
-            self.state.show_shared_work();
-        }
+        self.show_onboarding_surface(intent);
         Ok(())
+    }
+
+    fn show_onboarding_surface(&mut self, intent: DesktopOnboardingIntent) {
+        if matches!(
+            intent,
+            DesktopOnboardingIntent::Team | DesktopOnboardingIntent::Execution
+        ) && self.state.show_shared_work()
+            && intent == DesktopOnboardingIntent::Execution
+        {
+            // The shared shell can connect before local AI setup is complete. Keep the
+            // unfinished config owner until the Hub file is actually saved.
+            self.state.show_hub_editor();
+        }
     }
 
     fn persist_preferences(&mut self) {

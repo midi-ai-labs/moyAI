@@ -101,6 +101,10 @@ impl HubConnection {
         expected_settings_revision: String,
         expected_connection_generation: String,
     ) -> Result<HubConnectionProjection, HubError> {
+        let managed = self.managed_endpoint();
+        if managed.is_some() && mode == HubRouteMode::Direct {
+            return Err(HubError::InvalidSelection);
+        }
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
         state.check_generation(&expected_connection_generation)?;
         state.check_settings(&expected_settings_revision)?;
@@ -118,7 +122,7 @@ impl HubConnection {
             HubReviewContext::SideChat => proposed.side_chat_mode = mode,
         }
         state.settings = self.persisted_store()?.save(&proposed)?;
-        Ok(state.projection())
+        Ok(state.projection(managed.as_deref()))
     }
 
     /// Capture a user-turn owner synchronously, before starting a detached Desktop worker.
@@ -145,8 +149,9 @@ impl HubConnection {
         purpose: HubRequestPurpose,
         cancel: CancellationToken,
     ) -> Result<Option<HubTurnRoute>, HubError> {
+        let managed = self.managed_endpoint().is_some();
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
-        if context.mode(&state.settings) == HubRouteMode::Direct {
+        if !managed && context.mode(&state.settings) == HubRouteMode::Direct {
             return Ok(None);
         }
         if state.active[context.index()].is_some() {

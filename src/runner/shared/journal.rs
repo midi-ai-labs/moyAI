@@ -1,7 +1,7 @@
 //! Local evidence of possible execution. Hub owns scheduling; this journal never retries effects.
 use std::fs::{File, OpenOptions};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -58,6 +58,49 @@ impl Entry {
 }
 
 impl Journal {
+    /// Preserve the legacy journal in place. A different identity gets a separate
+    /// file, so unresolved old work never becomes a new Hub's recovery input.
+    pub(crate) fn path_for(
+        data: &Utf8Path,
+        settings: &SharedSettings,
+    ) -> Result<Utf8PathBuf, RunnerError> {
+        let legacy = data.join("runner-shared.sqlite3");
+        if !legacy.exists() {
+            return Ok(legacy);
+        }
+        let db = Connection::open_with_flags(&legacy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(error)?;
+        let version: u32 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(error)?;
+        if version == 0 {
+            let objects: u64 = db
+                .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+                .map_err(error)?;
+            if objects == 0 {
+                // A crash may leave the newly opened SQLite file before its
+                // initial schema transaction. Journal::open owns that recovery.
+                return Ok(legacy);
+            }
+        }
+        let identity: (String, String) = db
+            .query_row(
+                "SELECT hub_id,device_id FROM runner_identity WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(error)?;
+        if identity == (settings.hub_id.clone(), settings.device_id.clone()) {
+            return Ok(legacy);
+        }
+        use sha2::{Digest, Sha256};
+        let key = format!(
+            "{:x}",
+            Sha256::digest(format!("{}|{}", settings.hub_id, settings.device_id).as_bytes())
+        );
+        Ok(data.join(format!("runner-shared-{key}.sqlite3")))
+    }
+
     pub(crate) fn open(path: &Utf8Path, settings: &SharedSettings) -> Result<Self, RunnerError> {
         let parent = path
             .parent()

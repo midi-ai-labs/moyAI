@@ -150,6 +150,10 @@ mod windows {
         Ok(())
     }
     pub(super) fn remove() -> Result<(), RunnerError> {
+        let executable = std::env::current_exe().map_err(|e| RunnerError::new(e.to_string()))?;
+        remove_for(&executable)
+    }
+    pub(super) fn remove_for(executable: &std::path::Path) -> Result<(), RunnerError> {
         if std::env::var_os("MOYAI_CONFIG_PATH").is_some()
             || std::env::var_os("MOYAI_DATA_DIR").is_some()
         {
@@ -157,7 +161,6 @@ mod windows {
                 "An isolated profile cannot change normal-profile logon startup",
             ));
         }
-        let executable = std::env::current_exe().map_err(|e| RunnerError::new(e.to_string()))?;
         let command = format!("\"{}\" serve --background", executable.display());
         let Some(existing) = read_command()? else {
             return Ok(());
@@ -202,6 +205,20 @@ pub(crate) fn remove() -> Result<(), RunnerError> {
     #[cfg(windows)]
     {
         windows::remove()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(RunnerError::new(
+            "Logon autostart currently supports Windows only",
+        ))
+    }
+}
+
+pub(crate) fn remove_adjacent_runner() -> Result<(), RunnerError> {
+    #[cfg(windows)]
+    {
+        let desktop = std::env::current_exe().map_err(|e| RunnerError::new(e.to_string()))?;
+        windows::remove_for(&desktop.with_file_name("moyai-runner.exe"))
     }
     #[cfg(not(windows))]
     {

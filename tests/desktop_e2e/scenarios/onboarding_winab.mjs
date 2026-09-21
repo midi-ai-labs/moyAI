@@ -136,12 +136,45 @@ export function createOnboardingWinAbScenario(options = {}) {
         await pc.sink.record("onboarding-native-selection", { intent, selectedPath, result }, { phase: "executing", owner: OWNER });
       }
       async function saveHubForm() {
+        const readDraft = () => page.locator("#shared-admin-form").evaluate(form => Array.from(form.querySelectorAll("input,select,textarea"), node => ({
+          name: node.name, value: node.value, checked: node.type === "checkbox" ? node.checked : null,
+        })));
+        const draft = await readDraft();
         await page.locator("#shared-admin-save").click();
+        const result = await wait("Hub saves the project or requests an explicit comparison", () => page.evaluate(() => ({
+          closed: !document.querySelector("#shared-admin-form"),
+          conflict: Boolean(document.querySelector("#shared-admin-review-conflict")?.getClientRects().length),
+        })), value => value.closed || value.conflict);
+        if (result.conflict) {
+          // Initial Runner template publication can advance management revision
+          // while the form is open. Review the visible comparison once; never
+          // retry a stale request or silently replace the operator's draft.
+          await page.locator("#shared-admin-review-conflict").click();
+          await page.locator("#shared-admin-accept-comparison").waitFor({ state: "visible" });
+          const comparison = await page.locator("#shared-admin-comparison").innerText();
+          if (!["CSV集計の実装", a.label, b.label].every(value => comparison.includes(value))) throw fail("Project comparison must identify the requested name and PCs", { comparison });
+          await page.locator("#shared-admin-accept-comparison").click();
+          if (JSON.stringify(await readDraft()) !== JSON.stringify(draft)) throw fail("Conflict review changed the project draft");
+          await sink.record("onboarding-project-conflict-reviewed", { comparison, draft_preserved: true, retries: 1 }, { phase: "executing", owner: OWNER });
+          await page.locator("#shared-admin-save").click();
+        }
         await page.locator("#shared-admin-form").waitFor({ state: "detached" });
       }
       try {
         await attach(a, { context, runtime, driver, sink }); await checkpoint(a, "first-launch");
         await page.locator('nav a[href="#team-onboarding"]').click(); await nextStep("Hubへの接続を開始してください", ["Hub管理者", "このHub管理画面"]); await hubCheckpoint("onboarding-initial");
+        await page.locator('nav a[href="#models"]').click();
+        await page.locator("#endpoint").fill(live?.providerBaseUrl ?? state.provider.baseUrl);
+        await page.locator("#profile").selectOption("openai_compatible_chat");
+        await page.locator("#discover").click();
+        const providerModel = live?.model ?? "shared-workflow";
+        await page.locator(`#model option[value=${JSON.stringify(providerModel)}]`).waitFor({ state: "attached" });
+        await page.locator("#model").selectOption(providerModel);
+        await page.locator("#label").fill("WinBの標準AI");
+        await page.locator("#allow-tools").check();
+        await page.locator("#register").click();
+        await page.locator("#model-rows tr").filter({ hasText: "WinBの標準AI" }).waitFor();
+        await hubCheckpoint("shared-ai-registered");
         await page.locator('nav a[href="#device-network"]').click(); await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
         await hubCheckpoint("network-before-start"); await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
         await enroll(a);
@@ -151,18 +184,19 @@ export function createOnboardingWinAbScenario(options = {}) {
         const companion = await host.openCompanion({ context: await createCompanionContext(context, "desktop-b"), scenario: childScenario, sink });
         await attach(b, companion); await checkpoint(b, "first-launch");
         await click(b, action("initial-setup-execution", '[data-surface="initial-setup"]'));
-        await wait("B selects execution setup while configuration is unfinished", () => projection(b, "desktop_state"), p => p.overlay === "initial_setup" && p.startup.onboarding_intent === "execution" && p.startup.initial_setup_required);
-        const configTarget = (key, tag = "INPUT") => ({ selector: `[data-surface="initial-setup"] .settings-control[data-config-key=${JSON.stringify(key)}]`, identity: { tag, configKey: key } });
-        await fill(b, configTarget("model.base_url"), live?.providerBaseUrl ?? state.provider.baseUrl);
-        await select(b, configTarget("model.provider_profile", "SELECT"), "openai_compatible"); await checkpoint(b, "local-ai-provider");
-        await click(b, action("initial-setup-next", '[data-surface="initial-setup"]'));
-        await fill(b, byId("initial-setup-model-manual", "INPUT"), live?.model ?? "shared-workflow"); await checkpoint(b, "local-ai-model");
-        await click(b, action("initial-setup-next", '[data-surface="initial-setup"]'));
-        await wait("Execution AI review is rendered before its screenshot", () => b.driver.evaluate(`Boolean(document.querySelector('[data-surface="initial-setup"] [data-action="finish-initial-setup"]')?.getClientRects().length)`), Boolean);
-        await checkpoint(b, "local-ai-before-save"); await click(b, action("finish-initial-setup", '[data-surface="initial-setup"]'));
-        await wait("B's execution-purpose setup opens PC connection directly", () => projection(b, "desktop_state"), p => p.overlay === "hub" && p.startup.status === "ready" && p.startup.initial_setup_required === false);
+        await wait("B opens PC connection without entering manual AI settings", () => projection(b, "desktop_state"),
+          p => p.overlay === "hub" && p.hub_project_open === true && p.startup.onboarding_intent === "execution");
+        await checkpoint(b, "hub-first-execution-setup");
         await wait("PC connection tab is visible after execution-purpose setup", () => b.driver.evaluate(`document.querySelector('#hub-tab-devices')?.getAttribute('aria-pressed') === 'true' && Boolean(document.querySelector('#device-network-import')?.getClientRects().length)`), Boolean);
         await enroll(b, "hub");
+        const models = await wait("B adopts the Hub standard model for Main and Side", () => projection(b, "hub_projection"),
+          p => p.status === "connected" && p.main_mode === "hub" && p.side_chat_mode === "hub"
+            && p.main_review && p.main_uses_default === true && p.side_chat_uses_default === true);
+        const localConfig = await readFile(b.context.paths.config_file, "utf8");
+        if (localConfig.includes(live?.providerBaseUrl ?? state.provider.baseUrl) || localConfig.includes(live?.model ?? "shared-workflow"))
+          throw fail("WinB must not receive the provider URL or manual model configuration");
+        await sink.record("onboarding-hub-only-ai", { endpoint: models.endpoint, main: models.main_review,
+          side: models.side_chat_review, manual_provider_config_absent: true }, { phase: "executing", owner: OWNER });
         await renameDevice(b);
         if (!isolatedDevicesAccepted(a.identity, b.identity)) throw fail("A and B must have distinct live processes and credentials");
         await sink.record("onboarding-two-pcs", { a: a.identity, b: b.identity }, { phase: "executing", owner: OWNER });

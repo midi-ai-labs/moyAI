@@ -231,9 +231,13 @@ pub(crate) fn save_device_network_config(
     shared: &crate::device_network::SharedHubConfig,
     validate: impl FnOnce(&ResolvedConfig) -> Result<(), String>,
 ) -> Result<ResolvedConfig, String> {
-    shared
-        .validate()
-        .map_err(|_| "invalid_configuration".to_string())?;
+    // An entirely empty public connection is the explicit local reset result.
+    // Partial connection documents are still invalid.
+    if shared.configured() {
+        shared
+            .validate()
+            .map_err(|_| "invalid_configuration".to_string())?;
+    }
     let _lease =
         acquire_global_config_write_lease(path).map_err(|_| "storage_error".to_string())?;
     let mut document = read_toml_document(path).map_err(|_| "settings_corrupt".to_string())?;
@@ -596,6 +600,37 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), original);
         super::save_device_network_config(&path, &Default::default(), &shared, |_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn local_connection_reset_preserves_direct_model_and_unrelated_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        std::fs::write(
+            &path,
+            "[model]\nmodel='saved-direct-model'\n[future_integration]\nlocal_secret='unchanged'\n",
+        )
+        .unwrap();
+        let shared = shared_hub_config();
+        super::save_device_network_config(&path, &Default::default(), &shared, |_| Ok(())).unwrap();
+        let cleared =
+            super::save_device_network_config(&path, &shared, &Default::default(), |_| Ok(()))
+                .unwrap();
+        assert!(!cleared.device_network.configured());
+        assert_eq!(cleared.model.model, "saved-direct-model");
+        let document: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            document["future_integration"]["local_secret"].as_str(),
+            Some("unchanged")
+        );
+        let mut partial = crate::device_network::SharedHubConfig::default();
+        partial.hub_url = "https://new.example".into();
+        assert_eq!(
+            super::save_device_network_config(&path, &Default::default(), &partial, |_| Ok(()))
+                .unwrap_err(),
+            "invalid_configuration"
+        );
     }
 
     #[test]

@@ -112,9 +112,10 @@ try {
   Write-Output "`n導入が完了しました。moyAI $($manifest.version)`n導入先: $InstallRoot"
   if ($NoShortcuts) { Write-Output "次に開くもの: $InstallRoot\Start-moyAI.cmd（ショートカットは作成していません）" }
   else { Write-Output '次に開くもの: Windowsのスタートメニュー → moyAI' }
-  Write-Output '・依頼と結果確認: 「チームに参加する」。管理者から接続ファイル・利用者名・本人設定コードを受け取ってください。このPCのAI設定は不要です。'
-  Write-Output '・仕事を実行するPC: 「チームの仕事をこのPCで実行する」。AIの設定、PCの参加、作業の保存先と操作の許可を進めてください。'
+  Write-Output '・依頼と結果確認: 「チームに参加する」。管理者から接続ファイルを受け取り、PCの参加許可を待ちます。ID・パスワードの入力は不要です。'
+  Write-Output '・仕事を実行するPC: 「チームの仕事をこのPCで実行する」。接続ファイルを読み込み、PCの参加、作業の保存先と操作の許可を進めてください。AIはHubの設定を使います。'
   Write-Output '・チームの管理者: Hub同梱版で「チーム環境を用意する」。個人で使う方は「自分のPCで使う」を選んでください。'
+  if ($manifest.hub) { Write-Output '・Hubは今回の導入先から起動してください。更新時も同じ導入先を使うと、Windowsの受信許可を引き継げます。初回はHubの画面で接続するLANと受信許可を確認します。' }
   Write-Output '導入完了は、PCの参加承認や最初の仕事の準備完了とは別です。既存の設定と履歴は保持しています。手順: docs/user/windows-setup.md'
   if ($previous) { Write-Output "以前のアプリは次の場所に残しました。必要なファイルがないことを確認してから削除できます: $previous`n設定と履歴はAppDataに残っています。" }
   Write-Output 'この画面を閉じて、上の案内からmoyAIを開いてください。moyAIは自動では起動しません。'

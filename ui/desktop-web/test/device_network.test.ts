@@ -3,9 +3,9 @@ import test from "node:test";
 import { acceptDeviceNetworkProjection, createDeviceNetworkUiState, deviceCanJoin, deviceCanReceive, deviceCanSelect,
   deviceCanStopJob, deviceDraftCurrent, deviceNetworkError, deviceNetworkPresentation, devicePeerAvailability, devicePeerKey,
   editDeviceNetworkField, visibleDevicePeers } from "../src/device_network_state.ts";
-import { renderDeviceNetwork } from "../src/device_network_render.ts";
+import { renderDeviceConnectionReset, renderDeviceNetwork } from "../src/device_network_render.ts";
 import { devicePathLabel, renderDeviceNetworkJobs } from "../src/device_network_jobs.ts";
-import { renderHubOverlay } from "../src/hub_render.ts";
+import { renderHubOverlay, renderManagedAiConnection } from "../src/hub_render.ts";
 import { createHubUiState } from "../src/hub_state.ts";
 import { synchronizeRetainedSettingsSurface } from "../src/settings_surface.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
@@ -192,6 +192,21 @@ test("temporary disconnect preserves registration and selected targets with an e
   assert.equal(local.projection!.peers[0].selected, true);
 });
 
+test("reset reports its result next to the action in either settings surface", () => {
+  const local = deviceUiFixture();
+  const feedback = () => renderDeviceConnectionReset(local).match(/<div id="device-network-reset-feedback"([^>]*)>([^<]*)<\/div>/)!;
+  assert.match(feedback()[1], /\bhidden\b/);
+  local.notice = "接続設定をリセットしました。履歴・成果物・未確認記録は保持しています。";
+  assert.equal(feedback()[2], local.notice);
+  assert.doesNotMatch(feedback()[1], /\bhidden\b/);
+  assert.match(feedback()[1], /data-settings-passive="device-network-reset-feedback"/);
+  local.projection.error = "reset_autostart_unconfirmed";
+  assert.match(feedback()[1], /data-error="true"/);
+  assert.equal(feedback()[2], deviceNetworkError("reset_autostart_unconfirmed"));
+  local.error = "保存先を確認してください。";
+  assert.equal(feedback()[2], local.error);
+});
+
 test("route display keeps delegated path, exact stop identity, and unconfirmed cancellation distinct", () => {
   const local = deviceUiFixture();
   assert.equal(devicePathLabel(local, local.jobs.outgoing[0].device_path), "Win00 → Win19 → Win20");
@@ -209,13 +224,12 @@ test("route display keeps delegated path, exact stop identity, and unconfirmed c
   assert.doesNotMatch(html, /このPCの作業を確認/);
 });
 
-test("joined devices use the model owner with manual connection folded; leaving stays discoverable while revoked", () => {
+test("joined devices link to the single AI settings form; leaving stays discoverable while revoked", () => {
   const local = deviceUiFixture();
   const hub = createHubUiState();
   const html = renderHubOverlay(hub, deviceNetworkPresentation(local));
-  assert.match(html, /接続済みのHubからモデルを取得/);
-  assert.match(html, /<details id="hub-manual-connection"[^>]*>/);
-  assert.doesNotMatch(html.match(/<details id="hub-manual-connection"[^>]*>/)![0], /\bopen\b/);
+  assert.match(html, /data-action="show-config">AIの接続/);
+  assert.doesNotMatch(html, /hub-manual-connection|hub-token/);
   assert.doesNotMatch(html, /class="modal-backdrop"[^>]*data-action/);
   local.projection!.enrollment = "revoked";
   const revoked = renderDeviceNetwork(local);
@@ -224,7 +238,7 @@ test("joined devices use the model owner with manual connection folded; leaving 
 
 test("pending approval updates the connected model help through retained settings without replacing the receiver draft", () => {
   function retainedHelp(html: string) {
-    const match = html.match(/<p id="hub-scope-help"([^>]*)>([^<]*)<\/p>/)!;
+    const match = html.match(/<p[^>]*class="hub-help"([^>]*data-settings-passive="ai-main-status"[^>]*)>([^<]*)<\/p>/)!;
     const attributes = new Map([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(item => [item[1], item[2]]));
     const region = {
       textContent: match[2], dataset: { settingsPassive: attributes.get("data-settings-passive") },
@@ -242,13 +256,13 @@ test("pending approval updates the connected model help through retained setting
   editDeviceNetworkField(local, "target", "project:project-a", false);
   const draft = structuredClone(local.target);
   const hub = createHubUiState();
-  const current = retainedHelp(renderHubOverlay(hub, deviceNetworkPresentation(local)));
-  assert.match(current.region.textContent, /管理者から受け取った設定ファイル/);
+  const current = retainedHelp(renderManagedAiConnection(hub, "main", deviceNetworkPresentation(local)));
+  assert.match(current.region.textContent, /参加承認を待っています/);
   acceptDeviceNetworkProjection(local, deviceProjection({ generation: "8" }));
-  const next = retainedHelp(renderHubOverlay(hub, deviceNetworkPresentation(local)));
+  const next = retainedHelp(renderManagedAiConnection(hub, "main", deviceNetworkPresentation(local)));
   synchronizeRetainedSettingsSurface(current as unknown as HTMLElement, next as unknown as HTMLElement, false);
-  assert.match(current.region.textContent, /接続済みのHubからモデルを取得/);
-  assert.doesNotMatch(current.region.textContent, /管理者から受け取った設定ファイル/);
+  assert.match(current.region.textContent, /再接続を待っています/);
+  assert.doesNotMatch(current.region.textContent, /参加承認を待っています/);
   assert.deepEqual(local.target, draft);
 });
 
