@@ -4737,7 +4737,7 @@ mod tests {
         assert_eq!(failure.code.as_deref(), Some("server_error"));
         assert_eq!(
             error.public_message(),
-            "The model provider could not complete generation. Check the model state and try again."
+            "AIが応答を作成できませんでした。接続先でモデルが正常に動いているか確認してから、もう一度依頼してください。"
         );
         assert!(!error.public_message().contains("ANE evaluation failed"));
         assert_eq!(requests.lock().expect("request capture").len(), 1);

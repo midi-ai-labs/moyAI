@@ -247,7 +247,7 @@ export function runStopInFlightFailures(sample) {
     || surface?.stop_button?.enabled !== true) {
     failures.push("semantic-stop-not-interactable");
   }
-  if (surface?.stop_button?.aria_label !== "Mainを停止" || surface?.stop_button?.text !== "Mainを停止") {
+  if (surface?.stop_button?.aria_label !== "メインチャットを停止" || surface?.stop_button?.text !== "メインチャットを停止") {
     failures.push("main-stop-label-mismatch");
   }
   const taskActivity = surface?.task_activity;

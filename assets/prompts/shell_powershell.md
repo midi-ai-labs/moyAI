@@ -8,6 +8,10 @@ Run a PowerShell command in a fresh, non-profile shell.
   case-insensitive; do not assign to automatic variables such as `$Host` or `$PID`.
 - Check the requested data and stderr as well as the exit code. A non-terminating
   PowerShell error can be followed by successful statements and exit code 0.
+- In scripts you create or modify, stop on errors in required work and return
+  nonzero before reporting success, for example with `$ErrorActionPreference = 'Stop'`
+  inside the script. A parent shell's setting is not inherited by a new PowerShell
+  process. Check native programs' exit codes separately.
 - Preserve the user's limits on security settings, including process-scoped
   changes. Do not add `-ExecutionPolicy Bypass` or `Unrestricted` as routine
   script-launch flags. Use the existing policy unless a change is authorized for

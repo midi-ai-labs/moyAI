@@ -186,7 +186,7 @@ export function createSharedWorkEntryScenario(options = {}) {
         const contactState = (value, state) => value.job?.state === "running" && value.detail?.id === occupied.id
           && value.detail.state === "running" && value.environment?.occupied === 1
           && [value.job, value.environment, value.detail].every(row => row.runner_contact?.state === state)
-          && Object.values(value.text).every(text => text.includes(state === "recent" ? "最近の応答あり" : "PCの応答なし（状態不明）"));
+          && Object.values(value.text).every(text => text.includes(state === "recent" ? "PCからの応答あり" : "PCの応答なし（状態不明）"));
         async function confirmRunnerContact() {
           const requestedAt = Date.now();
           await participant.sharedAssignments(["env-project-b"]);

@@ -17,14 +17,17 @@ export function onboardingImplementationReply(messages) {
     return { delta: { role: "assistant", content: "CSVを集計する Summarize-Numbers.ps1 を作成し、実行しました。件数は3、合計は60です。スクリプトと onboarding-result.md を保存できます。" }, finish: "stop" };
   }
   if (results("implementation-execute").length) return call("implementation-read-result", "read", { path: RESULT_NAME });
-  if (results("implementation-script").length) {
+  if (results("implementation-publish-script-final").length) {
     const quote = value => "'" + value.replaceAll("'", "''") + "'";
     return call("implementation-execute", "shell", { command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./${SCRIPT_NAME} -InputPath ${quote(input)} -OutputPath ./${RESULT_NAME}` });
   }
+  if (results("implementation-script-final").length) return call("implementation-publish-script-final", "shared_publish_artifact", { path: SCRIPT_NAME });
+  if (results("implementation-publish-script-first").length) return call("implementation-script-final", "apply_patch", { patch_text: `*** Begin Patch\n*** Update File: ${SCRIPT_NAME}\n@@\n-# First published version\n+# Final published version\n*** End Patch` });
+  if (results("implementation-script").length) return call("implementation-publish-script-first", "shared_publish_artifact", { path: SCRIPT_NAME });
   if (results("implementation-read-input").length) {
     if (!["10", "20", "30"].every(value => results("implementation-read-input")[0].content.includes(value))) throw new Error("Implementation CSV content was not read");
     const script = ["param([Parameter(Mandatory=$true)][string]$InputPath, [Parameter(Mandatory=$true)][string]$OutputPath)", "$ErrorActionPreference = 'Stop'", "$rows = @(Import-Csv -LiteralPath $InputPath)", "$sum = ($rows | Measure-Object -Property value -Sum).Sum", 'Set-Content -LiteralPath $OutputPath -Value @("Count: $($rows.Count)", "Sum: $sum") -Encoding UTF8', 'Get-Content -LiteralPath $OutputPath'];
-    return call("implementation-script", "apply_patch", { patch_text: `*** Begin Patch\n*** Add File: ${SCRIPT_NAME}\n${script.map(line => "+" + line).join("\n")}\n*** End Patch` });
+    return call("implementation-script", "apply_patch", { patch_text: `*** Begin Patch\n*** Add File: ${SCRIPT_NAME}\n+# First published version\n${script.map(line => "+" + line).join("\n")}\n*** End Patch` });
   }
   return call("implementation-read-input", "read", { path: input });
 }

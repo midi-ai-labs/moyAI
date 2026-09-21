@@ -42,7 +42,11 @@ tests/desktop_e2e/
 
 ## Desktop の起動範囲
 
-`onboarding.win-a-to-win-b` は同一Windows内の隔離された実Desktop A/Bで、Aのチーム参加・本人初回設定、Bの実行PC専用入口からAI設定・PC参加・実行同意、Hub画面の人/PC/プロジェクト割当、AのCSV添付、Bのスクリプト作成と実PowerShell実行、Aの成果2ファイル保存を通す。Hubは本人入力中に別タブで今回使うプロジェクトを作り、競合時に入力を残して比較→継続→明示保存する。承認ボタンはfocus/scroll前の可視性を記録し、Aへ保存した2成果のhashをHub・B実ファイルと照合する。共通のcompanion/managed Runner/native picker/cleanup ownerを使用する。`runnerBinary` と固定コピーした `runnerTestBinary` をHub optionsに追加する。providerは固定tool計画で、LLM品質・物理別PC・fresh Windows導入の証明ではない。画面と経過時間は自動操作の観察資料であり、初見利用者の所要時間を表さない。
+`onboarding.win-a-to-win-b` は同一Windows内の隔離された実Desktop A/Bで、Aのチーム参加・本人初回設定、Bの実行PC専用入口からAI設定・PC参加・実行同意、Hub画面の人/PC/プロジェクト割当、AのCSV添付、Bのスクリプト作成と実PowerShell実行、Aの成果2ファイル保存を通す。Hubは本人入力中に別タブで今回使うプロジェクトを作り、競合時に入力を残して比較→継続→明示保存する。Hubでは次の操作・担当者・PCの案内を確認する。承認ボタンはfocus/scroll前の可視性を記録し、日本語の影響説明とコマンド全文、元データの開閉保持、判断後とSHAの折畳みを確認する。Aへ保存した2成果のhashをHub・B実ファイルと照合する。共通のcompanion/managed Runner/native picker/cleanup ownerを使用する。`runnerBinary` と固定コピーした `runnerTestBinary` をHub optionsに追加する。providerは固定tool計画で、LLM品質・物理別PC・fresh Windows導入の証明ではない。画面と経過時間は自動操作の観察資料であり、初見利用者の所要時間を表さない。
+
+同scenarioのconfigに `liveProvider: { "provider_base_url": "http://host:port/v1", "model": "model-id" }` を明示すると、固定応答providerを起動せず指定済みの実LLMを使用する。外部providerは起動・停止しない。実装待ちは最大15分とし、結果の2行形式を依頼に明記する。実LLMの承認は自動許可せず、execution rootの `live-approval-N.json` に操作と実行先を保存する。担当者が内容と対象スクリプトを確認した後、同rootの `live-approval-N-decision.json` に一致する `approval_id`、`request_sha256`、`decision: "approve"` を記録した場合だけGUI承認する（各承認の確認待ちは最大5分）。このファイルは今回の隔離試験専用で、製品の権限設定を変更しない。実モデルのtool数はmock requestから推測せず、保存された実行履歴から別途確認する。
+
+接続不能時の表示を検証する場合は、停止済みの隔離endpointを指定した同configへ `expectProviderFailure: true` を追加する。失敗理由が閉じた詳細を開かずに日本語で表示され、「続きの依頼へ」から未送信の入力欄へ移動できることを判定する。これは失敗表示の試験であり、実LLMの実装成功には数えない。
 
 省略時の `--desktop-isolation user-wide` は、既存の Desktop があると起動前に停止する従来の試験である。実利用中の Desktop と共存させる場合だけ、`desktop-e2e` feature 付きの専用 Desktop と `--desktop-isolation fixture` を明示する。通常配布版は隔離用の環境変数が渡された起動を拒否する。どちらのモードでも共通の GUI admission を一つだけ取得し、別 execution の GUI 操作を並行させない。
 

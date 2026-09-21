@@ -126,7 +126,12 @@ export function createSharedWorkContinuationScenario(options = {}) {
         const { createDeviceParticipant } = await import(pathToFileURL(path.join(settings.hubRepository, "tests/browser/device-fixture.mjs")));
         const actor = await createDeviceParticipant(network, "Shared workflow setup");
         await page.locator('nav a[href="#clients"]').click(); await page.locator("#network-clients-refresh").click();
-        await page.locator(`[data-id="request:${actor.requestId}"] button[data-network-action]`).click(); await actor.collectApproval(); await actor.presence();
+        await page.locator(`[data-id="request:${actor.requestId}"] button[data-network-action]`).click();
+        await page.locator("#join-project-save").click();
+        await page.locator("#join-project-dialog").waitFor({ state: "hidden" });
+        const actorApproval = await actor.collectApproval();
+        if (actorApproval.status !== "approved") throw fail("The fixture participant was not approved through Hub controls");
+        await actor.presence();
         await actor.sharedLogin(state.resource.administrator.username, state.resource.administrator.password);
         const password = randomUUID();
         const alice = await actor.sharedCall("createUser", { username: "workflow-alice", display_name: "担当 Alice", password, administrator: false });

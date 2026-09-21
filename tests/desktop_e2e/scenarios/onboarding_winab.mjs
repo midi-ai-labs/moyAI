@@ -16,10 +16,14 @@ import { action, byId, trustedClick, wait, enrollDesktopFromHubBrowser, requestH
 import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget } from "./shared_work_navigation.mjs";
 import { isolatedDevicesAccepted } from "./shared_work_isolation.mjs";
 import { quiesceDeviceExecutionResources } from "./device_execution.mjs";
+import { normalizeProviderConnectionLiveOptions } from "./provider_connection_live.mjs";
 
 const ID = "onboarding.win-a-to-win-b", OWNER = `scenario:${ID}`;
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const fail = (message, evidence = {}) => new DesktopE2eError("product", "onboarding-winab-mismatch", message, evidence);
+export function latestArtifactVersion(assets, name) {
+  return assets.filter(asset => asset.name === name && asset.kind === "artifact").sort((a, b) => b.version - a.version)[0];
+}
 export function implementedArtifactsAccepted(files) {
   return Array.isArray(files) && files.length === 2 && [SCRIPT_NAME, RESULT_NAME].every(name => files.some(file => file.name === name
     && /^[a-f0-9]{64}$/.test(file.hub_sha256) && file.saved_sha256 === file.hub_sha256 && file.execution_sha256 === file.hub_sha256))
@@ -30,7 +34,9 @@ export function approvalVisibleBeforeScroll(observation) {
     && observation.center_in_viewport === true && observation.center_in_scroll_clip === true && observation.center_hit === true;
 }
 export function createOnboardingWinAbScenario(options = {}) {
-  const { runnerBinary, runnerTestBinary, ...hubOptions } = options;
+  const { runnerBinary, runnerTestBinary, liveProvider, expectProviderFailure = false, ...hubOptions } = options;
+  const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider);
+  if (typeof expectProviderFailure !== "boolean" || (expectProviderFailure && !live)) throw new TypeError("expectProviderFailure requires explicit live provider options");
   const settings = normalizeHubBrowserOptions(hubOptions);
   const a = { name: "a", input: null }, b = { name: "b", input: null };
   const state = { resource: null, provider: null, runner: null, close: null, failures: [], environment: {}, consent: false };
@@ -52,9 +58,9 @@ export function createOnboardingWinAbScenario(options = {}) {
   return Object.freeze({ id: ID, productOracle: "pass", manualGate: "pending", databaseRequired: true,
     async prepare(args) {
       if (args.context.desktopIsolation !== "fixture" || !runnerTestBinary || !(await stat(runnerTestBinary)).isFile()) throw new TypeError("WinA/WinB requires fixture isolation and an immutable Runner libtest");
-      await prepare(args); state.provider = await startSharedWorkflowProvider();
+      await prepare(args); if (!live) state.provider = await startSharedWorkflowProvider();
       state.resource = await startHubBrowserResource({ ...args, options: settings });
-      await args.sink.record("onboarding-boundary", { simulated_pcs: 2, actual_windows_hosts: 1, provider: "scripted deterministic tool plan", test_runner: { path: runnerTestBinary, sha256: sha(await readFile(runnerTestBinary)) },
+      await args.sink.record("onboarding-boundary", { simulated_pcs: 2, actual_windows_hosts: 1, provider: live ? { kind: "live", ...live } : "scripted deterministic tool plan", test_runner: { path: runnerTestBinary, sha256: sha(await readFile(runnerTestBinary)) },
         preparation: "Common owners start an isolated Hub/browser/provider; Hub administrator setup uses browser controls. Both Desktop configurations start absent. No people, projects, enrollment or execution consent is created through a fixture API." }, { phase: args.phase, owner: OWNER });
     },
     requestGracefulExit: cdp => requestHubEnrollmentExit(cdp, a),
@@ -76,6 +82,10 @@ export function createOnboardingWinAbScenario(options = {}) {
           return;
         }
         await state.resource.screenshot(`journey-hub-${name}`);
+      }
+      async function nextStep(title, expected) {
+        await wait("Hub identifies the next operation, responsible person and PC", async () => page.locator("#onboarding-next").innerText(), value => value.includes(title) && expected.every(text => value.includes(text)));
+        await sink.record("onboarding-next-step", { title, text: await page.locator("#onboarding-next").innerText() }, { phase: "executing", owner: OWNER });
       }
       async function click(pc, target) { desktopActions++; await trustedClick(pc.input, pc.driver, target, pc.sink); }
       async function fill(pc, target, value) { await click(pc, target); await pc.input.keyDown("Control"); await pc.input.pressKey("a"); await pc.input.keyUp("Control"); await pc.input.insertText(target, value); }
@@ -135,7 +145,7 @@ export function createOnboardingWinAbScenario(options = {}) {
       }
       try {
         await attach(a, { context, runtime, driver, sink }); await checkpoint(a, "first-launch");
-        await page.locator('nav a[href="#team-onboarding"]').click(); await hubCheckpoint("onboarding-initial");
+        await page.locator('nav a[href="#team-onboarding"]').click(); await nextStep("Hubへの接続を開始してください", ["Hub管理者", "このHub管理画面"]); await hubCheckpoint("onboarding-initial");
         await page.locator('nav a[href="#device-network"]').click(); await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
         await hubCheckpoint("network-before-start"); await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
         await enroll(a);
@@ -148,10 +158,10 @@ export function createOnboardingWinAbScenario(options = {}) {
         await click(b, action("initial-setup-execution", '[data-surface="initial-setup"]'));
         await wait("B selects execution setup while configuration is unfinished", () => projection(b, "desktop_state"), p => p.overlay === "initial_setup" && p.startup.onboarding_intent === "execution" && p.startup.initial_setup_required);
         const configTarget = (key, tag = "INPUT") => ({ selector: `[data-surface="initial-setup"] .settings-control[data-config-key=${JSON.stringify(key)}]`, identity: { tag, configKey: key } });
-        await fill(b, configTarget("model.base_url"), state.provider.baseUrl);
+        await fill(b, configTarget("model.base_url"), live?.providerBaseUrl ?? state.provider.baseUrl);
         await select(b, configTarget("model.provider_profile", "SELECT"), "openai_compatible"); await checkpoint(b, "local-ai-provider");
         await click(b, action("initial-setup-next", '[data-surface="initial-setup"]'));
-        await fill(b, byId("initial-setup-model-manual", "INPUT"), "shared-workflow"); await checkpoint(b, "local-ai-model");
+        await fill(b, byId("initial-setup-model-manual", "INPUT"), live?.model ?? "shared-workflow"); await checkpoint(b, "local-ai-model");
         await click(b, action("initial-setup-next", '[data-surface="initial-setup"]'));
         await wait("Execution AI review is rendered before its screenshot", () => b.driver.evaluate(`Boolean(document.querySelector('[data-surface="initial-setup"] [data-action="finish-initial-setup"]')?.getClientRects().length)`), Boolean);
         await checkpoint(b, "local-ai-before-save"); await click(b, action("finish-initial-setup", '[data-surface="initial-setup"]'));
@@ -208,7 +218,7 @@ export function createOnboardingWinAbScenario(options = {}) {
         const relative = directory && path.relative(path.toNamespacedPath(approvedRoot), path.toNamespacedPath(directory));
         if (!relative || path.isAbsolute(relative) || relative.startsWith("..")) throw fail("B executes outside its consent directory");
         await checkpoint(b, "project-ready-without-human-login"); await hubCheckpoint("project-ready");
-        await page.locator('nav a[href="#team-onboarding"]').click(); await hubCheckpoint("onboarding-project-ready");
+        await page.locator('nav a[href="#team-onboarding"]').click(); await nextStep("Desktopからサンプルを依頼してください", ["Desktop", "AIの接続・実行結果はこのサンプルで確認"]); await hubCheckpoint("onboarding-project-ready");
         await wait("A receives the assigned project", () => projection(a), p => p.projects.some(row => row.id === projectId && row.can_submit));
         await click(a, { selector: `.sidebar button[data-action="open-hub-project"][data-value="${projectId}"]`, identity: { tag: "BUTTON", action: "open-hub-project" } }); await checkpoint(a, "project-empty");
         const inputPath = path.join(a.context.paths.workspace, INPUT_NAME); await writeFile(inputPath, "value\n10\n20\n30\n", { flag: "wx" });
@@ -218,7 +228,7 @@ export function createOnboardingWinAbScenario(options = {}) {
         else if ((await projection(a)).status.environments.length !== 1 || (await projection(a)).status.environments[0].id !== environmentId) throw fail("The single displayed execution PC must be B");
         await openSharedDisclosure(a.input, a.driver, a.sink, "hub-new-chat-options");
         await fill(a, byId("shared-title", "INPUT"), "CSVを集計するスクリプトを作る");
-        await fill(a, byId("shared-prompt", "TEXTAREA"), `${INPUT_NAME} の value 列を集計する ${SCRIPT_NAME} を作成し、PowerShellで実行してください。件数と合計を ${RESULT_NAME} に保存し、スクリプトと結果を返してください。`);
+        await fill(a, byId("shared-prompt", "TEXTAREA"), `${INPUT_NAME} の value 列を集計する ${SCRIPT_NAME} を作成し、PowerShellで実行してください。件数と合計を ${RESULT_NAME} に保存し、スクリプトと結果を返してください。${live ? '結果は「Count: 件数」「Sum: 合計」の2行にしてください。両方のファイルをこの会話の成果ファイルとして共有してください。' : ''}`);
         await checkpoint(a, "request-before-send"); await click(a, sharedActionTarget("submit"));
         const approvals = new Set(), approvalVisibility = [];
         const completed = await wait("B implements and runs the script; A receives both files", async () => {
@@ -229,26 +239,83 @@ export function createOnboardingWinAbScenario(options = {}) {
             const { observation } = await wait("Approval action is rendered before any focus or scroll", () => a.input.observeExactTarget(target), value => value.observation.count === 1 && value.observation.enabled);
             approvalVisibility.push({ id: p.approval.id, visible_before_scroll: approvalVisibleBeforeScroll(observation), observation });
             await sink.record("onboarding-approval-before-scroll", approvalVisibility.at(-1), { phase: "executing", owner: OWNER });
-            await checkpoint(a, `approval-${approvals.size}`); await click(a, target);
+            await checkpoint(a, `approval-${approvals.size}`);
+            if (p.approval.request.access === "shell") {
+              const operation = await a.driver.evaluate(`document.querySelector('[data-shared-region="approval"]')?.innerText`);
+              const commands = p.approval.request.details.filter(text => text.startsWith("Command: ")).map(text => text.slice("Command: ".length));
+              if (!operation.includes("実行コマンド") || !operation.includes("保護を外して実行") || commands.some(command => !operation.includes(command))) throw fail("Approval must explain the effect in Japanese and preserve the full command", { operation, commands });
+            }
+            const detailKey = `shared-approval-${p.approval.id}`;
+            const detailSelector = `[data-shared-region="approval"] details[data-details-key=${JSON.stringify(detailKey)}]`;
+            const summaryTarget = { selector: `${detailSelector} > summary`, identity: { tag: "DETAILS", detailsKey: detailKey } };
+            await openSharedDisclosure(a.input, a.driver, a.sink, detailKey);
+            const observed = p.observed_at_ms, refreshes = new Set();
+            await wait("Approval original data stays open across two refreshes", async () => {
+              const view = await projection(a); if (view.observed_at_ms > observed) refreshes.add(view.observed_at_ms);
+              return { count: refreshes.size, open: await a.driver.evaluate(`document.querySelector(${JSON.stringify(detailSelector)})?.open`) };
+            }, value => value.count >= 2 && value.open);
+            await checkpoint(a, `approval-${approvals.size}-original-data`);
+            await click(a, summaryTarget);
+            if (live) {
+              const review = { approval: p.approval, execution_directory: directory };
+              const requestSha256 = sha(Buffer.from(JSON.stringify(review)));
+              const requestPath = path.join(context.root, `live-approval-${approvals.size}.json`);
+              const decisionPath = path.join(context.root, `live-approval-${approvals.size}-decision.json`);
+              await writeFile(requestPath, JSON.stringify({ ...review, request_sha256: requestSha256 }, null, 2), { flag: "wx" });
+              const decision = await wait("Live tool request is reviewed before a GUI approval", async () => {
+                try { return JSON.parse(await readFile(decisionPath, "utf8")); }
+                catch (error) { if (error.code === "ENOENT") return null; throw error; }
+              }, Boolean, 300000);
+              if (decision.approval_id !== p.approval.id || decision.request_sha256 !== requestSha256 || decision.decision !== "approve") throw fail("Live approval was not authorized for this exact request");
+              await sink.record("onboarding-live-approval-reviewed", { requestPath, decisionPath, request_sha256: requestSha256 }, { phase: "executing", owner: OWNER });
+            }
+            await click(a, target);
           }
-          if (p.detail?.state === "failed") throw fail("B's implementation failed", { detail: p.detail, provider_failures: state.provider.failures });
+          if (p.detail?.state === "failed" && !expectProviderFailure) throw fail("B's implementation failed", { detail: p.detail, provider_failures: state.provider?.failures });
           return p;
-        }, p => p.detail?.state === "succeeded" && [SCRIPT_NAME, RESULT_NAME].every(name => p.assets.some(asset => asset.name === name && asset.kind === "artifact")), 120000);
+        }, p => expectProviderFailure ? p.detail?.state === "failed" : p.detail?.state === "succeeded" && [SCRIPT_NAME, RESULT_NAME].every(name => p.assets.some(asset => asset.name === name && asset.kind === "artifact")), live ? 900000 : 120000);
+        if (expectProviderFailure) {
+          const reason = completed.detail.result?.summary?.terminal?.outcome?.error;
+          if (!reason || !completed.detail.can_continue) throw fail("Failed work must retain its error and continuation capability");
+          await wait("The actual provider failure is readable without opening diagnostic details", () => a.driver.evaluate(`(() => { const region = document.querySelector('[data-shared-region="detail"]'); return { visible: region?.innerText, open: [...region.querySelectorAll('details')].some(n => n.open), followup: Boolean(document.querySelector('#shared-followup')) }; })()`), value => value.visible?.includes(reason) && value.visible.includes("仕事を完了できませんでした") && value.visible.includes("URL") && !value.visible.includes("回答文はありません") && !value.open && value.followup);
+          await checkpoint(a, "provider-failure-readable");
+          await click(a, { selector: '[data-shared-region="detail"] a[href="#shared-followup"]', identity: { tag: "A", href: "#shared-followup" } });
+          await wait("Failure recovery link reaches the existing continuation input without submitting", () => a.driver.evaluate(`(() => { const field = document.querySelector('#shared-followup'); const rect = field?.getBoundingClientRect(); return { focused: document.activeElement === field, visible: rect && rect.top >= 0 && rect.top < innerHeight, value: field?.value, disabled: field?.disabled }; })()`), value => value.focused && value.visible && value.value === "" && !value.disabled);
+          await checkpoint(a, "provider-failure-continuation-input");
+          await sink.record("onboarding-provider-failure-readable", { reason, can_continue: completed.detail.can_continue, job_id: completed.detail.id }, { phase: "executing", owner: OWNER });
+          return { acquisition: "pass", oracle: "pass", manual: "pending" };
+        }
+        await wait("Completed approval and artifact checksums stay folded", () => a.driver.evaluate(`(() => { const assets = document.querySelector('[data-shared-region="assets"]'); const approval = document.querySelector('[data-shared-region="approval"]'); return { visible: assets?.innerText, raw: assets?.textContent, open: [...(approval?.querySelectorAll('details') ?? [])].some(d => d.open) }; })()`), value => value.raw?.includes("SHA-256") && !value.visible?.includes("SHA-256") && !value.open);
+        const scriptVersions = completed.assets.filter(asset => asset.name === SCRIPT_NAME && asset.kind === "artifact");
+        if (!live && scriptVersions.length < 2) throw fail("The scripted journey must exercise corrected and older published versions");
+        if (scriptVersions.length > 1) {
+          const history = await a.driver.evaluate(`(() => { const region = document.querySelector('[data-shared-region="assets"]'); const detail = region?.querySelector('details[data-details-key^="shared-asset-versions:"]'); return { text: region?.innerText, key: detail?.dataset.detailsKey, open: detail?.open }; })()`);
+          if (!history.key || history.open || !history.text.includes("最新版")) throw fail("Latest artifact must be clear before opening older versions", history);
+          const selector = `[data-shared-region="assets"] details[data-details-key=${JSON.stringify(history.key)}]`;
+          const target = { selector: `${selector} > summary`, identity: { tag: "DETAILS", detailsKey: history.key } };
+          await click(a, target);
+          const observed = (await projection(a)).observed_at_ms, refreshes = new Set();
+          await wait("Older versions remain open over two refreshes", async () => {
+            const view = await projection(a); if (view.observed_at_ms > observed) refreshes.add(view.observed_at_ms);
+            return { count: refreshes.size, open: await a.driver.evaluate(`document.querySelector(${JSON.stringify(selector)})?.open`) };
+          }, value => value.count >= 2 && value.open);
+          await checkpoint(a, "previous-artifact-versions"); await click(a, target);
+        }
         await checkpoint(a, "implementation-result"); await checkpoint(b, "after-implementation");
         const files = [];
         for (const name of [SCRIPT_NAME, RESULT_NAME]) {
-          const asset = completed.assets.find(row => row.name === name && row.kind === "artifact"); const saved = path.join(a.context.paths.workspace, name);
+          const asset = latestArtifactVersion(completed.assets, name); const saved = path.join(a.context.paths.workspace, name);
           await nativeFile(a, sharedActionTarget("save-asset", asset.id), saved, "save_new");
           const savedBytes = await readFile(saved), executionBytes = await readFile(path.join(directory, name));
-          files.push({ name, saved, execution_path: path.join(directory, name), hub_sha256: asset.sha256, saved_sha256: sha(savedBytes), execution_sha256: sha(executionBytes), text: savedBytes.toString("utf8").replace(/^\uFEFF/, "") });
+          files.push({ name, version: asset.version, saved, execution_path: path.join(directory, name), hub_sha256: asset.sha256, saved_sha256: sha(savedBytes), execution_sha256: sha(executionBytes), text: savedBytes.toString("utf8").replace(/^\uFEFF/, "") });
         }
-        if (!implementedArtifactsAccepted(files) || state.provider.failures.length) throw fail("A's saved output differs from B's actual files", { files, provider_failures: state.provider.failures });
+        if (!implementedArtifactsAccepted(files) || state.provider?.failures.length) throw fail("A's saved output differs from B's actual files", { files, provider_failures: state.provider?.failures });
         await checkpoint(a, "saved-results");
         await hubCheckpoint("onboarding-after-result");
         await sink.record("onboarding-journey-complete", { elapsed_ms: Date.now() - started, checkpoint_role_switches: switches, explicit_desktop_actions: desktopActions, steps,
-          files, project_id: projectId, environment_id: environmentId, approvals: approvals.size, approval_visibility: approvalVisibility, provider_calls: state.provider.requests.length,
-          actual_tools: state.provider.requests.flatMap(r => r.messages.filter(m => m.role === "assistant").flatMap(m => m.tool_calls ?? []).map(t => t.function.name)),
-          caveats: ["One Windows host and account, two isolated actual Tauri processes; no VM/network installation proof.", "Scripted plan proves real tool/file/approval transport and execution, not LLM quality.", "Hub/A/B UI mutations use controls; fixture prepares processes and source CSV. A rename compensates for the simulated same Windows machine name. A second Hub tab creates the real project to exercise concurrent-edit comparison deliberately.", "Checkpoint switches and explicit actions are lower bounds; helper keyboard navigation, native controls and Hub browser actions are recorded separately."] }, { phase: "executing", owner: OWNER });
+          files, project_id: projectId, environment_id: environmentId, approvals: approvals.size, approval_visibility: approvalVisibility, provider_calls: state.provider?.requests.length ?? null,
+          actual_tools: state.provider?.requests.flatMap(r => r.messages.filter(m => m.role === "assistant").flatMap(m => m.tool_calls ?? []).map(t => t.function.name)) ?? null,
+          caveats: ["One Windows host and account, two isolated actual Tauri processes; no VM/network installation proof.", live ? "Live provider; canonical tool counts must be audited from persisted runtime evidence, not mock request history." : "Scripted plan proves real tool/file/approval transport and execution, not LLM quality.", "Hub/A/B UI mutations use controls; fixture prepares processes and source CSV. A rename compensates for the simulated same Windows machine name. A second Hub tab creates the real project to exercise concurrent-edit comparison deliberately.", "Checkpoint switches and explicit actions are lower bounds; helper keyboard navigation, native controls and Hub browser actions are recorded separately."] }, { phase: "executing", owner: OWNER });
         if (!approvalVisibility.length || approvalVisibility.some(row => !row.visible_before_scroll)) throw fail("Approval needed scrolling before its action could be found", { approval_visibility: approvalVisibility, artifacts_verified: true });
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {

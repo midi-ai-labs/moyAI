@@ -172,7 +172,7 @@ function runningSample(overrides = {}) {
   return {
     surface: {
       projection: runningProjection(),
-      stop_button: { count: 1, visible: true, enabled: true, aria_label: "Mainを停止", text: "Mainを停止" },
+      stop_button: { count: 1, visible: true, enabled: true, aria_label: "メインチャットを停止", text: "メインチャットを停止" },
       task_activity: {
         total_count: 2,
         visible_count: 2,

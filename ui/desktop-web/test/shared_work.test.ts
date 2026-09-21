@@ -125,7 +125,8 @@ test("pending approval precedes the conversation with exact decision controls an
   const start = html.indexOf('data-shared-region="approval"'), record = html.indexOf('data-shared-region="detail"');
   assert.ok(start >= 0 && start < record);
   const approval = html.slice(start, record), details = approval.indexOf("<details");
-  assert.ok(approval.indexOf("Command: &lt;write report&gt;") < details);
+  assert.ok(approval.indexOf("実行コマンド") < details);
+  assert.ok(approval.indexOf("&lt;write report&gt;") < details);
   assert.ok(approval.indexOf("C:/Approved/report.md") < details);
   assert.ok(approval.indexOf("作業フォルダー外") < details);
   assert.ok(approval.indexOf("外部システムの変更") < details);

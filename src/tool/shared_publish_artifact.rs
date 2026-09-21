@@ -133,7 +133,7 @@ impl Tool for SharedPublishArtifactTool {
         ToolSpec {
             name: ToolName::SharedPublishArtifact,
             effect: ToolEffectPolicy::read(),
-            description: "Attach a file produced in this shared environment to the shared job, including binary solver outputs. The path is relative to the environment root; optional name is a safe relative download name. Maximum 8 MiB. Saves a fixed copy without changing the source. Call after the producing process has finished writing. Project members allowed to view this job can download the artifact.",
+            description: include_str!("../../assets/prompts/shared_publish_artifact.md"),
             input_schema: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string","minLength":1,"maxLength":240},"name":{"type":"string","minLength":1,"maxLength":240}}}),
         }
     }
