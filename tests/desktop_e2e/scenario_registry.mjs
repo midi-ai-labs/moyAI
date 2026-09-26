@@ -48,7 +48,7 @@ import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial
 import { createInitialSetupHubScenario, createInitialSetupHubPreferencesFailureScenario } from "./scenarios/settings_initial_setup_hub.mjs";
 import { createSharedWorkEntryScenario } from "./scenarios/shared_work_entry.mjs";
 import { createSharedWorkIsolationScenario } from "./scenarios/shared_work_isolation.mjs";
-import { createSharedWorkContinuationScenario } from "./scenarios/shared_work_continuation.mjs";
+import { createSharedWorkContinuationScenario, createProjectFolderRecoveryScenario } from "./scenarios/shared_work_continuation.mjs";
 import { createDeviceExecutionScenario } from "./scenarios/device_execution.mjs";
 import { createOnboardingWinAbScenario } from "./scenarios/onboarding_winab.mjs";
 import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
@@ -75,6 +75,7 @@ const factories = new Map([
   ["settings.shared-work", createSharedWorkEntryScenario],
   ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
   ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
+  ["settings.project-folder-recovery", createProjectFolderRecoveryScenario],
   ["run.latest-message-edit", createLocalLatestMessageEditScenario],
   ["settings.device-execution", createDeviceExecutionScenario],
   ["onboarding.win-a-to-win-b", createOnboardingWinAbScenario],
@@ -155,6 +156,7 @@ const configurableScenarios = new Set([
   "settings.shared-work",
   "settings.shared-work-isolation",
   "settings.shared-work-continuation",
+  "settings.project-folder-recovery",
   "settings.device-execution",
   "onboarding.win-a-to-win-b",
   "agent.interrupt",

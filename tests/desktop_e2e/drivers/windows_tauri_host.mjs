@@ -339,7 +339,8 @@ export class WindowsTauriHost {
     if (primary !== null) throw primary;
   }
 
-  async restart({ context, nextContext = context, scenario, sink, driver, phase = "executing" }) {
+  async restart({ context, nextContext = context, scenario, sink, driver, phase = "executing", beforeRelaunch = null }) {
+    if (beforeRelaunch !== null && typeof beforeRelaunch !== "function") throw new TypeError("beforeRelaunch must be a function");
     if (this.#parentHost !== null || this.#companions.length) throw new Error("simultaneous companion sessions must finish through common cleanup before restart");
     if (normalizeDesktopIsolation(nextContext.desktopIsolation) !== normalizeDesktopIsolation(context.desktopIsolation)) throw new Error("Desktop isolation cannot change across restart");
     if (nextContext.root !== context.root || nextContext.binary !== context.binary || nextContext.paths.logs !== context.paths.logs) {
@@ -391,6 +392,9 @@ export class WindowsTauriHost {
       profile_webviews_remaining: 0,
     }, { phase, owner: "desktop-app" });
     await sink.record("desktop-next-fixture", { paths: nextContext.paths, previous_paths: context.paths }, { phase, owner: "run-context" });
+    // Persisted-state fixtures may change only after the exact Desktop and its
+    // WebView generation have exited. The callback owns any other process it stops.
+    if (beforeRelaunch) await beforeRelaunch({ context: nextContext, previous });
     const runtime = await this.launch({ context: nextContext, scenario, sink, phase });
     const nextDriver = await this.attach({ context: nextContext, scenario, sink, runtime, phase });
     return {

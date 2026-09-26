@@ -75,28 +75,15 @@ impl SharedWorker {
         host: RunnerHost,
         mut settings: SharedSettings,
     ) -> Result<Self, RunnerError> {
-        let locally_selected = host
+        let receipts = host
             .inner
             .operations
             .lock()
             .map_err(|_| RunnerError::new("Runner operations unavailable"))?
             .installed
             .provisions
-            .iter()
-            .filter(|receipt| receipt.local_folder_environment())
-            .map(|receipt| receipt.environment_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        // A deleted or replaced user-selected folder becomes unbound. It cannot
-        // acquire a different path merely because the same saved string resolves.
-        settings.environments.retain(|mapping| {
-            !locally_selected.contains(&mapping.environment_id)
-                || std::fs::canonicalize(&mapping.directory)
-                    .ok()
-                    .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
-                    .as_ref()
-                    == Some(&mapping.directory)
-        });
-        settings.resolve()?;
+            .clone();
+        settings.resolve_installed(&receipts)?;
         let client = SharedClient::load(&settings, &host)?;
         let path = Journal::path_for(&host.inner.process.store().paths().data_dir, &settings)?;
         let journal = Journal::open(&path, &settings)?;

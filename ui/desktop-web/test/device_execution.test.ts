@@ -91,8 +91,59 @@ test("execution settings point to per-project folders and missing capabilities d
   const { local } = fixture(projection({ state: "ready", directory: "C:/Approved", access_mode: "default" }));
   const html = renderDeviceExecution(local);
   assert.match(html, /この後プロジェクトごとに選びます/);
+  assert.match(html, /既存プロジェクトの場所を変える場合は、下の「2\. プロジェクトの作業フォルダー」で選び直してください/);
   assert.doesNotMatch(html, /今後追加されるプロジェクト/);
   assert.doesNotMatch(html, /data-action="device-execution-resume"|data-action="device-execution-pause"/);
+});
+
+test("a missing project mapping gives its own reselection action without blocking another prepared project", () => {
+  for (const preparation_state of ["ready", "failed"] as const) {
+    const { local } = fixture(projection({ state: "ready", directory: "C:/NewFolders", projects: [
+      { id: "needs-folder", label: "時計アプリ", can_control: false, can_execute: true,
+        environment_id: "clock-env", directory: null, preparation_state,
+        error: preparation_state === "failed" ? "登録した作業フォルダーが見つかりません。" : null },
+      { id: "prepared", label: "TODOアプリ", can_control: true, can_execute: true,
+        environment_id: "todo-env", directory: "C:/ExistingTODO", preparation_state: "ready", error: null },
+    ] }));
+    const html = renderDeviceExecution(local);
+    assert.match(html, /このプロジェクトの新しい仕事を実行できません/);
+    assert.match(html, /data-action="bind-project-folder" data-value="needs-folder" >作業フォルダーを選び直す/);
+    assert.match(html, /data-action="bind-project-folder" data-value="prepared" >作業フォルダーを変更/);
+    assert.match(html, /作業フォルダー: C:\/ExistingTODO/);
+    assert.equal(projectFolderBindingEnabled(local, "needs-folder"), true);
+  }
+  const { local } = fixture(projection({ state: "unavailable", directory: "C:/NewFolders", error: "状態を取得できません。", projects: [
+    { id: "first-use", label: "初回設定", can_control: false, can_execute: true,
+      environment_id: "new-env", directory: null, preparation_state: "waiting_setup", error: null },
+  ] }));
+  const html = renderDeviceExecution(local);
+  assert.match(html, /data-value="first-use" >作業フォルダーを選ぶ/);
+  assert.doesNotMatch(html, /作業フォルダーを選び直す|削除|見つかりません/);
+  assert.match(html, /状態を取得できません/);
+});
+
+test("reselecting an unbound folder sends the project mapping target independently of the creation root", async () => {
+  const project = { id: "project-a", label: "時計アプリ", can_control: true, can_execute: true,
+    environment_id: "clock-env", directory: null, preparation_state: "failed" as const, error: "登録した作業フォルダーが見つかりません。" };
+  const { local, context } = fixture(projection({ state: "ready", directory: "C:/NewFolders", access_mode: "default", projects: [project] }));
+  const calls: { name: string; args: Record<string, unknown> }[] = [];
+  let polls = 0;
+  await withInvoke(async (name, args) => {
+    calls.push({ name, args });
+    if (name === "browse_shared_project_folder") return "C:/RecoveredClock";
+    if (name === "device_execution_projection") return projection({ revision: String(++polls + 1), state: "ready", directory: "C:/NewFolders", access_mode: "default",
+      projects: polls === 1 ? [project] : [{ ...project, directory: "C:/RecoveredClock", preparation_state: "ready", error: null }] });
+    if (name === "shared_work_projection") return { generation: "7" };
+    if (name === "shared_work_command") return { error: null };
+    throw new Error(`Unexpected command: ${name}`);
+  }, async () => { await bindProjectFolder(context, project.id); });
+  assert.deepEqual(calls.find(call => call.name === "shared_work_command")?.args, {
+    expectedGeneration: "7", request: { kind: "bind_project_folder", project_id: "project-a", environment_id: "clock-env",
+      directory: "C:/RecoveredClock", access_mode: "default", expected_directory: null },
+  });
+  assert.equal(local.execution!.directory, "C:/NewFolders");
+  assert.equal(local.execution!.projects[0].directory, "C:/RecoveredClock");
+  assert.equal(local.executionError, "");
 });
 
 test("first-use folder selection follows PC consent and does not open an unusable native picker", async () => {

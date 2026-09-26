@@ -197,18 +197,19 @@ async fn effect_authorization_progresses_after_http_used_on_the_local_agent_runt
 }
 
 #[tokio::test]
-async fn local_project_folder_binding_uses_existing_contents_and_reports_current_participation() {
-    let (_temp, mut settings, path) = super::tests::fixture();
-    settings.environments.clear();
-    let root = path.parent().unwrap();
-    let selected = root.join("human-existing");
-    std::fs::create_dir(&selected).unwrap();
-    std::fs::write(selected.join("ProjectBrief.md"), "partial work").unwrap();
-    let (client, requests, server) = tls_script(
+async fn project_folder_binding_uses_existing_contents_and_reports_current_participation() {
+    for template_id in ["local-folder", "desktop-default"] {
+        let (_temp, mut settings, path) = super::tests::fixture();
+        settings.environments.clear();
+        let root = path.parent().unwrap();
+        let selected = root.join("human-existing");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("ProjectBrief.md"), "partial work").unwrap();
+        let (client, requests, server) = tls_script(
         root,
         vec![
             Some((200, json!([{"id":"fresh-env","resource_id":"device-resource","capacity":1,"project_ids":["project"],"enabled":false}]))),
-            Some((200, json!([{"environment_id":"fresh-env","template_id":"local-folder","generation":1}]))),
+            Some((200, json!([{"environment_id":"fresh-env","template_id":template_id,"generation":1}]))),
             Some((200, json!({"saved":true}))),
             Some((200, json!([
                 {"id":"fresh-env","resource_id":"device-resource","capacity":1,"project_ids":[],"enabled":false},
@@ -218,7 +219,7 @@ async fn local_project_folder_binding_uses_existing_contents_and_reports_current
                 {"id":"fresh-env","resource_id":"device-resource","capacity":1,"project_ids":[],"enabled":false},
                 {"id":"next-env","resource_id":"device-resource","capacity":1,"project_ids":["project"],"enabled":false}
             ]))),
-            Some((200, json!([{"environment_id":"next-env","template_id":"local-folder","generation":1}]))),
+            Some((200, json!([{"environment_id":"next-env","template_id":template_id,"generation":1}]))),
             Some((200, json!({"saved":true}))),
             Some((200, json!({"saved":true}))),
             Some((200, json!([
@@ -226,16 +227,188 @@ async fn local_project_folder_binding_uses_existing_contents_and_reports_current
                 {"id":"next-env","resource_id":"device-resource","capacity":1,"project_ids":["project"],"enabled":true}
             ]))),
             Some((200, json!({"saved":true}))),
-            Some((200, json!([{"environment_id":"next-env","template_id":"local-folder","generation":2,"state":"failed"}]))),
+            Some((200, json!([{"environment_id":"next-env","template_id":template_id,"generation":2,"state":"failed"}]))),
             Some((200, json!([
                 {"id":"fresh-env","resource_id":"device-resource","capacity":1,"project_ids":[],"enabled":false},
                 {"id":"next-env","resource_id":"device-resource","capacity":1,"project_ids":["project"],"enabled":false}
             ]))),
-            Some((200, json!([{"environment_id":"next-env","template_id":"local-folder","generation":2,"state":"failed"}]))),
+            Some((200, json!([{"environment_id":"next-env","template_id":template_id,"generation":2,"state":"failed"}]))),
             Some((200, json!({"saved":true}))),
         ],
     )
     .await;
+        let paths = crate::storage::StoragePaths {
+            data_dir: root.join("data"),
+            database_path: root.join("data/db.sqlite3"),
+            truncation_dir: root.join("data/output"),
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let process = crate::app::AppBootstrap::create_process_runtime(
+            crate::storage::StoreBundle::new(sqlite),
+        )
+        .await
+        .unwrap();
+        let host = RunnerHost::from_process(process).unwrap();
+        let journal = Journal::open(&path, &settings).unwrap();
+        let mut controller = Controller {
+            host: host.clone(),
+            settings,
+            client,
+            journal,
+            checkpoint_cursor: String::new(),
+            commands: None,
+            external: None,
+            local_project_id: None,
+        };
+        controller
+            .bind_project_folder(
+                "project",
+                "fresh-env",
+                selected.clone(),
+                crate::config::AccessMode::Default,
+                None,
+            )
+            .await
+            .unwrap();
+        let mapping = controller.settings.mapping("fresh-env").unwrap().clone();
+        assert_eq!(
+            mapping.directory,
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(&selected).unwrap()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(selected.join("ProjectBrief.md")).unwrap(),
+            "partial work"
+        );
+        assert_eq!(std::fs::read_dir(&selected).unwrap().count(), 1);
+        let saved = host.installed_shared_settings().unwrap().unwrap();
+        assert_eq!(saved.mapping("fresh-env").unwrap(), &mapping);
+        controller.validated_resource_catalog().await.unwrap();
+        assert!(controller.settings.mapping("fresh-env").is_err());
+        assert!(controller.settings.mapping("next-env").is_err());
+        controller
+            .bind_project_folder(
+                "project",
+                "next-env",
+                selected.clone(),
+                crate::config::AccessMode::Default,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(controller.settings.mapping("fresh-env").is_err());
+        assert_eq!(
+            controller.settings.mapping("next-env").unwrap().directory,
+            mapping.directory
+        );
+        let moved = root.join("human-moved");
+        std::fs::rename(&selected, &moved).unwrap();
+        controller.sync_provisioning().await.unwrap();
+        assert!(controller.settings.mapping("next-env").is_err());
+        assert_eq!(
+            std::fs::read_to_string(moved.join("ProjectBrief.md")).unwrap(),
+            "partial work"
+        );
+        controller
+            .bind_project_folder(
+                "project",
+                "next-env",
+                moved.clone(),
+                crate::config::AccessMode::Default,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.settings.mapping("next-env").unwrap().directory,
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(&moved).unwrap()).unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let observed = requests.lock().unwrap();
+        assert_eq!(
+            observed
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/v1/shared/runner/environments",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/environments",
+                "/v1/shared/runner/environments",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/templates",
+                "/v1/shared/runner/environments",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/environments",
+                "/v1/shared/runner/provisioning",
+                "/v1/shared/runner/provisioning",
+            ]
+        );
+        assert_eq!(
+            observed[2].1,
+            json!({"environment_id":"fresh-env","template_id":template_id,"generation":1,"success":true,"error":null})
+        );
+        assert_eq!(
+            observed[6].1,
+            json!({"environment_id":"next-env","template_id":template_id,"generation":1,"success":true,"error":null})
+        );
+        assert_eq!(observed[9].1["success"], false);
+        assert_eq!(observed[9].1["template_id"], template_id);
+        assert_eq!(
+            observed[13].1,
+            json!({"environment_id":"next-env","template_id":template_id,"generation":2,"success":true,"error":null})
+        );
+        drop(observed);
+        drop(controller);
+        host.begin_shutdown().unwrap();
+        host.wait_stopped().await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_missing_folder_rebind_keeps_authority_guards_and_recovers_a_lost_ack() {
+    let (_temp, mut settings, path) = super::tests::fixture();
+    let root = path.parent().unwrap();
+    let selected = root.join("original-work");
+    let moved = root.join("moved-work");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::write(selected.join("ProjectBrief.md"), "human work").unwrap();
+    settings.environments[0].directory = selected.clone();
+    settings.resolve().unwrap();
+    let old_mapping = settings.environments[0].clone();
+    let catalog = |project: &str, enabled: bool| {
+        json!([{
+            "id":"environment", "resource_id":"device-resource", "capacity":1,
+            "project_ids":[project], "enabled":enabled
+        }])
+    };
+    let pending = json!([{"environment_id":"environment", "template_id":"desktop-default", "generation":2, "state":"failed"}]);
+    let mut responses = vec![
+        Some((200, json!({"saved":true}))),
+        Some((200, catalog("project", true))),
+        Some((200, json!({"saved":true}))),
+        Some((200, pending.clone())),
+        Some((200, catalog("another-project", false))),
+    ];
+    // Stale selection, active work, uncertain work, retained app, then an explicit rebind.
+    for _ in 0..5 {
+        responses.push(Some((200, catalog("project", false))));
+        responses.push(Some((200, pending.clone())));
+    }
+    responses.push(None); // The local rebind is durable, but the Hub acknowledgement is lost.
+    responses.extend([
+        Some((200, json!({"saved":true}))),
+        Some((200, catalog("project", false))),
+        Some((200, pending.clone())),
+        Some((200, json!({"saved":true}))),
+    ]);
+    let (client, requests, server) = tls_script(root, responses).await;
     let paths = crate::storage::StoragePaths {
         data_dir: root.join("data"),
         database_path: root.join("data/db.sqlite3"),
@@ -248,6 +421,29 @@ async fn local_project_folder_binding_uses_existing_contents_and_reports_current
             .await
             .unwrap();
     let host = RunnerHost::from_process(process).unwrap();
+    {
+        let mut store = host.inner.operations.lock().unwrap();
+        let mut installed = store.installed.clone();
+        installed.settings = Some(settings.clone());
+        installed.provisions.push(
+            serde_json::from_value(json!({
+                "environment_id":"environment", "template_id":"desktop-default",
+                "generation":1, "success":true, "error":null
+            }))
+            .unwrap(),
+        );
+        store.update(installed).unwrap();
+    }
+    std::fs::rename(&selected, &moved).unwrap();
+    {
+        let mut store = host.inner.operations.lock().unwrap();
+        settings
+            .resolve_installed(&store.installed.provisions)
+            .unwrap();
+        let mut installed = store.installed.clone();
+        installed.settings = Some(settings.clone());
+        store.update(installed).unwrap();
+    }
     let journal = Journal::open(&path, &settings).unwrap();
     let mut controller = Controller {
         host: host.clone(),
@@ -259,107 +455,153 @@ async fn local_project_folder_binding_uses_existing_contents_and_reports_current
         external: None,
         local_project_id: None,
     };
-    controller
-        .bind_project_folder(
-            "project",
-            "fresh-env",
-            selected.clone(),
-            crate::config::AccessMode::Default,
-            None,
-        )
-        .await
-        .unwrap();
-    let mapping = controller.settings.mapping("fresh-env").unwrap().clone();
-    assert_eq!(
-        mapping.directory,
-        camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(&selected).unwrap()).unwrap()
-    );
-    assert_eq!(
-        std::fs::read_to_string(selected.join("ProjectBrief.md")).unwrap(),
-        "partial work"
-    );
-    assert_eq!(std::fs::read_dir(&selected).unwrap().count(), 1);
-    let saved = host.installed_shared_settings().unwrap().unwrap();
-    assert_eq!(saved.mapping("fresh-env").unwrap(), &mapping);
-    controller.validated_resource_catalog().await.unwrap();
-    assert!(controller.settings.mapping("fresh-env").is_err());
-    assert!(controller.settings.mapping("next-env").is_err());
-    controller
-        .bind_project_folder(
-            "project",
-            "next-env",
-            selected.clone(),
-            crate::config::AccessMode::Default,
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(controller.settings.mapping("fresh-env").is_err());
-    assert_eq!(
-        controller.settings.mapping("next-env").unwrap().directory,
-        mapping.directory
-    );
-    let moved = root.join("human-moved");
-    std::fs::rename(&selected, &moved).unwrap();
     controller.sync_provisioning().await.unwrap();
-    assert!(controller.settings.mapping("next-env").is_err());
     assert_eq!(
-        std::fs::read_to_string(moved.join("ProjectBrief.md")).unwrap(),
-        "partial work"
+        requests.lock().unwrap().len(),
+        4,
+        "Missing legacy folders must wait for explicit selection"
+    );
+    assert!(!selected.exists());
+    assert!(controller.settings.mapping("environment").is_err());
+    let access = crate::config::AccessMode::Default;
+    assert!(
+        controller
+            .bind_project_folder("project", "environment", moved.clone(), access, None)
+            .await
+            .unwrap_err()
+            .message
+            .contains("no longer belongs")
+    );
+    assert!(
+        controller
+            .bind_project_folder(
+                "project",
+                "environment",
+                moved.clone(),
+                access,
+                Some(old_mapping.directory.clone())
+            )
+            .await
+            .unwrap_err()
+            .message
+            .contains("previously selected")
+    );
+    let mut entry = controller
+        .journal
+        .intent(super::tests::assignment(), old_mapping.clone())
+        .unwrap();
+    assert!(
+        controller
+            .bind_project_folder("project", "environment", moved.clone(), access, None)
+            .await
+            .unwrap_err()
+            .message
+            .contains("Stop this PC")
+    );
+    controller.journal.executing(&mut entry).unwrap();
+    controller
+        .journal
+        .uncertain(&mut entry, "Restart requires review")
+        .unwrap();
+    assert!(
+        controller
+            .bind_project_folder("project", "environment", moved.clone(), access, None)
+            .await
+            .unwrap_err()
+            .message
+            .contains("Stop this PC")
+    );
+    let report = Report::for_assignment(
+        &entry.assignment,
+        "reviewed",
+        ReportOutcome::Finished {
+            success: false,
+            result: json!({"reviewed":true}),
+            resources_released: true,
+        },
+    );
+    controller.journal.reconciled(&mut entry, report).unwrap();
+    controller.journal.settled(&mut entry).unwrap();
+    let mut assignment = super::tests::assignment();
+    assignment.attempt_id = "retained-attempt".into();
+    let mut retained = controller.journal.intent(assignment, old_mapping).unwrap();
+    let report = Report::for_assignment(
+        &retained.assignment,
+        "preview",
+        ReportOutcome::Finished {
+            success: true,
+            result: json!({"preview":true}),
+            resources_released: false,
+        },
     );
     controller
-        .bind_project_folder(
-            "project",
-            "next-env",
-            moved.clone(),
-            crate::config::AccessMode::Default,
+        .journal
+        .outcome_with_retention(
+            &mut retained,
+            report,
             None,
+            Some(crate::tool::shell::RetainedService {
+                service_id: ulid::Ulid::new(),
+                expires_at_ms: u64::MAX,
+                retain_after_turn: true,
+            }),
         )
-        .await
+        .unwrap();
+    controller.journal.settled(&mut retained).unwrap();
+    assert!(
+        controller
+            .bind_project_folder("project", "environment", moved.clone(), access, None)
+            .await
+            .unwrap_err()
+            .message
+            .contains("Stop this PC")
+    );
+    controller.journal.service_stopped(&mut retained).unwrap();
+    assert!(
+        controller
+            .bind_project_folder("project", "environment", moved.clone(), access, None)
+            .await
+            .is_err()
+    );
+    let reopened = crate::runner::operations::OperationsStore::open(&paths.data_dir).unwrap();
+    controller.settings = reopened.installed.settings.clone().unwrap();
+    controller
+        .settings
+        .resolve_installed(&reopened.installed.provisions)
         .unwrap();
     assert_eq!(
-        controller.settings.mapping("next-env").unwrap().directory,
+        controller
+            .settings
+            .mapping("environment")
+            .unwrap()
+            .directory,
         camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(&moved).unwrap()).unwrap()
     );
+    controller.sync_provisioning().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
         .unwrap();
     let observed = requests.lock().unwrap();
+    assert_eq!(observed.len(), 20);
+    let reports = observed
+        .iter()
+        .filter(|(path, body)| path == "/v1/shared/runner/provisioning" && body.is_object())
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 3);
+    for (_, report) in &reports {
+        assert_eq!(report["template_id"], "desktop-default");
+    }
+    assert_eq!(reports[0].1["generation"], 1);
+    assert_eq!(reports[1].1["generation"], 2);
+    assert_eq!(reports[2].1["generation"], 2);
+    assert_eq!(reports[0].1["success"], false);
+    assert_eq!(reports[1].1["success"], true);
+    assert_eq!(reports[2].1["success"], true);
+    assert!(!selected.exists());
     assert_eq!(
-        observed
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "/v1/shared/runner/environments",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/environments",
-            "/v1/shared/runner/environments",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/templates",
-            "/v1/shared/runner/environments",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/environments",
-            "/v1/shared/runner/provisioning",
-            "/v1/shared/runner/provisioning",
-        ]
-    );
-    assert_eq!(
-        observed[2].1,
-        json!({"environment_id":"fresh-env","template_id":"local-folder","generation":1,"success":true,"error":null})
-    );
-    assert_eq!(
-        observed[6].1,
-        json!({"environment_id":"next-env","template_id":"local-folder","generation":1,"success":true,"error":null})
-    );
-    assert_eq!(observed[9].1["success"], false);
-    assert_eq!(
-        observed[13].1,
-        json!({"environment_id":"next-env","template_id":"local-folder","generation":2,"success":true,"error":null})
+        std::fs::read_to_string(moved.join("ProjectBrief.md")).unwrap(),
+        "human work"
     );
     drop(observed);
     drop(controller);

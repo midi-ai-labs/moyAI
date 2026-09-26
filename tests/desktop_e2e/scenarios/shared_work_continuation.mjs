@@ -13,14 +13,18 @@ import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.
 import { action, byId, hubSettingsCloseTarget, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
 import { openHubProjectSurface, sharedActionTarget } from "./shared_work_navigation.mjs";
 import { quiesceDeviceExecutionResources } from "./device_execution.mjs";
+import { exerciseProjectFolderRecovery } from "./project_folder_recovery.mjs";
 
-const ID = "settings.shared-work-continuation", OWNER = `scenario:${ID}`;
 const fail = (message, evidence = {}) => new DesktopE2eError("product", "shared-continuation-mismatch", message, evidence);
 export const sameFixtureFolder = (actual, expected) => typeof actual === "string"
   && path.toNamespacedPath(path.resolve(actual)).toLowerCase() === path.toNamespacedPath(path.resolve(expected)).toLowerCase();
 
 /** One actual Desktop and its independent Runner exercise the normal Hub chat twice. */
-export function createSharedWorkContinuationScenario(options = {}) {
+export function createProjectFolderRecoveryScenario(options = {}) {
+  return createSharedWorkContinuationScenario(options, true);
+}
+export function createSharedWorkContinuationScenario(options = {}, folderRecovery = false) {
+  const ID = folderRecovery ? "settings.project-folder-recovery" : "settings.shared-work-continuation", OWNER = `scenario:${ID}`;
   const { runnerBinary, runnerTestBinary, ...hubOptions } = options;
   const settings = normalizeHubBrowserOptions(hubOptions);
   const state = { resource: null, provider: null, runner: null, input: null, close: null, environment: {},
@@ -43,7 +47,8 @@ export function createSharedWorkContinuationScenario(options = {}) {
         { phase: args.phase, owner: OWNER });
     },
     requestGracefulExit: cdp => requestHubEnrollmentExit(cdp, state),
-    async execute({ context, runtime, driver: cdp, sink }) {
+    async execute({ context, runtime, driver, host, sink }) {
+      let cdp = driver;
       const { page, hub } = state.resource;
       const shared = () => invokeDesktopCommand(cdp, "shared_work_projection");
       const execution = () => invokeDesktopCommand(cdp, "device_execution_projection");
@@ -150,7 +155,7 @@ export function createSharedWorkContinuationScenario(options = {}) {
         const assigned = await wait("Hub assigns this PC's exact project environment", execution,
           p => p.projects.some(row => row.id === projectId && row.can_control && row.can_execute && row.environment_id), 60000);
         const environmentId = assigned.projects.find(row => row.id === projectId).environment_id;
-        const projectFolder = path.join(context.paths.workspace, "shared-conversation"); await mkdir(projectFolder);
+        const projectFolder = path.join(folderRecovery ? approvedRoot : context.paths.workspace, "shared-conversation"); await mkdir(projectFolder);
         await chooseFolder(action("bind-project-folder"), projectFolder);
         await wait("The chosen existing folder is bound to this project", execution,
           p => p.projects.some(row => row.id === projectId && row.environment_id === environmentId
@@ -158,6 +163,12 @@ export function createSharedWorkContinuationScenario(options = {}) {
         const operations = (await state.runner.command(["operations", "--runner", runner.identity.runner_id])).projection;
         if (!sameFixtureFolder(operations.environments.find(row => row.environment_id === environmentId)?.directory, projectFolder))
           throw fail("The independent Runner did not adopt the chosen project folder");
+        if (folderRecovery) {
+          return await exerciseProjectFolderRecovery({ context, runtime, cdp, host, sink, scenario: this, state,
+            projectId, environmentId, approvedRoot, projectFolder, runnerBinary, runnerTestBinary,
+            chooseFolder, click, settleInput, execution,
+            updateRuntime(next) { cdp = next.driver; runtime = next.runtime; } });
+        }
         await click(hubSettingsCloseTarget);
         await wait("The ordinary shell is visible", () => invokeDesktopCommand(cdp, "desktop_state"), p => p.overlay === "none");
         await wait("The assigned Hub project appears in the ordinary sidebar", shared, p => p.projects.some(row => row.id === projectId && row.can_submit));

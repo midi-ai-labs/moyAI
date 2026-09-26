@@ -3,6 +3,13 @@ use super::*;
 
 const LOCAL_FOLDER_TEMPLATE_ID: &str = "local-folder";
 
+fn project_folder_template(template_id: &str) -> bool {
+    matches!(
+        template_id,
+        crate::runner::provision::DESKTOP_TEMPLATE_ID | LOCAL_FOLDER_TEMPLATE_ID
+    )
+}
+
 #[derive(Clone, Deserialize)]
 pub(super) struct Environment {
     pub(super) id: String,
@@ -22,16 +29,11 @@ pub(crate) struct ProvisionDelivery {
     error: Option<String>,
 }
 impl ProvisionDelivery {
-    pub(crate) fn local_folder_environment(&self) -> bool {
-        self.success && self.template_id == LOCAL_FOLDER_TEMPLATE_ID
+    pub(crate) fn project_folder_environment(&self) -> bool {
+        self.success && project_folder_template(&self.template_id)
     }
     pub(crate) fn desktop_environment(&self, environment_id: &str) -> bool {
-        self.environment_id == environment_id
-            && self.success
-            && matches!(
-                self.template_id.as_str(),
-                crate::runner::provision::DESKTOP_TEMPLATE_ID | LOCAL_FOLDER_TEMPLATE_ID
-            )
+        self.environment_id == environment_id && self.project_folder_environment()
     }
 }
 #[derive(Deserialize)]
@@ -112,7 +114,7 @@ impl Controller {
                 .installed
                 .provisions
                 .iter()
-                .filter(|receipt| receipt.local_folder_environment())
+                .filter(|receipt| receipt.project_folder_environment())
                 .filter(|receipt| {
                     catalog
                         .iter()
@@ -175,7 +177,7 @@ impl Controller {
             .installed
             .provisions
             .iter()
-            .filter(|receipt| receipt.local_folder_environment())
+            .filter(|receipt| receipt.project_folder_environment())
             .cloned()
             .collect::<Vec<_>>();
         let missing = receipts
@@ -185,13 +187,7 @@ impl Controller {
                     .environments
                     .iter()
                     .find(|mapping| mapping.environment_id == receipt.environment_id)
-                    .is_none_or(|mapping| {
-                        std::fs::canonicalize(&mapping.directory)
-                            .ok()
-                            .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
-                            .as_ref()
-                            != Some(&mapping.directory)
-                    })
+                    .is_none_or(|mapping| !mapping.directory_is_current())
             })
             .collect::<Vec<_>>();
         if missing.is_empty() {
@@ -237,10 +233,10 @@ impl Controller {
     ) -> Result<(), RunnerError> {
         let report = ProvisionDelivery {
             environment_id: receipt.environment_id.clone(),
-            template_id: LOCAL_FOLDER_TEMPLATE_ID.into(),
+            template_id: receipt.template_id.clone(),
             generation: receipt.generation,
             success: false,
-            error: Some("The selected project folder is missing or changed on this PC".into()),
+            error: Some("このPCで作業フォルダーを利用できません。削除・移動や共有先への接続を確認し、作業フォルダーを選び直してください。".into()),
         };
         let _: serde_json::Value = self
             .client
@@ -278,7 +274,9 @@ impl Controller {
             .await?;
         if pending.iter().any(|request| {
             request.environment_id == environment_id
-                && request.template_id == LOCAL_FOLDER_TEMPLATE_ID
+                && (request.template_id == LOCAL_FOLDER_TEMPLATE_ID
+                    || (project_folder_template(&request.template_id)
+                        && request.state.as_deref() == Some("failed")))
         }) {
             return Err(RunnerError::new(
                 "Choose this project's existing folder on this PC instead of creating a template folder",
@@ -363,7 +361,7 @@ impl Controller {
             .await?;
         let pending = pending.iter().find(|request| {
             request.environment_id == environment_id
-                && request.template_id == LOCAL_FOLDER_TEMPLATE_ID
+                && project_folder_template(&request.template_id)
         });
         let current = self
             .settings
@@ -380,7 +378,7 @@ impl Controller {
             .provisions
             .iter()
             .find(|receipt| {
-                receipt.environment_id == environment_id && receipt.local_folder_environment()
+                receipt.environment_id == environment_id && receipt.project_folder_environment()
             })
             .cloned();
         if current.is_none()
@@ -469,7 +467,14 @@ impl Controller {
             }
             installed.provisions.push(ProvisionDelivery {
                 environment_id: environment_id.into(),
-                template_id: LOCAL_FOLDER_TEMPLATE_ID.into(),
+                template_id: pending
+                    .map(|request| request.template_id.clone())
+                    .or_else(|| {
+                        previously_selected
+                            .as_ref()
+                            .map(|receipt| receipt.template_id.clone())
+                    })
+                    .unwrap_or_else(|| LOCAL_FOLDER_TEMPLATE_ID.into()),
                 generation: pending
                     .map(|request| request.generation)
                     .or_else(|| {
@@ -493,7 +498,7 @@ impl Controller {
     async fn report_local_folder_ready(&mut self, request: &Request) -> Result<(), RunnerError> {
         let receipt = ProvisionDelivery {
             environment_id: request.environment_id.clone(),
-            template_id: LOCAL_FOLDER_TEMPLATE_ID.into(),
+            template_id: request.template_id.clone(),
             generation: request.generation,
             success: true,
             error: None,
@@ -538,7 +543,7 @@ impl Controller {
             .installed
             .provisions
             .iter()
-            .any(ProvisionDelivery::local_folder_environment);
+            .any(ProvisionDelivery::project_folder_environment);
         if has_local_folders {
             let catalog = self.resource_catalog().await?;
             self.retire_removed_local_folders(&catalog)?;
@@ -553,23 +558,43 @@ impl Controller {
         if pending.len() > 128 {
             return Err(RunnerError::new("Provision request bound exceeded"));
         }
+        let receipts = self
+            .host
+            .inner
+            .operations
+            .lock()
+            .map_err(|_| RunnerError::new("Runner operations unavailable"))?
+            .installed
+            .provisions
+            .clone();
         for request in pending.iter().filter(|request| {
-            request.template_id == LOCAL_FOLDER_TEMPLATE_ID
-                && request.state.as_deref().unwrap_or("pending") == "pending"
+            project_folder_template(&request.template_id)
+                && matches!(
+                    request.state.as_deref().unwrap_or("pending"),
+                    "pending" | "failed"
+                )
+                && (request.template_id == LOCAL_FOLDER_TEMPLATE_ID
+                    || receipts.iter().any(|receipt| {
+                        receipt.environment_id == request.environment_id
+                            && receipt.template_id == request.template_id
+                            && receipt.generation == request.generation
+                            && receipt.project_folder_environment()
+                    }))
         }) {
-            if self
-                .settings
-                .environments
-                .iter()
-                .any(|mapping| mapping.environment_id == request.environment_id)
-            {
+            if self.settings.environments.iter().any(|mapping| {
+                mapping.environment_id == request.environment_id && mapping.directory_is_current()
+            }) {
                 self.report_local_folder_ready(request).await?;
             }
         }
-        let Some(request) = pending
-            .into_iter()
-            .find(|request| request.template_id != LOCAL_FOLDER_TEMPLATE_ID)
-        else {
+        let Some(request) = pending.into_iter().find(|request| {
+            request.template_id != LOCAL_FOLDER_TEMPLATE_ID
+                && request.state.as_deref().unwrap_or("pending") == "pending"
+                && !receipts.iter().any(|receipt| {
+                    receipt.environment_id == request.environment_id
+                        && receipt.project_folder_environment()
+                })
+        }) else {
             return Ok(());
         };
         let existing = self

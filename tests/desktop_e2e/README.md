@@ -276,6 +276,8 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 `run.latest-message-edit` はローカルチャットで完了済みの最新依頼だけに編集ボタンが出ること、編集で元の会話を保持した新チャットへ分岐し、元の本文が入力欄に戻ること、修正して再送できることを実Tauri画面で確認する。実行先やHubの設定は不要で、隔離したscripted providerを使う。
 
+`settings.project-folder-recovery` は `settings.shared-work-continuation` と同じ初期設定・Hub登録・native pickerを使い、既存フォルダーを選んだ後にDesktopとRunnerを停止する。隔離fixtureのHub/Runner双方を旧 `desktop-default` 形式へ合わせ、作成先ごとフォルダーを移動してから再起動する。実行機能が起動したまま対象プロジェクトの問題と選び直し操作を表示すること、GUIから作業フォルダーと新規作成先をそれぞれ保存できること、再度両プロセスを起動しても保存先・既存ファイルを保持し、古いフォルダーを勝手に再作成しないことを確認する。共通hostの `beforeRelaunch` は対象Desktop/WebViewが完全に終了した後だけfixture準備を行い、独立Runnerはscenario自身が正確な所有情報で停止する。Hub/Runnerの構造を旧形式にする操作はfixture準備であり、復旧操作は実GUIを通す。物理別PC・UNC疎通は対象外。実行引数とscenario configは `settings.shared-work-continuation` と共通で、scenario名だけを指定し直す。
+
 共有チャットの入力欄は、ローカルと同じく自然文を送る導線とする。実行先はHubの許可範囲を参照して自動で決まり、送信画面にPC・仕事種別・タイトルの指定欄を置かない。
 
 共通native path helperは既存fileを選ぶ `open`、execution配下の既存folderを選ぶ `directory`、execution配下の既存parentへ新fileを保存する `save_new` の意図を明示する。対象HWND・controlの照合とfile名のreadbackを経て確認buttonを一度だけ押し、別意図のdelivery evidenceや上書き確認への暗黙fallbackを受理しない。
