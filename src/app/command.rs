@@ -107,6 +107,8 @@ pub struct App {
     pub session_event_hub: SessionRuntimeEventHub,
     pub(crate) resolved_run_session_id: Option<SessionId>,
     pub(crate) process_runtime: AppProcessRuntime,
+    /// Keeps the process's approved device connection alive for CLI, TUI, and Desktop agents.
+    pub(crate) device_network: Option<crate::device_network::DeviceNetworkService>,
 }
 
 impl App {

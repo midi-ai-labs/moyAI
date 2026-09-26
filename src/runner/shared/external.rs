@@ -2,7 +2,9 @@
 use super::super::{RunnerCommand, RunnerResponse};
 use super::*;
 use camino::Utf8PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock, Weak};
 use ulid::Ulid;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -305,15 +307,65 @@ impl RunnerHost {
 }
 
 #[derive(Clone)]
-pub(crate) struct LocalResourceLease(Arc<LeaseInner>);
+pub(crate) struct LocalResourceLease(Arc<LeaseInner>, Arc<TurnMonitor>);
 struct LeaseInner {
     config: Utf8PathBuf,
+    workspace: String,
     runner: Ulid,
     assignment: Assignment,
     _file: std::fs::File,
     _resource: crate::runtime::resource_admission::ResourceGuard,
-    monitor_stop: tokio_util::sync::CancellationToken,
-    monitor_finished: tokio_util::sync::CancellationToken,
+    turns: Mutex<LeaseTurns>,
+}
+struct LeaseTurns {
+    session_id: Option<crate::session::SessionId>,
+    active: usize,
+    finishing: bool,
+    success: bool,
+    result: serde_json::Value,
+}
+impl LeaseTurns {
+    fn join(&mut self, session_id: crate::session::SessionId) -> bool {
+        if self.finishing || self.session_id != Some(session_id) {
+            return false;
+        }
+        self.active += 1;
+        true
+    }
+
+    fn leave(&mut self, success: bool, result: serde_json::Value) -> Result<bool, RunnerError> {
+        if self.finishing || self.active == 0 {
+            return Err(RunnerError::new(
+                "Local resource turn was already completed",
+            ));
+        }
+        self.active -= 1;
+        self.success &= success;
+        self.result = result;
+        if self.active == 0 {
+            self.finishing = true;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+struct TurnMonitor {
+    stop: tokio_util::sync::CancellationToken,
+    finished: tokio_util::sync::CancellationToken,
+}
+impl TurnMonitor {
+    fn new() -> Self {
+        Self {
+            stop: tokio_util::sync::CancellationToken::new(),
+            finished: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+}
+fn live_local_leases() -> &'static Mutex<HashMap<crate::session::SessionId, Weak<LeaseInner>>> {
+    static LEASES: OnceLock<Mutex<HashMap<crate::session::SessionId, Weak<LeaseInner>>>> =
+        OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 struct MonitorFinished(tokio_util::sync::CancellationToken);
 impl Drop for MonitorFinished {
@@ -322,15 +374,146 @@ impl Drop for MonitorFinished {
     }
 }
 impl LocalResourceLease {
+    fn try_reenter(
+        session_id: crate::session::SessionId,
+        binding: &crate::runtime::resource_admission::PublishedRoot,
+        directory: &camino::Utf8Path,
+        project_id: Option<&str>,
+        control: &crate::runtime::RunControl,
+    ) -> Result<Option<Self>, RunnerError> {
+        Self::try_reenter_checked(
+            session_id,
+            binding,
+            directory,
+            project_id,
+            control,
+            |lease| {
+                crate::runtime::ExternalEffectAuthority::authorize(lease, None)
+                    .map_err(RunnerError::new)
+            },
+        )
+    }
+
+    fn try_reenter_checked(
+        session_id: crate::session::SessionId,
+        binding: &crate::runtime::resource_admission::PublishedRoot,
+        directory: &camino::Utf8Path,
+        project_id: Option<&str>,
+        control: &crate::runtime::RunControl,
+        authorize: impl FnOnce(&Self) -> Result<(), RunnerError>,
+    ) -> Result<Option<Self>, RunnerError> {
+        let candidate = {
+            let index = live_local_leases()
+                .lock()
+                .map_err(|_| RunnerError::new("Local resource index unavailable"))?;
+            index.get(&session_id).and_then(Weak::upgrade)
+        };
+        let Some(inner) = candidate else {
+            return Ok(None);
+        };
+        if inner.config != binding.config_path
+            || inner.workspace != crate::workspace::PathGuard::stable_identity_key(directory)
+        {
+            return Err(RunnerError::new(
+                "This session's running preview belongs to another workspace or resource provider",
+            ));
+        }
+        if project_id.is_some_and(|project| project != inner.assignment.job.project_id) {
+            return Err(RunnerError::new(
+                "This session's running preview belongs to another Hub project",
+            ));
+        }
+        let lease = Self(inner.clone(), Arc::new(TurnMonitor::new()));
+        authorize(&lease)?;
+        {
+            let index = live_local_leases()
+                .lock()
+                .map_err(|_| RunnerError::new("Local resource index unavailable"))?;
+            if !index
+                .get(&session_id)
+                .and_then(Weak::upgrade)
+                .is_some_and(|current| Arc::ptr_eq(&current, &inner))
+            {
+                return Ok(None);
+            }
+            let mut turns = inner
+                .turns
+                .lock()
+                .map_err(|_| RunnerError::new("Local resource turn state unavailable"))?;
+            if !turns.join(session_id) {
+                return Ok(None);
+            }
+        }
+        control.set_effect_authority(Arc::new(LocalResourceAuthority(Arc::downgrade(&lease.0))));
+        Ok(Some(lease))
+    }
+
+    fn settle_turn(
+        &self,
+        success: bool,
+        result: serde_json::Value,
+    ) -> Result<Option<(bool, serde_json::Value)>, RunnerError> {
+        let mut index = live_local_leases()
+            .lock()
+            .map_err(|_| RunnerError::new("Local resource index unavailable"))?;
+        let mut turns = self
+            .0
+            .turns
+            .lock()
+            .map_err(|_| RunnerError::new("Local resource turn state unavailable"))?;
+        if !turns.leave(success, result)? {
+            return Ok(None);
+        }
+        if let Some(session_id) = turns.session_id {
+            if index
+                .get(&session_id)
+                .and_then(Weak::upgrade)
+                .is_some_and(|current| Arc::ptr_eq(&current, &self.0))
+            {
+                index.remove(&session_id);
+            }
+        }
+        Ok(Some((turns.success, turns.result.clone())))
+    }
+
+    pub(crate) fn bind_session(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<(), RunnerError> {
+        let mut index = live_local_leases()
+            .lock()
+            .map_err(|_| RunnerError::new("Local resource index unavailable"))?;
+        let mut turns = self
+            .0
+            .turns
+            .lock()
+            .map_err(|_| RunnerError::new("Local resource turn state unavailable"))?;
+        if turns.finishing || turns.session_id.is_some_and(|old| old != session_id) {
+            return Err(RunnerError::new("Local resource session ownership changed"));
+        }
+        if index
+            .get(&session_id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|old| !Arc::ptr_eq(&old, &self.0))
+        {
+            return Err(RunnerError::new(
+                "This session has another local resource owner",
+            ));
+        }
+        turns.session_id = Some(session_id);
+        index.insert(session_id, Arc::downgrade(&self.0));
+        Ok(())
+    }
+
     pub(crate) fn watch(
         &self,
         service: Arc<crate::app::RunService>,
         control: crate::runtime::RunControl,
     ) -> impl std::future::Future<Output = ()> + 'static {
         let weak = Arc::downgrade(&self.0);
-        let stop = self.0.monitor_stop.clone();
+        let stop = self.1.stop.clone();
         // Created outside the future so abandoning an unpolled worker also acknowledges it.
-        let finished = MonitorFinished(self.0.monitor_finished.clone());
+        let finished = MonitorFinished(self.1.finished.clone());
         async move {
             let _finished = finished;
             loop {
@@ -394,6 +577,7 @@ impl LocalResourceLease {
         control: &crate::runtime::RunControl,
         title: &str,
         caller: ResourceCaller,
+        session_id: Option<crate::session::SessionId>,
     ) -> Result<Option<Self>, RunnerError> {
         let Some(binding) = crate::runtime::resource_admission::for_workspace(directory)? else {
             return Ok(None);
@@ -402,6 +586,23 @@ impl LocalResourceLease {
             return Err(RunnerError::new(
                 "This Windows device provides shared resources under another OS account. Submit a Hub shared job to its Runner; direct Desktop, CLI, TUI, and legacy MCP execution from this account is unavailable.",
             ));
+        }
+        if matches!(caller, ResourceCaller::Local) {
+            if let Some(session_id) = session_id {
+                let project_id = store
+                    .device_network()
+                    .and_then(|network| network.local_resource_human())
+                    .map(|human| human.project_id);
+                if let Some(lease) = Self::try_reenter(
+                    session_id,
+                    &binding,
+                    directory,
+                    project_id.as_deref(),
+                    control,
+                )? {
+                    return Ok(Some(lease));
+                }
+            }
         }
         let human = participant_human(
             caller,
@@ -414,6 +615,7 @@ impl LocalResourceLease {
         let config = binding.config_path;
         let resource_scope = binding.scope.clone();
         let resource_directory = binding.directory.clone();
+        let workspace = crate::workspace::PathGuard::stable_identity_key(directory);
         let target = config.clone();
         let directory = directory.to_owned();
         let title = title.chars().take(256).collect::<String>();
@@ -450,15 +652,24 @@ impl LocalResourceLease {
             &resource_scope,
             &resource_directory,
         )?;
-        let lease = Self(Arc::new(LeaseInner {
-            config,
-            runner,
-            assignment,
-            _file: file,
-            _resource: resource,
-            monitor_stop: tokio_util::sync::CancellationToken::new(),
-            monitor_finished: tokio_util::sync::CancellationToken::new(),
-        }));
+        let lease = Self(
+            Arc::new(LeaseInner {
+                config,
+                workspace,
+                runner,
+                assignment,
+                _file: file,
+                _resource: resource,
+                turns: Mutex::new(LeaseTurns {
+                    session_id: None,
+                    active: 1,
+                    finishing: false,
+                    success: true,
+                    result: serde_json::Value::Null,
+                }),
+            }),
+            Arc::new(TurnMonitor::new()),
+        );
         control.set_effect_authority(Arc::new(LocalResourceAuthority(Arc::downgrade(&lease.0))));
         Ok(Some(lease))
     }
@@ -469,6 +680,7 @@ impl LocalResourceLease {
         _: &crate::runtime::RunControl,
         _: &str,
         _: ResourceCaller,
+        _: Option<crate::session::SessionId>,
     ) -> Result<Option<Self>, RunnerError> {
         Ok(None)
     }
@@ -477,8 +689,11 @@ impl LocalResourceLease {
         success: bool,
         result: serde_json::Value,
     ) -> Result<(), RunnerError> {
-        self.0.monitor_stop.cancel();
-        self.0.monitor_finished.cancelled().await;
+        self.1.stop.cancel();
+        self.1.finished.cancelled().await;
+        let Some((success, result)) = self.settle_turn(success, result)? else {
+            return Ok(());
+        };
         #[cfg(windows)]
         {
             let this = self.clone();
@@ -516,6 +731,146 @@ impl LocalResourceLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn same_session_preview_reentry_holds_one_resource_until_last_turn_leaves() {
+        let session = crate::session::SessionId::new();
+        let other = crate::session::SessionId::new();
+        let mut turns = LeaseTurns {
+            session_id: Some(session),
+            active: 1,
+            finishing: false,
+            success: true,
+            result: serde_json::Value::Null,
+        };
+        assert!(!turns.join(other));
+        assert!(turns.join(session));
+        assert!(!turns.leave(true, json!({"turn":1})).unwrap());
+        assert_eq!(turns.active, 1);
+        assert!(turns.join(session));
+        assert!(!turns.leave(false, json!({"turn":2})).unwrap());
+        assert!(turns.leave(true, json!({"turn":3})).unwrap());
+        assert!(turns.finishing);
+        assert!(!turns.success);
+        assert_eq!(turns.result, json!({"turn":3}));
+        assert!(!turns.join(session));
+        assert!(turns.leave(true, json!({"turn":4})).is_err());
+    }
+    #[test]
+    fn exact_local_reentry_rejects_foreign_scope_and_keeps_physical_slot_until_final_turn() {
+        let (temp, _, _) = super::super::tests::fixture();
+        let root = camino::Utf8Path::from_path(temp.path()).unwrap();
+        let scope = ResourceScope::WorkspaceIsolation { confirmed: true };
+        let binding = crate::runtime::resource_admission::PublishedRoot {
+            hub_id: "hub".into(),
+            device_id: "device".into(),
+            environment_id: "environment".into(),
+            directory: root.to_owned(),
+            config_path: root.join("config.toml"),
+            scope: scope.clone(),
+            operator_sid: String::new(),
+        };
+        let resource =
+            crate::runtime::resource_admission::ResourceGuard::acquire(&scope, root).unwrap();
+        let session = crate::session::SessionId::new();
+        let first = LocalResourceLease(
+            Arc::new(LeaseInner {
+                config: binding.config_path.clone(),
+                workspace: crate::workspace::PathGuard::stable_identity_key(root),
+                runner: Ulid::new(),
+                assignment: super::super::tests::assignment(),
+                _file: std::fs::File::create(root.join("owner.lock")).unwrap(),
+                _resource: resource,
+                turns: Mutex::new(LeaseTurns {
+                    session_id: None,
+                    active: 1,
+                    finishing: false,
+                    success: true,
+                    result: serde_json::Value::Null,
+                }),
+            }),
+            Arc::new(TurnMonitor::new()),
+        );
+        first.bind_session(session).unwrap();
+        let control = crate::runtime::RunControl::new();
+        let reenter = |who,
+                       binding: &crate::runtime::resource_admission::PublishedRoot,
+                       directory,
+                       project,
+                       allow| {
+            LocalResourceLease::try_reenter_checked(
+                who,
+                binding,
+                directory,
+                project,
+                &control,
+                |_| {
+                    if allow {
+                        Ok(())
+                    } else {
+                        Err(RunnerError::new("Hub attempt stopped or unknown"))
+                    }
+                },
+            )
+        };
+        assert!(
+            reenter(
+                crate::session::SessionId::new(),
+                &binding,
+                root,
+                Some("project"),
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        let other_workspace = root.join("other");
+        assert!(reenter(session, &binding, &other_workspace, Some("project"), true).is_err());
+        let mut other_config = binding.clone();
+        other_config.config_path = root.join("other.toml");
+        assert!(reenter(session, &other_config, root, Some("project"), true).is_err());
+        assert!(reenter(session, &binding, root, Some("other-project"), true).is_err());
+        for _ in 0..2 {
+            assert!(reenter(session, &binding, root, Some("project"), false).is_err());
+        }
+        assert_eq!(first.0.turns.lock().unwrap().active, 1);
+        let second = reenter(session, &binding, root, Some("project"), true)
+            .unwrap()
+            .expect("same-session owner reentry");
+        assert_eq!(first.0.turns.lock().unwrap().active, 2);
+        assert!(crate::runtime::resource_admission::ResourceGuard::acquire(&scope, root).is_err());
+        assert!(
+            first
+                .settle_turn(true, json!({"turn":1}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            live_local_leases()
+                .lock()
+                .unwrap()
+                .get(&session)
+                .and_then(Weak::upgrade)
+                .is_some()
+        );
+        assert!(crate::runtime::resource_admission::ResourceGuard::acquire(&scope, root).is_err());
+        assert!(
+            second
+                .settle_turn(true, json!({"turn":2}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            live_local_leases()
+                .lock()
+                .unwrap()
+                .get(&session)
+                .and_then(Weak::upgrade)
+                .is_none()
+        );
+        drop(first);
+        drop(second);
+        assert!(crate::runtime::resource_admission::ResourceGuard::acquire(&scope, root).is_ok());
+    }
     #[test]
     fn device_local_routing_uses_the_selected_project_and_live_environment() {
         let mappings = ["alpha", "beta-disabled", "beta"].map(|id| EnvironmentMapping {
@@ -636,6 +991,9 @@ impl crate::runtime::ExternalEffectAuthority for LocalResourceAuthority {
             .0
             .upgrade()
             .ok_or_else(|| "Resource execution lifetime has ended".to_string())?;
-        crate::runtime::ExternalEffectAuthority::authorize(&LocalResourceLease(lease), approval)
+        crate::runtime::ExternalEffectAuthority::authorize(
+            &LocalResourceLease(lease, Arc::new(TurnMonitor::new())),
+            approval,
+        )
     }
 }

@@ -1,8 +1,21 @@
 use super::super::RunnerError;
+use super::protocol::MULTI_DEVICE_SESSION_CAPABILITY;
 use super::{Assignment, AttemptStatus, Job, Report, SharedSettings};
 use crate::device_network::{DeviceClient, DeviceIdentityStore, DeviceSettingsStore};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ServiceLeaseView {
+    pub service_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub conversation_id: String,
+    pub environment_id: String,
+    pub expires_at_ms: u64,
+    pub stop_requested: bool,
+}
 
 #[derive(Debug)]
 pub(crate) enum TransportError {
@@ -216,6 +229,12 @@ impl SharedClient {
             .map_err(Into::into)
     }
 
+    pub(super) async fn services(&self) -> Result<Vec<ServiceLeaseView>, RunnerError> {
+        self.request("/v1/shared/runner/services", None)
+            .await
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn report(&self, report: &Report) -> Result<Job, TransportError> {
         self.request(
             "/v1/shared/runner/report",
@@ -290,7 +309,13 @@ impl SharedClient {
             let request = match body {
                 Some(body) => lease.http.post(url).json(body),
                 None => lease.http.get(url),
-            };
+            }
+            // An HTTP header preserves the old Hub's strict claim/query JSON contract.
+            // The new Hub uses it before assigning origin-linked work; an old Runner omits it.
+            .header(
+                "X-MoyAI-Runner-Capabilities",
+                MULTI_DEVICE_SESSION_CAPABILITY,
+            );
             let request = match human {
                 Some(token) => request.bearer_auth(token),
                 None => request,

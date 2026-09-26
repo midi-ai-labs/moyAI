@@ -97,9 +97,11 @@ fn execution_binding_change_discards_review_and_old_unknown_mutation_targets() {
         attempt_id: "attempt".into(),
         generation: 2,
         job_id: "job".into(),
+        project_id: "project".into(),
         environment_id: "env".into(),
         run_id: ulid::Ulid::new(),
         state: "unknown".into(),
+        local_state: None,
     });
     state.revise(view);
     let revision = state.view.revision.clone();
@@ -124,4 +126,34 @@ fn execution_commands_accept_only_native_review_receipts_and_exact_reconciliatio
     );
     assert!(serde_json::from_value::<DeviceExecutionCommand>(serde_json::json!({"kind":"reconcile","attempt_id":"a","reason":"verified","evidence":{"kind":"process_drain"}})).is_err());
     assert!(serde_json::from_value::<DeviceExecutionCommand>(serde_json::json!({"kind":"reconcile","attempt_id":"a","generation":2,"reason":"verified","evidence":{"kind":"operator_confirmed_stopped","effects_reviewed":true,"processes_stopped":true}})).is_ok());
+}
+
+#[test]
+fn hub_project_refresh_cannot_supply_or_replace_a_local_folder() {
+    let mut state = ExecutionRuntime::default();
+    state.bind("hub/device/trust");
+    let mut current = executable_project();
+    current.environment_id = Some("environment-a".into());
+    current.directory = Some("C:/real-folder".into());
+    current.access_mode = Some(AccessMode::FullAccess);
+    state.view.projects = vec![current];
+
+    let mut hub = executable_project();
+    hub.environment_id = Some("environment-a".into());
+    hub.directory = Some("C:/hub-supplied-folder".into());
+    hub.access_mode = Some(AccessMode::Default);
+    state.refresh_projects(vec![hub.clone()], true);
+    assert_eq!(
+        state.view.projects[0].directory.as_deref(),
+        Some(camino::Utf8Path::new("C:/real-folder"))
+    );
+    assert_eq!(
+        state.view.projects[0].access_mode,
+        Some(AccessMode::FullAccess)
+    );
+
+    hub.environment_id = Some("new-participation-environment".into());
+    state.refresh_projects(vec![hub], true);
+    assert!(state.view.projects[0].directory.is_none());
+    assert!(state.view.projects[0].access_mode.is_none());
 }

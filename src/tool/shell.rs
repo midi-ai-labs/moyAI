@@ -681,6 +681,7 @@ async fn execute_shell_command_observed(
 
 mod managed;
 pub use managed::{ManagedShells, ShellStartTool, ShellStatusTool, ShellStopTool};
+pub(crate) use managed::{RetainedService, RetainedServiceState};
 
 fn resolve_shell_programs(
     shell: &crate::config::ShellConfig,

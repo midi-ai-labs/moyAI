@@ -286,6 +286,7 @@ pub struct AgentLoop {
     prompt_builder: PromptBuilder,
     tool_services: Arc<Mutex<ToolServices>>,
     managed_shell_lifetime: Option<CancellationToken>,
+    managed_shell_scope_id: Option<ulid::Ulid>,
     model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
     shared_run: Option<shared::SharedRunContext>,
     #[cfg(test)]
@@ -296,14 +297,35 @@ pub struct AgentLoop {
 
 impl AgentLoop {
     pub(crate) fn managed_shells(&self) -> crate::tool::shell::ManagedShells {
-        self.tool_services
+        let shells = self
+            .tool_services
             .lock()
             .expect("tool services poisoned")
             .managed_shells
-            .clone()
+            .clone();
+        self.scope_managed_shells(shells)
     }
-    pub(crate) fn with_managed_shell_lifetime(mut self, lifetime: CancellationToken) -> Self {
+
+    fn scope_managed_shells(
+        &self,
+        shells: crate::tool::shell::ManagedShells,
+    ) -> crate::tool::shell::ManagedShells {
+        match &self.managed_shell_lifetime {
+            Some(lifetime) => shells.with_lifetime(
+                lifetime.clone(),
+                self.managed_shell_scope_id
+                    .expect("scoped managed lifetime"),
+            ),
+            None => shells,
+        }
+    }
+    pub(crate) fn with_managed_shell_lifetime(
+        mut self,
+        lifetime: CancellationToken,
+        scope_id: ulid::Ulid,
+    ) -> Self {
         self.managed_shell_lifetime = Some(lifetime);
+        self.managed_shell_scope_id = Some(scope_id);
         self
     }
 
@@ -328,6 +350,7 @@ impl AgentLoop {
             prompt_builder,
             tool_services: Arc::new(Mutex::new(tool_services)),
             managed_shell_lifetime: None,
+            managed_shell_scope_id: None,
             model_request_gate: None,
             shared_run: None,
             #[cfg(test)]
@@ -391,18 +414,21 @@ impl AgentLoop {
         // Each admitted turn keeps its immutable client, including peer trust
         // and credentials. Equal later configurations reuse its MCP sessions.
         let mut turn_services = services.clone();
-        if let Some(lifetime) = &self.managed_shell_lifetime {
-            turn_services.managed_shells =
-                turn_services.managed_shells.with_lifetime(lifetime.clone());
-        }
+        turn_services.managed_shells = self.scope_managed_shells(turn_services.managed_shells);
         Ok(turn_services)
     }
 
     pub(crate) fn with_shared_run(&self, context: shared::SharedRunContext) -> Self {
         let mut agent = self.clone();
-        agent.registry = agent
-            .registry
-            .with_shared_environments(&context.job_id, &context.allowed_child_environments);
+        agent.registry = agent.registry.with_shared_environments(
+            &context.project_id,
+            &context.job_id,
+            &context.attempt_id,
+            context.generation,
+            &context.environment_id,
+            &context.allowed_child_environments,
+            &context.allowed_child_candidates,
+        );
         agent.shared_run = Some(context);
         agent
     }
@@ -520,6 +546,7 @@ impl AgentLoop {
                 let step_config = request.turn.resolved_config().runtime_config();
                 let mut step_registry = self.registry.with_config_overlays(step_config);
                 if self.shared_run.is_some() {
+                    step_registry.remove_legacy_local_team_tools();
                     step_registry.retain_tools(|name| !matches!(name,
                         "mcp_call" | "wait_remote_tasks" | "spawn_agent" | "send_message"
                         | "followup_task" | "wait_agent" | "interrupt_agent" | "list_agents"
@@ -1068,11 +1095,15 @@ impl AgentLoop {
                 }
 
                 mailbox_delivery_phase = mailbox_delivery_phase.after_model_tool_call();
+                let retained_service = tool_services
+                    .managed_shells
+                    .delegable_service(request.session.session.id);
                 if let Some(shared) = self.shared_run.as_ref()
                     && prepared_tool_calls.len() == 1
                     && prepared_tool_calls[0].tool == crate::tool::ToolName::SharedDelegate
                     && prepared_tool_calls[0].validation_error.is_none()
-                    && !tool_services.managed_shells.has_local_work(request.session.session.id)
+                    && (!tool_services.managed_shells.has_local_work(request.session.session.id)
+                        || retained_service.is_some())
                     && !request.run_control.is_cancelled()
                 {
                     let call = &prepared_tool_calls[0];
@@ -1085,6 +1116,7 @@ impl AgentLoop {
                         return Ok(shared::AgentRunOutcome::Yielded(shared::SharedYieldProposal {
                             tool_call_id: call.id,
                             child,
+                            retained_service,
                             progress: shared::SharedProgress {
                                 tool_call_count, failed_tool_count, change_count, model_request_count,
                                 tool_calls_by_name: tool_calls_by_name.clone(),
@@ -2105,7 +2137,7 @@ impl AgentLoop {
             model_request_count,
             sink,
             pending_retry_lease: None,
-            approved_retry_lease: None,
+            review_retry_lease: None,
         };
         let ctx = crate::tool::context::ToolContext {
             session: &request.session,
@@ -3160,7 +3192,7 @@ struct AgentPermissionGuardian<'a> {
     model_request_count: &'a mut usize,
     sink: &'a mut dyn RunEventSink,
     pending_retry_lease: Option<crate::storage::PermissionReviewLease>,
-    approved_retry_lease: Option<crate::storage::PermissionReviewLease>,
+    review_retry_lease: Option<crate::storage::PermissionReviewLease>,
 }
 
 impl AgentPermissionGuardian<'_> {
@@ -3223,7 +3255,8 @@ impl AgentPermissionGuardian<'_> {
             }
         }
 
-        let _guardian_transport = resolved_guardian_isolation_transport(self.request)?;
+        let _guardian_transport = resolved_guardian_isolation_transport(self.request)
+            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
 
         let input = serde_json::to_string_pretty(&serde_json::json!({
             "trusted_world_state": &self.trusted_world_state.snapshot,
@@ -3258,7 +3291,7 @@ impl AgentPermissionGuardian<'_> {
         );
         guardian_request
             .validate_provider_lifecycle()
-            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
 
         self.sink
             .emit(RunEvent::ModelRequestPrepared {
@@ -3274,10 +3307,10 @@ impl AgentPermissionGuardian<'_> {
                     None,
                 ),
             })
-            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
         renew_admission_lease(&self.agent_loop.store, self.request)
             .await
-            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
         *self.model_request_count += 1;
 
         let request_gate = self
@@ -3304,7 +3337,7 @@ impl AgentPermissionGuardian<'_> {
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             ensure_admission_active(&self.agent_loop.store, self.request)
                                 .await
-                                .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+                                .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
                         }
                     }
                 }
@@ -3340,7 +3373,7 @@ impl AgentPermissionGuardian<'_> {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         ensure_admission_active(&self.agent_loop.store, self.request)
                             .await
-                            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+                            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
                     }
                 }
             }
@@ -3367,7 +3400,7 @@ impl AgentPermissionGuardian<'_> {
                     error.token_usage(),
                 )
                 .await?;
-                return Err(PermissionGuardianError::Request(error.public_message()));
+                return Err(permission_guardian_provider_error(error));
             }
         };
         let collector = collector.into_inner();
@@ -3376,10 +3409,10 @@ impl AgentPermissionGuardian<'_> {
             &response,
             !collector.tool_calls.is_empty(),
         )
-        .map_err(|error| PermissionGuardianError::Request(error.public_message()))?;
+        .map_err(|error| PermissionGuardianError::InvalidDecision(error.public_message()))?;
         ensure_admission_active(&self.agent_loop.store, self.request)
             .await
-            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
         crate::tool::permission_guardian::parse_guardian_decision(&collector.text)
     }
 }
@@ -3426,7 +3459,19 @@ impl crate::tool::permission_guardian::PermissionGuardian for AgentPermissionGua
                     lease.mark_allowed_pending(),
                     "recording Guardian Allow",
                 )?;
-                self.approved_retry_lease = Some(lease);
+                self.review_retry_lease = Some(lease);
+            }
+            Ok(crate::tool::permission_guardian::PermissionGuardianDecision::AskUser {
+                ..
+            })
+            | Err(
+                PermissionGuardianError::InvalidDecision(_)
+                | PermissionGuardianError::TotalDeadline { .. }
+                | PermissionGuardianError::Request(_),
+            ) => {
+                // Keep the exact reviewing claim while the existing human confirmation waiter
+                // is pending. It blocks parallel/equivalent reviews without granting an effect.
+                self.review_retry_lease = Some(lease);
             }
             _ if fence_outcome.is_some() => {
                 require_owned_permission_fence_transition(
@@ -3435,16 +3480,17 @@ impl crate::tool::permission_guardian::PermissionGuardian for AgentPermissionGua
                 )?;
             }
             _ => {
-                lease
-                    .release()
-                    .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+                require_owned_permission_fence_transition(
+                    lease.release(),
+                    "releasing cancelled or failed Guardian review",
+                )?;
             }
         }
         result
     }
 
-    fn take_approved_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
-        self.approved_retry_lease.take()
+    fn take_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
+        self.review_retry_lease.take()
     }
 }
 
@@ -3452,6 +3498,23 @@ fn permission_guardian_total_deadline(
     provider_deadlines: crate::config::ProviderDeadlines,
 ) -> Duration {
     Duration::from_millis(provider_deadlines.request_timeout_ms)
+}
+
+fn permission_guardian_provider_error(
+    error: crate::error::LlmError,
+) -> crate::tool::permission_guardian::PermissionGuardianError {
+    use crate::llm::ProviderFailureKind;
+    use crate::tool::permission_guardian::PermissionGuardianError;
+    match error.provider_failure().map(|failure| failure.kind) {
+        Some(ProviderFailureKind::Cancelled) => PermissionGuardianError::Cancelled,
+        Some(ProviderFailureKind::EventProjection) => {
+            PermissionGuardianError::UnfencedAdmission(error.public_message())
+        }
+        _ if matches!(error, crate::error::LlmError::Io(_)) => {
+            PermissionGuardianError::UnfencedAdmission(error.public_message())
+        }
+        _ => PermissionGuardianError::Request(error.public_message()),
+    }
 }
 
 async fn permission_guardian_review_with_deadline<F>(
@@ -3512,9 +3575,9 @@ fn permission_retry_fence_outcome(
     use crate::tool::permission_guardian::{PermissionGuardianDecision, PermissionGuardianError};
     match result {
         Ok(PermissionGuardianDecision::Allow { .. }) => None,
-        Ok(PermissionGuardianDecision::Deny { .. }) => {
-            Some(PermissionRetryFenceOutcome::GuardianDenied)
-        }
+        Ok(
+            PermissionGuardianDecision::Deny { .. } | PermissionGuardianDecision::AskUser { .. },
+        ) => Some(PermissionRetryFenceOutcome::GuardianDenied),
         Err(PermissionGuardianError::InvalidDecision(_)) => {
             Some(PermissionRetryFenceOutcome::InvalidDecision)
         }
@@ -3566,7 +3629,9 @@ async fn account_permission_guardian_goal_usage(
         .account_thread_goal_usage_for_goal(session_id, goal_token_delta(usage), Some(goal_id))
         .await
         .map_err(|error| {
-            crate::tool::permission_guardian::PermissionGuardianError::Request(error.to_string())
+            crate::tool::permission_guardian::PermissionGuardianError::UnfencedAdmission(
+                error.to_string(),
+            )
         })?;
     Ok(())
 }
@@ -8342,7 +8407,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn auto_review_all_current_profiles_use_exact_toolless_wire_and_fail_closed() {
+    async fn auto_review_all_current_profiles_use_exact_toolless_wire_and_human_handoff() {
         use crate::config::{ProviderApiMode, ProviderProfile, ProviderReasoningCapability};
 
         let profiles = [
@@ -8365,16 +8430,22 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ToolLifecycleStatus::Declined,
             ),
             (
+                "ask_user",
+                Some(r#"{"decision":"ask_user","rationale":"confirm exact command"}"#),
+                FinishReason::Stop,
+                ToolLifecycleStatus::Completed,
+            ),
+            (
                 "invalid",
                 Some("approval looks fine"),
                 FinishReason::Stop,
-                ToolLifecycleStatus::Declined,
+                ToolLifecycleStatus::Completed,
             ),
             (
                 "provider_error",
                 None,
                 FinishReason::Error,
-                ToolLifecycleStatus::Declined,
+                ToolLifecycleStatus::Completed,
             ),
         ];
 
@@ -8413,10 +8484,26 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     .summary
                     .unwrap_or_else(|error| panic!("{label}: {error}"));
 
-                assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
-                assert_eq!(run.confirmations.len(), 0, "{label}");
+                assert_eq!(
+                    summary.status(),
+                    if case == "deny" {
+                        SessionStatus::Failed
+                    } else {
+                        SessionStatus::Completed
+                    },
+                    "{label}"
+                );
+                assert_eq!(
+                    run.confirmations.len(),
+                    usize::from(matches!(case, "ask_user" | "invalid" | "provider_error")),
+                    "{label}"
+                );
                 assert_canonical_tool_statuses(&run.store, run.session_id, &[expected_status]);
-                assert_eq!(run.requests.len(), 3, "{label}");
+                assert_eq!(
+                    run.requests.len(),
+                    if case == "deny" { 2 } else { 3 },
+                    "{label}"
+                );
                 let guardian_request = &run.requests[1];
                 assert_eq!(
                     guardian_request.provider_target().api_mode(),
@@ -9044,6 +9131,50 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[test]
+    fn guardian_transport_handoff_excludes_projection_storage_and_cancellation_failures() {
+        use crate::llm::{ProviderFailure, ProviderFailureKind, ProviderPhase, ProviderRequestId};
+        use crate::tool::permission_guardian::PermissionGuardianError;
+        for kind in [
+            ProviderFailureKind::Connect,
+            ProviderFailureKind::StreamIdleTimeout,
+            ProviderFailureKind::EventProjection,
+            ProviderFailureKind::Cancelled,
+        ] {
+            let error =
+                permission_guardian_provider_error(crate::error::LlmError::ProviderFailure {
+                    failure: ProviderFailure {
+                        request_id: ProviderRequestId::new(),
+                        endpoint: "http://provider.invalid".into(),
+                        phase: ProviderPhase::ProviderTerminal,
+                        attempt: 1,
+                        elapsed_ms: 1,
+                        kind,
+                        status: None,
+                        code: None,
+                        message: "private diagnostic".into(),
+                    },
+                    source: Box::new(crate::error::LlmError::Message("fixture".into())),
+                });
+            match kind {
+                ProviderFailureKind::EventProjection => assert!(matches!(
+                    error,
+                    PermissionGuardianError::UnfencedAdmission(_)
+                )),
+                ProviderFailureKind::Cancelled => {
+                    assert!(matches!(error, PermissionGuardianError::Cancelled))
+                }
+                _ => assert!(matches!(error, PermissionGuardianError::Request(_))),
+            }
+        }
+        assert!(matches!(
+            permission_guardian_provider_error(crate::error::LlmError::Io(std::io::Error::other(
+                "local data failure"
+            ))),
+            PermissionGuardianError::UnfencedAdmission(_)
+        ));
+    }
+
+    #[test]
     fn auto_review_retry_fence_classifies_owned_deadline_invalid_and_cancel_paths() {
         use crate::storage::PermissionRetryFenceOutcome;
         use crate::tool::permission_guardian::PermissionGuardianError;
@@ -9225,6 +9356,59 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
+    async fn scoped_managed_shell_drain_observes_the_turns_live_process() {
+        let config = ResolvedConfig::default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let paths = StoragePaths {
+            data_dir: root.clone(),
+            database_path: root.join("db.sqlite3"),
+            truncation_dir: root.join("output"),
+        };
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = StoreBundle::new(sqlite);
+        let services = test_tool_services(&config, &store, paths);
+        let agent = AgentLoop::new(
+            Arc::new(ScriptedClient {
+                outcomes: Mutex::new(Vec::new()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::builtin(services.clone()),
+            store,
+            PromptBuilder,
+            services,
+        );
+        let unscoped = agent.clone();
+        let scoped = agent.with_managed_shell_lifetime(CancellationToken::new(), ulid::Ulid::new());
+        let turn_services = scoped.tool_services_for_turn(&config.mcp).unwrap();
+        let session_id = crate::session::SessionId::new();
+        let preview = turn_services
+            .managed_shells
+            .start_preview_for_test(session_id)
+            .await;
+        assert!(turn_services.managed_shells.has_local_work(session_id));
+        assert!(
+            scoped.managed_shells().has_local_work(session_id),
+            "The resource drain must observe the same scoped process as the tool"
+        );
+        assert!(!unscoped.managed_shells().has_local_work(session_id));
+        assert!(
+            turn_services
+                .managed_shells
+                .cancel_retained_service(preview.service_id)
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while scoped.managed_shells().has_local_work(session_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        turn_services.managed_shells.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn auto_review_mcp_guardian_receives_full_arguments_beyond_human_preview() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
@@ -9291,11 +9475,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn auto_review_denial_and_invalid_output_fail_closed_without_human_fallback() {
+    async fn auto_review_handoff_approves_only_the_exact_effect_then_reviews_the_next_step() {
         for (label, guardian_output, api_mode) in [
             (
-                "deny",
-                r#"{"decision":"deny","rationale":"not authorized"}"#,
+                "ask_user",
+                r#"{"decision":"ask_user","rationale":"外部の接続先を確認してください"}"#,
                 crate::config::model::ProviderApiMode::Responses,
             ),
             (
@@ -9315,14 +9499,28 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 vec![
                     scripted_escalated_shell_call(
                         &format!("guardian_{label}"),
-                        "echo must-not-run",
+                        "echo first >> approved.txt",
                     ),
                     ScriptedResponse {
                         events: vec![LlmEvent::TextDelta(guardian_output.to_string())],
                         finish_reason: FinishReason::Stop,
                     },
                     ScriptedResponse {
-                        events: vec![LlmEvent::TextDelta("used a safer route".to_string())],
+                        events: scripted_escalated_shell_call(
+                            "next_step",
+                            "echo second >> approved.txt",
+                        )
+                        .events,
+                        finish_reason: FinishReason::ToolCall,
+                    },
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta(
+                            r#"{"decision":"allow","rationale":"next scoped step"}"#.to_string(),
+                        )],
+                        finish_reason: FinishReason::Stop,
+                    },
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta("done".to_string())],
                         finish_reason: FinishReason::Stop,
                     },
                 ],
@@ -9332,34 +9530,53 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             let summary = run.summary.expect(label);
 
             assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
-            assert_eq!(summary.metrics().model_request_count, 3, "{label}");
-            assert_eq!(run.confirmations.len(), 0, "{label}");
+            assert_eq!(summary.metrics().model_request_count, 5, "{label}");
+            assert_eq!(run.confirmations.len(), 1, "{label}");
+            let details = run.confirmations[0].details.join("\n");
+            assert!(
+                details.contains("echo first >> approved.txt"),
+                "{label}: {details}"
+            );
+            assert!(details.contains("代理承認からの確認"), "{label}: {details}");
+            if label == "ask_user" {
+                assert!(details.contains("外部の接続先を確認してください"));
+            }
+            let contents = std::fs::read_to_string(run.root.join("approved.txt"))
+                .expect("approved command output");
+            assert_eq!(
+                contents.lines().map(str::trim).collect::<Vec<_>>(),
+                vec!["first", "second"],
+                "{label}: each effect runs once"
+            );
             assert_eq!(run.requests[1].provider_target().api_mode(), api_mode);
             assert_canonical_tool_statuses(
                 &run.store,
                 run.session_id,
-                &[ToolLifecycleStatus::Declined],
+                &[
+                    ToolLifecycleStatus::Completed,
+                    ToolLifecycleStatus::Completed,
+                ],
             );
         }
     }
 
     #[tokio::test]
-    async fn auto_review_retry_fence_blocks_varied_shell_workarounds_until_new_authority() {
+    async fn auto_review_human_denial_stops_before_a_varied_shell_workaround() {
         for (label, guardian_output) in [
             (
-                "deny",
-                r#"{"decision":"deny","rationale":"not authorized"}"#,
+                "ask_user",
+                r#"{"decision":"ask_user","rationale":"confirm the exact effect"}"#,
             ),
             ("invalid", &"x".repeat(512)),
         ] {
             let mut config = ResolvedConfig::default();
             config.permissions.access_mode = AccessMode::AutoReview;
-            let run = run_scripted(
+            let run = run_scripted_with_options_and_decision(
                 config,
                 vec![
                     scripted_escalated_shell_call(
                         &format!("guardian_retry_{label}_first"),
-                        "python -m pytest -q",
+                        "echo forbidden > denied-first.txt",
                     ),
                     ScriptedResponse {
                         events: vec![LlmEvent::TextDelta(guardian_output.to_string())],
@@ -9367,7 +9584,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     },
                     scripted_escalated_shell_call(
                         &format!("guardian_retry_{label}_workaround"),
-                        "python -c \"import shutil; shutil.rmtree('.pytest-tmp')\"",
+                        "echo forbidden > denied-workaround.txt",
                     ),
                     ScriptedResponse {
                         events: vec![LlmEvent::TextDelta(
@@ -9376,14 +9593,19 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                         finish_reason: FinishReason::Stop,
                     },
                 ],
+                None,
+                None,
+                crate::cli::ReviewDecision::Denied,
             )
             .await
             .expect(label);
             let summary = run.summary.expect(label);
 
-            assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
-            assert_eq!(summary.metrics().model_request_count, 4, "{label}");
-            assert_eq!(run.confirmations.len(), 0, "{label}");
+            assert_eq!(summary.status(), SessionStatus::Cancelled, "{label}");
+            assert_eq!(summary.metrics().model_request_count, 2, "{label}");
+            assert_eq!(run.confirmations.len(), 1, "{label}");
+            assert!(!run.root.join("denied-first.txt").exists());
+            assert!(!run.root.join("denied-workaround.txt").exists());
             assert_eq!(
                 run.requests
                     .iter()
@@ -9397,7 +9619,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             assert_canonical_tool_statuses(
                 &run.store,
                 run.session_id,
-                &[ToolLifecycleStatus::Declined, ToolLifecycleStatus::Declined],
+                &[ToolLifecycleStatus::Declined],
             );
         }
     }
@@ -9500,7 +9722,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn auto_review_cancelled_provider_finish_releases_claim_for_a_new_review() {
+    async fn auto_review_cancelled_provider_finish_stops_without_human_or_model_retry() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
         let run = run_scripted(
@@ -9534,7 +9756,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         .expect("cancelled Guardian finish run");
         let summary = run.summary.expect("completed summary");
 
-        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(summary.status(), SessionStatus::Cancelled);
+        assert_eq!(run.confirmations.len(), 0);
+        assert_eq!(run.requests.len(), 2);
         assert_eq!(
             run.requests
                 .iter()
@@ -9542,13 +9766,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     .system_prompt
                     .contains("independent permission guardian"))
                 .count(),
-            2,
-            "a provider-level Cancelled finish must release the in-flight fence claim"
+            1,
+            "a provider-level Cancelled finish must stop without another Guardian request"
         );
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
-            &[ToolLifecycleStatus::Declined, ToolLifecycleStatus::Declined],
+            &[ToolLifecycleStatus::Cancelled],
         );
     }
 
@@ -9556,7 +9780,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     async fn auto_review_accounts_usage_before_rejecting_tool_call_response_shape() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
-        let run = run_scripted_with_goal(
+        let run = run_scripted_with_options_and_decision(
             config,
             vec![
                 scripted_escalated_shell_call("guardian_invalid_shape", "echo must-not-run"),
@@ -9573,6 +9797,8 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 },
             ],
             Some(("finish safely", ThreadGoalStatus::Active, None)),
+            None,
+            crate::cli::ReviewDecision::Denied,
         )
         .await
         .expect("run");
@@ -9590,7 +9816,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .await
             .expect("goal")
             .expect("stored goal");
-        assert_eq!(goal.tokens_used, 45);
+        assert_eq!(goal.tokens_used, 30);
     }
 
     #[tokio::test]
@@ -9603,7 +9829,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             total_tokens: 37,
             reasoning_tokens: None,
         };
-        let run = run_scripted_with_goal(
+        let run = run_scripted_with_options_and_decision(
             config,
             vec![
                 scripted_escalated_shell_call("guardian_provider_error", "echo must-not-run"),
@@ -9624,6 +9850,8 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 },
             ],
             Some(("finish safely", ThreadGoalStatus::Active, None)),
+            None,
+            crate::cli::ReviewDecision::Denied,
         )
         .await
         .expect("run");
@@ -9632,7 +9860,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
-            &[ToolLifecycleStatus::Declined, ToolLifecycleStatus::Declined],
+            &[ToolLifecycleStatus::Declined],
         );
         assert_eq!(
             run.requests
@@ -9651,7 +9879,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .await
             .expect("goal")
             .expect("stored goal");
-        assert_eq!(goal.tokens_used, 82);
+        assert_eq!(goal.tokens_used, 52);
     }
 
     #[tokio::test]

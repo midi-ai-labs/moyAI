@@ -204,6 +204,7 @@ struct State {
 }
 
 struct Execution {
+    managed_scope_id: Ulid,
     request: LocalRunRequest,
     session_id: Option<SessionId>,
     control: RunControl,
@@ -241,6 +242,7 @@ struct SharedExecution {
     authority: Arc<dyn crate::runtime::ExternalEffectAuthority>,
     resource: Arc<crate::runtime::resource_admission::ResourceGuard>,
     model_client: shared::transport::SharedClient,
+    compatible_retained_runs: Vec<Ulid>,
 }
 
 impl Execution {
@@ -253,9 +255,9 @@ impl Execution {
     fn observe_process_completion(&mut self, shells: &crate::tool::shell::ManagedShells) {
         if !self.processes_drained
             && !self.active()
-            && !self
-                .session_id
-                .is_some_and(|session| shells.has_local_work(session))
+            && !self.session_id.is_some_and(|session| {
+                shells.has_local_work_in_scope(session, self.managed_scope_id)
+            })
         {
             self.processes_drained = true;
             self.resource = None;
@@ -490,7 +492,14 @@ impl RunnerHost {
             for run in state.runs.values_mut() {
                 run.observe_process_completion(&shells);
             }
-            if state.runs.values().any(|run| !run.processes_drained) {
+            if state.runs.iter().any(|(existing_id, run)| {
+                !run.processes_drained
+                    && (!run.shared
+                        || run.active()
+                        || !shared.as_ref().is_some_and(|shared| {
+                            shared.compatible_retained_runs.contains(existing_id)
+                        }))
+            }) {
                 return Err(RunnerError::new(
                     "Runner is busy; another local execution still owns its worker",
                 ));
@@ -505,6 +514,7 @@ impl RunnerHost {
             state.runs.insert(
                 id,
                 Execution {
+                    managed_scope_id: id,
                     request: request.clone(),
                     session_id: None,
                     control: RunControl::new(),
@@ -620,7 +630,7 @@ impl RunnerHost {
             let run = state.runs.get(&id).expect("accepted execution retained");
             (run.control.clone(), run.process_lifetime.clone())
         };
-        app.run_service = Arc::new(app.run_service.with_managed_shell_lifetime(lifetime));
+        app.run_service = Arc::new(app.run_service.with_managed_shell_lifetime(lifetime, id));
         // Capture once for this assignment. A Desktop save affects the next job, and a Hub
         // failure must never send this job to a retained manual provider.
         let hub_guard = if let Some(shared) = &shared {

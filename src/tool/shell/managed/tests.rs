@@ -20,6 +20,60 @@ fn stopped_output() -> CommandOutput {
     }
 }
 
+impl ManagedShells {
+    pub(crate) async fn start_preview_for_test(&self, root: SessionId) -> RetainedService {
+        let (mut snapshot, _) = self
+            .start_with_retention(
+                Owner {
+                    workspace: "fixture".into(),
+                    authority: Authority::Local(root),
+                },
+                "controlled preview".into(),
+                "fixture".into(),
+                60_000,
+                json!(null),
+                CancellationToken::new(),
+                false,
+                true,
+                |cancel, started| async move {
+                    started(1);
+                    cancel.cancelled().await;
+                    Ok(stopped_output())
+                },
+            )
+            .unwrap();
+        while snapshot.borrow_and_update().state == State::Starting {
+            snapshot.changed().await.unwrap();
+        }
+        assert_eq!(snapshot.borrow().state, State::Running);
+        self.completion_service_in_scope(root, self.receiver_scope_id.expect("receiver scope"))
+            .expect("finite preview")
+    }
+}
+
+#[tokio::test]
+async fn terminal_snapshot_is_not_a_live_retained_server_while_worker_finishes() {
+    let registry = ManagedShells::default().with_lifetime(CancellationToken::new(), Ulid::new());
+    let service = registry.start_preview_for_test(SessionId::new()).await;
+    let mut terminal = {
+        let records = registry.inner.lock().unwrap();
+        let record = &records.records[&service.service_id];
+        assert!(!record.worker.is_finished());
+        record.snapshot.borrow().clone()
+    };
+    assert_eq!(
+        classify_retained_state(false, false, &terminal),
+        RetainedServiceState::Running
+    );
+    terminal.state = State::Completed;
+    assert_eq!(
+        classify_retained_state(false, false, &terminal),
+        RetainedServiceState::Stopped
+    );
+    assert!(registry.cancel_retained_service(service.service_id));
+    registry.shutdown().await;
+}
+
 fn start_waiter(
     registry: &ManagedShells,
     owner: Owner,
@@ -56,6 +110,105 @@ async fn terminal(receiver: &mut watch::Receiver<Snapshot>) {
     })
     .await
     .expect("worker must settle");
+}
+
+#[tokio::test]
+async fn delegation_retains_only_one_explicit_finite_running_service() {
+    let registry = ManagedShells::default();
+    let owner = owner();
+    let session = match &owner.authority {
+        Authority::Local(session) => *session,
+        _ => unreachable!(),
+    };
+    let (mut service, _) = registry
+        .start_with_retention(
+            owner.clone(),
+            "test server".into(),
+            "fixture".into(),
+            60_000,
+            json!(null),
+            CancellationToken::new(),
+            true,
+            false,
+            |cancel, started| async move {
+                started(1);
+                cancel.cancelled().await;
+                Ok(stopped_output())
+            },
+        )
+        .unwrap();
+    while service.borrow_and_update().state == State::Starting {
+        service.changed().await.unwrap();
+    }
+    let retained = registry.delegable_service(session).expect("marked service");
+    assert_eq!(retained.service_id, service.borrow().process_id);
+    assert!(registry.retained_service_live(retained));
+    let mut ordinary = start_waiter(&registry, owner, CancellationToken::new());
+    while ordinary.borrow_and_update().state == State::Starting {
+        ordinary.changed().await.unwrap();
+    }
+    assert!(registry.delegable_service(session).is_none());
+    let ordinary_id = ordinary.borrow().process_id;
+    let ordinary_cancel = registry.inner.lock().unwrap().records[&ordinary_id]
+        .cancel
+        .clone();
+    ordinary_cancel.cancel();
+    terminal(&mut ordinary).await;
+    assert_eq!(registry.delegable_service(session), Some(retained));
+    assert!(registry.cancel_retained_service(retained.service_id));
+    terminal(&mut service).await;
+    assert!(!registry.retained_service_live(retained));
+    assert!(registry.delegable_service(session).is_none());
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn finite_preview_is_visible_only_to_its_exact_receiver_scope() {
+    let registry = ManagedShells::default();
+    let scope = Ulid::new();
+    let other_scope = Ulid::new();
+    let scoped = registry.with_lifetime(CancellationToken::new(), scope);
+    let owner = owner();
+    let session = match &owner.authority {
+        Authority::Local(session) => *session,
+        _ => unreachable!(),
+    };
+    let (mut preview, _) = scoped
+        .start_with_retention(
+            owner,
+            "preview server".into(),
+            "fixture".into(),
+            60_000,
+            json!(null),
+            CancellationToken::new(),
+            false,
+            true,
+            |cancel, started| async move {
+                started(1);
+                cancel.cancelled().await;
+                Ok(stopped_output())
+            },
+        )
+        .unwrap();
+    while preview.borrow_and_update().state == State::Starting {
+        preview.changed().await.unwrap();
+    }
+    let service = registry
+        .completion_service_in_scope(session, scope)
+        .expect("explicit finite preview");
+    assert_eq!(service.service_id, preview.borrow().process_id);
+    assert!(service.retain_after_turn);
+    assert!(registry.has_local_work_in_scope(session, scope));
+    assert!(!registry.has_local_work_in_scope(session, other_scope));
+    assert!(
+        registry
+            .completion_service_in_scope(session, other_scope)
+            .is_none()
+    );
+    assert!(registry.cancel_retained_service(service.service_id));
+    terminal(&mut preview).await;
+    assert!(!registry.has_local_work_in_scope(session, scope));
+    registry.shutdown().await;
 }
 
 #[tokio::test]
@@ -218,7 +371,7 @@ async fn managed_cancelled_start_handoff_never_leaves_an_unclaimed_worker() {
 async fn managed_revocation_between_registration_and_spawn_cannot_escape_a_completed_turn() {
     let registry = ManagedShells::default();
     let scope = CancellationToken::new();
-    let receiver_registry = registry.with_lifetime(scope.child_token());
+    let receiver_registry = registry.with_lifetime(scope.child_token(), Ulid::new());
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let (mut result, _) = receiver_registry

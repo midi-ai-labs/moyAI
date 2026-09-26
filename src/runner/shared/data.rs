@@ -2,7 +2,7 @@
 use super::{SharedInput, journal::Entry, transport::SharedClient};
 use crate::{
     runner::RunnerError,
-    workspace::{AccessKind, PathGuard, WorkspaceDiscovery},
+    workspace::{AccessKind, PathGuard, Workspace, WorkspaceDiscovery},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{OptionalExtension, params};
@@ -142,10 +142,15 @@ pub(super) async fn prepare(
         if download.asset.job_id.as_deref() == Some(job.id.as_str()) {
             if job.checkpoint.is_some() {
                 archive = Some(value);
+            } else if job.continued_from.is_some() {
+                return Err(error("continuation archive is not the exact predecessor"));
             }
         } else {
             if job.checkpoint.is_some() {
                 return Err(error("checkpoint archive belongs to another job"));
+            }
+            if download.asset.job_id.as_deref() != job.continued_from.as_deref() {
+                return Err(error("continuation archive is not the exact predecessor"));
             }
             continuation = Some(crate::agent::shared::SharedContinuation {
                 previous_job_id: download
@@ -155,10 +160,11 @@ pub(super) async fn prepare(
                 archive: value,
             });
         }
-    } else if job
-        .checkpoint
-        .as_ref()
-        .is_some_and(|checkpoint| checkpoint["version"] == 2)
+    } else if job.continued_from.is_some()
+        || job
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint["version"] == 2)
     {
         return Err(error("portable checkpoint has no durable Hub archive"));
     }
@@ -205,6 +211,35 @@ fn spool(host: &crate::runner::RunnerHost) -> Result<rusqlite::Connection, Runne
         .map_err(error)?;
     db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS outcome_payloads(attempt_id TEXT PRIMARY KEY,report_sha256 TEXT NOT NULL,payload_json TEXT NOT NULL);").map_err(error)?;
     Ok(db)
+}
+
+/// Once payload publication has begun, the outcome report is an exact retry
+/// receipt. A stop crossing that boundary must drain the service and resend the
+/// same report; changing its result would conflict with both this spool and a
+/// possibly accepted Hub report whose acknowledgement was lost.
+pub(super) fn report_frozen(
+    host: &crate::runner::RunnerHost,
+    entry: &Entry,
+) -> Result<bool, RunnerError> {
+    let saved: Option<String> = spool(host)?
+        .query_row(
+            "SELECT report_sha256 FROM outcome_payloads WHERE attempt_id=?1",
+            [&entry.assignment.attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(error)?;
+    let Some(saved) = saved else {
+        return Ok(false);
+    };
+    let current = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&entry.report).map_err(error)?)
+    );
+    if saved != current {
+        return Err(error("shared outcome data is bound to a different report"));
+    }
+    Ok(true)
 }
 fn freeze(host: &crate::runner::RunnerHost, entry: &Entry) -> Result<Vec<Value>, RunnerError> {
     let mut db = spool(host)?;
@@ -271,21 +306,32 @@ fn collect(host: &crate::runner::RunnerHost, entry: &Entry) -> Result<Vec<Value>
     let config = crate::config::ResolvedConfig::default();
     let workspace = WorkspaceDiscovery::discover_fixed_root(&entry.mapping.directory, &config)
         .map_err(error)?;
+    uploads.extend(changed_file_uploads(
+        &archive,
+        &workspace,
+        &names,
+        attempt,
+        entry.assignment.generation,
+    )?);
+    uploads.extend(published);
+    Ok(uploads)
+}
+fn changed_file_uploads(
+    archive: &Value,
+    workspace: &Workspace,
+    names: &std::collections::HashSet<&str>,
+    attempt: &str,
+    generation: u64,
+) -> Result<Vec<Value>, RunnerError> {
     let mut changes = std::collections::BTreeMap::<String, (Option<String>, Option<String>)>::new();
     if let Some(rows) = archive["tables"]["file_changes"].as_array() {
         for row in rows {
             let Some(name) = row["path_after"].as_str() else {
                 continue;
             };
-            let path = camino::Utf8Path::new(name);
-            let relative = if path.is_absolute() {
-                path.strip_prefix(&workspace.root).map_err(error)?.as_str()
-            } else {
-                name
-            };
-            path_name(relative)?;
+            let relative = file_change_name(name, &workspace.root)?;
             let change = changes
-                .entry(relative.into())
+                .entry(relative)
                 .or_insert_with(|| (row["before_sha256"].as_str().map(str::to_owned), None));
             change.1 = row["after_sha256"].as_str().map(str::to_owned);
         }
@@ -295,6 +341,7 @@ fn collect(host: &crate::runner::RunnerHost, entry: &Entry) -> Result<Vec<Value>
             "shared result has more than 128 changed artifact files",
         ));
     }
+    let mut uploads = Vec::new();
     for (name, (base, _)) in changes {
         if names.contains(name.as_str()) {
             continue;
@@ -315,12 +362,26 @@ fn collect(host: &crate::runner::RunnerHost, entry: &Entry) -> Result<Vec<Value>
             return Err(error("shared artifact exceeds 8 MiB"));
         }
         let name_hash = format!("{:x}", Sha256::digest(name.as_bytes()));
-        let upload = json!({"generation":entry.assignment.generation,"kind":"artifact","base_sha256":base,
+        let upload = json!({"generation":generation,"kind":"artifact","base_sha256":base,
             "upload":{"request_id":format!("{attempt}:file:{}",&name_hash[..32]),"name":name,"sha256":format!("{:x}",Sha256::digest(&content)),"content_base64":STANDARD.encode(content)}});
         uploads.push(upload);
     }
-    uploads.extend(published);
     Ok(uploads)
+}
+fn file_change_name(name: &str, workspace_root: &camino::Utf8Path) -> Result<String, RunnerError> {
+    let path = camino::Utf8Path::new(name);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace_root).map_err(error)?
+    } else {
+        path
+    };
+    // The Hub asset name is portable even when the local history used Windows separators.
+    #[cfg(windows)]
+    let name = relative.as_str().replace('\\', "/");
+    #[cfg(not(windows))]
+    let name = relative.as_str().to_owned();
+    path_name(&name)?;
+    Ok(name)
 }
 fn path_name(name: &str) -> Result<(), RunnerError> {
     path(name)
@@ -419,6 +480,74 @@ fn published_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn nested_windows_change_publishes_portable_name_and_original_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(temp.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(root.join("todo_app")).unwrap();
+        let content = b"nested Flask app\n";
+        std::fs::write(root.join("todo_app/app.py"), content).unwrap();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(
+            &root,
+            &crate::config::ResolvedConfig::default(),
+        )
+        .unwrap();
+        let archive = json!({"tables":{"file_changes":[{
+            "path_after":"todo_app\\app.py","before_sha256":null,
+            "after_sha256":format!("{:x}",Sha256::digest(content))
+        }]}});
+        let uploads = changed_file_uploads(
+            &archive,
+            &workspace,
+            &std::collections::HashSet::new(),
+            "nested-attempt",
+            1,
+        )
+        .unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0]["upload"]["name"], "todo_app/app.py");
+        assert_eq!(
+            STANDARD
+                .decode(uploads[0]["upload"]["content_base64"].as_str().unwrap())
+                .unwrap(),
+            content
+        );
+    }
+    #[test]
+    fn changed_file_names_are_portable_and_stay_within_the_workspace() {
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap())
+            .unwrap()
+            .join("workspace");
+        let nested = root.join("todo_app/app.py");
+        assert_eq!(
+            file_change_name(nested.as_str(), &root).unwrap(),
+            "todo_app/app.py"
+        );
+        assert_eq!(
+            file_change_name("todo_app/app.py", &root).unwrap(),
+            "todo_app/app.py"
+        );
+        assert!(path_name("todo_app\\app.py").is_err());
+        assert!(file_change_name("../outside.py", &root).is_err());
+        assert!(
+            file_change_name(
+                root.with_file_name("foreign").join("app.py").as_str(),
+                &root
+            )
+            .is_err()
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                file_change_name("todo_app\\app.py", &root).unwrap(),
+                "todo_app/app.py"
+            );
+            assert!(file_change_name("todo_app\\..\\outside.py", &root).is_err());
+        }
+        #[cfg(not(windows))]
+        assert!(file_change_name("literal\\name.py", &root).is_err());
+    }
     #[test]
     fn shared_artifact_runner_upload_uses_canonical_binary_snapshot_and_checks_ownership() {
         let content = [0u8, 255, 42];

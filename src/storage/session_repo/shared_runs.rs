@@ -8,6 +8,105 @@ fn invalid(message: &str) -> StorageError {
     StorageError::Message(message.into())
 }
 
+impl SqliteSessionRepository {
+    /// Reconcile a prepared remote Stop against the local exact UserStop that
+    /// won the admission CAS. The request row may have been removed after the
+    /// turn terminalized, so the canonical terminal is also authoritative.
+    pub(crate) fn origin_turn_user_stop_committed(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        admission_revision: u64,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let requested: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM exact_execution_interrupt_requests
+             WHERE session_id=?1 AND turn_id=?2 AND admission_revision=?3 AND cause='user_stop')",
+            params![
+                session_id.to_string(),
+                turn_id.to_string(),
+                i64::try_from(admission_revision).map_err(|_| StorageError::Message(
+                    "origin Stop admission revision exceeds SQLite INTEGER".into(),
+                ))?,
+            ],
+            |row| row.get(0),
+        )?;
+        if requested {
+            return Ok(true);
+        }
+        Ok(
+            terminal_for_turn_in_connection(&connection, session_id, turn_id)?.is_some_and(
+                |terminal| {
+                    terminal.interruption_cause()
+                        == Some(crate::protocol::TurnInterruptionCause::UserStop)
+                },
+            ),
+        )
+    }
+
+    pub(crate) fn origin_turn_terminal_without_user_stop(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(
+            terminal_for_turn_in_connection(&connection, session_id, turn_id)?.is_some_and(
+                |terminal| {
+                    terminal.interruption_cause()
+                        != Some(crate::protocol::TurnInterruptionCause::UserStop)
+                },
+            ),
+        )
+    }
+
+    /// Canonical tool history is written before the tool executes. Only a turn
+    /// that attempted delegation can have a remote job to stop.
+    pub(crate) fn turn_attempted_team_delegation(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM protocol_history_items AS call
+                 WHERE call.session_id=?1 AND call.scope_kind='turn' AND call.turn_id=?2
+                   AND json_extract(call.payload_json,'$.kind')='tool_call'
+                   AND json_extract(call.payload_json,'$.tool_name')='team_delegate'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM protocol_history_items AS output
+                     WHERE output.session_id=call.session_id
+                       AND output.turn_id=call.turn_id
+                       AND output.scope_kind='turn'
+                       AND json_extract(output.payload_json,'$.kind')='tool_output'
+                       AND json_extract(output.payload_json,'$.call_id')=
+                           json_extract(call.payload_json,'$.call_id')
+                       AND json_extract(output.payload_json,'$.status')='declined'
+                   ))",
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// A receiver-owned session is never a private Hub work origin.
+    pub(crate) fn has_received_execution_owner(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM shared_run_checkpoints WHERE session_id = ?1)
+                 OR EXISTS(SELECT 1 FROM remote_agent_jobs WHERE session_id = ?1)",
+                params![session_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+}
+
 /// Hash actual canonical bytes and their append order, not an independently retained digest.
 pub(super) fn history_digest(
     connection: &Connection,
@@ -432,6 +531,7 @@ impl SqliteSessionRepository {
             child: proposal.child,
             session_id: session,
             turn_id: turn,
+            retained_service: proposal.retained_service,
         })
     }
 

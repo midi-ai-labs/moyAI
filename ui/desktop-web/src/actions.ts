@@ -1,7 +1,10 @@
 import { command } from "./api.ts";
-import { openHubProject, openSharedWork, refreshSharedWork, sharedWorkAction } from "./shared_work_actions.ts";
+import { cancelSharedConfirmation, cancelSharedRename, cancelSharedRevision, confirmSharedConfirmation, openHubProject, openSharedWork, refreshSharedWork, requestSharedConfirmation, saveSharedRename, saveSharedRevision, sharedWorkAction, startSharedRename, startSharedRevision } from "./shared_work_actions.ts";
 import { sharedWorkActionEnabled } from "./shared_work_state.ts";
-import { deviceExecutionAction, deviceExecutionActionEnabled } from "./device_execution.ts";
+import { localRevisionActionEnabled, prepareLocalMessageEdit } from "./local_revision_source.ts";
+import { bindProjectFolder, cancelExecutionProjectLeave, confirmExecutionProjectLeave, deviceExecutionAction, deviceExecutionActionEnabled, executionProjectLeaveEnabled, projectFolderBindingEnabled, requestExecutionProjectLeave } from "./device_execution.ts";
+import { receiverBlocksLocalSend, receiverServiceStopEnabled, receiverStopEnabled, stopReceiverAttempt, stopReceiverService } from "./receiver_activity.ts";
+import { originAllStopEnabled, originAppsStopEnabled, stopOriginAll, stopOriginApps } from "./origin_work.ts";
 import { openHub, refreshHub, saveHubReview, selectHubTab } from "./hub_actions.ts";
 import { deleteSavedDevicePeer, importDeviceNetwork, joinDeviceNetwork, leaveDeviceNetwork, loadDeviceNetwork, refreshDeviceNetwork, resetDeviceNetwork } from "./device_network_actions.ts";
 import { deviceCanJoin } from "./device_network_state.ts";
@@ -1490,13 +1493,15 @@ async function confirmDeleteSideChat(state: DesktopWebState, context: ActionCont
 }
 
 const ACTION_DEFINITIONS = [
+  { id: "edit-local-message", label: "送信済みの依頼を編集", enabled: (state, payload, model) => localRevisionActionEnabled(state, model.local.localMessageEdit.pending, payload.value),
+    run: (_state, context, payload) => prepareLocalMessageEdit(context, payload.value) },
   {
     id: "send",
     label: "送信",
     shortcut: "Ctrl+Enter",
     palette: true,
     enabled: (state, _payload, model) => state.hub_project_open === true
-      ? sharedWorkActionEnabled(model.local.sharedWork, model.local.sharedWork.projection?.detail ? "continue" : "submit", "") : canSubmit(state),
+      ? sharedWorkActionEnabled(model.local.sharedWork, model.local.sharedWork.projection?.detail ? "continue" : "submit", "") : canSubmit(state) && !receiverBlocksLocalSend(model.local.deviceNetwork),
     run: (state, context) => state.hub_project_open === true
       ? sharedWorkAction(context, context.uiState.sharedWork.projection?.detail ? "continue" : "submit") : context.mutate("submit_prompt", {
       text: state.draft_prompt,
@@ -1560,12 +1565,45 @@ const ACTION_DEFINITIONS = [
   },
   { id: "show-hub", label: "moyAI Hub", menu: "view", palette: true, enabled: always, run: (_state, context) => openHub(context) },
   { id: "show-shared-work", label: "Hubのプロジェクト", menu: "view", palette: true, enabled: always, run: (_state, context) => openSharedWork(context) },
-  { id: "open-hub-project", label: "Hubのプロジェクトを開く", enabled: (state, payload, model) => navigationIsIdle(state) && !model.local.sharedWork.pending && !model.local.sharedWork.conceal && Boolean(model.local.sharedWork.projection?.projects.some(row => row.id === payload.value)), run: (_state, context, payload) => openHubProject(context, payload.value) },
-  ...["refresh", "open-management", "new-conversation", "detail", "submit", "retry-submission", "cancel", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "continue", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
+  { id: "open-hub-project", label: "Hubのプロジェクトを開く", enabled: (state, payload, model) => navigationIsIdle(state) && !model.local.sharedWork.pending && !model.local.sharedWork.conceal && !model.local.sharedWork.projection?.projects_stale && Boolean(model.local.sharedWork.projection?.principal && model.local.sharedWork.projection.projects.some(row => row.id === payload.value)), run: (_state, context, payload) => openHubProject(context, payload.value) },
+  { id: "shared-request-leave-project", label: "プロジェクトから離脱", enabled: (state, payload, model) => state.overlay === "none" && sharedWorkActionEnabled(model.local.sharedWork, "leave-project", payload.value), run: (_state, context, payload) => requestSharedConfirmation(context, "leave_project", payload.value) },
+  { id: "shared-request-delete-conversation", label: "共有チャットを削除", enabled: (state, payload, model) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, "request-delete-conversation", payload.value), run: (_state, context, payload) => requestSharedConfirmation(context, "delete_conversation", payload.value) },
+  { id: "shared-confirm-confirmation", label: "共有操作を確認", enabled: (_state, _payload, model) => Boolean(model.local.sharedWork.confirmation && !model.local.sharedWork.pending), run: (_state, context) => confirmSharedConfirmation(context) },
+  { id: "shared-cancel-confirmation", label: "確認を取り消す", enabled: (_state, _payload, model) => Boolean(model.local.sharedWork.confirmation && !model.local.sharedWork.pending), run: (_state, context) => cancelSharedConfirmation(context) },
+  { id: "shared-select-conversation", label: "共有チャットを開く", enabled: (state, payload, model) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, "select-conversation", payload.value), run: (_state, context, payload) => sharedWorkAction(context, "select_conversation", payload.value) },
+  { id: "shared-start-rename-conversation", label: "共有チャット名を変更", enabled: (state, payload, model) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, "rename-conversation", payload.value), run: (_state, context, payload) => startSharedRename(context, payload.value) },
+  { id: "shared-save-rename-conversation", label: "共有チャット名を保存", enabled: (state, _payload, model) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, "save-rename-conversation", ""), run: (_state, context) => saveSharedRename(context) },
+  { id: "shared-cancel-rename-conversation", label: "名前の変更を取り消す", enabled: (_state, _payload, model) => Boolean(model.local.sharedWork.editingConversationId), run: (_state, context) => cancelSharedRename(context) },
+  { id: "shared-start-revise", label: "送信済みの依頼を編集", enabled: (state, payload, model) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, "start-revise", payload.value), run: (_state, context, payload) => startSharedRevision(context, payload.value) },
+  { id: "shared-save-revise", label: "編集した依頼を再送", enabled: (state, _payload, model) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, "save-revise", ""), run: (_state, context) => saveSharedRevision(context) },
+  { id: "shared-cancel-revise", label: "依頼の編集を取り消す", enabled: (_state, _payload, model) => Boolean(model.local.sharedWork.editingJobId), run: (_state, context) => cancelSharedRevision(context) },
+  { id: "receiver-stop", label: "このPCの受信作業を停止", enabled: (_state, payload, model) => receiverStopEnabled(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => stopReceiverAttempt(context, payload.value) },
+  { id: "receiver-service-stop", label: "このPCのアプリを停止", enabled: (_state, payload, model) => receiverServiceStopEnabled(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => stopReceiverService(context, payload.value) },
+  { id: "origin-stop-apps", label: "この会話の起動中のアプリを停止", enabled: (state, _payload, model) => !state.hub_project_open && originAppsStopEnabled(model.local.deviceNetwork), run: (_state, context) => stopOriginApps(context) },
+  { id: "origin-stop-all", label: "この会話の実行をすべて停止", enabled: (state, _payload, model) => !state.hub_project_open && originAllStopEnabled(model.local.deviceNetwork), run: (_state, context) => stopOriginAll(context) },
+  ...["refresh", "open-management", "new-conversation", "detail", "retry-submission", "cancel", "stop-service", "stop-conversation", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "history-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
     id: `shared-${kind}`, label: "共有仕事の操作",
     enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
     run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => sharedWorkAction(context, kind.replaceAll("-", "_"), payload.value),
   })),
+  {
+    id: "bind-project-folder",
+    label: "プロジェクトの作業フォルダーを選択",
+    enabled: (state, payload, model) => state.overlay === "hub"
+      && projectFolderBindingEnabled(model.local.deviceNetwork, payload.value),
+    run: (_state, context, payload) => bindProjectFolder(context, payload.value),
+  },
+  { id: "request-execution-project-leave", label: "実行専用PCをプロジェクトから離脱", enabled: (state, payload, model) => state.overlay === "hub"
+    && executionProjectLeaveEnabled(model.local.deviceNetwork, payload.value, model.local.sharedWork.projection?.leave_pending_project_id),
+    run: (_state, context, payload) => requestExecutionProjectLeave(context, payload.value) },
+  { id: "confirm-execution-project-leave", label: "実行専用PCの離脱を確定", enabled: (state, _payload, model) => state.overlay === "hub"
+    && Boolean(model.local.deviceNetwork.executionLeaveConfirmation
+      && executionProjectLeaveEnabled(model.local.deviceNetwork,
+        model.local.deviceNetwork.executionLeaveConfirmation.projectId, model.local.sharedWork.projection?.leave_pending_project_id)),
+    run: (_state, context) => confirmExecutionProjectLeave(context) },
+  { id: "cancel-execution-project-leave", label: "実行専用PCの離脱を取り消す", enabled: (state, _payload, model) => state.overlay === "hub"
+    && Boolean(model.local.deviceNetwork.executionLeaveConfirmation && !model.local.deviceNetwork.executionPending),
+    run: (_state, context) => cancelExecutionProjectLeave(context) },
   { id: "hub-tab-devices", label: "HubのPCの接続", enabled: (state, _payload, model) => state.overlay === "hub" && !model.local.hub.pending && !model.local.deviceNetwork.pending, run: (_state, context) => selectHubTab(context, "devices") },
   ...["prepare", "enable", "pause", "resume", "install-autostart", "remove-autostart", "reconcile"].map(kind => ({
     id: `device-execution-${kind}`, label: "このPCの実行設定",

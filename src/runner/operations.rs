@@ -43,7 +43,37 @@ pub enum RunnerOperation {
         template_id: String,
         environment_id: String,
     },
+    /// Local operator selection for one current Hub project participation.
+    /// The path is never accepted from a Hub assignment or sent to the Hub.
+    BindProjectFolder {
+        project_id: String,
+        environment_id: String,
+        directory: Utf8PathBuf,
+        access_mode: crate::config::AccessMode,
+        expected_directory: Option<Utf8PathBuf>,
+    },
     ReconcileUnknown {
+        attempt_id: String,
+        generation: u64,
+        reason: String,
+        evidence: ReconciliationEvidence,
+    },
+    /// Stop one locally owned Hub attempt after checking its durable generation.
+    StopShared {
+        attempt_id: String,
+        generation: u64,
+        run_id: Ulid,
+    },
+    /// Stop one process recorded by this Runner, even while the Hub is offline.
+    StopRetainedService {
+        service_id: String,
+        attempt_id: String,
+        generation: u64,
+    },
+    /// A lost process handle cannot be freed from absence alone. Record explicit
+    /// local operator evidence before reporting the lease stopped to Hub.
+    ReconcileRetainedService {
+        service_id: String,
         attempt_id: String,
         generation: u64,
         reason: String,
@@ -454,8 +484,12 @@ impl RunnerHost {
             RunnerOperation::InstallAutostart => super::autostart::install()?,
             RunnerOperation::RemoveAutostart => super::autostart::remove()?,
             operation @ (RunnerOperation::Provision { .. }
+            | RunnerOperation::BindProjectFolder { .. }
             | RunnerOperation::QuiescentShutdown { .. }
             | RunnerOperation::ReconcileUnknown { .. }
+            | RunnerOperation::StopShared { .. }
+            | RunnerOperation::StopRetainedService { .. }
+            | RunnerOperation::ReconcileRetainedService { .. }
             | RunnerOperation::LocalProject { .. }) => {
                 let sender = self
                     .inner

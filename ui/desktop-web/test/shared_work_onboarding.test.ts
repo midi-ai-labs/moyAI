@@ -11,6 +11,9 @@ test("controller onboarding needs device approval and project assignment without
   local.projection = sharedProjection({ connected: false, enrollment: "pending", principal: null, projects: [], selected_project_id: null, status: null });
   const html = renderSharedWorkOnboarding(local);
   assert.match(html, /管理者の承認待ち/);
+  assert.match(html, /PCの参加後に表示/);
+  assert.match(html, /data-details-key="shared-onboarding" open/);
+  assert.doesNotMatch(html, /プロジェクト · 未完了/);
   assert.doesNotMatch(html, /本人ログイン|パスワード/);
   assert.match(html, /このPCにAIや実行用フォルダーを設定する必要はありません/);
   assert.doesNotMatch(html, /data-action="shared-prepare-sample"/);

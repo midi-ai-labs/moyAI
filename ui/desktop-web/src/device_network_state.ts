@@ -2,6 +2,8 @@ import type { PublishJob, PublishTarget } from "./mcp_publish_state.ts";
 import type { DeviceDiagnosticResult } from "./device_network_diagnostics.ts";
 import type { DeviceArtifactView } from "./device_network_artifacts.ts";
 import type { DeviceExecutionProjection } from "./device_execution.ts";
+import type { ReceiverActivityProjection } from "./receiver_activity.ts";
+import type { OriginWorkProjection } from "./origin_work.ts";
 
 export type DeviceTarget = Exclude<PublishTarget, { kind: "legacy_session" }>;
 export type DeviceAccessMode = "default" | "auto_review" | "full_access";
@@ -60,10 +62,22 @@ export interface DeviceOutgoingJob {
 export interface DeviceNetworkJobs { incoming: DeviceIncomingJob[]; outgoing: DeviceOutgoingJob[] }
 export interface DeviceNetworkUiState {
   execution: DeviceExecutionProjection | null;
+  receiverActivity: ReceiverActivityProjection | null;
+  receiverPending: string | null;
+  receiverError: string;
+  receiverSerial: number;
+  originWork: OriginWorkProjection | null;
+  originOwner: string | null;
+  originPending: boolean;
+  originStopPending: boolean;
+  originError: string;
+  originSerial: number;
+  originLastFetchMs: number;
   executionPending: string | null;
   executionSerial: number;
   executionAccess: DeviceAccessMode;
   executionError: string;
+  executionLeaveConfirmation: { projectId: string; participationGeneration: number | null } | null;
   executionRecoveryTarget: string;
   executionRecoveryReason: string;
   executionEffectsReviewed: boolean;
@@ -102,9 +116,9 @@ export interface DeviceNetworkUiState {
   artifactPending: { referenceId: string; operation: "inspect" | "export" } | null;
   artifactSerial: number;
 }
-export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial" | "executionSerial">;
+export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial" | "executionSerial" | "receiverSerial" | "originSerial" | "originLastFetchMs">;
 export function createDeviceNetworkUiState(): DeviceNetworkUiState {
-  return { execution: null, executionPending: null, executionSerial: 0, executionAccess: "default", executionError: "", executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, executionResetConfirmed: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
+  return { execution: null, executionPending: null, executionSerial: 0, receiverActivity: null, receiverPending: null, receiverError: "", receiverSerial: 0, originWork: null, originOwner: null, originPending: false, originStopPending: false, originError: "", originSerial: 0, originLastFetchMs: 0, executionAccess: "default", executionError: "", executionLeaveConfirmation: null, executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, executionResetConfirmed: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
     receiverConfirmed: false, target: { kind: "temp" }, accessMode: "default", modelMode: "hub",
     dirty: false, draftTarget: null, leaveConfirmed: false, resetConfirmed: false, deletePeerKey: "", error: "", notice: "", startOnLaunch: false, keepWhenHidden: false,
     bindIp: "", port: "",
@@ -113,7 +127,7 @@ export function createDeviceNetworkUiState(): DeviceNetworkUiState {
     artifacts: {}, artifactErrors: {}, artifactNotices: {}, artifactPending: null, artifactSerial: 0 };
 }
 export function deviceNetworkPresentation(state: DeviceNetworkUiState): DeviceNetworkPresentation {
-  const { requestSerial: _serial, jobsSerial: _jobsSerial, diagnosticSerial: _diagnosticSerial, artifactSerial: _artifactSerial, executionSerial: _executionSerial, ...presentation } = state;
+  const { requestSerial: _serial, jobsSerial: _jobsSerial, diagnosticSerial: _diagnosticSerial, artifactSerial: _artifactSerial, executionSerial: _executionSerial, receiverSerial: _receiverSerial, originSerial: _originSerial, originLastFetchMs: _originLastFetchMs, ...presentation } = state;
   return presentation;
 }
 export function deviceNetworkTarget(projection: DeviceNetworkProjection): DeviceNetworkTarget {
@@ -129,7 +143,7 @@ export function acceptDeviceNetworkProjection(
   if (previous && (previous.hub_url !== projection.hub_url || previous.device_id !== projection.device_id
     || previous.enrollment === "active" && projection.enrollment !== "active")) {
     ++state.executionSerial;
-    state.execution = null; state.executionPending = null; state.executionError = "";
+    state.execution = null; state.executionPending = null; state.executionError = ""; state.executionLeaveConfirmation = null;
     resetExecutionRecovery(state);
   }
   state.projection = projection;

@@ -335,7 +335,7 @@ impl RemoteJobService {
                 TargetSnapshot::capture(&service.inner.process.store(), &profile.target, &config).await?;
                 profile.target.workspace_root().cloned().ok_or(PublishCallError::InvalidTarget)?
             };
-            let app = if temporary.is_some() {
+            let mut app = if temporary.is_some() {
                 AppBootstrap::rebuild_for_remote_temp_with_process_runtime_and_config(
                     &root, service.inner.process.clone(), config, profile.id.0,
                 ).await
@@ -344,6 +344,10 @@ impl RemoteJobService {
                     &root, service.inner.process.clone(), config,
                 ).await
             }.map_err(|_| PublishCallError::InvalidTarget)?;
+            // This scope is owned by RemoteJobService, which is itself held by the
+            // device runtime. Keeping that runtime in the nested App would form a
+            // strong cycle; the process-level owner remains available through StoreBundle.
+            app.device_network = None;
             let target = match profile.target {
                 PublishTarget::Temp {} => PublishTarget::Project { project_id: app.workspace.project_id, workspace_root: app.workspace.root.clone() },
                 _ => profile.target.clone(),
@@ -771,7 +775,7 @@ impl RemoteJobService {
                     }
                     let managed_shell_lifetime = scope.admission_closed.child_token();
                     let worker_run_service = Arc::new(
-                        run_service.with_managed_shell_lifetime(managed_shell_lifetime.clone()),
+                        run_service.with_managed_shell_lifetime(managed_shell_lifetime.clone(), id),
                     );
                     let worker_network = network.clone();
                     let worker_authority = authority.clone();

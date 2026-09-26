@@ -29,6 +29,10 @@ pub struct WorkNotification {
     pub read_at_ms: Option<u64>,
     pub can_act: bool,
     pub approval_id: Option<String>,
+    #[serde(default)]
+    pub approval_status: Option<String>,
+    #[serde(default)]
+    pub approval_decision: Option<String>,
 }
 impl DeviceNetworkService {
     pub(super) async fn shared_handover(
@@ -117,13 +121,18 @@ impl DeviceNetworkService {
             runtime.view.inputs.clear();
         }
         runtime.view.selected_project_id = Some(item.project_id);
+        // An inbox item targets an exact job, which may be a child of the
+        // currently selected conversation or belong to another project.
+        runtime.view.selected_conversation_id = None;
         runtime.view.selected_job_id = Some(item.job_id);
         runtime.view.detail = None;
         runtime.view.approval = None;
         runtime.view.handover = None;
         runtime.view.assets.clear();
         runtime.view.transcript = None;
+        runtime.view.conversation_history = None;
         runtime.transcript_after = 0;
+        runtime.history_before = None;
         runtime.before = None;
         runtime.environment_before = None;
         Ok(())

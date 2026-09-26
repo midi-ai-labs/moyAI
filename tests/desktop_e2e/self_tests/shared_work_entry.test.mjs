@@ -44,8 +44,8 @@ test("unavailable device access shows the connection step, never a login form", 
     assert.equal(sharedWorkSurfaceMatches({ ...surface, ...patch }, { principal: null }), false);
   }
 });
-test("job navigation uses the sidebar while explicit job mutation uses the conversation", () => {
-  assert.match(sharedActionTarget("detail", "job-1").selector, /^\.sidebar /);
+test("a job's detail and mutation controls remain inside its shared conversation", () => {
+  assert.match(sharedActionTarget("detail", "job-1").selector, /^\.shared-work /);
   assert.match(sharedActionTarget("cancel", "job-1").selector, /^\.shared-work /);
   assert.deepEqual(sharedActionTarget("approve", "job-1").identity, { tag: "BUTTON", action: "shared-approve" });
 });

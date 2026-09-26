@@ -235,6 +235,7 @@ export interface AgentExecutionRequest extends AgentExecutionTarget {
 
 export interface UiLocalState {
   sharedWork: SharedWorkUiState;
+  localMessageEdit: { pending: boolean; error: string; handoff: { forkedSessionId: string; sourceSessionId: string; workspacePath: string; editableText: string } | null };
   hub: HubUiState;
   deviceNetwork: DeviceNetworkUiState;
   mcpHistory: McpHistoryUiState;
@@ -302,6 +303,7 @@ export interface UiLocalState {
 
 export function createUiLocalState(): UiLocalState {
   return {
+    localMessageEdit: { pending: false, error: "", handoff: null },
     hub: createHubUiState(),
     deviceNetwork: createDeviceNetworkUiState(),
     sharedWork: createSharedWorkUiState(),

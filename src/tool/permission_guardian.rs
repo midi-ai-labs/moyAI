@@ -156,6 +156,7 @@ impl PermissionGuardianEvidenceState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionGuardianDecision {
     Allow { rationale: String },
+    AskUser { rationale: String },
     Deny { rationale: String },
 }
 
@@ -185,7 +186,9 @@ pub trait PermissionGuardian {
         evidence: &PermissionGuardianEvidence,
     ) -> Result<PermissionGuardianDecision, PermissionGuardianError>;
 
-    fn take_approved_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
+    /// Transfer the exact review claim. An Allow has already reached allowed_pending;
+    /// a human handoff remains reviewing until the existing confirmation waiter resolves.
+    fn take_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
         None
     }
 }
@@ -201,6 +204,7 @@ struct GuardianDecisionWire {
 #[serde(rename_all = "snake_case")]
 enum GuardianDecisionKind {
     Allow,
+    AskUser,
     Deny,
 }
 
@@ -220,6 +224,7 @@ pub(crate) fn parse_guardian_decision(
     }
     Ok(match wire.decision {
         GuardianDecisionKind::Allow => PermissionGuardianDecision::Allow { rationale },
+        GuardianDecisionKind::AskUser => PermissionGuardianDecision::AskUser { rationale },
         GuardianDecisionKind::Deny => PermissionGuardianDecision::Deny { rationale },
     })
 }
@@ -230,11 +235,18 @@ mod tests {
     use crate::workspace::AccessKind;
 
     #[test]
-    fn parses_exact_allow_and_deny_decisions() {
+    fn parses_exact_allow_ask_user_and_deny_decisions() {
         assert_eq!(
             parse_guardian_decision(r#"{"decision":"allow","rationale":"scoped"}"#).expect("allow"),
             PermissionGuardianDecision::Allow {
                 rationale: "scoped".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_guardian_decision(r#"{"decision":"ask_user","rationale":"confirm destination"}"#)
+                .expect("ask user"),
+            PermissionGuardianDecision::AskUser {
+                rationale: "confirm destination".to_string(),
             }
         );
         assert_eq!(

@@ -303,6 +303,37 @@ test("permission restart Guardian script serves native metadata and exact four-r
   }
 });
 
+test("Guardian handoff fixture emits ask_user while preserving exact tool and evidence validation", async (context) => {
+  const provider = await startScriptedProvider({ responseBehavior: "hold_until_release",
+    script: { ...script(), guardianDecision: "ask_user" } });
+  context.after(() => provider.close());
+  await seed(provider);
+  const call = await heldShellCall(provider);
+  const review = await post(provider, guardianRequest(call));
+  assert.equal(review.status, 200);
+  assert.equal(JSON.parse(parseSse(await review.text())[0].delta).decision, "ask_user");
+  assert.deepEqual(provider.requestLedger.filter(row => row.route === "responses").map(row => row.contract.role),
+    ["guardian_seed", "guardian_tool_initial", "guardian_review"]);
+  assert.throws(() => createPermissionRestartGuardianProviderScript({ ...script(), guardianDecision: "maybe" }), /guardianDecision/);
+});
+
+test("Guardian handoff checks the fixture's exact nonempty risk evidence instead of the no-op default", async (context) => {
+  const provider = await startScriptedProvider({ responseBehavior: "hold_until_release",
+    script: { ...script(), guardianDecision: "ask_user", expectedPermissionRisks: ["unclassified_shell"] } });
+  context.after(() => provider.close());
+  await seed(provider);
+  const call = await heldShellCall(provider);
+  const empty = await post(provider, guardianRequest(call));
+  assert.equal(empty.status, 422);
+  const review = await post(provider, guardianRequest(call, value => ({ ...value,
+    permission_request: { ...value.permission_request, risks: ["unclassified_shell"] } })));
+  assert.equal(review.status, 200);
+  assert.equal(JSON.parse(parseSse(await review.text())[0].delta).decision, "ask_user");
+  for (const expectedPermissionRisks of [["anything"], ["network", "network"], "network"]) {
+    assert.throws(() => createPermissionRestartGuardianProviderScript({ ...script(), expectedPermissionRisks }), /expectedPermissionRisks/);
+  }
+});
+
 test("permission restart Guardian script fails closed on order, replay, and evidence drift", async (context) => {
   const premature = await startScriptedProvider({ script: script() });
   const replay = await startScriptedProvider({ script: script() });

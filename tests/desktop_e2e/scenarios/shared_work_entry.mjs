@@ -8,7 +8,7 @@ import { DesktopCommandProbe } from "../drivers/desktop_command_probe.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { action, byId, hubSettingsCloseTarget, trustedClick, trustedFocus, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { hubProjectReady, observeSharedWorkSurface, sharedWorkSurfaceMatches, openHubProjectSurface, openSharedDisclosure, rememberedRestartAccepted, sharedActionTarget, bindHubDevice } from "./shared_work_navigation.mjs";
+import { hubProjectReady, observeSharedWorkSurface, sharedWorkSurfaceMatches, openHubProjectSurface, openSharedDisclosure, rememberedRestartAccepted, sharedActionTarget, openSharedJob, bindHubDevice } from "./shared_work_navigation.mjs";
 
 const ID = "settings.shared-work", OWNER = `scenario:${ID}`;
 const failure = (message, evidence) => new DesktopE2eError("product", "shared-work-mismatch", message, evidence);
@@ -111,7 +111,7 @@ export function createSharedWorkEntryScenario(options = {}) {
         await input.keyDown("Control"); try { await input.pressKey("Enter"); } finally { await input.keyUp("Control"); }
         const submitted = await wait("The normal composer generates a chat name and queues at the selected PC", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.status?.jobs.some(j => j.title === prompt && j.state === "queued"));
         const job = submitted.status.jobs.find(j => j.title === prompt);
-        await click("detail", job.id);
+        await openSharedJob(input, cdp, sink, job.id);
         await wait("Job detail displays the submitted prompt", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.detail?.id === job.id && p.detail.input?.prompt === "共有環境で解析してください。");
         await captureScenarioScreenshot({ cdp, sink, name: "shared-submitted-job", owner: OWNER });
         const beforeRestart = { user_id: alice.user_id, project_id: "project-a", job_id: job.id };
@@ -122,7 +122,7 @@ export function createSharedWorkEntryScenario(options = {}) {
         }), value => rememberedRestartAccepted(value, beforeRestart));
         await sink.record("shared-remembered-person-restart", { ...beforeRestart, restart: restartProof, connected: restored.shared.connected, surface: restored.surface, login_commands: 0 }, { phase: "executing", owner: OWNER });
         await captureScenarioScreenshot({ cdp, sink, name: "shared-person-restored-after-restart", owner: OWNER });
-        await click("detail", job.id);
+        await openSharedJob(input, cdp, sink, job.id);
         await click("cancel", job.id);
         await wait("Cancel changes the shared job", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.status?.jobs.some(j => j.id === job.id && j.state === "cancelled"));
         await bindHubDevice(resource, enrolled.network.device_id, bob.user_id);
@@ -133,7 +133,7 @@ export function createSharedWorkEntryScenario(options = {}) {
         await captureScenarioScreenshot({ cdp, sink, name: "shared-bob-reconnected", owner: OWNER });
         const approvalId = randomUUID();
         await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: assignment.attempt_id, generation: assignment.generation, outcome: { kind: "started" } });
-        await click("detail", occupied.id);
+        await openSharedJob(input, cdp, sink, occupied.id);
         const contacts = async () => {
           const p = await invokeDesktopCommand(cdp, "shared_work_projection");
           const job = p.status?.jobs.find(row => row.id === occupied.id);
@@ -157,8 +157,7 @@ export function createSharedWorkEntryScenario(options = {}) {
         const stale = await wait("Fifteen seconds without Runner control contact preserves the occupied running work", contacts,
           value => contactState(value, "stale") && [value.job, value.environment, value.detail].every(row => row.runner_contact.last_contact_ms === lastContact), 30_000);
         if (stale.observed_at_ms <= recent.observed_at_ms || Object.values(stale.text).some(text => text.includes("空きがあります"))) throw failure("Desktop reads must not refresh Runner contact or declare the occupied environment free", {});
-        const selectedJob = sharedActionTarget("detail", occupied.id);
-        await trustedFocus(input, cdp, selectedJob);
+        await openSharedJob(input, cdp, sink, occupied.id);
         await captureScenarioScreenshot({ cdp, sink, name: "shared-runner-contact-stale", owner: OWNER });
         const recovered = await confirmRunnerContact();
         if ([recovered.job, recovered.environment, recovered.detail].some(row => row.runner_contact.last_contact_ms <= lastContact)) throw failure("The new Runner control response did not advance the contact time", {});
@@ -168,7 +167,7 @@ export function createSharedWorkEntryScenario(options = {}) {
           desktop_observation_advanced: stale.observed_at_ms > recent.observed_at_ms, occupancy_before: recent.environment.occupied, occupancy_stale: stale.environment.occupied, occupancy_after: recovered.environment.occupied,
           scope: "Actual Desktop and real mTLS Hub assignments API; fixture controls its own Runner-role contact, with the default 15-second Hub threshold and no clock override. Process liveness and progress are not inferred." }, { phase: "executing", owner: OWNER });
         await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: assignment.attempt_id, generation: assignment.generation, outcome: { kind: "approval_requested", approval_id: approvalId, expires_at_ms: Date.now() + 300000, request: { access: "shell", summary: "解析環境で入力ファイルの確認を実行", details: ["実行予定: Get-ChildItem -LiteralPath ."], targets: [context.paths.workspace], outside_workspace: false, risks: ["unclassified_shell"] } } });
-        await click("detail", occupied.id);
+        await openSharedJob(input, cdp, sink, occupied.id);
         await wait("Shared detail receives the pending approval", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.approval?.id === approvalId && p.approval.status === "pending" && p.approval.can_decide);
         if (!(await cdp.evaluate("document.querySelector('[data-shared-region=approval]').textContent")).includes("Get-ChildItem -LiteralPath .")) throw failure("Approval omitted concrete operation details", {});
         await click("approve", approvalId);

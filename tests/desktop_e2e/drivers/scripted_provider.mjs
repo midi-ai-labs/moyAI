@@ -294,12 +294,23 @@ function permissionRestartGuardianScript(value) {
     "seedResponseText",
     "taskPrompt",
   ];
+  if (Object.hasOwn(value, "guardianDecision")) expectedKeys.push("guardianDecision");
+  if (Object.hasOwn(value, "expectedPermissionRisks")) expectedKeys.push("expectedPermissionRisks");
   if (!exactKeys(value, expectedKeys)
     || value.kind !== SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     throw new TypeError("permission restart Guardian scripted provider mode must use its exact schema");
   }
   if (!SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_API_MODES.includes(value.apiMode)) {
     throw new TypeError("permission restart Guardian script.apiMode must use a supported wire mode");
+  }
+  if (value.guardianDecision !== undefined && !["allow", "ask_user", "deny"].includes(value.guardianDecision)) {
+    throw new TypeError("script.guardianDecision must be allow, ask_user, or deny");
+  }
+  if (value.expectedPermissionRisks !== undefined && (!Array.isArray(value.expectedPermissionRisks)
+    || value.expectedPermissionRisks.some(risk => !["destructive_delete", "move_or_rename", "network", "external_connection",
+      "configured_local_service", "protected_workspace_authority", "external_mutation", "external_destructive_operation", "unclassified_shell"].includes(risk))
+    || new Set(value.expectedPermissionRisks).size !== value.expectedPermissionRisks.length)) {
+    throw new TypeError("script.expectedPermissionRisks must be an exact unique list of permission risk codes");
   }
   return Object.freeze({
     kind: value.kind,
@@ -310,6 +321,8 @@ function permissionRestartGuardianScript(value) {
     command: nonEmptyString(value.command, "script.command"),
     justification: nonEmptyString(value.justification, "script.justification"),
     responseText: nonEmptyString(value.responseText, "script.responseText"),
+    ...(value.guardianDecision === undefined ? {} : { guardianDecision: value.guardianDecision }),
+    ...(value.expectedPermissionRisks === undefined ? {} : { expectedPermissionRisks: Object.freeze([...value.expectedPermissionRisks]) }),
   });
 }
 
@@ -528,6 +541,8 @@ export function createPermissionRestartGuardianProviderScript({
   command,
   justification,
   responseText,
+  guardianDecision,
+  expectedPermissionRisks,
 } = {}) {
   return permissionRestartGuardianScript({
     kind: SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND,
@@ -538,6 +553,8 @@ export function createPermissionRestartGuardianProviderScript({
     command,
     justification,
     responseText,
+    ...(guardianDecision === undefined ? {} : { guardianDecision }),
+    ...(expectedPermissionRisks === undefined ? {} : { expectedPermissionRisks }),
   });
 }
 
@@ -2417,7 +2434,7 @@ function permissionGuardianPayloadContract(inputText, script) {
     && permission.targets.every((target) => typeof target === "string" && target.length > 0)
     && permission.outside_workspace === true
     && Array.isArray(permission.risks)
-    && permission.risks.length === 0;
+    && JSON.stringify(permission.risks) === JSON.stringify(script.expectedPermissionRisks ?? []);
   const evidenceMatches = exactKeys(payload?.action_evidence, ["kind"])
     && payload.action_evidence.kind === "permission_request";
   const worldStateMatches = payload?.trusted_world_state !== null
@@ -4964,6 +4981,8 @@ export class ScriptedProvider {
     row.response_phase = "completed";
     row.response_status = 200;
     let payload;
+    const guardianDecision = { ...PERMISSION_RESTART_GUARDIAN_ALLOW,
+      decision: this.script.guardianDecision ?? "allow" };
     if (this.script.apiMode === "chat_completions" && role === "guardian_seed") {
       payload = permissionRestartGuardianChatTextSse(
         this.modelId,
@@ -4977,7 +4996,7 @@ export class ScriptedProvider {
       payload = permissionRestartGuardianChatTextSse(
         this.modelId,
         "chatcmpl_permission_restart_guardian_allow",
-        JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW),
+        JSON.stringify(guardianDecision),
         { promptTokens: 40, completionTokens: 8 },
       );
     } else if (this.script.apiMode === "chat_completions") {
@@ -4995,7 +5014,7 @@ export class ScriptedProvider {
     } else if (role === "guardian_tool_initial") {
       payload = permissionRestartGuardianShellSse(this.script);
     } else if (role === "guardian_review") {
-      payload = responsesSse(JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW), {
+      payload = responsesSse(JSON.stringify(guardianDecision), {
         itemId: "msg_permission_restart_guardian_allow",
         responseId: "resp_permission_restart_guardian_allow",
       });

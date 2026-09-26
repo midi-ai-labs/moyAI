@@ -359,6 +359,7 @@ mod tests {
             label: "P".into(),
             role: "contributor".into(),
             can_submit: true,
+            participation_generation: 1,
         });
         assert!(view.can_prepare_sample("p"));
         assert!(!view.can_prepare_sample("another-project"));

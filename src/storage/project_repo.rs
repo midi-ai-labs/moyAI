@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StorageError;
 use crate::runtime::{Clock, SystemClock};
-use crate::session::{ProjectId, ProjectRecord, ProjectRepository};
+use crate::session::{ProjectId, ProjectRecord, ProjectRepository, SessionId};
 use crate::storage::session_repo::mutation_blocker_for_project_in_connection;
 
 #[derive(Clone)]
@@ -176,8 +176,52 @@ impl ProjectRepository for SqliteProjectRepository {
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<(), StorageError> {
+        self.delete_project_checked(id, None).await
+    }
+}
+
+impl SqliteProjectRepository {
+    /// Recheck the complete local history owner set in the same transaction
+    /// that erases the project. Hub was consulted before this transaction; a
+    /// newly admitted and already completed turn must still invalidate it.
+    pub(crate) async fn delete_project_checked(
+        &self,
+        id: ProjectId,
+        expected_revisions: Option<&[(SessionId, u64)]>,
+    ) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(expected_revisions) = expected_revisions {
+            let mut statement = tx.prepare(
+                "SELECT session.id, revision.revision
+                 FROM sessions AS session
+                 INNER JOIN session_admission_revisions AS revision ON revision.session_id=session.id
+                 WHERE session.project_id=?1 ORDER BY session.id",
+            )?;
+            let actual = statement
+                .query_map(params![id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut expected = expected_revisions
+                .iter()
+                .map(|(session_id, revision)| {
+                    Ok((
+                        session_id.to_string(),
+                        i64::try_from(*revision).map_err(|_| {
+                            StorageError::Message("project chat revision is invalid".into())
+                        })?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            expected.sort();
+            if actual != expected {
+                return Err(StorageError::Message(
+                    "project chats changed while Hub work was being checked; refresh before deleting"
+                        .into(),
+                ));
+            }
+        }
         let has_remote_job: bool = tx.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM remote_agent_jobs AS job
@@ -401,6 +445,40 @@ mod tests {
         assert_eq!(preserved.root_path, root);
         assert_eq!(preserved.display_name, "original");
         assert_eq!(preserved.vcs_kind, "git");
+    }
+
+    #[tokio::test]
+    async fn checked_project_delete_rejects_new_or_changed_chats_after_hub_snapshot() {
+        let (store, root) = project_store_fixture();
+        let project_id = ProjectId::new();
+        let repo = store.project_repo();
+        repo.upsert_project(project_id, &root, "project", "none")
+            .await
+            .unwrap();
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "later chat".into(),
+                cwd: root,
+                model: "model".into(),
+                base_url: "http://localhost:1234".into(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            repo.delete_project_checked(project_id, Some(&[]))
+                .await
+                .is_err()
+        );
+        assert!(
+            repo.delete_project_checked(project_id, Some(&[(session.id, 999)]))
+                .await
+                .is_err()
+        );
+        assert!(repo.get_project(project_id).await.is_ok());
     }
 
     #[tokio::test]

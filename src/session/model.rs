@@ -518,6 +518,14 @@ pub struct SessionForkResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEditForkResult {
+    pub source_session: SessionRecord,
+    pub forked_session: SessionRecord,
+    pub edited_turn_id: TurnId,
+    pub editable_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub id: ProjectId,
     pub root_path: Utf8PathBuf,

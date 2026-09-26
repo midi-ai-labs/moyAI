@@ -3,6 +3,7 @@ import { escapeHtml } from "./utils.ts";
 import { renderDeviceNetwork } from "./device_network_render.ts";
 import { renderHubCatalogComparison } from "./hub_catalog_render.ts";
 import type { DeviceNetworkPresentation } from "./device_network_state.ts";
+import type { SharedWorkPresentation } from "./shared_work_state.ts";
 import {
   createHubUiState, hubActiveRoute, hubCanSave, hubErrorText, hubModelChoice,
   hubSaveFeedback, type HubContext, type HubPresentation,
@@ -52,12 +53,12 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
   </div>`;
 }
 
-export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetworkPresentation): string {
+export function renderHubOverlay(input?: HubPresentation, network?: DeviceNetworkPresentation, shared?: SharedWorkPresentation): string {
   const local = input ?? createHubUiState();
   return `<div class="modal-backdrop"><section class="modal settings-modal hub-modal" data-modal="hub" data-surface="hub" role="dialog" aria-modal="true" aria-labelledby="hub-dialog-title" tabindex="-1">
     <header class="hub-modal-header"><div><h2 id="hub-dialog-title">moyAI Hub</h2><p>このPCをHubにつなぎ、チームの仕事に参加します。</p></div><button class="icon-button" data-action="close-overlay" aria-label="閉じる">${icon("x")}</button></header>
     <nav class="hub-tabs" aria-label="Hub設定の分類"><button id="hub-tab-devices" data-action="hub-tab-devices" aria-controls="hub-panel-devices" aria-pressed="${local.tab === "devices"}">PCの接続</button><button data-action="show-config">AIの接続</button></nav>
-    <div class="hub-modal-body settings-content"><div id="hub-panel-devices" data-hub-panel="devices">${renderDeviceNetwork(network)}</div></div>
+    <div class="hub-modal-body settings-content"><div id="hub-panel-devices" data-hub-panel="devices">${renderDeviceNetwork(network, shared)}</div></div>
     <footer class="hub-modal-footer"><span>AIの接続先とモデルは「設定」の同じ欄で確認できます。</span><button data-action="close-overlay">閉じる</button></footer>
   </section></div>`;
 }

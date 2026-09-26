@@ -14,9 +14,12 @@ pub const MAX_SHARED_PROMPT_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone)]
 pub struct SharedRunContext {
     pub job_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
     pub project_id: String,
     pub environment_id: String,
     pub allowed_child_environments: Vec<String>,
+    pub allowed_child_candidates: Vec<crate::runner::shared::SharedCandidate>,
     pub resume: Option<SharedResume>,
     pub continuation: Option<SharedContinuation>,
 }
@@ -55,6 +58,7 @@ pub struct SharedYield {
     pub child: SharedChildRequest,
     pub session_id: SessionId,
     pub turn_id: TurnId,
+    pub(crate) retained_service: Option<crate::tool::shell::RetainedService>,
 }
 
 /// A confirmed Hub outcome can retire a paused local continuation without running the agent.
@@ -103,6 +107,7 @@ pub(crate) struct SharedYieldProposal {
     pub tool_call_id: ToolCallId,
     pub child: SharedChildRequest,
     pub progress: SharedProgress,
+    pub retained_service: Option<crate::tool::shell::RetainedService>,
 }
 
 impl SharedRunContext {
@@ -113,14 +118,34 @@ impl SharedRunContext {
                     .into(),
             );
         }
-        if [&self.job_id, &self.project_id, &self.environment_id]
-            .into_iter()
-            .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+        if [
+            &self.job_id,
+            &self.attempt_id,
+            &self.project_id,
+            &self.environment_id,
+        ]
+        .into_iter()
+        .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+            || self.generation == 0
             || self.allowed_child_environments.len() > 128
+            || self.allowed_child_candidates.len() > 128
             || self
                 .allowed_child_environments
                 .iter()
                 .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+            || self.allowed_child_candidates.iter().any(|candidate| {
+                !self
+                    .allowed_child_environments
+                    .contains(&candidate.environment_id)
+                    || candidate.device_label.len() > 256
+                    || candidate.environment_label.len() > 256
+                    || candidate.device_label.chars().any(char::is_control)
+                    || candidate.environment_label.chars().any(char::is_control)
+                    || candidate.capabilities.len() > 32
+                    || candidate.capabilities.iter().any(|capability| {
+                        capability.len() > 128 || capability.chars().any(char::is_control)
+                    })
+            })
         {
             return Err("invalid shared job identity or allowed environments".into());
         }

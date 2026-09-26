@@ -1,26 +1,41 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { createCompanionContext } from "../core/run_context.mjs";
 import { prepareDesktopFixtureEnvironment } from "../core/desktop_isolation.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/hub_browser_resource.mjs";
 import { startSharedWorkflowProvider } from "../drivers/shared_work_runner_fixture.mjs";
 import { createManagedExecutionRunner } from "../drivers/managed_execution_runner.mjs";
-import { WebviewInput } from "../drivers/webview_input.mjs";
+import { WebviewInput, assertTrustedTextInsertion } from "../drivers/webview_input.mjs";
 import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathInOwnedNativeDialog, probeExactOwnedWindow } from "../drivers/windows_native_input.mjs";
 import { INPUT_NAME, SCRIPT_NAME, RESULT_NAME } from "../fixtures/onboarding_implementation.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
-import { action, byId, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
+import { action, byId, hubSettingsCloseTarget, trustedClick, trustedFocus, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
 import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget } from "./shared_work_navigation.mjs";
 import { isolatedDevicesAccepted } from "./shared_work_isolation.mjs";
 import { quiesceDeviceExecutionResources } from "./device_execution.mjs";
 import { normalizeProviderConnectionLiveOptions } from "./provider_connection_live.mjs";
+import { observeRunNextTurnSurface } from "./run_next_turn.mjs";
 
 const ID = "onboarding.win-a-to-win-b", OWNER = `scenario:${ID}`;
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const fail = (message, evidence = {}) => new DesktopE2eError("product", "onboarding-winab-mismatch", message, evidence);
+const sameFixtureFolder = (actual, expected) => typeof actual === "string"
+  && path.toNamespacedPath(path.resolve(actual)).toLowerCase() === path.toNamespacedPath(path.resolve(expected)).toLowerCase();
+export function ordinaryChatDraftOwnerReady(surface, workspace) {
+  const p = surface?.projection;
+  return Boolean(p && sameFixtureFolder(p.workspace_path, workspace)
+    && p.overlay === "none" && p.hub_project_open !== true && p.navigation_loading === false
+    && p.busy === false && p.background_mutation_pending === false && p.post_run_refresh_pending === false
+    && p.composer_submit_mode === "new_request" && p.can_submit === true
+    && surface.composer?.count === 1 && surface.composer.visible
+    && isDeepStrictEqual(surface.composer.run_target, p.run_target)
+    && surface.prompt?.count === 1 && surface.prompt.enabled && surface.prompt.visible
+    && surface.visible_fatal_count === 0 && surface.visible_recoverable_error_count === 0);
+}
 export function latestArtifactVersion(assets, name) {
   return assets.filter(asset => asset.name === name && asset.kind === "artifact").sort((a, b) => b.version - a.version)[0];
 }
@@ -90,12 +105,21 @@ export function createOnboardingWinAbScenario(options = {}) {
         await sink.record("onboarding-next-step", { title, text: await page.locator("#onboarding-next").innerText() }, { phase: "executing", owner: OWNER });
       }
       async function click(pc, target) { desktopActions++; await trustedClick(pc.input, pc.driver, target, pc.sink); }
-      async function fill(pc, target, value) { await click(pc, target); await pc.input.keyDown("Control"); await pc.input.pressKey("a"); await pc.input.keyUp("Control"); await pc.input.insertText(target, value); }
-      async function select(pc, target, value) {
-        const values = await pc.driver.evaluate(`Array.from(document.querySelector(${JSON.stringify(target.selector)}).options,o=>o.value)`);
-        const index = values.indexOf(value); if (index < 0) throw fail("Required choice is absent", { target, value, values });
-        await click(pc, target); await pc.input.pressKey("Home"); for (let i = 0; i < index; i++) await pc.input.pressKey("ArrowDown"); await pc.input.pressKey("Enter");
-        await wait("User selection is retained", () => pc.driver.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.value`), v => v === value);
+      async function fill(pc, target, value) {
+        await click(pc, target);
+        // Hub polling can replace a newly focused textarea between click,
+        // selection and insertion. Reacquire only the same semantic input.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await trustedFocus(pc.input, pc.driver, target);
+          await pc.input.keyDown("Control"); await pc.input.pressKey("a"); await pc.input.keyUp("Control");
+          await trustedFocus(pc.input, pc.driver, target);
+          try {
+            await pc.input.insertText(target, value);
+            return;
+          } catch (error) {
+            if (error?.code !== "text-insert-focus-owner" || attempt === 2) throw error;
+          }
+        }
       }
       async function attach(pc, connection) {
         Object.assign(pc, connection); await pc.driver.call("Runtime.enable"); await pc.driver.call("DOM.enable");
@@ -121,7 +145,12 @@ export function createOnboardingWinAbScenario(options = {}) {
         return wait("The same approved actor and visible account use the current PC name", async () => ({
           shared: await projection(a),
           account_text: await a.driver.evaluate(`document.querySelector('[data-shared-region="account"] p')?.textContent?.trim()`),
-        }), value => value.shared.principal?.user_id === userId && value.shared.principal.display_name === a.label && !value.shared.principal.administrator && value.account_text?.startsWith(`${a.label} · `));
+        }), value => {
+          const project = value.shared.projects.find(row => row.id === value.shared.selected_project_id);
+          const account = project ? `${project.label} · プロジェクトで共有` : `${a.label} · プロジェクトの割り当てを待っています`;
+          return value.shared.principal?.user_id === userId && value.shared.principal.display_name === a.label
+            && !value.shared.principal.administrator && value.account_text === account;
+        });
       }
       async function nativeFile(pc, target, selectedPath, intent) {
         pc.nativeOwner = { executionRoot: pc.context.root, ownerPath: pc.runtime.desktop_owner_path, expectedOwner: pc.runtime.desktop_owner };
@@ -189,6 +218,8 @@ export function createOnboardingWinAbScenario(options = {}) {
         await checkpoint(b, "hub-first-execution-setup");
         await wait("PC connection tab is visible after execution-purpose setup", () => b.driver.evaluate(`document.querySelector('#hub-tab-devices')?.getAttribute('aria-pressed') === 'true' && Boolean(document.querySelector('#device-network-import')?.getClientRects().length)`), Boolean);
         await enroll(b, "hub");
+        await wait("Hub connection completes B's first-use setup without a password", () => projection(b, "desktop_state"),
+          p => p.startup.initial_setup_required === false && p.startup.onboarding_intent === null);
         const models = await wait("B adopts the Hub standard model for Main and Side", () => projection(b, "hub_projection"),
           p => p.status === "connected" && p.main_mode === "hub" && p.side_chat_mode === "hub"
             && p.main_review && p.main_uses_default === true && p.side_chat_uses_default === true);
@@ -225,12 +256,33 @@ export function createOnboardingWinAbScenario(options = {}) {
         await page.locator(`input[name="runner_device_ids"][value="${b.identity.network.device_id}"]`).check();
         await hubCheckpoint("project-before-save"); await saveHubForm();
         const projectId = await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "CSV集計の実装", exact: true }) }).locator('[data-sa-operation="save_project"]').getAttribute("data-sa-id");
-        const ready = await wait("Assigned B provisions its project execution folder", execution, p => p.projects.some(row => row.id === projectId && row.can_execute && row.preparation_state === "ready" && row.environment_id), 60000);
-        const environmentId = ready.projects.find(row => row.id === projectId).environment_id;
+        const assigned = await wait("Assigned B receives a project that needs a work folder", execution, p => p.projects.some(row => row.id === projectId && row.can_execute && row.environment_id), 60000);
+        const environmentId = assigned.projects.find(row => row.id === projectId).environment_id;
+        const projectFolder = path.join(b.context.paths.workspace, "csv-implementation"); await mkdir(projectFolder);
+        await nativeFile(b, action("bind-project-folder"), projectFolder, "directory");
+        const ready = await wait("B's selected project folder is ready for work", execution, p => p.projects.some(row => row.id === projectId && row.environment_id === environmentId
+          && row.preparation_state === "ready" && sameFixtureFolder(row.directory, projectFolder)), 60000);
+        await click(b, hubSettingsCloseTarget);
+        await wait("B returns to the ordinary Desktop shell", () => projection(b, "desktop_state"), p => p.overlay === "none");
+        await click(b, { selector: '.sidebar button[data-action="new-chat"][data-value="local"]', identity: { tag: "BUTTON", action: "new-chat" } });
+        const quickWorkspace = path.join(b.context.paths.data, "quick-chat-workspace");
+        const draftOwner = await wait("B's new ordinary chat settles before entering its unsent draft", () => observeRunNextTurnSurface(b.driver),
+          value => ordinaryChatDraftOwnerReady(value, quickWorkspace) && value.prompt.value === "" && value.send.enabled === false);
+        const draftTarget = byId("prompt", "TEXTAREA"), draftText = "WinB local draft stays here";
+        await click(b, draftTarget); await trustedFocus(b.input, b.driver, draftTarget);
+        const inputStart = (await b.input.snapshotProbe()).sequence;
+        const inserted = await b.input.insertText(draftTarget, draftText);
+        const inputSnapshot = await b.input.snapshotProbe(inputStart);
+        await b.sink.record("onboarding-receiver-draft-input", { owner: draftOwner.projection.draft_target, inserted, inputSnapshot }, { phase: "executing", owner: OWNER });
+        const inputProof = assertTrustedTextInsertion(inputSnapshot, { afterSequence: inputStart, identity: draftTarget.identity, text: draftText });
+        const enteredDraft = await wait("B's trusted input appears on the same completed new-chat owner", () => observeRunNextTurnSurface(b.driver),
+          value => ordinaryChatDraftOwnerReady(value, quickWorkspace) && value.prompt.value === draftText
+            && isDeepStrictEqual(value.projection.draft_target, draftOwner.projection.draft_target));
+        await b.sink.record("onboarding-receiver-draft-ready", { inputProof, surface: enteredDraft }, { phase: "executing", owner: OWNER });
+        await checkpoint(b, "ordinary-shell-before-remote-work");
         const operations = (await state.runner.command(["operations", "--runner", runner.identity.runner_id])).projection;
         const directory = operations.environments.find(row => row.environment_id === environmentId)?.directory;
-        const relative = directory && path.relative(path.toNamespacedPath(approvedRoot), path.toNamespacedPath(directory));
-        if (!relative || path.isAbsolute(relative) || relative.startsWith("..")) throw fail("B executes outside its consent directory");
+        if (!sameFixtureFolder(directory, projectFolder)) throw fail("B did not bind the folder selected for this project", { directory, projectFolder });
         await checkpoint(b, "project-ready-without-human-login"); await hubCheckpoint("project-ready");
         await page.locator('nav a[href="#team-onboarding"]').click(); await nextStep("Desktopからサンプルを依頼してください", ["Desktop", "AIの接続・実行結果はこのサンプルで確認"]); await hubCheckpoint("onboarding-project-ready");
         await wait("A receives the assigned project", () => projection(a), p => p.projects.some(row => row.id === projectId && row.can_submit));
@@ -238,16 +290,28 @@ export function createOnboardingWinAbScenario(options = {}) {
         const inputPath = path.join(a.context.paths.workspace, INPUT_NAME); await writeFile(inputPath, "value\n10\n20\n30\n", { flag: "wx" });
         await openSharedDisclosure(a.input, a.driver, a.sink, "hub-inputs"); await nativeFile(a, sharedActionTarget("upload-inputs"), inputPath, "open");
         await wait("CSV reaches the project input list", () => projection(a), p => p.inputs.some(asset => asset.name === INPUT_NAME));
-        if (await a.driver.evaluate(`Boolean(document.getElementById('shared-environment'))`)) await select(a, byId("shared-environment", "SELECT"), environmentId);
-        else if ((await projection(a)).status.environments.length !== 1 || (await projection(a)).status.environments[0].id !== environmentId) throw fail("The single displayed execution PC must be B");
-        await openSharedDisclosure(a.input, a.driver, a.sink, "hub-new-chat-options");
-        await fill(a, byId("shared-title", "INPUT"), "CSVを集計するスクリプトを作る");
-        await fill(a, byId("shared-prompt", "TEXTAREA"), `${INPUT_NAME} の value 列を集計する ${SCRIPT_NAME} を作成し、PowerShellで実行してください。件数と合計を ${RESULT_NAME} に保存し、スクリプトと結果を返してください。${live ? '結果は「Count: 件数」「Sum: 合計」の2行にしてください。両方のファイルをこの会話の成果ファイルとして共有してください。' : ''}`);
+        if (await a.driver.evaluate(`Boolean(document.getElementById('shared-environment') || document.getElementById('shared-title'))`)) throw fail("The regular composer must not require a PC or title form");
+        await fill(a, byId("shared-prompt", "TEXTAREA"), `WinBをホストにして、${INPUT_NAME} の value 列を集計する ${SCRIPT_NAME} を作成し、PowerShellで実行してください。件数と合計を ${RESULT_NAME} に保存し、スクリプトと結果を返してください。${live ? '結果は「Count: 件数」「Sum: 合計」の2行にしてください。両方のファイルをこの会話の成果ファイルとして共有してください。' : ''}`);
         await checkpoint(a, "request-before-send"); await click(a, sharedActionTarget("submit"));
-        const approvals = new Set(), approvalVisibility = [];
+        const placed = await wait("A's regular chat request is admitted to authorized B", () => projection(a), p => Boolean(p.detail?.id || p.error));
+        if (placed.detail?.environment_id !== environmentId) throw fail("A's request was not placed on the sole authorized execution PC B", { detail: placed.detail, error: placed.error, environment_id: environmentId });
+        await sink.record("onboarding-request-placement", { job_id: placed.detail.id, requested_pc: "WinB", environment_id: placed.detail.environment_id }, { phase: "executing", owner: OWNER });
+        const approvals = new Set(), approvalVisibility = []; let receiverEvidence = null;
         const completed = await wait("B implements and runs the script; A receives both files", async () => {
           const p = await projection(a);
           if (p.approval?.status === "pending" && p.approval.can_decide && !approvals.has(p.approval.id)) {
+            if (!receiverEvidence && !live) {
+              receiverEvidence = await wait("B's ordinary chat visibly shows the exact received work", async () => ({
+                activity: await projection(b, "receiver_activity_projection"),
+                visible: await b.driver.evaluate(`document.querySelector('.receiver-activity')?.innerText ?? ''`),
+                stop: await b.driver.evaluate(`Boolean(document.querySelector('.receiver-activity button[data-action="receiver-stop"]'))`),
+                composer: await b.driver.evaluate(`({disabled:document.querySelector('.composer button[data-action="send"]')?.disabled,draft:document.querySelector('#prompt')?.value,reason:document.querySelector('.composer-route-notice')?.textContent})`),
+              }), value => value.activity.attempts.some(attempt => attempt.job_id === p.detail?.id && attempt.state === "executing")
+                && value.visible.includes("このPCは使用中") && value.stop && value.composer.disabled
+                && value.composer.draft === "WinB local draft stays here" && value.composer.reason?.includes("受信した仕事"), 30000);
+              await b.sink.record("onboarding-receiver-activity", { job_id: p.detail.id, receiver: receiverEvidence }, { phase: "executing", owner: OWNER });
+              await checkpoint(b, "receiver-visible-in-ordinary-chat");
+            }
             approvals.add(p.approval.id);
             const target = sharedActionTarget("approve", p.approval.id);
             const { observation } = await wait("Approval action is rendered before any focus or scroll", () => a.input.observeExactTarget(target), value => value.observation.count === 1 && value.observation.enabled);
@@ -291,13 +355,22 @@ export function createOnboardingWinAbScenario(options = {}) {
         if (expectProviderFailure) {
           const reason = completed.detail.result?.summary?.terminal?.outcome?.error;
           if (!reason || !completed.detail.can_continue) throw fail("Failed work must retain its error and continuation capability");
-          await wait("The actual provider failure is readable without opening diagnostic details", () => a.driver.evaluate(`(() => { const region = document.querySelector('[data-shared-region="detail"]'); return { visible: region?.innerText, open: [...region.querySelectorAll('details')].some(n => n.open), followup: Boolean(document.querySelector('#shared-followup')) }; })()`), value => value.visible?.includes(reason) && value.visible.includes("仕事を完了できませんでした") && value.visible.includes("URL") && !value.visible.includes("回答文はありません") && !value.open && value.followup);
+          await wait("The actual provider failure is readable in the conversation", () => a.driver.evaluate(`(() => { const region = document.querySelector('[data-shared-region="history-container"]'); return { visible: region?.innerText, open: [...region.querySelectorAll('details')].some(n => n.open), followup: Boolean(document.querySelector('#shared-followup')) }; })()`), value => value.visible?.includes(reason) && value.visible.includes("仕事を完了できませんでした") && value.visible.includes("URL") && !value.visible.includes("回答文はありません") && !value.open && value.followup);
           await checkpoint(a, "provider-failure-readable");
-          await click(a, { selector: '[data-shared-region="detail"] a[href="#shared-followup"]', identity: { tag: "A", href: "#shared-followup" } });
+          await click(a, { selector: '[data-shared-region="history-container"] a[href="#shared-followup"]', identity: { tag: "A", href: "#shared-followup" } });
           await wait("Failure recovery link reaches the existing continuation input without submitting", () => a.driver.evaluate(`(() => { const field = document.querySelector('#shared-followup'); const rect = field?.getBoundingClientRect(); return { focused: document.activeElement === field, visible: rect && rect.top >= 0 && rect.top < innerHeight, value: field?.value, disabled: field?.disabled }; })()`), value => value.focused && value.visible && value.value === "" && !value.disabled);
           await checkpoint(a, "provider-failure-continuation-input");
           await sink.record("onboarding-provider-failure-readable", { reason, can_continue: completed.detail.can_continue, job_id: completed.detail.id }, { phase: "executing", owner: OWNER });
           return { acquisition: "pass", oracle: "pass", manual: "pending" };
+        }
+        if (!live && !receiverEvidence) throw fail("B's ordinary chat never showed the received work and stop control");
+        if (!live) {
+          const released = await wait("B unlocks local Send after the received job drains", async () => ({
+            activity: await projection(b, "receiver_activity_projection"),
+            composer: await b.driver.evaluate(`({disabled:document.querySelector('.composer button[data-action="send"]')?.disabled,draft:document.querySelector('#prompt')?.value})`),
+          }), value => value.activity.attempts.length === 0 && !value.composer.disabled && value.composer.draft === "WinB local draft stays here", 30000);
+          await b.sink.record("onboarding-receiver-unlocked", released, { phase: "executing", owner: OWNER });
+          await checkpoint(b, "receiver-released-local-draft-preserved");
         }
         await wait("Completed approval and artifact checksums stay folded", () => a.driver.evaluate(`(() => { const assets = document.querySelector('[data-shared-region="assets"]'); const approval = document.querySelector('[data-shared-region="approval"]'); return { visible: assets?.innerText, raw: assets?.textContent, open: [...(approval?.querySelectorAll('details') ?? [])].some(d => d.open) }; })()`), value => value.raw?.includes("SHA-256") && !value.visible?.includes("SHA-256") && !value.open);
         const scriptVersions = completed.assets.filter(asset => asset.name === SCRIPT_NAME && asset.kind === "artifact");

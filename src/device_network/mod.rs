@@ -9,7 +9,7 @@ mod execution;
 pub use diagnostics::{DeviceDiagnostic, DiagnosticScope};
 pub use execution::{
     DeviceExecutionCommand, DeviceExecutionProjection, DeviceExecutionState, DeviceProject,
-    ExecutionReview,
+    ExecutionReview, ReceiverActivityProjection, ReceiverServiceStopTarget, ReceiverStopTarget,
 };
 mod http;
 mod identity;
@@ -20,7 +20,7 @@ pub(crate) mod reset;
 mod service;
 mod shared_work;
 pub(crate) use shared_work::WorkProject;
-pub use shared_work::{SharedWorkCommand, SharedWorkProjection};
+pub use shared_work::{OriginWorkProjection, SharedWorkCommand, SharedWorkProjection};
 mod settings;
 mod wait;
 pub(crate) use client::{DeviceClient, DeviceGrant, DirectoryPeer};

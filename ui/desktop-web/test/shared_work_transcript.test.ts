@@ -1,9 +1,53 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { renderWorkDetails, renderWorkResult, retainWorkRecord } from "../src/shared_work_details.ts";
+import { renderWorkDetails, renderWorkInbox, renderWorkResult, retainWorkRecord } from "../src/shared_work_details.ts";
 import { sharedWorkPresentation, type WorkAsset } from "../src/shared_work_state.ts";
 import { renderSharedWork } from "../src/shared_work_render.ts";
 import { sharedUiFixture } from "./shared_work_fixture.ts";
+
+test("an empty live record reports the known execution state without inventing model progress", () => {
+  const local = sharedUiFixture();
+  local.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null,
+    environment_id: "env-a", title: "Work", input: {}, result: null, state: "running", awaiting_child_id: null,
+    revision: 1, created_at_ms: 1, updated_at_ms: 1 };
+  for (const [state, text] of [["running", "実行中です"], ["waiting_child", "依頼先の仕事の結果を待っています"],
+    ["queued", "実行の開始を待っています"], ["assigned", "実行するPCで準備しています"], ["cancelling", "停止を確認しています"]]) {
+    local.projection!.detail.state = state;
+    const html = renderWorkDetails(local, "record");
+    const visible = html.slice(0, html.indexOf("<details"));
+    assert.ok(visible.includes(text), state);
+    assert.doesNotMatch(html.replace(/<[^>]*>/g, ""), /共有済みの会話はまだありません|AIが考えています|トークン|%/);
+  }
+  local.projection!.detail.state = "running";
+  local.projection!.detail.uncertainty_reason = "offline";
+  assert.match(renderWorkDetails(local, "record"), /実行状況を確認できません/);
+  assert.doesNotMatch(renderWorkDetails(local, "record"), /実行中です/);
+  local.projection!.detail.uncertainty_reason = null;
+  local.projection!.transcript = { items: [{ position: 1, kind: "assistant_message", payload: "Saved answer" }], next_after: null };
+  assert.doesNotMatch(renderWorkDetails(local, "record"), /Hubに届き次第/);
+  assert.match(renderWorkDetails(local, "record"), /Saved answer/);
+});
+
+test("notification read state is distinct from pending or resolved approval state", () => {
+  const local = sharedUiFixture();
+  const item = { id: "notice", job_id: "job-a", project_id: "project-a", kind: "approval", title: "Task <A>",
+    created_at_ms: 1, read_at_ms: null, can_act: false, approval_id: "approval-a" };
+  for (const [status, decision, expected] of [["decided", "approve", "許可済み"], ["consumed", "deny", "拒否済み"],
+    ["decided", "stop", "停止を指示済み"], ["expired", null, "承認期限切れ"], ["cancelled", null, "承認依頼の取消済み"],
+    ["pending", null, "担当者の承認待ち"], [undefined, null, "実行の承認"]] as const) {
+    local.projection!.inbox = { items: [{ ...item, approval_status: status, approval_decision: decision }], next_before: null, unread_count: 1 };
+    const html = renderWorkInbox(local);
+    assert.ok(html.includes(`<strong>${expected}</strong>`), String(status));
+    assert.match(html, /未読のお知らせ/);
+    assert.doesNotMatch(html, /お知らせ・要対応|shared-notice-actionable|あなたの承認待ち|<A>/);
+    assert.equal(local.projection!.inbox.items[0].read_at_ms, null, "rendering never marks a notification read");
+  }
+  local.projection!.inbox!.items = [{ ...item, can_act: true, approval_status: "pending", read_at_ms: 2 }];
+  const actionable = renderWorkInbox(local);
+  assert.match(actionable, /shared-notice-actionable/);
+  assert.match(actionable, /あなたの承認待ち/);
+  assert.match(actionable, /data-action="shared-inbox-open" data-value="notice"/);
+});
 
 test("a failed Runner outcome explains the failure before collapsed diagnostics even if it has partial answer text", () => {
   const error = "Could not connect to the model provider. <script>not markup</script>";
@@ -27,8 +71,10 @@ test("a failed Runner outcome explains the failure before collapsed diagnostics 
 test("a failed conversation links directly to its continuation input only when the Hub allows continuation", () => {
   const local = sharedUiFixture();
   local.projection!.selected_job_id = "job-a";
+  local.projection!.selected_conversation_id = "conversation-a";
+  local.projection!.conversations = [{ id: "conversation-a", title: "集計", latest_job_id: "job-a", updated_at_ms: 2 }];
   local.projection!.detail = {
-    id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a",
+    id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, conversation_id: "conversation-a", environment_id: "env-a",
     title: "集計", input: { prompt: "CSVを集計" }, result: { error: "接続できません", text: "途中までの回答" },
     state: "failed", awaiting_child_id: null, revision: 1, created_at_ms: 1, updated_at_ms: 2,
   };
@@ -42,7 +88,9 @@ test("a failed conversation links directly to its continuation input only when t
       assert.match(visible, /<a href="#shared-followup">続きの依頼へ<\/a>/);
       assert.match(visible, /<textarea id="shared-followup"/);
     } else {
-      assert.doesNotMatch(visible, /href="#shared-followup"|<textarea id="shared-followup"/);
+      assert.doesNotMatch(visible, /href="#shared-followup"/);
+      assert.match(visible, /<textarea id="shared-followup"/);
+      assert.match(visible, /data-action="send"[^>]*disabled/);
     }
   }
   assert.doesNotMatch(renderWorkResult({ text: "完成" }, "job", true), /href="#shared-followup"/);
@@ -210,7 +258,7 @@ test("same-owner polls retain native disclosure and selection while changed owne
   assert.equal(retainWorkRecord(selected.element, changed.element), true);
 });
 
-test("submission and continuation expose separate deadline drafts and show the accepted deadline", () => {
+test("the ordinary Hub composer has no per-turn scheduling form while old job deadlines stay inspectable", () => {
   const local = sharedUiFixture();
   const deadline = Date.parse("2030-09-14T10:00:00+09:00");
   local.draft.startBefore = "2030-09-14T10:00";
@@ -220,15 +268,11 @@ test("submission and continuation expose separate deadline drafts and show the a
     environment_id: "env-a", title: "Finished", input: {}, result: "done", state: "succeeded", awaiting_child_id: null,
     revision: 1, created_at_ms: 1, updated_at_ms: 2, can_continue: true, start_before_ms: deadline };
   let html = renderSharedWork(sharedWorkPresentation(local));
-  assert.doesNotMatch(html, /data-shared-field="draft:startBefore"/);
-  assert.match(html, /data-shared-field="draft:followupStartBefore" type="datetime-local" value="2030-09-15T11:00"/);
-  assert.match(html, /開始期限（空欄は投入から24時間）/);
-  assert.match(html, /開始済みの処理を打ち切る期限ではありません/);
+  assert.doesNotMatch(html, /data-shared-field="draft:(?:startBefore|followupStartBefore)"|hub-followup-options/);
   assert.ok(html.includes(`開始期限: ${new Date(deadline).toLocaleString("ja-JP")}`));
   local.pending = "submit";
   html = renderSharedWork(sharedWorkPresentation(local));
-  assert.doesNotMatch(html, /data-shared-field="draft:startBefore"/);
-  assert.match(html, /data-shared-field="draft:followupStartBefore"[^>]* disabled/);
+  assert.doesNotMatch(html, /data-shared-field="draft:(?:startBefore|followupStartBefore)"/);
   local.projection!.projects[0].can_submit = false;
   local.projection!.detail.can_continue = false;
   html = renderSharedWork(sharedWorkPresentation(local));

@@ -105,7 +105,7 @@ function capturedPendingIdleOwner(projection) {
     && projection.run_target.sessionId === projection?.draft_target?.sessionId;
 }
 
-function settledComposer(surface) {
+export function settledComposer(surface) {
   const projection = surface?.projection;
   return projection?.run_status_key === "completed"
     && projection?.task_activity_state === "idle"
@@ -252,7 +252,7 @@ export function nextTurnTerminalFailures(sample, firstTerminal, secondTurn) {
   return failures;
 }
 
-async function observeRunNextTurnSurface(cdp) {
+export async function observeRunNextTurnSurface(cdp) {
   return cdp.evaluate(`(async () => {
     const invoke = window.__TAURI_INTERNALS__?.invoke;
     if (typeof invoke !== 'function') throw new Error('tauri-invoke-unavailable');

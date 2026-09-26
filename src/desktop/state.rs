@@ -273,6 +273,26 @@ impl DesktopState {
         self.clamp_artifact_selection();
     }
 
+    /// A newly created edit branch is not in the previous sidebar snapshot.
+    /// Select its exact row rather than preserving the previously open chat.
+    pub fn replace_snapshot_selecting_session(
+        &mut self,
+        mut snapshot: DesktopSnapshot,
+        session_id: SessionId,
+    ) -> bool {
+        let Some(index) = snapshot
+            .session_rows
+            .iter()
+            .position(|row| row.session_id == session_id)
+        else {
+            return false;
+        };
+        snapshot.selected_session_index = index;
+        self.snapshot = snapshot;
+        self.clamp_artifact_selection();
+        true
+    }
+
     pub fn replace_snapshot_preserving_current_owner(&mut self, mut snapshot: DesktopSnapshot) {
         if let Some(current_session_id) = self.app_state.current_session_id
             && !snapshot

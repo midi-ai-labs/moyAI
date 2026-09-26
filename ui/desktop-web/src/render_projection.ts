@@ -36,6 +36,7 @@ import type { SideChatPendingQuote } from "./types.ts";
  */
 export interface DesktopRenderLocalPresentation {
   readonly sharedWork: SharedWorkPresentation;
+  readonly localMessageEdit: { readonly pending: boolean; readonly error: string };
   readonly hub: HubPresentation;
   readonly deviceNetwork: DeviceNetworkPresentation;
   readonly mcpHistory: McpHistoryPresentation;
@@ -103,6 +104,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
     hub: hubPresentation(createHubUiState()),
     deviceNetwork: deviceNetworkPresentation(createDeviceNetworkUiState()),
     sharedWork: sharedWorkPresentation(createSharedWorkUiState()),
+    localMessageEdit: { pending: false, error: "" },
     mcpHistory: mcpHistoryPresentation(createMcpHistoryUiState()),
     mcpPeers: mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
@@ -211,6 +213,7 @@ function snapshotLocalPresentation(
     hub: local.hub ?? hubPresentation(createHubUiState()),
     deviceNetwork: local.deviceNetwork ?? deviceNetworkPresentation(createDeviceNetworkUiState()),
     sharedWork: local.sharedWork ?? sharedWorkPresentation(createSharedWorkUiState()),
+    localMessageEdit: local.localMessageEdit ?? { pending: false, error: "" },
     mcpHistory: local.mcpHistory ?? mcpHistoryPresentation(createMcpHistoryUiState()),
     mcpPeers: local.mcpPeers ?? mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {

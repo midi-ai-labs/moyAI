@@ -115,9 +115,29 @@ struct Snapshot {
 
 struct Record {
     owner: Owner,
+    receiver_scope_id: Option<Ulid>,
     cancel: CancellationToken,
     snapshot: watch::Receiver<Snapshot>,
     worker: std::thread::JoinHandle<()>,
+    retain_for_delegation: bool,
+    retain_after_turn: bool,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetainedService {
+    pub service_id: Ulid,
+    pub expires_at_ms: u64,
+    #[serde(default)]
+    pub retain_after_turn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetainedServiceState {
+    Running,
+    Stopping,
+    Stopped,
+    Unknown,
 }
 
 #[derive(Default)]
@@ -143,13 +163,15 @@ impl Drop for Registry {
 pub struct ManagedShells {
     inner: Arc<Mutex<Registry>>,
     receiver_lifetime: Option<CancellationToken>,
+    receiver_scope_id: Option<Ulid>,
 }
 
 impl ManagedShells {
-    pub(crate) fn with_lifetime(&self, lifetime: CancellationToken) -> Self {
+    pub(crate) fn with_lifetime(&self, lifetime: CancellationToken, scope_id: Ulid) -> Self {
         Self {
             inner: self.inner.clone(),
             receiver_lifetime: Some(lifetime),
+            receiver_scope_id: Some(scope_id),
         }
     }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Registry>, ToolError> {
@@ -158,6 +180,7 @@ impl ManagedShells {
             .map_err(|_| ToolError::Message("managed shell registry unavailable".into()))
     }
 
+    #[cfg(test)]
     fn start<F, Fut>(
         &self,
         owner: Owner,
@@ -166,6 +189,35 @@ impl ManagedShells {
         timeout_ms: u64,
         sandbox: serde_json::Value,
         parent_cancel: CancellationToken,
+        execute: F,
+    ) -> Result<(watch::Receiver<Snapshot>, CancellationToken), ToolError>
+    where
+        F: FnOnce(CancellationToken, ProcessStarted) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CommandOutput, ToolError>> + 'static,
+    {
+        self.start_with_retention(
+            owner,
+            command,
+            workdir,
+            timeout_ms,
+            sandbox,
+            parent_cancel,
+            false,
+            false,
+            execute,
+        )
+    }
+
+    fn start_with_retention<F, Fut>(
+        &self,
+        owner: Owner,
+        command: String,
+        workdir: camino::Utf8PathBuf,
+        timeout_ms: u64,
+        sandbox: serde_json::Value,
+        parent_cancel: CancellationToken,
+        retain_for_delegation: bool,
+        retain_after_turn: bool,
         execute: F,
     ) -> Result<(watch::Receiver<Snapshot>, CancellationToken), ToolError>
     where
@@ -214,6 +266,8 @@ impl ManagedShells {
                 ));
             }
         }
+        let expires_at_ms =
+            (chrono::Utc::now().timestamp_millis().max(0) as u64).saturating_add(timeout_ms);
         let id = Ulid::new();
         let (sender, receiver) = watch::channel(Snapshot {
             process_id: id,
@@ -314,9 +368,13 @@ impl ManagedShells {
             id,
             Record {
                 owner,
+                receiver_scope_id: self.receiver_scope_id,
                 cancel: cancel.clone(),
                 snapshot: receiver.clone(),
                 worker,
+                retain_for_delegation,
+                retain_after_turn,
+                expires_at_ms,
             },
         );
         Ok((receiver, cancel))
@@ -405,12 +463,115 @@ impl ManagedShells {
     /// A terminal local turn may still own a managed process. The Runner keeps its execution
     /// capacity occupied until the existing process-tree owner confirms that worker has ended.
     pub(crate) fn has_local_work(&self, root: SessionId) -> bool {
+        self.has_local_work_for(root, self.receiver_scope_id)
+    }
+
+    pub(crate) fn has_local_work_in_scope(&self, root: SessionId, scope_id: Ulid) -> bool {
+        self.has_local_work_for(root, Some(scope_id))
+    }
+
+    fn has_local_work_for(&self, root: SessionId, scope_id: Option<Ulid>) -> bool {
         self.inner.lock().map_or(true, |registry| {
             registry.records.values().any(|record| {
                 !record.worker.is_finished()
+                    && record.receiver_scope_id == scope_id
                     && matches!(&record.owner.authority, Authority::Local(session) if *session == root)
             })
         })
+    }
+
+    /// Only one explicitly marked, running service can remain when a shared turn
+    /// delegates. Ordinary commands retain the existing quiescent-yield rule.
+    pub(crate) fn delegable_service(&self, root: SessionId) -> Option<RetainedService> {
+        self.delegable_service_for(root, self.receiver_scope_id)
+    }
+
+    fn delegable_service_for(
+        &self,
+        root: SessionId,
+        scope_id: Option<Ulid>,
+    ) -> Option<RetainedService> {
+        let registry = self.inner.lock().ok()?;
+        let mut active = registry.records.iter().filter(|(_, record)| {
+            !record.worker.is_finished()
+                && record.receiver_scope_id == scope_id
+                && matches!(&record.owner.authority, Authority::Local(session) if *session == root)
+        });
+        let (id, record) = active.next()?;
+        if active.next().is_some()
+            || !(record.retain_for_delegation || record.retain_after_turn)
+            || record.cancel.is_cancelled()
+            || record.snapshot.borrow().state != State::Running
+            || record.snapshot.borrow().pid.is_none()
+            || record.expires_at_ms <= chrono::Utc::now().timestamp_millis().max(0) as u64
+        {
+            return None;
+        }
+        Some(RetainedService {
+            service_id: *id,
+            expires_at_ms: record.expires_at_ms,
+            retain_after_turn: record.retain_after_turn,
+        })
+    }
+
+    pub(crate) fn completion_service_in_scope(
+        &self,
+        root: SessionId,
+        scope_id: Ulid,
+    ) -> Option<RetainedService> {
+        self.delegable_service_for(root, Some(scope_id))
+            .filter(|service| service.retain_after_turn)
+    }
+
+    pub(crate) fn retained_service_live(&self, service: RetainedService) -> bool {
+        self.retained_service_state(service) == RetainedServiceState::Running
+    }
+
+    pub(crate) fn retained_service_state(&self, service: RetainedService) -> RetainedServiceState {
+        self.inner
+            .lock()
+            .map_or(RetainedServiceState::Unknown, |registry| {
+                let Some(record) = registry.records.get(&service.service_id).filter(|record| {
+                    (record.retain_for_delegation || record.retain_after_turn)
+                        && record.retain_after_turn == service.retain_after_turn
+                        && record.expires_at_ms == service.expires_at_ms
+                }) else {
+                    return RetainedServiceState::Unknown;
+                };
+                classify_retained_state(
+                    record.worker.is_finished(),
+                    record.cancel.is_cancelled(),
+                    &record.snapshot.borrow(),
+                )
+            })
+    }
+
+    pub(crate) fn cancel_retained_service(&self, id: Ulid) -> bool {
+        self.inner.lock().is_ok_and(|registry| {
+            registry.records.get(&id).is_some_and(|record| {
+                if !(record.retain_for_delegation || record.retain_after_turn) {
+                    return false;
+                }
+                record.cancel.cancel();
+                true
+            })
+        })
+    }
+}
+
+fn classify_retained_state(
+    worker_finished: bool,
+    cancelled: bool,
+    snapshot: &Snapshot,
+) -> RetainedServiceState {
+    if worker_finished || snapshot.state.terminal() {
+        RetainedServiceState::Stopped
+    } else if cancelled {
+        RetainedServiceState::Stopping
+    } else if snapshot.state == State::Running && snapshot.pid.is_some() {
+        RetainedServiceState::Running
+    } else {
+        RetainedServiceState::Unknown
     }
 }
 
@@ -437,8 +598,18 @@ impl Tool for ShellStartTool {
         spec.name = ToolName::ShellStart;
         spec.description = include_str!("../../../assets/prompts/shell_start.md");
         spec.input_schema["properties"]["timeout_ms"]["description"] = json!(
-            "Execution lifetime limit in milliseconds; defaults to shell.max_timeout_ms and cannot exceed it. A running command is stopped at this limit."
+            "Execution lifetime limit in milliseconds. Normally omit to inherit model.request_timeout_ms from the executing PC. A shorter positive value is allowed; values above that setting are rejected. A running command is stopped at this limit."
         );
+        spec.input_schema["properties"]["retain_for_delegation"] = json!({
+            "type":"boolean",
+            "default":false,
+            "description":"This job hosts a server while it calls shared_delegate to another PC. With this option alone, the server stops when this job finishes. If this job will return before its caller uses the server, use retain_after_turn instead."
+        });
+        spec.input_schema["properties"]["retain_after_turn"] = json!({
+            "type":"boolean",
+            "default":false,
+            "description":"Keep this server running after this shared job returns, for the requested follow-up use or testing by its caller, or a requested preview. Only one server can be retained; it remains visible for explicit stop and ends at timeout_ms."
+        });
         spec
     }
 
@@ -447,17 +618,44 @@ impl Tool for ShellStartTool {
         raw: serde_json::Value,
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        let retain_for_delegation = match raw.get("retain_for_delegation") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(ToolError::Message(
+                    "retain_for_delegation must be a boolean".into(),
+                ));
+            }
+        };
+        let retain_after_turn = match raw.get("retain_after_turn") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(ToolError::Message(
+                    "retain_after_turn must be a boolean".into(),
+                ));
+            }
+        };
         let input: ShellInput = serde_json::from_value(raw)?;
         let owner = Owner::from_context(&ctx)?;
-        let timeout_ms = input.timeout_ms.unwrap_or(ctx.config.shell.max_timeout_ms);
-        if timeout_ms == 0 || timeout_ms > ctx.config.shell.max_timeout_ms {
+        let max_timeout_ms = ctx.config.model.request_timeout_ms;
+        let timeout_ms = input.timeout_ms.unwrap_or(max_timeout_ms);
+        if timeout_ms == 0 || timeout_ms > max_timeout_ms {
             return Err(ToolError::Message(format!(
-                "timeout_ms must be between 1 and {}",
-                ctx.config.shell.max_timeout_ms
+                "timeout_ms must be between 1 and {max_timeout_ms} (model.request_timeout_ms)"
             )));
         }
         let mut intent = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
-        intent.details.push(format!("Managed command: may outlive this turn; maximum lifetime {timeout_ms} ms; stop with shell_stop."));
+        let lifetime = if timeout_ms.is_multiple_of(60_000) {
+            format!("{}分", timeout_ms / 60_000)
+        } else if timeout_ms.is_multiple_of(1_000) {
+            format!("{}秒", timeout_ms / 1_000)
+        } else {
+            format!("{}秒", timeout_ms as f64 / 1_000.0)
+        };
+        intent.details.push(format!(
+            "実行時間の上限: 起動から{lifetime}。上限に達すると自動で停止します。必要に応じて、AIに停止を依頼することもできます。"
+        ));
         let admission = ctx
             .confirm_if_needed_with_details(
                 AccessKind::Shell,
@@ -474,16 +672,20 @@ impl Tool for ShellStartTool {
         let command = input.command;
         let workdir = intent.guarded.absolute.clone();
         let sandbox = serde_json::to_value(admission.sandbox_plan().audit_description())?;
-        let (mut snapshot, cancel) = ctx.services.managed_shells.start(
+        // Keep the startup ticket until handoff, independently of the process lifetime.
+        let worker_admission = admission.clone();
+        let (mut snapshot, cancel) = ctx.services.managed_shells.start_with_retention(
             owner,
             command.clone(),
             workdir.clone(),
             timeout_ms,
             sandbox,
             ctx.cancel.clone(),
+            retain_for_delegation,
+            retain_after_turn,
             move |cancel, started| async move {
                 fence.assert_owned().await?;
-                admission.admit()?;
+                worker_admission.admit()?;
                 PathGuard::revalidate(&intent.guarded)?;
                 execute_shell_command_observed(
                     &shell,
@@ -492,7 +694,7 @@ impl Tool for ShellStartTool {
                     timeout_ms,
                     max_output,
                     cancel,
-                    admission.sandbox_plan(),
+                    worker_admission.sandbox_plan(),
                     intent.execution.family,
                     intent.execution.environment,
                     intent.execution.programs,
@@ -512,7 +714,13 @@ impl Tool for ShellStartTool {
                 .await
                 .map_err(|_| ToolError::Message("managed command startup lost its owner".into()))?;
         }
-        let result = snapshot_result(snapshot.borrow().clone(), false, &ctx)?;
+        let snapshot = snapshot.borrow().clone();
+        if snapshot.pid.is_some() {
+            // A failed settlement leaves handoff uncommitted, so the owned process
+            // is cancelled instead of returning a misleading successful startup.
+            admission.finish_started_effect()?;
+        }
+        let result = snapshot_result(snapshot, false, &ctx)?;
         handoff.committed = true;
         Ok(result)
     }

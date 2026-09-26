@@ -71,11 +71,37 @@ function select(local: SharedWorkPresentation, name: string, label: string, choi
 }
 export function renderWorkInputs(local: SharedWorkPresentation): string {
   const p = local.projection!;
-  return `<section data-shared-region="inputs" class="shared-card"><details data-details-key="hub-inputs"><summary>ファイルを添付${p.inputs.length ? `（${p.inputs.length}件）` : ""}</summary><p class="shared-secondary">1件8 MiB、32件まで。選んだ内容をプロジェクトの参加者と共有します。</p>${p.inputs.map(a => `<p>${esc(a.name)} · ${a.byte_length.toLocaleString()} bytes ${button("remove-input", "添付から外す", a.id, Boolean(local.pending || p.submission_uncertain))}</p>`).join("")}${button("upload-inputs", "ファイルを選択して添付", "", Boolean(local.pending || p.submission_uncertain))}</details></section>`;
+  return `<section data-shared-region="inputs" class="shared-card"><details data-details-key="hub-inputs"><summary>添付ファイル${p.inputs.length ? `（${p.inputs.length}件）` : ""}</summary><p class="shared-secondary">下の「ファイルを添付」から選べます。1件8 MiB、32件まで。選んだ内容をプロジェクトの参加者と共有します。</p>${p.inputs.map(a => `<p>${esc(a.name)} · ${a.byte_length.toLocaleString()} bytes ${button("remove-input", "添付から外す", a.id, Boolean(local.pending || p.submission_uncertain))}</p>`).join("")}</details></section>`;
 }
 export function renderWorkInbox(local: SharedWorkPresentation): string {
   const inbox = local.projection?.inbox;
-  return `<section data-shared-region="inbox" class="shared-card"><h2>お知らせ・要対応 ${inbox?.unread_count ? `<span aria-label="未読">${inbox.unread_count}</span>` : ""}</h2>${inbox?.items.map(item => `<article class="shared-job"><p>${item.read_at_ms === null ? "未読 · " : ""}${esc(({ approval: "実行の承認", finished: "仕事の終了", handover: "担当の引継ぎ" } as Record<string, string>)[item.kind] ?? item.kind)} · ${esc(new Date(item.created_at_ms).toLocaleString("ja-JP"))}</p>${button("inbox-open", item.title, item.id, Boolean(local.pending))}${item.can_act ? "<p>この仕事で対応できる操作があります。</p>" : ""}</article>`).join("") || "<p>現在のお知らせはありません。</p>"}<div class="shared-actions">${inbox?.next_before ? button("inbox-next", "以前のお知らせ", "", Boolean(local.pending)) : ""}${button("inbox-latest", "最新のお知らせ", "", Boolean(local.pending))}</div></section>`;
+  const items = inbox?.items.map(item => {
+    let label = ({ approval: "実行の承認", finished: "仕事の終了", handover: "担当の引継ぎ" } as Record<string, string>)[item.kind] ?? item.kind;
+    if (item.kind === "approval") {
+      if (item.approval_status === "cancelled") label = "承認依頼の取消済み";
+      else if (item.approval_status === "expired") label = "承認期限切れ";
+      else if (["decided", "consumed"].includes(item.approval_status ?? "")) {
+        label = ({ approve: "許可済み", deny: "拒否済み", stop: "停止を指示済み" } as Record<string, string>)[item.approval_decision ?? ""] ?? "承認の回答済み";
+      } else if (item.approval_status === "pending") label = item.can_act ? "あなたの承認待ち" : "担当者の承認待ち";
+      else if (item.can_act) label = "あなたの承認待ち";
+    }
+    return `<article class="shared-job${item.can_act ? " shared-notice-actionable" : ""}"><p><strong>${esc(label)}</strong> · ${esc(new Date(item.created_at_ms).toLocaleString("ja-JP"))}${item.read_at_ms === null ? ' · <span class="shared-secondary">未読のお知らせ</span>' : ""}</p>${button("inbox-open", item.title, item.id, Boolean(local.pending))}</article>`;
+  }).join("");
+  return `<section data-shared-region="inbox" class="shared-card"><h2>お知らせ ${inbox?.unread_count ? `<span class="shared-secondary" aria-label="未読のお知らせ">（未読 ${inbox.unread_count} 件）</span>` : ""}</h2>${items || "<p>現在のお知らせはありません。</p>"}<div class="shared-actions">${inbox?.next_before ? button("inbox-next", "以前のお知らせ", "", Boolean(local.pending)) : ""}${button("inbox-latest", "最新のお知らせ", "", Boolean(local.pending))}</div></section>`;
+}
+
+function workRecordWaitingText(local: SharedWorkPresentation): string {
+  const detail = local.projection?.detail;
+  if (!detail) return "実行記録はまだありません。";
+  if (detail.uncertainty_reason) return "実行状況を確認できません。PCの利用状況を確認してください。";
+  if (local.projection?.approval?.status === "pending") return "承認待ちです。承認内容を確認してください。";
+  if (detail.state === "running") return "実行中です。応答や操作結果は、Hubに届き次第ここに表示します。";
+  if (detail.state === "waiting_child") return "依頼先の仕事の結果を待っています。応答や操作結果は、Hubに届き次第ここに表示します。";
+  if (detail.state === "cancelling") return "停止を確認しています。停止が完了するまでお待ちください。";
+  if (detail.state === "queued") return detail.wait_reason || "実行の開始を待っています。";
+  if (detail.state === "assigned") return "実行するPCで準備しています。応答や操作結果は、Hubに届き次第ここに表示します。";
+  return ["succeeded", "failed", "cancelled"].includes(detail.state)
+    ? "この仕事の実行記録はありません。結果は会話内で確認できます。" : "実行記録はまだ届いていません。";
 }
 function renderWorkAsset(a: WorkAsset, owner: string, busy: boolean, latest = false): string {
   return `<article class="shared-job"><h3>${esc(a.name)}${latest ? " · 最新版" : ""}</h3><p>${a.kind === "input" ? "入力" : "成果"} · ${a.byte_length.toLocaleString()} bytes · 版 ${a.version}</p><details data-details-key="shared-asset:${esc(owner)}:${esc(a.id)}"><summary>ファイルの詳細</summary><p class="shared-secondary">SHA-256: ${esc(a.sha256)}</p></details><div class="shared-actions">${a.purged_at_ms ? "<p>保持期限により内容は削除済みです。</p>" : ""}${button("save-asset", "名前を付けて保存", a.id, busy || a.purged_at_ms !== null)}${a.kind !== "input" ? button("import-asset", "元の版と照合して取り込む", a.id, busy || a.purged_at_ms !== null) : ""}</div></article>`;
@@ -96,12 +122,28 @@ function renderWorkAssets(local: SharedWorkPresentation): string {
   }).join("");
   return `<section data-shared-region="assets" class="shared-card"><h2>入力と成果ファイル</h2>${files || "<p>選択した仕事のファイルはまだありません。</p>"}</section>`;
 }
-export function renderWorkDetails(local: SharedWorkPresentation, mode: "conversation" | "support" = "conversation"): string {
+function renderRetainedServices(local: SharedWorkPresentation): string {
+  const services = local.projection?.detail?.retained_services ?? [];
+  if (!services.length) return '<section data-shared-region="services" hidden></section>';
+  return `<section data-shared-region="services" class="shared-card"><h2>この会話で起動中のアプリ</h2>${services.map(service => {
+    const environment = local.projection?.status?.environments.find(row => row.id === service.environment_id);
+    const state = service.uncertain ? "稼働状態を確認できません" : service.stop_requested ? "停止を確認中" : "起動中";
+    const stop = service.can_stop && !service.stop_requested;
+    return `<article class="shared-job"><h3>${esc(environment?.device_label ?? environment?.label ?? "実行PC")}</h3><p>${state} · 保持期限 ${esc(new Date(service.expires_at_ms).toLocaleString("ja-JP"))}</p>${stop ? button("stop-service", "このアプリを停止", service.service_id, Boolean(local.pending)) : ""}</article>`;
+  }).join("")}</section>`;
+}
+export function renderWorkDetails(local: SharedWorkPresentation, mode: "conversation" | "support" | "record" | "composer" = "conversation"): string {
   const p = local.projection!, detail = p.detail, busy = Boolean(local.pending);
   const transcriptOwner = encodeURIComponent(JSON.stringify([p.generation, p.principal?.user_id, p.selected_project_id, p.selected_job_id, p.transcript?.items[0]?.position ?? null]));
   const assets = renderWorkAssets(local);
-  const conversation = `<section data-shared-region="transcript" data-shared-record-owner="${esc(transcriptOwner)}" class="shared-card"><h2>会話と実行の記録</h2>${p.transcript?.items.map(item => renderTranscriptItem(item, transcriptOwner)).join("") || "<p>共有済みの会話はまだありません。</p>"}${p.transcript?.next_after !== null && p.transcript ? button("transcript-next", "続きの会話を表示", "", busy) : ""}</section>
-  <section data-shared-region="followup" class="shared-card"><h2>メッセージ</h2>${detail?.can_continue ? `<label>追加の依頼内容<textarea id="shared-followup" data-shared-field="draft:followup" rows="4" ${busy ? "disabled" : ""}>${esc(local.draft.followup)}</textarea></label><details data-details-key="hub-followup-options"><summary>追加設定</summary>${renderStartDeadline(local, "followupStartBefore")}</details>${button("continue", "送信", "", busy || !local.draft.followup?.trim() || p.submission_uncertain)}` : "<p>追加の依頼には、前の仕事の終了、保存された会話、継続する権限が必要です。</p>"}</section>`;
+  const emptyRecord = !p.transcript?.items.length;
+  const waitingText = workRecordWaitingText(local);
+  const transcriptBody = `${p.transcript?.items.map(item => renderTranscriptItem(item, transcriptOwner)).join("") || `<p>${esc(waitingText)}</p>`}${p.transcript?.next_after !== null && p.transcript ? button("transcript-next", "続きの会話を表示", "", busy) : ""}`;
+  const transcript = `<section data-shared-region="transcript" data-shared-record-owner="${esc(transcriptOwner)}" class="shared-card"><h2>会話と実行の記録</h2>${transcriptBody}</section>`;
+  const composer = `<section data-shared-region="followup" class="shared-card shared-composer-content"><h2>メッセージ</h2>${detail?.can_continue ? `<label>追加の依頼内容<textarea id="shared-followup" data-shared-field="draft:followup" rows="4" ${busy ? "disabled" : ""}>${esc(local.draft.followup)}</textarea></label><details data-details-key="hub-followup-options"><summary>追加設定</summary>${renderStartDeadline(local, "followupStartBefore")}</details>${button("continue", "送信", "", busy || !local.draft.followup?.trim() || p.submission_uncertain)}` : "<p>追加の依頼には、前の仕事の終了、保存された会話、継続する権限が必要です。</p>"}</section>`;
   const handover = `<section data-shared-region="handover" class="shared-card"><h2>担当の引継ぎ</h2>${p.handover?.pending ? `<p>担当変更を受け付けました。実行が安全に区切れるまで待っています。</p>` : ""}${p.handover?.can_handover ? select(local, "assigneeId", "次の担当者", p.handover.candidates.map(u => [u.user_id, u.display_name])) + button("handover", "この利用者へ引き継ぐ", "", busy || !local.draft.assigneeId) : "<p>現在の担当者またはプロジェクト管理者が引き継ぎます。</p>"}</section>`;
-  return mode === "support" ? assets + handover : conversation;
+  if (mode === "support") return renderRetainedServices(local) + assets + handover;
+  if (mode === "record") return `<section data-shared-region="transcript" data-shared-record-owner="${esc(transcriptOwner)}" class="shared-card">${emptyRecord && detail && ["running", "waiting_child", "queued", "assigned", "cancelling"].includes(detail.state) ? `<p class="shared-record-waiting" role="status">${esc(waitingText)}</p>` : ""}<details data-details-key="hub-selected-job-transcript"><summary>選択した仕事の実行記録</summary>${transcriptBody}</details></section>`;
+  if (mode === "composer") return composer;
+  return transcript + composer;
 }

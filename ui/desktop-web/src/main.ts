@@ -5,8 +5,11 @@ import { acceptDeviceNetworkProjection, deviceNetworkPresentation } from "./devi
 import { synchronizeDeviceNetworkControls } from "./device_network_dom.ts";
 import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
 import { refreshSharedWork } from "./shared_work_actions.ts";
+import { refreshReceiverActivity } from "./receiver_activity.ts";
+import { refreshOriginWork } from "./origin_work.ts";
 import { refreshDeviceExecution } from "./device_execution.ts";
 import { sharedWorkPresentation } from "./shared_work_state.ts";
+import { applyLocalMessageEditHandoff } from "./local_revision_source.ts";
 import { retainSharedWorkSurface } from "./shared_work_render.ts";
 import { shouldRetainSharedWorkMain } from "./shared_work_retention.ts";
 import "./shared_work.css";
@@ -251,6 +254,8 @@ const refresh = createSnapshotRefresh(async () => {
     await refreshDeviceNetworkJobs(eventContext);
     await refreshSharedWork(eventContext);
     await refreshDeviceExecution(eventContext);
+    await refreshReceiverActivity(eventContext);
+    await refreshOriginWork(eventContext);
     await refreshMcpHistory(eventContext);
   } catch (error) {
     reportError(error);
@@ -365,7 +370,7 @@ void installSnapshotInvalidation(
 ).catch(reportError);
 installRuntimePolling(window, document, () => Boolean(
     currentState
-    && (currentState.hub_project_open === true || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || Boolean(uiState.sharedWork.projection?.hub_url) || uiState.deviceNetwork.projection?.enrollment === "active" || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
+    && (currentState.hub_project_open === true || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || Boolean(uiState.sharedWork.projection?.hub_url) || uiState.deviceNetwork.projection?.enrollment === "active" || Boolean(uiState.deviceNetwork.receiverActivity?.attempts.length || uiState.deviceNetwork.receiverActivity?.retained_services.length) || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
     && shouldAutoRefresh(currentState)
 ), refresh);
 
@@ -857,6 +862,7 @@ function applyStateUpdate(update: StateUpdate): void {
     uiState.mcpPeers.pending = null;
   }
   reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
+  applyLocalMessageEditHandoff(uiState, update.state);
   reconcileSettingsFlowState(update.state);
   reconcileAgentPaneState(uiState, update.state);
   const viewState = projectViewState(update.state, uiState);
@@ -907,6 +913,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     hub: hubPresentation(uiState.hub),
     deviceNetwork: deviceNetworkPresentation(uiState.deviceNetwork),
     sharedWork: sharedWorkPresentation(uiState.sharedWork),
+    localMessageEdit: { pending: uiState.localMessageEdit.pending, error: uiState.localMessageEdit.error },
     mcpHistory: mcpHistoryPresentation(uiState.mcpHistory),
     mcpPeers: mcpPeerPresentation(uiState.mcpPeers),
     artifactPane: {

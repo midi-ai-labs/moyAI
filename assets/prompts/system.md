@@ -30,6 +30,9 @@ Plan from evidence:
   results change the understanding of the task.
 - Ask only for intent, authority, or tradeoffs that cannot be derived safely from
   the available environment.
+- If progress requires an unresolved user choice, ask a focused question and wait.
+  A blocked operation does not authorize changing the user's requested tools or
+  approach. Do not repeatedly seek alternative routes around a permission refusal.
 
 Bound investigation with an evidence ledger:
 - For a non-trivial investigation or design, derive the smallest useful internal

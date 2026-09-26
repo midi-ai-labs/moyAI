@@ -311,9 +311,15 @@ impl RunService {
     }
 
     /// Preserve the receiver's cancellation authority for commands that can outlive a turn.
-    pub(crate) fn with_managed_shell_lifetime(&self, lifetime: CancellationToken) -> Self {
+    pub(crate) fn with_managed_shell_lifetime(
+        &self,
+        lifetime: CancellationToken,
+        scope_id: ulid::Ulid,
+    ) -> Self {
         let mut service = self.clone();
-        service.agent_loop = service.agent_loop.with_managed_shell_lifetime(lifetime);
+        service.agent_loop = service
+            .agent_loop
+            .with_managed_shell_lifetime(lifetime, scope_id);
         service
     }
 
@@ -461,25 +467,32 @@ impl RunService {
             });
         }
         let terminal_already_settled = matches!(validation, ExactRootExecutionValidation::Terminal);
-        if !terminal_already_settled
-            && matches!(
-                self.session_service
-                    .request_exact_execution_interrupt(
-                        session_id,
-                        receipt.turn_id,
-                        receipt.revision,
-                        crate::protocol::TurnInterruptionCause::UserStop,
-                    )
-                    .await?,
+        let remote_stop_prepared = if terminal_already_settled {
+            false
+        } else {
+            self.prepare_origin_turn_stop(receipt)?
+        };
+        if !terminal_already_settled {
+            let interrupt = self
+                .session_service
+                .request_exact_execution_interrupt(
+                    session_id,
+                    receipt.turn_id,
+                    receipt.revision,
+                    crate::protocol::TurnInterruptionCause::UserStop,
+                )
+                .await?;
+            if matches!(
+                interrupt,
                 ExactExecutionInterruptRequestOutcome::TargetChanged
-            )
-        {
-            return Ok(RootExecutionStopClaim {
-                session_id: Some(session_id),
-                expected_active_turn: Some(expected),
-                durable_outcome: Some(ExactRootExecutionStopOutcome::TargetChanged),
-                local_stop: None,
-            });
+            ) {
+                return Ok(RootExecutionStopClaim {
+                    session_id: Some(session_id),
+                    expected_active_turn: Some(expected),
+                    durable_outcome: Some(ExactRootExecutionStopOutcome::TargetChanged),
+                    local_stop: None,
+                });
+            }
         }
         let local_stop = self.commit_local_root_execution_stop(
             expected_root_scope_control,
@@ -494,12 +507,80 @@ impl RunService {
             cancelled: !terminal_already_settled,
         };
         lease.commit();
+        if remote_stop_prepared {
+            self.dispatch_prepared_origin_turn_stop().await?;
+        }
         Ok(RootExecutionStopClaim {
             session_id: Some(session_id),
             expected_active_turn: Some(expected),
             durable_outcome: Some(outcome),
             local_stop: Some(local_stop),
         })
+    }
+
+    /// Reserve the remote Stop before changing the local exact turn. A prepared
+    /// receipt cannot be sent by a reconnecting worker until the local UserStop
+    /// CAS is visible in durable storage.
+    fn prepare_origin_turn_stop(&self, receipt: RootAdmissionReceipt) -> Result<bool, AppRunError> {
+        if self
+            .store
+            .session_repo()
+            .has_received_execution_owner(receipt.session_id)?
+        {
+            return Ok(false);
+        }
+        let attempted = self
+            .store
+            .session_repo()
+            .turn_attempted_team_delegation(receipt.session_id, receipt.turn_id)?;
+        let network = self.store.device_network();
+        if !attempted {
+            let Some(ref network) = network else {
+                return Ok(false);
+            };
+            if !network
+                .origin_turn_has_pending_submission(
+                    &receipt.session_id.to_string(),
+                    &receipt.turn_id.to_string(),
+                )
+                .map_err(AppRunError::Message)?
+            {
+                return Ok(false);
+            }
+        }
+        let network = network.ok_or_else(|| {
+            AppRunError::Message(
+                "This turn used another PC; restore its Hub connection before stopping it".into(),
+            )
+        })?;
+        if !network
+            .prepare_origin_turn_stop(
+                &receipt.session_id.to_string(),
+                &receipt.turn_id.to_string(),
+                receipt.revision,
+            )
+            .map_err(AppRunError::Message)?
+        {
+            return Err(AppRunError::Message(
+                "This turn used another PC; restore its Hub connection before stopping it".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    async fn dispatch_prepared_origin_turn_stop(&self) -> Result<(), AppRunError> {
+        let network = self.store.device_network().ok_or_else(|| {
+            AppRunError::Message("Hub Stop was saved but the connection is unavailable".into())
+        })?;
+        network
+            .agent_retry_origin_turn_stops()
+            .await
+            .map_err(|error| {
+                AppRunError::Message(format!(
+                    "This PC stopped the turn; Hub Stop is saved and will retry: {error}"
+                ))
+            })?;
+        Ok(())
     }
 
     /// Commits an exact root Stop that won before this task published any durable admission.
@@ -681,6 +762,7 @@ impl RunService {
             turn_id: expected_turn_id,
             revision: expected_revision,
         };
+        let remote_stop_prepared = self.prepare_origin_turn_stop(expected_receipt)?;
         match self
             .session_service
             .request_exact_execution_interrupt(
@@ -709,6 +791,9 @@ impl RunService {
                 RootExecutionStopSealOutcome::Acquired(plan) => plan,
                 RootExecutionStopSealOutcome::AlreadySealed
                 | RootExecutionStopSealOutcome::Rejected => {
+                    if remote_stop_prepared {
+                        self.dispatch_prepared_origin_turn_stop().await?;
+                    }
                     return Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true });
                 }
             };
@@ -720,6 +805,9 @@ impl RunService {
             if plan.admission.pending.is_some()
                 || plan.admission.last_admitted != Some(expected_receipt)
             {
+                if remote_stop_prepared {
+                    self.dispatch_prepared_origin_turn_stop().await?;
+                }
                 return Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true });
             }
             let _ = self.commit_local_root_execution_stop(&root_scope_control, false)?;
@@ -729,6 +817,9 @@ impl RunService {
                 ));
             }
             lease.commit();
+            if remote_stop_prepared {
+                self.dispatch_prepared_origin_turn_stop().await?;
+            }
             return Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true });
         }
         let _ = self.cancel_local_root_execution_at_turn(
@@ -737,6 +828,9 @@ impl RunService {
             expected_revision,
             crate::protocol::TurnInterruptionCause::UserStop,
         );
+        if remote_stop_prepared {
+            self.dispatch_prepared_origin_turn_stop().await?;
+        }
         Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true })
     }
 
@@ -1090,6 +1184,7 @@ impl RunService {
             } else {
                 crate::runner::shared::external::ResourceCaller::Local
             },
+            request.session_id,
         )
         .await
         .map_err(|e| AppRunError::Message(e.to_string()))?;
@@ -1109,6 +1204,11 @@ impl RunService {
                 .map(|receipt| receipt.session_id),
         };
         let success = matches!(&result,Ok(AppCommandOutcome::Turn(summary)) if summary.status()==SessionStatus::Completed);
+        if let (Some(resource), Some(session)) = (&resource, session) {
+            if let Err(error) = resource.bind_session(session) {
+                eprintln!("Local resource session could not retain its exact owner: {error}");
+            }
+        }
         let service = self.clone();
         self.agent_runtime()?.retain_resource_drain(move || async move {
             let _publication=publication;

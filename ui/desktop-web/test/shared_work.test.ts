@@ -34,11 +34,16 @@ test("project role and selected enabled environment govern input while readers r
 test("continuation requires the Hub capability and sends the selected job revision with its draft", async () => {
   const local = sharedUiFixture();
   local.projection!.selected_job_id = "finished-a";
-  local.projection!.detail = { id: "finished-a", project_id: "project-a", root_id: "finished-a", parent_id: null, environment_id: "env-a", title: "Original", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: false };
+  local.projection!.selected_conversation_id = "conversation-a";
+  local.projection!.conversations = [{ id: "conversation-a", title: "Original", latest_job_id: "finished-a", updated_at_ms: 2 }];
+  local.projection!.detail = { id: "finished-a", project_id: "project-a", root_id: "finished-a", parent_id: null, conversation_id: "conversation-a", environment_id: "env-a", title: "Original", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: false };
   local.draft.followup = "追加の分析";
   assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "continue", ""), false);
   local.projection!.detail.can_continue = true;
   assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "continue", ""), true);
+  local.projection!.conversations[0].latest_job_id = "newer-job";
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "continue", ""), false);
+  local.projection!.conversations[0].latest_job_id = "finished-a";
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   let sent: unknown;
   Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (_name: string, args: unknown) => { sent = args; return { ...local.projection, revision: "2" }; } } } });
@@ -103,7 +108,8 @@ test("retained metadata shows deleted content and cannot save or import it", () 
 test("shared surface shows restricted occupancy only as a count and escapes returned work text", () => {
   const local = sharedUiFixture(); local.projection!.status!.environments[0].label = "<script>alert(1)</script>";
   const html = renderSharedWork(sharedWorkPresentation(local));
-  assert.match(html, /他のプロジェクトで 1 件使用中/);
+  assert.match(html, /ほかに 1 枠使用中（起動中のアプリを含む）/);
+  assert.doesNotMatch(html, /他のプロジェクトで/);
   assert.match(html, /&lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
 });
 test("uncertain submission has an independent retry control and blocks a new draft submission", () => {
@@ -129,13 +135,46 @@ test("pending approval precedes the conversation with exact decision controls an
   assert.ok(approval.indexOf("&lt;write report&gt;") < details);
   assert.ok(approval.indexOf("C:/Approved/report.md") < details);
   assert.ok(approval.indexOf("作業フォルダー外") < details);
-  assert.ok(approval.indexOf("外部システムの変更") < details);
+  assert.ok(approval.indexOf("外部サービスのデータを変更する操作") < details);
   for (const kind of ["approve", "deny", "stop"]) assert.match(approval, new RegExp(`data-action="shared-${kind}" data-value="exact-approval"`));
   assert.equal(sharedWorkActionEnabled(local, "approve", "stale-approval"), false);
   local.projection!.approval.can_decide = false;
   html = renderSharedWork(sharedWorkPresentation(local));
   assert.doesNotMatch(html, /data-action="shared-(?:approve|deny|stop)"/);
   assert.match(html, /担当者の承認待ち/);
+});
+test("an actionable child approval is visible from its parent conversation and opens the exact notification", async () => {
+  const local = sharedUiFixture();
+  local.projection!.selected_job_id = "job-a";
+  local.projection!.selected_conversation_id = "job-a";
+  local.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null,
+    conversation_id: "job-a", environment_id: "env-a", title: "Parent", input: { prompt: "Build an app" },
+    result: null, state: "waiting_child", awaiting_child_id: "job-child", revision: 1, created_at_ms: 1, updated_at_ms: 1 };
+  local.projection!.inbox = { items: [
+    { id: "notice-child", job_id: "job-child", project_id: "project-a", kind: "approval", title: "Host <app>",
+      created_at_ms: 2, read_at_ms: null, can_act: true, approval_id: "approval-child" },
+    { id: "notice-other", job_id: "other", project_id: "other-project", kind: "approval", title: "Other project",
+      created_at_ms: 2, read_at_ms: null, can_act: true, approval_id: "other-approval" },
+  ], next_before: null, unread_count: 2 };
+  const html = renderSharedWork(sharedWorkPresentation(local));
+  const banner = html.slice(html.indexOf('data-shared-region="message"'), html.indexOf('data-shared-region="stop-all"'));
+  assert.match(banner, /shared-work-message has-approval/);
+  assert.match(banner, /承認が必要な仕事があります/);
+  assert.match(banner, /data-action="shared-inbox-open" data-value="notice-child"/);
+  assert.match(banner, /Host &lt;app&gt;/);
+  assert.doesNotMatch(banner, /Other project|notice-other|<app>/);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "inbox-open", "notice-child"), true);
+
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let sent: unknown;
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (_name: string, args: unknown) => {
+    sent = args; return { ...local.projection, revision: "2" };
+  } } } });
+  try {
+    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
+    await sharedWorkAction(context, "inbox_open", "notice-child");
+    assert.deepEqual(sent, { expectedGeneration: "1", request: { kind: "inbox_open", notification_id: "notice-child" } });
+  } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
 });
 test("retaining an active draft synchronizes native and accessible button availability together", () => {
   const attributes = new Map([["aria-disabled", "true"]]);
@@ -174,7 +213,7 @@ test("resolved approvals show only a Japanese result and keep their original sco
     assert.notEqual(key, pendingKey, "an expanded pending explanation must not keep the settled record expanded");
     const summaryEnd = section.indexOf("</summary>");
     assert.doesNotMatch(section.slice(0, summaryEnd), /Original operation|Command:|C:\/Approved|consumed|approve|expired|cancelled|future-status|future-decision/);
-    for (const original of ["Original operation", "Command: write report", "C:/Approved/report.md", "作業フォルダー外", "外部システムの変更"]) assert.ok(section.indexOf(original) > summaryEnd, original);
+    for (const original of ["Original operation", "Command: write report", "C:/Approved/report.md", "作業フォルダー外", "外部サービスのデータを変更する操作"]) assert.ok(section.indexOf(original) > summaryEnd, original);
     assert.doesNotMatch(section, /data-action="shared-(?:approve|deny|stop)"/);
     assert.doesNotMatch(html, /href="#shared-approval-title"/);
   }

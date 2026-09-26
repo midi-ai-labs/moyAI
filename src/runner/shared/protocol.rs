@@ -55,6 +55,8 @@ pub enum JobState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: String,
+    #[serde(default)]
+    pub conversation_id: String,
     pub root_id: String,
     pub parent_id: Option<String>,
     pub project_id: String,
@@ -65,6 +67,8 @@ pub struct Job {
     pub input: Value,
     pub checkpoint: Option<Value>,
     pub result: Option<Value>,
+    #[serde(default)]
+    pub continued_from: Option<String>,
     pub state: JobState,
     pub awaiting_child_id: Option<String>,
     pub revision: u64,
@@ -84,6 +88,50 @@ pub struct Assignment {
     pub child_result: Option<Box<Job>>,
     #[serde(default)]
     pub allowed_child_environments: Vec<String>,
+    #[serde(default)]
+    pub allowed_child_candidates: Vec<SharedCandidate>,
+    #[serde(default)]
+    pub retained_services: Vec<RetainedService>,
+    #[serde(default)]
+    pub required_runner_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedCandidate {
+    pub environment_id: String,
+    pub device_id: String,
+    pub device_label: String,
+    pub environment_label: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+pub(crate) const MULTI_DEVICE_SESSION_CAPABILITY: &str = "multi_device_session_v1";
+
+impl Assignment {
+    pub(crate) fn require_supported_capabilities(&self) -> Result<(), RunnerError> {
+        if self.required_runner_capabilities.len() > 1
+            || self
+                .required_runner_capabilities
+                .iter()
+                .any(|capability| capability != MULTI_DEVICE_SESSION_CAPABILITY)
+        {
+            return Err(RunnerError::new(
+                "This Hub job requires a newer Runner. Update moyAI on the execution PC before accepting it",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetainedService {
+    pub service_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub conversation_id: String,
+    pub environment_id: String,
+    pub expires_at_ms: u64,
 }
 
 fn initial_authority_generation() -> u64 {
@@ -110,6 +158,17 @@ pub struct Report {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReportOutcome {
     Started,
+    RetainService {
+        service_id: String,
+        expires_at_ms: u64,
+    },
+    ServiceStopped {
+        service_id: String,
+    },
+    ServiceUncertain {
+        service_id: String,
+        reason: String,
+    },
     YieldToChild {
         checkpoint: Value,
         child_environment_id: String,

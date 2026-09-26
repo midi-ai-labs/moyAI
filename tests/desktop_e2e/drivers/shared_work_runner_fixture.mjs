@@ -13,6 +13,8 @@ export async function startSharedWorkflowProvider() {
   const requests = [], failures = [], sockets = new Set();
   let release;
   const childGate = new Promise(resolve => { release = resolve; });
+  let releaseStoppedRequest;
+  const stoppedRequestGate = new Promise(resolve => { releaseStoppedRequest = resolve; });
   const server = createServer(async (req, res) => {
     try {
       if (req.url === "/v1/models") { res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ data: [{ id: "shared-workflow" }] })); return; }
@@ -21,12 +23,23 @@ export async function startSharedWorkflowProvider() {
       for await (const bytes of req) { length += bytes.length; if (length > 4 * 1024 * 1024) throw new Error("Provider fixture request bound"); chunks.push(bytes); }
       const request = JSON.parse(Buffer.concat(chunks)); requests.push(request);
       const messages = request.messages, task = JSON.stringify(messages.filter(m => m.role === "user"));
+      const latestUser = JSON.stringify(messages.filter(m => m.role === "user").at(-1) ?? {});
       const tool = id => messages.filter(m => m.role === "tool" && m.tool_call_id === id);
       const call = (id, name, args) => ({ role: "assistant", tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] });
       let delta, finish = "stop";
       const implementation = onboardingImplementationReply(messages);
       if (implementation) {
         ({ delta, finish } = implementation);
+      } else if (latestUser.includes("desktop-conversation-revised")) {
+        delta = { role: "assistant", content: "編集後の依頼をこのプロジェクトで実行しました。" };
+      } else if (latestUser.includes("desktop-conversation-stop")) {
+        await Promise.race([stoppedRequestGate, new Promise(resolve => res.once("close", resolve))]);
+        if (res.destroyed) return;
+        delta = { role: "assistant", content: "停止されなかった依頼です。" };
+      } else if (latestUser.includes("desktop-conversation-followup")) {
+        delta = { role: "assistant", content: "追加の依頼にも、同じ共有チャットで回答しました。" };
+      } else if (latestUser.includes("desktop-conversation-start")) {
+        delta = { role: "assistant", content: "最初の依頼をこのプロジェクトで実行しました。" };
       } else if (task.includes("moyai-sample-numbers.csv")) {
         if (tool("sample-output").length) {
           delta = { role: "assistant", content: "件数は3、合計は60です。moyai-sample-result.md に結果を保存しました。" };
@@ -66,7 +79,7 @@ export async function startSharedWorkflowProvider() {
   server.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   return { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, requests, failures, releaseChild: release,
-    async close() { release(); const closed = new Promise(resolve => server.close(resolve)); for (const s of sockets) s.destroy(); await closed; } };
+    async close() { release(); releaseStoppedRequest(); const closed = new Promise(resolve => server.close(resolve)); for (const s of sockets) s.destroy(); await closed; } };
 }
 
 export async function startSharedWorkflowRunner({ context, deviceId, hubId, runnerBinary, runnerTestBinary, sink }) {

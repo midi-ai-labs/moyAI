@@ -3,29 +3,33 @@ import { mcpHistoryRegionHasSelection } from "./mcp_history_dom.ts";
 import type { SharedWorkPresentation, SharedWorkProjection } from "./shared_work_state.ts";
 import { renderHubConversation } from "./shared_work_conversation.ts";
 import { retainWorkRecord } from "./shared_work_details.ts";
+import { guardianReasonPrefix, permissionReviewReason, permissionRiskLabel } from "./permission_copy.ts";
 const esc = (value: unknown) => escapeHtml(String(value ?? ""));
 function button(action: string, label: string, value = "", disabled = false): string {
   return `<button data-action="shared-${action}" data-value="${esc(value)}" ${disabled ? "disabled" : ""}>${esc(label)}</button>`;
 }
-export function renderSharedWork(local: SharedWorkPresentation): string {
-  return renderHubConversation(local, local.projection?.principal && !local.conceal ? renderSharedApproval(local) : "");
+export function renderSharedWork(local: SharedWorkPresentation, receiverActivity = ""): string {
+  return renderHubConversation(local, local.projection?.principal && !local.conceal ? renderSharedApproval(local) : "", receiverActivity);
 }
 
 type ApprovalRequest = NonNullable<SharedWorkProjection["approval"]>["request"];
 const approvalAccessLabels: Record<string, string> = { list: "フォルダー内の一覧の取得", search: "ファイルの検索", read: "ファイルの読取り", edit: "ファイルの変更", shell: "コマンドの実行" };
-const approvalRiskLabels: Record<string, string> = {
-  destructive_delete: "ファイルやデータの削除", move_or_rename: "移動・名前の変更", network: "ネットワーク通信",
-  external_connection: "外部への接続・接続設定", configured_local_service: "設定済みローカルサービスの利用",
-  protected_workspace_authority: "保護された作業設定への操作", external_mutation: "外部システムの変更",
-  external_destructive_operation: "外部システムの削除などの操作", unclassified_shell: "コマンドの影響を自動では判定できません",
-};
+
+function approvalDetail(request: ApprovalRequest, prefix: string): string | undefined {
+  return request.details.find(detail => detail.startsWith(prefix) && detail.slice(prefix.length).trim())?.slice(prefix.length);
+}
 
 function renderApprovalOperation(request: ApprovalRequest): string {
   const shell = request.access === "shell";
+  const operation = approvalDetail(request, "操作: ");
+  const target = request.targets.length ? undefined : approvalDetail(request, "対象: ");
+  const reviewReason = permissionReviewReason(request.details);
   // These are explanatory strings owned by shell.rs/context.rs, not a second
   // permission classifier. Unknown details stay visible; the complete request
   // is always retained below, including all original strings and identifiers.
   const details = request.details.flatMap(detail => {
+    if (detail.startsWith(guardianReasonPrefix)) return [];
+    if ((operation && detail === `操作: ${operation}`) || (target && detail === `対象: ${target}`)) return [];
     if (shell) {
       for (const [prefix, label] of [["Command: ", "実行コマンド"], ["Workdir: ", "実行するフォルダー"], ["Requested sandbox elevation: ", "保護を外す理由（AIの説明）"]]) {
         if (detail.startsWith(prefix)) return [`<p><strong>${label}</strong></p><pre>${esc(detail.slice(prefix.length))}</pre>`];
@@ -36,24 +40,27 @@ function renderApprovalOperation(request: ApprovalRequest): string {
     }
     return [`<pre>${esc(detail)}</pre>`];
   });
-  const risks = request.risks.map(risk => approvalRiskLabels[risk] ?? `未対応の確認事項: ${risk}`);
+  const risks = request.risks.map(permissionRiskLabel);
   const permission = shell ? '<p class="shared-error"><strong>許可すると、このコマンドを作業フォルダー内に限定する保護を外して実行します。</strong>実行PCのユーザー権限で、表示された対象以外のファイル操作や外部通信も可能になります。</p>' : "";
   const summary = shell ? "次のコマンドを実行しようとしています。" : request.summary;
   const outside = request.outside_workspace ? `<p class="shared-error">${shell ? "作業フォルダー外への操作、または保護を外した実行の要求を含みます。" : "実行環境の作業フォルダー外への操作を含みます。"}</p>` : "";
-  return `<p>${esc(summary)}</p><p><strong>対象:</strong> ${request.targets.map(esc).join("、") || "指定なし"}</p>${outside}${permission}<div class="shared-approval-operation" aria-label="実行する操作">${details.join("") || (shell ? "<p>具体的な操作内容が記載されていません。元の承認データを確認してください。</p>" : "")}</div>${risks.length ? `<p>確認事項: ${risks.map(esc).join("、")}</p>` : ""}`;
+  const targets = request.targets.map(esc).join("、") || esc(target ?? "指定なし");
+  return `${reviewReason ? `<p><strong>確認が必要な理由</strong><br>${esc(reviewReason)}</p>` : ""}<p>${esc(summary)}</p><p><strong>対象:</strong> ${targets}</p>${outside}${permission}<div class="shared-approval-operation" aria-label="実行する操作">${details.join("") || (shell ? "<p>具体的な操作内容が記載されていません。元の承認データを確認してください。</p>" : "")}</div>${risks.length ? `<p>操作前の確認事項: ${risks.map(esc).join("、")}</p>${shell ? '<p class="shared-secondary">コマンドに含まれる文字列からの判定です。実際に行う操作は、上のコマンドを確認してください。</p>' : ""}` : ""}`;
 }
 
 function renderSharedApproval(local: SharedWorkPresentation): string {
   const approval = local.projection?.approval;
   if (!approval) return '<section data-shared-region="approval" class="shared-card" hidden></section>';
   const operation = renderApprovalOperation(approval.request);
-  const metadata = `<p>操作種別: ${esc(approvalAccessLabels[approval.request.access] ?? approval.request.access)}${approval.request.agent_task_name ? ` · ${esc(approval.request.agent_task_name)}` : ""}</p><p>有効期限: ${esc(new Date(approval.expires_at_ms).toLocaleString("ja-JP"))}</p><h3>元の承認データ</h3><pre>${esc(JSON.stringify(approval.request, null, 2))}</pre>`;
+  const metadata = `<p>操作種別: ${esc(approvalDetail(approval.request, "操作: ") ?? approvalAccessLabels[approval.request.access] ?? approval.request.access)}${approval.request.agent_task_name ? ` · ${esc(approval.request.agent_task_name)}` : ""}</p><p>有効期限: ${esc(new Date(approval.expires_at_ms).toLocaleString("ja-JP"))}</p><h3>元の承認データ</h3><pre>${esc(JSON.stringify(approval.request, null, 2))}</pre>`;
   if (approval.status !== "pending") {
     // A different details owner closes the record when an expanded pending
     // explanation settles; subsequent reading still retains its open state.
     return `<section data-shared-region="approval" class="shared-card shared-approval-record" aria-labelledby="shared-approval-title"><details data-details-key="shared-approval-record-${esc(approval.id)}"><summary id="shared-approval-title">${approvalResultTitle(approval.status, approval.decision)} <span class="shared-secondary">（詳細）</span></summary>${operation}${metadata}</details></section>`;
   }
-  return `<section data-shared-region="approval" class="shared-card shared-approval-pending" aria-labelledby="shared-approval-title"><h2 id="shared-approval-title">${approval.can_decide ? "あなたの承認を待っています" : "担当者の承認待ち"}</h2>${operation}${approval.can_decide ? `<p>許可は、この承認依頼に記載された操作にだけ適用されます。</p><div class="shared-actions">${button("approve", "この操作の実行を許可", approval.id, Boolean(local.pending))}${button("deny", "この操作を拒否", approval.id, Boolean(local.pending))}${button("stop", "仕事を停止", approval.id, Boolean(local.pending))}</div>` : "<p>担当者またはプロジェクト管理者が、この画面で判断できます。</p>"}<details data-details-key="shared-approval-${esc(approval.id)}"><summary>承認の詳細・元のデータ</summary>${metadata}</details></section>`;
+  const review = `<div class="shared-approval-review" role="region" aria-label="承認する操作の詳細" tabindex="0">${operation}<details data-details-key="shared-approval-${esc(approval.id)}"><summary>承認の詳細・元のデータ</summary>${metadata}</details></div>`;
+  const decisions = `<div class="shared-approval-decisions">${approval.can_decide ? `<p>許可は、この承認依頼に記載された操作にだけ適用されます。</p><div class="shared-actions">${button("approve", "この操作の実行を許可", approval.id, Boolean(local.pending))}${button("deny", "この操作を拒否", approval.id, Boolean(local.pending))}${button("stop", "仕事を停止", approval.id, Boolean(local.pending))}</div>` : "<p>担当者またはプロジェクト管理者が、この画面で判断できます。</p>"}</div>`;
+  return `<section data-shared-region="approval" class="shared-card shared-approval-pending" aria-labelledby="shared-approval-title"><h2 id="shared-approval-title">${approval.can_decide ? "あなたの承認を待っています" : "担当者の承認待ち"}</h2>${review}${decisions}</section>`;
 }
 
 function approvalResultTitle(status: string, decision: string | null): string {
@@ -90,7 +97,7 @@ export function retainSharedWorkSurface(current: HTMLElement, next: HTMLElement)
     }
     if (region.isEqualNode(nextRegion)) continue;
     const active = region.contains(document.activeElement);
-    if (active && document.activeElement?.matches("input,textarea,select") && ["draft", "followup", "handover"].includes(nextRegion.dataset.sharedRegion ?? "")) {
+    if (active && document.activeElement?.matches("input,textarea,select") && ["account", "draft", "followup", "handover", "revision-editor"].includes(nextRegion.dataset.sharedRegion ?? "")) {
       for (const field of region.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-shared-field]")) {
         const replacement = nextRegion.querySelector<HTMLInputElement>(`[data-shared-field="${field.dataset.sharedField}"]`);
         if (replacement) field.disabled = replacement.disabled;
@@ -99,7 +106,7 @@ export function retainSharedWorkSurface(current: HTMLElement, next: HTMLElement)
         const replacement = Array.from(nextRegion.querySelectorAll<HTMLButtonElement>("button[data-action]")).find(candidate => candidate.dataset.action === button.dataset.action && candidate.dataset.value === button.dataset.value);
         if (replacement) { button.disabled = replacement.disabled; button.setAttribute("aria-disabled", String(replacement.disabled)); button.textContent = replacement.textContent; }
       }
-    } else if (!["transcript", "detail"].includes(nextRegion.dataset.sharedRegion ?? "") || !retainWorkRecord(region, nextRegion)) region.replaceWith(nextRegion);
+    } else if (!["transcript", "detail", "history-container"].includes(nextRegion.dataset.sharedRegion ?? "") || !retainWorkRecord(region, nextRegion)) region.replaceWith(nextRegion);
   }
   return true;
 }

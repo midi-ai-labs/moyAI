@@ -986,3 +986,6 @@ export function createPermissionRestartGuardianScenario() {
 export function createPermissionRestartGuardianChatScenario() {
   return createPermissionRestartGuardianScenarioForApiMode(CHAT_COMPLETIONS_API_MODE);
 }
+
+// Shared trusted entry path; handoff scenarios keep the restart/pressure oracle unchanged.
+export { submitTrustedPrompt as submitGuardianPrompt };

@@ -26,9 +26,12 @@ test("approval enrollment never grants reception or selects peers automatically"
   assert.equal(deviceCanJoin(local), false);
   const pendingHtml = renderDeviceNetwork(local);
   assert.match(pendingHtml, /管理者の参加承認待ち/);
+  assert.match(pendingHtml, /次はHub管理者が、このPCの参加を承認します/);
+  assert.match(pendingHtml, /この画面のまま待てます/);
   assert.doesNotMatch(pendingHtml, /id="device-network-code"|id="device-network-join-confirmed"/);
   assert.equal(deviceCanReceive(local, true), false);
   acceptDeviceNetworkProjection(local, deviceProjection());
+  assert.match(renderDeviceNetwork(local), /Hubに接続できました/);
   assert.deepEqual(local.target, { kind: "temp" });
   assert.equal(local.startOnLaunch, false);
   assert.equal(local.keepWhenHidden, false);

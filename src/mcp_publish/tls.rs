@@ -258,6 +258,13 @@ pub(crate) fn managed_hub_http_from(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(4))
+        // This identity is used on both the host runtime and the local Agent runtime.
+        // A pooled H1 connection's driver belongs to the runtime that created it.
+        // The synchronous final-effect fence blocks the Agent while the host authorizes;
+        // reusing an Agent-owned idle connection there would deadlock until the deadline.
+        // Fresh connections preserve the shared identity/rotation lease without replaying
+        // requests or changing control/model deadlines. Active streams remain unchanged.
+        .pool_max_idle_per_host(0)
         .local_address(local_ip.map(std::net::IpAddr::V4))
         .use_preconfigured_tls(config)
         .build()

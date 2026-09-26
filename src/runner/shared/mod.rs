@@ -9,7 +9,9 @@ pub(crate) mod provisioning;
 mod settings;
 pub(super) mod transport;
 
-pub use protocol::{Assignment, AttemptStatus, Job, JobState, Report, ReportOutcome, SharedInput};
+pub use protocol::{
+    Assignment, AttemptStatus, Job, JobState, Report, ReportOutcome, SharedCandidate, SharedInput,
+};
 pub use settings::{EnvironmentMapping, ResourceScope, SharedSettings};
 
 use std::time::Duration;
@@ -26,7 +28,24 @@ pub struct SharedProjection {
     pub connected: bool,
     pub accepting: bool,
     pub attempts: Vec<SharedAttemptProjection>,
+    #[serde(default)]
+    pub retained_services: Vec<RetainedServiceProjection>,
     pub error: Option<String>,
+}
+
+/// Local process evidence only. Job titles and private input are obtained separately
+/// through the Hub's authorized project view.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetainedServiceProjection {
+    pub service_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub project_id: String,
+    pub conversation_id: String,
+    pub environment_id: String,
+    pub expires_at_ms: u64,
+    pub local_state: String,
+    pub uncertain: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,9 +53,16 @@ pub struct SharedAttemptProjection {
     pub attempt_id: String,
     pub generation: u64,
     pub job_id: String,
+    /// Opaque key for matching a separately authorized Hub project view.
+    #[serde(default)]
+    pub project_id: String,
     pub environment_id: String,
     pub run_id: ulid::Ulid,
     pub state: String,
+    /// Live state of the exact local run. A journal receipt alone is not proof that
+    /// its worker or managed processes have stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_state: Option<super::LocalRunState>,
 }
 
 /// Kept by the process entrypoint until its final local outcomes have reached the journal.
@@ -49,6 +75,27 @@ impl SharedWorker {
         host: RunnerHost,
         mut settings: SharedSettings,
     ) -> Result<Self, RunnerError> {
+        let locally_selected = host
+            .inner
+            .operations
+            .lock()
+            .map_err(|_| RunnerError::new("Runner operations unavailable"))?
+            .installed
+            .provisions
+            .iter()
+            .filter(|receipt| receipt.local_folder_environment())
+            .map(|receipt| receipt.environment_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        // A deleted or replaced user-selected folder becomes unbound. It cannot
+        // acquire a different path merely because the same saved string resolves.
+        settings.environments.retain(|mapping| {
+            !locally_selected.contains(&mapping.environment_id)
+                || std::fs::canonicalize(&mapping.directory)
+                    .ok()
+                    .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
+                    .as_ref()
+                    == Some(&mapping.directory)
+        });
         settings.resolve()?;
         let client = SharedClient::load(&settings, &host)?;
         let path = Journal::path_for(&host.inner.process.store().paths().data_dir, &settings)?;
@@ -197,6 +244,22 @@ impl Controller {
                 self.provision_environment(&template_id, &environment_id)
                     .await
             }
+            RunnerOperation::BindProjectFolder {
+                project_id,
+                environment_id,
+                directory,
+                access_mode,
+                expected_directory,
+            } => {
+                self.bind_project_folder(
+                    &project_id,
+                    &environment_id,
+                    directory,
+                    access_mode,
+                    expected_directory,
+                )
+                .await
+            }
             RunnerOperation::ReconcileUnknown {
                 attempt_id,
                 generation,
@@ -269,6 +332,148 @@ impl Controller {
                 self.journal.reconciled(&mut entry, report)?;
                 self.flush_report(&mut entry).await
             }
+            RunnerOperation::StopShared {
+                attempt_id,
+                generation,
+                run_id,
+            } => {
+                let entry = self
+                    .journal
+                    .get(&attempt_id)?
+                    .ok_or_else(|| RunnerError::new("This received work is no longer active"))?;
+                if entry.assignment.generation != generation
+                    || entry.run_id != run_id
+                    || entry.phase != Phase::Executing
+                    || entry.external.is_some()
+                {
+                    return Err(RunnerError::new(
+                        "This received work changed; refresh its status before stopping it",
+                    ));
+                }
+                {
+                    let state = self
+                        .host
+                        .inner
+                        .state
+                        .lock()
+                        .map_err(|_| RunnerError::new("Runner unavailable"))?;
+                    if !state.runs.get(&run_id).is_some_and(|run| run.shared) {
+                        return Err(RunnerError::new(
+                            "This exact received execution is no longer owned here",
+                        ));
+                    }
+                }
+                self.host
+                    .on_executor(move |host| async move { host.stop_execution(run_id).await })
+                    .await
+            }
+            RunnerOperation::StopRetainedService {
+                service_id,
+                attempt_id,
+                generation,
+            } => {
+                let entry = self.journal.get(&attempt_id)?.ok_or_else(|| {
+                    RunnerError::new("This received service is no longer recorded")
+                })?;
+                let service = entry
+                    .retained_service
+                    .ok_or_else(|| RunnerError::new("This attempt has no retained service"))?;
+                if entry.assignment.generation != generation
+                    || service.service_id.to_string() != service_id
+                    || entry.service_stopped_ack
+                {
+                    return Err(RunnerError::new(
+                        "This received service changed; refresh its status before stopping it",
+                    ));
+                }
+                if !self
+                    .host
+                    .inner
+                    .process
+                    .managed_shells()
+                    .cancel_retained_service(service.service_id)
+                {
+                    return Err(RunnerError::new(
+                        "The exact local process handle is unavailable; confirm cleanup before reconciliation",
+                    ));
+                }
+                Ok(())
+            }
+            RunnerOperation::ReconcileRetainedService {
+                service_id,
+                attempt_id,
+                generation,
+                reason,
+                evidence,
+            } => {
+                if reason.trim().is_empty() || reason.len() > 4096 {
+                    return Err(RunnerError::new(
+                        "A reconciliation reason of 1 to 4096 bytes is required",
+                    ));
+                }
+                let mut entry = self
+                    .journal
+                    .get(&attempt_id)?
+                    .ok_or_else(|| RunnerError::new("This retained service is not recorded"))?;
+                let service = entry
+                    .retained_service
+                    .ok_or_else(|| RunnerError::new("This attempt has no retained service"))?;
+                if entry.assignment.generation != generation
+                    || service.service_id.to_string() != service_id
+                    || entry.service_stopped_ack
+                {
+                    return Err(RunnerError::new(
+                        "This exact retained service changed; refresh before reconciliation",
+                    ));
+                }
+                let shells = self.host.inner.process.managed_shells();
+                let local_state = shells.retained_service_state(service);
+                if matches!(
+                    local_state,
+                    crate::tool::shell::RetainedServiceState::Running
+                        | crate::tool::shell::RetainedServiceState::Stopping
+                ) {
+                    return Err(RunnerError::new(
+                        "The exact managed process may still be running; stop and wait",
+                    ));
+                }
+                match &evidence {
+                    ReconciliationEvidence::ProcessDrain
+                        if local_state == crate::tool::shell::RetainedServiceState::Stopped =>
+                    {
+                        let mut state = self
+                            .host
+                            .inner
+                            .state
+                            .lock()
+                            .map_err(|_| RunnerError::new("Runner unavailable"))?;
+                        let run = state.runs.get_mut(&entry.run_id).ok_or_else(|| {
+                            RunnerError::new("No exact process-drain receipt survives here")
+                        })?;
+                        run.process_lifetime.cancel();
+                        run.observe_process_completion(&shells);
+                        if !run.processes_drained {
+                            return Err(RunnerError::new(
+                                "The exact managed process is still draining",
+                            ));
+                        }
+                    }
+                    ReconciliationEvidence::OperatorConfirmedStopped {
+                        effects_reviewed: true,
+                        processes_stopped: true,
+                    } if local_state == crate::tool::shell::RetainedServiceState::Unknown => {}
+                    _ => {
+                        return Err(RunnerError::new(
+                            "Reconciliation requires exact process drain or explicit operator confirmation of effects and cleanup",
+                        ));
+                    }
+                }
+                self.journal.reconcile_service_stopped(
+                    &mut entry,
+                    json!({"reason":reason,"evidence":evidence,"at_ms":super::operations::now_ms(),
+                        "operator_sid":crate::runtime::resource_admission::operator_sid()?}),
+                )
+            }
             _ => Err(RunnerError::new("Invalid shared operator command")),
         }
     }
@@ -285,6 +490,11 @@ impl Controller {
             self.process_operations().await;
             let result = self.tick().await;
             let connected = result.is_ok();
+            if !connected {
+                // A retained server may not continue serving after the Hub authority
+                // becomes unreachable. Keep the lease occupied until drain is proven.
+                self.cancel_retained_services();
+            }
             // Delivery of old checkpoint cleanup is not admission for current work. It has
             // no execution effects and runs after current stop/approval/claim processing.
             let cleanup = if connected && !self.closing() {
@@ -311,6 +521,141 @@ impl Controller {
             .map_or(true, |state| state.closing)
     }
 
+    fn cancel_retained_services(&self) {
+        if let Ok(entries) = self.journal.retained_services() {
+            let shells = self.host.inner.process.managed_shells();
+            for entry in entries {
+                if let Some(service) = entry.retained_service {
+                    shells.cancel_retained_service(service.service_id);
+                }
+            }
+        }
+    }
+
+    async fn stop_fenced_executions(
+        &mut self,
+        assignments: Option<&[Assignment]>,
+    ) -> Result<(), RunnerError> {
+        for entry in self.journal.active()? {
+            if entry.phase != Phase::Executing || entry.external.is_some() {
+                continue;
+            }
+            let delivered = assignments.and_then(|assignments| {
+                assignments
+                    .iter()
+                    .find(|assignment| assignment.attempt_id == entry.assignment.attempt_id)
+            });
+            let changed = delivered.is_some_and(|assignment| {
+                assignment.generation != entry.assignment.generation
+                    || assignment.runner_id != entry.assignment.runner_id
+                    || assignment.job.id != entry.assignment.job.id
+            });
+            if delivered.is_none_or(|assignment| assignment.stop_requested) || changed {
+                let id = entry.run_id;
+                self.host
+                    .on_executor(move |host| async move { host.stop_execution(id).await })
+                    .await?;
+            }
+            if changed {
+                return Err(RunnerError::new("Hub attempt identity changed"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_retained_services(&mut self) -> Result<(), RunnerError> {
+        use crate::tool::shell::RetainedServiceState;
+
+        let retained = self.journal.retained_services()?;
+        if retained.is_empty() {
+            return Ok(());
+        }
+        let leases = self.client.services().await?;
+        if leases.len() > 128 {
+            return Err(RunnerError::new(
+                "Hub retained-service count exceeds the Runner bound",
+            ));
+        }
+        let shells = self.host.inner.process.managed_shells();
+        for mut entry in retained {
+            if !entry.retention_reported {
+                continue;
+            }
+            let service = entry.retained_service.expect("retained-service query");
+            let id = service.service_id.to_string();
+            let lease = leases.iter().find(|lease| lease.service_id == id);
+            if let Some(lease) = lease {
+                if lease.attempt_id != entry.assignment.attempt_id
+                    || lease.generation != entry.assignment.generation
+                    || lease.conversation_id != entry.assignment.job.conversation_id
+                    || lease.environment_id != entry.assignment.job.environment_id
+                    || lease.expires_at_ms != service.expires_at_ms
+                {
+                    shells.cancel_retained_service(service.service_id);
+                    return Err(RunnerError::new("Hub retained-service identity changed"));
+                }
+            }
+            if entry.service_reconciliation.is_some() {
+                let report = Report::for_assignment(
+                    &entry.assignment,
+                    &format!("service_stopped:{id}"),
+                    ReportOutcome::ServiceStopped { service_id: id },
+                );
+                self.client.report(&report).await?;
+                self.journal.service_stopped(&mut entry)?;
+                continue;
+            }
+            let expired = service.expires_at_ms <= super::operations::now_ms();
+            if lease.is_none() || lease.is_some_and(|lease| lease.stop_requested) || expired {
+                shells.cancel_retained_service(service.service_id);
+            }
+            match shells.retained_service_state(service) {
+                RetainedServiceState::Stopped => {
+                    let drained = {
+                        let mut state = self
+                            .host
+                            .inner
+                            .state
+                            .lock()
+                            .map_err(|_| RunnerError::new("Runner unavailable"))?;
+                        let Some(run) = state.runs.get_mut(&entry.run_id) else {
+                            return Err(RunnerError::new(
+                                "Retained service lost its exact local run receipt",
+                            ));
+                        };
+                        run.process_lifetime.cancel();
+                        run.observe_process_completion(&shells);
+                        run.processes_drained
+                    };
+                    if !drained {
+                        continue;
+                    }
+                    let report = Report::for_assignment(
+                        &entry.assignment,
+                        &format!("service_stopped:{id}"),
+                        ReportOutcome::ServiceStopped { service_id: id },
+                    );
+                    self.client.report(&report).await?;
+                    self.journal.service_stopped(&mut entry)?;
+                }
+                RetainedServiceState::Unknown if !entry.service_uncertain_ack => {
+                    let report = Report::for_assignment(
+                        &entry.assignment,
+                        &format!("service_uncertain:{id}"),
+                        ReportOutcome::ServiceUncertain {
+                            service_id: id,
+                            reason: "Runner restarted or lost the exact process handle; local cleanup requires confirmation".into(),
+                        },
+                    );
+                    self.client.report(&report).await?;
+                    self.journal.service_uncertain(&mut entry)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn recover(&mut self) -> Result<(), RunnerError> {
         for mut entry in self.journal.active()? {
             if entry.phase == Phase::Executing {
@@ -334,9 +679,20 @@ impl Controller {
                 entries
                     .into_iter()
                     .map(|entry| SharedAttemptProjection {
+                        local_state: if entry.phase == Phase::Executing && entry.external.is_none()
+                        {
+                            Some(
+                                self.host
+                                    .snapshot(entry.run_id)
+                                    .map_or(super::LocalRunState::Unknown, |run| run.state),
+                            )
+                        } else {
+                            None
+                        },
                         attempt_id: entry.assignment.attempt_id,
                         generation: entry.assignment.generation,
                         job_id: entry.assignment.job.id,
+                        project_id: entry.assignment.job.project_id,
                         environment_id: entry.assignment.job.environment_id,
                         run_id: entry.run_id,
                         state: match entry.phase {
@@ -353,6 +709,41 @@ impl Controller {
             ),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let (retained_services, service_error) = match self.journal.retained_services() {
+            Ok(entries) => (
+                entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let service = entry.retained_service?;
+                        let local_state = match self
+                            .host
+                            .inner
+                            .process
+                            .managed_shells()
+                            .retained_service_state(service)
+                        {
+                            crate::tool::shell::RetainedServiceState::Running => "running",
+                            crate::tool::shell::RetainedServiceState::Stopping => "stopping",
+                            crate::tool::shell::RetainedServiceState::Stopped => "stopped",
+                            crate::tool::shell::RetainedServiceState::Unknown => "unknown",
+                        };
+                        Some(RetainedServiceProjection {
+                            service_id: service.service_id.to_string(),
+                            attempt_id: entry.assignment.attempt_id,
+                            generation: entry.assignment.generation,
+                            project_id: entry.assignment.job.project_id,
+                            conversation_id: entry.assignment.job.conversation_id,
+                            environment_id: entry.assignment.job.environment_id,
+                            expires_at_ms: service.expires_at_ms,
+                            local_state: local_state.into(),
+                            uncertain: entry.service_uncertain_ack || local_state == "unknown",
+                        })
+                    })
+                    .collect(),
+                None,
+            ),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         if let Ok(mut state) = self.host.inner.state.lock() {
             state.shared_projection = Some(SharedProjection {
                 connected,
@@ -360,9 +751,15 @@ impl Controller {
                     && connected
                     && !state.closing
                     && attempts.is_empty()
-                    && journal_error.is_none(),
+                    && retained_services.is_empty()
+                    && journal_error.is_none()
+                    && service_error.is_none(),
                 attempts,
-                error: error.or(journal_error).map(|error| error.message),
+                retained_services,
+                error: error
+                    .or(journal_error)
+                    .or(service_error)
+                    .map(|error| error.message),
             });
         }
     }
@@ -373,6 +770,39 @@ impl Controller {
             self.host.begin_shutdown()?;
         }
         self.host.refresh_maintenance()?;
+        // Observe Hub stop fences before collecting a terminal result or publishing a
+        // retained process. The Hub still serializes reports with the stop transaction,
+        // but this ordering closes the avoidable local window where a stopped worker
+        // could be recorded as a successful preview before the next assignment poll.
+        let assignments = if retired || self.closing() {
+            None
+        } else {
+            Some(self.client.assignments(&self.settings).await)
+        };
+        match assignments.as_ref() {
+            Some(Ok(assignments)) => {
+                if assignments.len() > 128 {
+                    self.stop_fenced_executions(None).await?;
+                    return Err(RunnerError::new(
+                        "Hub assignment count exceeds the Runner reconciliation bound",
+                    ));
+                }
+                for assignment in assignments {
+                    if let Err(error) = self.validate_assignment(assignment) {
+                        self.stop_fenced_executions(None).await?;
+                        return Err(error);
+                    }
+                }
+                self.stop_fenced_executions(Some(assignments)).await?;
+            }
+            Some(Err(_)) => {
+                // If this Runner cannot observe the Hub's current fence, stop its
+                // active workers. Keep the journal and capacity until exact drain and
+                // acknowledgement; a reconnect must never replay their effects.
+                self.stop_fenced_executions(None).await?;
+            }
+            None => {}
+        }
         // Durable results are saved even while the Hub is disconnected or during shutdown.
         for mut entry in self.journal.active()? {
             if entry.phase == Phase::Executing {
@@ -391,6 +821,14 @@ impl Controller {
                 "Hub connection was reset on this PC. Previous work remains recorded locally and is not submitted to another Hub.",
             ));
         }
+        let assignments = match assignments {
+            Some(Ok(assignments)) => Some(assignments),
+            Some(Err(error)) => return Err(error.into()),
+            None => None,
+        };
+        // An already accepted retained lease may have been fenced after the
+        // previous tick. Stop and reconcile it before reporting its turn terminal.
+        self.reconcile_retained_services().await?;
         for mut entry in self.journal.active()? {
             if entry.phase == Phase::ReportPending {
                 self.flush_report(&mut entry).await?;
@@ -408,26 +846,12 @@ impl Controller {
         if self.closing() {
             return Ok(());
         }
-        let assignments = self.client.assignments(&self.settings).await?;
-        if assignments.len() > 128 {
-            return Err(RunnerError::new(
-                "Hub assignment count exceeds the Runner reconciliation bound",
-            ));
-        }
+        let assignments = assignments.expect("open Runner polls assignments before reconciliation");
         for assignment in &assignments {
             self.validate_assignment(assignment)?;
             if let Some(entry) = self.journal.get(&assignment.attempt_id)? {
                 if entry.assignment.generation != assignment.generation {
                     return Err(RunnerError::new("Hub attempt generation changed"));
-                }
-                if entry.phase == Phase::Executing && assignment.stop_requested {
-                    if entry.external.is_some() {
-                        continue;
-                    }
-                    let id = entry.run_id;
-                    self.host
-                        .on_executor(move |host| async move { host.stop_execution(id).await })
-                        .await?;
                 }
             } else if assignment.job.state != JobState::Assigned || assignment.stop_requested {
                 // An active attempt missing from this journal might belong to an earlier host.
@@ -534,6 +958,7 @@ impl Controller {
     }
 
     fn validate_assignment(&self, assignment: &Assignment) -> Result<(), RunnerError> {
+        assignment.require_supported_capabilities()?;
         let ids = [
             &assignment.attempt_id,
             &assignment.runner_id,
@@ -544,14 +969,131 @@ impl Controller {
             &assignment.job.requestor_id,
             &assignment.job.assignee_id,
         ];
+        let child_ids = assignment
+            .allowed_child_environments
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let candidate_ids = assignment
+            .allowed_child_candidates
+            .iter()
+            .map(|candidate| &candidate.environment_id)
+            .collect::<std::collections::BTreeSet<_>>();
         if assignment.runner_id != self.settings.device_id
             || assignment.generation == 0
             || ids.iter().any(|id| !crate::device_network::stable_id(id))
+            || assignment
+                .job
+                .continued_from
+                .as_ref()
+                .is_some_and(|id| !crate::device_network::stable_id(id) || id == &assignment.job.id)
+            || child_ids.len() != assignment.allowed_child_environments.len()
+            || child_ids.len() > 128
+            || child_ids
+                .iter()
+                .any(|id| !crate::device_network::stable_id(id))
+            || candidate_ids.len() != assignment.allowed_child_candidates.len()
+            || candidate_ids.len() > 128
+            || assignment.allowed_child_candidates.iter().any(|candidate| {
+                !child_ids.contains(&candidate.environment_id)
+                    || !crate::device_network::stable_id(&candidate.device_id)
+                    || candidate.device_label.trim().is_empty()
+                    || candidate.device_label.len() > 256
+                    || candidate.environment_label.trim().is_empty()
+                    || candidate.environment_label.len() > 256
+                    || candidate.capabilities.len() > 32
+                    || candidate
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability.trim().is_empty() || capability.len() > 128)
+            })
             || assignment.job.title.len() > 256
+            || assignment.retained_services.len() > 16
+            || assignment.retained_services.iter().any(|service| {
+                service.service_id.parse::<ulid::Ulid>().is_err()
+                    || !crate::device_network::stable_id(&service.attempt_id)
+                    || service.generation == 0
+                    || service.conversation_id != assignment.job.conversation_id
+                    || !crate::device_network::stable_id(&service.environment_id)
+            })
         {
             return Err(RunnerError::new("Hub assignment identity is invalid"));
         }
         Ok(())
+    }
+
+    fn resource_for_assignment(
+        &self,
+        entry: &Entry,
+    ) -> Result<
+        (
+            std::sync::Arc<crate::runtime::resource_admission::ResourceGuard>,
+            Vec<ulid::Ulid>,
+        ),
+        RunnerError,
+    > {
+        let leases = &entry.assignment.retained_services;
+        if leases.is_empty() {
+            return Ok((
+                std::sync::Arc::new(crate::runtime::resource_admission::ResourceGuard::acquire(
+                    &self.settings.resource_scope,
+                    &entry.mapping.directory,
+                )?),
+                Vec::new(),
+            ));
+        }
+        let shells = self.host.inner.process.managed_shells();
+        let state = self
+            .host
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RunnerError::new("Runner unavailable"))?;
+        let mut resource = None;
+        let mut runs = Vec::new();
+        for lease in leases {
+            let old = self
+                .journal
+                .get(&lease.attempt_id)?
+                .ok_or_else(|| RunnerError::new("Hub service lease has no local receipt"))?;
+            let service = old.retained_service.ok_or_else(|| {
+                RunnerError::new("Hub service lease has no local process receipt")
+            })?;
+            if old.assignment.generation != lease.generation
+                || old.assignment.job.project_id != entry.assignment.job.project_id
+                || old.assignment.job.conversation_id != lease.conversation_id
+                || old.assignment.job.environment_id != lease.environment_id
+                || old.mapping.directory != entry.mapping.directory
+                || service.service_id.to_string() != lease.service_id
+                || service.expires_at_ms != lease.expires_at_ms
+                || !old.retention_reported
+                || old.service_stopped_ack
+                || !shells.retained_service_live(service)
+            {
+                return Err(RunnerError::new(
+                    "Hub service lease is not live in this exact workspace",
+                ));
+            }
+            let run = state.runs.get(&old.run_id).ok_or_else(|| {
+                RunnerError::new("Hub service lease lost its local execution receipt")
+            })?;
+            if !run.shared || run.active() || run.processes_drained {
+                return Err(RunnerError::new("Hub service lease is not locally settled"));
+            }
+            let held = run.resource.clone().ok_or_else(|| {
+                RunnerError::new("Hub service lease lost its local resource guard")
+            })?;
+            if resource
+                .as_ref()
+                .is_some_and(|first| !std::sync::Arc::ptr_eq(first, &held))
+            {
+                return Err(RunnerError::new(
+                    "Hub leases do not share one local resource owner",
+                ));
+            }
+            resource = Some(held);
+            runs.push(old.run_id);
+        }
+        Ok((resource.expect("nonempty leases"), runs))
     }
 
     async fn relay_approval(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
@@ -659,6 +1201,16 @@ impl Controller {
                 )
                 .await;
         }
+        if std::fs::canonicalize(&entry.mapping.directory)
+            .ok()
+            .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
+            .as_ref()
+            != Some(&entry.mapping.directory)
+        {
+            return self
+                .preparation_failed(entry, "The selected project folder is missing or changed")
+                .await;
+        }
         let input = serde_json::from_value::<SharedInput>(entry.assignment.job.input.clone())
             .map_err(|_| RunnerError::new("Unsupported shared input"))
             .and_then(|input| {
@@ -680,6 +1232,9 @@ impl Controller {
             Err(error) => return Err(error.into()),
         }
         let status = self.client.attempt(&entry.assignment.attempt_id).await?;
+        if let Err(error) = self.validate_assignment(&status.assignment) {
+            return self.preparation_failed(entry, &error.message).await;
+        }
         if status.assignment.attempt_id != entry.assignment.attempt_id
             || status.assignment.generation != entry.assignment.generation
             || status.assignment.runner_id != self.settings.device_id
@@ -704,15 +1259,19 @@ impl Controller {
                 &entry.mapping,
                 &status.assignment.allowed_child_environments,
             );
+        let allowed_child_candidates = status
+            .assignment
+            .allowed_child_candidates
+            .iter()
+            .filter(|candidate| allowed_child_environments.contains(&candidate.environment_id))
+            .cloned()
+            .collect();
         self.journal.executing(entry)?;
         if let Err(error) = self.client.authorize(&status.assignment, None).await {
             return self.preparation_failed(entry, &error.message).await;
         }
-        let resource = match crate::runtime::resource_admission::ResourceGuard::acquire(
-            &self.settings.resource_scope,
-            &entry.mapping.directory,
-        ) {
-            Ok(resource) => std::sync::Arc::new(resource),
+        let (resource, compatible_retained_runs) = match self.resource_for_assignment(entry) {
+            Ok(resource) => resource,
             Err(error) => return self.preparation_failed(entry, &error.message).await,
         };
         let prepared = match data::prepare(&self.client, entry, &input).await {
@@ -745,9 +1304,12 @@ impl Controller {
         };
         let context = crate::agent::shared::SharedRunContext {
             job_id: entry.assignment.job.id.clone(),
+            attempt_id: entry.assignment.attempt_id.clone(),
+            generation: entry.assignment.generation,
             project_id: entry.assignment.job.project_id.clone(),
             environment_id: entry.assignment.job.environment_id.clone(),
             allowed_child_environments,
+            allowed_child_candidates,
             resume,
             continuation: prepared.continuation,
         };
@@ -769,6 +1331,7 @@ impl Controller {
                     access_mode: entry.mapping.access_mode,
                     authority: self.client.effect_authority(entry.assignment.clone()),
                     resource,
+                    compatible_retained_runs,
                 }),
             )
             .await
@@ -817,7 +1380,7 @@ impl Controller {
 
     fn collect_outcome(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
         let snapshot = self.host.snapshot(entry.run_id)?;
-        let (outcome, cancelled) = {
+        let (outcome, cancelled, retained_service) = {
             let mut state = self
                 .host
                 .inner
@@ -828,14 +1391,41 @@ impl Controller {
                 .runs
                 .get_mut(&entry.run_id)
                 .ok_or_else(|| RunnerError::new("Accepted shared execution is missing"))?;
-            if run.result.is_some() {
+            let proposed_service = match &run.result {
+                Some(Ok(ExecutionOutcome::Yielded(yielded))) if !run.control.is_cancelled() => {
+                    yielded.retained_service
+                }
+                Some(Ok(ExecutionOutcome::Completed(summary)))
+                    if !run.control.is_cancelled()
+                        && summary.status() == crate::session::SessionStatus::Completed =>
+                {
+                    self.host
+                        .inner
+                        .process
+                        .managed_shells()
+                        .completion_service_in_scope(summary.session_id(), run.managed_scope_id)
+                }
+                _ => None,
+            };
+            let retained_service = proposed_service.filter(|service| {
+                self.host
+                    .inner
+                    .process
+                    .managed_shells()
+                    .retained_service_live(*service)
+            });
+            if run.result.is_some() && retained_service.is_none() {
                 run.process_lifetime.cancel();
             }
             run.observe_process_completion(&self.host.inner.process.managed_shells());
-            if run.active() || !run.processes_drained {
+            if run.active() || (retained_service.is_none() && !run.processes_drained) {
                 return Ok(());
             }
-            (run.result.clone(), run.control.is_cancelled())
+            (
+                run.result.clone(),
+                run.control.is_cancelled(),
+                retained_service,
+            )
         };
         let local_checkpoint = match &outcome {
             Some(Ok(ExecutionOutcome::Yielded(yielded))) => Some(yielded.checkpoint.clone()),
@@ -851,6 +1441,15 @@ impl Controller {
                 result: json!({"version":1,"error":"Execution was stopped before the child handoff"}),
                 resources_released: true,
             },
+            Some(Ok(ExecutionOutcome::Yielded(yielded)))
+                if yielded.retained_service.is_some() && retained_service.is_none() =>
+            {
+                ReportOutcome::Finished {
+                    success: false,
+                    result: json!({"version":1,"error":"The retained service stopped before the child handoff"}),
+                    resources_released: true,
+                }
+            }
             Some(Ok(ExecutionOutcome::Yielded(yielded))) => ReportOutcome::YieldToChild {
                 checkpoint: yielded.checkpoint,
                 child_environment_id: yielded.child.environment_id,
@@ -859,8 +1458,11 @@ impl Controller {
                 resources_released: true,
             },
             Some(Ok(ExecutionOutcome::Completed(summary))) => ReportOutcome::Finished {
-                success: summary.status() == crate::session::SessionStatus::Completed,
-                result: json!({"version":1,"summary":summary,"text":snapshot.result_text,"truncated":snapshot.result_truncated}),
+                success: !cancelled && summary.status() == crate::session::SessionStatus::Completed,
+                result: json!({"version":1,"summary":summary,"text":snapshot.result_text,"truncated":snapshot.result_truncated,
+                    "stopped_before_acknowledgement":cancelled,
+                    "retained_service":retained_service.map(|service| json!({"service_id":service.service_id.to_string(),
+                        "expires_at_ms":service.expires_at_ms}))}),
                 resources_released: true,
             },
             Some(Err(error)) => ReportOutcome::Finished {
@@ -871,10 +1473,104 @@ impl Controller {
         };
         let report = Report::for_assignment(&entry.assignment, "outcome", outcome);
         self.journal
-            .outcome_with_checkpoint(entry, report, local_checkpoint)
+            .outcome_with_retention(entry, report, local_checkpoint, retained_service)
     }
 
     async fn flush_report(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
+        if let Some(service) = entry.retained_service {
+            let shells = self.host.inner.process.managed_shells();
+            if !entry.retention_reported
+                && !entry.service_stopped_ack
+                && entry.report.as_ref().is_some_and(|report| {
+                    matches!(
+                        report.outcome,
+                        ReportOutcome::YieldToChild { .. }
+                            | ReportOutcome::Finished { success: true, .. }
+                    )
+                })
+            {
+                let id = service.service_id.to_string();
+                let retain = Report::for_assignment(
+                    &entry.assignment,
+                    &format!("retain_service:{id}"),
+                    ReportOutcome::RetainService {
+                        service_id: id,
+                        expires_at_ms: service.expires_at_ms,
+                    },
+                );
+                match self.client.report(&retain).await {
+                    Ok(_) => self.journal.retention_reported(entry)?,
+                    Err(TransportError::Rejected(_)) => {
+                        shells.cancel_retained_service(service.service_id);
+                        self.journal.fail_retained_handoff(
+                            entry,
+                            "Hub rejected the finite service lease before the turn completed",
+                        )?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if entry.report.as_ref().is_some_and(|report| {
+                matches!(
+                    report.outcome,
+                    ReportOutcome::YieldToChild { .. }
+                        | ReportOutcome::Finished { success: true, .. }
+                )
+            }) && !shells.retained_service_live(service)
+            {
+                shells.cancel_retained_service(service.service_id);
+                if data::report_frozen(&self.host, entry)? {
+                    // The exact success/yield report may already be accepted despite a
+                    // lost acknowledgement. Keep its payload and event ID immutable,
+                    // and let the stopped service's separate lease receipt drain first.
+                    if !entry.service_stopped_ack {
+                        return Ok(());
+                    }
+                } else {
+                    self.journal.fail_retained_handoff(
+                        entry,
+                        "The retained service stopped before the turn completed",
+                    )?;
+                    return Ok(());
+                }
+            }
+            if entry.report.as_ref().is_some_and(|report| {
+                matches!(
+                    report.outcome,
+                    ReportOutcome::Finished { success: false, .. }
+                )
+            }) && !entry.service_stopped_ack
+            {
+                // An accepted lease is reconciled with Hub before the root reports
+                // completion. A rejected lease must still drain locally first.
+                if entry.retention_reported {
+                    return Ok(());
+                }
+                if entry.service_reconciliation.is_some() {
+                    self.journal.service_stopped(entry)?;
+                } else {
+                    let drained = {
+                        let mut state = self
+                            .host
+                            .inner
+                            .state
+                            .lock()
+                            .map_err(|_| RunnerError::new("Runner unavailable"))?;
+                        let run = state.runs.get_mut(&entry.run_id).ok_or_else(|| {
+                            RunnerError::new("Retained service lost its exact local run receipt")
+                        })?;
+                        run.process_lifetime.cancel();
+                        run.observe_process_completion(&shells);
+                        run.processes_drained
+                    };
+                    if !drained {
+                        return Ok(());
+                    }
+                    self.journal.service_stopped(entry)?;
+                }
+            }
+        }
         if entry.external.is_none() {
             data::persist(&self.client, &self.host, entry).await?;
         }
@@ -909,6 +1605,13 @@ impl Controller {
                     Err(_) => false,
                 };
                 if !already_released {
+                    if let Some(service) = entry.retained_service {
+                        self.host
+                            .inner
+                            .process
+                            .managed_shells()
+                            .cancel_retained_service(service.service_id);
+                    }
                     let fallback = Report::for_assignment(
                         &entry.assignment,
                         "yield_rejected",

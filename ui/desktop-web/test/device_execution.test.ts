@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ActionContext } from "../src/actions.ts";
-import { deviceExecutionAction, deviceExecutionActionEnabled, refreshDeviceExecution, renderDeviceExecution, type DeviceExecutionProjection } from "../src/device_execution.ts";
+import { bindProjectFolder, deviceExecutionAction, deviceExecutionActionEnabled, projectFolderBindingEnabled, refreshDeviceExecution, renderDeviceExecution, type DeviceExecutionProjection } from "../src/device_execution.ts";
 import { acceptDeviceNetworkProjection, editDeviceNetworkField } from "../src/device_network_state.ts";
 import { deviceProjection, deviceUiFixture } from "./device_network_fixture.ts";
 
@@ -60,7 +60,7 @@ async function withInvoke(invoke: (name: string, args: Record<string, unknown>) 
 test("execution setup sends one native review and enables only that review with its displayed access", async () => {
   const { local, context } = fixture(), calls: Record<string, unknown>[] = [];
   const review = { id: "review-a", directory: "C:/Approved", access_mode: "default" as const };
-  assert.match(renderDeviceExecution(local), /初回の実行設定|保存先フォルダーを選ぶ/);
+  assert.match(renderDeviceExecution(local), /フォルダーの作成先を選ぶ/);
   assert.doesNotMatch(renderDeviceExecution(local), /Runnerを起動|ひな形をHubに公開|templateId/);
   await withInvoke(async (_name, args) => { calls.push(args); return projection({ revision: String(calls.length + 1), review }); }, async () => {
     await deviceExecutionAction(context, "prepare");
@@ -87,12 +87,42 @@ test("new execution after a connection reset requires a separate local stop and 
   assert.equal(local.executionResetConfirmed,false);
 });
 
-test("changing execution defaults describes future projects and missing capabilities do not invent Resume", () => {
+test("execution settings point to per-project folders and missing capabilities do not invent Resume", () => {
   const { local } = fixture(projection({ state: "ready", directory: "C:/Approved", access_mode: "default" }));
   const html = renderDeviceExecution(local);
-  assert.match(html, /今後追加されるプロジェクト/);
-  assert.match(html, /作成済みの作業フォルダーと実行権限は変更しません/);
+  assert.match(html, /この後プロジェクトごとに選びます/);
+  assert.doesNotMatch(html, /今後追加されるプロジェクト/);
   assert.doesNotMatch(html, /data-action="device-execution-resume"|data-action="device-execution-pause"/);
+});
+
+test("first-use folder selection follows PC consent and does not open an unusable native picker", async () => {
+  const project = { id: "project-a", label: "TODOアプリ", can_control: true, can_execute: true,
+    environment_id: "environment-a", directory: null, preparation_state: "failed" as const, error: "実行設定がありません" };
+  const { local, context } = fixture(projection({ projects: [project] }));
+  const before = renderDeviceExecution(local);
+  assert.ok(before.indexOf("1. このPCの実行許可") < before.indexOf("2. プロジェクトの作業フォルダー"));
+  assert.match(before, /実行許可」を保存すると選べます/);
+  assert.doesNotMatch(before, /実行設定がありません/);
+  assert.match(before, /data-action="bind-project-folder" data-value="project-a" disabled/);
+  assert.equal(projectFolderBindingEnabled(local, "project-a"), false);
+  let calls = 0;
+  await withInvoke(async () => { calls++; throw new Error("no picker before consent"); }, async () => {
+    await bindProjectFolder(context, "project-a");
+  });
+  assert.equal(calls, 0);
+  local.execution = projection({ state: "ready", directory: "C:/CreatedFolders", projects: [project] });
+  assert.equal(projectFolderBindingEnabled(local, "project-a"), true);
+  const after = renderDeviceExecution(local);
+  assert.match(after, /フォルダーの作成先: C:\/CreatedFolders/);
+  assert.match(after, /実行設定がありません/); // Once consented, preserve an actual preparation failure.
+  assert.equal(projectFolderBindingEnabled(local, "another-project"), false);
+  local.execution.state = "starting";
+  assert.equal(projectFolderBindingEnabled(local, "project-a"), false);
+  local.execution.state = "unconnected";
+  assert.equal(projectFolderBindingEnabled(local, "project-a"), false);
+  const disconnected = renderDeviceExecution(local);
+  assert.match(disconnected, /先に上の「Hubへの接続」/);
+  assert.match(disconnected, /data-action="device-execution-prepare" disabled/);
 });
 
 test("execution controls follow capabilities even while a running task temporarily occupies the PC", () => {

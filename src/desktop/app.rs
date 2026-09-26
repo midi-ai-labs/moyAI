@@ -726,6 +726,7 @@ impl RuntimeMessage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionLoadReason {
     UserSelection,
+    CreatedEditFork,
     RunningRejoin,
 }
 
@@ -748,6 +749,7 @@ struct LoadedSession {
 
 struct SessionNavigationLoadResult {
     workspace: Option<WorkspaceLoadResult>,
+    snapshot: Option<DesktopSnapshot>,
     loaded: LoadedSession,
 }
 
@@ -1952,6 +1954,7 @@ mod command_projection_owner_tests {
             SessionLoadReason::UserSelection,
             Ok(SessionNavigationLoadResult {
                 workspace: None,
+                snapshot: None,
                 loaded: stale_loaded,
             }),
         );
@@ -7340,6 +7343,7 @@ mod command_projection_owner_tests {
                 SessionLoadReason::UserSelection,
                 Ok(SessionNavigationLoadResult {
                     workspace: None,
+                    snapshot: None,
                     loaded,
                 }),
             );
@@ -7360,6 +7364,100 @@ mod command_projection_owner_tests {
             let projection = controller.next_web_state().expect("rehydrated projection");
             assert_eq!(projection.status_message, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn created_edit_fork_refreshes_same_workspace_sidebar_and_selects_exact_session() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let create = |title: &str| NewSession {
+            project_id: controller.app.workspace.project_id,
+            title: title.to_string(),
+            cwd: root.clone(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: controller.app.config.permissions.access_mode,
+            provider_connection: None,
+        };
+        let original = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(create("Original"))
+            .await
+            .expect("original session");
+        let old_snapshot = load_snapshot_for_selection(&controller.app, Some(original.id))
+            .await
+            .expect("old sidebar snapshot");
+        controller.state.replace_snapshot(old_snapshot);
+        controller.state.app_state.current_session_id = Some(original.id);
+
+        let fork = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(create("Original (edit)"))
+            .await
+            .expect("new fork session");
+        assert!(
+            !controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == fork.id)
+        );
+
+        let result = load_session_navigation_result(
+            controller.app.clone(),
+            fork.id,
+            SessionLoadReason::CreatedEditFork,
+        )
+        .await
+        .expect("fork navigation result");
+        assert!(result.workspace.is_none());
+        assert!(result.snapshot.is_some());
+        let request_id = controller.state.begin_session_load(fork.id);
+        let target = SessionLoadRequestTarget {
+            workspace_root: controller.app.workspace.root.clone(),
+            workspace_cwd: controller.app.workspace.cwd.clone(),
+            project_id: controller.app.workspace.project_id,
+            session_id: fork.id,
+        };
+        controller.apply_session_loaded_message(
+            request_id,
+            target,
+            SessionLoadReason::CreatedEditFork,
+            Ok(result),
+        );
+
+        assert_eq!(controller.state.app_state.current_session_id, Some(fork.id));
+        assert_eq!(controller.state.selected_session_id(), Some(fork.id));
+        assert!(
+            controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == original.id)
+        );
+        assert!(
+            controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == fork.id)
+        );
+        assert_eq!(
+            controller
+                .state
+                .open_session
+                .as_ref()
+                .map(|open| open.session_id()),
+            Some(fork.id)
+        );
     }
 
     #[tokio::test]
@@ -11597,6 +11695,20 @@ impl DesktopController {
         true
     }
 
+    /// The edit-fork command has just created this exact durable session, so it is
+    /// not yet present in the current sidebar snapshot for indexed selection.
+    pub(crate) fn open_created_edit_fork(&mut self, session_id: SessionId) -> bool {
+        if !self.ensure_navigation_admission("edited session") {
+            return false;
+        }
+        self.invalidate_session_target_requests();
+        self.state
+            .set_status_message(format!("opening edited session {session_id}..."));
+        let request_id = self.state.begin_session_load(session_id);
+        self.spawn_session_load(session_id, SessionLoadReason::CreatedEditFork, request_id);
+        true
+    }
+
     pub(crate) fn select_project_and_open(&mut self, index: usize) -> bool {
         if !self.ensure_navigation_admission("project") {
             return false;
@@ -15360,6 +15472,17 @@ impl DesktopController {
                 {
                     return;
                 }
+                if let Some(snapshot) = result.snapshot
+                    && !self
+                        .state
+                        .replace_snapshot_selecting_session(snapshot, session_id)
+                {
+                    self.state.set_status_message(format!(
+                        "edited session {} is missing from the project list",
+                        session_id
+                    ));
+                    return;
+                }
                 let loaded = result.loaded;
                 let loaded_status = loaded.read.session.status;
                 self.state.load_open_session(&loaded.read);
@@ -15377,7 +15500,7 @@ impl DesktopController {
                         SessionLoadReason::RunningRejoin => {
                             format!("rejoined running session {}", session_id)
                         }
-                        SessionLoadReason::UserSelection => {
+                        SessionLoadReason::UserSelection | SessionLoadReason::CreatedEditFork => {
                             format!("opened session {}", session_id)
                         }
                     });
@@ -16848,7 +16971,7 @@ async fn load_session_navigation_result(
     };
 
     let loaded = match reason {
-        SessionLoadReason::UserSelection => {
+        SessionLoadReason::UserSelection | SessionLoadReason::CreatedEditFork => {
             let detail = load_session_detail(&aligned_app, session_id)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -16885,6 +17008,15 @@ async fn load_session_navigation_result(
         }
     };
 
+    let snapshot = if !workspace_changed && reason == SessionLoadReason::CreatedEditFork {
+        Some(
+            load_snapshot_for_selection(&aligned_app, Some(session_id))
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let workspace = if workspace_changed {
         let snapshot = load_snapshot_for_selection(&aligned_app, Some(session_id))
             .await
@@ -16896,7 +17028,11 @@ async fn load_session_navigation_result(
     } else {
         None
     };
-    Ok(SessionNavigationLoadResult { workspace, loaded })
+    Ok(SessionNavigationLoadResult {
+        workspace,
+        snapshot,
+        loaded,
+    })
 }
 
 async fn load_stopped_session_operation_projection(

@@ -4,9 +4,32 @@ import { action, byId, trustedClick, wait } from "./hub_browser_enrollment.mjs";
 export const hubProjectReady = value => value?.hub_project_open === true && value.overlay === "none" && !value.busy;
 
 export function sharedActionTarget(kind, value = "") {
-  const scope = kind === "detail" ? ".sidebar" : ".shared-work";
+  if (kind === "submit" || kind === "continue") {
+    return { selector: '.shared-work button[data-action="send"]', identity: { tag: "BUTTON", action: "send" } };
+  }
+  const scope = ".shared-work";
   return value ? { selector: `${scope} button[data-action="shared-${kind}"][data-value=${JSON.stringify(value)}]`, identity: { tag: "BUTTON", action: `shared-${kind}` } }
     : action(`shared-${kind}`, scope);
+}
+
+/** Open a Hub job through its conversation, then the exact work row if needed. */
+export async function openSharedJob(input, cdp, sink, jobId) {
+  let view = await invokeDesktopCommand(cdp, "shared_work_projection");
+  if (view.selected_job_id === jobId) return view;
+  const job = view.status?.jobs.find(row => row.id === jobId);
+  const conversationId = job?.conversation_id ?? view.conversations?.find(row => row.latest_job_id === jobId || row.id === jobId)?.id;
+  if (conversationId && view.selected_conversation_id !== conversationId) {
+    await trustedClick(input, cdp, { selector: `.sidebar button[data-action="shared-select-conversation"][data-value=${JSON.stringify(conversationId)}]`,
+      identity: { tag: "BUTTON", action: "shared-select-conversation" } }, sink);
+    view = await wait("Hub opens the job's shared conversation", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+      p => p.selected_conversation_id === conversationId);
+  }
+  if (view.selected_job_id !== jobId) {
+    await trustedClick(input, cdp, sharedActionTarget("detail", jobId), sink);
+    view = await wait("Hub selects the exact work in its conversation", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+      p => p.selected_job_id === jobId);
+  }
+  return view;
 }
 
 export async function openHubProjectSurface(input, cdp, sink) {
@@ -61,7 +84,7 @@ export async function observeSharedWorkSurface(cdp) {
     const visible = element => Boolean(element?.isConnected && element.getClientRects().length
       && getComputedStyle(element).display !== 'none' && getComputedStyle(element).visibility !== 'hidden'
       && !element.closest('[hidden],[inert],[aria-hidden="true"]'));
-    const roots = [...document.querySelectorAll('main.shared-work')].filter(visible), root = roots[0];
+    const roots = [...document.querySelectorAll('.shared-work main.conversation')].filter(visible), root = roots[0];
     const login = root?.querySelector('#shared-username');
     return { count:roots.length, splash_visible:[...document.querySelectorAll('.splash-screen')].some(visible),
       heading:root?.querySelector('#shared-heading')?.textContent?.trim() ?? '',
@@ -74,9 +97,12 @@ export function sharedWorkSurfaceMatches(surface, shared) {
   if (surface?.count !== 1 || surface.splash_visible !== false) return false;
   if (!shared?.principal) return surface.connection_visible === true && surface.login_visible === false;
   const project = shared.projects?.find(row => row.id === shared.selected_project_id);
+  const title = shared.selected_conversation_id
+    ? shared.conversations?.find(row => row.id === shared.selected_conversation_id)?.title ?? shared.detail?.title
+    : shared.detail?.title ?? project?.label;
   return surface.login_visible === false && Boolean(shared.principal.display_name)
-    && surface.account_text.includes(shared.principal.display_name)
-    && Boolean(project) && surface.heading === project.label;
+    && Boolean(project) && surface.account_text.includes(project.label)
+    && surface.heading === title;
 }
 
 export function rememberedRestartAccepted({ desktop, shared, surface, calls }, expected) {

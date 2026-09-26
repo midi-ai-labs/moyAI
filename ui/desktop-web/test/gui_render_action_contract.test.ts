@@ -5,6 +5,7 @@ import { executionRecoveryKey, deviceNetworkPresentation } from "../src/device_n
 import { renderDeviceExecution } from "../src/device_execution.ts";
 import { sharedWorkPresentation } from "../src/shared_work_state.ts";
 import { renderSharedWork } from "../src/shared_work_render.ts";
+import { renderReceiverActivity } from "../src/receiver_activity.ts";
 import { sharedUiFixture } from "./shared_work_fixture.ts";
 
 import { ACTIONS, actionById, actionEnabledById } from "../src/actions.ts";
@@ -617,7 +618,10 @@ function representativeSurfaces(): RenderedSurface[] {
     root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: true, state_source: "last_observed", result_received: false }] };
   local.deviceNetwork = deviceNetworkPresentation(deviceUiFixture());
   local.deviceNetwork.projection!.peers[0].selected = true;
-  local.deviceNetwork.execution = { revision: "1", state: "ready", projects: [], review: { id: "review", directory: "C:/shared", access_mode: "default" }, directory: "C:/shared", access_mode: "default", accepting: true, can_pause: true, can_resume: false, error: null, unknown_attempts: [{ attempt_id: "unknown", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }] };
+  local.deviceNetwork.execution = { revision: "1", state: "ready", projects: [{ id: "project-a", label: "解析 A", can_control: false, can_execute: true,
+    environment_id: "env-a", preparation_state: "pending", error: null, directory: null, access_mode: "default", participation_generation: 7 }],
+    review: { id: "review", directory: "C:/shared", access_mode: "default" }, directory: "C:/shared", access_mode: "default", accepting: true,
+    can_pause: true, can_resume: false, error: null, unknown_attempts: [{ attempt_id: "unknown", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }] };
   local.deviceNetwork.executionRecoveryTarget = executionRecoveryKey(local.deviceNetwork.execution.unknown_attempts[0]);
   local.deviceNetwork.jobs.outgoing[0].state = "completed";
   local.deviceNetwork.jobs.outgoing[0].can_stop = false;
@@ -641,8 +645,33 @@ function representativeSurfaces(): RenderedSurface[] {
       job_id: "job-b", profile_id: "profile-b", session_id: "session-b", requester_label: "WinA", target_label: "Temp",
     } } }) },
   ];
+  surfaces.push({ name: "stopped-local-message-edit", html: renderThreadContent(representativeState({
+    task_activity_state: "idle", pending_turn_inputs: [], confirmation_visible: false, can_cancel_run: false, stop_target: null,
+  }), local) });
+  const originLocal = {
+    ...local,
+    deviceNetwork: {
+      ...local.deviceNetwork,
+      originOwner: JSON.stringify(["C:/workspace", SESSION_IDLE, "2", local.deviceNetwork.projection!.hub_url, local.deviceNetwork.projection!.device_id]),
+      originWork: {
+        origin_session_ref: SESSION_IDLE,
+        jobs: [],
+        retained_services: [{ project_id: "project-a", service: {
+          service_id: "service-a", conversation_id: "conversation-a", environment_id: "environment-a",
+          expires_at_ms: Date.now() + 60_000, stop_requested: false, uncertain: false, can_stop: true,
+        } }],
+        observed_at_ms: Date.now(),
+        admission_revision: "7",
+      },
+    },
+  };
+  surfaces.push({ name: "ordinary-chat-origin-app", html: renderDesktopMarkup(
+    createDesktopRenderModel(base, originLocal), { backgroundInert: false, taskActivityDelay: "0ms" },
+  ) });
   surfaces.push({ name: "device-execution-ready", html: renderDeviceExecution(local.deviceNetwork) });
   surfaces.push({ name: "device-execution-paused", html: renderDeviceExecution({ ...local.deviceNetwork, execution: { ...local.deviceNetwork.execution, state: "paused", accepting: false, can_pause: false, can_resume: true, autostart: true } }) });
+  surfaces.push({ name: "device-execution-leave-confirmation", html: renderDeviceExecution({ ...local.deviceNetwork,
+    executionLeaveConfirmation: { projectId: "project-a", participationGeneration: 7 } }) });
 
   for (const overlay of [
     "provider",
@@ -876,18 +905,51 @@ function representativeSurfaces(): RenderedSurface[] {
   });
 
   const shared = sharedUiFixture();
+  shared.projection!.conversations = [{ id: "job-a", title: "試験の会話", latest_job_id: "job-a", updated_at_ms: 2,
+    revision: 1, delete_pending: false, can_rename: true, can_delete: true }];
+  shared.projection!.selected_conversation_id = "job-a";
+  shared.editingConversationId = "job-a";
+  shared.renameDraft = "新しい会話名";
   shared.projection!.principal!.administrator = true;
   shared.projection!.approval = { id: "approval-a", attempt_id: "attempt-a", request: { access: "shell", summary: "実行の確認", details: [], targets: [], outside_workspace: false, risks: [] }, status: "pending", decision: null, can_decide: true, expires_at_ms: 9999999999999 };
   shared.projection!.submission_uncertain = true;
   const asset = { id: "asset-a", project_id: "project-a", job_id: "job-a", kind: "artifact", name: "result.txt", sha256: "a".repeat(64), byte_length: 4, created_at_ms: 1, version: 1, base_sha256: null, purged_at_ms: null };
   shared.projection!.inputs = [asset]; shared.projection!.assets = [asset];
   shared.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a", title: "終了した仕事", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: true };
+  shared.projection!.conversation_history = { project_id: "project-a", conversation_id: "job-a", snapshot: 1, next_before: 1,
+    jobs: [{ job: { ...shared.projection!.status!.jobs[0], conversation_id: "job-a" }, input: { prompt: "前の依頼" }, result: { text: "完了" }, artifacts: [], more_artifacts: false }] };
+  shared.projection!.detail.retained_services = [{ service_id: "service-a", environment_id: "env-a", expires_at_ms: 9_999_999_999_999, stop_requested: false, uncertain: false, can_stop: true }];
   shared.projection!.handover = { candidates: [{ user_id: "user-b", display_name: "次の担当" }], pending: null, can_handover: true };
   shared.projection!.inbox = { items: [{ id: "finished:job-a", project_id: "project-a", job_id: "job-a", kind: "finished", title: "完了", created_at_ms: 1, read_at_ms: null, can_act: true, approval_id: null }], unread_count: 1, next_before: "older" };
   shared.projection!.transcript = { items: [], next_after: 100 };
   surfaces.push({ name: "shared-work-authenticated", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.submission_uncertain = false;
+  surfaces.push({ name: "shared-work-stop-all", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.submission_uncertain = true;
+  const receiver = deviceUiFixture();
+  receiver.receiverActivity = { runner_id: "01K5RSWRDNYVZ5QNS5FD6C0FTM", observed_at_ms: 1, unavailable: false,
+    attempts: [{ attempt_id: "attempt-a", generation: "3", job_id: "job-a", project_id: "project-a", environment_id: "env-a", run_id: "01K5RSWRDNYVZ5QNS5FD6C0FTK", state: "executing", local_state: "running" }],
+    retained_services: [{ service_id: "service-a", attempt_id: "attempt-a", generation: "3", project_id: "project-a", conversation_id: "job-a", environment_id: "env-a", expires_at_ms: 9_999_999_999_999, local_state: "running", uncertain: false }] };
+  surfaces.push({ name: "receiver-activity", html: renderReceiverActivity(deviceNetworkPresentation(receiver), sharedWorkPresentation(shared)) });
   shared.projection!.status!.next_before = "older";
   surfaces.push({ name: "shared-work-sidebar", html: renderSidebar({ ...base, hub_project_open: true }, sharedWorkPresentation(shared)) });
+  surfaces.push({ name: "shared-work-sidebar-legacy-list", html: renderSidebar({ ...base, hub_project_open: true },
+    sharedWorkPresentation({ ...shared, projection: { ...shared.projection!, conversations: undefined } })) });
+  shared.confirmation = { kind: "delete_conversation", projectId: "project-a", conversationId: "job-a", generation: "1", title: "試験の会話" };
+  surfaces.push({ name: "shared-work-delete-confirmation", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.confirmation = null;
+  shared.projection!.detail!.can_revise = true;
+  shared.projection!.detail!.state = "cancelled";
+  shared.projection!.conversation_history!.jobs[0].job.can_cancel = false;
+  shared.projection!.conversation_history!.jobs[0].job.state = "cancelled";
+  surfaces.push({ name: "shared-work-revise-available", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.editingJobId = "job-a";
+  shared.editingJobRevision = 7;
+  shared.revisionDraft = "再送する依頼";
+  surfaces.push({ name: "shared-work-revise-editor", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.editingJobId = null;
+  shared.editingJobRevision = null;
+  shared.revisionDraft = "";
   shared.projection!.detail = null;
   shared.projection!.selected_job_id = null;
   shared.projection!.submission_uncertain = false;
@@ -1032,6 +1094,27 @@ test("Hub-managed session settings retain the local context budget without anoth
     assert.match(html, new RegExp(`data-session-setting="${field}"[^>]*disabled`));
   }
   assert.match(html, /AIの接続を開く/);
+});
+
+test("received work locks local Send while preserving the draft, then unlocks after Runner release", () => {
+  const state = representativeState({ overlay: "none", confirmation_visible: false });
+  const local = defaultRenderLocal();
+  local.deviceNetwork = { ...local.deviceNetwork, receiverActivity: {
+    runner_id: "runner", attempts: [{ attempt_id: "attempt", generation: "7", job_id: "job", project_id: "project", environment_id: "environment", run_id: "run", state: "executing", local_state: "running" }],
+    retained_services: [], observed_at_ms: Date.now(), unavailable: false,
+  } };
+  const model = createDesktopRenderModel(state, local);
+  assert.equal(actionEnabledById("send", model), false);
+  const locked = renderDesktopMarkup(model, { backgroundInert: false, taskActivityDelay: "0ms" });
+  assert.match(locked, /data-action="send"[^>]*disabled/);
+  assert.match(locked, /このPCに受信した仕事またはアプリが残っています/);
+  assert.match(locked, /Check every control/);
+  assert.match(locked, /data-action="receiver-stop"/);
+
+  local.deviceNetwork = { ...local.deviceNetwork, receiverActivity: { ...local.deviceNetwork.receiverActivity!, attempts: [] } };
+  const released = createDesktopRenderModel(state, local);
+  assert.equal(actionEnabledById("send", released), true);
+  assert.doesNotMatch(renderComposer(state, local), /このPCに受信した仕事またはアプリが残っています/);
 });
 
 test("initial welcome offers execution separately and guided review keeps permissions visible without requiring a workspace", () => {

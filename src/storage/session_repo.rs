@@ -25,10 +25,11 @@ use crate::protocol::{
 use crate::runtime::{AgentPath, Clock, SystemClock};
 use crate::session::{
     ActiveTurnExpectation, AdmissionId, DurableTurnTerminal, NewSession, ProjectId, RunEvent,
-    SessionForkResult, SessionId, SessionModelParameters, SessionProviderConnection, SessionRecord,
-    SessionRepository, SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge,
-    SessionStatus, SessionTitleUpdate, ThreadGoal, ThreadGoalStatus, ToolCallId, ToolCallStatus,
-    validate_session_page_limit, validate_thread_goal_objective,
+    SessionEditForkResult, SessionForkResult, SessionId, SessionModelParameters,
+    SessionProviderConnection, SessionRecord, SessionRepository, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionSpawnEdge, SessionStatus, SessionTitleUpdate, ThreadGoal,
+    ThreadGoalStatus, ToolCallId, ToolCallStatus, validate_session_page_limit,
+    validate_thread_goal_objective,
 };
 
 pub const RUN_ADMISSION_LEASE_DURATION_MS: i64 = 15_000;
@@ -747,6 +748,177 @@ impl SqliteSessionRepository {
         Self { connection }
     }
 
+    /// Includes archived and child sessions because project deletion removes
+    /// their local history too. A truncated scan must never authorize deletion.
+    pub(crate) fn project_session_ids_for_origin_guard(
+        &self,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> Result<Vec<SessionId>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection
+            .prepare("SELECT id FROM sessions WHERE project_id = ?1 ORDER BY id LIMIT ?2")?;
+        let sql_limit = i64::try_from(limit.saturating_add(1))
+            .map_err(|_| StorageError::Message("project chat scan limit is invalid".into()))?;
+        let rows = statement
+            .query_map(params![project_id.to_string(), sql_limit], |row| {
+                parse_session_id_column(row, 0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() > limit {
+            return Err(StorageError::Message(
+                "project has too many chats to verify remote work before deletion".into(),
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// Capture the complete local mutation target before consulting Hub. The
+    /// checked mutation compares this exact set again inside its write
+    /// transaction, including sessions with no delegation history yet.
+    pub(crate) fn origin_history_revisions_for_session_tree(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<(SessionId, u64)>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        origin_history_revisions_for_tree_in_connection(&connection, session_id, limit)
+    }
+
+    pub(crate) fn origin_history_revisions_for_project(
+        &self,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> Result<Vec<(SessionId, u64)>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        origin_history_revisions_for_project_in_connection(&connection, project_id, limit)
+    }
+
+    /// Accepted Hub job identities recorded by this chat's canonical tool
+    /// results. The caller must also check durable pending submission receipts:
+    /// a failed tool result alone cannot prove an uncertain POST was rejected.
+    pub(crate) fn origin_delegated_job_ids(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<String>, StorageError> {
+        const MAX_TOOL_ROWS: usize = 32_768;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT json_extract(payload_json, '$.kind'),
+                    json_extract(payload_json, '$.call_id'),
+                    json_extract(payload_json, '$.tool_name'),
+                    json_extract(payload_json, '$.status'),
+                    json_extract(payload_json, '$.metadata')
+             FROM protocol_history_items
+             WHERE session_id = ?1
+               AND (json_extract(payload_json, '$.kind') = 'tool_output'
+                    OR (json_extract(payload_json, '$.kind') = 'tool_call'
+                        AND json_extract(payload_json, '$.tool_name') = 'team_delegate'))
+             ORDER BY rowid LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![session_id.to_string(), (MAX_TOOL_ROWS + 1) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_TOOL_ROWS {
+            return Err(StorageError::Message(
+                "chat tool history exceeds the remote-work deletion guard limit".into(),
+            ));
+        }
+        let mut delegate_calls = HashSet::new();
+        let mut outputs = HashMap::new();
+        for (kind, call_id, tool_name, status, metadata) in rows {
+            if call_id.parse::<ToolCallId>().is_err() {
+                return Err(StorageError::Message(
+                    "chat tool history contains an invalid call identity".into(),
+                ));
+            }
+            match kind.as_str() {
+                "tool_call" if tool_name.as_deref() == Some("team_delegate") => {
+                    if !delegate_calls.insert(call_id) {
+                        return Err(StorageError::Message(
+                            "chat tool history contains a repeated delegation".into(),
+                        ));
+                    }
+                }
+                "tool_output" => {
+                    if outputs.insert(call_id, (status, metadata)).is_some() {
+                        return Err(StorageError::Message(
+                            "chat tool history contains a repeated tool result".into(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut job_ids = Vec::new();
+        for call_id in delegate_calls {
+            let Some((status, metadata)) = outputs.get(&call_id) else {
+                return Err(StorageError::Message(
+                    "a remote job submission has no durable result".into(),
+                ));
+            };
+            if status.as_deref() != Some("completed") {
+                continue;
+            }
+            let metadata: serde_json::Value = metadata
+                .as_deref()
+                .ok_or_else(|| StorageError::Message("remote job result is missing".into()))
+                .and_then(|value| serde_json::from_str(value).map_err(StorageError::from))?;
+            let result_metadata = metadata.get("tool_metadata").unwrap_or(&metadata);
+            let job_id = result_metadata
+                .get("job_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| {
+                    !id.is_empty()
+                        && id.len() <= 128
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"-_:.".contains(&byte))
+                })
+                .ok_or_else(|| StorageError::Message("remote job ID is missing".into()))?;
+            job_ids.push(job_id.to_owned());
+        }
+        job_ids.sort();
+        job_ids.dedup();
+        Ok(job_ids)
+    }
+
+    pub(crate) fn session_attempted_team_delegation(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let found: i64 = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM protocol_history_items AS call
+                 WHERE call.session_id = ?1
+                   AND json_extract(call.payload_json, '$.kind') = 'tool_call'
+                   AND json_extract(call.payload_json, '$.tool_name') = 'team_delegate'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM protocol_history_items AS output
+                       WHERE output.session_id = call.session_id
+                         AND json_extract(output.payload_json, '$.kind') = 'tool_output'
+                         AND json_extract(output.payload_json, '$.call_id') = json_extract(call.payload_json, '$.call_id')
+                         AND json_extract(output.payload_json, '$.status') = 'declined'
+                   )
+            )",
+            params![session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(found != 0)
+    }
+
     #[cfg(test)]
     pub(crate) async fn insert_session_spawn_edge(
         &self,
@@ -1351,8 +1523,34 @@ impl SqliteSessionRepository {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionId>, StorageError> {
+        self.delete_session_tree_with_revisions(session_id, None)
+            .await
+    }
+
+    pub(crate) async fn delete_session_tree_checked(
+        &self,
+        session_id: SessionId,
+        expected_revisions: &[(SessionId, u64)],
+    ) -> Result<Vec<SessionId>, StorageError> {
+        self.delete_session_tree_with_revisions(session_id, Some(expected_revisions))
+            .await
+    }
+
+    async fn delete_session_tree_with_revisions(
+        &self,
+        session_id: SessionId,
+        expected_revisions: Option<&[(SessionId, u64)]>,
+    ) -> Result<Vec<SessionId>, StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(expected_revisions) = expected_revisions {
+            let actual = origin_history_revisions_for_tree_in_connection(
+                &transaction,
+                session_id,
+                expected_revisions.len(),
+            )?;
+            verify_origin_history_revisions(actual, expected_revisions)?;
+        }
         let session_exists = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
             params![session_id.to_string()],
@@ -1679,6 +1877,30 @@ impl SqliteSessionRepository {
         session_id: SessionId,
         num_turns: usize,
     ) -> Result<crate::session::SessionRollbackResult, StorageError> {
+        self.rollback_session_transaction_with_revisions(session_id, num_turns, None)
+            .await
+    }
+
+    pub(crate) async fn rollback_session_transaction_checked(
+        &self,
+        session_id: SessionId,
+        num_turns: usize,
+        expected_revisions: &[(SessionId, u64)],
+    ) -> Result<crate::session::SessionRollbackResult, StorageError> {
+        self.rollback_session_transaction_with_revisions(
+            session_id,
+            num_turns,
+            Some(expected_revisions),
+        )
+        .await
+    }
+
+    async fn rollback_session_transaction_with_revisions(
+        &self,
+        session_id: SessionId,
+        num_turns: usize,
+        expected_revisions: Option<&[(SessionId, u64)]>,
+    ) -> Result<crate::session::SessionRollbackResult, StorageError> {
         if num_turns == 0 {
             return Err(StorageError::Message(
                 "session rollback turn count must be greater than zero".to_string(),
@@ -1687,6 +1909,15 @@ impl SqliteSessionRepository {
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(expected_revisions) = expected_revisions {
+            let actual = origin_history_revisions_for_tree_in_connection(
+                &transaction,
+                session_id,
+                expected_revisions.len(),
+            )?;
+            verify_origin_history_revisions(actual, expected_revisions)?;
+        }
 
         session_record_from_connection(&transaction, session_id)?;
         let root_session_id = transaction
@@ -1907,6 +2138,166 @@ impl SqliteSessionRepository {
             copied_history_items,
             copied_turn_items,
             interrupted_live_snapshot: source_was_active,
+        })
+    }
+
+    pub(crate) async fn fork_latest_turn_for_edit_checked(
+        &self,
+        source_session_id: SessionId,
+        expected_turn_id: TurnId,
+        expected_admission_revision: u64,
+        expected_revisions: &[(SessionId, u64)],
+    ) -> Result<SessionEditForkResult, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual = origin_history_revisions_for_tree_in_connection(
+            &transaction,
+            source_session_id,
+            expected_revisions.len(),
+        )?;
+        verify_origin_history_revisions(actual, expected_revisions)?;
+        let source = session_record_from_connection(&transaction, source_session_id)?;
+        let current_revision =
+            session_admission_revision_in_connection(&transaction, source_session_id)?;
+        let latest_turn_id =
+            latest_protocol_turn_ids_in_transaction(&transaction, source_session_id, 1)?
+                .into_iter()
+                .next();
+        if current_revision != expected_admission_revision
+            || latest_turn_id != Some(expected_turn_id)
+        {
+            return Err(StorageError::Message(
+                "the latest message changed; refresh this chat before editing".into(),
+            ));
+        }
+        let terminal =
+            terminal_for_turn_in_connection(&transaction, source_session_id, expected_turn_id)?;
+        let terminal_matches_status = match (source.status, terminal.map(|item| item.outcome)) {
+            (SessionStatus::Completed, Some(TurnTerminalOutcome::Completed))
+            | (SessionStatus::Failed, Some(TurnTerminalOutcome::Failed { .. }))
+            | (
+                SessionStatus::Cancelled,
+                Some(TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                }),
+            ) => true,
+            _ => false,
+        };
+        if !terminal_matches_status {
+            return Err(StorageError::Message(
+                "only the latest finished or user-stopped message can be edited".into(),
+            ));
+        }
+        if active_session_for_mutation_branch(&transaction, source_session_id, true)?.is_some() {
+            return Err(StorageError::Message(
+                "stop this chat's active work before editing its message".into(),
+            ));
+        }
+        let first_turn_position: i64 = transaction
+            .query_row(
+                "SELECT MIN(append_position) FROM protocol_item_append_order
+             WHERE session_id = ?1 AND scope_kind = 'turn' AND turn_id = ?2",
+                params![source_session_id.to_string(), expected_turn_id.to_string()],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .ok_or_else(|| {
+                StorageError::Message("the latest message has no canonical turn".into())
+            })?;
+        let trailing_session_items = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM protocol_item_append_order
+             WHERE session_id = ?1 AND scope_kind = 'session' AND append_position > ?2)",
+            params![source_session_id.to_string(), first_turn_position],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if trailing_session_items {
+            return Err(StorageError::Message(
+                "this chat has later session changes that cannot be safely omitted from the edit"
+                    .into(),
+            ));
+        }
+        let mut statement = transaction.prepare(
+            "SELECT payload_json FROM protocol_history_items
+             WHERE session_id = ?1 AND turn_id = ?2
+               AND json_extract(payload_json, '$.kind') IN ('user_turn', 'steer_turn')
+             ORDER BY sequence_no LIMIT 2",
+        )?;
+        let user_rows = statement
+            .query_map(
+                params![source_session_id.to_string(), expected_turn_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if user_rows.len() != 1 {
+            return Err(StorageError::Message(
+                "this turn has multiple user messages; edit them in a new request".into(),
+            ));
+        }
+        let HistoryItemPayload::UserTurn { content, .. } =
+            serde_json::from_str::<HistoryItemPayload>(&user_rows[0])?
+        else {
+            return Err(StorageError::Message(
+                "only the initial user message of the latest turn can be edited".into(),
+            ));
+        };
+        let mut text_parts = Vec::with_capacity(content.len());
+        for part in content {
+            let ContentPart::Text { text } = part else {
+                return Err(StorageError::Message(
+                    "a message with an image cannot be edited in the text composer".into(),
+                ));
+            };
+            text_parts.push(text);
+        }
+        let editable_text = text_parts.join("\n");
+        if editable_text.trim().is_empty() {
+            return Err(StorageError::Message(
+                "the latest message has no editable text".into(),
+            ));
+        }
+
+        let target_session_id = SessionId::new();
+        let now = SystemClock::now_ms();
+        let title = format!("{}（編集）", source.title);
+        transaction.execute(
+            "INSERT INTO sessions (
+                 id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                 model_parameters_json, provider_connection_json,
+                 created_at_ms, updated_at_ms, completed_at_ms
+             )
+             SELECT ?2, project_id, ?3, 'idle', cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, provider_connection_json, ?4, ?4, NULL
+             FROM sessions WHERE id = ?1",
+            params![
+                source_session_id.to_string(),
+                target_session_id.to_string(),
+                title,
+                now
+            ],
+        )?;
+        fork_canonical_items_in_transaction(&transaction, source_session_id, target_session_id)?;
+        // The existing canonical fork rewrites history identities and preserves compaction
+        // references. Remove every projection of the edited turn only in the new branch.
+        for table in [
+            "turn_steer_inputs",
+            "protocol_turn_items",
+            "protocol_history_items",
+            "protocol_runtime_events",
+            "protocol_item_append_order",
+            "protocol_turn_sequence_allocators",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1 AND turn_id = ?2"),
+                params![target_session_id.to_string(), expected_turn_id.to_string()],
+            )?;
+        }
+        let forked_session = session_record_from_connection(&transaction, target_session_id)?;
+        transaction.commit()?;
+        Ok(SessionEditForkResult {
+            source_session: source,
+            forked_session,
+            edited_turn_id: expected_turn_id,
+            editable_text,
         })
     }
 
@@ -10007,6 +10398,103 @@ fn session_admission_revision_in_connection(
     })
 }
 
+fn checked_origin_revision_rows(
+    rows: Vec<(String, Option<i64>)>,
+    limit: usize,
+) -> Result<Vec<(SessionId, u64)>, StorageError> {
+    if rows.len() > limit {
+        return Err(StorageError::Message(
+            "too many chats to verify their remote work before changing history".into(),
+        ));
+    }
+    rows.into_iter()
+        .map(|(session_id, revision)| {
+            let id = parse_session_id_text(&session_id, "origin history mutation target")?;
+            let revision = revision.ok_or_else(|| {
+                StorageError::Message(format!("session {id} has no canonical admission revision"))
+            })?;
+            let revision = u64::try_from(revision).map_err(|_| {
+                StorageError::Message(format!(
+                    "session {id} has invalid admission revision {revision}"
+                ))
+            })?;
+            Ok((id, revision))
+        })
+        .collect()
+}
+
+fn origin_history_revisions_for_tree_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    limit: usize,
+) -> Result<Vec<(SessionId, u64)>, StorageError> {
+    let sql_limit = i64::try_from(limit.saturating_add(1)).map_err(|_| {
+        StorageError::Message("origin history verification limit is too large".into())
+    })?;
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE tree_root(root_session_id) AS (
+             SELECT COALESCE(
+                 (SELECT root_session_id FROM session_spawn_edges WHERE child_session_id = ?1),
+                 ?1
+             )
+         ), subtree(session_id) AS (
+             SELECT id FROM sessions WHERE id = ?1
+             UNION
+             SELECT edge.child_session_id
+             FROM session_spawn_edges AS edge
+             INNER JOIN subtree ON edge.parent_session_id = subtree.session_id
+             INNER JOIN tree_root ON edge.root_session_id = tree_root.root_session_id
+         )
+         SELECT subtree.session_id,
+                (SELECT revision FROM session_admission_revisions
+                 WHERE session_id = subtree.session_id)
+         FROM subtree ORDER BY subtree.session_id LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![session_id.to_string(), sql_limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    checked_origin_revision_rows(rows, limit)
+}
+
+fn origin_history_revisions_for_project_in_connection(
+    connection: &Connection,
+    project_id: ProjectId,
+    limit: usize,
+) -> Result<Vec<(SessionId, u64)>, StorageError> {
+    let sql_limit = i64::try_from(limit.saturating_add(1)).map_err(|_| {
+        StorageError::Message("origin history verification limit is too large".into())
+    })?;
+    let mut statement = connection.prepare(
+        "SELECT session.id,
+                (SELECT revision FROM session_admission_revisions
+                 WHERE session_id = session.id)
+         FROM sessions AS session
+         WHERE session.project_id = ?1 ORDER BY session.id LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![project_id.to_string(), sql_limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    checked_origin_revision_rows(rows, limit)
+}
+
+fn verify_origin_history_revisions(
+    actual: Vec<(SessionId, u64)>,
+    expected: &[(SessionId, u64)],
+) -> Result<(), StorageError> {
+    let mut expected = expected.to_vec();
+    expected.sort_unstable_by_key(|(session_id, _)| session_id.to_string());
+    if actual != expected {
+        return Err(StorageError::Message(
+            "chat history changed while Hub work was being checked; refresh and retry".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn exact_root_execution_validation_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
@@ -12481,6 +12969,104 @@ mod tests {
             .await
             .expect("session");
         (store, session.id)
+    }
+
+    #[tokio::test]
+    async fn origin_deletion_scan_keeps_accepted_job_ids_and_rejects_incomplete_history() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let project_id = repository
+            .get_session(session_id)
+            .await
+            .expect("session")
+            .project_id;
+        assert_eq!(
+            repository
+                .project_session_ids_for_origin_guard(project_id, 1)
+                .expect("project session IDs"),
+            vec![session_id]
+        );
+        assert!(
+            repository
+                .project_session_ids_for_origin_guard(project_id, 0)
+                .is_err()
+        );
+        assert!(
+            !repository
+                .session_attempted_team_delegation(session_id)
+                .expect("no delegation")
+        );
+        let turn_id = TurnId::new();
+        let call_id = ToolCallId::new();
+        let call = HistoryItemPayload::ToolCall {
+            call_id,
+            response_id: ModelResponseId::new(),
+            model_call_id: "call-provider".into(),
+            tool_name: "team_delegate".into(),
+            arguments_json: "{}".into(),
+        };
+        let output = HistoryItemPayload::ToolOutput {
+            call_id,
+            status: ToolLifecycleStatus::Completed,
+            title: "PCへ仕事を依頼".into(),
+            output_text: "accepted".into(),
+            metadata: serde_json::json!({"tool_metadata":{"job_id":"job-a","project_id":"project-a"},"success":true}),
+            success: Some(true),
+        };
+        {
+            let connection = repository.connection.lock().expect("connection");
+            for (index, payload) in [call, output].into_iter().enumerate() {
+                let json = serde_json::to_string(&payload).expect("payload");
+                let sha = format!("{:x}", Sha256::digest(json.as_bytes()));
+                connection
+                    .execute(
+                        "INSERT INTO protocol_history_items
+                         (id,session_id,scope_kind,turn_id,sequence_no,payload_json,payload_sha256,created_at_ms)
+                         VALUES (?1,?2,'turn',?3,?4,?5,?6,1)",
+                        params![
+                            ulid::Ulid::new().to_string(),
+                            session_id.to_string(),
+                            turn_id.to_string(),
+                            index as i64,
+                            json,
+                            sha
+                        ],
+                    )
+                    .expect("canonical row");
+            }
+        }
+        assert!(
+            repository
+                .session_attempted_team_delegation(session_id)
+                .expect("delegation evidence")
+        );
+        assert_eq!(
+            repository
+                .origin_delegated_job_ids(session_id)
+                .expect("accepted job IDs"),
+            vec!["job-a".to_string()]
+        );
+        let missing_id = HistoryItemPayload::ToolOutput {
+            call_id,
+            status: ToolLifecycleStatus::Completed,
+            title: "bad result".into(),
+            output_text: "accepted".into(),
+            metadata: serde_json::json!({"tool_metadata":{},"success":true}),
+            success: Some(true),
+        };
+        let replacement = serde_json::to_string(&missing_id).expect("replacement");
+        let replacement_sha = format!("{:x}", Sha256::digest(replacement.as_bytes()));
+        repository
+            .connection
+            .lock()
+            .expect("connection")
+            .execute(
+                "UPDATE protocol_history_items SET payload_json = ?1, payload_sha256 = ?2
+                 WHERE session_id = ?3 AND sequence_no = 1",
+                params![replacement, replacement_sha, session_id.to_string()],
+            )
+            .expect("replace result");
+        assert!(repository.origin_delegated_job_ids(session_id).is_err());
     }
 
     async fn create_sibling_session(
@@ -24436,6 +25022,231 @@ mod tests {
             .expect_err("fork must fail closed without an active turn");
 
         assert!(error.to_string().contains("durable run admission"));
+    }
+
+    #[tokio::test]
+    async fn edit_fork_keeps_stopped_turn_only_in_source_and_checks_exact_idle_target() {
+        let (store, source_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (first_admission, first_turn) = active_turn(&store, source_session_id).await;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    source_session_id,
+                    first_admission,
+                    &completed_terminal(source_session_id),
+                    first_turn,
+                    None,
+                    None,
+                )
+                .await
+                .expect("first terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        let (stopped_admission, stopped_turn) = active_turn(&store, source_session_id).await;
+        record_text_response(
+            &store,
+            source_session_id,
+            stopped_admission,
+            stopped_turn,
+            "answer from the stopped turn",
+        )
+        .await;
+        let stop = RunEvent::TurnTerminal {
+            session_id: source_session_id,
+            terminal: Box::new(DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        };
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    source_session_id,
+                    stopped_admission,
+                    &stop,
+                    stopped_turn,
+                    None,
+                    None,
+                )
+                .await
+                .expect("stop terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        let expected_revision = repository
+            .active_turn_expectation_for_session(source_session_id)
+            .await
+            .expect("idle state")
+            .expect("source exists")
+            .revision();
+        let expected_revisions = repository
+            .origin_history_revisions_for_session_tree(source_session_id, 1)
+            .expect("history revision");
+        assert!(
+            repository
+                .fork_latest_turn_for_edit_checked(
+                    source_session_id,
+                    first_turn,
+                    expected_revision,
+                    &expected_revisions,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .fork_latest_turn_for_edit_checked(
+                    source_session_id,
+                    stopped_turn,
+                    expected_revision + 1,
+                    &expected_revisions,
+                )
+                .await
+                .is_err()
+        );
+
+        let fork = repository
+            .fork_latest_turn_for_edit_checked(
+                source_session_id,
+                stopped_turn,
+                expected_revision,
+                &expected_revisions,
+            )
+            .await
+            .expect("exact edit fork");
+        assert_eq!(fork.edited_turn_id, stopped_turn);
+        assert_eq!(fork.editable_text, "canonical request");
+        assert_eq!(fork.forked_session.status, SessionStatus::Idle);
+        assert_eq!(
+            fork.forked_session.project_id,
+            fork.source_session.project_id
+        );
+        assert_eq!(fork.forked_session.cwd, fork.source_session.cwd);
+        assert_eq!(fork.forked_session.model, fork.source_session.model);
+        assert_eq!(fork.forked_session.base_url, fork.source_session.base_url);
+        assert_eq!(
+            fork.forked_session.access_mode,
+            fork.source_session.access_mode
+        );
+        assert_eq!(
+            fork.forked_session.provider_connection,
+            fork.source_session.provider_connection
+        );
+
+        let source_history = store
+            .protocol_event_store()
+            .list_history_items_for_session(source_session_id)
+            .expect("source history");
+        let branch_history = store
+            .protocol_event_store()
+            .list_history_items_for_session(fork.forked_session.id)
+            .expect("branch history");
+        assert!(
+            source_history
+                .iter()
+                .any(|item| item.turn_id() == Some(stopped_turn))
+        );
+        assert!(
+            branch_history
+                .iter()
+                .any(|item| item.turn_id() == Some(first_turn))
+        );
+        assert!(
+            !branch_history
+                .iter()
+                .any(|item| item.turn_id() == Some(stopped_turn))
+        );
+        for (table, count) in
+            protocol_turn_table_counts(&store, fork.forked_session.id, stopped_turn)
+        {
+            assert_eq!(
+                count, 0,
+                "{table} leaked a stopped-turn projection into the branch"
+            );
+        }
+        assert!(
+            repository
+                .durable_terminal_for_turn(source_session_id, stopped_turn)
+                .await
+                .expect("source terminal")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_fork_accepts_finished_turn_with_settled_agent_history_without_copying_authority()
+    {
+        let (store, source_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission, turn_id) = active_turn(&store, source_session_id).await;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    source_session_id,
+                    admission,
+                    &completed_terminal(source_session_id),
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("completed turn"),
+            AdmittedTerminalCommit::Applied
+        );
+        let child = create_sibling_session(&store, source_session_id, "past_child").await;
+        repository
+            .insert_session_spawn_edge(
+                source_session_id,
+                source_session_id,
+                child.id,
+                "/root/past_child",
+                "past_child",
+            )
+            .await
+            .expect("past agent edge");
+        let expected_revision = repository
+            .active_turn_expectation_for_session(source_session_id)
+            .await
+            .expect("idle state")
+            .expect("source")
+            .revision();
+        let expected_revisions = repository
+            .origin_history_revisions_for_session_tree(source_session_id, 2)
+            .expect("source and child revisions");
+        let fork = repository
+            .fork_latest_turn_for_edit_checked(
+                source_session_id,
+                turn_id,
+                expected_revision,
+                &expected_revisions,
+            )
+            .await
+            .expect("finished turn edit fork");
+        let branch_history = store
+            .protocol_event_store()
+            .list_history_items_for_session(fork.forked_session.id)
+            .expect("branch history");
+        assert!(
+            !branch_history
+                .iter()
+                .any(|item| item.turn_id() == Some(turn_id))
+        );
+        let connection = repository.connection.lock().expect("sqlite mutex");
+        let branch_edges: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_spawn_edges
+                 WHERE parent_session_id = ?1 OR child_session_id = ?1",
+                params![fork.forked_session.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("branch edge count");
+        assert_eq!(branch_edges, 0, "the fork must not inherit agent authority");
     }
 
     #[tokio::test]

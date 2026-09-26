@@ -436,6 +436,7 @@ impl ReadDispatcherInner {
             &control,
             &format!("MCP {name}"),
             crate::runner::shared::external::ResourceCaller::LegacyRemote,
+            None,
         )
         .await
         .map_err(|_| PublishCallError::Unavailable)?;

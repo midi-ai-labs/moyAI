@@ -2,7 +2,7 @@
 use super::{DeviceClient, DeviceNetworkService};
 use crate::config::AccessMode;
 use crate::runner::{
-    RunnerCommand, RunnerResponse,
+    LocalRunState, RunnerCommand, RunnerResponse,
     operations::{
         OperationsStore, ReconciliationEvidence, RunnerOperation, RunnerOperationsProjection,
         desktop_consent_matches,
@@ -27,7 +27,13 @@ pub struct DeviceProject {
     pub label: String,
     pub can_control: bool,
     pub can_execute: bool,
+    #[serde(default)]
+    pub participation_generation: u64,
     pub environment_id: Option<String>,
+    #[serde(default)]
+    pub directory: Option<Utf8PathBuf>,
+    #[serde(default)]
+    pub access_mode: Option<AccessMode>,
     pub preparation_state: String,
     pub error: Option<String>,
 }
@@ -74,6 +80,62 @@ pub struct DeviceExecutionProjection {
     #[serde(default)]
     pub reset_review_required: bool,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiverAttemptProjection {
+    pub attempt_id: String,
+    /// Decimal text keeps the exact Runner generation through JavaScript.
+    pub generation: String,
+    pub job_id: String,
+    pub project_id: String,
+    pub environment_id: String,
+    pub run_id: String,
+    pub state: String,
+    pub local_state: Option<LocalRunState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiverServiceProjection {
+    pub service_id: String,
+    pub attempt_id: String,
+    /// Decimal text keeps the exact Runner generation through JavaScript.
+    pub generation: String,
+    /// Opaque identities; the UI reveals titles only from a separately authorized Hub view.
+    pub project_id: String,
+    pub conversation_id: String,
+    pub environment_id: String,
+    pub expires_at_ms: u64,
+    pub local_state: String,
+    pub uncertain: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiverActivityProjection {
+    pub runner_id: Option<String>,
+    pub attempts: Vec<ReceiverAttemptProjection>,
+    pub retained_services: Vec<ReceiverServiceProjection>,
+    pub observed_at_ms: Option<u64>,
+    /// A failed local observation does not prove that an active attempt stopped.
+    pub unavailable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiverStopTarget {
+    pub runner_id: String,
+    pub attempt_id: String,
+    pub generation: String,
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiverServiceStopTarget {
+    pub runner_id: String,
+    pub service_id: String,
+    pub attempt_id: String,
+    pub generation: String,
+}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeviceExecutionCommand {
@@ -101,6 +163,7 @@ pub(super) struct ExecutionOwner {
     started: AtomicBool,
     pub(super) lane: std::sync::Arc<tokio::sync::Mutex<()>>,
     state: Mutex<ExecutionRuntime>,
+    receiver: Mutex<ReceiverActivityProjection>,
 }
 #[derive(Default)]
 struct ExecutionRuntime {
@@ -123,8 +186,19 @@ impl ExecutionRuntime {
             self.revise(DeviceExecutionProjection::default());
         }
     }
-    fn refresh_projects(&mut self, projects: Vec<DeviceProject>, consented: bool) {
+    fn refresh_projects(&mut self, mut projects: Vec<DeviceProject>, consented: bool) {
         let mut view = self.view.clone();
+        // Local filesystem authority comes only from the installed Runner, never Hub JSON.
+        for project in &mut projects {
+            let previous = self.view.projects.iter().find(|old| {
+                consented
+                    && project.can_execute
+                    && old.id == project.id
+                    && old.environment_id == project.environment_id
+            });
+            project.directory = previous.and_then(|old| old.directory.clone());
+            project.access_mode = previous.and_then(|old| old.access_mode);
+        }
         view.projects = projects;
         if !consented {
             view.accepting = false;
@@ -234,6 +308,7 @@ impl DeviceNetworkService {
                     break;
                 }
                 if let Ok(_lane) = service.inner.execution.lane.try_lock() {
+                    service.refresh_receiver_activity().await;
                     if let Err(error) = service.refresh_execution().await {
                         service.execution_error(error);
                     }
@@ -256,6 +331,191 @@ impl DeviceNetworkService {
             value.revision = "0".into();
         }
         value
+    }
+    #[cfg(test)]
+    pub(crate) fn set_execution_projects_for_test(&self, projects: Vec<DeviceProject>) {
+        let mut state = self.inner.execution.state.lock().unwrap();
+        let mut view = state.view.clone();
+        view.projects = projects;
+        state.revise(view);
+    }
+
+    pub fn receiver_activity_projection(&self) -> ReceiverActivityProjection {
+        self.inner.execution.receiver.lock().unwrap().clone()
+    }
+
+    pub async fn stop_receiver_attempt(
+        &self,
+        target: ReceiverStopTarget,
+    ) -> Result<ReceiverActivityProjection, String> {
+        let current = self.receiver_activity_projection();
+        if current.unavailable
+            || current.runner_id.as_deref() != Some(&target.runner_id)
+            || !current.attempts.iter().any(|attempt| {
+                attempt.attempt_id == target.attempt_id
+                    && attempt.generation == target.generation
+                    && attempt.run_id == target.run_id
+                    && attempt.state == "executing"
+                    && !matches!(
+                        attempt.local_state,
+                        Some(
+                            LocalRunState::Stopping
+                                | LocalRunState::Draining
+                                | LocalRunState::Settled
+                        )
+                    )
+            })
+        {
+            return Err("停止対象の実行が変わりました。現在の状態を確認してください。".into());
+        }
+        let runner_id = target
+            .runner_id
+            .parse::<ulid::Ulid>()
+            .map_err(|_| "実行機能の識別子が不正です。".to_string())?;
+        let run_id = target
+            .run_id
+            .parse::<ulid::Ulid>()
+            .map_err(|_| "停止対象の識別子が不正です。".to_string())?;
+        let generation = target
+            .generation
+            .parse::<u64>()
+            .map_err(|_| "停止対象の世代が不正です。".to_string())?;
+        let attempt_id = target.attempt_id;
+        tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            {
+                match crate::runner::windows::request(&RunnerCommand::Operations {
+                    runner_id,
+                    operation: RunnerOperation::StopShared {
+                        attempt_id,
+                        generation,
+                        run_id,
+                    },
+                })
+                .map_err(|error| error.message)?
+                {
+                    RunnerResponse::Operations { .. } => Ok::<(), String>(()),
+                    _ => Err("実行機能からの応答が不正です。".into()),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (runner_id, run_id, generation, attempt_id);
+                Err("実行機能はWindowsで使用してください。".into())
+            }
+        })
+        .await
+        .map_err(|_| "実行機能との通信を確認できません。".to_string())??;
+        self.refresh_receiver_activity().await;
+        Ok(self.receiver_activity_projection())
+    }
+
+    pub async fn stop_receiver_service(
+        &self,
+        target: ReceiverServiceStopTarget,
+    ) -> Result<ReceiverActivityProjection, String> {
+        let current = self.receiver_activity_projection();
+        if current.unavailable
+            || current.runner_id.as_deref() != Some(&target.runner_id)
+            || !current.retained_services.iter().any(|service| {
+                service.service_id == target.service_id
+                    && service.attempt_id == target.attempt_id
+                    && service.generation == target.generation
+                    && service.local_state == "running"
+                    && !service.uncertain
+            })
+        {
+            return Err("停止対象のアプリが変わりました。現在の状態を確認してください。".into());
+        }
+        let runner_id = target
+            .runner_id
+            .parse::<ulid::Ulid>()
+            .map_err(|_| "実行機能の識別子が不正です。".to_string())?;
+        let generation = target
+            .generation
+            .parse::<u64>()
+            .map_err(|_| "停止対象の世代が不正です。".to_string())?;
+        tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            {
+                match crate::runner::windows::request(&RunnerCommand::Operations {
+                    runner_id,
+                    operation: RunnerOperation::StopRetainedService {
+                        service_id: target.service_id,
+                        attempt_id: target.attempt_id,
+                        generation,
+                    },
+                })
+                .map_err(|error| error.message)?
+                {
+                    RunnerResponse::Operations { .. } => Ok::<(), String>(()),
+                    _ => Err("実行機能からの応答が不正です。".into()),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (runner_id, generation, target);
+                Err("実行機能はWindowsで使用してください。".into())
+            }
+        })
+        .await
+        .map_err(|_| "実行機能との通信を確認できません。".to_string())??;
+        self.refresh_receiver_activity().await;
+        Ok(self.receiver_activity_projection())
+    }
+
+    async fn refresh_receiver_activity(&self) {
+        let result = tokio::task::spawn_blocking(read_local_receiver).await;
+        let mut current = self.inner.execution.receiver.lock().unwrap();
+        match result {
+            Ok(Ok((runner_id, Some(status)))) => {
+                *current = ReceiverActivityProjection {
+                    runner_id: Some(runner_id.to_string()),
+                    attempts: status
+                        .attempts
+                        .into_iter()
+                        .map(|attempt| ReceiverAttemptProjection {
+                            attempt_id: attempt.attempt_id,
+                            generation: attempt.generation.to_string(),
+                            job_id: attempt.job_id,
+                            project_id: attempt.project_id,
+                            environment_id: attempt.environment_id,
+                            run_id: attempt.run_id.to_string(),
+                            state: attempt.state,
+                            local_state: attempt.local_state,
+                        })
+                        .collect(),
+                    retained_services: status
+                        .retained_services
+                        .into_iter()
+                        .map(|service| ReceiverServiceProjection {
+                            service_id: service.service_id,
+                            attempt_id: service.attempt_id,
+                            generation: service.generation.to_string(),
+                            project_id: service.project_id,
+                            conversation_id: service.conversation_id,
+                            environment_id: service.environment_id,
+                            expires_at_ms: service.expires_at_ms,
+                            local_state: service.local_state,
+                            uncertain: service.uncertain,
+                        })
+                        .collect(),
+                    observed_at_ms: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    ),
+                    unavailable: false,
+                };
+            }
+            Ok(Ok((_runner_id, None)))
+                if current.attempts.is_empty() && current.retained_services.is_empty() =>
+            {
+                *current = ReceiverActivityProjection::default()
+            }
+            _ => current.unavailable = true,
+        }
     }
     fn execution_error(&self, message: String) {
         let mut state = self.inner.execution.state.lock().unwrap();
@@ -376,6 +636,20 @@ impl DeviceNetworkService {
             return;
         }
         let mut view = state.view.clone();
+        for project in &mut view.projects {
+            let mapping = project
+                .can_execute
+                .then_some(())
+                .and(project.environment_id.as_deref())
+                .and_then(|id| {
+                    status
+                        .environments
+                        .iter()
+                        .find(|mapping| mapping.environment_id == id)
+                });
+            project.directory = mapping.map(|mapping| mapping.directory.clone());
+            project.access_mode = mapping.map(|mapping| mapping.access_mode);
+        }
         if let Some(template) = status
             .templates
             .iter()
@@ -401,6 +675,60 @@ impl DeviceNetworkService {
             DeviceExecutionState::Ready
         };
         state.revise(view);
+    }
+    pub(super) async fn bind_project_folder(
+        &self,
+        project_id: &str,
+        environment_id: &str,
+        directory: Utf8PathBuf,
+        access_mode: AccessMode,
+        expected_directory: Option<Utf8PathBuf>,
+    ) -> Result<(), String> {
+        let _lane = self.inner.execution.lane.lock().await;
+        if !super::stable_id(project_id) || !super::stable_id(environment_id) {
+            return Err("実行するプロジェクトまたは環境を確認してください。".into());
+        }
+        let connection = self
+            .execution_connection()
+            .ok_or_else(|| "このPCのHub接続を確認してください。".to_string())?;
+        let current: DeviceProjects = connection
+            .client
+            .request("/v1/shared/device-projects", None)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !current.projects.iter().any(|project| {
+            project.id == project_id
+                && project.can_execute
+                && project.environment_id.as_deref() == Some(environment_id)
+        }) {
+            return Err(
+                "このPCの実行対象が変わりました。最新のプロジェクト設定を確認してください。".into(),
+            );
+        }
+        self.require_execution_binding(&connection.binding)?;
+        let status = ensure_status().await?;
+        self.require_execution_binding(&connection.binding)?;
+        if !status
+            .desktop_binding
+            .as_deref()
+            .is_some_and(|saved| desktop_consent_matches(saved, &connection.binding))
+        {
+            return Err("このHubでの実行許可を確認してください。".into());
+        }
+        let updated = request_operation(
+            status.runner_id,
+            RunnerOperation::BindProjectFolder {
+                project_id: project_id.to_owned(),
+                environment_id: environment_id.to_owned(),
+                directory,
+                access_mode,
+                expected_directory,
+            },
+        )
+        .await?;
+        self.require_execution_binding(&connection.binding)?;
+        self.accept_execution_status(&connection.binding, updated);
+        self.refresh_execution().await
     }
     pub async fn execution_command(
         &self,
@@ -544,6 +872,32 @@ impl DeviceNetworkService {
             }
         }
         Ok(())
+    }
+}
+
+fn read_local_receiver()
+-> Result<(ulid::Ulid, Option<crate::runner::shared::SharedProjection>), String> {
+    #[cfg(windows)]
+    {
+        let RunnerResponse::Identity { identity } =
+            crate::runner::windows::request(&RunnerCommand::Identity)
+                .map_err(|error| error.message)?
+        else {
+            return Err("実行機能からの応答が不正です。".into());
+        };
+        let RunnerResponse::SharedStatus { status } =
+            crate::runner::windows::request(&RunnerCommand::SharedStatus {
+                runner_id: identity.runner_id,
+            })
+            .map_err(|error| error.message)?
+        else {
+            return Err("実行機能からの応答が不正です。".into());
+        };
+        Ok((identity.runner_id, status))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("実行機能はWindowsで使用してください。".into())
     }
 }
 

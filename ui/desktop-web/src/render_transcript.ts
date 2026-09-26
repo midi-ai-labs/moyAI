@@ -18,6 +18,7 @@ interface TranscriptRenderOptions {
   selectedAgentPath?: string | null;
   stableLatestAssistant?: boolean;
   sideChatQuoteOwnerSessionId?: string | null;
+  editableUserHistoryId?: string | null;
 }
 
 interface AgentHistoryEvent {
@@ -84,6 +85,7 @@ export function renderTranscriptRows(
       anchor.row,
       prefixedAnchorId(prefix, anchor.id),
       options.sideChatQuoteOwnerSessionId ?? null,
+      options.editableUserHistoryId ?? null,
     ));
   });
   if (pendingAgentEvents.length > 0) {
@@ -156,6 +158,7 @@ function renderTranscriptRow(
   row: TranscriptRow,
   anchorId: string,
   sideChatQuoteOwnerSessionId: string | null,
+  editableUserHistoryId: string | null,
 ): string {
   if (row.row_kind === "file_changes") {
     return renderFileChanges(row, anchorId, sideChatQuoteOwnerSessionId);
@@ -172,6 +175,7 @@ function renderTranscriptRow(
       <div class="message-body">
         ${routineConversation ? "" : `<h2>${escapeHtml(row.title)}</h2>`}
         <div class="markdown-body">${renderMarkdown(row.body)}</div>
+        ${row.row_kind === "user" && durableIdentity === editableUserHistoryId ? `<div class="message-edit-actions"><button type="button" data-action="edit-local-message" data-value="${escapeHtml(durableIdentity)}">編集して再送</button><span>作成済みファイルや起動中のアプリは元に戻りません。</span></div>` : ""}
         ${quoteSourceKind && durableIdentity ? renderSideChatQuoteAction(durableIdentity) : ""}
       </div>
     </article>

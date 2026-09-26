@@ -79,7 +79,7 @@ impl AppBootstrap {
     ) -> Result<App, AppBootstrapError> {
         let store = process_runtime.store();
         let project = store.project_repo().get_project(session.project_id).await?;
-        let directory = crate::session::service::normalize_session_cwd_for_project(
+        let directory = crate::session::service::normalize_stored_session_cwd_for_project(
             &project.root_path,
             session.project_id,
             &project.vcs_kind,
@@ -109,21 +109,6 @@ impl AppBootstrap {
             WorkspaceRootMode::FixedToStart,
             config,
             Some(process_runtime),
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn build_with_store(
-        start_dir: &Utf8Path,
-        run_args: Option<&RunArgs>,
-        store: StoreBundle,
-    ) -> Result<App, AppBootstrapError> {
-        Self::build_with_store_with_root_mode(
-            start_dir,
-            run_args,
-            store,
-            WorkspaceRootMode::Discover,
         )
         .await
     }
@@ -279,6 +264,31 @@ impl AppBootstrap {
         } else {
             Self::create_process_runtime(store.clone()).await?
         };
+        // The store advertises the device runtime through a weak reference. Keep its
+        // process owner alive in App so ordinary CLI/TUI turns can use the same Hub
+        // authority as Desktop without creating a second device identity.
+        let device_network = if let Some(existing) = store.device_network() {
+            Some(existing)
+        } else if config.device_network.configured() {
+            let config_path = crate::config::loader::global_config_path()?;
+            let remote_jobs = crate::remote_agent::RemoteJobService::new(process_runtime.clone())
+                .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
+            let publish = crate::mcp_publish::PublishService::new(
+                config_path.with_file_name("mcp-publish.json"),
+                store.clone(),
+                config.clone(),
+            )
+            .with_remote_jobs(remote_jobs.clone());
+            Some(crate::device_network::DeviceNetworkService::new(
+                config_path.with_file_name("device-network"),
+                store.clone(),
+                config.clone(),
+                remote_jobs,
+                publish,
+            ))
+        } else {
+            None
+        };
         let session_event_hub = process_runtime.session_event_hub();
         let session_service = process_runtime.session_service();
         let agent_runtime = process_runtime.agent_runtime();
@@ -316,6 +326,7 @@ impl AppBootstrap {
             session_event_hub,
             resolved_run_session_id: None,
             process_runtime,
+            device_network,
         })
     }
 }
@@ -364,7 +375,7 @@ async fn restore_run_session_directory(
         });
     };
     let project = store.project_repo().get_project(session.project_id).await?;
-    let directory = crate::session::service::normalize_session_cwd_for_project(
+    let directory = crate::session::service::normalize_stored_session_cwd_for_project(
         &project.root_path,
         session.project_id,
         &project.vcs_kind,
@@ -449,6 +460,49 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn rebuilt_app_keeps_existing_device_runtime_alive_for_non_desktop_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let paths = StoragePaths {
+            data_dir: root.join("data"),
+            database_path: root.join("data/store.sqlite3"),
+            truncation_dir: root.join("data/output"),
+        };
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = StoreBundle::new(sqlite);
+        let process = AppBootstrap::create_process_runtime(store.clone())
+            .await
+            .unwrap();
+        let jobs = crate::remote_agent::RemoteJobService::new(process.clone()).unwrap();
+        let publish = crate::mcp_publish::PublishService::new(
+            root.join("config/publish.json"),
+            store.clone(),
+            ResolvedConfig::default(),
+        );
+        let network = crate::device_network::DeviceNetworkService::new(
+            root.join("config/device-network"),
+            store.clone(),
+            ResolvedConfig::default(),
+            jobs,
+            publish,
+        );
+        let app =
+            AppBootstrap::rebuild_for_directory_as_workspace_root_with_process_runtime_and_config(
+                &workspace,
+                process,
+                ResolvedConfig::default(),
+            )
+            .await
+            .unwrap();
+        drop(network);
+        assert!(app.device_network.is_some());
+        assert!(app.store.device_network().is_some());
+    }
+
+    #[tokio::test]
     async fn cli_run_session_restores_its_nested_workspace_directory_before_bootstrap() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root =
@@ -503,18 +557,77 @@ mod tests {
             image_paths: Vec::new(),
         };
 
-        let restored = restore_run_session_directory(project_root.clone(), Some(&args), &store)
+        for initialize_git in [false, true] {
+            if initialize_git {
+                std::fs::create_dir_all(selected.join(".git")).expect("new nested git marker");
+                assert_ne!(
+                    WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+                        .expect("new discovery")
+                        .project_id,
+                    session.project_id,
+                    "new discovery identifies the new repository independently"
+                );
+            }
+            let restored = restore_run_session_directory(project_root.clone(), Some(&args), &store)
+                .await
+                .expect("restored directory");
+            let app = AppBootstrap::build_with_store_with_root_mode(
+                &restored.directory,
+                Some(&args),
+                store.clone(),
+                WorkspaceRootMode::Stored(restored.project_root.clone().expect("stored root")),
+            )
             .await
-            .expect("restored directory");
-        let app = AppBootstrap::build_with_store(&restored.directory, Some(&args), store)
-            .await
-            .expect("restored app");
+            .expect("restored CLI app");
 
-        assert_eq!(restored.directory, selected);
-        assert_eq!(restored.session_id, Some(session.id));
-        assert_eq!(app.workspace.root, project_root);
-        assert_eq!(app.workspace.cwd, selected);
-        assert_eq!(app.workspace.authority_root(), selected);
+            assert_eq!(restored.directory, selected);
+            assert_eq!(restored.session_id, Some(session.id));
+            assert_eq!(app.workspace.project_id, session.project_id);
+            assert_eq!(app.workspace.root, project_root);
+            assert_eq!(app.workspace.cwd, selected);
+            assert_eq!(app.workspace.authority_root(), selected);
+
+            let projected = app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("session");
+            let reopened = AppBootstrap::rebuild_for_session_with_process_runtime(
+                &projected,
+                app.process_runtime.clone(),
+            )
+            .await
+            .expect("reopened Desktop/TUI app");
+            let resumed = reopened
+                .session_service
+                .start_or_resume(
+                    SessionStartRequest {
+                        selector: SessionSelector::ById(session.id),
+                        title: None,
+                        cwd: selected.clone(),
+                        model: session.model.clone(),
+                        base_url: session.base_url.clone(),
+                        access_mode: session.access_mode,
+                        provider_connection: None,
+                    },
+                    reopened.workspace.clone(),
+                )
+                .await
+                .expect("resume the same session");
+            assert_eq!(resumed.session.id, session.id);
+            assert_eq!(resumed.session.project_id, session.project_id);
+            assert_eq!(resumed.workspace.root, project_root);
+            assert_eq!(resumed.workspace.authority_root(), selected);
+            assert!(
+                crate::workspace::PathGuard::require_path(
+                    &resumed.workspace,
+                    &project_root,
+                    crate::workspace::AccessKind::Read,
+                )
+                .is_err(),
+                "restoring a session must not grant access to its parent project"
+            );
+        }
     }
 
     #[tokio::test]
@@ -598,13 +711,15 @@ mod tests {
             image_paths: Vec::new(),
         };
 
-        let restored = restore_run_session_directory(project_root, Some(&args), &store)
+        std::fs::create_dir_all(latest_cwd.join(".git")).expect("new nested git marker");
+        let restored = restore_run_session_directory(project_root.clone(), Some(&args), &store)
             .await
             .expect("restored latest session");
 
         assert_ne!(restored.session_id, Some(first.id));
         assert_eq!(restored.session_id, Some(latest.id));
         assert_eq!(restored.directory, latest_cwd);
+        assert_eq!(restored.project_root, Some(project_root));
     }
 
     #[tokio::test]

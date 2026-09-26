@@ -1,115 +1,56 @@
-# Hubで管理する端末接続とタスク受付
+# Hubで管理する端末接続
 
-2026-09-13時点の扱い: 本文の個別接続先選択・受付ONによる新規moyAI間依頼は退役した。現在の通常運用は [Hub接続ガイド](../hub-device-network-guide.md) と [Hubプロジェクト](../shared-work-desktop.md) を参照する。本書の端末証明書・更新・既存遠隔仕事の照会と停止の契約はcurrent code / testsと併せて互換境界を確認する資料として保持する。
+2026-09-24更新。現在のPC登録・証明書・診断・接続変更と、旧端末間MCPの互換境界を記す。通常操作は [Hub接続ガイド](../hub-device-network-guide.md)、現在の仕事経路は [Hubプロジェクト](multi-device-session.md) と独立Runnerである。旧「受付ON」「利用先ON」による新規委任を導入手順へ戻さない。
 
-2026-09-07。ユーザーが採用した設定簡略化と部分結合・再委任の設計。実装済みの範囲と同一Windowsで確認した操作、残る受入条件を末尾の実装状況とtask-local evidenceで区別する。元の分散実行要件は [remote-agent-delegation.md](remote-agent-delegation.md)、既存の手動MCP配信は [mcp-publish-foundation.md](mcp-publish-foundation.md) を参照する。
+## 識別と正本
 
-## 1. 利用体験
-
-社内のWin00–Win20が同じHubに参加しても、全端末を相互接続しない。Hubへの参加、組織としての利用許可、各Desktopで利用する接続先、各Desktopの受付ONを分ける。送信・受信の役割は非排他的で、Win19は他端末から受け付けながらWin20へ再委任できる。
-
-1. 管理者から受け取った共通configでHubのURLとCA公開信頼を読み込む。
-2. 共通configの読込後、各Desktopが固有の鍵を生成して自動参加申請する。PC名・IPv4は自動取得し、参加コードは入力しない。Hub管理者が接続端末一覧から対象申請を許可すると、Desktopが証明書取得・モデル接続まで自動で進む。既存Direct設定の切替は利用者の明示操作を保持する。
-3. Win19/Win20はHub管理者が指定した登録名と、初回の作業場所・実行権限を確認して「この端末でタスクを受け付ける」をONにする。作業場所の初期値はtemp。IP/port/TLS/証明書/tokenの手作業は通常導線に置かない。
-4. Win00はHubの端末一覧から許可されたWin19/Win20を名前で検索して利用ONにする。内部には永続IDを保存し、名前やIPを認可に用いない。
-5. 接続先・TLS・資格情報を自動取得し、到達性を確認する。希望のON/OFFと実際の受付・利用可能状態は別に表示する。
-
-公開対象は受入側の登録Projectまたはmanaged tempに限定する。tempは任意フォルダーへの権限ではない。公開ONはFullAccessへの昇格を意味しない。権限や公開対象の変更は既存jobへ遡及させない。
-
-受入RunRequestの既存構成データには、認証audienceと照合した自端末ID・Hub登録名・OSホスト名・workspaceをJSONで含め、登録名がDNS名ではなく現在のローカル実行端末を指すことを短い追加指示で伝える。
-
-## 2. 正本と識別
-
-| 事実 | owner |
+| 事実 | 所有者 |
 | --- | --- |
-| Hub識別、鍵に束縛した参加申請・承認、登録済み端末、新規利用の停止、グループ所属、組織の有向利用許可・例外、失効 | Hubの永続端末管理 |
-| CA発行・証明書更新、端末の公開接続情報、期限とrevision | Hubの端末管理。endpointは本人確認後の申告を検証し、通信の観測IPだけで上書きしない |
-| 端末の秘密鍵・登録資格、選択した利用先ID、受付設定・公開対象・実行権限 | 各DesktopのRust owner |
-| 利用者の入力中draft、検索、focus、scroll、details | 各GUI |
-| 元の依頼と下位jobへの参照 | 依頼元の既存canonical taskと遠隔参照 |
-| 作業・OS操作・変更・確定結果の正本 | 実行端末の既存RunService/session/storage |
-| 推論model・容量・割当 | 既存Hub model control/gateway |
+| Hub identity・CA・申請と承認・登録PC・停止と失効 | Hub `network/` |
+| 端末IDと人の対応・業務/管理権限 | Hub `identity/`。Windowsユーザー名やPC名は参考情報 |
+| プロジェクトの操作/実行用途・参加世代 | Hub `shared_work/project_setup.rs` |
+| 秘密鍵・登録資格・保存済み接続・診断・リセット | Desktop `device_network/` |
+| 端末の作業場所・実行同意・実process | Runnerと既存App / RunService |
+| モデルの選択とrequest許可 | Hub model control/GatewayとDesktop `hub/` |
 
-表示名の重複を本人証明に用いない。再インストールや端末交換を同名端末へ自動で結び付けない。個人の本人確認とアプリ端末の識別を混同しない。共通configには共有秘密鍵、全端末共通の長期認証token、端末IDやローカルProjectパスを含めない。
+同名PCを同一端末とみなさず、IPv4変更でIDを変えない。共通接続ファイルはHub URLと公開CAだけを持ち、共有秘密鍵・全PC共通の長期token・端末ID・作業パスを含めない。信頼はアプリ内に限定し、OSの信頼ストアへ暗黙追加しない。
 
-## 3. 証明書と参加
+## 参加と証明書
 
-端末ごとに鍵と証明書を持たせ、同じCA公開信頼を共有する。証明書は接続ペアごとには発行しない。秘密鍵は端末で生成し、CSRの署名と所有を検証してHubが証明書を発行する。CAの秘密鍵を共通configへ含めない。信頼の追加はmoyAIアプリ内に限定し、OS全体の信頼ストアへ暗黙に追加しない。
+Desktopが固有鍵を生成し、共通configから参加を申請する。HubはCSR署名、申請固有challengeの所有証明、観測IPと申請revisionを確認し、管理者が許可してから証明書を発行する。申請IDだけで証明書を取得できず、自己申告からgroupや管理権限を得られない。
 
-Hubの最初の信頼は、管理者が信頼できる方法で配布したCA公開情報から確立する。未確認のHubから取得したCAをそのまま自動信頼しない。共通configの読込は参加申請を開始するもので、利用を自動承認するものではない。管理者が申請鍵・観測IP・申請revisionに束縛した承認を行い、登録名・グループ所属を確定する。グループや操作権限を端末の自己申告で取得させない。
+保留申請は登録済みPCと別の上限・期限を持つ。再送・再起動は同じ鍵の申請を再開し、変更された鍵や承認対象へ古い許可を適用しない。旧参加コードAPIは互換用であり、通常GUIでは入力不要。Windowsの秘密鍵は現在利用者のDPAPIで保護し、別利用者へコピーされた鍵を上書きして作り直さない。
 
-認証前の参加申請・承認結果取得は専用の限定APIだけで受け付ける。申請CSRの署名・IPを確認し、結果取得にも同じ鍵による申請固有challengeの所有証明を要求する。申請IDだけで他端末の証明書を取得させない。保留申請は登録済み端末と別の上限・期限で管理する。再送・再起動で同じ申請を再開し、変更された鍵や承認対象のIPを古い承認へ結び付けない。端末証明書は承認後に発行する。従来の一回限りの参加コードAPIは互換用に保持し、標準GUIは自動申請を使う。厳密なwire・期限・保存形式は両アプリのcurrent sourceとtestsを正とする。
+登録後はmTLSでHubと端末を認証する。証明書が有効でも、現在の端末状態とproject権限を実操作ごとに確認する。暗号化なしのLANやTLS検証省略へfallbackしない。通常の共有仕事は各PCからHubへ接続し、PC間の個別待受を要求しない。
 
-登録後のHubと端末、moyAI端末同士は相互TLSで相手の登録資格を確認する。証明書の有効性だけで作業実行を許可せず、接続先・対象・呼出者に限定した短命の資格と現在の利用許可を照合する。暗号化なしのLAN経路やTLS検証を省略するfallbackは作らない。既存loopback/manual MCPは互換導線として維持する。
+IPv4はHubへのOS経路から候補を得て、到達性を別に検証する。複数NIC等で解決できなければ詳細設定を案内する。IP変更後はTLSの名前/IP検証に一致する証明書を使い、更新失敗を平文接続で隠さない。
 
-IPv4はHubへ到達するOS経路を候補に自動選択し、到達性を別途検証する。複数NIC/VPNで自動選択できない場合だけ詳細設定へ案内する。IPv4変更は端末IDの変更ではない。接続先とTLSの名前/IP検証が一致する証明書を更新してから利用可能とする。証明書更新失敗を平文接続への切替で隠さない。
+Hub/Gatewayのserver leafは同じCA・Hub用途・IP・鍵対を検証して更新し、新しいhandshakeへ反映する。既存TLS通信を保持し、失敗時は旧有効leafとエラーを残す。手動更新も同じownerを通る。CA rootの全PC自動入替とは別。ownerはHub `network/certificate.rs`・`server_runtime.rs`・`tls.rs` と [Gateway](../../../moyAI-Hub/docs/gateway.md)。
 
-Hub/Gateway server leafは期限7日前から1分周期で更新を試み、同じCA・Hub用途・IP・鍵対を検証して稼働listenerへ反映する。private管理経路でGatewayの更新確認を受けてからHubを更新し、既存TLS通信は保持する。新しいhandshakeから新leafを使用し、失敗時は旧有効leafと公開されたエラー状態を保持する。手動更新も同じoperation ownerを通る。正本はHubの `src/network/certificate.rs`、`server_runtime.rs`、`tls.rs`、Gatewayのprivate controlであり、CA rootの全端末への自動入替とは別である。[Gatewayの設計](../../../moyAI-Hub/docs/gateway.md) も参照する。
+## 停止・診断・接続変更
 
-受入Desktopは固定IPv4・ポートを任意設定でき、nullでは自動経路・空きポートを使う。固定ポートの競合ではfallbackしない。HubのGatewayポート保存値は次回起動用で、稼働listenerのendpointを上書きしない。診断は明示操作だけで実施し、exact接続owner・端末・公開対象に束縛した段階別結果を返す。ローカルから観測したIPを全NIC一覧とは扱わず、別端末からの到達やWindowsファイアウォールが未検証ならskippedを表示する。
+HubのPC停止は新規利用を禁止する可逆状態。既存仕事の照会・停止・終了通知を現在の資格条件で維持する。再許可しても古い未使用permitや退役grantを復活させない。恒久失効は別操作で、通常アクセスを拒否する。失効した実行PCの清算は、有効期限内の実証明書を検証した対象試行の停止照合・不確定報告に限定する。
 
-## 4. 方向付き利用許可と選択
+診断は保存済み接続owner・端末・対象に束縛し、TCP/TLS/許可/Gateway等の段階を返す。Hub PCのローカル観測を別PCの到達・全NIC情報・FW合格とみなさず、未実施を表示する。診断だけでOS規則を変更しない。
 
-Hubは「接続元の端末/グループ → 接続先の端末/グループ → 公開対象/権限」の許可を持つ。既定は不許可。グループは非排他的で管理者が所属を決める。共通のgroup許可で大量のペア入力を減らし、個別例外を優先できる。Desktopの利用ONはその上限内で利用先を選ぶものであり、Hubの拒否を解除しない。
+同じHubのURL変更は候補先へのmTLS自己照会でHub・端末・CAを確認し、実行PCの受付停止・worker queueの静止を経て保存する。確認済み実行同意は保持し、古い未保存確認とasync結果は無効化する。別Hub/CAへの変更は接続リセット後の新規参加。リセットは旧Hubの応答を要求せず、ローカル解除記録で旧Runnerの再開・送信・副作用を拒否し、旧履歴・成果・journalを保持する。詳細は [導入設計](../../../docs/design/onboarding.md)。
 
-直接利用と再委任の許可は区別する。Win00がWin20を直接呼べなくても、Win19の業務処理の一部としてならWin20へ委任できる規則を表現する。公開対象・操作上限を含め、受入端末の許可を広げない。runtimeが検証済みの利用先だけをモデルへ提示し、モデルが任意のURL・端末ID・証明書・資格を指定して認可を迂回できない。
+## 旧端末間MCPの互換境界
 
-## 5. 再委任と停止
+現存する有向grant、選択済み利用先、公開Project/temp、保存済み親子参照は旧仕事の認可・照会・停止に必要なため維持する。現在の新規実行はHub projectの用途・環境権限で扱い、旧ルールやpeer選択を利用者へ再設定させない。
 
-Win00→Win19→Win20の再委任では、認証された元の依頼元、直前の委任元、次の実行先、root task、parent job、公開対象、許可範囲、期限を保持する。モデル入力のhostname/parent表示情報を認証済みoriginに昇格しない。Hubはparentの資格と現在の規則を検証して、次の宛先だけに使える資格を発行する。Win19自身の広い権限を使ってWin00の依頼範囲を広げない。
+- grantは認証済みの元依頼元、直前の委任元、宛先、root/parent、対象、範囲、期限を束縛する。名前・申告parent・推移的な接続関係を権限にしない。
+- 保存済みrootの停止は子へ伝え、遠隔processの終了が不明なら停止未確認を残す。通信失敗で別PCへ自動再実行しない。
+- `peer_connections.rs` は同じ認可範囲のMCP sessionを再利用する。鍵・証明書・grant・targetの異なる仕事へ流用せず、通信不明の `tools/call` を自動再送しない。
+- `wait_remote_tasks` は同じcanonical sessionの保存済み参照をRustで待つ。待機のためにモデルや新しいネットワーク要求を繰り返さず、既存の背景同期が観測を更新する。timeoutや中断を仕事取消・停止済みに変換しない。
+- `RetiredRemoteDispatcher` は新規 `delegate_task` を拒否し、状態・停止・成果の互換操作を維持する。
 
-許可の推移的な到達可能性だけで再委任を認めない。直接/再委任の規則、公開対象、呼出側で選択した利用先、元の依頼の再委任範囲を照合する。循環・最大深さ・root単位の総job数を制限する。資格の更新とjobの新規受理を分け、同一要求キーの再照会/再接続で二重実行しない。
+旧仕事の履歴・承認・成果書出しは [旧委任の互換境界](remote-agent-delegation.md)、read profile/TLS/Streamable HTTPは [MCP通信基盤](mcp-publish-foundation.md) を正とする。
 
-rootの停止は下位端末へ停止要求を伝え、終端が確認できない作業を停止済みと表示しない。接続不能時は最後に確認した状態と停止未確認を表示する。Hubの端末「停止」は新規利用を禁止する可逆な管理状態で、端末の認証・更新・受理済みjobのexactな観測/取消/終端通知を保持する。新規model予約・claimとMCPの新規grant・受付は最終認可境界で停止を照合し、再許可でも停止前の未使用permitや退役済みgrantを復活させない。永久失効は別の取り消せない操作として保持する。実行中作業の停止は既存job操作で行う。短命資格だけで期限前の即時失効を保証したことにせず、Hubで現在の失効を照合する。Hub不達時は新規受理を拒否し、既存jobは履歴を保持して明示した継続/停止方針に従う。
+## 履歴・画面・検証
 
-### 通信セッションの再利用と遠隔待機
+旧MCP履歴は指示側の保存済み観測と実行側のcanonical状態を分け、Hub未接続・受付OFF・再起動後もローカル記録を閲覧できる。Hub管理画面による履歴取得は明示要求に限定し、端末・照会ID・期限を検証したsnapshotを返す。Hubへ本文を全端末から自動収集しない。current ownerは `remote_agent/history.rs`、`device_network/service/history.rs`、Hub `network/history.rs`。操作は [MCP履歴ガイド](../mcp-history-guide.md) を参照する。
 
-Hub管理MCPの依頼元は、同じ認可範囲の通信セッションとHTTP clientをプロセス内で再利用する。初回だけMCP初期化を行い、毎回の状態取得で作り直さない。キーにはHub・共通信頼・双方の証明書・接続先・全grant claims（root task、要求キー、再委任経路を含む）を用いる。別タスクや公開対象の権限へセッションを流用しない。短命tokenはキャッシュせず操作ごとに取得し、受入側は各HTTP要求の現在の認可を引き続き照合する。
+通常のPC接続画面は申請・許可・停止と稼働状態を分ける。入力・focus・detailsを更新で失わず、古い結果を別PCへ適用しない。新規プロジェクトの受信表示と送信制限は旧MCP件数から導出せず、Runnerの現在の観測を使う。
 
-通信失敗では該当接続だけを破棄し、次の明示操作で再初期化する。結果不明の`tools/call`を自動で再送しない。既存の要求キー・job IDで結果を照会する。照会用の一時セッションと終了済みjobのセッションは現在の資格で解放し、設定・証明書・接続ownerの変更でもローカル接続を破棄する。通信セッションの終了はjobの終了ではない。ownerは `src/device_network/peer_connections.rs`、`outgoing.rs`、`src/mcp/mod.rs`。
-
-`wait_remote_tasks`は依頼元のRustで保存済みの遠隔参照を待つread toolで、待機中にモデルやネットワークを呼び出さない。従来の認証済み背景同期が参照を更新し、待機側は同じsessionの最大8 jobを照合する。過去turnのjobも同じsessionなら観測できる。端末がdirectoryから消えても、Hub設定とローカルruntime・保存参照があれば待機できる。待機は既定10分、1秒から1時間まで指定可能。結果・失敗・停止完了・承認待ちを返し、通常の未完了観測はRust内に留める。返却した派生`cursor`を次回の`after`へ渡すと、同じ完了・承認待ち状態を再通知しない。cursorは永続状態の別ownerを作らない。
-
-待機timeoutや新しい指示による中断は再委任・job取消を発生させない。ユーザーStopと下位jobの停止伝播は既存RunControl/遠隔参照ownerに従い、待機中もcommand lane・証明書更新lease・モデル実行枠を保持しない。接続を失っただけでは停止完了を返さず、最後の保存済み観測とtimeoutを区別する。ownerは `src/device_network/wait.rs` と `src/tool/wait_remote_tasks.rs`。アプリ再起動後の自律的なtask再開や常駐サーバーjobの管理はこの待機機能の範囲に含めない。
-
-## 6. GUIと受入
-
-Desktopの独立した **MCP履歴** は **MCP指示**（保存済みのHub管理の遠隔参照）と **MCP実行**（全公開profileの受入job）をページングし、各jobに対応するcanonical履歴の詳細を表示する。実行側のsession/turnを正本とし、指示側は自身の要求と取得済みの応答を保持する。閲覧時に遠隔イベントを暗黙取得せず、最後に観測した状態と実行側の状態を区別する。旧記録の欠損時刻や未記録の待機理由は推測しない。受入OFF・Hub未接続・再起動後もローカル履歴を読める。保存は対象IDに束縛したMarkdownスナップショットをnative保存ダイアログから行い、未取得の遠隔ログや資格情報を追加しない。current ownerは `src/remote_agent/history.rs`、Desktop commandと `mcp_history_*.ts`。操作手順は [MCP履歴](../mcp-history-guide.md) を正とする。
-
-Hubのローカル管理画面から選択した端末の履歴を明示取得できる。`src/device_network/service/history.rs` は既存のmTLS接続で照会を受け取り、端末ID・照会ID・方向・jobと期限を照合してローカル履歴を返す。新しい待受口や証明書設定を要求しない。Hubのスナップショットは30分間のメモリ保持で、オフライン時も取得日時を明示する。詳細は `src/remote_agent/history.rs` のHub専用projectionで概要と最新記録を優先し、Markdown本文64 KiB以内に収める。区分ごとの新しい記録から読み取り、指示・実行、進行、待機の予算を分け、採用した記録の末尾番号・記録時刻と省略を明示する。大きな本文は途中を省略して両端を残す。公開wire・認証・対象の分離は維持し、再取得時に最新の記録を読み直す。通常のDesktop履歴と端末上のMarkdown保存は従来の順序・より大きいローカル上限を使う。Hub側の正本は `moyAI-Hub/src/network/history.rs` とHubの `docs/mcp-history.md`。
-
-Hub: 接続端末セクションの単一一覧で申請と登録端末を管理し、承認状態（承認待ち/許可/停止）と稼働状態を別列にする。申告名・観測IP・申請日時・鍵の識別情報を確認して入力無しで承認でき、名前・非排他groupは任意に編集できる。恒久失効と旧参加コードは詳細導線へ置く。共通configの出力に秘密を含めない。Desktop: 自動参加申請と承認待ち/停止/失効の表示、受付ON、初回の対象/権限、利用先の検索・ON/OFF、設定詳細、受入jobと再委任の経路・状態・結果・停止を表示する。
-
-pollingは入力中のDOMや選択を置換せず、遅れた結果を別端末へ適用しない。「Hub登録済み」「受付中」「到達可能」「利用許可」「model待ち」を単一の緑アイコンへまとめない。設定画面の外側誤クリックは閉じる操作にしない。無人運用のトレイ継続・再起動時の開始方針は明示設定として扱う。
-
-対話承認は受入側の既存permission modalを使い、remote job/profile/confirmationを同じ決定commandへ渡す。操作許可、操作拒否、job全体の停止を区別し、remote承認ではEscapeを無視する。A/Bはjob正本のawaiting_approvalを表示し、別の承認queueや待機timerをGUIに作らない。
-
-成果物は終端jobのcanonical FileChangeに限定したUTF-8 manifestを版SHA-256で固定する。送信元はremote reference/job/versionを照合し、native pickerで選んだ場所の新規フォルダへ書き出す。元のProjectへの暗黙適用や削除は行わない。書き出しはWindowsのstable directory handleによる新規生成に限定し、Unix等では未対応として副作用前に拒否する。通常のpath操作へfallbackしない。シェルの任意出力・一般フォルダ同期は対象外で、最大8 files・各64 KiB・合計256 KiBに制限する。再取得中も確認済み版とlocal draftのownerを混同しない。
-
-入力・成果物はJSONへの符号化後にも768 KiBの上限を適用する。制御文字等のescapeで転送表現が膨らむ場合は、UTF-8本文の上限以内でも拒否する。既存MCP応答の1 MiB枠を超える転送には拡張しない。
-
-受入は、同一PCの役割分離試験と物理複数Windowsの試験を区別する。少なくとも次を確認する。
-
-- 共通config→一度の参加許可→以後の自動再接続・TLS更新、Hub再起動後の端末ID/CA/許可保持。
-- Win00は選択したWin19/20のみを利用。無許可Win01、逆方向、別group、失効資格、別宛先資格、別公開対象、偽origin、期限切れ、同名別IDを副作用前に拒否。
-- 公開ON/利用ONの実GUIで設定操作が完結し、IP/token/証明書パスを手入力しない。
-- Win00→Win19の実作業・結果返却、Win00→Win19→Win20の許可された再委任と、禁止された再委任の拒否。
-- job要求キーの再送で同じjobを返す。通信断で別端末へ勝手に再実行しない。
-- root停止・個別停止・Hub失効を区別し、下位の実process終了とGUIの停止確認を照合。
-- 旧manual/read profile、Directモデル設定、既存catalog/review/gatewayの互換性。
-
-## 7. 実装状況
-
-Hubの端末登録・共通CA・有向利用許可と、Desktopの参加・受付・利用先選択・委任・状態/停止の接続を実装した。wire/DTOはHubとDesktopのcurrent sourceと近傍testsを正とする。
-
-同一Windows上の実Hub/Desktop画面と分離した送受信runtimeで、Directモデル未設定から共通設定の読込と参加、成功通知、temp受付ON、サーバーグループへの有向許可、利用先の検索・ONを確認した。設定画面外の誤クリック無視、登録端末名を使う承認と長文折返し、実モデルによるCPU調査と送信元への結果返却も確認した。これは物理別端末や3台経路の受入を代替しない。
-
-同じ実画面試験で、Win00-GUI→Win20-Workerの完了経路と結果・識別情報、tempからProject公開対象へ変更した際の再確認要求、確認後の受付ONとOFF・停止中表示を確認した。受入workerの実行数0・正常終了・子process解放、Desktopの「moyAIを終了」とharnessの正常終了も確認済みである。
-
-Hubの期限投影修正を含む最終ビルドでも、実Tauri画面からネットワークを開始し、稼働・モデル接続稼働の表示と停止を確認した。期限競合の検証は単体・protocol試験によるもので、この実画面確認は開始・停止の範囲である。両実画面試験の最終資源監査はPASSし、強制終了なし・WebView残留0・SQLite整合・実行枠解放を確認した。
-
-物理WinA→WinBのtemp基本往復は確認済みだが、複数Windowsの全操作・3台再委任の受入は未完了。再委任関係の永続化、Hub/Gatewayのサーバー証明書更新、遠隔の対話承認、接続診断と任意の固定IPv4・ポート、版付き入力・成果物の書き出しを実装し、Rustとfrontendの全体試験を通過した。これらの追加操作の実画面試験はWindows操作ツールの前面ウィンドウ取得エラーで中断したため、未確認のGUI操作が残る。以前のGUI合格を新しい操作の合格として流用しない。
-
-その後、参加コードを不要にする変更を加え、操作環境が回復した実Tauri画面で、共通configの書出し・新規読込→自動申請→Hubで許可→証明書の取得とMainの自動Hub選択→停止・再許可を確認した。同じ最終Rust sourceでHub経由のoMLX実応答を確認した。初回GUIで見つけた説明文と開いたままの設定画面の更新不整合はFAIL証跡を残して修正し、新ビルドで再操作してPASSした。推奨候補の選択だけではDirectの送信先を変更しないことも確認した。この試験は初期設定・承認状態の変更範囲であり、前段の未確認操作や物理別端末の受入を代替しない。
-
-全項目の受入完了は宣言しない。既存の確認範囲は `project_sandbox/lynx-hub-device-network-20260907/RESULTS.md`、追加操作と検証の正本は `project_sandbox/lynx-hub-completion-20260907/RESULTS.md`、参加申請・承認・停止の修正と最新の実画面確認は [参加承認の検証結果](../../../project_sandbox/lynx-hub-join-approval-20260907/RESULTS.md) を参照する。
+[2026-09-23 Live GUI](../../../project_sandbox/live-gui-winab-20260923/RESULTS.md) は、同一Windowsの隔離WinA/Bで参加・共有AI・実LLM仕事・成果・受信表示を確認した。複数候補の工程判断、物理PCのLAN/FW・三台再委任・全状態・長時間運転は別の受入として残る。旧経路の過去の成功を現行版の合格へ読み替えない。

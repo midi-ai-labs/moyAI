@@ -1,250 +1,238 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { prepareDesktopFixtureEnvironment } from "../core/desktop_isolation.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/hub_browser_resource.mjs";
-import { startSharedWorkflowProvider, startSharedWorkflowRunner } from "../drivers/shared_work_runner_fixture.mjs";
-import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
+import { startSharedWorkflowProvider } from "../drivers/shared_work_runner_fixture.mjs";
+import { createManagedExecutionRunner } from "../drivers/managed_execution_runner.mjs";
+import { WebviewInput } from "../drivers/webview_input.mjs";
 import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathInOwnedNativeDialog, probeExactOwnedWindow } from "../drivers/windows_native_input.mjs";
-import { openHubProjectSurface, openSharedDisclosure, sharedActionTarget, bindHubDevice } from "./shared_work_navigation.mjs";
-import { auditClosedSqlite } from "../drivers/sqlite_cleanup.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
-import { action, byId, trustedClick, trustedFocus, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
+import { action, byId, hubSettingsCloseTarget, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
+import { openHubProjectSurface, sharedActionTarget } from "./shared_work_navigation.mjs";
+import { quiesceDeviceExecutionResources } from "./device_execution.mjs";
 
 const ID = "settings.shared-work-continuation", OWNER = `scenario:${ID}`;
-const fail = message => new DesktopE2eError("product", "shared-continuation-mismatch", message);
-const scopedSink = (sink, prefix) => ({ record: sink.record.bind(sink), writeBytes: (name, bytes) => sink.writeBytes(`${prefix}/${name}`, bytes) });
+const fail = (message, evidence = {}) => new DesktopE2eError("product", "shared-continuation-mismatch", message, evidence);
+export const sameFixtureFolder = (actual, expected) => typeof actual === "string"
+  && path.toNamespacedPath(path.resolve(actual)).toLowerCase() === path.toNamespacedPath(path.resolve(expected)).toLowerCase();
 
+/** One actual Desktop and its independent Runner exercise the normal Hub chat twice. */
 export function createSharedWorkContinuationScenario(options = {}) {
   const { runnerBinary, runnerTestBinary, ...hubOptions } = options;
   const settings = normalizeHubBrowserOptions(hubOptions);
-  const state = { resource: null, provider: null, runner: null, input: null, close: null, primaryContext: null,
-    nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false };
+  const state = { resource: null, provider: null, runner: null, input: null, close: null, environment: {},
+    consent: false, nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false };
   async function settleInput() { if (state.input) { await state.input.cleanup(); state.input = null; } }
   return Object.freeze({ id: ID, productOracle: "pass", manualGate: "pending", databaseRequired: true,
+    get environment() { return state.environment; },
     async prepare(args) {
-      state.primaryContext = args.context;
+      if (args.context.desktopIsolation !== "fixture" || !runnerTestBinary || !(await stat(runnerTestBinary)).isFile())
+        throw new TypeError("Shared conversation GUI verification needs an isolated desktop-e2e Runner libtest");
+      const registry = (await prepareDesktopFixtureEnvironment(args.context)).registry;
+      state.environment = { MOYAI_DESKTOP_E2E_RUNNER: runnerTestBinary, MOYAI_TEST_RESOURCE_REGISTRY: registry };
+      state.runner = createManagedExecutionRunner({ context: args.context, sink: args.sink, runnerBinary, runnerTestBinary });
       state.provider = await startSharedWorkflowProvider();
       await prepareDesktopFixture({ ...args, owner: OWNER, configText: `[model]\nbase_url = ${JSON.stringify(state.provider.baseUrl)}\nmodel = "shared-workflow"\nprovider_profile = "openai_compatible"\nmax_retries = 0\n[multi_agent]\nenabled = false\n` });
       state.resource = await startHubBrowserResource({ ...args, options: settings });
+      await args.sink.record("shared-conversation-test-boundary", { runner: runnerTestBinary,
+        sha256: createHash("sha256").update(await readFile(runnerTestBinary)).digest("hex"),
+        scope: "One actual Tauri Desktop and its independent isolated Runner on one Windows PC. Physical WinB is not exercised." },
+        { phase: args.phase, owner: OWNER });
     },
     requestGracefulExit: cdp => requestHubEnrollmentExit(cdp, state),
-    async execute({ context, runtime, driver, host, sink }) {
-      let cdp = driver, currentContext = context, currentRuntime = runtime;
+    async execute({ context, runtime, driver: cdp, sink }) {
       const { page, hub } = state.resource;
-      const provider = state.provider;
-      async function attach() {
-        await cdp.call("Runtime.enable"); await cdp.call("DOM.enable");
-        state.input = new WebviewInput(cdp, { probeId: `${ID}-${currentRuntime.generation}` }); await state.input.installProbe();
-        await openHubProjectSurface(state.input, cdp, sink);
-      }
-      async function click(kind, value = "") {
-        await trustedClick(state.input, cdp, sharedActionTarget(kind, value), sink);
-      }
-      async function fill(id, value, tag = "INPUT") {
-        const target = byId(id, tag); await trustedClick(state.input, cdp, target, sink);
-        await state.input.keyDown("Control"); await state.input.pressKey("a"); await state.input.keyUp("Control"); await state.input.insertText(target, value);
-        if (["shared-title", "shared-prompt"].includes(id)) await sink.record("shared-draft-selection-observed", {
-          after_field: id, environment: await cdp.evaluate(`document.getElementById('shared-environment')?.value`),
-        }, { phase: "executing", owner: OWNER });
-      }
-      async function select(id, index, value) {
-        const target = byId(id, "SELECT");
-        const afterSequence = (await state.input.snapshotProbe()).sequence;
-        const observations = [];
-        async function observe(step) { observations.push({ step, ...await cdp.evaluate(`(() => { const input = document.getElementById(${JSON.stringify(id)}); return { value: input?.value, focused: document.activeElement === input, options: Array.from(input?.options ?? [], option => option.value) }; })()`) }); }
-        await trustedClick(state.input, cdp, target, sink); await observe("click");
-        await state.input.pressKey("Home"); await observe("home");
-        for (let n = 0; n < index; n++) { await state.input.pressKey("ArrowDown"); await observe(`down-${n + 1}`); }
-        await state.input.pressKey("Enter"); await observe("enter");
-        const probe = await state.input.snapshotProbe(afterSequence);
-        const events = probe.events.filter(event => event.id === id && ["keydown", "keyup", "input", "change"].includes(event.type));
-        await sink.record("shared-select-observed", { id, index, observations, events }, { phase: "executing", owner: OWNER });
-        assertTrustedProbeSequence(probe, { afterSequence, expected: [
-          { type: "input", identity: target.identity }, { type: "change", identity: target.identity },
-        ] });
-        await wait("Shared selection committed its requested value", () => cdp.evaluate(`document.getElementById(${JSON.stringify(id)})?.value`), current => current === value);
-      }
-      async function selectValue(id, value) {
-        const observed = await cdp.evaluate(`Array.from(document.getElementById(${JSON.stringify(id)}).options, option => option.value)`);
-        const index = observed.indexOf(value);
-        if (index < 0) throw fail(`Option ${value} is absent from ${id}`);
-        await select(id, index, value);
-      }
-      const projection = () => invokeDesktopCommand(cdp, "shared_work_projection");
-      async function focusDefaultDeadline(id) {
-        await trustedClick(state.input, cdp, byId(id, "INPUT"), sink);
-        const value = await cdp.evaluate(`(() => { const input = document.getElementById(${JSON.stringify(id)}); return { focused: document.activeElement === input, type: input?.type, value: input?.value }; })()`);
-        if (!value.focused || value.type !== "datetime-local" || value.value !== "") throw fail("The default start deadline is not an interactive empty date field");
-      }
-      async function checkReadableTranscript() {
-        await wait("Canonical request and answer are shown as readable text", () => cdp.evaluate(`Array.from(document.querySelectorAll('[data-shared-region="transcript"] .markdown-body'), node => node.textContent).join('\\n')`), text => text.includes("desktop-transfer-parent") && text.includes("親は子の解析結果"));
-        await wait("Job result shows the answer before internal metadata", () => cdp.evaluate(`document.querySelector('[data-shared-region="detail"]')?.innerText`), text => text.includes("親は子の解析結果") && !text.includes("admission_revision"));
-        for (const [region, image] of [["detail", "shared-b-readable-result"], ["transcript", "shared-b-readable-conversation"]]) {
-        const selector = `[data-shared-region="${region}"] details[data-details-key]`;
-        const first = await cdp.evaluate(`(() => { const items = [...document.querySelectorAll(${JSON.stringify(selector)})]; return { key: items[0]?.dataset.detailsKey, open: items.some(item => item.open) }; })()`);
-        if (!first.key || first.open) throw fail("Transcript technical details must begin collapsed for a fresh person/job");
-        const exact = `${selector}[data-details-key=${JSON.stringify(first.key)}]`;
-        const summary = { selector: `${exact} > summary`, identity: { tag: "DETAILS", detailsKey: first.key } };
-        for (const open of [true, false]) {
-          const observed = (await projection()).observed_at_ms;
-          const refreshes = new Set();
-          await trustedClick(state.input, cdp, summary, sink);
-          await wait("Two subsequent shared refreshes retain the disclosure state", async () => {
-            const view = await projection(); if (view.observed_at_ms > observed) refreshes.add(view.observed_at_ms);
-            return { count: refreshes.size, open: await cdp.evaluate(`document.querySelector(${JSON.stringify(exact)})?.open`) };
-          }, value => value.count >= 2 && value.open === open);
-          await captureScenarioScreenshot({ cdp, sink, name: open ? `${image}-details-open` : image, owner: OWNER });
-        }
+      const shared = () => invokeDesktopCommand(cdp, "shared_work_projection");
+      const execution = () => invokeDesktopCommand(cdp, "device_execution_projection");
+      async function click(target) { await trustedClick(state.input, cdp, target, sink); }
+      async function fill(target, value) {
+        // The conversation textarea is reached by a visible pointer click;
+        // settings-dialog tab traversal does not model the chat composer.
+        await wait("The shared chat input is ready", () => cdp.evaluate(`(() => {
+          const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
+          return nodes.length === 1 && !nodes[0].disabled && !nodes[0].closest('[hidden]');
+        })()`), ready => ready === true, 15000);
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await state.input.click(target, { stableHitSamples: 3 });
+          await state.input.keyDown("Control"); await state.input.pressKey("a"); await state.input.keyUp("Control");
+          try { await state.input.insertText(target, value); return; }
+          catch (error) { if (error?.code !== "text-insert-focus-owner" || attempt === 2) throw error; }
         }
       }
-      async function nativeFile(kind, selectedPath, value = "") {
-        if (kind === "upload-inputs") await openSharedDisclosure(state.input, cdp, sink, "hub-inputs");
-        state.nativeOwner = { executionRoot: currentContext.root, ownerPath: currentRuntime.desktop_owner_path, expectedOwner: currentRuntime.desktop_owner };
+      async function chooseFolder(target, selectedPath) {
+        state.nativeOwner = { executionRoot: context.root, ownerPath: runtime.desktop_owner_path, expectedOwner: runtime.desktop_owner };
         state.nativeBefore = await snapshotOwnedTopLevelWindows(state.nativeOwner); state.importDispatched = true;
-        await click(kind, value);
-        const native = await wait("Shared file picker belongs to exact Desktop", async () => {
-          try { return selectFreshOwnedRootWindow(state.nativeBefore, await snapshotOwnedTopLevelWindows(state.nativeOwner), currentRuntime.desktop_owner, { expectedClassName: "#32770" }); }
+        await click(target);
+        state.nativeCandidate = await wait("Project folder picker belongs to this Desktop", async () => {
+          try { return selectFreshOwnedRootWindow(state.nativeBefore, await snapshotOwnedTopLevelWindows(state.nativeOwner), runtime.desktop_owner, { expectedClassName: "#32770" }); }
           catch (error) { if (error?.code === "native-window-cardinality" && error.evidence?.fresh_windows?.length === 0) return null; throw error; }
         }, Boolean);
-        state.nativeCandidate = native;
-        const nativeResult = await openFilePathInOwnedNativeDialog({ ...state.nativeOwner, candidate: native, selectedPath, intent: kind === "save-asset" ? "save_new" : "open" });
-        await sink.record("shared-native-path-selection", { action: kind, result: nativeResult }, { phase: "executing", owner: OWNER });
-        await wait("Shared native picker closes", () => probeExactOwnedWindow({ ...state.nativeOwner, candidate: native }), value => !value.live);
+        const result = await openFilePathInOwnedNativeDialog({ ...state.nativeOwner, candidate: state.nativeCandidate, selectedPath, intent: "directory" });
+        await wait("Project folder picker closes", () => probeExactOwnedWindow({ ...state.nativeOwner, candidate: state.nativeCandidate }), value => !value.live);
         state.nativeCandidate = null; state.importDispatched = false;
+        await sink.record("shared-conversation-folder-selection", { selectedPath, result }, { phase: "executing", owner: OWNER });
       }
       try {
-        await attach();
+        await cdp.call("Runtime.enable"); await cdp.call("DOM.enable");
+        state.input = new WebviewInput(cdp, { probeId: ID }); await state.input.installProbe();
+        if ((await execution()).isolated_test_host !== true) throw fail("The Runner is not isolated from this PC's real settings");
+        await openHubProjectSurface(state.input, cdp, sink);
+        await page.locator('nav a[href="#models"]').click();
+        await page.locator("#endpoint").fill(state.provider.baseUrl);
+        await page.locator("#profile").selectOption("openai_compatible_chat");
+        await page.locator("#discover").click();
+        await page.locator('#model option[value="shared-workflow"]').waitFor({ state: "attached" });
+        await page.locator("#model").selectOption("shared-workflow");
+        await page.locator("#label").fill("会話の試験用AI");
+        await page.locator("#allow-tools").check();
+        await page.locator("#register").click();
         await page.locator('nav a[href="#device-network"]').click();
         await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
-        await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
-        const enrolled = await enrollDesktopFromHubBrowser({ resource: { ...state.resource, screenshot: name => state.resource.screenshot(`a-${name}`) }, context, runtime, cdp, input: state.input, sink: scopedSink(sink, "desktop-a"), nativeState: state, entry: "shared-work" });
-        const network = await hub.observeNetwork();
-        const { createDeviceParticipant } = await import(pathToFileURL(path.join(settings.hubRepository, "tests/browser/device-fixture.mjs")));
-        const actor = await createDeviceParticipant(network, "Shared workflow setup");
-        await page.locator('nav a[href="#clients"]').click(); await page.locator("#network-clients-refresh").click();
-        await page.locator(`[data-id="request:${actor.requestId}"] button[data-network-action]`).click();
-        await page.locator("#join-project-save").click();
-        await page.locator("#join-project-dialog").waitFor({ state: "hidden" });
-        const actorApproval = await actor.collectApproval();
-        if (actorApproval.status !== "approved") throw fail("The fixture participant was not approved through Hub controls");
-        await actor.presence();
-        const bob = (await actor.sharedDeviceSession()).principal;
-        const alice = (await wait("Desktop A uses its approved device identity", projection, p => p.principal && !p.principal.administrator)).principal;
-        await bindHubDevice(state.resource, actorApproval.deviceId, state.resource.administrator.user_id);
-        await actor.sharedDeviceSession();
-        await actor.sharedCall("createProject", { id: "workflow", label: "端末を移る共有業務" });
-        for (const user of [alice, bob]) await actor.sharedCall("membership", { project_id: "workflow", user_id: user.user_id, role: "contributor" });
-        for (const [id, label] of [["analysis", "親の解析"], ["solver", "子の解析"]]) await actor.sharedCall("environment", { id, label, resource_id: "workflow-device", runner_id: enrolled.network.device_id, capacity: 1, project_ids: ["workflow"] });
-        state.runner = await startSharedWorkflowRunner({ context, deviceId: enrolled.network.device_id, hubId: network.hub_id, runnerBinary: runnerBinary ?? path.join(path.dirname(context.binary), "moyai-runner.exe"), runnerTestBinary, sink });
-        // This scenario owns real parent/child execution and cross-device conversation.
-        // Initial PC execution permission and automatic folder provisioning have their
-        // own device-execution scenario; no retired provider controls are invoked here.
-        await wait("Alice can submit to the real Runner", projection, p => p.principal?.user_id === alice.user_id && ["analysis", "solver"].every(id => p.status?.environments.some(e => e.id === id)));
-        await trustedClick(state.input, cdp, { selector: '.sidebar button[data-action="open-hub-project"][data-value="workflow"]', identity: { tag: "BUTTON", action: "open-hub-project" } }, sink);
-        await click("new-conversation");
-        const inputPath = path.join(context.paths.workspace, "input.txt"); await writeFile(inputPath, "input snapshot 日本語\n", { flag: "wx" });
-        await nativeFile("upload-inputs", inputPath);
-        const firstInput = await wait("Input upload is visible", projection, p => p.inputs.length === 1);
-        await nativeFile("upload-inputs", inputPath);
-        await wait("Selecting the same file replaces the draft attachment with a fresh upload intent", projection, p => p.inputs.length === 1 && p.inputs[0].id !== firstInput.inputs[0].id && p.feedback?.includes("置き換えました"));
-        await selectValue("shared-environment", "analysis"); await openSharedDisclosure(state.input, cdp, sink, "hub-new-chat-options"); await fill("shared-title", "端末 A から依頼した親の仕事"); await fill("shared-prompt", "desktop-transfer-parent: 子の解析を待って結果をまとめてください。", "TEXTAREA");
-        await focusDefaultDeadline("shared-startBefore"); const submittedAt = Date.now(); await click("submit");
-        const parentView = await wait("Parent releases its slot while the actual child is running", projection, p => p.detail?.state === "waiting_child" && provider.requests.some(r => JSON.stringify(r.messages.filter(m => m.role === "user")).includes("desktop-transfer-child")), 60000);
-        const parentId = parentView.detail.id, childId = parentView.detail.awaiting_child_id;
-        if (!Number.isFinite(parentView.detail.start_before_ms) || parentView.detail.start_before_ms < submittedAt + 86400000 || parentView.detail.start_before_ms > Date.now() + 86400000) throw fail("Submitted root deadline was not fixed to 24 hours");
-        await selectValue("shared-assigneeId", bob.user_id); await click("handover");
-        await wait("Handover is pending at the running child", projection, p => p.handover?.pending?.new_assignee_id === bob.user_id);
-        await captureScenarioScreenshot({ cdp, sink, name: "shared-a-waiting-child-handover", owner: OWNER });
-        await settleInput();
-        const secondRoot = path.join(context.root, "desktop-b"); await mkdir(secondRoot);
-        const directories = Object.fromEntries(["workspace", "config", "data", "prefs", "webview"].map(name => [name, path.join(secondRoot, name)]));
-        for (const directory of Object.values(directories)) await mkdir(directory);
-        const nextContext = { ...context, paths: { ...context.paths, ...directories, config_file: path.join(directories.config, "config.toml"), prefs_file: path.join(directories.prefs, "desktop.toml"), database: path.join(directories.data, "moyai.sqlite3") } };
-        await prepareDesktopFixture({ context: nextContext, sink, phase: "executing", owner: OWNER, configMode: "absent", sentinelName: null, sentinelText: "" });
-        const restarted = await host.restart({ context, nextContext, scenario: this, sink, driver: cdp });
-        cdp = restarted.driver; currentRuntime = restarted.runtime; currentContext = nextContext;
-        await attach();
-        const fresh = await invokeDesktopCommand(cdp, "desktop_state"); if (!fresh.startup.initial_setup_required) throw fail("Desktop B unexpectedly has local model setup");
-        await page.locator('nav a[href="#device-network"]').click();
-        const second = await enrollDesktopFromHubBrowser({ resource: { ...state.resource, screenshot: name => state.resource.screenshot(`b-${name}`) }, context: currentContext, runtime: currentRuntime, cdp, input: state.input, sink: scopedSink(sink, "desktop-b"), nativeState: state, entry: "shared-work", onEnrollmentError: async rejected => {
-          if (rejected.error !== "device_name_conflict") throw fail("Unexpected B enrollment rejection");
-          await wait("Shared entry explains B's duplicate registered name", () => cdp.evaluate(`document.querySelector('[data-shared-region="message"]')?.textContent`), value => value?.includes("同じ端末名が既に登録されています"));
-          await captureScenarioScreenshot({ cdp, sink, name: "shared-b-enrollment-error", owner: OWNER });
-          // A and B use distinct identities on one host. Resolve the real name
-          // conflict through Hub management, then retry B's existing request UI.
-          await page.locator('nav a[href="#clients"]').click();
-          await page.locator("#network-clients-refresh").click();
-          const firstDevice = page.locator(`[data-id="device:${enrolled.network.device_id}"]`);
-          await firstDevice.locator("details[data-device-identity] > summary").click();
-          await firstDevice.getByRole("button", { name: /を管理$/ }).click();
-          await page.locator("#network-device-label").fill("共有 Runner A");
-          await page.locator("#network-device-save").click();
-          await page.locator("#network-device-dialog").waitFor({ state: "hidden" });
-          await wait("A's registered name is distinct for this same-host B fixture", () => hub.observeNetwork(), p => p.devices.some(d => d.device_id === enrolled.network.device_id && d.label === "共有 Runner A"));
-          await click("reconnect");
-        } });
-        if (second.network.device_id === enrolled.network.device_id) throw fail("B reused the same device identity");
-        const beforeAssociation = await wait("A different registered device receives its own actor", projection, p => p.principal && !p.principal.administrator);
-        if (beforeAssociation.principal.user_id === alice.user_id) throw fail("B inherited A identity without administrator association");
-        await bindHubDevice(state.resource, second.network.device_id, alice.user_id);
-        await wait("Fresh B sees the same parent job", projection, p => p.status?.jobs.some(j => j.id === parentId));
-        provider.releaseChild();
-        await click("detail", childId);
-        const approval = await wait("B receives the actual child's write approval", projection, p => p.approval?.can_decide && p.approval.status === "pending", 60000);
-        const marker = path.join(state.runner.child, "approved-marker.txt");
-        if (await stat(marker).then(() => true, () => false)) throw fail("Controlled shell effect occurred before B's approval");
-        if (!approval.approval.request.details.some(text => text.includes("approved-marker.txt"))) throw fail("Approval does not identify the controlled shell effect");
-        await trustedFocus(state.input, cdp, action("shared-approve", ".shared-work"));
-        await captureScenarioScreenshot({ cdp, sink, name: "shared-b-real-child-approval", owner: OWNER });
-        await click("approve", approval.approval.id);
-        await wait("Only B approval allows the controlled shell effect", () => readFile(marker, "utf8").catch(() => null), text => text === "approved");
-        await wait("The parent completes after actual child output and safe handover", projection, p => p.status?.jobs.some(j => j.id === parentId && j.state === "succeeded" && j.assignee.user_id === bob.user_id), 60000);
-        await wait("Child result file is stored on Hub", projection, p => p.assets.some(a => a.name === "result.txt" && a.kind === "artifact"));
-        const asset = (await projection()).assets.find(a => a.name === "result.txt" && a.kind === "artifact");
-        const saved = path.join(currentContext.paths.workspace, "downloaded-result.txt"); await nativeFile("save-asset", saved, asset.id);
-        await wait("B saves verified artifact bytes", () => readFile(saved).catch(() => null), bytes => bytes !== null && createHash("sha256").update(bytes).digest("hex") === asset.sha256 && bytes.toString("utf8").replaceAll("\r\n", "\n") === "shared solver result 日本語\n");
-        await bindHubDevice(state.resource, second.network.device_id, bob.user_id);
-        const notified = await wait("New assignee receives a handover notification", projection, p => p.principal?.user_id === bob.user_id && p.inbox?.items.some(i => i.kind === "handover" && i.job_id === parentId));
-        const notification = notified.inbox.items.find(i => i.kind === "handover" && i.job_id === parentId);
-        await click("inbox-open", notification.id);
-        await wait("Opening the notification marks it read and restores the Hub conversation", projection, p => p.detail?.id === parentId && p.detail.can_continue && p.transcript?.items.length && p.inbox?.items.some(i => i.id === notification.id && i.read_at_ms !== null));
-        await checkReadableTranscript();
-        await fill("shared-followup", "desktop-followup: 元の解析結果を参照して追加の説明をしてください。", "TEXTAREA");
-        await openSharedDisclosure(state.input, cdp, sink, "hub-followup-options");
-        await focusDefaultDeadline("shared-followupStartBefore"); const continuedAt = Date.now(); await click("continue");
-        const continued = await wait("Continuation finishes from Hub canonical history", projection, p => p.detail?.id !== parentId && p.detail?.state === "succeeded", 60000);
-        if (!Number.isFinite(continued.detail.start_before_ms) || continued.detail.start_before_ms < continuedAt + 86400000 || continued.detail.start_before_ms > Date.now() + 86400000) throw fail("Continued job deadline was not fixed to 24 hours");
-        await sink.record("shared-accepted-start-deadlines", { parent: { job_id: parentId, requested_after_ms: submittedAt, start_before_ms: parentView.detail.start_before_ms }, continuation: { job_id: continued.detail.id, requested_after_ms: continuedAt, start_before_ms: continued.detail.start_before_ms }, default_hours: 24 }, { phase: "executing", owner: OWNER });
-        await wait("The new job has its own collapsed technical details", () => cdp.evaluate(`(() => { const region = document.querySelector('[data-shared-region="transcript"]'); return { owner: region?.dataset.sharedRecordOwner, open: [...document.querySelectorAll('[data-shared-region="transcript"] details, [data-shared-region="detail"] details')].some(d => d.open) }; })()`), value => decodeURIComponent(value.owner ?? "").includes(continued.detail.id) && !value.open);
-        const resultKey = await cdp.evaluate(`document.querySelector('[data-shared-region="detail"] details[data-details-key^="shared-result:"]')?.dataset.detailsKey`);
-        if (!resultKey) throw fail("The completed conversation has no result disclosure");
-        await trustedFocus(state.input, cdp, { selector: `[data-shared-region="detail"] details[data-details-key=${JSON.stringify(resultKey)}] > summary`, identity: { tag: "DETAILS", detailsKey: resultKey } });
-        if (provider.failures.length) throw fail(provider.failures.join("; "));
-        await captureScenarioScreenshot({ cdp, sink, name: "shared-b-canonical-continuation-result", owner: OWNER });
-        await sink.record("shared-a-to-b-actual-runner-complete", { parent_id: parentId, child_id: childId, continued_id: continued.detail.id, device_a: enrolled.network.device_id, device_b: second.network.device_id, no_local_setup_on_b: true, runner_incarnation: state.runner.incarnation, artifact: { id: asset.id, sha256: asset.sha256, saved }, provider_calls: provider.requests.length, scope: "Two isolated Desktop device identities on one Windows account; actual Runner, Hub, native input/save, human approval and canonical continuation. Physical different PCs and external solver are not exercised." }, { phase: "executing", owner: OWNER });
-        await sink.writeJson("shared-workflow-provider-requests.json", provider.requests);
+        await page.locator("#network-start").click();
+        try { await page.locator("#network-stop").waitFor(); }
+        catch (error) {
+          const observed = await page.evaluate(() => ({
+            status: document.querySelector("#network-server-status")?.textContent?.trim() || "",
+            notice: document.querySelector("#network-notice")?.textContent?.trim() || "",
+            hostingError: document.querySelector("#network-hosting-error")?.textContent?.trim() || "",
+            bind: document.querySelector("#network-identity")?.textContent?.trim() || "",
+            configuredPort: document.querySelector("#network-port")?.value || "",
+          })).catch(() => null);
+          await sink.record("shared-conversation-hub-start-failure", observed, { phase: "executing", owner: OWNER });
+          if (observed?.notice || observed?.hostingError) throw fail("Hub did not start its connection listener", observed);
+          throw error;
+        }
+        const enrolled = await enrollDesktopFromHubBrowser({ resource: state.resource, context, runtime, cdp, input: state.input, sink, nativeState: state, entry: "shared-work" });
+        await click(action("show-hub", "aside.sidebar"));
+        await click(byId("hub-tab-devices"));
+        const approvedRoot = path.join(context.root, "approved-execution"); await mkdir(approvedRoot);
+        const setup = { selector: '#device-execution details[data-details-key="device-execution-setup"] > summary', identity: { tag: "DETAILS", detailsKey: "device-execution-setup" } };
+        if (!await cdp.evaluate(`document.querySelector('#device-execution details[data-details-key="device-execution-setup"]')?.open`)) await click(setup);
+        await chooseFolder(action("device-execution-prepare"), approvedRoot);
+        await wait("One-time execution consent shows the chosen parent folder", execution,
+          p => p.review?.access_mode === "default" && sameFixtureFolder(p.review.directory, approvedRoot));
+        state.consent = true; await click(action("device-execution-enable"));
+        await wait("This PC's independent Runner is ready", execution, p => p.can_pause && p.review === null, 45000);
+        const runner = await state.runner.capture(runtime.desktop_process_id);
+        await page.locator('nav a[href="#shared-administration"]').click();
+        await page.locator('[data-sa-tab="projects"]').click();
+        await page.locator('[data-sa-operation="save_project"][data-sa-id=""]').click();
+        await page.locator("#shared-admin-label").fill("通常の共有チャット");
+        await page.locator(`input[name="controller_device_ids"][value="${enrolled.network.device_id}"]`).check();
+        await page.locator(`input[name="runner_device_ids"][value="${enrolled.network.device_id}"]`).check();
+        const readDraft = () => page.locator("#shared-admin-form").evaluate(form => Array.from(form.querySelectorAll("input,select,textarea"), node => ({
+          name: node.name, value: node.value, checked: node.type === "checkbox" ? node.checked : null,
+        })));
+        const projectDraft = await readDraft();
+        await page.locator("#shared-admin-save").click();
+        const saveResult = await wait("Hub saves the project or requests a current-state comparison", () => page.evaluate(() => ({
+          closed: !document.querySelector("#shared-admin-form"),
+          conflict: Boolean(document.querySelector("#shared-admin-review-conflict")?.getClientRects().length),
+          error: document.querySelector("#shared-admin-form-error")?.textContent?.trim() || "",
+        })), value => value.closed || value.conflict || Boolean(value.error));
+        if (saveResult.conflict) {
+          await page.locator("#shared-admin-review-conflict").click();
+          await page.locator("#shared-admin-accept-comparison").waitFor({ state: "visible" });
+          const comparison = await page.locator("#shared-admin-comparison").innerText();
+          if (!comparison.includes("通常の共有チャット")) throw fail("Hub comparison lost the intended project", { comparison });
+          await page.locator("#shared-admin-accept-comparison").click();
+          if (JSON.stringify(await readDraft()) !== JSON.stringify(projectDraft)) throw fail("Hub comparison changed the project draft");
+          await sink.record("shared-conversation-project-conflict-reviewed", { comparison, draft_preserved: true }, { phase: "executing", owner: OWNER });
+          await page.locator("#shared-admin-save").click();
+        } else if (saveResult.error) throw fail("Hub rejected the project form", saveResult);
+        await page.locator("#shared-admin-form").waitFor({ state: "detached" });
+        const projectId = await page.locator(".shared-admin-row").filter({ has: page.getByRole("heading", { name: "通常の共有チャット", exact: true }) })
+          .locator('[data-sa-operation="save_project"]').getAttribute("data-sa-id");
+        if (!projectId) throw fail("Hub did not return the created project identity");
+        const assigned = await wait("Hub assigns this PC's exact project environment", execution,
+          p => p.projects.some(row => row.id === projectId && row.can_control && row.can_execute && row.environment_id), 60000);
+        const environmentId = assigned.projects.find(row => row.id === projectId).environment_id;
+        const projectFolder = path.join(context.paths.workspace, "shared-conversation"); await mkdir(projectFolder);
+        await chooseFolder(action("bind-project-folder"), projectFolder);
+        await wait("The chosen existing folder is bound to this project", execution,
+          p => p.projects.some(row => row.id === projectId && row.environment_id === environmentId
+            && row.preparation_state === "ready" && sameFixtureFolder(row.directory, projectFolder)), 60000);
+        const operations = (await state.runner.command(["operations", "--runner", runner.identity.runner_id])).projection;
+        if (!sameFixtureFolder(operations.environments.find(row => row.environment_id === environmentId)?.directory, projectFolder))
+          throw fail("The independent Runner did not adopt the chosen project folder");
+        await click(hubSettingsCloseTarget);
+        await wait("The ordinary shell is visible", () => invokeDesktopCommand(cdp, "desktop_state"), p => p.overlay === "none");
+        await wait("The assigned Hub project appears in the ordinary sidebar", shared, p => p.projects.some(row => row.id === projectId && row.can_submit));
+        await click({ selector: `.sidebar button[data-action="open-hub-project"][data-value=${JSON.stringify(projectId)}]`, identity: { tag: "BUTTON", action: "open-hub-project" } });
+        if (await cdp.evaluate(`Boolean(document.querySelector('#shared-environment, #shared-title, #shared-job-kind'))`))
+          throw fail("The shared chat still asks the person to choose a PC, title or job type");
+        await fill(byId("shared-prompt", "TEXTAREA"), "desktop-conversation-start: このプロジェクトで短く答えてください。");
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-before-send", owner: OWNER });
+        await click(sharedActionTarget("submit"));
+        const first = await wait("Ordinary Send creates one Hub job and completes it", shared,
+          p => p.detail?.state === "succeeded" || p.error, 60000);
+        if (first.error || !first.detail?.id || !first.detail.conversation_id) throw fail("Common Send did not create a Hub job", { error: first.error, detail: first.detail });
+        const firstJobId = first.detail.id, conversationId = first.detail.conversation_id;
+        await wait("First request and result appear in the same ordinary chat", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
+          text => text?.includes("desktop-conversation-start") && text.includes("最初の依頼をこのプロジェクトで実行しました。"));
+        await fill(byId("shared-followup", "TEXTAREA"), "desktop-conversation-followup: 同じ会話で続けてください。");
+        await click(sharedActionTarget("continue"));
+        const second = await wait("Additional Send creates a later turn in the same Hub conversation", shared,
+          p => p.detail?.id !== firstJobId && (p.detail?.state === "succeeded" || p.error), 60000);
+        if (second.error || second.detail?.conversation_id !== conversationId) throw fail("Follow-up left the original conversation", { error: second.error, detail: second.detail, conversationId });
+        await wait("Both user turns and answers remain readable", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
+          text => text?.includes("desktop-conversation-start") && text.includes("desktop-conversation-followup")
+            && text.includes("最初の依頼をこのプロジェクトで実行しました。") && text.includes("追加の依頼にも、同じ共有チャットで回答しました。"));
+        await fill(byId("shared-followup", "TEXTAREA"), "desktop-conversation-stop: この依頼を実行中に停止してください。");
+        await click(sharedActionTarget("continue"));
+        const stopping = await wait("The latest job exposes Stop while the provider is still working", shared,
+          p => p.detail?.id !== second.detail.id && p.status?.jobs?.some(job => job.id === p.detail?.id && job.can_cancel)
+            && state.provider.requests.some(request =>
+            JSON.stringify(request.messages?.filter(message => message.role === "user")).includes("desktop-conversation-stop")), 60000);
+        const stoppedJobId = stopping.detail.id;
+        await wait("This PC shows the received work while it is running", () => cdp.evaluate(`Boolean(document.querySelector('section.receiver-activity'))`),
+          visible => visible === true, 15000);
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-running-stop", owner: OWNER });
+        await click(sharedActionTarget("cancel", stoppedJobId));
+        const stopped = await wait("Stop has settled and the latest message can be edited", shared,
+          p => p.detail?.id === stoppedJobId && p.detail.state === "cancelled" && p.detail.can_revise, 60000);
+        if (stopped.detail.conversation_id !== conversationId) throw fail("Stop left the shared conversation", { stoppedJobId, conversationId });
+        await click(sharedActionTarget("start-revise", stoppedJobId));
+        await wait("The latest stopped message opens in the ordinary editor", () => cdp.evaluate(`({
+          input: Boolean(document.querySelector('#shared-revise-prompt')),
+          warning: document.querySelector('[data-shared-region="revision-editor"]')?.innerText || ''
+        })`), value => value.input && value.warning.includes("作成済みのファイルや起動中のアプリは元に戻りません"));
+        await fill(byId("shared-revise-prompt", "TEXTAREA"), "desktop-conversation-revised: 停止した最新の依頼を修正して回答してください。");
+        await click(sharedActionTarget("save-revise"));
+        const revised = await wait("Resend creates a new job in the same conversation", shared,
+          p => p.detail?.id !== stoppedJobId && (p.detail?.state === "succeeded" || p.error), 60000);
+        if (revised.error || revised.detail?.conversation_id !== conversationId || revised.detail?.revises_job_id !== stoppedJobId)
+          throw fail("The edited latest message did not create the expected conversation revision", { error: revised.error,
+            detail: revised.detail, conversationId, stoppedJobId });
+        await wait("The revised answer and prior turns stay readable", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
+          text => text?.includes("desktop-conversation-start") && text.includes("desktop-conversation-followup")
+            && text.includes("編集後の依頼をこのプロジェクトで実行しました。") && text.includes("編集前の依頼"));
+        await wait("The Runner releases this PC after the revised work finishes", () => invokeDesktopCommand(cdp, "receiver_activity_projection"),
+          p => !p.unavailable && p.attempts.length === 0 && p.retained_services.length === 0, 30000);
+        await wait("The actual chat clears its receiver-use banner", () => cdp.evaluate(`Boolean(document.querySelector('section.receiver-activity'))`),
+          visible => visible === false, 15000);
+        if (state.provider.failures.length) throw fail("The provider fixture rejected the current agent route", { failures: state.provider.failures });
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-stop-edit-result", owner: OWNER });
+        await sink.record("shared-conversation-continuation-complete", { project_id: projectId, environment_id: environmentId,
+          folder: projectFolder, first_job_id: firstJobId, second_job_id: second.detail.id, conversation_id: conversationId,
+          stopped_job_id: stoppedJobId, revised_job_id: revised.detail.id, provider_calls: state.provider.requests.length,
+          scope: "One Windows PC with actual Tauri Desktop, independent Runner, Hub and GUI picker. Physical WinB is not exercised." },
+          { phase: "executing", owner: OWNER });
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
-        await sink.record("shared-continuation-failure-state", { desktop: await invokeDesktopCommand(cdp, "desktop_state"), shared: await projection() }, { phase: "executing", owner: OWNER }).catch(() => {});
+        await sink.record("shared-continuation-failure-state", { desktop: await invokeDesktopCommand(cdp, "desktop_state"), shared: await shared(),
+          execution: await execution(), receiver: await invokeDesktopCommand(cdp, "receiver_activity_projection") },
+          { phase: "executing", owner: OWNER }).catch(() => {});
         await captureScenarioScreenshot({ cdp, sink, name: "shared-continuation-failure", owner: OWNER }).catch(() => {});
-        await state.resource.screenshot("shared-hub-continuation-failure").catch(() => {}); throw error;
-      }
-      finally { await settleInput(); }
+        if (state.consent && !state.runner?.identity) await state.runner.capture(runtime.desktop_process_id).catch(() => {});
+        throw error;
+      } finally { await settleInput(); }
     },
-    async quiesce() {
-      await settleInput();
-      if (!state.close) {
-        const runner = state.runner ? await state.runner.close() : { pass: true };
-        await state.provider?.close();
-        const sqlite = state.primaryContext ? await auditClosedSqlite({ executionRoot: state.primaryContext.root, database: state.primaryContext.paths.database, required: true }) : { pass: true };
-        const hub = state.resource ? await state.resource.close() : { pass: true };
-        state.close = { pass: runner.pass && sqlite.pass && hub.pass, runner, sqlite, hub };
-      }
-      return { input: state.close.pass ? "pass" : "fail", resources: [{ kind: ID, ...state.close }] };
-    },
+    async quiesce() { await settleInput(); state.close ??= await quiesceDeviceExecutionResources(state);
+      return { input: state.close.pass ? "pass" : "fail", resources: [{ kind: ID, ...state.close }] }; },
     async cleanup() { return { input: state.close?.pass ? "pass" : "fail", resources: [] }; },
   });
 }

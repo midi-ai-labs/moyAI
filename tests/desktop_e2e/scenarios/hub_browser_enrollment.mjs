@@ -56,6 +56,18 @@ export async function trustedFocus(input, cdp, target) {
   // Completed histories can contain more than 100 controls. Allow one traversal
   // of the current document's potential tab stops, plus browser/reentry steps.
   const navigationBudget = await cdp.evaluate(`document.querySelectorAll('a[href],button,input,select,textarea,summary,iframe,[tabindex],[contenteditable]').length + 4`);
+  // A just-edited option can be after the message box in DOM order. Walk back
+  // toward that visible field instead of cycling through every later control.
+  const reverse = await cdp.evaluate(`(() => {
+    const target = document.querySelectorAll(${JSON.stringify(target.selector)})[0];
+    const active = document.activeElement;
+    return Boolean(active && active !== target && (active.compareDocumentPosition?.(target) & 2));
+  })()`);
+  async function pressTab() {
+    if (!reverse) return input.pressKey("Tab");
+    await input.keyDown("Shift");
+    try { await input.pressKey("Tab"); } finally { await input.keyUp("Shift"); }
+  }
   let focused = false, reentered = false;
   for (let count = 0; count <= navigationBudget; ++count) {
     const observation = await cdp.evaluate(`(() => { const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
@@ -77,7 +89,7 @@ export async function trustedFocus(input, cdp, target) {
       focused = true; break;
     }
     if (count === navigationBudget) break;
-    await input.pressKey("Tab");
+    await pressTab();
   }
   if (!focused) throw new DesktopE2eError("harness", "hub-browser-focus-unreachable", "Desktop control cannot be reached by keyboard", { target, navigationBudget });
 }

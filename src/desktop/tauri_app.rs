@@ -21,7 +21,9 @@ use crate::hub::{
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
 use crate::mcp_publish::{PublishProfileId, PublishService};
 use crate::protocol::TurnId;
-use crate::session::{ActiveTurnExpectation, SessionId, SessionSettingsPatch, SessionSpawnEdge};
+use crate::session::{
+    ActiveTurnExpectation, ProjectId, SessionId, SessionSettingsPatch, SessionSpawnEdge,
+};
 use crate::tool::shell::ManagedShells;
 
 use super::app::{
@@ -59,6 +61,7 @@ macro_rules! desktop_command_manifest {
         $consumer! {
             desktop_state,
             submit_prompt,
+            prepare_latest_message_edit,
             cancel_run,
             ensure_side_chat,
             capture_side_chat_direct_provider,
@@ -112,8 +115,15 @@ macro_rules! desktop_command_manifest {
             show_shared_work,
             shared_work_projection,
             shared_work_command,
+            browse_shared_project_folder,
             device_execution_projection,
             device_execution_command,
+            receiver_activity_projection,
+            receiver_activity_stop,
+            receiver_service_stop,
+            origin_work_projection,
+            origin_work_stop_apps,
+            origin_work_stop_all,
             hub_projection,
             hub_connect,
             hub_refresh,
@@ -398,31 +408,38 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .with_file_name("hub-settings.json");
     let hub_connection = HubConnection::new(HubSettingsStore::new(hub_path));
     controller.state.hub_connection = Some(hub_connection.clone());
-    let publish_path = crate::config::loader::global_config_path()
-        .map_err(|_| {
-            AppRunError::Message("failed to resolve MCP publish settings directory".into())
-        })?
-        .with_file_name("mcp-publish.json");
-    let remote_jobs =
-        crate::remote_agent::RemoteJobService::new(controller.app.process_runtime.clone())
-            .map_err(|error| AppRunError::Message(error.to_string()))?;
-    let mcp_publish = PublishService::new(
-        publish_path,
-        controller.app.store.clone(),
-        controller.app.config.clone(),
-    )
-    .with_remote_jobs(remote_jobs.clone());
+    let (remote_jobs, mcp_publish, device_network) =
+        if let Some(device_network) = controller.app.device_network.clone() {
+            (
+                device_network.remote_jobs(),
+                device_network.publish_service(),
+                device_network,
+            )
+        } else {
+            // Initial setup has no saved Hub binding yet. Create the same process
+            // owner here so importing a join file can attach it to this store.
+            let config_path = crate::config::loader::global_config_path().map_err(|_| {
+                AppRunError::Message("failed to resolve device settings directory".into())
+            })?;
+            let remote_jobs =
+                crate::remote_agent::RemoteJobService::new(controller.app.process_runtime.clone())
+                    .map_err(|error| AppRunError::Message(error.to_string()))?;
+            let mcp_publish = PublishService::new(
+                config_path.with_file_name("mcp-publish.json"),
+                controller.app.store.clone(),
+                controller.app.config.clone(),
+            )
+            .with_remote_jobs(remote_jobs.clone());
+            let device_network = DeviceNetworkService::new(
+                config_path.with_file_name("device-network"),
+                controller.app.store.clone(),
+                controller.state.global_config().clone(),
+                remote_jobs.clone(),
+                mcp_publish.clone(),
+            );
+            (remote_jobs, mcp_publish, device_network)
+        };
     controller.state.mcp_publish = Some(mcp_publish.clone());
-    let network_directory = crate::config::loader::global_config_path()
-        .map_err(|_| AppRunError::Message("failed to resolve device settings directory".into()))?
-        .with_file_name("device-network");
-    let device_network = DeviceNetworkService::new(
-        network_directory,
-        controller.app.store.clone(),
-        controller.state.global_config().clone(),
-        remote_jobs.clone(),
-        mcp_publish.clone(),
-    );
     device_network.attach_hub_connection(hub_connection.clone());
     hub_connection.attach_device_network(device_network.downgrade());
     controller.state.device_network = Some(device_network.clone());
@@ -1776,6 +1793,121 @@ async fn submit_prompt(
     .await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreparedMessageEdit {
+    state: DesktopWebState,
+    forked_session_id: String,
+    editable_text: String,
+}
+
+#[tauri::command]
+async fn prepare_latest_message_edit(
+    controller: State<'_, SharedController>,
+    expected_run_target: DesktopRunMutationTarget,
+    expected_history_item_id: String,
+) -> Result<PreparedMessageEdit, DesktopCommandError> {
+    let (session_service, source_session_id, expected_turn_id, expected_revision) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let result = (|| {
+            ensure_stable_view_admission(&controller, "message editing")?;
+            if controller.state.view.hub_project_open {
+                return Err(DesktopCommandConflict::new(
+                    "open a local chat before editing its last message",
+                ));
+            }
+            let ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_id),
+                revision,
+            } = ensure_run_mutation_target(&controller, &expected_run_target)?
+            else {
+                return Err(DesktopCommandConflict::new(
+                    "stop the current task before editing its last message",
+                ));
+            };
+            let session_id = controller
+                .state
+                .app_state
+                .current_session_id
+                .ok_or_else(|| DesktopCommandConflict::new("select the chat to edit first"))?;
+            if controller.state.selected_session_id() != Some(session_id)
+                || controller
+                    .state
+                    .selected_detail()
+                    .transcript_rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.row_kind == super::models::DesktopTranscriptRowKind::User)
+                    .and_then(|row| row.stable_history_identity.as_deref())
+                    != Some(expected_history_item_id.as_str())
+            {
+                return Err(DesktopCommandConflict::new(
+                    "the message changed; reopen the latest chat and try again",
+                ));
+            }
+            Ok((
+                controller.app.session_service.clone(),
+                session_id,
+                turn_id,
+                revision,
+            ))
+        })();
+        result.map_err(|conflict| command_conflict_error(&mut controller, conflict))?
+    };
+
+    let prepared = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to start the message edit worker: {error}"))?;
+        runtime
+            .block_on(session_service.fork_latest_turn_for_edit(
+                source_session_id,
+                expected_turn_id,
+                expected_revision,
+            ))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| DesktopCommandError::storage(error.to_string()))?
+    .map_err(DesktopCommandError::storage)?;
+
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let result = (|| {
+        ensure_stable_view_admission(&controller, "message editing")?;
+        if controller.state.view.hub_project_open
+            || controller.state.selected_session_id() != Some(source_session_id)
+            || ensure_run_mutation_target(&controller, &expected_run_target)?
+                != (ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(expected_turn_id),
+                    revision: expected_revision,
+                })
+            || prepared.source_session.id != source_session_id
+            || prepared.forked_session.project_id != controller.app.workspace.project_id
+        {
+            return Err(DesktopCommandConflict::new(
+                "the chat changed while preparing the edit; open the new draft chat from the sidebar",
+            ));
+        }
+        if !controller.open_created_edit_fork(prepared.forked_session.id) {
+            return Err(DesktopCommandConflict::new(
+                "the new draft chat could not be opened",
+            ));
+        }
+        Ok(())
+    })();
+    result.map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+    Ok(PreparedMessageEdit {
+        state: controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        forked_session_id: prepared.forked_session.id.to_string(),
+        editable_text: prepared.editable_text,
+    })
+}
+
 #[tauri::command]
 async fn cancel_run(
     controller: State<'_, SharedController>,
@@ -2987,9 +3119,29 @@ async fn unarchive_session(
 #[tauri::command]
 async fn rollback_session(
     controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::Session,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let session_id =
+            validated_session_id(&controller, index).map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), session_id)
+    };
+    guard_origin_chat_deletion(&app, &service, session_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -3142,6 +3294,25 @@ async fn delete_project(
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, project_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::Project,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let project_id =
+            validated_project_id(&controller, index).map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), project_id)
+    };
+    guard_origin_project_deletion(&app, project_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -3161,12 +3332,72 @@ async fn delete_project(
     .await
 }
 
+async fn guard_origin_project_deletion(app: &App, project_id: ProjectId) -> Result<(), String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("プロジェクトの会話を確認できません: {error}"))?;
+        runtime
+            .block_on(
+                app.session_service
+                    .guard_origin_project_history_mutation(project_id),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("プロジェクトの会話を確認できません: {error}"))?
+}
+
+async fn guard_origin_chat_deletion(
+    app: &App,
+    _service: &DeviceNetworkService,
+    session_id: SessionId,
+) -> Result<(), String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("会話の履歴を確認できません: {error}"))?;
+        runtime
+            .block_on(
+                app.session_service
+                    .guard_origin_history_mutation(session_id),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("会話の履歴を確認できません: {error}"))?
+}
+
 #[tauri::command]
 async fn delete_session(
     controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::Session,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let session_id =
+            validated_session_id(&controller, index).map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), session_id)
+    };
+    guard_origin_chat_deletion(&app, &service, session_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -3186,9 +3417,29 @@ async fn delete_session(
 #[tauri::command]
 async fn delete_chat_session(
     controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::QuickChatSession,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let session_id = validated_quick_chat_session_id(&controller, index)
+            .map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), session_id)
+    };
+    guard_origin_chat_deletion(&app, &service, session_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -3534,6 +3785,24 @@ async fn shared_work_command(
 }
 
 #[tauri::command]
+async fn browse_shared_project_folder() -> Result<Option<String>, String> {
+    let selected = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("このPCで使うプロジェクトのフォルダーを選択")
+            .pick_folder()
+    })
+    .await
+    .map_err(|_| "フォルダーを選択できません。".to_string())?;
+    selected
+        .map(|path| {
+            camino::Utf8PathBuf::from_path_buf(path)
+                .map(|path| path.to_string())
+                .map_err(|_| "フォルダーのパスを読み取れません。".to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
 async fn show_hub_editor(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
@@ -3559,6 +3828,193 @@ async fn device_execution_command(
     request: crate::device_network::DeviceExecutionCommand,
 ) -> Result<crate::device_network::DeviceExecutionProjection, String> {
     Ok(service.execution_command(&expected_revision, request).await)
+}
+
+#[tauri::command]
+async fn receiver_activity_projection(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::ReceiverActivityProjection, String> {
+    Ok(service.receiver_activity_projection())
+}
+
+#[tauri::command]
+async fn receiver_activity_stop(
+    service: State<'_, DeviceNetworkService>,
+    target: crate::device_network::ReceiverStopTarget,
+) -> Result<crate::device_network::ReceiverActivityProjection, String> {
+    service.stop_receiver_attempt(target).await
+}
+
+#[tauri::command]
+async fn receiver_service_stop(
+    service: State<'_, DeviceNetworkService>,
+    target: crate::device_network::ReceiverServiceStopTarget,
+) -> Result<crate::device_network::ReceiverActivityProjection, String> {
+    service.stop_receiver_service(target).await
+}
+
+async fn validate_current_origin(
+    controller: &SharedController,
+    expected_target: &DesktopDraftActionTarget,
+) -> Result<String, String> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_draft_action_target(&controller, expected_target)
+        .map_err(|conflict| conflict.message)?;
+    let origin = expected_target
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "先に会話を開いてください。".to_string())?;
+    let parsed = origin
+        .parse::<SessionId>()
+        .map_err(|_| "会話の識別子を確認できません。".to_string())?;
+    if parsed.to_string() != origin {
+        return Err("会話の識別子を確認できません。".into());
+    }
+    Ok(origin.to_owned())
+}
+
+fn origin_full_stop_revision(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| *revision > 0 && revision.to_string() == value)
+        .ok_or_else(|| "会話の実行状態を確認できません。更新してください。".to_string())
+}
+
+fn origin_full_stop_local_target(
+    can_cancel_run: bool,
+    current: Option<&DesktopStopMutationTarget>,
+    expected: Option<&DesktopStopMutationTarget>,
+) -> Result<Option<DesktopStopMutationTarget>, String> {
+    if !can_cancel_run {
+        return Ok(None);
+    }
+    let expected = expected
+        .ok_or_else(|| "実行状態が変わりました。更新してから停止してください。".to_string())?;
+    if current != Some(expected) {
+        return Err("実行状態が変わりました。更新してから停止してください。".into());
+    }
+    Ok(Some(expected.clone()))
+}
+
+#[tauri::command]
+async fn origin_work_projection(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<crate::device_network::OriginWorkProjection, String> {
+    let origin = validate_current_origin(&controller, &expected_target).await?;
+    let projection = service.origin_work(&origin).await?;
+    validate_current_origin(&controller, &expected_target).await?;
+    Ok(projection)
+}
+
+fn origin_app_stop_targets(
+    projection: &crate::device_network::OriginWorkProjection,
+    expected_service_ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    use std::collections::BTreeSet;
+    if expected_service_ids.is_empty() || expected_service_ids.len() > 4096 {
+        return Err("停止対象のアプリを確認できません。更新してください。".into());
+    }
+    let expected: BTreeSet<_> = expected_service_ids.iter().collect();
+    let current: BTreeSet<_> = projection
+        .retained_services
+        .iter()
+        .map(|row| &row.service.service_id)
+        .collect();
+    if expected.len() != expected_service_ids.len() || expected != current {
+        return Err("アプリの状態が変わりました。更新してから停止してください。".into());
+    }
+    let mut conversations = BTreeSet::new();
+    for row in &projection.retained_services {
+        if !row.service.can_stop || row.service.uncertain {
+            return Err("停止できないアプリがあります。状態と権限を確認してください。".into());
+        }
+        if !row.service.stop_requested {
+            conversations.insert((row.project_id.clone(), row.service.conversation_id.clone()));
+        }
+    }
+    if conversations.is_empty() {
+        return Err("停止を要求できるアプリはありません。状態を更新してください。".into());
+    }
+    Ok(conversations.into_iter().collect())
+}
+
+#[tauri::command]
+async fn origin_work_stop_apps(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_target: DesktopDraftActionTarget,
+    expected_service_ids: Vec<String>,
+) -> Result<crate::device_network::OriginWorkProjection, String> {
+    let origin = validate_current_origin(&controller, &expected_target).await?;
+    let projection = service.origin_work(&origin).await?;
+    validate_current_origin(&controller, &expected_target).await?;
+    let conversations = origin_app_stop_targets(&projection, &expected_service_ids)?;
+    for (project_id, conversation_id) in conversations {
+        validate_current_origin(&controller, &expected_target).await?;
+        service
+            .agent_stop_conversation(
+                &ulid::Ulid::new().to_string(),
+                &project_id,
+                &conversation_id,
+                || Ok(()),
+            )
+            .await?;
+    }
+    validate_current_origin(&controller, &expected_target).await?;
+    service.origin_work(&origin).await
+}
+
+#[tauri::command]
+async fn origin_work_stop_all(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_target: DesktopDraftActionTarget,
+    expected_admission_revision: String,
+    expected_stop_target: Option<DesktopStopMutationTarget>,
+) -> Result<crate::device_network::OriginWorkProjection, String> {
+    let revision = origin_full_stop_revision(&expected_admission_revision)?;
+    let origin = validate_current_origin(&controller, &expected_target).await?;
+    if service.origin_revision(&origin).await? != revision {
+        return Err("会話が更新されました。状態を確認してから停止してください。".into());
+    }
+    {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_draft_action_target(&controller, &expected_target)
+            .map_err(|conflict| conflict.message)?;
+        let view = controller.next_web_state()?;
+        let local_stop = origin_full_stop_local_target(
+            view.can_cancel_run,
+            view.stop_target.as_ref(),
+            expected_stop_target.as_ref(),
+        )?
+        .map(|stop_target| {
+            ensure_stop_mutation_target(&controller, &stop_target)
+                .map_err(|conflict| conflict.message)
+        })
+        .transpose()?;
+        // Keep the exact Desktop target locked from final validation through
+        // the durable remote receipt and local Stop admission.
+        if !service.queue_origin_conversation_stop(&origin, revision)? {
+            return Err(
+                "Hubへの接続情報を確認できません。接続を回復してから停止してください。".into(),
+            );
+        }
+        if let Some(admission) = local_stop {
+            apply_stop_admission(&mut controller, admission).map_err(|conflict| {
+                format!(
+                    "Hubへの停止要求は保存しました。現在の回答の停止は確認できません: {}",
+                    conflict.message
+                )
+            })?;
+        }
+    }
+    service.agent_retry_origin_turn_stops().await?;
+    service.origin_work(&origin).await
 }
 
 #[tauri::command]
@@ -4012,7 +4468,7 @@ async fn device_network_import(
     expected_revision: String,
     expected_generation: String,
 ) -> Result<DeviceNetworkProjection, String> {
-    let (start, target, current, registered) = {
+    let (start, target, current, registered, initial_setup_generation) = {
         let mut controller = controller.lock().await;
         controller.drain_runtime_messages();
         ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
@@ -4038,6 +4494,13 @@ async fn device_network_import(
             target,
             controller.state.global_config().device_network.clone(),
             service.projection_now().device_id.is_some(),
+            hub_import_completes_initial_setup(
+                controller.state.startup.requires_initial_setup(),
+                controller.state.view.overlay,
+                controller.state.view.hub_project_open,
+                controller.state.startup.onboarding_intent,
+            )
+            .then_some(controller.state.startup.setup_generation),
         )
     };
     let Some(shared) = pick_shared_hub_config(start).await? else {
@@ -4059,6 +4522,17 @@ async fn device_network_import(
         "connection_changed"
     };
     ensure_config_mutation_target(&controller, &target).map_err(|_| changed)?;
+    if initial_setup_generation.is_some_and(|generation| {
+        generation != controller.state.startup.setup_generation
+            || !hub_import_completes_initial_setup(
+                controller.state.startup.requires_initial_setup(),
+                controller.state.view.overlay,
+                controller.state.view.hub_project_open,
+                controller.state.startup.onboarding_intent,
+            )
+    }) {
+        return Err(changed.into());
+    }
     ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
         .map_err(|_| changed)?;
     service
@@ -4074,7 +4548,7 @@ async fn device_network_import(
     let result = service
         .commit_configuration(prepared, |saved| {
             controller
-                .save_device_network_config(saved, false)
+                .save_device_network_config(saved, initial_setup_generation.is_some())
                 .map_err(|error| {
                     persist_error = Some(error);
                     crate::device_network::DeviceError::Storage
@@ -4095,14 +4569,50 @@ async fn device_network_import(
         }
     })?;
     service.update_runtime_config(controller.state.global_config().clone());
+    let return_to_shared_work = controller.state.view.hub_project_open
+        && controller.state.view.overlay == DesktopOverlay::None;
+    let completion_error = if initial_setup_generation.is_some() {
+        let result = controller.finish_initial_setup_after_device_network_persist();
+        if result.is_ok() {
+            if return_to_shared_work {
+                controller.state.show_shared_work();
+            }
+            service.enable_default_model_on_join();
+        }
+        result.err()
+    } else {
+        None
+    };
     drop(controller);
     if endpoint_changed {
         service.reconnect_model_after_endpoint_change().await;
     }
-    service
+    let joined = service
         .request_join(&result.revision, &result.generation)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    if completion_error.is_some() {
+        return Err("接続情報は保存済みです。初回設定の完了状態を保存できませんでした。設定の保存先を確認し、同じ接続ファイルを読み込み直してください。".into());
+    }
+    joined
+}
+
+fn hub_import_completes_initial_setup(
+    required: bool,
+    overlay: DesktopOverlay,
+    hub_project_open: bool,
+    intent: Option<super::preferences::DesktopOnboardingIntent>,
+) -> bool {
+    use super::preferences::DesktopOnboardingIntent::{Execution, Team};
+    required
+        && match intent {
+            Some(Execution) => overlay == DesktopOverlay::HubConnection,
+            Some(Team) => {
+                overlay == DesktopOverlay::HubConnection
+                    || (overlay == DesktopOverlay::None && hub_project_open)
+            }
+            _ => false,
+        }
 }
 
 #[tauri::command]
@@ -6185,6 +6695,131 @@ mod tests {
     use super::*;
 
     const TEST_ADMISSION_REVISION: u64 = 7;
+
+    #[test]
+    fn origin_full_stop_requires_canonical_revision_and_exact_live_local_target() {
+        let session_id = SessionId::new();
+        let exact = DesktopStopMutationTarget::Turn {
+            workspace_path: "C:/workspace".into(),
+            session_id: session_id.to_string(),
+            turn_id: TurnId::new().to_string(),
+            admission_revision: "7".into(),
+            root_epoch: "2".into(),
+        };
+        let different = DesktopStopMutationTarget::Turn {
+            workspace_path: "C:/workspace".into(),
+            session_id: session_id.to_string(),
+            turn_id: TurnId::new().to_string(),
+            admission_revision: "7".into(),
+            root_epoch: "2".into(),
+        };
+        assert_eq!(origin_full_stop_revision("7"), Ok(7));
+        for value in ["0", "07", "-1", "18446744073709551616"] {
+            assert!(origin_full_stop_revision(value).is_err());
+        }
+        assert!(origin_full_stop_local_target(true, Some(&exact), None).is_err());
+        assert!(origin_full_stop_local_target(true, Some(&exact), Some(&different)).is_err());
+        assert_eq!(
+            origin_full_stop_local_target(true, Some(&exact), Some(&exact)),
+            Ok(Some(exact.clone()))
+        );
+        assert_eq!(
+            origin_full_stop_local_target(false, None, Some(&different)),
+            Ok(None),
+            "a completed local turn must not block the exact remote Stop"
+        );
+    }
+
+    #[test]
+    fn first_use_hub_import_finishes_only_the_selected_team_or_execution_surface() {
+        use super::super::preferences::DesktopOnboardingIntent::{Execution, Personal, Team};
+
+        assert!(hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Execution)
+        ));
+        assert!(hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Team)
+        ));
+        assert!(hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::None,
+            true,
+            Some(Team)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Personal)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::InitialSetup,
+            false,
+            Some(Execution)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::None,
+            false,
+            Some(Team)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::None,
+            true,
+            Some(Execution)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            false,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Execution)
+        ));
+    }
+
+    #[test]
+    fn origin_app_stop_requires_the_exact_current_set_and_permission() {
+        let projection: crate::device_network::OriginWorkProjection = serde_json::from_value(
+            serde_json::json!({
+                "origin_session_ref":"local-session-a","jobs":[],"observed_at_ms":42,"admission_revision":"7",
+                "retained_services":[
+                    {"project_id":"project-a","service":{"service_id":"service-a",
+                        "conversation_id":"conversation-a","environment_id":"env-a",
+                        "expires_at_ms":100,"stop_requested":false,"uncertain":false,"can_stop":true}},
+                    {"project_id":"project-a","service":{"service_id":"service-b",
+                        "conversation_id":"conversation-a","environment_id":"env-a",
+                        "expires_at_ms":100,"stop_requested":false,"uncertain":false,"can_stop":true}}
+                ]
+            }),
+        )
+        .expect("typed origin projection");
+        let expected = vec!["service-b".to_string(), "service-a".to_string()];
+        assert_eq!(
+            origin_app_stop_targets(&projection, &expected).expect("exact target"),
+            vec![("project-a".into(), "conversation-a".into())]
+        );
+        assert!(origin_app_stop_targets(&projection, &["service-a".into()]).is_err());
+        assert!(
+            origin_app_stop_targets(&projection, &["service-a".into(), "service-a".into()])
+                .is_err()
+        );
+        let mut one_pending = projection.clone();
+        one_pending.retained_services[0].service.stop_requested = true;
+        assert_eq!(
+            origin_app_stop_targets(&one_pending, &expected).expect("other app still stoppable"),
+            vec![("project-a".into(), "conversation-a".into())]
+        );
+        let mut denied = projection;
+        denied.retained_services[1].service.can_stop = false;
+        assert!(origin_app_stop_targets(&denied, &expected).is_err());
+    }
 
     fn root_receipt(
         session_id: SessionId,

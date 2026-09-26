@@ -17,8 +17,8 @@ use crate::session::{
     CanonicalSessionRead, CanonicalSessionSnapshot, CanonicalTurnPage, DurableTurnTerminal,
     IdleTurnAdmission, IdleTurnRejectionReason, LoadedSessionList, LoadedSessionStatus,
     LoadedSessionSummary, NewSession, ProjectId, ProjectRecord, ProjectRepository, RunEvent,
-    RunningSessionRejoin, SessionContext, SessionForkResult, SessionId, SessionRecord,
-    SessionRepository, SessionRollbackResult, SessionSelector, SessionSettingsPatch,
+    RunningSessionRejoin, SessionContext, SessionEditForkResult, SessionForkResult, SessionId,
+    SessionRecord, SessionRepository, SessionRollbackResult, SessionSelector, SessionSettingsPatch,
     SessionSettingsUpdate, SessionStartRequest, SessionStatus, SessionTitleUpdate,
 };
 #[cfg(test)]
@@ -88,13 +88,19 @@ impl SessionService {
             crate::workspace::VcsKind::Git => "git",
             crate::workspace::VcsKind::None => "none",
         };
-        let workspace_cwd = normalize_session_cwd_for_project(
+        let normalize_cwd = match request.selector {
+            SessionSelector::New => normalize_session_cwd_for_project,
+            SessionSelector::ById(_) | SessionSelector::Latest => {
+                normalize_stored_session_cwd_for_project
+            }
+        };
+        let workspace_cwd = normalize_cwd(
             &workspace.root,
             workspace.project_id,
             project_vcs_kind,
             workspace.authority_root(),
         )?;
-        let requested_cwd = normalize_session_cwd_for_project(
+        let requested_cwd = normalize_cwd(
             &workspace.root,
             workspace.project_id,
             project_vcs_kind,
@@ -971,7 +977,7 @@ impl SessionService {
             .project_repo()
             .get_project(session.project_id)
             .await?;
-        session.cwd = normalize_session_cwd_for_project(
+        session.cwd = normalize_stored_session_cwd_for_project(
             &project.root_path,
             session.project_id,
             &project.vcs_kind,
@@ -1231,10 +1237,16 @@ impl SessionService {
                 "session {session_id} has active or pending agent-tree session {active_session_id}; stop the agent tree before rollback"
             )));
         }
+        let expected_revisions = self
+            .store
+            .session_repo()
+            .origin_history_revisions_for_session_tree(session_id, 10_000)?;
+        self.guard_origin_session_tree_history_mutation(session_id)
+            .await?;
         Ok(self
             .store
             .session_repo()
-            .rollback_session_transaction(session_id, num_turns)
+            .rollback_session_transaction_checked(session_id, num_turns, &expected_revisions)
             .await?)
     }
 
@@ -1257,6 +1269,40 @@ impl SessionService {
             .store
             .session_repo()
             .fork_session_snapshot(source_session_id, title)
+            .await?)
+    }
+
+    /// Start an edit from the history preceding the latest finished user turn. The
+    /// original chat remains an immutable record of the execution and its effects.
+    pub async fn fork_latest_turn_for_edit(
+        &self,
+        source_session_id: SessionId,
+        expected_turn_id: TurnId,
+        expected_admission_revision: u64,
+    ) -> Result<SessionEditForkResult, SessionError> {
+        if let Some(active_session_id) = self
+            .active_session_in_tree_branch(source_session_id)
+            .await?
+        {
+            return Err(SessionError::Message(format!(
+                "session {source_session_id} has active or pending agent-tree session {active_session_id}; stop it before editing"
+            )));
+        }
+        let expected_revisions = self
+            .store
+            .session_repo()
+            .origin_history_revisions_for_session_tree(source_session_id, 10_000)?;
+        self.guard_origin_session_tree_history_mutation(source_session_id)
+            .await?;
+        Ok(self
+            .store
+            .session_repo()
+            .fork_latest_turn_for_edit_checked(
+                source_session_id,
+                expected_turn_id,
+                expected_admission_revision,
+                &expected_revisions,
+            )
             .await?)
     }
 
@@ -1374,7 +1420,100 @@ impl SessionService {
                 "session {session_id} has active or pending agent-tree session {active_session_id}; stop the agent tree before deleting it"
             )));
         }
-        Ok(self.store.session_repo().delete_session(session_id).await?)
+        let expected_revisions = self
+            .store
+            .session_repo()
+            .origin_history_revisions_for_session_tree(session_id, 10_000)?;
+        self.guard_origin_session_tree_history_mutation(session_id)
+            .await?;
+        self.store
+            .session_repo()
+            .delete_session_tree_checked(session_id, &expected_revisions)
+            .await?;
+        Ok(())
+    }
+
+    async fn guard_origin_session_tree_history_mutation(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionError> {
+        for branch_session_id in self
+            .store
+            .session_repo()
+            .list_session_subtree_ids(session_id)
+            .await?
+        {
+            self.guard_origin_history_mutation(branch_session_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The canonical chat may be the only local trail for work retained on another PC.
+    /// Every caller (Desktop, TUI, CLI) must obtain a fresh Hub view before erasing it.
+    pub(crate) async fn guard_origin_history_mutation(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionError> {
+        let repository = self.store.session_repo();
+        if !repository.session_attempted_team_delegation(session_id)? {
+            return Ok(());
+        }
+        let network = self.store.device_network().ok_or_else(|| {
+            SessionError::Message(
+                "This chat used another PC; reconnect to Hub before changing its history".into(),
+            )
+        })?;
+        let origin = session_id.to_string();
+        if network
+            .origin_has_pending_submission(&origin)
+            .map_err(SessionError::Message)?
+        {
+            return Err(SessionError::Message(
+                "This chat has an unconfirmed PC request; confirm it before changing its history"
+                    .into(),
+            ));
+        }
+        let remote = network.origin_work(&origin).await.map_err(|error| {
+            SessionError::Message(format!(
+                "Hub could not confirm whether this chat still has work on another PC: {error}"
+            ))
+        })?;
+        let known_job_ids = repository.origin_delegated_job_ids(session_id)?;
+        Self::guard_origin_work_projection(&remote, &known_job_ids)
+    }
+
+    fn guard_origin_work_projection(
+        remote: &crate::device_network::OriginWorkProjection,
+        known_job_ids: &[String],
+    ) -> Result<(), SessionError> {
+        let visible_jobs = remote
+            .jobs
+            .iter()
+            .map(|row| row.job.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if known_job_ids
+            .iter()
+            .any(|job_id| !visible_jobs.contains(job_id.as_str()))
+        {
+            return Err(SessionError::Message(
+                "Hub no longer shows every PC request from this chat; restore access before changing its history"
+                    .into(),
+            ));
+        }
+        if remote.hidden_active_work
+            || remote.stop_pending
+            || !remote.retained_services.is_empty()
+            || remote
+                .jobs
+                .iter()
+                .any(|row| !matches!(row.job.state.as_str(), "succeeded" | "failed" | "cancelled"))
+        {
+            return Err(SessionError::Message(
+                "Stop and confirm this chat's work on other PCs before changing its history".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn active_session_in_tree_branch(
@@ -1419,7 +1558,31 @@ impl SessionService {
                 project_id, session_id
             )));
         }
-        Ok(self.store.project_repo().delete_project(project_id).await?)
+        let expected_revisions = self
+            .store
+            .session_repo()
+            .origin_history_revisions_for_project(project_id, 10_000)?;
+        self.guard_origin_project_history_mutation(project_id)
+            .await?;
+        Ok(self
+            .store
+            .project_repo()
+            .delete_project_checked(project_id, Some(&expected_revisions))
+            .await?)
+    }
+
+    pub(crate) async fn guard_origin_project_history_mutation(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), SessionError> {
+        for session_id in self
+            .store
+            .session_repo()
+            .project_session_ids_for_origin_guard(project_id, 10_000)?
+        {
+            self.guard_origin_history_mutation(session_id).await?;
+        }
+        Ok(())
     }
 
     pub async fn list_projects(&self, limit: usize) -> Result<Vec<ProjectRecord>, SessionError> {
@@ -1732,7 +1895,7 @@ fn loaded_status_from_session_status(status: SessionStatus) -> LoadedSessionStat
     }
 }
 
-pub(crate) fn normalize_session_cwd_for_project(
+pub(crate) fn normalize_stored_session_cwd_for_project(
     project_root: &Utf8Path,
     project_id: ProjectId,
     project_vcs_kind: &str,
@@ -1745,22 +1908,34 @@ pub(crate) fn normalize_session_cwd_for_project(
             "session workspace directory `{cwd}` is outside stored project root `{project_root}`"
         ))
     })?;
-    let normalized = project_root.join(relative);
     match project_vcs_kind {
-        "git" => {
-            let discovered = WorkspaceDiscovery::discover(&normalized, &ResolvedConfig::default())
-                .map_err(|error| SessionError::Message(error.to_string()))?;
-            if discovered.project_id != project_id {
-                return Err(SessionError::Message(format!(
-                    "session workspace directory `{cwd}` resolves to project {}, not stored project {project_id}",
-                    discovered.project_id
-                )));
-            }
-        }
-        "none" => {}
+        "git" | "none" => {}
         other => {
             return Err(SessionError::Message(format!(
                 "stored project {project_id} has unsupported vcs kind `{other}`"
+            )));
+        }
+    }
+    // A session owns its saved project identity even if its tools create or remove .git.
+    // Restore that identity without widening the selected cwd's workspace authority.
+    Ok(project_root.join(relative))
+}
+
+pub(crate) fn normalize_session_cwd_for_project(
+    project_root: &Utf8Path,
+    project_id: ProjectId,
+    project_vcs_kind: &str,
+    cwd: &Utf8Path,
+) -> Result<Utf8PathBuf, SessionError> {
+    let normalized =
+        normalize_stored_session_cwd_for_project(project_root, project_id, project_vcs_kind, cwd)?;
+    if project_vcs_kind == "git" {
+        let discovered = WorkspaceDiscovery::discover(&normalized, &ResolvedConfig::default())
+            .map_err(|error| SessionError::Message(error.to_string()))?;
+        if discovered.project_id != project_id {
+            return Err(SessionError::Message(format!(
+                "session workspace directory `{cwd}` resolves to project {}, not stored project {project_id}",
+                discovered.project_id
             )));
         }
     }
@@ -1919,6 +2094,91 @@ mod tests {
             )
             .await
             .expect("session")
+    }
+
+    #[tokio::test]
+    async fn delegated_chat_history_mutations_fail_closed_without_hub_on_every_surface() {
+        use sha2::{Digest, Sha256};
+
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let child = create_session(&service, &workspace).await;
+        let call = HistoryItemPayload::ToolCall {
+            call_id: crate::session::ToolCallId::new(),
+            response_id: crate::protocol::ModelResponseId::new(),
+            model_call_id: "delegate-call".into(),
+            tool_name: "team_delegate".into(),
+            arguments_json: "{}".into(),
+        };
+        let payload = serde_json::to_string(&call).unwrap();
+        let sha = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let database = workspace.root.parent().unwrap().join("data/moyai.sqlite3");
+        let connection = rusqlite::Connection::open(database.as_std_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_spawn_edges
+                 (root_session_id,parent_session_id,child_session_id,agent_path,task_name,spawn_order,created_at_ms)
+                 VALUES (?1,?1,?2,'/root/delegate','delegate',1,1)",
+                rusqlite::params![session.session.id.to_string(), child.session.id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id,session_id,scope_kind,turn_id,sequence_no,payload_json,payload_sha256,created_at_ms)
+                 VALUES (?1,?2,'turn',?3,0,?4,?5,1)",
+                rusqlite::params![
+                    ulid::Ulid::new().to_string(),
+                    child.session.id.to_string(),
+                    crate::protocol::TurnId::new().to_string(),
+                    payload,
+                    sha,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        for error in [
+            service
+                .rollback_session(session.session.id, 1)
+                .await
+                .unwrap_err()
+                .to_string(),
+            service
+                .fork_latest_turn_for_edit(session.session.id, TurnId::new(), 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+            service
+                .delete_session(session.session.id)
+                .await
+                .unwrap_err()
+                .to_string(),
+            service
+                .delete_project(workspace.project_id)
+                .await
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(error.contains("reconnect to Hub"), "{error}");
+        }
+    }
+
+    #[test]
+    fn origin_history_guard_rejects_hidden_or_missing_remote_work() {
+        let mut remote = crate::device_network::OriginWorkProjection {
+            origin_session_ref: "session-a".into(),
+            jobs: vec![],
+            retained_services: vec![],
+            observed_at_ms: 1,
+            admission_revision: "1".into(),
+            hidden_active_work: true,
+            stop_pending: false,
+            stop_error: None,
+        };
+        assert!(SessionService::guard_origin_work_projection(&remote, &[]).is_err());
+        remote.hidden_active_work = false;
+        assert!(SessionService::guard_origin_work_projection(&remote, &["job-a".into()]).is_err());
+        assert!(SessionService::guard_origin_work_projection(&remote, &[]).is_ok());
     }
 
     #[tokio::test]
@@ -2710,6 +2970,87 @@ mod tests {
             .expect("legacy resume")
             .expect("session");
         assert_eq!(resumed.cwd, workspace.root);
+    }
+
+    #[tokio::test]
+    async fn stored_git_session_survives_repository_initialization_in_its_cwd() {
+        let (service, parent, _) = service_fixture().await;
+        fs::create_dir_all(parent.root.join(".git")).expect("parent git");
+        let cwd = parent.root.join("application");
+        fs::create_dir_all(&cwd).expect("empty application folder");
+        let workspace = WorkspaceDiscovery::discover(&cwd, &ResolvedConfig::default())
+            .expect("workspace before git init");
+        service
+            .store
+            .project_repo()
+            .upsert_project(workspace.project_id, &workspace.root, "parent", "git")
+            .await
+            .expect("stored parent project");
+        let session = create_session(&service, &workspace).await.session;
+
+        fs::create_dir_all(cwd.join(".git")).expect("application git init");
+        let newly_discovered = WorkspaceDiscovery::discover(&cwd, &ResolvedConfig::default())
+            .expect("workspace after git init");
+        assert_ne!(newly_discovered.project_id, session.project_id);
+
+        let projected = service.get_session(session.id).await.expect("session read");
+        assert_eq!(projected.project_id, session.project_id);
+        assert_eq!(projected.cwd, cwd);
+        let latest = service
+            .latest_session(session.project_id)
+            .await
+            .expect("latest session read")
+            .expect("session");
+        assert_eq!(latest.id, session.id);
+        let canonical = service
+            .canonical_latest_session_snapshot(session.id, 10, 10)
+            .await
+            .expect("canonical read after git init");
+        assert_eq!(canonical.read.session.cwd, cwd);
+        for selector in [SessionSelector::ById(session.id), SessionSelector::Latest] {
+            let resumed = service
+                .start_or_resume(
+                    SessionStartRequest {
+                        selector,
+                        title: None,
+                        cwd: cwd.clone(),
+                        model: session.model.clone(),
+                        base_url: session.base_url.clone(),
+                        access_mode: session.access_mode,
+                        provider_connection: session.provider_connection.clone(),
+                    },
+                    workspace.clone(),
+                )
+                .await
+                .expect("resume saved session after git init");
+            assert_eq!(resumed.session.id, session.id);
+            assert_eq!(resumed.workspace.authority_root(), cwd);
+        }
+
+        let error = service
+            .resolve_session_for_workspace(&SessionSelector::ById(session.id), &newly_discovered)
+            .await
+            .expect_err("newly discovered project cannot take over the saved session");
+        assert!(error.to_string().contains("project"));
+        let error = service
+            .update_session_settings(
+                session.id,
+                SessionSettingsPatch {
+                    cwd: Some(cwd.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("explicit cwd selection must still validate current Git identity");
+        assert!(error.to_string().contains("resolves to project"));
+        assert_eq!(
+            service
+                .get_session(session.id)
+                .await
+                .expect("preserved cwd")
+                .cwd,
+            cwd
+        );
     }
 
     #[test]
@@ -3745,6 +4086,47 @@ mod tests {
                 TurnInterruptionCause::UserStop
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn remote_stop_preparation_reconciles_only_after_exact_local_user_stop() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let (_, turn_id) = admit_session_turn(&service, session.session.id).await;
+        let revision = service
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision();
+        let repository = service.store.session_repo();
+        assert!(
+            !repository
+                .origin_turn_user_stop_committed(session.session.id, turn_id, revision)
+                .unwrap()
+        );
+        assert_eq!(
+            service
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .unwrap(),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(
+            repository
+                .origin_turn_user_stop_committed(session.session.id, turn_id, revision)
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .origin_turn_user_stop_committed(session.session.id, turn_id, revision + 1)
+                .unwrap()
+        );
     }
 
     #[tokio::test]

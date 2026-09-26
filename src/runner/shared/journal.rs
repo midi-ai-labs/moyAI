@@ -43,6 +43,16 @@ pub(crate) struct Entry {
     pub checkpoint_settlement_ack: bool,
     #[serde(default)]
     pub external: Option<super::external::ExternalEvidence>,
+    #[serde(default)]
+    pub retained_service: Option<crate::tool::shell::RetainedService>,
+    #[serde(default)]
+    pub retention_reported: bool,
+    #[serde(default)]
+    pub service_stopped_ack: bool,
+    #[serde(default)]
+    pub service_uncertain_ack: bool,
+    #[serde(default)]
+    pub service_reconciliation: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -188,6 +198,70 @@ impl Journal {
         Ok(result)
     }
 
+    pub(crate) fn retained_services(&self) -> Result<Vec<Entry>, RunnerError> {
+        let mut statement = self.db.prepare("SELECT entry_json FROM runner_attempts WHERE json_extract(entry_json,'$.retained_service.service_id') IS NOT NULL AND COALESCE(json_extract(entry_json,'$.service_stopped_ack'),0)=0 ORDER BY attempt_id LIMIT 129").map_err(error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(error)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(serde_json::from_str(&row.map_err(error)?).map_err(error)?);
+        }
+        if entries.len() > 128 {
+            return Err(RunnerError::new(
+                "Runner retained-service limit exceeded; reconcile its local journal",
+            ));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn retention_reported(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
+        if entry.retained_service.is_none() || entry.service_stopped_ack {
+            return Err(RunnerError::new(
+                "No live retained service belongs to this attempt",
+            ));
+        }
+        entry.retention_reported = true;
+        self.save(entry)
+    }
+
+    pub(crate) fn service_stopped(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
+        if entry.retained_service.is_none() {
+            return Err(RunnerError::new(
+                "No retained service belongs to this attempt",
+            ));
+        }
+        entry.service_stopped_ack = true;
+        self.save(entry)
+    }
+
+    pub(crate) fn service_uncertain(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
+        if entry.retained_service.is_none() || entry.service_stopped_ack {
+            return Err(RunnerError::new(
+                "No unresolved service belongs to this attempt",
+            ));
+        }
+        entry.service_uncertain_ack = true;
+        self.save(entry)
+    }
+
+    pub(crate) fn reconcile_service_stopped(
+        &mut self,
+        entry: &mut Entry,
+        evidence: serde_json::Value,
+    ) -> Result<(), RunnerError> {
+        if entry.retained_service.is_none()
+            || entry.service_stopped_ack
+            || entry.service_reconciliation.is_some()
+        {
+            return Err(RunnerError::new(
+                "This retained service no longer accepts reconciliation",
+            ));
+        }
+        entry.service_reconciliation = Some(evidence);
+        self.save(entry)
+    }
+
     pub(crate) fn unsettled_checkpoints(&self, after: &str) -> Result<Vec<Entry>, RunnerError> {
         let mut statement = self
             .db
@@ -260,6 +334,11 @@ impl Journal {
             local_checkpoint: None,
             checkpoint_settlement_ack: false,
             external: None,
+            retained_service: None,
+            retention_reported: false,
+            service_stopped_ack: false,
+            service_uncertain_ack: false,
+            service_reconciliation: None,
         };
         let encoded = serde_json::to_string(&entry).map_err(error)?;
         self.db
@@ -331,17 +410,75 @@ impl Journal {
         report: Report,
         local_checkpoint: Option<serde_json::Value>,
     ) -> Result<(), RunnerError> {
+        self.outcome_with_retention(entry, report, local_checkpoint, None)
+    }
+
+    pub(crate) fn outcome_with_retention(
+        &mut self,
+        entry: &mut Entry,
+        report: Report,
+        local_checkpoint: Option<serde_json::Value>,
+        retained_service: Option<crate::tool::shell::RetainedService>,
+    ) -> Result<(), RunnerError> {
         if !matches!(entry.phase, Phase::Intent | Phase::Executing) {
             return Err(RunnerError::new(
                 "This attempt already has durable execution evidence",
             ));
         }
+        if retained_service.is_some()
+            && !matches!(
+                report.outcome,
+                ReportOutcome::YieldToChild { .. } | ReportOutcome::Finished { success: true, .. }
+            )
+        {
+            return Err(RunnerError::new(
+                "Only a child handoff or successful preview turn may retain a managed service",
+            ));
+        }
+        if matches!(report.outcome, ReportOutcome::Finished { .. })
+            && retained_service.is_some_and(|service| !service.retain_after_turn)
+        {
+            return Err(RunnerError::new(
+                "A completed turn requires an explicitly requested finite preview",
+            ));
+        }
         entry.phase = Phase::ReportPending;
+        entry.retained_service = retained_service;
         entry.local_checkpoint = local_checkpoint.or_else(|| match &report.outcome {
             ReportOutcome::YieldToChild { checkpoint, .. } => Some(checkpoint.clone()),
             _ => None,
         });
         entry.report = Some(report);
+        self.save(entry)
+    }
+
+    pub(crate) fn fail_retained_handoff(
+        &mut self,
+        entry: &mut Entry,
+        reason: &str,
+    ) -> Result<(), RunnerError> {
+        if entry.phase != Phase::ReportPending
+            || !entry.report.as_ref().is_some_and(|report| {
+                matches!(
+                    report.outcome,
+                    ReportOutcome::YieldToChild { .. }
+                        | ReportOutcome::Finished { success: true, .. }
+                )
+            })
+        {
+            return Err(RunnerError::new(
+                "No pending retained handoff may be failed",
+            ));
+        }
+        entry.report = Some(Report::for_assignment(
+            &entry.assignment,
+            "retained_handoff_failed",
+            ReportOutcome::Finished {
+                success: false,
+                result: serde_json::json!({"version":1,"error":reason}),
+                resources_released: true,
+            },
+        ));
         self.save(entry)
     }
 

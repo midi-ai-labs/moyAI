@@ -8,6 +8,18 @@ use crate::tool::context::{ToolContext, ToolServices};
 use crate::tool::read_context::ReadToolContext;
 use crate::tool::{ToolEffectClass, ToolResult, ToolSpec};
 
+const LEGACY_LOCAL_TEAM_TOOLS: &[&str] = &[
+    "team_pcs",
+    "team_upload_file",
+    "team_delegate",
+    "team_retry_submission",
+    "team_wait",
+    "team_read_artifact",
+    "team_save_artifact",
+    "team_stop_service",
+    "team_stop_conversation",
+];
+
 #[async_trait(?Send)]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
@@ -39,9 +51,17 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub(crate) fn with_shared_environments(
         mut self,
+        project_id: &str,
         job_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        current_environment_id: &str,
         environments: &[String],
+        candidates: &[crate::runner::shared::SharedCandidate],
     ) -> Self {
+        // Hub-project runs own their conversation and child jobs in Hub. The older local
+        // origin tools would create a second, unrelated parent for the same request.
+        self.remove_legacy_local_team_tools();
         self.tools.insert(
             "shared_publish_artifact".into(),
             Arc::new(
@@ -50,14 +70,69 @@ impl ToolRegistry {
                 },
             ),
         );
+        self.tools.insert(
+            "shared_upload_file".into(),
+            Arc::new(crate::tool::team_work::SharedUploadFileTool {
+                project_id: project_id.to_owned(),
+                job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self.tools.insert(
+            "shared_job_artifacts".into(),
+            Arc::new(crate::tool::team_work::SharedJobArtifactsTool {
+                project_id: project_id.to_owned(),
+                parent_job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self.tools.insert(
+            "shared_read_artifact".into(),
+            Arc::new(crate::tool::team_work::SharedReadArtifactTool {
+                project_id: project_id.to_owned(),
+                parent_job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self.tools.insert(
+            "shared_save_artifact".into(),
+            Arc::new(crate::tool::team_work::SharedSaveArtifactTool {
+                project_id: project_id.to_owned(),
+                parent_job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
         if !environments.is_empty() {
             self.tools.insert(
                 "shared_delegate".into(),
                 Arc::new(crate::tool::shared_delegate::SharedDelegateTool {
                     environments: environments.to_vec(),
+                    current_environment_id: current_environment_id.to_owned(),
+                    candidates: candidates.to_vec(),
                 }),
             );
         }
+        self.tools.insert(
+            "shared_stop_service".into(),
+            Arc::new(crate::tool::shared_stop_service::SharedStopServiceTool {
+                job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+                candidates: candidates.to_vec(),
+            }),
+        );
+        self.tools.insert(
+            "shared_services".into(),
+            Arc::new(crate::tool::shared_stop_service::SharedServicesTool {
+                job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
         self
     }
     pub(crate) fn empty() -> Self {
@@ -70,6 +145,12 @@ impl ToolRegistry {
 
     pub(crate) fn retain_tools(&mut self, mut predicate: impl FnMut(&str) -> bool) {
         self.tools.retain(|name, _| predicate(name));
+    }
+
+    pub(crate) fn remove_legacy_local_team_tools(&mut self) {
+        for name in LEGACY_LOCAL_TEAM_TOOLS {
+            self.tools.remove(*name);
+        }
     }
 
     pub(crate) fn retain_effect_with_exceptions(
@@ -157,6 +238,7 @@ impl ToolRegistry {
             );
         }
         synchronize_remote_wait_tool(&mut tools, config);
+        synchronize_team_tools(&mut tools, config);
         Self {
             tools,
             effect_filter: None,
@@ -188,6 +270,7 @@ impl ToolRegistry {
             tools.remove("mcp_call");
         }
         synchronize_remote_wait_tool(&mut tools, config);
+        synchronize_team_tools(&mut tools, config);
         Self {
             tools,
             effect_filter: self.effect_filter,
@@ -293,6 +376,47 @@ fn synchronize_remote_wait_tool(
     }
 }
 
+fn synchronize_team_tools(
+    tools: &mut HashMap<String, Arc<dyn Tool>>,
+    config: &crate::config::ResolvedConfig,
+) {
+    if config.device_network.configured() {
+        // Existing local-origin jobs still need their saved receipt and result tools.
+        // A new local chat creates shared work only by joining a Hub project.
+        for name in ["team_pcs", "team_upload_file", "team_delegate"] {
+            tools.remove(name);
+        }
+        tools.insert(
+            "team_retry_submission".into(),
+            Arc::new(crate::tool::team_work::TeamRetrySubmissionTool),
+        );
+        tools.insert(
+            "team_wait".into(),
+            Arc::new(crate::tool::team_work::TeamWaitTool),
+        );
+        tools.insert(
+            "team_read_artifact".into(),
+            Arc::new(crate::tool::team_work::TeamReadArtifactTool),
+        );
+        tools.insert(
+            "team_save_artifact".into(),
+            Arc::new(crate::tool::team_work::TeamSaveArtifactTool),
+        );
+        tools.insert(
+            "team_stop_service".into(),
+            Arc::new(crate::tool::team_work::TeamStopServiceTool),
+        );
+        tools.insert(
+            "team_stop_conversation".into(),
+            Arc::new(crate::tool::team_work::TeamStopConversationTool),
+        );
+    } else {
+        for name in LEGACY_LOCAL_TEAM_TOOLS {
+            tools.remove(*name);
+        }
+    }
+}
+
 fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     insert_goal_tools(tools);
     tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
@@ -392,6 +516,69 @@ fn remove_multi_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_team_tools_follow_hub_configuration_without_multi_agent_mode() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+        assert!(!names.iter().any(|name| name.starts_with("team_")));
+        config.device_network.hub_url = "https://hub.example/".into();
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+        for name in [
+            "team_retry_submission",
+            "team_wait",
+            "team_read_artifact",
+            "team_save_artifact",
+            "team_stop_service",
+            "team_stop_conversation",
+        ] {
+            assert!(names.contains(&name.to_string()), "missing {name}");
+        }
+        for name in ["team_pcs", "team_upload_file", "team_delegate"] {
+            assert!(
+                !names.contains(&name.to_string()),
+                "new local chat exposed {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_project_agent_uses_one_child_job_path() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.device_network.hub_url = "https://hub.example/".into();
+        let registry = super::ToolRegistry::core_agent_for_config(&config)
+            .with_shared_environments(
+                "project-a",
+                "job-a",
+                "attempt-a",
+                1,
+                "env-a",
+                &["env-b".into()],
+                &[],
+            );
+        let names = registry.available_tool_names();
+        assert!(names.contains(&"shared_delegate".into()));
+        assert!(names.contains(&"shared_upload_file".into()));
+        assert!(names.contains(&"shared_job_artifacts".into()));
+        assert!(names.contains(&"shared_read_artifact".into()));
+        assert!(names.contains(&"shared_save_artifact".into()));
+        assert!(names.contains(&"shared_publish_artifact".into()));
+        assert!(
+            super::LEGACY_LOCAL_TEAM_TOOLS
+                .iter()
+                .all(|name| !names.contains(&name.to_string()))
+        );
+        let mut per_step = registry.with_config_overlays(&config);
+        per_step.remove_legacy_local_team_tools();
+        let names = per_step.available_tool_names();
+        assert!(names.contains(&"shared_delegate".into()));
+        assert!(
+            super::LEGACY_LOCAL_TEAM_TOOLS
+                .iter()
+                .all(|name| !names.contains(&name.to_string()))
+        );
+    }
+
     #[test]
     fn remote_wait_registration_requires_enabled_hub_agent_but_not_local_multi_agent() {
         let mut config = crate::config::ResolvedConfig::default();

@@ -28,6 +28,7 @@ import {
   createPermissionRestartGuardianChatScenario,
   createPermissionRestartGuardianScenario,
 } from "./scenarios/permission_restart_guardian.mjs";
+import { createGuardianHandoffScenario } from "./scenarios/permission_guardian_handoff.mjs";
 import {
   createPermissionGuardianOpenAiCompatibleScenario,
   createPermissionTempEscalationLmStudioScenario,
@@ -38,6 +39,7 @@ import { createProviderResponsesCompactionRetryScenario } from "./scenarios/prov
 import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunNextTurnScenario } from "./scenarios/run_next_turn.mjs";
+import { createLocalLatestMessageEditScenario } from "./scenarios/local_latest_message_edit.mjs";
 import { createRunStopScenario } from "./scenarios/run_stop.mjs";
 import { createSideChatQuoteScenario } from "./scenarios/side_chat_quote.mjs";
 import { createSideChatSessionScenario } from "./scenarios/side_chat_session.mjs";
@@ -73,6 +75,7 @@ const factories = new Map([
   ["settings.shared-work", createSharedWorkEntryScenario],
   ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
   ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
+  ["run.latest-message-edit", createLocalLatestMessageEditScenario],
   ["settings.device-execution", createDeviceExecutionScenario],
   ["onboarding.win-a-to-win-b", createOnboardingWinAbScenario],
   ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
@@ -116,6 +119,8 @@ const factories = new Map([
   ["prompt-review.submit-enhanced", () => createPromptReviewSubmitScenario({ choice: "enhanced" })],
   ["permission.restart-guardian", createPermissionRestartGuardianScenario],
   ["permission.restart-guardian-chat", createPermissionRestartGuardianChatScenario],
+  ["permission.guardian-handoff-approve", () => createGuardianHandoffScenario("approve")],
+  ["permission.guardian-handoff-abort", () => createGuardianHandoffScenario("abort")],
   ["permission.temp-escalation", createPermissionTempEscalationScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
   ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],

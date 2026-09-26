@@ -420,11 +420,36 @@ impl Provider {
                     captured.lock().unwrap().push(request.clone());
                     let task_text = request["messages"].to_string();
                     let approval_case = task_text.contains("approval-fixture") || task_text.contains("cancel-fixture");
-                    let (delta,finish) = if task_text.contains("gateway-interruption-fixture") {
+                    let (delta,finish) = if task_text.contains("guardian-handoff-fixture") {
+                        let is_guardian = request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "system" && message["content"].as_str().is_some_and(|content| content.contains("independent permission guardian")));
+                        if is_guardian {
+                            assert!(request["tools"].is_null() || request["tools"].as_array().is_some_and(Vec::is_empty));
+                            assert!(request["tool_choice"].is_null());
+                            (json!({"role":"assistant","content":json!({"decision":"ask_user","rationale":"WinB側の作業フォルダに確認用ファイルを作成してよいか確認してください。"}).to_string()}),"stop")
+                        } else if request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool" && message["tool_call_id"] == "guardian-handoff-effect") {
+                            (json!({"role":"assistant","content":"Human-approved shared effect completed once"}),"stop")
+                        } else {
+                            let arguments = json!({"command":"[System.IO.File]::AppendAllText((Join-Path (Get-Location) 'guardian-handoff.txt'), 'approved')","sandbox_permissions":"require_escalated","justification":"Create the controlled shared test file after human confirmation."});
+                            (json!({"role":"assistant","tool_calls":[{"index":0,"id":"guardian-handoff-effect","type":"function","function":{"name":"shell","arguments":arguments.to_string()}}]}),"tool_calls")
+                        }
+                    } else if task_text.contains("gateway-interruption-fixture") {
                         released.notified().await;
                         (json!({"role":"assistant","content":"Interrupted response must never become a successful job"}),"stop")
                     } else if task_text.contains("gateway-reconnection-fixture") {
                         (json!({"role":"assistant","content":"Gateway reconnection verified"}),"stop")
+                    } else if task_text.contains("shared-active-stop-fixture") {
+                        if request["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool"&&message["tool_call_id"]=="active-stop-shell") {
+                            released.notified().await;
+                            (json!({"role":"assistant","content":"Stopped work must not complete"}),"stop")
+                        } else {
+                            (json!({"role":"assistant","tool_calls":[{"index":0,"id":"active-stop-shell","type":"function","function":{"name":"shell_start","arguments":json!({"command":"Start-Sleep -Seconds 120","timeout_ms":120000,"retain_after_turn":true}).to_string()}}]}),"tool_calls")
+                        }
+                    } else if task_text.contains("shared-retained-stop-fixture") {
+                        if request["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool"&&message["tool_call_id"]=="retained-stop-shell") {
+                            (json!({"role":"assistant","content":"Preview is available for this conversation"}),"stop")
+                        } else {
+                            (json!({"role":"assistant","tool_calls":[{"index":0,"id":"retained-stop-shell","type":"function","function":{"name":"shell_start","arguments":json!({"command":"Start-Sleep -Seconds 120","timeout_ms":120000,"retain_after_turn":true}).to_string()}}]}),"tool_calls")
+                        }
                     } else if task_text.contains("local-managed-fixture") {
                         if request["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool"&&message["tool_call_id"]=="local-managed") {
                             (json!({"role":"assistant","content":"Local managed root completed"}),"stop")
@@ -1221,6 +1246,114 @@ async fn real_hub_scenario() {
             assert!(!stale.status().is_success());
         }
     }
+    // Exercise Guardian -> existing shared approval -> authenticated Hub -> exact effect.
+    // The fixture restores the on-disk settings even if start/assertion panics; Worker Drop
+    // stops the isolated host. A fresh start after this case restores its effective mode too.
+    workers[1].stop().await;
+    {
+        struct RestoreSettings {
+            path: Utf8PathBuf,
+            original: Vec<u8>,
+        }
+        impl Drop for RestoreSettings {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::write(&self.path, &self.original) {
+                    eprintln!(
+                        "Could not restore isolated Runner settings {}: {error}",
+                        self.path
+                    );
+                }
+            }
+        }
+        let restore = RestoreSettings {
+            path: workers[1].settings.clone(),
+            original: std::fs::read(&workers[1].settings).unwrap(),
+        };
+        let mut settings: Value = serde_json::from_slice(&restore.original).unwrap();
+        assert_eq!(settings["environments"][0]["access_mode"], "default");
+        settings["environments"][0]["access_mode"] = json!("auto_review");
+        std::fs::write(&restore.path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        workers[1].start().await;
+        // The running host captured its mapping at startup. Keep no temporary mode on disk.
+        std::fs::write(&restore.path, &restore.original).unwrap();
+    }
+    let handoff = shared_post(http,&url,token,"jobs",json!({"request_id":"guardian-handoff-request","project_id":"project","environment_id":"solver","title":"Guardian human confirmation","input":{"version":1,"prompt":"guardian-handoff-fixture: create the controlled file after confirmation"},"descendant_budget":0})).await;
+    let handoff_id = handoff["id"].as_str().unwrap();
+    let handoff_approval = wait_approval(http, &url, token, handoff_id).await;
+    let handoff_approval_id = handoff_approval["id"].as_str().unwrap();
+    let handoff_details = handoff_approval["request"]["details"].to_string();
+    assert!(
+        handoff_details.contains("代理承認からの確認"),
+        "{handoff_approval}"
+    );
+    assert!(
+        handoff_details.contains("WinB側の作業フォルダ"),
+        "{handoff_approval}"
+    );
+    assert!(
+        handoff_details.contains("guardian-handoff.txt"),
+        "{handoff_approval}"
+    );
+    assert!(!child_workspace.join("guardian-handoff.txt").exists());
+    let pending_runs: Value = serde_json::from_slice(
+        &workers[1]
+            .command(&["list", "--runner", &workers[1].incarnation])
+            .stdout,
+    )
+    .unwrap();
+    let pending_run = pending_runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["approval"]["approval_id"] == handoff_approval_id)
+        .unwrap();
+    assert_eq!(pending_run["state"], "waiting_approval");
+    shared_post(
+        http,
+        &url,
+        token,
+        &format!("jobs/{handoff_id}/approvals/{handoff_approval_id}/decision"),
+        json!({"decision":"approve"}),
+    )
+    .await;
+    wait_job(http, &url, token, handoff_id, "succeeded").await;
+    assert_eq!(
+        std::fs::read_to_string(child_workspace.join("guardian-handoff.txt")).unwrap(),
+        "approved"
+    );
+    {
+        let requests = provider.requests.lock().unwrap();
+        let handoff_requests = requests
+            .iter()
+            .filter(|request| {
+                request["messages"]
+                    .to_string()
+                    .contains("guardian-handoff-fixture")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handoff_requests.len(),
+            3,
+            "One task request, one Guardian review, one continuation"
+        );
+        assert_eq!(
+            handoff_requests
+                .iter()
+                .filter(|request| request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "system"
+                        && message["content"].as_str().is_some_and(
+                            |content| content.contains("independent permission guardian")
+                        )))
+                .count(),
+            1
+        );
+    }
+    workers[1].stop().await;
+    workers[1].start().await;
+
     let paused = shared_post(http,&url,token,"jobs",json!({"request_id":"paused-parent-request","project_id":"project","environment_id":"analysis","title":"Cancel waiting parent","input":{"version":1,"prompt":"paused-parent-fixture: delegate and wait"},"descendant_budget":1})).await;
     let paused_id = paused["id"].as_str().unwrap();
     let paused = wait_job(http, &url, token, paused_id, "waiting_child").await;
@@ -1373,6 +1506,170 @@ async fn real_hub_scenario() {
     let after_reconnection = job(http, &url, token, interrupted_id).await;
     assert_eq!(after_reconnection["state"], "failed");
     assert_eq!(after_reconnection["result"], interrupted_terminal["result"]);
+    // A stop fence must reach an already running shared command. The model's
+    // second response is held so cancellation crosses a live managed process.
+    let active_stop = shared_post(http,&url,token,"jobs",json!({"request_id":"shared-active-stop","project_id":"project","environment_id":"solver","title":"Stop an active managed server","input":{"version":1,"prompt":"shared-active-stop-fixture: start a finite preview, then wait"},"descendant_budget":0})).await;
+    let active_stop_id = active_stop["id"].as_str().unwrap();
+    let approval = wait_approval(http, &url, token, active_stop_id).await;
+    shared_post(
+        http,
+        &url,
+        token,
+        &format!(
+            "jobs/{active_stop_id}/approvals/{}/decision",
+            approval["id"].as_str().unwrap()
+        ),
+        json!({"decision":"approve"}),
+    )
+    .await;
+    let active_requests = || {
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["messages"]
+                    .to_string()
+                    .contains("shared-active-stop-fixture")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(35);
+    while active_requests().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "Managed shared command never reached the model's second request: {}",
+            job(http, &url, token, active_stop_id).await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        active_requests()[1]["messages"]
+            .to_string()
+            .contains("process_id"),
+        "shell_start must return a real managed handle before stop"
+    );
+    shared_post(
+        http,
+        &url,
+        token,
+        &format!("jobs/{active_stop_id}/cancel"),
+        json!({}),
+    )
+    .await;
+    wait_job(http, &url, token, active_stop_id, "cancelled").await;
+    provider.release_child.notify_one();
+    let no_late_service = body(
+        identities[1]
+            .http
+            .get(format!("{url}/v1/shared/runner/services"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        no_late_service.as_array().unwrap().is_empty(),
+        "Stopped turn created a late retained service: {no_late_service}"
+    );
+    assert_eq!(
+        active_requests().len(),
+        2,
+        "Stopped work must not replay its model request"
+    );
+
+    // A successful turn may retain one finite preview. Its lease keeps another
+    // conversation queued until the exact process drains and ServiceStopped lands.
+    let retained = shared_post(http,&url,token,"jobs",json!({"request_id":"shared-retained-stop","project_id":"project","environment_id":"solver","title":"Keep a finite preview","input":{"version":1,"prompt":"shared-retained-stop-fixture: keep this finite preview available"},"descendant_budget":0})).await;
+    let retained_id = retained["id"].as_str().unwrap();
+    let approval = wait_approval(http, &url, token, retained_id).await;
+    shared_post(
+        http,
+        &url,
+        token,
+        &format!(
+            "jobs/{retained_id}/approvals/{}/decision",
+            approval["id"].as_str().unwrap()
+        ),
+        json!({"decision":"approve"}),
+    )
+    .await;
+    let retained_job = wait_job(http, &url, token, retained_id, "succeeded").await;
+    let retained_service_id = retained_job["result"]["retained_service"]["service_id"]
+        .as_str()
+        .expect("successful preview must publish its exact service ID");
+    let leases = body(
+        identities[1]
+            .http
+            .get(format!("{url}/v1/shared/runner/services"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        leases.as_array().unwrap().len(),
+        1,
+        "Runner must see the retained lease: {leases}"
+    );
+    assert_eq!(leases[0]["service_id"], retained_service_id);
+    assert_eq!(leases[0]["stop_requested"], false);
+    let waiting_for_drain = shared_post(http,&url,token,"jobs",json!({"request_id":"after-retained-stop","project_id":"project","environment_id":"solver","title":"Wait for preview drain","input":{"version":1,"prompt":"gateway-reconnection-fixture: only run after the preview stops"},"descendant_budget":0})).await;
+    let waiting_id = waiting_for_drain["id"].as_str().unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        job(http, &url, token, waiting_id).await["state"],
+        "queued",
+        "Retained process must keep the physical slot occupied"
+    );
+    body(
+        identities[1]
+            .http
+            .post(format!(
+                "{url}/v1/shared/runner/services/{retained_service_id}/stop"
+            ))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    wait_job(http, &url, token, waiting_id, "succeeded").await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let leases = body(
+            identities[1]
+                .http
+                .get(format!("{url}/v1/shared/runner/services"))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        if leases.as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Stopped service lease remained occupied: {leases}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["messages"]
+                .to_string()
+                .contains("shared-retained-stop-fixture"))
+            .count(),
+        2,
+        "Retained preview turn must not replay after stop"
+    );
     let status = body(
         http.get(format!("{url}/v1/shared/status?project_id=project"))
             .bearer_auth(token)

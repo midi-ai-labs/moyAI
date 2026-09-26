@@ -13,12 +13,17 @@ import { icon } from "./icons.ts";
 import { aiConnectionManaged, renderManagedAiConnection, renderHubOverlay } from "./hub_render.ts";
 import { renderDeviceConnectionReset } from "./device_network_render.ts";
 import { renderSharedWork } from "./shared_work_render.ts";
+import { renderConversationInput, renderConversationMain } from "./conversation_surface.ts";
+import { sharedConversationRows } from "./shared_work_state.ts";
 import { renderMcpHistoryOverlay } from "./mcp_history_render.ts";
 import { renderMcpActivityStrip } from "./mcp_activity.ts";
+import { receiverBlocksLocalSend, renderReceiverActivity } from "./receiver_activity.ts";
+import { renderOriginWork } from "./origin_work.ts";
 import { hubExecutionRoute } from "./hub_state.ts";
 import { transcriptAnchors, turnPageLoadPending } from "./history_navigation.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { renderEarlierHistoryTrigger, renderTranscriptRows } from "./render_transcript.ts";
+import { latestLocalRevisionSource, localRevisionActionEnabled } from "./local_revision_source.ts";
 import { navigationIsIdle, quickChatDeleteAction, sessionRowCapabilities } from "./navigation_state.ts";
 import {
   renderAgentInspector,
@@ -188,7 +193,7 @@ export function renderDesktopMarkup(
   const localModalObscuresOverlay = (localConfirmationPending && !settingsClosePending)
     || sideChatDeletePending;
   if (state.hub_project_open === true) {
-    return applyActionAvailabilityToButtons(`<div class="app-frame hub-project-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}<div class="shell hub-project-shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>${renderSidebar(state, local.sharedWork)}${renderSharedWork(local.sharedWork)}</div></div>
+    return applyActionAvailabilityToButtons(`<div class="app-frame hub-project-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}<div class="shell hub-project-shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>${renderSidebar(state, local.sharedWork)}${renderSharedWork(local.sharedWork, renderReceiverActivity(local.deviceNetwork, local.sharedWork))}</div></div>
       ${state.confirmation_visible ? renderConfirmation(state, local.modal.permissionDecision) : ""}
       ${!state.confirmation_visible && !localModalObscuresOverlay && state.overlay !== "none" ? renderOverlay(state, local, model) : ""}
       ${!state.confirmation_visible && local.modal.localConfirmation ? renderLocalConfirmation(local.modal.localConfirmation, local.modal.localDecisionPending, local.modal.localDecisionError) : ""}
@@ -210,14 +215,12 @@ export function renderDesktopMarkup(
       ${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}
       <div class="shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>
         ${renderSidebar(state, local.sharedWork)}
-        <main class="conversation">
-          ${renderTopbar(state, local)}
-          <div class="run-activity-stack">${renderRunStatusStrip(state)}</div>
-          <section class="thread" id="thread" tabindex="-1" aria-label="会話履歴">
-            ${renderThreadContent(state, local)}
-          </section>
-          ${renderComposer(state, local)}
-        </main>
+        ${renderConversationMain({
+          topbar: renderTopbar(state, local),
+          activity: `${renderRunStatusStrip(state)}${renderReceiverActivity(local.deviceNetwork, local.sharedWork)}${renderOriginWork(local.deviceNetwork, state.draft_target.sessionId, state.can_cancel_run)}`,
+          thread: renderThreadContent(state, local),
+          composer: renderComposer(state, local),
+        })}
         ${renderArtifactPane(state, local)}
       </div>
     </div>
@@ -474,7 +477,7 @@ function renderInitialSetupStartStep(
       <div class="initial-setup-choice-row">
         <div>
           <strong>チームの仕事をこのPCで実行する</strong>
-          <p>接続ファイルでHubに参加し、保存先と実行許可を設定します。AIはHubに登録されたモデルを使います。</p>
+          <p>接続ファイルでHubに参加します。参加承認後、このPCの実行許可とプロジェクトの作業フォルダーを設定します。AIはHubに登録されたモデルを使います。</p>
           <button id="initial-setup-execution" data-action="initial-setup-execution">チームの仕事をこのPCで実行する</button>
         </div>
         <div>
@@ -625,7 +628,7 @@ function renderInitialSetupPermissionsStep(state: DesktopViewState): string {
       }, { initialSetup: true })}
       <div class="initial-setup-permission-guide">
         <div><strong>承認を求める</strong><span>ファイルの変更など、承認が必要な操作を人が判断します。</span></div>
-        <div><strong>代理で承認</strong><span>別のAIが操作の安全性を審査します。安全と判断できない操作は拒否します。</span></div>
+        <div><strong>代理で承認</strong><span>別のAIが操作を審査します。代理で判断できない場合は、あなたに確認します。禁止された操作は実行せず停止します。</span></div>
         <div><strong>フルアクセス</strong><span>操作ごとの確認を省き、このPCの現在のユーザー権限で実行します。</span></div>
       </div>
     </section>
@@ -1069,7 +1072,12 @@ export function renderSidebar(state: DesktopWebState, shared?: import("./shared_
         <button class="tiny-button icon-only" data-action="create-project-from-picker" title="このPCにローカルプロジェクトを作成" aria-label="このPCにローカルプロジェクトを作成" ${navigationDisabled ? "disabled" : ""}>${icon("folder-plus")}</button>
       </div>
       <div class="row-list project-list">
-        ${hub?.principal ? hub.projects.map(project => `<div class="hub-project-row"><button class="rail-item ${state.hub_project_open === true && hub.selected_project_id === project.id ? "active" : ""}" data-action="open-hub-project" data-value="${escapeHtml(project.id)}" title="Hubのプロジェクト"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small>Hub</small></button>${state.hub_project_open === true && hub.selected_project_id === project.id ? `<div class="hub-project-chats">${hub.status?.jobs.map(job => `<button data-action="shared-detail" data-value="${escapeHtml(job.id)}" class="${hub.selected_job_id === job.id ? "active" : ""}" title="${escapeHtml(job.requestor.display_name + " · " + job.environment_label)}">${escapeHtml(job.title)}</button>`).join("") ?? ""}${hub.status?.next_before ? '<button data-action="shared-next-jobs">以前のチャット</button>' : ""}<button data-action="shared-new-conversation">＋ 新しいチャット</button></div>` : ""}</div>`).join("") : hub?.hub_url ? `<button class="rail-item" data-action="show-shared-work">${hub.connected ? "Hubのプロジェクトを確認" : "Hubへの参加状況"}</button>` : ""}
+        ${hub?.projects_stale && hub.projects.length ? hub.projects.map(project => `<div class="hub-project-row hub-project-stale"><div class="hub-project-heading"><button class="rail-item" type="button" disabled title="Hubから最新の参加状況を確認できません"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small class="project-source-badge">MCP · 未更新</small></button></div></div>`).join("") : hub?.principal ? hub.projects.map(project => {
+          const selected = state.hub_project_open === true && hub.selected_project_id === project.id;
+          const confirmation = shared?.confirmation?.kind === "leave_project" && shared.confirmation.projectId === project.id;
+          const chats = selected ? sharedConversationRows(hub.status?.jobs ?? [], hub.selected_job_id, hub.conversations, hub.selected_conversation_id) : [];
+          return `<div class="hub-project-row"><div class="hub-project-heading"><button class="rail-item ${selected ? "active" : ""}" data-action="open-hub-project" data-value="${escapeHtml(project.id)}" title="Hubで共有するプロジェクト"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small class="project-source-badge">MCP</small></button><button class="tiny-button icon-only" data-action="shared-request-leave-project" data-value="${escapeHtml(project.id)}" title="プロジェクトから離脱" aria-label="${escapeHtml(project.label)}から離脱" ${hub.leave_pending_project_id === project.id ? "disabled" : ""}>${icon("x")}</button></div>${hub.leave_pending_project_id === project.id ? '<p class="hub-project-pending" role="status">離脱処理待ちです。確認できるまで、このPCから新しい仕事は開始しません。</p>' : ""}${confirmation ? `<div class="hub-project-confirmation" role="group" aria-label="プロジェクトから離脱"><p>このPCが「${escapeHtml(project.label)}」から離脱します。他のPC、共有チャット、各PCのファイルは残ります。</p><button data-action="shared-confirm-confirmation">離脱する</button><button data-action="shared-cancel-confirmation">戻る</button></div>` : ""}${selected ? `<div class="hub-project-chats">${chats.map(chat => `<div class="hub-chat-row"><button data-action="${hub.conversations ? "shared-select-conversation" : "shared-detail"}" data-value="${escapeHtml(hub.conversations ? chat.conversationId : chat.jobId ?? "")}" class="${chat.selected ? "active" : ""}" title="${escapeHtml(chat.title)}">${escapeHtml(chat.title)}${chat.deletePending ? " · 削除処理中" : ""}</button>${hub.conversations ? `<button class="tiny-button icon-only" data-action="shared-start-rename-conversation" data-value="${escapeHtml(chat.conversationId)}" title="チャット名を変更" aria-label="${escapeHtml(chat.title)}の名前を変更" ${chat.deletePending || chat.canRename === false ? "disabled" : ""}>${icon("edit")}</button><button class="tiny-button icon-only" data-action="shared-request-delete-conversation" data-value="${escapeHtml(chat.conversationId)}" title="共有チャットを削除" aria-label="${escapeHtml(chat.title)}を削除" ${chat.deletePending || chat.canDelete === false ? "disabled" : ""}>${icon("x")}</button>` : ""}</div>`).join("")}${hub.status?.next_before && !hub.conversations ? '<button data-action="shared-next-jobs">以前のチャット</button>' : ""}<button data-action="shared-new-conversation">＋ 新しいチャット</button></div>` : ""}</div>`;
+        }).join("") : hub?.hub_url ? `<button class="rail-item" data-action="show-shared-work">${hub.connected ? "Hubのプロジェクトを確認" : "Hubへの参加状況"}</button>` : ""}
         ${state.project_rows
           .map((row, index) => renderProjectRowWithSessions(localState, row, index))
           .join("")}
@@ -1187,6 +1195,7 @@ export function renderThreadContent(
     : "";
   const pendingInputs = visiblePendingTurnInputs(state);
   const pending = renderPendingTurnInputs(pendingInputs);
+  const revisionSource = latestLocalRevisionSource(state);
   if (
     (state.thread_empty || state.selected_session_index < 0)
     && state.file_change_rows.length === 0
@@ -1210,8 +1219,10 @@ export function renderThreadContent(
       // projection that seals the same response.
       stableLatestAssistant: true,
       sideChatQuoteOwnerSessionId: sideChatOwnerSessionId(state),
+      editableUserHistoryId: revisionSource && localRevisionActionEnabled(state, local.localMessageEdit.pending, revisionSource.historyItemId)
+        ? revisionSource.historyItemId : null,
     });
-  return `${earlier}${agentActivity}${transcript}${pending}`;
+  return `${local.localMessageEdit.error ? `<p class="local-edit-feedback" role="status">${escapeHtml(local.localMessageEdit.error)}</p>` : ""}${earlier}${agentActivity}${transcript}${pending}`;
 }
 
 export function visiblePendingTurnInputs(
@@ -1286,7 +1297,11 @@ export function renderComposer(
   local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
 ): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
-  const sendTitle = composerSendTitle(state, state.draft_prompt);
+  const receiverBlocked = receiverBlocksLocalSend(local.deviceNetwork);
+  const receiverUnknown = receiverBlocked && Boolean(local.deviceNetwork.receiverActivity?.unavailable);
+  const sendTitle = receiverBlocked
+    ? receiverUnknown ? "このPCの実行状態を確認できません" : "このPCの受信作業が終了してから送信できます"
+    : composerSendTitle(state, state.draft_prompt);
   const hubRoute = hubExecutionRoute(state.hub, "main");
   const enhanceTitle = state.navigation_loading
     ? "画面の切り替え後に依頼文を整えられます"
@@ -1303,8 +1318,7 @@ export function renderComposer(
   return `
     <section class="composer ${goalHint ? "goal-command" : ""}" data-run-target="${escapeHtml(JSON.stringify(state.run_target))}">
       ${trayVisible ? renderAttachmentTray(state, controlsVisible) : ""}
-      <label class="sr-only" for="prompt">moyAIへの依頼</label>
-      <textarea id="prompt" placeholder="moyAI に依頼する" aria-describedby="goal-command-hint" ${state.navigation_loading ? "disabled" : ""}>${escapeHtml(state.draft_prompt)}</textarea>
+      ${renderConversationInput({ id: "prompt", value: state.draft_prompt, label: "moyAIへの依頼", placeholder: "moyAI に依頼する", attributes: `aria-describedby="goal-command-hint" ${state.navigation_loading ? "disabled" : ""}` })}
       <div class="goal-command-hint" id="goal-command-hint" ${goalHint ? "" : "hidden"}>
         <span class="goal-command-badge">/goal</span>
         <span data-goal-command-help>${escapeHtml(goalHint ?? "")}</span>
@@ -1313,7 +1327,7 @@ export function renderComposer(
         <button class="add-button icon-only" data-action="toggle-attachment-tray" title="画像添付" aria-label="画像添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("plus")}</button>
         <button class="icon-only" data-action="show-command-palette" title="検索 / コマンド" aria-label="検索 / コマンド">${icon("more")}</button>
         <button class="composer-text-action" data-action="enhance-prompt" title="${enhanceTitle}" aria-labelledby="enhance-prompt-label" ${state.enhance_enabled ? "" : "disabled"}>${icon("sparkles")}<span id="enhance-prompt-label">依頼を整える</span></button>
-        <button class="send composer-text-action" data-action="send" title="${sendTitle}" aria-label="${sendTitle}" ${state.can_submit ? "" : "disabled"}><span>送信</span>${icon("send")}</button>
+        <button class="send composer-text-action" data-action="send" title="${sendTitle}" aria-label="${sendTitle}" ${state.can_submit && !receiverBlocked ? "" : "disabled"}><span>送信</span>${icon("send")}</button>
       </div>
       <div class="composer-meta">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${state.selected_project_index >= 0 ? "プロジェクトで作業" : "プロジェクトを選択"}</button>
@@ -1321,6 +1335,7 @@ export function renderComposer(
         ${renderSessionUsage(state)}
       </div>
       ${hubRoute?.blockedReason ? `<p class="composer-route-notice" role="status">${escapeHtml(hubRoute.blockedReason)} <button data-action="show-hub">Hub設定を開く</button></p>` : ""}
+      ${receiverBlocked ? `<p class="composer-route-notice" role="status">${receiverUnknown ? "このPCの実行状態を確認できません。実行機能と接続を確認してください。" : "このPCに受信した仕事またはアプリが残っています。停止が確認されると送信できます。"}入力は保持されます。</p>` : ""}
     </section>
   `;
 }
@@ -1772,7 +1787,7 @@ export function renderOverlay(
 ): string {
   if (state.overlay === "provider") return renderProviderOverlay(state, local);
   if (state.overlay === "config") return renderConfigOverlay(state, local);
-  if (state.overlay === "hub") return renderHubOverlay(local.hub, local.deviceNetwork);
+  if (state.overlay === "hub") return renderHubOverlay(local.hub, local.deviceNetwork, local.sharedWork);
   if (state.overlay === "mcp_history") return renderMcpHistoryOverlay(local.mcpHistory, Boolean(state.mcp_publish?.profiles.length));
   if (state.overlay === "session_settings") return renderSessionSettingsOverlay(state, local);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);

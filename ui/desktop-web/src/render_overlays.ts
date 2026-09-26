@@ -7,6 +7,7 @@ import type {
 import type { PermissionDecisionState } from "./decision_state.ts";
 import { renderPermissionAgentIdentity } from "./render_agent_activity.ts";
 import { runCanBeCancelled } from "./run_control.ts";
+import { guardianReasonPrefix, permissionDetailLabel, permissionReviewReason, permissionRiskLabel } from "./permission_copy.ts";
 import { escapeHtml } from "./utils.ts";
 
 type RowLocalConfirmation = {
@@ -43,8 +44,9 @@ export function renderConfirmation(
     risks: [],
   };
   const targets = confirmation.targets.length > 0 ? confirmation.targets.join(", ") : "(なし)";
-  const risks = confirmation.risks.length > 0 ? confirmation.risks.join(", ") : "なし";
-  const details = confirmation.details.length > 0 ? confirmation.details.join("\n") : "なし";
+  const risks = confirmation.risks.length > 0 ? confirmation.risks.map(permissionRiskLabel).join("、") : "追加の検出事項なし";
+  const reviewReason = permissionReviewReason(confirmation.details);
+  const details = confirmation.details.length > 0 ? confirmation.details.filter(detail => !detail.startsWith(guardianReasonPrefix)).map(permissionDetailLabel).join("\n\n") : "なし";
   const agentPath = state.confirmation?.agent_path?.trim() ?? "";
   const agentTaskName = state.confirmation?.agent_task_name?.trim() ?? "";
   const remote = state.confirmation?.remote;
@@ -88,14 +90,15 @@ export function renderConfirmation(
           </dl>` : ""}
         </header>
         <section class="permission-review-body" role="region" aria-label="操作の詳細" tabindex="0" data-focus-key="permission:${escapeHtml(requestId)}:details">
-          <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
+          ${reviewReason ? `<p><strong>確認が必要な理由</strong><br>${escapeHtml(reviewReason)}</p>` : ""}
+          <div class="confirm-summary" id="permission-summary">${escapeHtml(permissionDetailLabel(confirmation.summary))}</div>
           <dl class="confirm-details">
             ${remote ? `<dt>依頼元</dt><dd>${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd>${escapeHtml(remote.target_label)}</dd><dt>受入タスク</dt><dd>${escapeHtml(remote.job_id)}</dd>` : ""}
             <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
-            <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
-            <dt>リスク</dt><dd>${escapeHtml(risks)}</dd>
+            <dt>操作前の確認事項</dt><dd>${escapeHtml(risks)}<br><small>実際の動作は、下の操作内容を確認してください。</small></dd>
           </dl>
           <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
+          ${confirmation.details.length ? `<details><summary>操作情報の原文</summary><pre class="confirm-command">${escapeHtml(confirmation.details.join("\n"))}</pre></details>` : ""}
         </section>
         <footer class="permission-footer">
           <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1" data-focus-key="permission:${escapeHtml(requestId)}:status">${escapeHtml(status)}</div>

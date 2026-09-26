@@ -27,12 +27,53 @@ pub(super) enum ReceiptOperation {
     Continue {
         job_id: String,
     },
+    LeaveProject {
+        project_id: String,
+    },
+    StopConversation {
+        conversation_id: String,
+    },
+    StopAllConversation {
+        conversation_id: String,
+    },
+    StopOriginTurn {
+        origin_session_ref: String,
+        origin_turn_ref: String,
+    },
+    /// Reserved before the local exact UserStop CAS. It must never be sent
+    /// until the durable local request can be observed after a crash.
+    StopOriginTurnPrepared {
+        origin_session_ref: String,
+        origin_turn_ref: String,
+    },
+    StopOriginConversation {
+        origin_session_ref: String,
+        through_revision: u64,
+    },
 }
 impl ReceiptOperation {
     pub fn path(&self) -> String {
         match self {
             Self::Submit => "jobs".into(),
             Self::Continue { job_id } => format!("jobs/{job_id}/continue"),
+            Self::LeaveProject { project_id } => format!("projects/{project_id}/leave"),
+            Self::StopConversation { conversation_id } => {
+                format!("conversations/{conversation_id}/services/stop")
+            }
+            Self::StopAllConversation { conversation_id } => {
+                format!("conversations/{conversation_id}/stop")
+            }
+            Self::StopOriginTurn {
+                origin_session_ref,
+                origin_turn_ref,
+            }
+            | Self::StopOriginTurnPrepared {
+                origin_session_ref,
+                origin_turn_ref,
+            } => format!("origins/{origin_session_ref}/turns/{origin_turn_ref}/stop"),
+            Self::StopOriginConversation {
+                origin_session_ref, ..
+            } => format!("origins/{origin_session_ref}/stop"),
         }
     }
 }
@@ -76,13 +117,37 @@ impl ReceiptStore {
         let document: Document =
             serde_json::from_slice(&bytes).map_err(|_| RequestError::Local(STORAGE_MESSAGE))?;
         let mut owners = std::collections::BTreeSet::new();
+        let mut origin_stops = std::collections::BTreeSet::new();
+        let mut origin_conversation_stops = std::collections::BTreeSet::new();
+        let mut leave_owners = std::collections::BTreeSet::new();
         if document.version != 1
             || document.receipts.len() > MAX_RECEIPTS
             || document.receipts.iter().any(|r| {
                 r.hub.is_empty()
                     || r.hub.len() > 1024
                     || !super::super::stable_id(&r.user_id)
-                    || !owners.insert((&r.hub, &r.user_id))
+                    || match &r.operation {
+                        ReceiptOperation::StopOriginTurn {
+                            origin_session_ref,
+                            origin_turn_ref,
+                        }
+                        | ReceiptOperation::StopOriginTurnPrepared {
+                            origin_session_ref,
+                            origin_turn_ref,
+                        } => !origin_stops.insert((&r.hub, origin_session_ref, origin_turn_ref)),
+                        ReceiptOperation::StopOriginConversation {
+                            origin_session_ref,
+                            through_revision,
+                        } => !origin_conversation_stops.insert((
+                            &r.hub,
+                            origin_session_ref,
+                            through_revision,
+                        )),
+                        ReceiptOperation::LeaveProject { .. } => {
+                            !leave_owners.insert((&r.hub, &r.user_id))
+                        }
+                        _ => !owners.insert((&r.hub, &r.user_id)),
+                    }
                     || !valid_payload(&r.operation, &r.payload)
             })
         {
@@ -94,9 +159,92 @@ impl ReceiptStore {
         self.blocked.then_some(STORAGE_MESSAGE)
     }
     pub fn pending(&self, hub: &str, user: &str) -> Option<&Receipt> {
+        self.receipts.iter().find(|r| {
+            r.hub == hub
+                && r.user_id == user
+                && !matches!(
+                    &r.operation,
+                    ReceiptOperation::StopOriginTurn { .. }
+                        | ReceiptOperation::StopOriginTurnPrepared { .. }
+                        | ReceiptOperation::StopOriginConversation { .. }
+                        | ReceiptOperation::LeaveProject { .. }
+                )
+        })
+    }
+    pub fn pending_leave(&self, hub: &str, user: &str) -> Option<&Receipt> {
+        self.receipts.iter().find(|receipt| {
+            receipt.hub == hub
+                && receipt.user_id == user
+                && matches!(&receipt.operation, ReceiptOperation::LeaveProject { .. })
+        })
+    }
+    pub fn pending_origin_stop(
+        &self,
+        hub: &str,
+        origin_session_ref: &str,
+        origin_turn_ref: &str,
+    ) -> Option<&Receipt> {
+        self.receipts.iter().find(|r| {
+            r.hub == hub
+                && matches!(&r.operation, ReceiptOperation::StopOriginTurn {
+                    origin_session_ref: session,
+                    origin_turn_ref: turn,
+                } | ReceiptOperation::StopOriginTurnPrepared {
+                    origin_session_ref: session,
+                    origin_turn_ref: turn,
+                } if session == origin_session_ref && turn == origin_turn_ref)
+        })
+    }
+    pub fn pending_origin_stops(&self, hub: &str) -> Vec<Receipt> {
         self.receipts
             .iter()
-            .find(|r| r.hub == hub && r.user_id == user)
+            .filter(|r| {
+                r.hub == hub
+                    && matches!(
+                        &r.operation,
+                        ReceiptOperation::StopOriginTurn { .. }
+                            | ReceiptOperation::StopOriginTurnPrepared { .. }
+                            | ReceiptOperation::StopOriginConversation { .. }
+                    )
+            })
+            .cloned()
+            .collect()
+    }
+    pub fn pending_origin_conversation_stop(
+        &self,
+        hub: &str,
+        origin_session_ref: &str,
+        through_revision: u64,
+    ) -> Option<&Receipt> {
+        self.receipts.iter().find(|r| {
+            r.hub == hub
+                && matches!(&r.operation, ReceiptOperation::StopOriginConversation {
+                origin_session_ref: session, through_revision: revision,
+            } if session == origin_session_ref && *revision == through_revision)
+        })
+    }
+    pub fn has_origin_submission(&self, origin_session_ref: &str) -> Result<bool, RequestError> {
+        if self.blocked {
+            return Err(RequestError::Local(STORAGE_MESSAGE));
+        }
+        Ok(self.receipts.iter().any(|receipt| {
+            receipt.operation == ReceiptOperation::Submit
+                && receipt.payload["origin_session_ref"].as_str() == Some(origin_session_ref)
+        }))
+    }
+    pub fn has_origin_turn_submission(
+        &self,
+        origin_session_ref: &str,
+        origin_turn_ref: &str,
+    ) -> Result<bool, RequestError> {
+        if self.blocked {
+            return Err(RequestError::Local(STORAGE_MESSAGE));
+        }
+        Ok(self.receipts.iter().any(|receipt| {
+            receipt.operation == ReceiptOperation::Submit
+                && receipt.payload["origin_session_ref"].as_str() == Some(origin_session_ref)
+                && receipt.payload["origin_turn_ref"].as_str() == Some(origin_turn_ref)
+        }))
     }
     pub fn insert(&mut self, receipt: Receipt) -> Result<(), RequestError> {
         if self.blocked {
@@ -107,7 +255,33 @@ impl ReceiptStore {
                 "未確認の受付記録が上限に達しました。既存の受付を確認してください。",
             ));
         }
-        if self.pending(&receipt.hub, &receipt.user_id).is_some() {
+        let duplicate = match &receipt.operation {
+            ReceiptOperation::StopOriginTurn {
+                origin_session_ref,
+                origin_turn_ref,
+            }
+            | ReceiptOperation::StopOriginTurnPrepared {
+                origin_session_ref,
+                origin_turn_ref,
+            } => self
+                .pending_origin_stop(&receipt.hub, origin_session_ref, origin_turn_ref)
+                .is_some(),
+            ReceiptOperation::StopOriginConversation {
+                origin_session_ref,
+                through_revision,
+            } => self
+                .pending_origin_conversation_stop(
+                    &receipt.hub,
+                    origin_session_ref,
+                    *through_revision,
+                )
+                .is_some(),
+            ReceiptOperation::LeaveProject { .. } => {
+                self.pending_leave(&receipt.hub, &receipt.user_id).is_some()
+            }
+            _ => self.pending(&receipt.hub, &receipt.user_id).is_some(),
+        };
+        if duplicate {
             return Err(RequestError::Local(
                 "前回の未確認の受付を先に確認してください。",
             ));
@@ -117,6 +291,24 @@ impl ReceiptStore {
         }
         let mut next = self.receipts.clone();
         next.push(receipt);
+        self.commit(next)
+    }
+    pub fn promote_prepared_origin_stop(&mut self, receipt: &Receipt) -> Result<(), RequestError> {
+        let ReceiptOperation::StopOriginTurnPrepared {
+            origin_session_ref,
+            origin_turn_ref,
+        } = &receipt.operation
+        else {
+            return Err(RequestError::Invalid);
+        };
+        let mut next = self.receipts.clone();
+        let Some(stored) = next.iter_mut().find(|stored| *stored == receipt) else {
+            return Err(RequestError::Local(STORAGE_MESSAGE));
+        };
+        stored.operation = ReceiptOperation::StopOriginTurn {
+            origin_session_ref: origin_session_ref.clone(),
+            origin_turn_ref: origin_turn_ref.clone(),
+        };
         self.commit(next)
     }
     pub fn remove_confirmed(&mut self, receipt: &Receipt) -> Result<(), RequestError> {
@@ -203,7 +395,21 @@ fn valid_payload(operation: &ReceiptOperation, payload: &Value) -> bool {
     #[serde(deny_unknown_fields)]
     struct Submission {
         request_id: String,
+        #[serde(default)]
+        origin_session_ref: Option<String>,
+        #[serde(default)]
+        origin_turn_ref: Option<String>,
+        #[serde(default)]
+        origin_turn_epoch: Option<u64>,
         project_id: String,
+        #[serde(default)]
+        project_participation: Option<u64>,
+        #[serde(default)]
+        conversation_id: Option<String>,
+        #[serde(default)]
+        revises_job_id: Option<String>,
+        #[serde(default)]
+        expected_revised_revision: Option<u64>,
         environment_id: String,
         title: String,
         input: Input,
@@ -216,21 +422,91 @@ fn valid_payload(operation: &ReceiptOperation, payload: &Value) -> bool {
     struct Continuation {
         request_id: String,
         expected_revision: u64,
+        #[serde(default)]
+        project_participation: Option<u64>,
+        #[serde(default)]
+        conversation_epoch: u64,
         prompt: String,
         input_refs: Vec<String>,
         #[serde(default)]
         start_before_ms: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StopConversation {
+        project_id: String,
+        request_id: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LeaveProject {
+        expected_participation_generation: u64,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StopOriginTurn {
+        request_id: String,
+        origin_turn_revision: u64,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StopOriginConversation {
+        request_id: String,
+        through_revision: u64,
     }
     let valid_refs = |refs: &[String]| {
         refs.len() <= 32
             && refs.iter().all(|id| super::super::stable_id(id))
             && refs.iter().collect::<std::collections::BTreeSet<_>>().len() == refs.len()
     };
+    if let ReceiptOperation::StopConversation { conversation_id }
+    | ReceiptOperation::StopAllConversation { conversation_id } = operation
+    {
+        return super::super::stable_id(conversation_id)
+            && serde_json::from_value::<StopConversation>(payload.clone()).is_ok_and(|p| {
+                super::super::stable_id(&p.project_id) && super::super::stable_id(&p.request_id)
+            });
+    }
+    if let ReceiptOperation::LeaveProject { project_id } = operation {
+        return super::super::stable_id(project_id)
+            && serde_json::from_value::<LeaveProject>(payload.clone())
+                .is_ok_and(|value| value.expected_participation_generation > 0);
+    }
+    if let ReceiptOperation::StopOriginTurn {
+        origin_session_ref,
+        origin_turn_ref,
+    }
+    | ReceiptOperation::StopOriginTurnPrepared {
+        origin_session_ref,
+        origin_turn_ref,
+    } = operation
+    {
+        return super::super::stable_id(origin_session_ref)
+            && super::super::stable_id(origin_turn_ref)
+            && serde_json::from_value::<StopOriginTurn>(payload.clone()).is_ok_and(|p| {
+                super::super::stable_id(&p.request_id) && p.origin_turn_revision > 0
+            });
+    }
+    if let ReceiptOperation::StopOriginConversation {
+        origin_session_ref,
+        through_revision,
+    } = operation
+    {
+        return super::super::stable_id(origin_session_ref)
+            && serde_json::from_value::<StopOriginConversation>(payload.clone()).is_ok_and(|p| {
+                super::super::stable_id(&p.request_id)
+                    && p.through_revision == *through_revision
+                    && p.through_revision > 0
+            });
+    }
     if let ReceiptOperation::Continue { job_id } = operation {
         return super::super::stable_id(job_id)
             && serde_json::from_value::<Continuation>(payload.clone()).is_ok_and(|p| {
                 super::super::stable_id(&p.request_id)
                     && p.expected_revision > 0
+                    && p.project_participation
+                        .is_none_or(|generation| generation > 0)
+                    && p.conversation_epoch <= i64::MAX as u64
                     && !p.prompt.trim().is_empty()
                     && p.prompt.len() <= 32768
                     && valid_refs(&p.input_refs)
@@ -239,9 +515,36 @@ fn valid_payload(operation: &ReceiptOperation, payload: &Value) -> bool {
             });
     }
     serde_json::from_value::<Submission>(payload.clone()).is_ok_and(|p| {
-        [&p.request_id, &p.project_id, &p.environment_id]
+        [&p.request_id, &p.project_id]
             .iter()
             .all(|id| super::super::stable_id(id))
+            && p.origin_session_ref
+                .as_deref()
+                .is_none_or(super::super::stable_id)
+            && match (p.origin_turn_ref.as_deref(), p.origin_turn_epoch) {
+                (None, None) => true,
+                (Some(turn), Some(epoch)) => {
+                    p.origin_session_ref.is_some() && super::super::stable_id(turn) && epoch > 0
+                }
+                _ => false,
+            }
+            && (p.environment_id.is_empty() || super::super::stable_id(&p.environment_id))
+            && p.project_participation
+                .is_none_or(|generation| generation > 0)
+            && match (
+                p.conversation_id.as_deref(),
+                p.revises_job_id.as_deref(),
+                p.expected_revised_revision,
+            ) {
+                (None, None, None) => true,
+                (Some(conversation), Some(job), Some(revision)) => {
+                    super::super::stable_id(conversation)
+                        && super::super::stable_id(job)
+                        && revision > 0
+                        && p.origin_session_ref.is_none()
+                }
+                _ => false,
+            }
             && !p.title.trim().is_empty()
             && p.title.len() <= 256
             && ((p.input.version == 1 && p.input.input_refs.is_empty()) || p.input.version == 2)
@@ -257,6 +560,45 @@ fn valid_payload(operation: &ReceiptOperation, payload: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_accepts_hub_placement_and_opaque_local_parent_only() {
+        let mut payload = serde_json::json!({
+            "request_id":"request-b","origin_session_ref":"01K6SESSION",
+            "project_id":"project-a","environment_id":"", "title":"依頼",
+            "input":{"version":2,"prompt":"WinBで確認","input_refs":[]},
+            "descendant_budget":8
+        });
+        assert!(valid_payload(&ReceiptOperation::Submit, &payload));
+        payload["origin_turn_ref"] = serde_json::json!("turn-a");
+        assert!(!valid_payload(&ReceiptOperation::Submit, &payload));
+        payload["origin_turn_epoch"] = serde_json::json!(1);
+        assert!(valid_payload(&ReceiptOperation::Submit, &payload));
+        payload["origin_session_ref"] = serde_json::json!("secret or malformed");
+        assert!(!valid_payload(&ReceiptOperation::Submit, &payload));
+    }
+    #[test]
+    fn revised_submission_requires_exact_conversation_and_revision_tuple() {
+        let mut payload = serde_json::json!({
+            "request_id":"request-r","project_id":"project-a","project_participation":2,
+            "environment_id":"","conversation_id":"conversation-a",
+            "revises_job_id":"job-old","expected_revised_revision":4,
+            "title":"Corrected request","input":{"version":2,"prompt":"Use WinB","input_refs":[]},
+            "descendant_budget":8
+        });
+        assert!(valid_payload(&ReceiptOperation::Submit, &payload));
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_revised_revision");
+        assert!(!valid_payload(&ReceiptOperation::Submit, &payload));
+        assert!(valid_payload(
+            &ReceiptOperation::LeaveProject {
+                project_id: "project-a".into()
+            },
+            &serde_json::json!({"expected_participation_generation":2})
+        ));
+    }
     fn receipt(user: &str) -> Receipt {
         Receipt {
             hub: "trusted-hub".into(),
@@ -303,7 +645,7 @@ mod tests {
         continued.operation = ReceiptOperation::Continue {
             job_id: "finished-a".into(),
         };
-        continued.payload = serde_json::json!({"request_id":"next-a","expected_revision":7,"prompt":"追加の解析","input_refs":["asset-a"]});
+        continued.payload = serde_json::json!({"request_id":"next-a","expected_revision":7,"conversation_epoch":2,"prompt":"追加の解析","input_refs":["asset-a"]});
         ReceiptStore::new(path.clone())
             .insert(continued.clone())
             .unwrap();
@@ -316,12 +658,116 @@ mod tests {
                 .path(),
             "jobs/finished-a/continue"
         );
+        assert_eq!(
+            reopened.pending("trusted-hub", "user-a").unwrap().payload["conversation_epoch"],
+            2
+        );
         let mut wrong = continued.clone();
         wrong.operation = ReceiptOperation::Submit;
         reopened.remove_confirmed(&wrong).unwrap();
         assert!(reopened.pending("trusted-hub", "user-a").is_some());
         reopened.remove_confirmed(&continued).unwrap();
         assert!(reopened.pending("trusted-hub", "user-a").is_none());
+    }
+
+    #[test]
+    fn conversation_stop_receipt_replays_exact_request_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(directory.path().join("receipts.json")).unwrap();
+        let mut stopped = receipt("user-a");
+        stopped.operation = ReceiptOperation::StopConversation {
+            conversation_id: "conversation-a".into(),
+        };
+        stopped.payload = serde_json::json!({"project_id":"project-a","request_id":"stop-once-a"});
+        ReceiptStore::new(path.clone())
+            .insert(stopped.clone())
+            .unwrap();
+        let mut reopened = ReceiptStore::new(path);
+        let pending = reopened.pending("trusted-hub", "user-a").unwrap();
+        assert_eq!(
+            pending.operation.path(),
+            "conversations/conversation-a/services/stop"
+        );
+        assert_eq!(pending.payload["request_id"], "stop-once-a");
+        let mut wrong = stopped.clone();
+        wrong.payload["request_id"] = serde_json::json!("stop-later-b");
+        reopened.remove_confirmed(&wrong).unwrap();
+        assert!(reopened.pending("trusted-hub", "user-a").is_some());
+        reopened.remove_confirmed(&stopped).unwrap();
+        assert!(reopened.pending("trusted-hub", "user-a").is_none());
+        let mut bad_payload = stopped.payload;
+        bad_payload["extra"] = serde_json::json!(true);
+        assert!(!valid_payload(&stopped.operation, &bad_payload));
+    }
+    #[test]
+    fn project_conversation_full_stop_uses_a_distinct_replay_target() {
+        let operation = ReceiptOperation::StopAllConversation {
+            conversation_id: "conversation-a".into(),
+        };
+        assert_eq!(operation.path(), "conversations/conversation-a/stop");
+        assert!(valid_payload(
+            &operation,
+            &serde_json::json!({"project_id":"project-a","request_id":"stop-all-once"})
+        ));
+        assert!(!valid_payload(
+            &operation,
+            &serde_json::json!({"project_id":"project-a","request_id":"stop-all-once","extra":true})
+        ));
+    }
+    #[test]
+    fn prepared_origin_stop_survives_restart_without_becoming_a_dispatchable_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(directory.path().join("receipts.json")).unwrap();
+        let prepared = Receipt {
+            hub: "trusted-hub".into(),
+            user_id: "device".into(),
+            operation: ReceiptOperation::StopOriginTurnPrepared {
+                origin_session_ref: "session-a".into(),
+                origin_turn_ref: "turn-a".into(),
+            },
+            payload: serde_json::json!({"request_id":"stop-turn-a","origin_turn_revision":4}),
+        };
+        ReceiptStore::new(path.clone())
+            .insert(prepared.clone())
+            .unwrap();
+        let mut restored = ReceiptStore::new(path.clone());
+        assert!(restored.pending_origin_stops("trusted-hub") == vec![prepared.clone()]);
+        assert!(
+            restored
+                .pending_origin_stop("trusted-hub", "session-a", "turn-a")
+                .is_some()
+        );
+        let mut duplicate_ready = prepared.clone();
+        duplicate_ready.operation = ReceiptOperation::StopOriginTurn {
+            origin_session_ref: "session-a".into(),
+            origin_turn_ref: "turn-a".into(),
+        };
+        assert!(restored.insert(duplicate_ready.clone()).is_err());
+        restored.promote_prepared_origin_stop(&prepared).unwrap();
+        let reopened = ReceiptStore::new(path);
+        assert!(reopened.pending_origin_stops("trusted-hub") == vec![duplicate_ready]);
+    }
+    #[test]
+    fn pending_submission_is_scoped_to_its_exact_origin_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(directory.path().join("receipts.json")).unwrap();
+        let mut submitted = receipt("device");
+        submitted.payload["origin_session_ref"] = serde_json::json!("session-a");
+        submitted.payload["origin_turn_ref"] = serde_json::json!("turn-old");
+        submitted.payload["origin_turn_epoch"] = serde_json::json!(1);
+        let mut store = ReceiptStore::new(path);
+        store.insert(submitted).unwrap();
+        assert!(store.has_origin_submission("session-a").unwrap());
+        assert!(
+            store
+                .has_origin_turn_submission("session-a", "turn-old")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_origin_turn_submission("session-a", "turn-new")
+                .unwrap()
+        );
     }
     #[test]
     fn legacy_receipt_stays_submission_and_v2_rejects_duplicate_input_refs() {

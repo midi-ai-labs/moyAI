@@ -3,19 +3,22 @@ import test from "node:test";
 import vm from "node:vm";
 import { trustedClick, trustedFocus } from "../scenarios/hub_browser_enrollment.mjs";
 
-function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = true, focusAfterTabs = null, disabledChecks = 0 } = {}) {
+function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = true, focusAfterTabs = null, disabledChecks = 0, initialFocusIndex = null } = {}) {
   const target = { selector: "#older-versions > summary", identity: { tag: "DETAILS", detailsKey: "older-versions" } };
   const controls = Array.from({ length: count }, () => ({ disabled: false, closest: () => null }));
   const node = controls[targetIndex];
   let disabledReads = 0;
   Object.defineProperty(node, "disabled", { get: () => disabledReads++ < disabledChecks });
-  const document = { activeElement: null, querySelectorAll: selector => selector === target.selector ? [node] : controls };
+  controls.forEach((control, index) => { control.compareDocumentPosition = other => other === node ? targetIndex < index ? 2 : targetIndex > index ? 4 : 0 : 0; });
+  const document = { activeElement: initialFocusIndex === null ? null : controls[initialFocusIndex], querySelectorAll: selector => selector === target.selector ? [node] : controls };
   const cdp = { evaluate: async source => vm.runInNewContext(source, { document }) };
   const keys = [], clicks = [], events = [], records = [];
-  let position = -1;
+  let position = initialFocusIndex ?? -1, shift = false;
   const input = {
+    keyDown: async key => { if (key === "Shift") shift = true; },
+    keyUp: async key => { if (key === "Shift") shift = false; },
     pressKey: async key => {
-      keys.push(key); position = (position + 1) % count;
+      keys.push(key); position = (position + (shift ? count - 1 : 1)) % count;
       document.activeElement = focusAfterTabs === null ? (reachable ? controls[position] : null) : (keys.length === focusAfterTabs ? node : null);
     },
     observeExactTarget: async () => ({ observation: { center_in_viewport: true, center_in_scroll_clip: true, center_hit: true } }),
@@ -47,6 +50,12 @@ test("Hub keyboard navigation observes focus after its final allowed Tab", async
   const f = fixture({ focusAfterTabs: 144 });
   await trustedFocus(f.input, f.cdp, f.target);
   assert.equal(f.keys.length, 144);
+});
+
+test("Hub keyboard navigation walks back from later settings to the visible message box", async () => {
+  const f = fixture({ targetIndex: 3, count: 8, initialFocusIndex: 4 });
+  await trustedFocus(f.input, f.cdp, f.target);
+  assert.deepEqual(f.keys, ["Tab"]);
 });
 
 test("Hub clicks only after native keyboard focus reaches the exact target", async () => {

@@ -427,6 +427,9 @@ impl DeviceNetworkService {
     pub(crate) fn remote_jobs(&self) -> RemoteJobService {
         self.inner.jobs.clone()
     }
+    pub(crate) fn publish_service(&self) -> PublishService {
+        self.inner.publish.clone()
+    }
     pub(crate) async fn acknowledge_incoming_job(
         &self,
         authority: &super::VerifiedGrant,
@@ -1237,6 +1240,12 @@ impl DeviceNetworkService {
                 self.adopt_model_session(false).await;
             }
             self.serve_history_requests(&client, generation).await;
+            if self.has_pending_origin_turn_stops() {
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let _ = service.retry_origin_turn_stops_connected().await;
+                });
+            }
         }
         Ok(self.projection_now())
     }

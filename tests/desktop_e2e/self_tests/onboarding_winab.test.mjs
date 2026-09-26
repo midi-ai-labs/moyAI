@@ -1,7 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import path from "node:path";
 import { onboardingImplementationReply, INPUT_NAME, SCRIPT_NAME, RESULT_NAME } from "../fixtures/onboarding_implementation.mjs";
-import { createOnboardingWinAbScenario, implementedArtifactsAccepted, approvalVisibleBeforeScroll, latestArtifactVersion, completedRequestorIdentityAccepted } from "../scenarios/onboarding_winab.mjs";
+import { createOnboardingWinAbScenario, implementedArtifactsAccepted, approvalVisibleBeforeScroll, latestArtifactVersion, completedRequestorIdentityAccepted, ordinaryChatDraftOwnerReady } from "../scenarios/onboarding_winab.mjs";
+
+test("B's draft input waits for the new chat workspace and the rendered owner, not just a visible textarea", () => {
+  const workspace = path.resolve("isolated/quick-chat-workspace");
+  const runTarget = { workspacePath: workspace, sessionId: null, runtimeOwnerToken: "idle:1" };
+  const surface = { projection: { workspace_path: workspace, overlay: "none", hub_project_open: false,
+    navigation_loading: false, busy: false, background_mutation_pending: false, post_run_refresh_pending: false,
+    composer_submit_mode: "new_request", can_submit: true, run_target: runTarget },
+    composer: { count: 1, visible: true, run_target: structuredClone(runTarget) }, prompt: { count: 1, visible: true, enabled: true },
+    visible_fatal_count: 0, visible_recoverable_error_count: 0 };
+  assert.equal(ordinaryChatDraftOwnerReady(surface, workspace), true);
+  surface.composer.run_target = { ...runTarget, runtimeOwnerToken: "prior-owner" };
+  assert.equal(ordinaryChatDraftOwnerReady(surface, workspace), false);
+  surface.composer.run_target = structuredClone(runTarget);
+  surface.projection.navigation_loading = true;
+  assert.equal(ordinaryChatDraftOwnerReady(surface, workspace), false);
+  surface.projection.navigation_loading = false;
+  assert.equal(ordinaryChatDraftOwnerReady(surface, path.resolve("old-workspace")), false);
+});
 
 test("completed requestor identity comes from the matching status summary, not the detail DTO", () => {
   const expected = { job_id: "job-a", user_id: "actor-a", display_name: "WinA (操作PC)" };

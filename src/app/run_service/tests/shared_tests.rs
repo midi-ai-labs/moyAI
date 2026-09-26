@@ -73,9 +73,12 @@ impl crate::llm::LlmClient for ChildThenAnswer {
 fn context() -> SharedRunContext {
     SharedRunContext {
         job_id: "parent-job".into(),
+        attempt_id: "test-attempt".into(),
+        generation: 1,
         project_id: "shared-project".into(),
         environment_id: "general".into(),
         allowed_child_environments: vec!["solver".into()],
+        allowed_child_candidates: Vec::new(),
         resume: None,
         continuation: None,
     }
@@ -1072,9 +1075,24 @@ impl crate::llm::LlmClient for RunningShellThenChild {
                 FinishReason::ToolCall
             }
             2 => {
+                let blocked = requests[step]
+                    .messages
+                    .iter()
+                    .find_map(|message| match message {
+                        ModelMessage::Tool {
+                            call_id,
+                            tool_name,
+                            result,
+                            ..
+                        } if call_id == "managed-step-1" && tool_name == "shared_delegate" => {
+                            Some(result.as_str())
+                        }
+                        _ => None,
+                    })
+                    .expect("the blocked delegation must return a tool result");
                 assert!(
-                    format!("{:?}", requests[step].messages)
-                        .contains("stop managed shell processes")
+                    blocked.contains("ordinary managed shell commands finish"),
+                    "the tool result must explain why an ordinary running shell blocks delegation: {blocked}"
                 );
                 sink.push(LlmEvent::TextDelta(
                     "Delegation could not release the running shell's resource.".into(),
