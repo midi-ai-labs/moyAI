@@ -5,7 +5,7 @@ export interface HubActiveRoute {
   phase: "waiting" | "running";
   logical_model_id: string | null;
 }
-export interface HubModel { id: string; label: string; capabilities: string[] }
+export interface HubModel { id: string; label: string; capabilities: string[]; system_prompt?: string }
 export interface HubCatalog {
   hub_id: string;
   software_version: string;
@@ -79,6 +79,7 @@ export interface HubUiState {
   drafts: Record<HubContext, HubDraft>;
   pending: "load" | "connect" | "refresh" | "main" | "side_chat" | "main_mode" | "side_chat_mode" | "disconnect" | null;
   error: string;
+  errorCode: string | null;
   errorContext: HubContext | "connection" | null;
   requestSerial: number;
 }
@@ -95,7 +96,7 @@ export function createHubUiState(): HubUiState {
     tab: "devices",
     projection: null, endpoint: "http://127.0.0.1:9470", label: "moyAI Desktop",
     connectionTouched: false, drafts: { main: emptyDraft(), side_chat: emptyDraft() },
-    pending: null, error: "", errorContext: null, requestSerial: 0,
+    pending: null, error: "", errorCode: null, errorContext: null, requestSerial: 0,
   };
 }
 export function hubPresentation(state: HubUiState): HubPresentation {
@@ -131,6 +132,21 @@ export function acceptHubProjection(
     && projection.connection_generation === previous.connection_generation
     && projection.settings_revision === previous.settings_revision
     && !localSaveReceiptMatchesCurrent(previous, projection, options.localSave)) return false;
+  if (previous && state.error && !state.pending && projection.status === "connected" && projection.error === null) {
+    const reconnected = previous.status !== "connected"
+      || previous.connection_generation !== projection.connection_generation;
+    const context = state.errorContext;
+    // Enrollment/import completes through the device owner, not a Hub form action.
+    // Its successful projection must retire a now-resolved connection/review error;
+    // otherwise the UI keeps it until an unrelated model-dropdown edit clears it.
+    const connectionError = ["unavailable", "deadline", "unauthorized", "connection_changed"].includes(state.errorCode ?? "");
+    const reviewError = ["review_required", "catalog_changed", "model_removed", "capability_mismatch"].includes(state.errorCode ?? "");
+    const resolved = connectionError && reconnected
+      || reviewError && context !== null && context !== "connection" && !state.drafts[context].dirty
+        && projection[`${context}_confirmation`] === "confirmed"
+        && (reconnected || previous[`${context}_confirmation`] !== "confirmed");
+    if (resolved) clearHubError(state);
+  }
   state.projection = projection;
   if (!state.connectionTouched || options.connected) {
     state.endpoint = projection.endpoint || state.endpoint;
@@ -352,12 +368,17 @@ export function hubCanUseRecommendation(state: HubPresentation): boolean {
   return !state.pending && state.projection?.status === "connected" && !state.projection.active_main
     && Boolean(state.projection.recommended_main_selection && hubReviewTarget(state.projection));
 }
+export function clearHubError(state: HubUiState): void {
+  state.error = "";
+  state.errorCode = null;
+  state.errorContext = null;
+}
 export function useHubRecommendation(state: HubUiState): void {
   if (!hubCanUseRecommendation(state) || !state.projection?.recommended_main_selection) return;
   const selection = structuredClone(state.projection.recommended_main_selection);
   state.drafts.main = { selection, affinityText: String(selection.affinity_turns), capabilitiesText: selection.required_capabilities.join(", "),
     dirty: true, target: hubReviewTarget(state.projection), usesDefault: true };
-  state.error = ""; state.errorContext = null;
+  clearHubError(state);
 }
 export function editHubField(state: HubUiState, field: string, value: string, checked: boolean): void {
   if (state.pending) return;
@@ -418,6 +439,7 @@ export function hubErrorText(code: string | null | undefined): string {
     invalid_selection: "モデルを選び直して保存してください。候補が古い場合は「最新情報を取得」を押してください。",
     route_busy: "このチャットの待機・実行が終了してからモデル選択を変更してください。",
     delegated_execution_unsupported: "このHubは子エージェントの独立実行に未対応です。Hubを更新してください。",
+    model_system_prompt_unsupported: "このモデルのシステムプロンプトに対応するDesktopとRunnerへ更新してください。",
     gateway_unavailable: "Hubの実行ゲートウェイを利用できません。Hubの管理画面で起動状態を確認してください。",
   };
   return code ? messages[code] ?? "Hubの操作を完了できませんでした。接続状態を確認して再度お試しください。" : "";

@@ -113,6 +113,7 @@ async fn shared_artifact_normal_agent_persists_binary_snapshot_in_canonical_arch
             request,
             SharedRunContext {
                 job_id: "artifact-job".into(),
+                project_context: None,
                 attempt_id: "test-attempt".into(),
                 generation: 1,
                 project_id: "project".into(),
@@ -267,6 +268,7 @@ async fn shared_artifact_batch_stays_within_archive_sidecar_budget() {
             request,
             SharedRunContext {
                 job_id: "artifact-batch".into(),
+                project_context: None,
                 attempt_id: "test-attempt".into(),
                 generation: 1,
                 project_id: "project".into(),

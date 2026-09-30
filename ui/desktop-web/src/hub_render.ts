@@ -47,6 +47,7 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
     </div>
     <p id="ai-${context}-status" class="hub-help" data-settings-passive="ai-${context}-status" role="status">${escapeHtml(status)}</p>
     <div data-settings-passive="ai-${context}-comparison">${renderHubCatalogComparison(projection?.[`${context}_catalog_comparison`], context)}</div>
+    <div data-settings-passive="ai-${context}-model-prompts">${(catalog?.models ?? []).filter(model => draft.selection.allowed_model_ids.includes(model.id) && model.system_prompt).map(model => `<details class="hub-model-prompt" data-details-key="hub-${context}-prompt-${escapeHtml(model.id)}"><summary>${escapeHtml(model.label)}のシステムプロンプト</summary><pre>${escapeHtml(model.system_prompt ?? "")}</pre></details>`).join("")}</div>
     <p id="ai-${context}-feedback" class="hub-help" data-settings-passive="ai-${context}-feedback" role="status">${escapeHtml(feedback || hubErrorText(projection?.error))}</p>
     <div class="hub-connection-actions"><button data-action="hub-save-${context === "main" ? "main" : "side"}" ${hubCanSave(state, context) ? "" : "disabled"}>${state.pending === context ? "保存しています…" : "モデル選択を保存"}</button><button data-action="hub-refresh" ${state.pending ? "disabled" : ""}>最新情報を取得</button></div>
     <p class="hub-help">メインとサイドは別々に保存します。共有仕事には、実行するPCのメインのモデル選択を使います。</p>

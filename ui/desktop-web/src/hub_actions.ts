@@ -2,7 +2,7 @@ import { command } from "./api.ts";
 import type { ActionContext } from "./actions.ts";
 import { loadDeviceNetwork } from "./device_network_actions.ts";
 import {
-  acceptHubProjection, hubCanSave, hubCanSetRouteMode, hubErrorText, hubSelectionFromDraft,
+  acceptHubProjection, clearHubError, hubCanSave, hubCanSetRouteMode, hubErrorText, hubSelectionFromDraft,
   type HubContext, type HubProjection, type HubRouteMode, type HubUiState,
 } from "./hub_state.ts";
 
@@ -21,8 +21,7 @@ async function hubRequest(
   const serial = ++local.requestSerial;
   const before = local.projection && structuredClone(local.projection);
   local.pending = pending;
-  local.error = "";
-  local.errorContext = null;
+  clearHubError(local);
   context.rerender();
   try {
     const result = await command<HubProjection>(name, args);
@@ -58,6 +57,7 @@ async function hubRequest(
     }
     if (serial === local.requestSerial && hubSettingsOpen(context)) {
       local.error = message;
+      local.errorCode = typeof error === "string" ? error : null;
       local.errorContext = pending === "main" || pending === "main_mode" ? "main"
         : pending === "side_chat" || pending === "side_chat_mode" ? "side_chat" : "connection";
     }

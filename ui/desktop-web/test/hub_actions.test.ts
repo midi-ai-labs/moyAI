@@ -296,6 +296,35 @@ test("failed recovery retains the original connection error and input without re
   });
 });
 
+test("successful device import retires a failed Hub refresh without another Hub form action", async () => {
+  const offline = projection({ status: "error", error: "unavailable", connection_generation: "1", main_mode: "hub", side_chat_mode: "hub" });
+  await withContext(async (name) => {
+    if (name === "hub_refresh") throw "unavailable";
+    assert.equal(name, "hub_projection");
+    return offline;
+  }, async ({ context, local }) => {
+    acceptHubProjection(local, offline);
+    await refreshHub(context);
+    assert.equal(local.errorCode, "unavailable");
+    assert.equal(local.errorContext, "connection");
+    assert.notEqual(local.error, "");
+    const selection: HubSelection = { allowed_model_ids: ["model-a"], preferred_model_id: "model-a",
+      required_capabilities: [], wait_policy: "wait_for_preferred", affinity_turns: 1 };
+    const review = { hub_id: "hub-a", reviewed_revision: "1", selection };
+    acceptHubProjection(local, projection({ status: "connected", settings_revision: "1", connection_generation: "2",
+      hub_id: "hub-a", catalog: { hub_id: "hub-a", software_version: "0.1.0", revision: "1", changes: [],
+        models: [{ id: "model-a", label: "Model A", capabilities: [] }] },
+      main_mode: "hub", side_chat_mode: "hub", main_review: review, side_chat_review: review,
+      main_uses_default: true, side_chat_uses_default: true, main_confirmation: "confirmed", side_chat_confirmation: "confirmed",
+      can_enable_main_hub: true, can_enable_side_chat_hub: true,
+    }));
+    assert.equal(local.error, "");
+    assert.equal(local.errorCode, null);
+    assert.equal(local.drafts.main.dirty, false);
+    assert.equal(hubCanSave(local, "main"), false);
+  });
+});
+
 test("recovery respects the active overlay and a failed projection load does not recurse", async () => {
   const recovery = deferred<HubProjection>();
   await withContext(async (name) => {

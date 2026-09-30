@@ -1,5 +1,104 @@
 use super::*;
 
+#[tokio::test]
+async fn folder_change_status_follows_current_runner_binding_and_retires_on_rejoin() {
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+    let base = camino::Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("project_sandbox/pre-physical-winab-20260927/folder-projection");
+    std::fs::create_dir_all(&base).unwrap();
+    let temp = tempfile::tempdir_in(base).unwrap();
+    let root = camino::Utf8Path::from_path(temp.path()).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let paths = StoragePaths {
+        data_dir: root.join("data"),
+        database_path: root.join("data/db.sqlite3"),
+        truncation_dir: root.join("data/output"),
+    };
+    let sqlite = SqliteStore::open(&paths).unwrap();
+    sqlite.migrate().unwrap();
+    let service = DeviceNetworkService::for_workspace(
+        root.join("config/device"),
+        workspace,
+        StoreBundle::new(sqlite),
+        crate::config::ResolvedConfig::default(),
+    )
+    .await
+    .unwrap();
+    service
+        .inner
+        .execution
+        .state
+        .lock()
+        .unwrap()
+        .bind("current");
+    let status: RunnerOperationsProjection = serde_json::from_value(serde_json::json!({
+        "runner_id": ulid::Ulid::new(), "mode":"shared", "state":"available", "accepting":false,
+        "folder_change_blocked":true, "maintenance_until_ms":null, "autostart":false,
+        "templates":[],"environments":[],"active_attempts":[],"unknown_attempts":[],"error":null,"desktop_binding":"current"
+    })).unwrap();
+    service.accept_execution_status("other", status.clone());
+    assert!(
+        !service
+            .inner
+            .execution
+            .state
+            .lock()
+            .unwrap()
+            .view
+            .folder_change_blocked
+    );
+    service.accept_execution_status("current", status.clone());
+    assert!(
+        service
+            .inner
+            .execution
+            .state
+            .lock()
+            .unwrap()
+            .view
+            .folder_change_blocked
+    );
+    service.accept_execution_status(
+        "current",
+        RunnerOperationsProjection {
+            folder_change_blocked: false,
+            ..status.clone()
+        },
+    );
+    assert!(
+        !service
+            .inner
+            .execution
+            .state
+            .lock()
+            .unwrap()
+            .view
+            .folder_change_blocked
+    );
+    service.accept_execution_status("current", status);
+    service
+        .inner
+        .execution
+        .state
+        .lock()
+        .unwrap()
+        .bind("new-participation");
+    assert!(
+        !service
+            .inner
+            .execution
+            .state
+            .lock()
+            .unwrap()
+            .view
+            .folder_change_blocked
+    );
+    service.shutdown().await;
+}
+
 #[test]
 fn endpoint_move_preserves_saved_consent_but_invalidates_native_review_and_async_target() {
     let old = format!("hub|device|https://old.example:9471|{}", "a".repeat(64));

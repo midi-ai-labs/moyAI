@@ -45,8 +45,21 @@ impl StepContext {
     }
 
     pub fn refresh_world_state(&mut self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        self.refresh_world_state_with_project(workspace, None)
+    }
+
+    pub(crate) fn refresh_world_state_with_project(
+        &mut self,
+        workspace: &Workspace,
+        shared: Option<(&crate::context::world_state::SharedProjectContext, &str)>,
+    ) -> Result<(), WorkspaceError> {
         let config = self.turn.resolved_config().runtime_config();
-        self.world_state = WorldState::build_at(workspace, config, self.turn.current_time.clone())?;
+        self.world_state = WorldState::build_at_with_project(
+            workspace,
+            config,
+            self.turn.current_time.clone(),
+            shared,
+        )?;
         Ok(())
     }
 }

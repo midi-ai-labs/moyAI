@@ -51,7 +51,9 @@ For a current development Windows package:
 
 Team access does not require a moyAI username/password. Every PC has its own ID and key, even when Windows usernames match. Hub membership alone does not grant access to every project.
 
-Closing Desktop leaves it in the system tray; launching it again shows the existing window. Use **終了** in the tray menu to exit. Runner and Hub have their own lifetimes.
+Closing the Desktop window leaves it in the system tray; launching it again shows the existing window. **終了** in the application or tray menu gracefully stops the connected local Runner's work and retained apps, waits for the Runner process to exit, then exits Desktop. Hub is managed separately. A Desktop crash or lost display connection does not stop Runner.
+
+After a normal restart, Desktop restores the last local project folder and conversation, including when Git was initialized in that conversation's folder. Explicit `--dir`, `--session`, or `--continue-last` options take priority. If the saved folder or conversation is unavailable, Desktop explains the problem so you can choose another project; it does not recreate missing folders.
 
 See [getting started](docs/user/getting-started.md), [Windows installation and updates](docs/user/windows-setup.md), [first-use recovery](docs/desktop-first-use.md), and [Hub project operation](docs/shared-work-desktop.md).
 

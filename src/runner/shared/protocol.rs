@@ -78,6 +78,8 @@ pub struct Job {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Assignment {
+    #[serde(default)]
+    pub project_context: Option<crate::context::world_state::SharedProjectContext>,
     pub attempt_id: String,
     pub generation: u64,
     #[serde(default = "initial_authority_generation")]
@@ -94,6 +96,9 @@ pub struct Assignment {
     pub retained_services: Vec<RetainedService>,
     #[serde(default)]
     pub required_runner_capabilities: Vec<String>,
+    /// New Hubs opt in; older Hubs must never receive an unknown report kind.
+    #[serde(default)]
+    pub supports_progress_reports: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,15 +111,15 @@ pub struct SharedCandidate {
     pub capabilities: Vec<String>,
 }
 
-pub(crate) const MULTI_DEVICE_SESSION_CAPABILITY: &str = "multi_device_session_v1";
+pub(crate) const MULTI_DEVICE_SESSION_CAPABILITY: &str = "multi_device_session_v2";
 
 impl Assignment {
     pub(crate) fn require_supported_capabilities(&self) -> Result<(), RunnerError> {
         if self.required_runner_capabilities.len() > 1
-            || self
-                .required_runner_capabilities
-                .iter()
-                .any(|capability| capability != MULTI_DEVICE_SESSION_CAPABILITY)
+            || self.required_runner_capabilities.iter().any(|capability| {
+                capability != MULTI_DEVICE_SESSION_CAPABILITY
+                    && capability != "multi_device_session_v1"
+            })
         {
             return Err(RunnerError::new(
                 "This Hub job requires a newer Runner. Update moyAI on the execution PC before accepting it",
@@ -131,7 +136,7 @@ pub struct RetainedService {
     pub generation: u64,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
 }
 
 fn initial_authority_generation() -> u64 {
@@ -158,9 +163,14 @@ pub struct Report {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReportOutcome {
     Started,
+    Progress {
+        revision: u64,
+        items: Vec<ProgressItem>,
+        truncated: bool,
+    },
     RetainService {
         service_id: String,
-        expires_at_ms: u64,
+        expires_at_ms: Option<u64>,
     },
     ServiceStopped {
         service_id: String,
@@ -189,6 +199,15 @@ pub enum ReportOutcome {
         request: Value,
         expires_at_ms: u64,
     },
+}
+
+/// Bounded public display derived from canonical history, never a restore archive.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressItem {
+    pub position: u64,
+    pub kind: String,
+    pub payload: Value,
 }
 
 #[derive(Debug, Deserialize)]

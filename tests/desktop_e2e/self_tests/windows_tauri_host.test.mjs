@@ -25,6 +25,11 @@ test("cold and duplicate activation use the same bounded fixture argv without sh
   const config = "C:\\fixture\\workspace\\team config 日本語.toml";
   assert.deepEqual(desktopLaunchArguments(context), ["--dir", context.paths.workspace]);
   assert.deepEqual(desktopLaunchArguments(context, config), ["--dir", context.paths.workspace, "--join-config", config]);
+  assert.deepEqual(desktopLaunchArguments(context, null, "preferences"), []);
+  assert.deepEqual(desktopLaunchArguments(context, config, "preferences"), ["--join-config", config]);
+  for (const value of [null, "", "current", ["preferences"], { workspace: false }]) {
+    assert.throws(() => desktopLaunchArguments(context, null, value), /startupTarget/);
+  }
   for (const value of ["relative.toml", "C:\\fixture\\workspace", "C:\\fixture\\workspace2\\other.toml", "C:\\fixture\\workspace\\..\\other.toml", config + "\0"]) {
     assert.throws(() => desktopLaunchArguments(context, value), /joinConfigPath/);
   }

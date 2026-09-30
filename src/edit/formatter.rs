@@ -175,7 +175,7 @@ impl Formatter {
                     cwd: invocation.working_directory.clone(),
                     environment,
                     stdin: text.into_bytes(),
-                    timeout_ms: options.timeout_ms.max(1),
+                    timeout_ms: Some(options.timeout_ms.max(1)),
                     max_output_bytes: options.max_output_bytes.max(1),
                     hide_window: shell.hide_windows,
                     cancel: options.cancel,

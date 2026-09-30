@@ -258,7 +258,7 @@ pub fn format_artifact_preview(
     }
     lines.push(String::new());
     lines.push(
-        "差分はセッション履歴のファイル変更から確認できます。Undo は安全契約を増やすため、この画面には露出していません。"
+        "変更内容は会話の作業履歴から確認できます。この画面からファイルの変更を元に戻すことはできません。"
             .to_string(),
     );
     lines.join("\n")

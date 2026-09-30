@@ -2,7 +2,7 @@ import { command } from "./api.ts";
 import type { ActionContext } from "./actions.ts";
 import type { DeviceNetworkProjection } from "./device_network_state.ts";
 import { deviceNetworkError } from "./device_network_state.ts";
-import { acceptSharedWork, clearSharedCurrentDraft, selectedSharedConversationDeletePending, selectedSharedJobIsLatest, selectedSharedRequestHasAttachments, sharedWorkActionEnabled, type SharedWorkProjection } from "./shared_work_state.ts";
+import { acceptSharedWork, clearSharedCurrentDraft, selectedSharedConversationDeletePending, selectedSharedJobIsLatest, sharedProjectParticipation, sharedWorkActionEnabled, type SharedWorkProjection } from "./shared_work_state.ts";
 import { SAMPLE_PROMPT, SAMPLE_TITLE } from "./shared_work_onboarding.ts";
 
 export async function openSharedWork(context: ActionContext): Promise<void> {
@@ -33,37 +33,29 @@ export async function refreshSharedWork(context: ActionContext): Promise<void> {
   } catch { if (serial === local.serial) local.error = "Hubのプロジェクトを確認できません。接続の復帰後に自動で更新します。"; }
   finally { local.polling = false; context.rerender(); }
 }
-export async function sharedWorkAction(context: ActionContext, kind: string, value = ""): Promise<void> {
+export async function sharedWorkAction(context: ActionContext, kind: string, value = "", expectedParticipation?: number): Promise<void> {
   const local = context.uiState.sharedWork;
   if ((kind !== "leave_project" && context.getViewState()?.hub_project_open !== true)
     || context.getViewState()?.overlay !== "none" || local.pending) return;
   const projection = local.projection;
   if (!projection) return;
+  const targetProject = kind === "leave_project" ? value : projection.selected_project_id;
+  const targetParticipation = sharedProjectParticipation(projection, targetProject);
+  if (["approve", "deny", "stop", "reconfirm_approval"].includes(kind) && !sharedWorkActionEnabled(local, kind.replaceAll("_", "-"), value)) return;
   if (["submit", "continue", "revise"].includes(kind) && selectedSharedConversationDeletePending(projection)) return;
   if (kind === "continue" && !selectedSharedJobIsLatest(projection)) return;
-  if (kind === "revise" && selectedSharedRequestHasAttachments(projection)) return;
-  if (kind === "leave_project" && !projection.projects.some(row => row.id === value)) return;
+  if (kind === "revise" && !sharedWorkActionEnabled(local, "save-revise", "")) return;
+  if (kind === "leave_project" && (expectedParticipation === undefined
+    || sharedProjectParticipation(projection, value) !== expectedParticipation)) return;
   if (["select_conversation", "rename_conversation", "delete_conversation"].includes(kind)
     && !projection.conversations?.some(row => row.id === value)) return;
   if (kind === "prepare_sample" && (local.prompt.trim() || local.title.trim() || projection.inputs.length || projection.selected_job_id)) return;
-  let startBeforeMs: number | null = null;
-  if (kind === "submit" || kind === "continue") {
-    const deadline = local.draft[kind === "submit" ? "startBefore" : "followupStartBefore"];
-    if (deadline) {
-      startBeforeMs = new Date(deadline).getTime();
-      if (!Number.isSafeInteger(startBeforeMs) || startBeforeMs <= Date.now()) {
-        local.error = "開始期限には未来の日時を指定してください。";
-        context.rerender();
-        return;
-      }
-    }
-  }
   const serial = ++local.serial;
   local.pending = kind; local.error = "";
   const request: Record<string, unknown> = { kind };
   if (kind === "project") request.project_id = value;
-  if (kind === "leave_project") request.project_id = value;
-  if (["new_conversation", "detail", "cancel", "stop_service", "stop_conversation", "next_jobs", "next_environments", "latest", "submit", "continue", "revise", "prepare_sample", "upload_inputs", "remove_input", "save_asset", "import_asset", "transcript_next", "history_next", "handover", "select_conversation", "rename_conversation", "delete_conversation"].includes(kind)) request.project_id = projection.selected_project_id;
+  if (kind === "leave_project") Object.assign(request, { project_id: value, expected_participation_generation: expectedParticipation });
+  if (["new_conversation", "detail", "cancel", "stop_service", "stop_conversation", "next_jobs", "next_environments", "latest", "submit", "continue", "revise", "prepare_sample", "upload_inputs", "remove_input", "save_asset", "import_asset", "transcript_next", "history_next", "select_conversation", "rename_conversation", "delete_conversation"].includes(kind)) request.project_id = projection.selected_project_id;
   if (["select_conversation", "rename_conversation", "delete_conversation"].includes(kind)) request.conversation_id = value;
   if (kind === "rename_conversation") request.title = local.renameDraft.trim();
   if (kind === "detail" || kind === "cancel") request.job_id = value;
@@ -71,17 +63,17 @@ export async function sharedWorkAction(context: ActionContext, kind: string, val
   if (kind === "stop_conversation") request.conversation_id = value;
   if (kind === "history_next") request.conversation_id = projection.conversation_history?.conversation_id;
   if (kind === "submit") {
-    Object.assign(request, { title: "", prompt: local.prompt, start_before_ms: startBeforeMs });
+    Object.assign(request, { title: "", prompt: local.prompt, start_before_ms: null });
   }
-  if (["continue", "handover", "save_asset", "import_asset", "transcript_next"].includes(kind)) request.job_id = projection.selected_job_id;
-  if (kind === "continue") Object.assign(request, { expected_revision: projection.detail?.revision, prompt: local.draft.followup, start_before_ms: startBeforeMs });
+  if (["continue", "save_asset", "import_asset", "transcript_next"].includes(kind)) request.job_id = projection.selected_job_id;
+  if (kind === "continue") Object.assign(request, { expected_revision: projection.detail?.revision, prompt: local.draft.followup, start_before_ms: null });
   if (kind === "revise") Object.assign(request, { conversation_id: projection.detail?.conversation_id ?? projection.detail?.root_id,
     job_id: local.editingJobId, expected_revision: local.editingJobRevision, prompt: local.revisionDraft });
-  if (kind === "handover") Object.assign(request, { expected_revision: projection.detail?.revision, new_assignee_id: local.draft.assigneeId });
   if (kind === "remove_input") request.asset_id = value;
   if (kind === "save_asset" || kind === "import_asset") Object.assign(request, { kind: "save_asset", asset_id: value, import: kind === "import_asset" });
   if (kind === "inbox_open") request.notification_id = value;
-  if (["approve", "deny", "stop"].includes(kind)) Object.assign(request, { kind: "decide", decision: kind, project_id: projection.selected_project_id, job_id: projection.selected_job_id, approval_id: value });
+    if (["approve", "deny", "stop"].includes(kind)) Object.assign(request, { kind: "decide", decision: kind, project_id: projection.approval?.context?.project_id ?? projection.selected_project_id, job_id: projection.approval?.context?.job_id ?? projection.selected_job_id, approval_id: value });
+  if (kind === "reconfirm_approval") Object.assign(request, { kind: "reconfirm_approval", project_id: projection.approval?.context?.project_id ?? projection.selected_project_id, job_id: projection.approval?.context?.job_id ?? projection.selected_job_id, approval_id: value });
   context.rerender();
   try {
     let result: SharedWorkProjection;
@@ -93,6 +85,8 @@ export async function sharedWorkAction(context: ActionContext, kind: string, val
       result = await command<SharedWorkProjection>("shared_work_projection");
     } else result = await command<SharedWorkProjection>("shared_work_command", { expectedGeneration: projection.generation, request });
     if (serial !== local.serial) return;
+    if (local.projection?.generation !== projection.generation
+      || sharedProjectParticipation(local.projection, targetProject) !== targetParticipation) return;
     if (kind === "submit" && !result.submission_uncertain && !result.error) {
       // Clear the old new-chat draft before the accepted job changes its owner.
       local.title = ""; local.prompt = ""; local.draft.startBefore = "";
@@ -132,9 +126,11 @@ export function requestSharedConfirmation(context: ActionContext, kind: "leave_p
   const projectId = kind === "leave_project" ? value : projection.selected_project_id;
   const project = projection.projects.find(row => row.id === projectId);
   if (!project || !projectId) return;
+  const participationGeneration = sharedProjectParticipation(projection, projectId);
+  if (participationGeneration === null) return;
   const conversation = kind === "delete_conversation" ? projection.conversations?.find(row => row.id === value) : null;
   if (kind === "delete_conversation" && !conversation) return;
-  local.confirmation = { kind, projectId, conversationId: conversation?.id ?? null,
+  local.confirmation = { kind, projectId, participationGeneration, conversationId: conversation?.id ?? null,
     generation: projection.generation, title: conversation?.title ?? project.label };
   context.rerender();
 }
@@ -148,10 +144,17 @@ export async function confirmSharedConfirmation(context: ActionContext): Promise
   const local = context.uiState.sharedWork;
   const confirmation = local.confirmation;
   const projection = local.projection;
-  if (!confirmation || !projection || confirmation.generation !== projection.generation || local.pending) return;
+  if (!confirmation || !projection || local.pending) return;
+  if (confirmation.generation !== projection.generation
+    || sharedProjectParticipation(projection, confirmation.projectId) !== confirmation.participationGeneration) {
+    local.confirmation = null;
+    local.error = "プロジェクトの参加状態が変わりました。最新の状態を確認してください。";
+    context.rerender();
+    return;
+  }
   if (confirmation.kind === "leave_project") {
     if (!projection.projects.some(row => row.id === confirmation.projectId)) return;
-    await sharedWorkAction(context, "leave_project", confirmation.projectId);
+    await sharedWorkAction(context, "leave_project", confirmation.projectId, confirmation.participationGeneration);
   } else if (confirmation.conversationId && projection.selected_project_id === confirmation.projectId
     && projection.conversations?.some(row => row.id === confirmation.conversationId)) {
     await sharedWorkAction(context, "delete_conversation", confirmation.conversationId);

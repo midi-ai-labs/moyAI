@@ -786,10 +786,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(directory.path().join("receipts.json")).unwrap();
         let deadline = super::super::submission_start_deadline(None, 100).unwrap();
-        assert_eq!(deadline, 86_400_100);
+        assert_eq!(deadline, None);
         assert_eq!(
             super::super::submission_start_deadline(Some(120), 100).unwrap(),
-            120
+            Some(120)
         );
         assert!(super::super::submission_start_deadline(Some(100), 100).is_err());
         assert!(super::super::submission_start_deadline(Some(u64::MAX), 100).is_err());

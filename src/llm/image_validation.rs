@@ -50,6 +50,38 @@ pub fn validate_image_payload(
     validate_image_bytes(declared_mime_type, &bytes, limits)
 }
 
+/// Validate stored image snapshots without reopening their informational source paths.
+pub(crate) fn validate_retained_images(images: &[crate::session::ImagePart]) -> Result<(), String> {
+    let limits = ProviderRequestLimits::product_default();
+    let invalid = || {
+        "保存済みの画像を読み込めません。画像を添付し直して新しい依頼を送ってください。".to_string()
+    };
+    if images.len() > limits.max_images {
+        return Err(invalid());
+    }
+    let mut bytes = 0_u64;
+    let mut encoded = 0_u64;
+    for image in images {
+        let metadata = validate_image_payload(&image.mime_type, &image.data_base64, limits)
+            .map_err(|_| invalid())?;
+        if metadata.decoded_bytes != image.byte_len {
+            return Err(invalid());
+        }
+        bytes = bytes
+            .checked_add(metadata.decoded_bytes)
+            .ok_or_else(&invalid)?;
+        encoded = encoded
+            .checked_add(image.data_base64.len() as u64)
+            .ok_or_else(&invalid)?;
+        if bytes > limits.max_total_image_decoded_bytes
+            || encoded > limits.max_total_image_base64_chars
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_image_bytes(
     declared_mime_type: &str,
     bytes: &[u8],

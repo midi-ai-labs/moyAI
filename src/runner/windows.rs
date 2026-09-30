@@ -214,7 +214,13 @@ pub fn endpoint_name() -> Result<String, RunnerError> {
 /// Only an absent pipe permits automatic startup. Busy or inaccessible endpoints are
 /// existing authority, never evidence to bypass identity verification with a new host.
 pub(crate) fn endpoint_present() -> Result<bool, RunnerError> {
-    let name = wide(&pipe_name(&current_identity()?));
+    let config = crate::config::loader::global_config_path()
+        .map_err(|error| RunnerError::new(error.to_string()))?;
+    endpoint_present_for_config(&config)
+}
+
+fn endpoint_present_for_config(config: &camino::Utf8Path) -> Result<bool, RunnerError> {
+    let name = wide(&pipe_name_in(&current_identity()?, config.as_str()));
     if unsafe { WaitNamedPipeW(name.as_ptr(), 0) } != 0 {
         return Ok(true);
     }
@@ -423,6 +429,61 @@ pub(crate) fn request_for_config(
     command: &RunnerCommand,
     config: &camino::Utf8Path,
 ) -> Result<RunnerResponse, RunnerError> {
+    connect_for_config(config, None)?.exchange(command)?
+}
+
+/// A live process handle pins the authenticated server, independently of its
+/// pipe lifetime. Closing the pipe or accepting Shutdown is not process exit.
+struct RunnerServer {
+    process: Handle,
+    process_id: u32,
+}
+
+impl RunnerServer {
+    fn has_exited(&self) -> Result<bool, RunnerError> {
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(last_error()),
+        }
+    }
+
+    fn wait_for_exit(&self) -> Result<(), RunnerError> {
+        if unsafe { WaitForSingleObject(self.process.0, INFINITE) } == WAIT_OBJECT_0 {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+}
+
+struct RunnerConnection {
+    pipe: Handle,
+    server: RunnerServer,
+}
+
+impl RunnerConnection {
+    /// Outer errors are transport/receipt uncertainty; an inner error is the
+    /// Runner's explicit rejection. Shutdown keeps its process owner on lost ACK.
+    fn exchange(
+        &self,
+        command: &RunnerCommand,
+    ) -> Result<Result<RunnerResponse, RunnerError>, RunnerError> {
+        let bytes = serde_json::to_vec(command).map_err(|e| RunnerError::new(e.to_string()))?;
+        let deadline = Instant::now() + IO_DEADLINE;
+        write_frame(self.pipe.0, &bytes, deadline)?;
+        let response = read_frame(self.pipe.0, deadline)?;
+        let _ = write_frame(self.pipe.0, b"received", deadline);
+        serde_json::from_slice::<Result<RunnerResponse, RunnerError>>(&response).map_err(|_| {
+            RunnerError::new("Invalid Runner response; execution delivery may be uncertain")
+        })
+    }
+}
+
+fn connect_for_config(
+    config: &camino::Utf8Path,
+    expected: Option<&RunnerServer>,
+) -> Result<RunnerConnection, RunnerError> {
     let identity = current_identity()?;
     let name = wide(&pipe_name_in(&identity, config.as_str()));
     let connect_deadline = Instant::now() + Duration::from_secs(2);
@@ -460,7 +521,13 @@ pub(crate) fn request_for_config(
     if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut server_pid) } == 0 {
         return Err(last_error());
     }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            server_pid,
+        )
+    };
     if process.is_null() {
         return Err(last_error());
     }
@@ -470,18 +537,86 @@ pub(crate) fn request_for_config(
             "Local Runner server identity does not match this Windows caller",
         ));
     }
+    if let Some(expected) = expected
+        && (expected.process_id != server_pid || expected.has_exited()?)
+    {
+        return Err(RunnerError::new(
+            "実行機能のプロセスが切り替わりました。新しいプロセスは停止していません。",
+        ));
+    }
     let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
     if unsafe { SetNamedPipeHandleState(pipe.0, &mode, null(), null()) } == 0 {
         return Err(last_error());
     }
-    let bytes = serde_json::to_vec(command).map_err(|e| RunnerError::new(e.to_string()))?;
-    let deadline = Instant::now() + IO_DEADLINE;
-    write_frame(pipe.0, &bytes, deadline)?;
-    let response = read_frame(pipe.0, deadline)?;
-    let _ = write_frame(pipe.0, b"received", deadline);
-    serde_json::from_slice::<Result<RunnerResponse, RunnerError>>(&response).map_err(|_| {
-        RunnerError::new("Invalid Runner response; execution delivery may be uncertain")
-    })?
+    Ok(RunnerConnection {
+        pipe,
+        server: RunnerServer {
+            process,
+            process_id: server_pid,
+        },
+    })
+}
+
+/// Uses the same config + Windows user/logon/token scope as normal local IPC.
+/// A replacement incarnation is never chased or stopped on behalf of the old one.
+pub(crate) fn shutdown_existing_for_config(config: &camino::Utf8Path) -> Result<(), RunnerError> {
+    if !endpoint_present_for_config(config)? {
+        return Ok(());
+    }
+    let connection = connect_for_config(config, None)?;
+    let RunnerResponse::Identity { identity } = connection.exchange(&RunnerCommand::Identity)??
+    else {
+        return Err(RunnerError::new("実行機能の識別情報を確認できません。"));
+    };
+    if identity.process_id != connection.server.process_id {
+        return Err(RunnerError::new(
+            "実行機能の識別情報と接続先が一致しないため、停止していません。",
+        ));
+    }
+    let RunnerConnection { pipe, server } = connection;
+    drop(pipe);
+    shutdown_captured_for_config(config, &server, identity)
+}
+
+fn shutdown_captured_for_config(
+    config: &camino::Utf8Path,
+    server: &RunnerServer,
+    identity: super::RunnerIdentity,
+) -> Result<(), RunnerError> {
+    let requested = if identity.accepting {
+        // Connection/authentication failures occur before any shutdown request.
+        // They must not be mistaken for a lost acknowledgement of accepted work.
+        let connection = connect_for_config(config, Some(server))?;
+        connection.exchange(&RunnerCommand::Shutdown {
+            runner_id: identity.runner_id,
+        })
+    } else {
+        // Another quit may already have closed admission. Its captured process
+        // still owns draining even after it stops accepting pipe connections.
+        Ok(Ok(RunnerResponse::ShutdownRequested))
+    };
+    match requested {
+        Ok(Ok(RunnerResponse::ShutdownRequested)) => {}
+        Ok(Ok(_)) => {
+            return Err(RunnerError::new("実行機能からの停止応答が不正です。"));
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(error) => {
+            // The exact process, not another connection or a missing endpoint,
+            // settles a shutdown whose response was lost.
+            eprintln!(
+                "Runner shutdown response unavailable; waiting for captured process exit: {}",
+                error.message
+            );
+        }
+    }
+    server.wait_for_exit()?;
+    if endpoint_present_for_config(config)? {
+        return Err(RunnerError::new(
+            "停止確認中に実行機能が再起動しました。新しいプロセスは停止していません。",
+        ));
+    }
+    Ok(())
 }
 
 fn read_exact(pipe: HANDLE, bytes: &mut [u8], deadline: Instant) -> Result<(), RunnerError> {

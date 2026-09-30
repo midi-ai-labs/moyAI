@@ -105,12 +105,16 @@ export function managementSearchReady(surface, { query, matchedIds, before }) {
 
 export function managementConfirmationReady(surface, { title, detail, verb, confirmationAction }) {
   const dialog = surface?.confirmation;
+  const fileConsequence = {
+    "アーカイブ": "作業フォルダー内のファイルは削除しません",
+    "復元": "作業フォルダー内のファイルは変更しません",
+    "削除": "作業フォルダー内のファイルは残ります",
+  }[verb];
   return surface?.errors === 0 && surface.dialog_count === 1 && dialog?.visible === true
     && dialog.aria_modal === "true" && dialog.focus_inside === true
     && dialog.title?.endsWith(`を${verb}しますか？`) === true
     && dialog.summary === title && dialog.target === detail
-    && dialog.consequence?.includes("実ファイルは削除しません") === (verb !== "復元")
-    && (verb !== "復元" || dialog.consequence?.includes("実ファイルは変更しません") === true)
+    && typeof fileConsequence === "string" && dialog.consequence?.includes(fileConsequence) === true
     && dialog.actions.length === 2
     && dialog.actions.every((row) => row.enabled && row.visible)
     && dialog.actions.filter((row) => row.action === "cancel-local-confirm").length === 1
@@ -170,7 +174,7 @@ async function waitSurface(cdp, sink, label, accept) {
 async function settleTarget(input, locator, sink) {
   // Rust settlement can precede DOM availability, and hovered actions fade in.
   // Acquire the exact visible/enabled DOM owner before each trusted input group.
-  const settled = await waitForSemanticTargetSettlement({input,locator,label:"management action visible and enabled",timeoutMs:2_000});
+  const settled = await waitForSemanticTargetSettlement({input,locator,label:"management action visible and enabled",timeoutMs:2_000,consecutiveReadySamples:3});
   if(settled.value.classified.decision!=="pass") {
     throw new DesktopE2eError("harness","management-action","Management action is not exact and actionable",settled.value);
   }

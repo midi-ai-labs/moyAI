@@ -28,6 +28,52 @@ function projection(overrides: Partial<HubProjection> = {}): HubProjection {
   };
 }
 
+test("join/default confirmation retires the resolved Hub form error without changing the model dropdown", () => {
+  for (const context of ["connection", "main", "side_chat"] as const) {
+    const local = createHubUiState();
+    acceptHubProjection(local, projection({ status: "disconnected", main_mode: "hub", side_chat_mode: "hub" }));
+    local.error = "接続とモデル選択を確認してください。";
+    local.errorCode = context === "connection" ? "unavailable" : "review_required";
+    local.errorContext = context;
+    const selection = { allowed_model_ids: ["model-a"], preferred_model_id: "model-a",
+      required_capabilities: ["tools"], wait_policy: "wait_for_preferred" as const, affinity_turns: 1 };
+    const review = { hub_id: "hub-a", reviewed_revision: "7", selection };
+    const connected = projection({ settings_revision: "2", connection_generation: "2",
+      main_mode: "hub", side_chat_mode: "hub", main_review: review, side_chat_review: review,
+      main_uses_default: true, side_chat_uses_default: true,
+      main_confirmation: "confirmed", side_chat_confirmation: "confirmed" });
+    assert.equal(acceptHubProjection(local, connected), true);
+    assert.equal(local.error, "");
+    assert.equal(local.errorCode, null);
+    assert.equal(local.errorContext, null);
+    assert.equal(hubModelChoice(local, "main"), ":hub-default");
+    assert.equal(hubCanSave(local, "main"), false);
+    assert.equal(hubExecutionRoute(connected, "main")!.blockedReason, null);
+    assert.match(renderManagedAiConnection(local, "main"), /保存済み/);
+  }
+});
+
+test("polling retains unresolved catalog reviews, other-context errors and failed edits", () => {
+  for (const unresolved of ["catalog", "other_context", "edited", "unchanged", "storage", "validation"] as const) {
+    const local = createHubUiState();
+    const before = projection({ main_confirmation: unresolved === "unchanged" ? "confirmed" : "unconfirmed" });
+    acceptHubProjection(local, before);
+    local.error = "この選択を保存できませんでした。";
+    local.errorCode = unresolved === "storage" ? "settings_unavailable"
+      : unresolved === "validation" ? "invalid_selection" : "review_required";
+    local.errorContext = "main";
+    if (unresolved === "edited") editHubField(local, "main:affinity", "invalid", false);
+    acceptHubProjection(local, { ...before,
+      main_confirmation: unresolved === "catalog" ? "review_required"
+        : unresolved === "other_context" ? "unconfirmed" : "confirmed",
+      side_chat_confirmation: "confirmed",
+      error: unresolved === "catalog" ? "review_required" : null,
+    });
+    assert.equal(local.error, "この選択を保存できませんでした。");
+    assert.equal(local.errorContext, "main");
+  }
+});
+
 test("a managed Hub recommendation changes only the explicitly selected draft until review and route commands", () => {
   const local = createHubUiState();
   const recommended = { allowed_model_ids:["model-a"], preferred_model_id:"model-a", required_capabilities:["tools"], wait_policy:"allow_selected_fallback" as const, affinity_turns:3 };

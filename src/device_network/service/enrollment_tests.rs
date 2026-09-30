@@ -382,6 +382,15 @@ async fn automatic_join_reuses_a_lost_request_and_reopens_pending_before_approva
     assert_eq!(models.side_chat_mode, crate::hub::HubRouteMode::Hub);
     assert!(models.main_uses_default && models.side_chat_uses_default);
     assert_eq!(
+        serde_json::to_value(models.main_confirmation).unwrap(),
+        serde_json::json!("confirmed")
+    );
+    assert_eq!(
+        serde_json::to_value(models.side_chat_confirmation).unwrap(),
+        serde_json::json!("confirmed")
+    );
+    assert!(models.can_enable_main_hub && models.can_enable_side_chat_hub);
+    assert_eq!(
         models
             .main_review
             .as_ref()

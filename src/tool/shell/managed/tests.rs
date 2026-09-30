@@ -30,7 +30,7 @@ impl ManagedShells {
                 },
                 "controlled preview".into(),
                 "fixture".into(),
-                60_000,
+                None,
                 json!(null),
                 CancellationToken::new(),
                 false,
@@ -47,7 +47,7 @@ impl ManagedShells {
         }
         assert_eq!(snapshot.borrow().state, State::Running);
         self.completion_service_in_scope(root, self.receiver_scope_id.expect("receiver scope"))
-            .expect("finite preview")
+            .expect("running preview")
     }
 }
 
@@ -84,7 +84,7 @@ fn start_waiter(
             owner,
             "controlled pending work".into(),
             "fixture".into(),
-            60000,
+            Some(60000),
             json!(null),
             parent,
             |cancel, started| async move {
@@ -125,7 +125,7 @@ async fn delegation_retains_only_one_explicit_finite_running_service() {
             owner.clone(),
             "test server".into(),
             "fixture".into(),
-            60_000,
+            Some(60_000),
             json!(null),
             CancellationToken::new(),
             true,
@@ -178,7 +178,7 @@ async fn finite_preview_is_visible_only_to_its_exact_receiver_scope() {
             owner,
             "preview server".into(),
             "fixture".into(),
-            60_000,
+            Some(60_000),
             json!(null),
             CancellationToken::new(),
             false,
@@ -307,7 +307,7 @@ async fn managed_capacity_shutdown_and_parent_cancellation_preserve_worker_owner
         original.clone(),
         "not started".into(),
         "fixture".into(),
-        1,
+        Some(1),
         json!(null),
         CancellationToken::new(),
         |_, _| async { panic!("capacity must reject before invoking worker") },
@@ -321,7 +321,7 @@ async fn managed_capacity_shutdown_and_parent_cancellation_preserve_worker_owner
         original,
         "not started".into(),
         "fixture".into(),
-        1,
+        Some(1),
         json!(null),
         CancellationToken::new(),
         |_, _| async { panic!("shutdown must reject before invoking worker") },
@@ -342,7 +342,7 @@ async fn managed_cancelled_start_handoff_never_leaves_an_unclaimed_worker() {
             owner(),
             "pending setup".into(),
             "fixture".into(),
-            60000,
+            Some(60000),
             json!(null),
             CancellationToken::new(),
             |cancel, _| async move {
@@ -379,7 +379,7 @@ async fn managed_revocation_between_registration_and_spawn_cannot_escape_a_compl
             owner(),
             "delayed spawn".into(),
             "fixture".into(),
-            60000,
+            Some(60000),
             json!(null),
             CancellationToken::new(),
             move |cancel, _started| async move {
@@ -403,7 +403,7 @@ async fn managed_revocation_between_registration_and_spawn_cannot_escape_a_compl
         owner(),
         "later call".into(),
         "fixture".into(),
-        60000,
+        Some(60000),
         json!(null),
         CancellationToken::new(),
         |_, _| async { panic!("revoked authority cannot start") },

@@ -18,6 +18,7 @@ pub struct SharedRunContext {
     pub generation: u64,
     pub project_id: String,
     pub environment_id: String,
+    pub project_context: Option<crate::context::world_state::SharedProjectContext>,
     pub allowed_child_environments: Vec<String>,
     pub allowed_child_candidates: Vec<crate::runner::shared::SharedCandidate>,
     pub resume: Option<SharedResume>,
@@ -112,6 +113,13 @@ pub(crate) struct SharedYieldProposal {
 
 impl SharedRunContext {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self
+            .project_context
+            .as_ref()
+            .is_some_and(|project| project.project_id != self.project_id || !project.validate())
+        {
+            return Err("invalid shared project context or project identity".into());
+        }
         if self.resume.is_some() && self.continuation.is_some() {
             return Err(
                 "a shared execution cannot resume a checkpoint and fork a continuation together"

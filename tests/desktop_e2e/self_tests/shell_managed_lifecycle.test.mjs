@@ -2,13 +2,21 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
 
-import { createShellManagedLifecycleScenario, managedShellExitMenuReady, probeManagedShell, shutdownBeforeNaturalExpiry } from "../scenarios/shell_managed_lifecycle.mjs";
+import { createShellManagedLifecycleScenario, managedShellExitMenuReady, managedShellFixtureConfig, probeManagedShell, shutdownBeforeNaturalExpiry } from "../scenarios/shell_managed_lifecycle.mjs";
 
 test("managed lifecycle scenario uses the common host contract and isolated state", () => {
   const scenario = createShellManagedLifecycleScenario();
   assert.equal(scenario.id, "shell.managed-lifecycle");
   assert.notEqual(scenario, createShellManagedLifecycleScenario());
   for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) assert.equal(typeof scenario[method], "function");
+});
+
+test("managed lifecycle configuration admits its sixty-second shell lifetime", () => {
+  const config = managedShellFixtureConfig("http://127.0.0.1:12345");
+  const timeout = /^request_timeout_ms = (\d+)$/m.exec(config);
+  assert.ok(timeout, "the fixture must declare the effective model deadline");
+  assert.ok(Number(timeout[1]) > 60_000, "shell_start must fit within the configured deadline");
+  assert.match(config, /^access_mode = "full_access"$/m);
 });
 
 test("HTTP oracle requires exact identity and observes refusal after owned listener closes", async () => {

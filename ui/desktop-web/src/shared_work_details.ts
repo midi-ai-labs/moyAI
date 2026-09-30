@@ -3,10 +3,13 @@ import { renderMarkdown } from "./markdown.ts";
 import { mcpHistoryRegionHasSelection } from "./mcp_history_dom.ts";
 import type { SharedWorkPresentation, WorkAsset } from "./shared_work_state.ts";
 const esc = (value: unknown) => escapeHtml(String(value ?? ""));
-const button = (action: string, label: string, value = "", disabled = false) => `<button data-action="shared-${action}" data-value="${esc(value)}" ${disabled ? "disabled" : ""}>${esc(label)}</button>`;
+const button = (action: string, label: string, value = "", disabled = false) => `<button class="local-mode" data-action="shared-${action}" data-value="${esc(value)}" ${disabled ? "disabled" : ""}>${esc(label)}</button>`;
 const pretty = (value: unknown): string => typeof value === "string" ? value : JSON.stringify(value, null, 2);
 const record = (value: unknown): Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown): string => typeof value === "string" ? value : "";
+function toolLabel(name: string): string {
+  return ({ read: "ファイルの読取り", write: "ファイルの保存", apply_patch: "ファイルの編集", shell: "コマンドの実行", shell_start: "継続するコマンドの起動", shell_status: "コマンドの状態確認", shell_stop: "コマンドの停止", shared_publish_artifact: "成果ファイルの共有", shared_delegate: "別の実行先への依頼", inspect_directory: "フォルダーの確認", list: "フォルダーの確認", glob: "ファイルの検索", grep: "内容の検索", current_time: "現在時刻の確認", update_plan: "作業手順の更新" } as Record<string, string>)[name] ?? "操作";
+}
 function renderTranscriptItem(item: { position: number; kind: string; payload: unknown }, owner: string): string {
   const payload = record(item.payload);
   let label = ({ user_turn: "依頼", steer_turn: "追加の指示", assistant_message: "応答", tool_call: "操作", tool_output: "操作結果", error: "エラー", file_change: "ファイルの変更", compaction: "会話の要約", user: "依頼", assistant: "応答", tool: "操作結果", event: "実行記録", world_state: "実行環境の確認" } as Record<string, string>)[item.kind] ?? "実行記録";
@@ -21,7 +24,7 @@ function renderTranscriptItem(item: { position: number; kind: string; payload: u
     if (!parts.length) body = renderMarkdown(text(item.payload) || text(payload.content));
     body = `<div class="markdown-body">${body || "<p>本文はありません。元データは詳細で確認できます。</p>"}</div>`;
   } else if (item.kind === "tool_call") {
-    label = ({ read: "ファイルの読取り", write: "ファイルの保存", apply_patch: "ファイルの編集", shell: "コマンドの実行", shell_start: "継続するコマンドの起動", shell_status: "コマンドの状態確認", shell_stop: "コマンドの停止", shared_publish_artifact: "成果ファイルの共有", shared_delegate: "別の実行先への依頼", inspect_directory: "フォルダーの確認", list: "フォルダーの確認", glob: "ファイルの検索", grep: "内容の検索", current_time: "現在時刻の確認", update_plan: "作業手順の更新" } as Record<string, string>)[text(payload.tool_name)] ?? "操作";
+    label = toolLabel(text(payload.tool_name));
   } else if (item.kind === "tool_output" || item.kind === "tool") {
     if (text(payload.title)) label = `操作結果: ${text(payload.title)}`;
     body = `<pre>${esc(text(payload.output_text) || text(item.payload))}</pre>`;
@@ -59,16 +62,6 @@ export function renderWorkResult(result: unknown, owner: string, canContinue = f
   const answer = text(result) || text(value.text) || text(value.message) || text(value.error);
   return `<h3>結果</h3><div class="markdown-body">${answer ? renderMarkdown(answer) : "<p>回答文はありません。「結果の詳細」を開くと保存された結果を確認できます。</p>"}</div><details data-details-key="shared-result:${esc(owner)}"><summary>結果の詳細</summary><pre>${esc(pretty(result))}</pre></details>`;
 }
-function textField(local: SharedWorkPresentation, name: string, label: string, type = "text"): string {
-  return `<label>${esc(label)}<input id="shared-${name}" data-shared-field="draft:${name}" type="${type}" value="${esc(local.draft[name])}" ${local.pending ? "disabled" : ""}></label>`;
-}
-export function renderStartDeadline(local: SharedWorkPresentation, name: "startBefore" | "followupStartBefore"): string {
-  return `${textField(local, name, "開始期限（空欄は投入から24時間）", "datetime-local")}<p class="shared-secondary">期限を過ぎた仕事は新たに開始・再開しません。開始済みの処理を打ち切る期限ではありません。</p>`;
-}
-function select(local: SharedWorkPresentation, name: string, label: string, choices: [string, string][], fallback = "", placeholder = "選択してください"): string {
-  const selected = local.draft[name] || fallback;
-  return `<label>${esc(label)}<select id="shared-${name}" data-shared-field="draft:${name}" ${local.pending ? "disabled" : ""}><option value="">${esc(placeholder)}</option>${choices.map(([value, text]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(text)}</option>`).join("")}</select></label>`;
-}
 export function renderWorkInputs(local: SharedWorkPresentation): string {
   const p = local.projection!;
   return `<section data-shared-region="inputs" class="shared-card"><details data-details-key="hub-inputs"><summary>添付ファイル${p.inputs.length ? `（${p.inputs.length}件）` : ""}</summary><p class="shared-secondary">下の「ファイルを添付」から選べます。1件8 MiB、32件まで。選んだ内容をプロジェクトの参加者と共有します。</p>${p.inputs.map(a => `<p>${esc(a.name)} · ${a.byte_length.toLocaleString()} bytes ${button("remove-input", "添付から外す", a.id, Boolean(local.pending || p.submission_uncertain))}</p>`).join("")}</details></section>`;
@@ -76,7 +69,7 @@ export function renderWorkInputs(local: SharedWorkPresentation): string {
 export function renderWorkInbox(local: SharedWorkPresentation): string {
   const inbox = local.projection?.inbox;
   const items = inbox?.items.map(item => {
-    let label = ({ approval: "実行の承認", finished: "仕事の終了", handover: "担当の引継ぎ" } as Record<string, string>)[item.kind] ?? item.kind;
+    let label = ({ approval: "実行の承認", finished: "仕事の終了" } as Record<string, string>)[item.kind] ?? item.kind;
     if (item.kind === "approval") {
       if (item.approval_status === "cancelled") label = "承認依頼の取消済み";
       else if (item.approval_status === "expired") label = "承認期限切れ";
@@ -102,6 +95,50 @@ function workRecordWaitingText(local: SharedWorkPresentation): string {
   if (detail.state === "assigned") return "実行するPCで準備しています。応答や操作結果は、Hubに届き次第ここに表示します。";
   return ["succeeded", "failed", "cancelled"].includes(detail.state)
     ? "この仕事の実行記録はありません。結果は会話内で確認できます。" : "実行記録はまだ届いていません。";
+}
+/** This is a bounded view of public canonical records, never another history owner. */
+function renderWorkActivity(local: SharedWorkPresentation): string {
+  const p = local.projection!, activity = p.transcript?.activity;
+  if (!activity || !p.detail || !["running", "waiting_child", "cancelling"].includes(p.detail.state)) return "";
+  const approvalPending = p.approval?.status === "pending" && p.approval.context?.job_id === activity.job_id
+    && p.approval.attempt_id === activity.attempt_id;
+  const outputs = new Set(activity.items.filter(item => item.kind === "tool_output").map(item => text(record(item.payload).call_id)).filter(Boolean));
+  const rows = activity.items.map(item => {
+    const payload = record(item.payload);
+    if (item.kind === "assistant_message") {
+      const parts = Array.isArray(payload.content) ? payload.content : [];
+      const message = parts.flatMap(part => {
+        const value = record(part);
+        return value.kind === "text" && typeof value.text === "string" ? [value.text] : [];
+      }).join("\n");
+      return message ? `<article class="shared-job"><h3>応答</h3><div class="markdown-body">${renderMarkdown(message)}</div></article>` : "";
+    }
+    if (item.kind === "tool_call") {
+      const pending = Boolean(text(payload.call_id)) && !outputs.has(text(payload.call_id));
+      let argumentsValue: Record<string, unknown> = {};
+      try { argumentsValue = record(JSON.parse(text(payload.arguments_json))); } catch { /* The canonical call may contain invalid arguments. */ }
+      const target = ["command", "path", "pattern", "url"].flatMap(key => typeof argumentsValue[key] === "string" ? [argumentsValue[key]] : []).join("\n");
+      return `<article class="shared-job"><h3>${esc(toolLabel(text(payload.tool_name)))}${pending ? " · 結果待ち" : ""}</h3>${target ? `<pre>${esc(target)}</pre>` : ""}</article>`;
+    }
+    if (item.kind === "tool_output") {
+      const status = payload.status === "declined" ? "拒否" : payload.status === "cancelled" ? "停止"
+        : payload.status === "failed" || payload.success === false ? "失敗" : payload.status === "completed" ? "完了" : "結果";
+      const failed = status === "失敗";
+      return `<article class="shared-job${failed ? " shared-error" : ""}"><h3>操作結果（${status}）${text(payload.title) ? `: ${esc(payload.title)}` : ""}</h3><pre>${esc(text(payload.output_text))}</pre></article>`;
+    }
+    if (item.kind === "error" || item.kind === "file_change") {
+      const message = item.kind === "error" ? text(payload.message) : text(payload.summary);
+      return message ? `<article class="shared-job${item.kind === "error" ? " shared-error" : ""}"><h3>${item.kind === "error" ? "エラー" : "ファイルの変更"}</h3><div class="markdown-body">${renderMarkdown(message)}</div></article>` : "";
+    }
+    return "";
+  }).join("");
+  if (!rows) return "";
+  const environment = p.status?.environments.find(row => row.id === activity.environment_id && row.runner_id === activity.runner_id);
+  const pc = environment?.device_label || environment?.label || "実行PC";
+  const owner = encodeURIComponent(JSON.stringify([p.generation, p.principal?.user_id, p.selected_project_id, p.selected_job_id, activity.job_id, activity.attempt_id, activity.generation]));
+  const observed = new Date(activity.observed_at_ms);
+  const updated = Number.isFinite(observed.getTime()) ? `<time datetime="${observed.toISOString()}">${esc(observed.toLocaleTimeString("ja-JP"))}</time>` : "時刻を確認できません";
+  return `<section data-shared-region="activity" data-shared-record-owner="${esc(owner)}" class="shared-card shared-work-activity" aria-label="進行中の作業"><h2>${esc(pc)}の作業</h2><p class="shared-secondary">更新: ${updated} · 実行先から届いた作業の記録です。</p>${approvalPending ? '<p>この仕事は承認待ちです。<a href="#shared-approval-title">承認内容を確認</a></p>' : ""}${activity.truncated ? '<p class="shared-secondary">直近の記録を表示しています。長い内容は一部を省略しています。</p>' : ""}${rows}</section>`;
 }
 function renderWorkAsset(a: WorkAsset, owner: string, busy: boolean, latest = false): string {
   return `<article class="shared-job"><h3>${esc(a.name)}${latest ? " · 最新版" : ""}</h3><p>${a.kind === "input" ? "入力" : "成果"} · ${a.byte_length.toLocaleString()} bytes · 版 ${a.version}</p><details data-details-key="shared-asset:${esc(owner)}:${esc(a.id)}"><summary>ファイルの詳細</summary><p class="shared-secondary">SHA-256: ${esc(a.sha256)}</p></details><div class="shared-actions">${a.purged_at_ms ? "<p>保持期限により内容は削除済みです。</p>" : ""}${button("save-asset", "名前を付けて保存", a.id, busy || a.purged_at_ms !== null)}${a.kind !== "input" ? button("import-asset", "元の版と照合して取り込む", a.id, busy || a.purged_at_ms !== null) : ""}</div></article>`;
@@ -129,7 +166,7 @@ function renderRetainedServices(local: SharedWorkPresentation): string {
     const environment = local.projection?.status?.environments.find(row => row.id === service.environment_id);
     const state = service.uncertain ? "稼働状態を確認できません" : service.stop_requested ? "停止を確認中" : "起動中";
     const stop = service.can_stop && !service.stop_requested;
-    return `<article class="shared-job"><h3>${esc(environment?.device_label ?? environment?.label ?? "実行PC")}</h3><p>${state} · 保持期限 ${esc(new Date(service.expires_at_ms).toLocaleString("ja-JP"))}</p>${stop ? button("stop-service", "このアプリを停止", service.service_id, Boolean(local.pending)) : ""}</article>`;
+    return `<article class="shared-job"><h3>${esc(environment?.device_label ?? environment?.label ?? "実行PC")}</h3><p>${state} · ${service.expires_at_ms == null ? "停止まで保持" : `保持期限 ${esc(new Date(service.expires_at_ms).toLocaleString("ja-JP"))}`}</p>${stop ? button("stop-service", "このアプリを停止", service.service_id, Boolean(local.pending)) : ""}</article>`;
   }).join("")}</section>`;
 }
 export function renderWorkDetails(local: SharedWorkPresentation, mode: "conversation" | "support" | "record" | "composer" = "conversation"): string {
@@ -140,10 +177,12 @@ export function renderWorkDetails(local: SharedWorkPresentation, mode: "conversa
   const waitingText = workRecordWaitingText(local);
   const transcriptBody = `${p.transcript?.items.map(item => renderTranscriptItem(item, transcriptOwner)).join("") || `<p>${esc(waitingText)}</p>`}${p.transcript?.next_after !== null && p.transcript ? button("transcript-next", "続きの会話を表示", "", busy) : ""}`;
   const transcript = `<section data-shared-region="transcript" data-shared-record-owner="${esc(transcriptOwner)}" class="shared-card"><h2>会話と実行の記録</h2>${transcriptBody}</section>`;
-  const composer = `<section data-shared-region="followup" class="shared-card shared-composer-content"><h2>メッセージ</h2>${detail?.can_continue ? `<label>追加の依頼内容<textarea id="shared-followup" data-shared-field="draft:followup" rows="4" ${busy ? "disabled" : ""}>${esc(local.draft.followup)}</textarea></label><details data-details-key="hub-followup-options"><summary>追加設定</summary>${renderStartDeadline(local, "followupStartBefore")}</details>${button("continue", "送信", "", busy || !local.draft.followup?.trim() || p.submission_uncertain)}` : "<p>追加の依頼には、前の仕事の終了、保存された会話、継続する権限が必要です。</p>"}</section>`;
-  const handover = `<section data-shared-region="handover" class="shared-card"><h2>担当の引継ぎ</h2>${p.handover?.pending ? `<p>担当変更を受け付けました。実行が安全に区切れるまで待っています。</p>` : ""}${p.handover?.can_handover ? select(local, "assigneeId", "次の担当者", p.handover.candidates.map(u => [u.user_id, u.display_name])) + button("handover", "この利用者へ引き継ぐ", "", busy || !local.draft.assigneeId) : "<p>現在の担当者またはプロジェクト管理者が引き継ぎます。</p>"}</section>`;
-  if (mode === "support") return renderRetainedServices(local) + assets + handover;
-  if (mode === "record") return `<section data-shared-region="transcript" data-shared-record-owner="${esc(transcriptOwner)}" class="shared-card">${emptyRecord && detail && ["running", "waiting_child", "queued", "assigned", "cancelling"].includes(detail.state) ? `<p class="shared-record-waiting" role="status">${esc(waitingText)}</p>` : ""}<details data-details-key="hub-selected-job-transcript"><summary>選択した仕事の実行記録</summary>${transcriptBody}</details></section>`;
+  const composer = `<section data-shared-region="followup" class="shared-card shared-composer-content"><h2>メッセージ</h2>${detail?.can_continue ? `<label>追加の依頼内容<textarea id="shared-followup" data-shared-field="draft:followup" rows="4" ${busy ? "disabled" : ""}>${esc(local.draft.followup)}</textarea></label>${button("continue", "送信", "", busy || !local.draft.followup?.trim() || p.submission_uncertain)}` : "<p>追加の依頼には、前の仕事の終了、保存された会話、継続する権限が必要です。</p>"}</section>`;
+  if (mode === "support") return renderRetainedServices(local) + assets;
+  if (mode === "record") {
+    const activity = renderWorkActivity(local);
+    return `${activity || '<section data-shared-region="activity" hidden></section>'}<section data-shared-region="transcript" data-shared-record-owner="${esc(transcriptOwner)}" class="shared-card">${emptyRecord && !activity && detail && ["running", "waiting_child", "queued", "assigned", "cancelling"].includes(detail.state) ? `<p class="shared-record-waiting" role="status">${esc(waitingText)}</p>` : ""}<details data-details-key="hub-selected-job-transcript"><summary>選択した仕事の実行記録</summary>${transcriptBody}</details></section>`;
+  }
   if (mode === "composer") return composer;
   return transcript + composer;
 }

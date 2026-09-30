@@ -77,6 +77,7 @@ export interface DeviceNetworkUiState {
   executionSerial: number;
   executionAccess: DeviceAccessMode;
   executionError: string;
+  executionObservationError: string;
   executionLeaveConfirmation: { projectId: string; participationGeneration: number | null } | null;
   executionRecoveryTarget: string;
   executionRecoveryReason: string;
@@ -118,7 +119,7 @@ export interface DeviceNetworkUiState {
 }
 export type DeviceNetworkPresentation = Omit<DeviceNetworkUiState, "requestSerial" | "jobsSerial" | "diagnosticSerial" | "artifactSerial" | "executionSerial" | "receiverSerial" | "originSerial" | "originLastFetchMs">;
 export function createDeviceNetworkUiState(): DeviceNetworkUiState {
-  return { execution: null, executionPending: null, executionSerial: 0, receiverActivity: null, receiverPending: null, receiverError: "", receiverSerial: 0, originWork: null, originOwner: null, originPending: false, originStopPending: false, originError: "", originSerial: 0, originLastFetchMs: 0, executionAccess: "default", executionError: "", executionLeaveConfirmation: null, executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, executionResetConfirmed: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
+  return { execution: null, executionPending: null, executionSerial: 0, receiverActivity: null, receiverPending: null, receiverError: "", receiverSerial: 0, originWork: null, originOwner: null, originPending: false, originStopPending: false, originError: "", originSerial: 0, originLastFetchMs: 0, executionAccess: "default", executionError: "", executionObservationError: "", executionLeaveConfirmation: null, executionRecoveryTarget: "", executionRecoveryReason: "", executionEffectsReviewed: false, executionProcessesStopped: false, executionResetConfirmed: false, projection: null, pending: null, selectionKey: null, requestSerial: 0, search: "",
     receiverConfirmed: false, target: { kind: "temp" }, accessMode: "default", modelMode: "hub",
     dirty: false, draftTarget: null, leaveConfirmed: false, resetConfirmed: false, deletePeerKey: "", error: "", notice: "", startOnLaunch: false, keepWhenHidden: false,
     bindIp: "", port: "",
@@ -143,7 +144,7 @@ export function acceptDeviceNetworkProjection(
   if (previous && (previous.hub_url !== projection.hub_url || previous.device_id !== projection.device_id
     || previous.enrollment === "active" && projection.enrollment !== "active")) {
     ++state.executionSerial;
-    state.execution = null; state.executionPending = null; state.executionError = ""; state.executionLeaveConfirmation = null;
+    state.execution = null; state.executionPending = null; state.executionError = ""; state.executionObservationError = ""; state.executionLeaveConfirmation = null;
     resetExecutionRecovery(state);
   }
   state.projection = projection;

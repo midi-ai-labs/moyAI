@@ -1,4 +1,4 @@
-Start a finite, managed foreground command, such as a development server.
+Start a managed foreground command, such as a development server.
 
 Use the same shell syntax, environment and permission rules as `shell`. Run the
 server in the foreground: do not detach it with Start-Process, nohup or `&`.
@@ -18,13 +18,14 @@ For a shared job, select the lifetime for the PC that starts the command:
   and its commands stop when the job finishes. Local commands can outlive a turn.
 
 Only one managed command may still be running when a shared job delegates or
-finishes; finish other commands before handing over the server. Retention does not
-reset the deadline: timeout, starting-turn cancellation, receiver revocation and
-application shutdown still stop it. It is not an installed service and is not
-restored after restart. Normally omit `timeout_ms` to inherit the executing PC's
-effective `model.request_timeout_ms`. This setting is both the default and maximum;
-specify a shorter positive value only when needed. The lifetime is fixed at startup,
-including AI and approval waits; report the actual deadline when handing over a server.
+finishes; finish other commands before handing over the server. Starting-turn
+cancellation, receiver revocation, control-connection loss and application shutdown
+still stop it. It is not an installed service and is not restored after restart.
+Normally omit `timeout_ms`: the process has no elapsed-time limit and stays owned
+until it exits or is stopped. The LLM response timeout does not limit its lifetime.
+Supply a positive timeout only when the task explicitly needs a finite command.
+Stop temporary services after their caller finishes verification; retain after the
+request only when continued use was requested.
 
 Running means the process started, not that a port or HTTP endpoint is ready.
 Check readiness separately. Output is bounded and becomes available after exit.

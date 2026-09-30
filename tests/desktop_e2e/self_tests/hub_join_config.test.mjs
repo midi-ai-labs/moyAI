@@ -15,6 +15,10 @@ const desktop = {
   provider_effective_base_url: "http://127.0.0.1:9", provider_effective_model_id: "existing-model",
   provider_effective_profile: "openai_compatible", access_mode: "default", draft_target: { workspace: "fixture", session: null },
 };
+const managedDesktop = url => ({ ...structuredClone(desktop), hub: {
+  main_mode: "hub", side_chat_mode: "hub", status: "connected", endpoint: url,
+  can_change_main_mode: false, can_change_side_chat_mode: false,
+} });
 
 test("activation scenarios share Hub options and do not add warm argv to ordinary startup", () => {
   for (const mode of ["cold", "warm"]) {
@@ -39,23 +43,26 @@ test("cancel oracle rejects persisted mutation, admission, lost draft or changed
   ]) { const changed = structuredClone(value); mutate(changed); assert.equal(cancelledActivationAccepted(changed), false); }
 });
 
-test("OK requires actual device registration and automatic device access without a login form, keeping both Direct routes", () => {
+test("OK requires actual registration and managed Hub access while retaining manual provider settings", () => {
   const url = "https://127.0.0.1:9471", expected = directRouteIdentity(desktop);
-  const value = { desktop: { ...desktop, startup: { onboarding_intent: "team" } },
+  const value = { desktop: { ...managedDesktop(url), startup: { onboarding_intent: "team" } },
     network: { enrollment: "active", hub_url: url, device_id: "device-1" },
     shared: { connected: true, principal: { user_id: "device-actor" }, projects: [] }, loginVisible: false };
   assert.equal(joinedActivationAccepted(value, expected, url), true);
   for (const mutate of [
     x => { x.network.enrollment = "pending"; }, x => { x.network.hub_url = "https://other:9471"; },
     x => { x.shared.principal = null; }, x => { x.shared.projects = [{}]; },
-    x => { x.loginVisible = true; }, x => { x.desktop.hub.side_chat_mode = "hub"; },
+    x => { x.loginVisible = true; }, x => { x.desktop.hub.side_chat_mode = "direct"; },
+    x => { x.desktop.hub.main_mode = "direct"; }, x => { x.desktop.hub.status = "disconnected"; },
+    x => { x.desktop.hub.endpoint = "https://other:9471"; }, x => { x.desktop.hub.can_change_main_mode = true; },
+    x => { x.desktop.hub.can_change_side_chat_mode = true; }, x => { x.desktop.provider_effective_base_url = url; },
     x => { x.desktop.provider_effective_model_id = "overwritten"; },
   ]) { const changed = structuredClone(value); mutate(changed); assert.equal(joinedActivationAccepted(changed, expected, url), false); }
 });
 
-test("endpoint migration preserves the same ordinary person and PC, visible account and Direct routes without a new login", () => {
+test("endpoint migration preserves the device and manual settings under the same managed Hub without a new login", () => {
   const expected = { url: "https://127.0.0.1:9555", device_id: "same-pc", user_id: "alice", display_name: "Endpoint Alice", direct: directRouteIdentity(desktop) };
-  const value = { desktop, network: { enrollment: "active", hub_url: expected.url, device_id: expected.device_id },
+  const value = { desktop: managedDesktop(expected.url), network: { enrollment: "active", hub_url: expected.url, device_id: expected.device_id },
     shared: { connected: true, principal: { user_id: "alice", administrator: false } },
     surface: { count: 1, login_visible: false, account_text: "Endpoint Alice · Hub projects" },
     calls: [{ args: { request: { kind: "refresh" } } }] };
@@ -67,6 +74,8 @@ test("endpoint migration preserves the same ordinary person and PC, visible acco
     x => { x.surface.account_text = "old person"; }, x => { x.surface.count = 0; },
     x => { x.calls.push({ args: { request: { kind: "login" } } }); },
     x => { x.calls.push({ args: { request: { kind: "setup_password" } } }); },
-    x => { x.desktop.hub.main_mode = "hub"; },
+    x => { x.desktop.hub.main_mode = "direct"; }, x => { x.desktop.hub.side_chat_mode = "direct"; },
+    x => { x.desktop.hub.endpoint = "https://old.example:9471"; },
+    x => { x.desktop.provider_effective_model_id = "overwritten"; },
   ]) { const changed = structuredClone(value); mutate(changed); assert.equal(movedActivationAccepted(changed, expected), false); }
 });

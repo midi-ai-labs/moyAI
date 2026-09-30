@@ -1,4 +1,4 @@
-//! App-owned, finite command lifetimes. Shell/sandbox remain the process-tree owners.
+//! App-owned command lifetimes, bounded by explicit stop and execution authority. Shell/sandbox remain the process-tree owners.
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -100,7 +100,7 @@ struct Snapshot {
     state: State,
     command: String,
     workdir: camino::Utf8PathBuf,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
     sandbox: serde_json::Value,
     pid: Option<u32>,
     started_at: Option<String>,
@@ -121,13 +121,13 @@ struct Record {
     worker: std::thread::JoinHandle<()>,
     retain_for_delegation: bool,
     retain_after_turn: bool,
-    expires_at_ms: u64,
+    expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RetainedService {
     pub service_id: Ulid,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     #[serde(default)]
     pub retain_after_turn: bool,
 }
@@ -186,7 +186,7 @@ impl ManagedShells {
         owner: Owner,
         command: String,
         workdir: camino::Utf8PathBuf,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         sandbox: serde_json::Value,
         parent_cancel: CancellationToken,
         execute: F,
@@ -213,7 +213,7 @@ impl ManagedShells {
         owner: Owner,
         command: String,
         workdir: camino::Utf8PathBuf,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         sandbox: serde_json::Value,
         parent_cancel: CancellationToken,
         retain_for_delegation: bool,
@@ -266,8 +266,9 @@ impl ManagedShells {
                 ));
             }
         }
-        let expires_at_ms =
-            (chrono::Utc::now().timestamp_millis().max(0) as u64).saturating_add(timeout_ms);
+        let expires_at_ms = timeout_ms.map(|timeout| {
+            (chrono::Utc::now().timestamp_millis().max(0) as u64).saturating_add(timeout)
+        });
         let id = Ulid::new();
         let (sender, receiver) = watch::channel(Snapshot {
             process_id: id,
@@ -503,7 +504,9 @@ impl ManagedShells {
             || record.cancel.is_cancelled()
             || record.snapshot.borrow().state != State::Running
             || record.snapshot.borrow().pid.is_none()
-            || record.expires_at_ms <= chrono::Utc::now().timestamp_millis().max(0) as u64
+            || record.expires_at_ms.is_some_and(|deadline| {
+                deadline <= chrono::Utc::now().timestamp_millis().max(0) as u64
+            })
         {
             return None;
         }
@@ -598,7 +601,7 @@ impl Tool for ShellStartTool {
         spec.name = ToolName::ShellStart;
         spec.description = include_str!("../../../assets/prompts/shell_start.md");
         spec.input_schema["properties"]["timeout_ms"]["description"] = json!(
-            "Execution lifetime limit in milliseconds. Normally omit to inherit model.request_timeout_ms from the executing PC. A shorter positive value is allowed; values above that setting are rejected. A running command is stopped at this limit."
+            "Optional explicit command lifetime in milliseconds. Normally omit: the command remains owned until completion, stop, authority loss or Runner shutdown. This is independent of LLM response timeout."
         );
         spec.input_schema["properties"]["retain_for_delegation"] = json!({
             "type":"boolean",
@@ -608,7 +611,7 @@ impl Tool for ShellStartTool {
         spec.input_schema["properties"]["retain_after_turn"] = json!({
             "type":"boolean",
             "default":false,
-            "description":"Keep this server running after this shared job returns, for the requested follow-up use or testing by its caller, or a requested preview. Only one server can be retained; it remains visible for explicit stop and ends at timeout_ms."
+            "description":"Keep this server running after this shared job returns, for the requested follow-up use or testing by its caller, or a requested preview. Only one server can be retained; it remains visible for explicit stop; an explicitly supplied timeout_ms also stops it."
         });
         spec
     }
@@ -638,24 +641,23 @@ impl Tool for ShellStartTool {
         };
         let input: ShellInput = serde_json::from_value(raw)?;
         let owner = Owner::from_context(&ctx)?;
-        let max_timeout_ms = ctx.config.model.request_timeout_ms;
-        let timeout_ms = input.timeout_ms.unwrap_or(max_timeout_ms);
-        if timeout_ms == 0 || timeout_ms > max_timeout_ms {
-            return Err(ToolError::Message(format!(
-                "timeout_ms must be between 1 and {max_timeout_ms} (model.request_timeout_ms)"
-            )));
+        let timeout_ms = input.timeout_ms;
+        if timeout_ms.is_some_and(|timeout| {
+            timeout == 0
+                || timeout > i64::MAX as u64
+                || Instant::now()
+                    .checked_add(Duration::from_millis(timeout))
+                    .is_none()
+        }) {
+            return Err(ToolError::Message(
+                "timeout_ms must be a positive representable lifetime when supplied".into(),
+            ));
         }
         let mut intent = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
-        let lifetime = if timeout_ms.is_multiple_of(60_000) {
-            format!("{}分", timeout_ms / 60_000)
-        } else if timeout_ms.is_multiple_of(1_000) {
-            format!("{}秒", timeout_ms / 1_000)
-        } else {
-            format!("{}秒", timeout_ms as f64 / 1_000.0)
-        };
-        intent.details.push(format!(
-            "実行時間の上限: 起動から{lifetime}。上限に達すると自動で停止します。必要に応じて、AIに停止を依頼することもできます。"
-        ));
+        intent.details.push(match timeout_ms {
+            Some(timeout) => format!("実行時間の上限: 起動から{}秒。上限で自動停止します。", timeout as f64 / 1_000.0),
+            None => "このアプリは終了・明示停止・実行権限の失効・Runner終了まで管理します。LLMの応答待ち時間では停止しません。".into(),
+        });
         let admission = ctx
             .confirm_if_needed_with_details(
                 AccessKind::Shell,

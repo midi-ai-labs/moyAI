@@ -9,8 +9,12 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 struct Script {
     sessions: usize,
+    session_limit: Option<usize>,
+    session_tokens: Vec<String>,
     old_hub: bool,
     pause_session: bool,
+    pause_inbox: bool,
+    deny_inbox: bool,
     unavailable: bool,
     deny: bool,
     projects: Vec<Value>,
@@ -20,6 +24,7 @@ struct Script {
     child_job: Option<Value>,
     newer_job: Option<Value>,
     child_approval: Option<Value>,
+    child_approval_for_root: bool,
     inbox_items: Vec<Value>,
     approval_decisions: Vec<Value>,
     submitted_job: Option<Value>,
@@ -134,8 +139,29 @@ impl Server {
                         ));
                         let principal =
                             json!({"user_id":"Alice","display_name":"Alice","administrator":false});
-                        let session = json!({"token":"c".repeat(64),"principal":principal,"expires_at_ms":now_ms()+28_800_000});
+                        let token = if script.session_limit.is_some() {
+                            format!("{:064x}", script.sessions + 1)
+                        } else {
+                            "c".repeat(64)
+                        };
+                        let session = json!({"token":token,"principal":principal,"expires_at_ms":now_ms()+28_800_000});
+                        let authorization = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                            .map(|(_, value)| {
+                                value.trim().strip_prefix("Bearer ").unwrap_or_default()
+                            });
                         match path {
+                            _ if script.session_limit.is_some()
+                                && path != "/v1/shared/device-session"
+                                && !script
+                                    .session_tokens
+                                    .iter()
+                                    .any(|token| Some(token.as_str()) == authorization) =>
+                            {
+                                (401, json!({"error":"unauthorized"}))
+                            }
                             "/v1/shared/device-session" => {
                                 script.sessions += 1;
                                 assert_eq!(body, json!({}));
@@ -148,6 +174,12 @@ impl Server {
                                 } else if script.deny {
                                     (403, json!({"error":"device_identity_required"}))
                                 } else {
+                                    if let Some(limit) = script.session_limit {
+                                        script.session_tokens.push(token);
+                                        while script.session_tokens.len() > limit {
+                                            script.session_tokens.remove(0);
+                                        }
+                                    }
                                     (200, session)
                                 }
                             }
@@ -298,19 +330,14 @@ impl Server {
                             "/v1/shared/jobs/job-revised/transcript" => {
                                 (200, json!({"items":[],"next_after":null}))
                             }
-                            "/v1/shared/jobs/job-a/handover" => (
+                            "/v1/shared/jobs/job-a/approval" => (
                                 200,
-                                json!({"candidates":[],"pending":null,"can_handover":false}),
+                                if script.child_approval_for_root {
+                                    script.child_approval.clone().unwrap_or_default()
+                                } else {
+                                    Value::Null
+                                },
                             ),
-                            "/v1/shared/jobs/job-child/handover" => (
-                                200,
-                                json!({"candidates":[],"pending":null,"can_handover":false}),
-                            ),
-                            "/v1/shared/jobs/job-revised/handover" => (
-                                200,
-                                json!({"candidates":[],"pending":null,"can_handover":false}),
-                            ),
-                            "/v1/shared/jobs/job-a/approval" => (200, Value::Null),
                             "/v1/shared/jobs/job-child/approval" => (
                                 200,
                                 script
@@ -390,6 +417,9 @@ impl Server {
                                     )
                                 }
                             }
+                            "/v1/shared/inbox" if script.deny_inbox => {
+                                (403, json!({"error":"forbidden"}))
+                            }
                             "/v1/shared/inbox" => (
                                 200,
                                 json!({"items":script.inbox_items,"next_before":null,"unread_count":script.inbox_items.len()}),
@@ -400,8 +430,9 @@ impl Server {
                             _ => panic!("unexpected route {path}"),
                         }
                     };
-                    let pause = path == "/v1/shared/device-session"
-                        && requests.lock().unwrap().pause_session;
+                    let pause = (path == "/v1/shared/device-session"
+                        && requests.lock().unwrap().pause_session)
+                        || (path == "/v1/shared/inbox" && requests.lock().unwrap().pause_inbox);
                     if pause {
                         started.notify_one();
                         release.notified().await;
@@ -803,7 +834,7 @@ async fn team_save_artifact_writes_verified_binary_without_leaving_or_clobbering
             &mut self,
             _: &crate::tool::PermissionRequest,
         ) -> Result<ReviewDecision, crate::error::CliPromptError> {
-            panic!("full-access fixture must not prompt")
+            panic!("invalid artifact destinations must fail before prompting")
         }
     }
 
@@ -919,6 +950,26 @@ async fn team_save_artifact_writes_verified_binary_without_leaving_or_clobbering
         control.clone(),
     );
 
+    let requests_before = server.script.lock().unwrap().requests.len();
+    config.permissions.access_mode = AccessMode::Default;
+    let missing_parent = workspace_root.join("not-created");
+    let error = save(
+        &session,
+        &config,
+        &services,
+        &control,
+        &fence,
+        "not-created/output.bin",
+    )
+    .await
+    .expect_err("missing parent must fail without approval or network");
+    assert!(!error.to_string().is_empty());
+    assert!(!missing_parent.exists());
+    assert_eq!(
+        server.script.lock().unwrap().requests.len(),
+        requests_before
+    );
+    config.permissions.access_mode = AccessMode::FullAccess;
     let result = save(&session, &config, &services, &control, &fence, "output.bin")
         .await
         .unwrap();
@@ -1166,6 +1217,157 @@ async fn child_approval_notification_keeps_exact_job_selected_until_decision_or_
     assert!(advanced.approval.is_none());
     server.stop().await;
 }
+
+#[tokio::test]
+async fn origin_conversation_approves_exact_child_without_switching_selected_job() {
+    let server = Server::start().await;
+    {
+        let mut script = server.script.lock().unwrap();
+        script.projects = vec![
+            json!({"id":"project-a","label":"Team","role":"contributor","can_submit":true,"participation_generation":1}),
+        ];
+        script.status = Some(
+            json!({"project_id":"project-a","jobs":[],"environments":[],"next_before":null,"next_environment_before":null}),
+        );
+        script.job = Some(json!({
+            "id":"job-a","conversation_id":"job-a","project_id":"project-a","root_id":"job-a",
+            "parent_id":null,"environment_id":"env-a","title":"Build the app","input":{"prompt":"Build the app"},
+            "result":null,"state":"waiting_child","awaiting_child_id":"job-child","revision":1,"created_at_ms":1,"updated_at_ms":1
+        }));
+        script.child_approval_for_root = true;
+        script.child_approval = Some(json!({
+            "id":"approval-child","attempt_id":"attempt-child","status":"pending",
+            "decision":null,"expires_at_ms":now_ms()+300_000,"can_decide":true,
+            "request":{"access":"shell","summary":"Run a shell check","details":["Command: Get-ChildItem -LiteralPath ."],"targets":["C:/workspace"],"outside_workspace":false,"risks":["unclassified_shell"]},
+            "context":{"job_id":"job-child","project_id":"project-a","root_id":"job-a","conversation_id":"job-a",
+                "job_title":"Host the app","controller_device_id":"WinA","controller_device_label":"操作PC",
+                "execution_device_id":"WinB","execution_device_label":"実行PC"}
+        }));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    let service = service(&root, &server.shared, "WinA").await;
+    command(&service, SharedWorkCommand::Refresh).await;
+    let parent = command(
+        &service,
+        SharedWorkCommand::SelectConversation {
+            project_id: "project-a".into(),
+            conversation_id: "job-a".into(),
+        },
+    )
+    .await;
+    assert!(parent.error.is_none(), "{:?}", parent.error);
+    assert_eq!(parent.selected_job_id.as_deref(), Some("job-a"));
+    let approval = parent.approval.as_ref().unwrap();
+    assert_eq!(approval.context.as_ref().unwrap().job_id, "job-child");
+    assert!(approval.can_decide);
+    let wrong = command(
+        &service,
+        SharedWorkCommand::Decide {
+            project_id: "project-a".into(),
+            job_id: "job-a".into(),
+            approval_id: "approval-child".into(),
+            decision: WorkDecision::Approve,
+        },
+    )
+    .await;
+    assert!(wrong.error.is_some());
+    assert!(server.script.lock().unwrap().approval_decisions.is_empty());
+    let decided = command(
+        &service,
+        SharedWorkCommand::Decide {
+            project_id: "project-a".into(),
+            job_id: "job-child".into(),
+            approval_id: "approval-child".into(),
+            decision: WorkDecision::Approve,
+        },
+    )
+    .await;
+    assert!(decided.error.is_none(), "{:?}", decided.error);
+    assert_eq!(decided.selected_job_id.as_deref(), Some("job-a"));
+    assert_eq!(decided.selected_conversation_id.as_deref(), Some("job-a"));
+    assert_eq!(server.script.lock().unwrap().approval_decisions.len(), 1);
+    let duplicate = command(
+        &service,
+        SharedWorkCommand::Decide {
+            project_id: "project-a".into(),
+            job_id: "job-child".into(),
+            approval_id: "approval-child".into(),
+            decision: WorkDecision::Approve,
+        },
+    )
+    .await;
+    assert!(duplicate.error.is_some());
+    assert_eq!(server.script.lock().unwrap().approval_decisions.len(), 1);
+    {
+        let mut script = server.script.lock().unwrap();
+        let approval = script.child_approval.as_mut().unwrap();
+        approval["context"]["root_id"] = json!("different-root");
+        approval["status"] = json!("pending");
+        approval["can_decide"] = json!(true);
+    }
+    assert!(
+        command(&service, SharedWorkCommand::Refresh)
+            .await
+            .error
+            .is_some()
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn background_approval_inbox_is_fresh_and_preserves_ui_state() {
+    let server = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    let service = service(&root, &server.shared, "WinA").await;
+    assert!(service.shared_notification_inbox().await.is_some());
+    assert_eq!(server.script.lock().unwrap().sessions, 1);
+    command(&service, SharedWorkCommand::Refresh).await;
+    server.script.lock().unwrap().inbox_items = vec![json!({
+        "id":"notification-child","job_id":"job-child","project_id":"project-a","kind":"approval","title":"Run on WinB",
+        "created_at_ms":2,"read_at_ms":null,"can_act":true,"approval_id":"approval-child","approval_status":"pending","approval_decision":null
+    })];
+    let before = {
+        let runtime = service.inner.shared_work.0.lock().unwrap();
+        (runtime.query, serde_json::to_value(&runtime.view).unwrap())
+    };
+    let (identity, inbox) = service.shared_notification_inbox().await.unwrap();
+    assert!(identity.contains("WinA"));
+    assert_eq!(inbox.items.len(), 1);
+    assert_eq!(
+        inbox.items[0].approval_id.as_deref(),
+        Some("approval-child")
+    );
+    let after = {
+        let runtime = service.inner.shared_work.0.lock().unwrap();
+        (runtime.query, serde_json::to_value(&runtime.view).unwrap())
+    };
+    assert_eq!(before, after);
+    // Expiry is renewed without foreground rendering or loss of selection.
+    service
+        .inner
+        .shared_work
+        .0
+        .lock()
+        .unwrap()
+        .view
+        .expires_at_ms = Some(now_ms());
+    assert!(service.shared_notification_inbox().await.is_some());
+    assert_eq!(server.script.lock().unwrap().sessions, 2);
+    server.script.lock().unwrap().deny_inbox = true;
+    assert!(service.shared_notification_inbox().await.is_none());
+    server.script.lock().unwrap().deny_inbox = false;
+    server.script.lock().unwrap().pause_inbox = true;
+    let poller = service.clone();
+    let pending = tokio::spawn(async move { poller.shared_notification_inbox().await });
+    server.session_started.notified().await;
+    service.inner.shared_work.0.lock().unwrap().clear();
+    server.session_release.notify_one();
+    assert!(pending.await.unwrap().is_none());
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn settled_child_returns_to_parent_with_followup_available() {
     let server = Server::start().await;
@@ -1303,6 +1505,7 @@ async fn lost_leave_reply_stays_pending_and_retries_same_participation_after_res
         &first,
         SharedWorkCommand::LeaveProject {
             project_id: "project-a".into(),
+            expected_participation_generation: 2,
         },
     )
     .await;
@@ -1328,6 +1531,93 @@ async fn lost_leave_reply_stays_pending_and_retries_same_participation_after_res
     drop(script);
     server.stop().await;
 }
+
+#[tokio::test]
+async fn same_project_rejoin_retires_old_selection_and_never_rebases_leave_confirmation() {
+    let server = Server::start().await;
+    {
+        let mut script = server.script.lock().unwrap();
+        script.projects = vec![
+            json!({"id":"project-a","label":"Team","role":"contributor","can_submit":true,"participation_generation":1}),
+            json!({"id":"project-b","label":"Other","role":"contributor","can_submit":true,"participation_generation":4}),
+        ];
+        script.status = Some(
+            json!({"project_id":"project-a","jobs":[],"environments":[],"next_before":null,"next_environment_before":null}),
+        );
+        script.job = Some(
+            json!({"id":"job-a","conversation_id":"job-a","project_id":"project-a","root_id":"job-a","parent_id":null,"environment_id":"env-a","title":"Old participation","input":{"prompt":"Old work"},"result":null,"state":"queued","awaiting_child_id":null,"revision":1,"created_at_ms":1,"updated_at_ms":1}),
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    let service = service(&root, &server.shared, "WinA").await;
+    command(&service, SharedWorkCommand::Refresh).await;
+    let old = command(
+        &service,
+        SharedWorkCommand::SelectConversation {
+            project_id: "project-a".into(),
+            conversation_id: "job-a".into(),
+        },
+    )
+    .await;
+    assert!(old.error.is_none(), "{:?}", old.error);
+    assert!(old.detail.is_some());
+    server.script.lock().unwrap().projects[0]["participation_generation"] = json!(2);
+    let fresh = command(&service, SharedWorkCommand::Refresh).await;
+    assert!(fresh.error.is_none(), "{:?}", fresh.error);
+    assert_ne!(fresh.generation, old.generation);
+    assert_eq!(fresh.selected_project_id.as_deref(), Some("project-a"));
+    assert!(fresh.selected_conversation_id.is_none());
+    assert!(fresh.selected_job_id.is_none());
+    assert!(fresh.detail.is_none());
+    assert!(fresh.inputs.is_empty());
+    assert!(fresh.assets.is_empty());
+    assert!(fresh.approval.is_none());
+    assert!(
+        fresh
+            .projects
+            .iter()
+            .any(|project| project.id == "project-b" && project.participation_generation == 4)
+    );
+    service
+        .shared_work_command(
+            &old.generation,
+            SharedWorkCommand::LeaveProject {
+                project_id: "project-a".into(),
+                expected_participation_generation: 1,
+            },
+        )
+        .await;
+    let stale = service
+        .shared_work_command(
+            &fresh.generation,
+            SharedWorkCommand::LeaveProject {
+                project_id: "project-a".into(),
+                expected_participation_generation: 1,
+            },
+        )
+        .await;
+    assert!(
+        stale
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("更新"))
+    );
+    assert!(server.script.lock().unwrap().leave_requests.is_empty());
+    assert!(
+        !service
+            .inner
+            .shared_work
+            .0
+            .lock()
+            .unwrap()
+            .receipts
+            .pending_leave(&service.shared_connection().unwrap().hub_binding, "Alice")
+            .is_some()
+    );
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn execution_only_pc_can_leave_its_own_project() {
     let server = Server::start().await;
@@ -1358,6 +1648,7 @@ async fn execution_only_pc_can_leave_its_own_project() {
         &service,
         SharedWorkCommand::LeaveProject {
             project_id: "project-a".into(),
+            expected_participation_generation: 6,
         },
     )
     .await;
@@ -1381,6 +1672,7 @@ async fn execution_only_pc_can_leave_its_own_project() {
         &service,
         SharedWorkCommand::LeaveProject {
             project_id: "project-a".into(),
+            expected_participation_generation: 7,
         },
     )
     .await;
@@ -1408,7 +1700,7 @@ async fn stopped_latest_shared_prompt_resends_as_revised_turn_in_same_conversati
         script.job = Some(json!({
             "id":"job-a","conversation_id":"job-a","project_id":"project-a",
             "root_id":"job-a","parent_id":null,"environment_id":"env-a",
-            "title":"Old prompt","input":{"version":2,"prompt":"Old prompt","input_refs":[]},
+            "title":"Old prompt","input":{"version":2,"prompt":"Old prompt","input_refs":["original-asset"]},
             "result":null,"state":"cancelled","awaiting_child_id":null,
             "revision":4,"created_at_ms":1,"updated_at_ms":2,"can_revise":true
         }));
@@ -1432,6 +1724,27 @@ async fn stopped_latest_shared_prompt_resends_as_revised_turn_in_same_conversati
     .await;
     assert!(selected.error.is_none(), "{:?}", selected.error);
     assert!(selected.detail.as_ref().unwrap().can_revise);
+    service
+        .inner
+        .shared_work
+        .0
+        .lock()
+        .unwrap()
+        .view
+        .inputs
+        .push(WorkAsset {
+            id: "unrelated-draft-asset".into(),
+            project_id: "project-a".into(),
+            job_id: None,
+            kind: "input".into(),
+            name: "next-request.txt".into(),
+            sha256: "a".repeat(64),
+            byte_length: 1,
+            created_at_ms: 1,
+            version: 1,
+            base_sha256: None,
+            purged_at_ms: None,
+        });
     let revised = command(
         &service,
         SharedWorkCommand::Revise {
@@ -1457,6 +1770,9 @@ async fn stopped_latest_shared_prompt_resends_as_revised_turn_in_same_conversati
     assert_eq!(request["revises_job_id"], "job-a");
     assert_eq!(request["expected_revised_revision"], 4);
     assert_eq!(request["project_participation"], 2);
+    assert_eq!(request["input"]["input_refs"], json!(["original-asset"]));
+    assert_eq!(revised.inputs.len(), 1);
+    assert_eq!(revised.inputs[0].id, "unrelated-draft-asset");
     drop(script);
     server.stop().await;
 }
@@ -1629,6 +1945,122 @@ fn expire(service: &DeviceNetworkService) {
         .unwrap()
         .view
         .expires_at_ms = Some(0);
+}
+
+#[tokio::test]
+async fn team_calls_reuse_device_session_without_losing_selected_conversation() {
+    let server = Server::start().await;
+    {
+        let mut script = server.script.lock().unwrap();
+        script.session_limit = Some(4);
+        script.projects = vec![json!({"id":"project-a","label":"Team","role":"contributor",
+            "can_submit":true,"participation_generation":1})];
+        script.status = Some(json!({"project_id":"project-a","jobs":[],"environments":[],
+            "next_before":null,"next_environment_before":null}));
+        script.job = Some(
+            json!({"id":"job-a","conversation_id":"job-a","project_id":"project-a",
+            "root_id":"job-a","parent_id":null,"environment_id":"env-a","title":"Current conversation",
+            "input":{"version":2,"prompt":"Work","input_refs":[]},"result":null,"state":"running",
+            "awaiting_child_id":null,"revision":1,"created_at_ms":1,"updated_at_ms":1}),
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    let service = service(&root, &server.shared, "WinA").await;
+    assert!(
+        command(&service, SharedWorkCommand::Refresh)
+            .await
+            .error
+            .is_none()
+    );
+    let selected = command(
+        &service,
+        SharedWorkCommand::SelectConversation {
+            project_id: "project-a".into(),
+            conversation_id: "job-a".into(),
+        },
+    )
+    .await;
+    assert!(selected.error.is_none());
+    for _ in 0..6 {
+        service
+            .agent_environments(Some("project-a"), None)
+            .await
+            .unwrap();
+    }
+    let refreshed = command(&service, SharedWorkCommand::Refresh).await;
+    assert!(refreshed.error.is_none(), "{:?}", refreshed.error);
+    assert_eq!(refreshed.selected_conversation_id.as_deref(), Some("job-a"));
+    assert_eq!(refreshed.selected_job_id.as_deref(), Some("job-a"));
+    assert_eq!(refreshed.generation, selected.generation);
+    assert_eq!(server.script.lock().unwrap().sessions, 1);
+
+    service
+        .inner
+        .shared_work
+        .0
+        .lock()
+        .unwrap()
+        .view
+        .expires_at_ms = Some(now_ms() + 30_000);
+    service
+        .agent_environments(Some("project-a"), None)
+        .await
+        .unwrap();
+    let renewed = command(&service, SharedWorkCommand::Refresh).await;
+    assert!(renewed.error.is_none());
+    assert_eq!(renewed.selected_conversation_id.as_deref(), Some("job-a"));
+    assert_eq!(renewed.generation, selected.generation);
+    assert_eq!(server.script.lock().unwrap().sessions, 2);
+
+    service
+        .inner
+        .shared_work
+        .0
+        .lock()
+        .unwrap()
+        .view
+        .expires_at_ms = Some(now_ms() + 30_000);
+    server.script.lock().unwrap().deny = true;
+    assert!(service.agent_session().await.is_err());
+    let revoked = service.shared_work_projection();
+    assert!(revoked.principal.is_none());
+    assert!(revoked.selected_conversation_id.is_none());
+    assert!(revoked.detail.is_none());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn concurrent_team_calls_share_one_device_session() {
+    let server = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+    let service = service(&root, &server.shared, "WinA").await;
+    let results = tokio::join!(
+        service.agent_session(),
+        service.agent_session(),
+        service.agent_session(),
+        service.agent_session(),
+        service.agent_session(),
+        service.agent_session()
+    );
+    assert!(
+        results.0.is_ok()
+            && results.1.is_ok()
+            && results.2.is_ok()
+            && results.3.is_ok()
+            && results.4.is_ok()
+            && results.5.is_ok()
+    );
+    assert_eq!(server.script.lock().unwrap().sessions, 1);
+    assert!(
+        command(&service, SharedWorkCommand::Refresh)
+            .await
+            .error
+            .is_none()
+    );
+    assert_eq!(server.script.lock().unwrap().sessions, 1);
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -2073,6 +2505,7 @@ async fn new_shared_conversation_clears_attachments_only_for_the_current_project
         runtime.view.transcript = Some(WorkTranscript {
             items: vec![],
             next_after: Some(100),
+            activity: None,
         });
         runtime.transcript_after = 100;
     }

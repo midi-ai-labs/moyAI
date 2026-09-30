@@ -77,8 +77,9 @@ export function normalizeScenarioEnvironment(value) {
   return normalized;
 }
 
-export function desktopLaunchArguments(context, joinConfigPath = null) {
-  const args = ["--dir", context.paths.workspace];
+export function desktopLaunchArguments(context, joinConfigPath = null, startupTarget = "workspace") {
+  if (!["workspace", "preferences"].includes(startupTarget)) throw new TypeError("startupTarget must be workspace or preferences");
+  const args = startupTarget === "workspace" ? ["--dir", context.paths.workspace] : [];
   if (joinConfigPath === null || joinConfigPath === undefined) return args;
   if (typeof joinConfigPath !== "string" || joinConfigPath.includes("\0") || joinConfigPath.length > 32767
     || !path.win32.isAbsolute(joinConfigPath)) throw new TypeError("joinConfigPath must be a bounded absolute Windows path");
@@ -166,11 +167,18 @@ export class WindowsTauriHost {
   #companions = [];
 
   async #checkDesktops(owned = []) {
-    if (this.#preservedDesktops === null) return null;
+    const root = this.#parentHost ?? this;
+    if (root.#preservedDesktops === null) return null;
+    // Peer generations belong to the same admission owner. Read their current
+    // captured identities, so restarting A does not turn its old PID into an
+    // allegedly preserved outside process in B's ledger.
+    const peers = [root, ...root.#companions.map(child => child.host)]
+      .filter(host => host !== this).map(host => host.#desktopOwner).filter(Boolean);
+    const expected = [...peers, ...owned];
     const observed = arrayValue(await invokeWindowsProcess("ListDesktop"));
-    if (!desktopOwnersMatch(this.#preservedDesktops, observed, owned)) {
+    if (!desktopOwnersMatch(root.#preservedDesktops, observed, expected)) {
       throw new DesktopE2eError("environment", "desktop-singleton-race", "Desktop ownership changed after preflight", {
-        preserved_desktops: this.#preservedDesktops, expected_owned: owned, observed_desktops: observed,
+        preserved_desktops: root.#preservedDesktops, expected_owned: expected, observed_desktops: observed,
       });
     }
     return observed;
@@ -191,7 +199,7 @@ export class WindowsTauriHost {
     }
     if (this.#admission !== null) await sink.record("admission-acquired", this.#admission.identity, { phase, owner: "process-ledger" });
     const existing = arrayValue(await invokeWindowsProcess("ListDesktop"));
-    this.#preservedDesktops = existing;
+    this.#preservedDesktops = this.#parentHost?.#preservedDesktops ?? existing;
     const isolation = normalizeDesktopIsolation(context.desktopIsolation);
     await sink.record("desktop-preexisting-owners", { desktop_isolation: isolation, processes: existing }, { phase, owner: "process-ledger" });
     if (existing.length > 0 && isolation !== "fixture") {
@@ -239,7 +247,8 @@ export class WindowsTauriHost {
     this.#stderrHandle = await open(stderr, "wx");
     this.#logPaths.push(stdout, stderr);
     this.#launchEnvironment = desktopLaunchEnvironment({ context, scenarioEnvironment: normalizeScenarioEnvironment(scenario.environment), processTemp });
-    this.#desktop = spawn(context.binary, desktopLaunchArguments(context, scenario.joinConfigPath), {
+    const launchArguments = desktopLaunchArguments(context, scenario.joinConfigPath, scenario.startupTarget);
+    this.#desktop = spawn(context.binary, launchArguments, {
       cwd: context.paths.workspace,
       env: this.#launchEnvironment,
       windowsHide: false,
@@ -266,6 +275,8 @@ export class WindowsTauriHost {
       fixture_root: fixtureRoot,
       preserved_desktops: this.#preservedDesktops,
       launch_started_at: launchStartedAt,
+      startup_target: scenario.startupTarget ?? "workspace",
+      arguments: launchArguments,
     }, { phase, owner: "desktop-app" });
     return {
       generation: this.#generation,
@@ -318,7 +329,7 @@ export class WindowsTauriHost {
       env: this.#launchEnvironment, stdoutPath: stdout, stderrPath: stderr,
       timeoutMs: 10_000, label,
     });
-    const observed = await this.#checkDesktops([this.#desktopOwner, ...this.#companions.map(child => child.host.#desktopOwner).filter(Boolean)]);
+    const observed = await this.#checkDesktops([this.#desktopOwner]);
     const result = {
       process: processResult,
       stdout: await readFile(stdout, "utf8"), stderr: await readFile(stderr, "utf8"),
@@ -341,7 +352,10 @@ export class WindowsTauriHost {
 
   async restart({ context, nextContext = context, scenario, sink, driver, phase = "executing", beforeRelaunch = null }) {
     if (beforeRelaunch !== null && typeof beforeRelaunch !== "function") throw new TypeError("beforeRelaunch must be a function");
-    if (this.#parentHost !== null || this.#companions.length) throw new Error("simultaneous companion sessions must finish through common cleanup before restart");
+    if ((this.#parentHost !== null || this.#companions.length)
+      && ["workspace", "config", "data", "prefs", "webview"].some(name => nextContext.paths[name] !== context.paths[name])) {
+      throw new Error("companion restart must retain the same PC fixture paths");
+    }
     if (normalizeDesktopIsolation(nextContext.desktopIsolation) !== normalizeDesktopIsolation(context.desktopIsolation)) throw new Error("Desktop isolation cannot change across restart");
     if (nextContext.root !== context.root || nextContext.binary !== context.binary || nextContext.paths.logs !== context.paths.logs) {
       throw new DesktopE2eError("harness", "restart-context-owner-drift", "Another Desktop fixture must keep the same execution, binary, and log owner");
@@ -354,6 +368,7 @@ export class WindowsTauriHost {
     if (activeDriver === null || this.#desktop === null) {
       throw new DesktopE2eError("harness", "restart-owner-missing", "Desktop restart requires an attached live generation");
     }
+    desktopLaunchArguments(nextContext, scenario.joinConfigPath, scenario.startupTarget);
     this.#restartBegan = true;
     const previous = {
       generation: this.#generation,
@@ -397,6 +412,8 @@ export class WindowsTauriHost {
     if (beforeRelaunch) await beforeRelaunch({ context: nextContext, previous });
     const runtime = await this.launch({ context: nextContext, scenario, sink, phase });
     const nextDriver = await this.attach({ context: nextContext, scenario, sink, runtime, phase });
+    const companion = this.#parentHost?.#companions.find(child => child.host === this);
+    if (companion) Object.assign(companion, { context: nextContext, runtime, driver: nextDriver });
     return {
       runtime,
       driver: nextDriver,
@@ -464,6 +481,7 @@ export class WindowsTauriHost {
       cleanup.profile_webviews_remaining = null;
     }
     try {
+      if (cleanup.desktop_exited) this.#desktopOwner = null;
       cleanup.preserved_desktops = await this.#checkDesktops(cleanup.desktop_exited ? [] : [this.#desktopOwner].filter(Boolean));
       cleanup.preserved_desktops_intact = this.#preservedDesktops === null ? null : true;
     } catch (error) { primary ??= error; cleanup.preserved_desktops_intact = false; }
@@ -526,7 +544,7 @@ export class WindowsTauriHost {
     if (context.root !== this.#activeContext.root || context.binary !== this.#activeContext.binary || normalizeDesktopIsolation(context.desktopIsolation) !== "fixture" || !context.desktopName) throw new Error("companion execution context does not match its parent");
     const childRoot = desktopFixtureRoot(context), primaryRoot = desktopFixtureRoot(this.#activeContext);
     if (childRoot === primaryRoot || this.#companions.some(child => desktopFixtureRoot(child.context) === childRoot)) throw new Error("companion must have a distinct fixture root");
-    await this.#checkDesktops([this.#desktopOwner, ...this.#companions.map(child => child.host.#desktopOwner).filter(Boolean)]);
+    await this.#checkDesktops([this.#desktopOwner]);
     const childSink = sink.scope(`companions/${context.desktopName}`);
     await childSink.writeJson("execution-context.json", { desktop_isolation: "fixture", execution_id: context.executionId, desktop_name: context.desktopName, root: context.root, paths: context.paths, binary: context.manifest.binary });
     const host = new WindowsTauriHost(); host.#parentHost = this;

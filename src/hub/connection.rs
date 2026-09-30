@@ -38,6 +38,23 @@ impl HubReviewContext {
             Self::SideChat => &settings.side_chat_review,
         }
     }
+    fn baseline(self, settings: &HubSettings) -> Option<&HubCatalogBaseline> {
+        match self {
+            Self::Main => settings.main_catalog_baseline.as_ref(),
+            Self::SideChat => settings.side_chat_catalog_baseline.as_ref(),
+        }
+    }
+    fn check_review(self, settings: &HubSettings, catalog: &HubCatalog) -> Result<(), HubError> {
+        self.review(settings)
+            .as_ref()
+            .ok_or(HubError::ReviewRequired)?
+            .check_admission(catalog)?;
+        // Old settings retain their selection, but cannot prove which catalog was reviewed.
+        // An explicit save captures the baseline for this context, never for the other one.
+        self.baseline(settings)
+            .ok_or(HubError::ReviewRequired)?
+            .check_successor(catalog)
+    }
     fn set(self, settings: &mut HubSettings, review: ReviewedHubSelection, catalog: &HubCatalog) {
         match self {
             Self::Main => {
@@ -191,7 +208,7 @@ impl ConnectionState {
         if self
             .catalog
             .as_ref()
-            .is_some_and(|catalog| review.check_admission(catalog).is_err())
+            .is_some_and(|catalog| context.check_review(&self.settings, catalog).is_err())
         {
             return HubReviewConfirmation::ReviewRequired;
         }
@@ -298,6 +315,29 @@ pub struct HubConnection {
 }
 
 impl HubConnection {
+    fn check_saved_catalog(settings: &HubSettings, catalog: &HubCatalog) -> Result<(), HubError> {
+        if settings
+            .hub_id
+            .as_ref()
+            .is_some_and(|id| id != &catalog.hub_id)
+        {
+            return Err(HubError::DifferentHub);
+        }
+        for context in [HubReviewContext::Main, HubReviewContext::SideChat] {
+            if context
+                .review(settings)
+                .as_ref()
+                .is_some_and(|review| review.reviewed_revision > catalog.revision)
+            {
+                return Err(HubError::RevisionRollback);
+            }
+            if let Some(baseline) = context.baseline(settings) {
+                baseline.check_successor(catalog)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(store: HubSettingsStore) -> Self {
         let (settings, storage_error) = match store.load() {
             Ok(settings) => (settings, None),
@@ -412,14 +452,12 @@ impl HubConnection {
             }
         };
         let review = if let Some(saved) = settings {
-            if saved
-                .hub_id
-                .as_ref()
-                .is_some_and(|id| id != &catalog.hub_id)
-            {
-                Err(HubError::DifferentHub)
-            } else if let Some(review) = saved.main_review {
-                review.check_admission(&catalog).map(|()| review)
+            if let Err(error) = Self::check_saved_catalog(&saved, &catalog) {
+                Err(error)
+            } else if let Some(review) = saved.main_review.as_ref() {
+                HubReviewContext::Main
+                    .check_review(&saved, &catalog)
+                    .map(|()| review.clone())
             } else {
                 selection
                     .ok_or(HubError::CapabilityMismatch)
@@ -457,7 +495,7 @@ impl HubConnection {
         let mut settings = HubSettings::default();
         settings.endpoint = endpoint.to_string();
         settings.hub_id = Some(catalog.hub_id.clone());
-        settings.main_review = Some(review.clone());
+        HubReviewContext::Main.set(&mut settings, review.clone(), &catalog);
         settings.main_mode = HubRouteMode::Hub;
         let cancellation = CancellationToken::new();
         let interval = client.heartbeat_interval_ms;
@@ -523,13 +561,7 @@ impl HubConnection {
         let result = async {
             let catalog = client.catalog().await?;
             let mut proposed = self.inner.state.lock().unwrap().settings.clone();
-            if proposed
-                .hub_id
-                .as_ref()
-                .is_some_and(|id| id != &catalog.hub_id)
-            {
-                return Err(HubError::DifferentHub);
-            }
+            Self::check_saved_catalog(&proposed, &catalog)?;
             proposed.endpoint = endpoint;
             proposed.hub_id = Some(catalog.hub_id.clone());
             let mut confirmed = [None, None];
@@ -546,7 +578,7 @@ impl HubConnection {
             for context in [HubReviewContext::Main, HubReviewContext::SideChat] {
                 let review = context.review(&proposed).clone();
                 if let Some(review) =
-                    review.filter(|review| review.check_admission(&catalog).is_ok())
+                    review.filter(|_| context.check_review(&proposed, &catalog).is_ok())
                 {
                     client.review(context, &review).await?;
                     confirmed[context.index()] = Some(review);
@@ -708,16 +740,8 @@ impl HubConnection {
                 {
                     return Err(HubError::DifferentHub);
                 }
-                if state.settings.hub_id.as_ref() == Some(&catalog.hub_id)
-                    && [
-                        &state.settings.main_review,
-                        &state.settings.side_chat_review,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .any(|review| review.reviewed_revision > catalog.revision)
-                {
-                    return Err(HubError::RevisionRollback);
+                if state.settings.hub_id.as_ref() == Some(&catalog.hub_id) {
+                    Self::check_saved_catalog(&state.settings, &catalog)?;
                 }
                 let mut proposed = state.settings.clone();
                 if proposed.endpoint != endpoint
@@ -1042,8 +1066,15 @@ impl HubConnection {
                         };
                         // Invalidate review immediately, then fetch the canonical catalog:
                         // presence revision alone is not authority for its model contents.
-                        if needs_refresh && service.refresh(generation.to_string()).await.is_err() {
-                            break;
+                        if needs_refresh {
+                            match service.refresh(generation.to_string()).await {
+                                // Device refresh replaces the registration, so it must wait
+                                // for all captured Main/Side/delegated routes to finish.
+                                // Keep their heartbeat alive and use this same owner to
+                                // retry; Connected must not silently lose its liveness loop.
+                                Ok(_) | Err(HubError::RouteBusy) => {}
+                                Err(_) => break,
+                            }
                         }
                     }
                     Ok(_) => {}

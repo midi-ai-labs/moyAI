@@ -122,6 +122,8 @@ pub struct ChatRequest {
     provider: ProviderTarget,
     pub(crate) model: ModelProfile,
     pub(crate) system_prompt: String,
+    /// Extra input reserved until a routed client selects and composes its model instructions.
+    pub(crate) pending_system_prompt_tokens: Option<usize>,
     pub(crate) messages: Vec<ModelMessage>,
     pub(crate) tools: Vec<ToolSchema>,
     pub(crate) reasoning: Option<ReasoningRequest>,
@@ -147,6 +149,10 @@ impl fmt::Debug for ChatRequest {
             .field("model", &self.model)
             .field("provider", &self.provider)
             .field("system_prompt_chars", &self.system_prompt.chars().count())
+            .field(
+                "pending_system_prompt_tokens",
+                &self.pending_system_prompt_tokens,
+            )
             .field("message_count", &self.messages.len())
             .field("tool_count", &self.tools.len())
             .field("reasoning", &self.reasoning)
@@ -197,6 +203,7 @@ impl ChatRequest {
             provider,
             model,
             system_prompt,
+            pending_system_prompt_tokens: None,
             messages,
             tools,
             reasoning,
@@ -630,6 +637,16 @@ pub enum LlmEvent {
 pub trait LlmEventSink {
     fn push(&mut self, event: LlmEvent) -> Result<(), LlmError>;
 
+    /// A routed request has completed preparation. Diagnostics retain the public route
+    /// endpoint, never the ephemeral permit URL used by the actual transport.
+    fn request_prepared(
+        &mut self,
+        _request: &ChatRequest,
+        _public_endpoint: &str,
+    ) -> Result<(), LlmError> {
+        Ok(())
+    }
+
     /// Low-volume typed transport lifecycle channel. It is deliberately
     /// separate from model output deltas so consumers that only collect model
     /// content do not need to reinterpret diagnostics as assistant output.
@@ -669,6 +686,11 @@ pub fn validate_toolless_text_response(
 
 #[async_trait(?Send)]
 pub trait LlmClient: Send + Sync {
+    /// None for ordinary clients; Some reserves additional routed input before compaction.
+    fn pending_system_prompt_tokens(&self) -> Option<usize> {
+        None
+    }
+
     async fn stream_chat(
         &self,
         request: ChatRequest,

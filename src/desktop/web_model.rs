@@ -661,12 +661,14 @@ pub struct DesktopWebState {
     pub draft_target: DesktopDraftActionTargetProjection,
     pub image_input: String,
     pub attached_images: Vec<String>,
+    pub retained_image_names: Vec<String>,
     pub composer_submit_mode: DesktopComposerSubmitMode,
     pub can_submit: bool,
     pub can_cancel_run: bool,
     pub run_target: DesktopRunMutationTargetProjection,
     pub stop_target: Option<DesktopStopMutationTarget>,
     pub busy: bool,
+    pub exit_requested: bool,
     pub task_activity_state: DesktopTaskActivityState,
     pub async_polling_required: bool,
     pub pending_async_operations: Vec<String>,
@@ -1126,6 +1128,20 @@ pub(crate) fn desktop_web_state_with_permission(
             .iter()
             .map(|path| path.to_string())
             .collect(),
+        retained_image_names: state
+            .composer
+            .retained_images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                image
+                    .source_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("画像 {}", index + 1))
+            })
+            .collect(),
         composer_submit_mode,
         can_submit: composer_admission_open && (root_run_active || main_route_ready),
         can_cancel_run: stop_target.is_some() && (busy || pending_permission.is_some()),
@@ -1145,6 +1161,7 @@ pub(crate) fn desktop_web_state_with_permission(
         },
         stop_target,
         busy,
+        exit_requested: false,
         task_activity_state,
         async_polling_required: state.async_polling_required()
             || hub_polling
@@ -1377,7 +1394,7 @@ fn agent_status_key(status: &AgentStatus) -> &'static str {
 }
 
 fn desktop_image_input_delegates_capability_to_runtime(state: &DesktopState) -> bool {
-    !state.is_busy() && !state.navigation_loading()
+    !state.is_busy() && !state.navigation_loading() && state.composer.retained_images.is_empty()
 }
 
 fn session_settings_projection(

@@ -83,20 +83,20 @@ test("edit command carries one exact source and hands draft only to its new chat
   assert.equal(ui.drafts.prompt, "書き足した入力");
 });
 
-test("an image-backed local message keeps the draft and shows the edit limitation", async () => {
+test("a corrupt saved image refuses editing without losing the current draft", async () => {
   const source = editableState();
   const ui = createUiLocalState();
   ui.drafts.prompt = "送信前の別の入力";
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async () => {
     throw { kind: "internal", category: "storage", code: "storage_failure",
-      message: "a message with an image cannot be edited in the text composer" };
+      message: "保存済みの画像を読み込めません。画像を添付し直して新しい依頼を送ってください。" };
   } } } });
   try {
     const context = { uiState: ui, getProjection: () => source, acceptProjection: () => { throw new Error("unexpected projection"); },
       rerender: () => {}, recoverCommandConflict: () => false } as unknown as ActionContext;
     await prepareLocalMessageEdit(context, "item-1");
-    assert.equal(ui.localMessageEdit.error, "画像付きの依頼は編集できません。新しい依頼として送ってください。");
+    assert.equal(ui.localMessageEdit.error, "保存済みの画像を読み込めないため、編集を始められません。画像を添付し直して新しい依頼を送ってください。");
     assert.equal(ui.drafts.prompt, "送信前の別の入力");
     assert.equal(ui.localMessageEdit.handoff, null);
   } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }

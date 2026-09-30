@@ -11,6 +11,10 @@ function capabilities(model: HubModel | null): string | null {
   return model ? model.capabilities.join(", ") || "機能情報なし" : null;
 }
 
+function modelPrompt(model: HubModel | null): string | null {
+  return model ? model.system_prompt || "設定なし" : null;
+}
+
 export function renderHubCatalogComparison(comparison: HubCatalogComparison | undefined, context: HubContext): string {
   if (!comparison) return '<p class="hub-help">モデル設定の変更内容はまだ読み込んでいません。</p>';
   switch (comparison.status) {
@@ -31,6 +35,6 @@ export function renderHubCatalogComparison(comparison: HubCatalogComparison | un
     <details class="hub-catalog-diff" data-details-key="hub-${context}-catalog-diff" id="hub-${context}-catalog-diff" open>
       <summary>確認時からの変更内容</summary><div class="hub-catalog-diff-list" tabindex="0" role="region" aria-label="${context === "main" ? "メインチャット" : "サイドチャット"}のモデル設定の変更内容">
       ${softwareChanged ? `<article><h4>Hubバージョン</h4>${table(field("バージョン", comparison.software_before, comparison.software_after))}</article>` : ""}
-      ${comparison.models.map((row) => `<article><h4>${!row.before ? "追加" : !row.after ? "削除" : "変更"} · <code>${escapeHtml(row.id)}</code></h4>${table(field("表示名", row.before?.label ?? null, row.after?.label ?? null) + field("機能", capabilities(row.before), capabilities(row.after)))}</article>`).join("")}
+      ${comparison.models.map((row) => `<article><h4>${!row.before ? "追加" : !row.after ? "削除" : "変更"} · <code>${escapeHtml(row.id)}</code></h4>${table(field("表示名", row.before?.label ?? null, row.after?.label ?? null) + field("機能", capabilities(row.before), capabilities(row.after)) + field("システムプロンプト", modelPrompt(row.before), modelPrompt(row.after)))}</article>`).join("")}
       </div></details>`;
 }

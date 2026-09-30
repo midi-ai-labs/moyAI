@@ -45,7 +45,7 @@ use crate::session::ThreadGoalStatus;
 use crate::session::{
     DurableTurnTerminal, FinishReason, RequestDiagnosticsPart, RequestMessageDiagnostic,
     RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RunConfigSnapshot, RunEvent,
-    RunMetrics, RunSummary, SessionContext, SessionStatus, TokenUsage, ToolCallId,
+    RunMetrics, RunSummary, SessionContext, SessionId, SessionStatus, TokenUsage, ToolCallId,
 };
 use crate::storage::{
     StoreBundle,
@@ -562,7 +562,12 @@ impl AgentLoop {
                 )?;
                 let tool_plan =
                     crate::tool::spec_plan::ToolSpecPlan::build(&step, &step_registry);
-                step.refresh_world_state(&request.session.workspace)?;
+                step.refresh_world_state_with_project(
+                    &request.session.workspace,
+                    self.shared_run.as_ref().and_then(|shared| {
+                        shared.project_context.as_ref().map(|project| (project, shared.environment_id.as_str()))
+                    }),
+                )?;
                 let supports_images = request
                     .turn
                     .policy
@@ -733,6 +738,7 @@ impl AgentLoop {
                     snapshot: prepared_request.world_state.snapshot.clone(),
                     rendered: prepared_request.world_state.rendered.clone(),
                 })?;
+                if prepared_request.chat_request.pending_system_prompt_tokens.is_none() {
                 sink.emit(RunEvent::ModelRequestPrepared {
                     session_id: request.session.session.id,
                     diagnostics: request_diagnostics(
@@ -746,6 +752,7 @@ impl AgentLoop {
                         Some(context_status.clone()),
                     ),
                 })?;
+                }
                 renew_admission_lease(&self.store, &request).await?;
                 model_request_count += 1;
                 let model_response_id = ModelResponseId::new();
@@ -1413,6 +1420,17 @@ impl AgentLoop {
         self.attach_provider_api_key(request, &mut chat_request)?;
 
         let mut collector = StreamingResponseCollector::new(response_id, sink);
+        collector.late_diagnostics = chat_request.pending_system_prompt_tokens.map(|_| {
+            (
+                request.session.session.id,
+                request
+                    .turn
+                    .resolved_config()
+                    .runtime_config()
+                    .session
+                    .overflow_margin_tokens,
+            )
+        });
         let response = {
             let stream = self
                 .llm
@@ -1469,6 +1487,7 @@ impl AgentLoop {
             resolved_model.extra_headers.clone(),
         );
         chat_request.parallel_tool_calls = tool_plan.parallel_tool_calls();
+        chat_request.pending_system_prompt_tokens = self.llm.pending_system_prompt_tokens();
         chat_request.validate_provider_lifecycle()?;
         Ok(PreparedChatRequest {
             chat_request,
@@ -1949,19 +1968,21 @@ impl AgentLoop {
         latest_usage: &mut Option<TokenUsage>,
         sink: &mut dyn RunEventSink,
     ) -> Result<CompactionSummaryOutcome, AgentError> {
-        sink.emit(RunEvent::ModelRequestPrepared {
-            session_id: request.session.session.id,
-            diagnostics: request_diagnostics(
-                &compaction_request,
-                request
-                    .turn
-                    .resolved_config()
-                    .runtime_config()
-                    .session
-                    .overflow_margin_tokens,
-                None,
-            ),
-        })?;
+        if compaction_request.pending_system_prompt_tokens.is_none() {
+            sink.emit(RunEvent::ModelRequestPrepared {
+                session_id: request.session.session.id,
+                diagnostics: request_diagnostics(
+                    &compaction_request,
+                    request
+                        .turn
+                        .resolved_config()
+                        .runtime_config()
+                        .session
+                        .overflow_margin_tokens,
+                    None,
+                ),
+            })?;
+        }
         renew_admission_lease(&self.store, request).await?;
         *model_request_count += 1;
 
@@ -1992,6 +2013,17 @@ impl AgentLoop {
         let local_request_tokens =
             ContextWindowTokenStatus::for_request(&compaction_request, 0).active_context_tokens;
         let mut collector = CompactionResponseCollector::new(ModelResponseId::new(), sink);
+        collector.late_diagnostics = compaction_request.pending_system_prompt_tokens.map(|_| {
+            (
+                request.session.session.id,
+                request
+                    .turn
+                    .resolved_config()
+                    .runtime_config()
+                    .session
+                    .overflow_margin_tokens,
+            )
+        });
         let response = match self
             .llm
             .stream_chat(compaction_request, request.cancel_token(), &mut collector)
@@ -3289,25 +3321,29 @@ impl AgentPermissionGuardian<'_> {
             crate::config::ProviderReasoningCapability::Unsupported,
             resolved_model.extra_headers.clone(),
         );
+        guardian_request.pending_system_prompt_tokens =
+            self.agent_loop.llm.pending_system_prompt_tokens();
         guardian_request
             .validate_provider_lifecycle()
             .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
 
-        self.sink
-            .emit(RunEvent::ModelRequestPrepared {
-                session_id: self.request.session.session.id,
-                diagnostics: request_diagnostics(
-                    &guardian_request,
-                    self.request
-                        .turn
-                        .resolved_config()
-                        .runtime_config()
-                        .session
-                        .overflow_margin_tokens,
-                    None,
-                ),
-            })
-            .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
+        if guardian_request.pending_system_prompt_tokens.is_none() {
+            self.sink
+                .emit(RunEvent::ModelRequestPrepared {
+                    session_id: self.request.session.session.id,
+                    diagnostics: request_diagnostics(
+                        &guardian_request,
+                        self.request
+                            .turn
+                            .resolved_config()
+                            .runtime_config()
+                            .session
+                            .overflow_margin_tokens,
+                        None,
+                    ),
+                })
+                .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
+        }
         renew_admission_lease(&self.agent_loop.store, self.request)
             .await
             .map_err(|error| PermissionGuardianError::UnfencedAdmission(error.to_string()))?;
@@ -3358,6 +3394,17 @@ impl AgentPermissionGuardian<'_> {
             .map(|goal| goal.goal_id().to_string());
         let cancel = self.request.cancel_token();
         let mut collector = CompactionResponseCollector::new(response_id, self.sink);
+        collector.late_diagnostics = guardian_request.pending_system_prompt_tokens.map(|_| {
+            (
+                self.request.session.session.id,
+                self.request
+                    .turn
+                    .resolved_config()
+                    .runtime_config()
+                    .session
+                    .overflow_margin_tokens,
+            )
+        });
         let response_result = {
             let generation =
                 self.agent_loop
@@ -3898,12 +3945,14 @@ struct StreamingResponseCollector<'a> {
     inner: ResponseCollector,
     response_id: ModelResponseId,
     sink: &'a mut dyn RunEventSink,
+    late_diagnostics: Option<(SessionId, usize)>,
 }
 
 struct CompactionResponseCollector<'a> {
     inner: ResponseCollector,
     response_id: ModelResponseId,
     sink: &'a mut dyn RunEventSink,
+    late_diagnostics: Option<(SessionId, usize)>,
 }
 
 impl<'a> CompactionResponseCollector<'a> {
@@ -3912,6 +3961,7 @@ impl<'a> CompactionResponseCollector<'a> {
             inner: ResponseCollector::default(),
             response_id,
             sink,
+            late_diagnostics: None,
         }
     }
 
@@ -3921,6 +3971,19 @@ impl<'a> CompactionResponseCollector<'a> {
 }
 
 impl LlmEventSink for CompactionResponseCollector<'_> {
+    fn request_prepared(
+        &mut self,
+        request: &ChatRequest,
+        public_endpoint: &str,
+    ) -> Result<(), crate::error::LlmError> {
+        emit_late_request_diagnostics(
+            self.sink,
+            &mut self.late_diagnostics,
+            request,
+            public_endpoint,
+        )
+    }
+
     fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
         self.inner.push(event)
     }
@@ -3945,6 +4008,7 @@ impl<'a> StreamingResponseCollector<'a> {
             inner: ResponseCollector::default(),
             response_id,
             sink,
+            late_diagnostics: None,
         }
     }
 
@@ -3954,6 +4018,19 @@ impl<'a> StreamingResponseCollector<'a> {
 }
 
 impl LlmEventSink for StreamingResponseCollector<'_> {
+    fn request_prepared(
+        &mut self,
+        request: &ChatRequest,
+        public_endpoint: &str,
+    ) -> Result<(), crate::error::LlmError> {
+        emit_late_request_diagnostics(
+            self.sink,
+            &mut self.late_diagnostics,
+            request,
+            public_endpoint,
+        )
+    }
+
     fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
         match &event {
             LlmEvent::TextDelta(delta) => self
@@ -4051,6 +4128,24 @@ fn run_metrics(
                 .access_mode,
         }),
     }
+}
+
+fn emit_late_request_diagnostics(
+    sink: &mut dyn RunEventSink,
+    pending: &mut Option<(SessionId, usize)>,
+    request: &ChatRequest,
+    public_endpoint: &str,
+) -> Result<(), crate::error::LlmError> {
+    if let Some((session_id, overflow_margin_tokens)) = pending.take() {
+        let mut diagnostics = request_diagnostics(request, overflow_margin_tokens, None);
+        diagnostics.base_url = public_endpoint.to_string();
+        sink.emit(RunEvent::ModelRequestPrepared {
+            session_id,
+            diagnostics,
+        })
+        .map_err(|error| crate::error::LlmError::Message(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn request_diagnostics(
@@ -5516,6 +5611,59 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[test]
+    fn routed_request_diagnostics_report_final_prompt_once_without_ephemeral_target() {
+        let session_id = SessionId::new();
+        let mut request = compaction_request_template();
+        let target = crate::config::ProviderTarget::new(
+            "http://127.0.0.1:1234/r/private-permit/v1",
+            "allocated-model",
+            crate::config::ProviderProfile::OpenAiCompatible,
+            request.provider_target().deadlines(),
+        )
+        .unwrap();
+        request.route_through_hub(target, "private-request-token".into());
+        request
+            .system_prompt
+            .push_str("\n\n## Hub model system prompt\n\n日本語で回答。");
+        for compaction in [false, true] {
+            let mut sink = CapturingSink::default();
+            {
+                let mut collector: Box<dyn LlmEventSink + '_> = if compaction {
+                    let mut value =
+                        CompactionResponseCollector::new(ModelResponseId::new(), &mut sink);
+                    value.late_diagnostics = Some((session_id, 0));
+                    Box::new(value)
+                } else {
+                    let mut value =
+                        StreamingResponseCollector::new(ModelResponseId::new(), &mut sink);
+                    value.late_diagnostics = Some((session_id, 0));
+                    Box::new(value)
+                };
+                collector
+                    .request_prepared(&request, "http://127.0.0.1:9470/")
+                    .unwrap();
+                collector
+                    .request_prepared(&request, "http://127.0.0.1:9470/")
+                    .unwrap();
+            }
+            assert_eq!(sink.events.len(), 1);
+            let RunEvent::ModelRequestPrepared { diagnostics, .. } = &sink.events[0] else {
+                panic!("request diagnostics");
+            };
+            assert_eq!(diagnostics.model_name, "allocated-model");
+            assert_eq!(
+                diagnostics.system_prompt_chars,
+                request.system_prompt.chars().count()
+            );
+            assert_eq!(diagnostics.base_url, "http://127.0.0.1:9470/");
+            assert!(diagnostics.wire.as_ref().unwrap().serialized_body_bytes > 0);
+            let rendered = serde_json::to_string(&sink.events).unwrap();
+            assert!(!rendered.contains("private-permit"));
+            assert!(!rendered.contains("private-request-token"));
+        }
+    }
+
+    #[test]
     fn compaction_collector_projects_provider_phase_without_exposing_summary_delta() {
         let response_id = ModelResponseId::new();
         let phase = crate::llm::ProviderPhaseEvent {
@@ -5850,6 +5998,101 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 && goal == "active goal steering"
                 && context_manager::is_semantic_compaction_message(summary)
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_project_snapshot_survives_actual_compaction_without_history_duplication() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let shared = shared::SharedRunContext {
+            job_id: "shared-job".into(),
+            attempt_id: "shared-attempt".into(),
+            generation: 1,
+            project_id: "shared-project".into(),
+            environment_id: "worker".into(),
+            allowed_child_environments: Vec::new(),
+            allowed_child_candidates: Vec::new(),
+            project_context: Some(crate::context::world_state::SharedProjectContext {
+                project_id: "shared-project".into(),
+                label: "Analysis application".into(),
+                overview: "PROJECT_CONTEXT_UNIQUE: worker=API; database=DB".into(),
+                revision: "17".into(),
+                root_prompt: "Build and verify the distributed application".into(),
+                origin_device_id: Some("WinA".into()),
+            }),
+            resume: None,
+            continuation: None,
+        };
+        let run = run_scripted_internal_with_prior_user_and_api_key_resolver(
+            config,
+            vec![
+                ScriptedOutcome::Response(scripted_read_call("large-read")),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(VALID_C8_COMPACTION_CHECKPOINT.into())],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".into())],
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 250_000,
+            })),
+            false,
+            None,
+            None,
+            None,
+            true,
+            None,
+            Some(shared),
+        )
+        .await
+        .expect("shared run compacts through the ordinary agent loop");
+        run.summary.expect("shared run completes after compaction");
+        assert_eq!(run.requests.len(), 3);
+        assert!(run.requests[1].tools.is_empty(), "real compaction request");
+        assert!(run.requests[2].messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::User { content } if content.contains("Another language model started")
+        )));
+        for request in &run.requests {
+            assert_eq!(
+                request
+                    .system_prompt
+                    .matches("PROJECT_CONTEXT_UNIQUE")
+                    .count(),
+                1
+            );
+            for expected in [
+                "<overview_revision>17</overview_revision>",
+                "<origin_device_id>WinA</origin_device_id>",
+                "<current_environment_id>worker</current_environment_id>",
+                "Build and verify the distributed application",
+            ] {
+                assert!(request.system_prompt.contains(expected), "{expected}");
+            }
+            assert!(
+                !serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("PROJECT_CONTEXT_UNIQUE"),
+                "the shared snapshot is rebuilt as State, not appended to history"
+            );
+        }
+        assert!(
+            run.store
+                .protocol_event_store()
+                .list_history_items_for_session(run.session_id)
+                .unwrap()
+                .iter()
+                .any(|item| matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
     }
 
     #[tokio::test]
@@ -9282,6 +9525,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             false,
             Some(bootstrap),
+            None,
         )
         .await
         .unwrap();
@@ -12117,6 +12361,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             Some(resolver),
             false,
             None,
+            None,
         )
         .await
     }
@@ -12207,6 +12452,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             true,
             None,
+            None,
         )
         .await
     }
@@ -12291,6 +12537,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             false,
             None,
+            None,
         )
         .await
     }
@@ -12310,6 +12557,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
         record_protocol_events: bool,
         bootstrap_mcp: Option<crate::config::McpConfig>,
+        shared_run: Option<shared::SharedRunContext>,
     ) -> Result<ScriptedRun, AgentError> {
         let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -12490,6 +12738,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             requests: Arc::clone(&requests),
         });
         let agent = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
+        let agent = if let Some(shared_run) = shared_run {
+            agent.with_shared_run(shared_run)
+        } else {
+            agent
+        };
         let agent = if let Some(resolver) = provider_api_key_resolver {
             agent.with_provider_api_key_resolver(resolver)
         } else {
@@ -12580,11 +12833,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 &mut sink,
             )
             .with_admission_id(recording_admission_id);
-            agent
-                .run(run_request, &mut prompt, &mut recording_sink)
-                .await
+            execute_scripted_agent(&agent, run_request, &mut prompt, &mut recording_sink).await
         } else {
-            agent.run(run_request, &mut prompt, &mut sink).await
+            execute_scripted_agent(&agent, run_request, &mut prompt, &mut sink).await
         };
 
         Ok(ScriptedRun {
@@ -12597,6 +12848,23 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             confirmations: prompt.requests,
             root,
         })
+    }
+
+    async fn execute_scripted_agent(
+        agent: &AgentLoop,
+        request: AgentRunRequest,
+        prompt: &mut dyn ConfirmationPrompt,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<RunSummary, AgentError> {
+        if agent.shared_run.is_none() {
+            return agent.run(request, prompt, sink).await;
+        }
+        match agent.run_inner(request, prompt, sink).await? {
+            shared::AgentRunOutcome::Completed(summary) => Ok(summary),
+            shared::AgentRunOutcome::Yielded(_) => {
+                panic!("this scripted fixture expects a completed shared run")
+            }
+        }
     }
 
     fn test_tool_services(

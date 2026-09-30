@@ -5,7 +5,7 @@ import { createManagedExecutionRunner } from "../drivers/managed_execution_runne
 import { releaseResourcesThenAuditClosedStore } from "../drivers/windows_tauri_host.mjs";
 import { waitForObservation } from "../core/deadline.mjs";
 
-function fixture({ forceShutdown = false, changedOwner = false, identityErrors = [], identityOutput, captureError,
+function fixture({ forceShutdown = false, changedOwner = false, identityErrors = [], identityOutput, captureError, observeError, observation,
   shutdownErrors = [], closedIdentityErrors = [] } = {}) {
   const root = path.resolve("managed-runner-fixture"), events = [], commands = [];
   const context = { root, binary: path.join(root, "moyai-desktop.exe"), desktopIsolation: "fixture", paths: {
@@ -17,13 +17,17 @@ function fixture({ forceShutdown = false, changedOwner = false, identityErrors =
   const identity = { runner_id: "runner-incarnation", process_id: 22 };
   const owner = { process_id: 22, parent_process_id: 11, process_start_time_utc_ticks: "123456", executable_path: runnerTestBinary };
   let exited = false;
+  const owners = new Map();
   const sink = { root: path.join(root, "evidence"), async writeJson(name, value) {
+    assert.equal(owners.has(path.join(this.root, name)), false, "captured owner evidence must not be overwritten");
+    owners.set(path.join(this.root, name), structuredClone(value));
     events.push(["owner-saved", name, value]); return { relative_path: name };
   } };
   const dependencies = {
     async execute(executable, args, options) {
       commands.push({ executable, args, options }); events.push(["cli", ...args]);
       if (args[0] === "shutdown") {
+        if (exited) throw new Error("IPC closed before shutdown");
         if (forceShutdown) throw new Error("shutdown failed");
         if (shutdownErrors.length) throw shutdownErrors.shift();
         exited = true; return { stdout: JSON.stringify({ stopped: true }) };
@@ -35,6 +39,14 @@ function fixture({ forceShutdown = false, changedOwner = false, identityErrors =
     async processCommand(action, params) {
       events.push([action, params]);
       if (action === "Capture") { if (exited) throw new Error("owner exited"); if (captureError) throw captureError; return structuredClone(owner); }
+      if (action === "ObserveOwner") {
+        if (observeError) throw observeError;
+        if (changedOwner) throw new Error("Process start identity changed");
+        if (observation !== undefined) return observation;
+        const captured = owners.get(params.OwnerPath);
+        assert.ok(captured);
+        return { live: !exited && captured.process_id === owner.process_id, process_id: captured.process_id };
+      }
       assert.equal(action, "StopOwner");
       if (changedOwner) throw new Error("Process start identity changed");
       const stopped = !exited; exited = true; return { stopped, process_id: owner.process_id };
@@ -47,8 +59,74 @@ function fixture({ forceShutdown = false, changedOwner = false, identityErrors =
     },
   };
   const options = { context, sink, runnerBinary, runnerTestBinary, expectedParentProcessId: 11 };
-  return { ...options, events, commands, dependencies, driver: createManagedExecutionRunner(options, dependencies) };
+  return { ...options, events, commands, dependencies, owners,
+    exitExternally() { exited = true; },
+    relaunch() { exited = false; Object.assign(identity, { runner_id: "next-incarnation", process_id: 23 }); Object.assign(owner, { process_id: 23, parent_process_id: 44, process_start_time_utc_ticks: "654321" }); },
+    driver: createManagedExecutionRunner(options, dependencies) };
 }
+
+test("Desktop graceful exit is accepted only by exact captured Runner absence", async () => {
+  const f = fixture(); await f.driver.capture(); f.exitExternally(); f.events.length = 0;
+  const result = await f.driver.quiesce();
+  assert.equal(result.pass, true); assert.equal(result.already_exited, true); assert.equal(result.forced, false);
+  assert.deepEqual(f.events.map(row => row[0]), ["ObserveOwner"]);
+});
+
+test("exit verification is read-only and fails for an uncaptured or still live Runner", async () => {
+  const f = fixture();
+  assert.equal((await f.driver.verifyExited()).pass, false);
+  assert.deepEqual(f.events, []);
+  await f.driver.capture(); f.events.length = 0;
+  assert.equal((await f.driver.verifyExited()).pass, false);
+  assert.deepEqual(f.events.map(row => row[0]), ["ObserveOwner"]);
+  f.exitExternally();
+  assert.equal((await f.driver.verifyExited()).pass, true);
+});
+
+test("exit observation failures cannot replace process-exit proof or stop another owner", async () => {
+  const f = fixture({ observeError: new Error("Cannot inspect exact owner") });
+  await f.driver.capture(); f.exitExternally(); f.events.length = 0;
+  await assert.rejects(f.driver.quiesce(), /Cannot inspect exact owner/);
+  assert.deepEqual(f.events.map(row => row[0]), ["ObserveOwner"]);
+});
+
+test("Runner recapture requires old process exit and retains each incarnation evidence", async () => {
+  const f = fixture(); const first = await f.driver.capture();
+  await assert.rejects(f.driver.capture(44), /still live/);
+  assert.equal(f.driver.identity.runner_id, first.identity.runner_id);
+  f.exitExternally();
+  assert.equal((await f.driver.verifyExited()).pass, true);
+  await f.driver.quiesce();
+  f.relaunch();
+  const second = await f.driver.capture(44);
+  assert.equal(second.identity.runner_id, "next-incarnation");
+  assert.equal(second.owner.parent_process_id, 44);
+  assert.equal(f.owners.size, 2);
+  f.events.length = 0;
+  const closed = await f.driver.quiesce();
+  assert.equal(closed.pass, true); assert.equal(closed.process_id, 23);
+  assert.ok(f.commands.some(row => row.args[0] === "shutdown" && row.args[2] === "next-incarnation"));
+});
+
+test("malformed or foreign owner observations cannot prove process exit", async () => {
+  for (const observation of [null, { live: false, process_id: 23 }, { live: "false", process_id: 22 }]) {
+    const f = fixture({ observation }); await f.driver.capture(); f.events.length = 0;
+    await assert.rejects(f.driver.quiesce(), error => error.code === "managed-runner-observation-invalid");
+    assert.deepEqual(f.events.map(row => row[0]), ["ObserveOwner"]);
+  }
+});
+
+test("failed new-generation capture cannot reuse a retired generation's successful settlement", async () => {
+  const identityErrors = [], f = fixture({ identityErrors });
+  await f.driver.capture(); f.exitExternally();
+  assert.equal((await f.driver.quiesce()).pass, true);
+  f.relaunch(); identityErrors.push(ipcError(2), ipcError(2));
+  await assert.rejects(f.driver.capture(44));
+  assert.equal(f.driver.identity, null);
+  await assert.rejects(f.driver.quiesce());
+  assert.equal(f.owners.size, 1);
+  assert.equal(f.events.some(row => row[0] === "StopOwner"), false);
+});
 
 test("managed Runner capture uses the same fixture IPC scope and records an exact process owner", async () => {
   const f = fixture(), captured = await f.driver.capture();
@@ -135,8 +213,8 @@ test("managed Runner settles once through IPC and exact owner before the common 
     auditSqlite: async () => { f.events.push(["sqlite-audit"]); return { pass: true }; },
   });
   assert.equal(result.sqlite.pass, true);
-  assert.deepEqual(f.events.map(row => row[0]), ["cli", "cli", "Capture", "StopOwner", "sqlite-audit"]);
-  assert.deepEqual(f.events[0], ["cli", "shutdown", "--runner", "runner-incarnation"]);
+  assert.deepEqual(f.events.map(row => row[0]), ["ObserveOwner", "cli", "cli", "ObserveOwner", "sqlite-audit"]);
+  assert.deepEqual(f.events[1], ["cli", "shutdown", "--runner", "runner-incarnation"]);
   assert.deepEqual(f.events[3][1], { ExecutionRoot: f.context.root, OwnerPath: path.join(f.sink.root, "owners/managed-execution-runner-incarnation.json") });
   const count = f.events.length;
   assert.deepEqual(await f.driver.quiesce(), { pass: true, normal_shutdown: true, forced: false, process_id: 22 });
@@ -151,7 +229,7 @@ test("failed normal shutdown uses only the captured owner and cannot pass the cl
     auditSqlite: async () => { assert.fail("audit ran before successful resource settlement"); },
   });
   assert.equal(result.sqlite.pass, false);
-  assert.deepEqual(f.events.map(row => row[0]), ["cli", "StopOwner"]);
+  assert.deepEqual(f.events.map(row => row[0]), ["ObserveOwner", "cli", "ObserveOwner", "StopOwner"]);
   assert.deepEqual(result.scenarioQuiesce.resources[0], { pass: false, normal_shutdown: false, forced: true, process_id: 22 });
 });
 

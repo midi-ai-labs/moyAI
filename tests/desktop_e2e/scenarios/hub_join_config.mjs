@@ -43,13 +43,21 @@ export function cancelledActivationAccepted({ before, after, configBefore, confi
     && isDeepStrictEqual(before?.desktop?.draft_target, after?.desktop?.draft_target);
 }
 
+function managedHubRetainsDirectSettings(desktop, expectedDirect, url) {
+  // Device configuration owns the effective route. Import retains the manual
+  // provider settings for a later reset; it does not leave Direct active.
+  return expectedDirect?.main === "direct" && expectedDirect.side === "direct"
+    && desktop?.hub?.status === "connected" && desktop.hub.endpoint === url
+    && desktop.hub.can_change_main_mode === false && desktop.hub.can_change_side_chat_mode === false
+    && isDeepStrictEqual(directRouteIdentity(desktop), { ...expectedDirect, main: "hub", side: "hub" });
+}
+
 export function joinedActivationAccepted(value, expectedDirect, url) {
   return value?.network?.enrollment === "active" && value.network.hub_url === url
     && typeof value.network.device_id === "string" && value.network.device_id.length > 0
     && value.shared?.connected === true && Boolean(value.shared.principal?.user_id) && value.shared.projects?.length === 0
     && value.loginVisible === false && value.desktop?.startup?.onboarding_intent === "team"
-    && isDeepStrictEqual(directRouteIdentity(value.desktop), expectedDirect)
-    && expectedDirect.main === "direct" && expectedDirect.side === "direct";
+    && managedHubRetainsDirectSettings(value.desktop, expectedDirect, url);
 }
 
 export function movedActivationAccepted(value, expected) {
@@ -58,7 +66,7 @@ export function movedActivationAccepted(value, expected) {
     && value.shared.principal?.user_id === expected.user_id && value.shared.principal.administrator === false
     && value.surface?.count === 1 && value.surface.login_visible === false
     && value.surface.account_text?.includes(expected.display_name)
-    && isDeepStrictEqual(directRouteIdentity(value.desktop), expected.direct)
+    && managedHubRetainsDirectSettings(value.desktop, expected.direct, expected.url)
     && Array.isArray(value.calls) && !value.calls.some(call => ["login", "setup_password"].includes(call.args?.request?.kind));
 }
 
@@ -182,11 +190,11 @@ function createJoinConfigScenario(mode, options) {
         await page.locator("#join-project-save").click(); await page.locator("#join-project-dialog").waitFor({ state: "hidden" });
         await wait("This approved Desktop device enrolls", async () => ({ network: await invokeDesktopCommand(cdp, "device_network_projection"), snapshot: await hub.observeNetwork() }),
           p => enrollmentAccepted(p.network, p.snapshot), 45_000);
-        const joined = await wait("Approved device becomes usable without login with Direct settings retained", () => observe(cdp),
+        const joined = await wait("Approved device uses the managed Hub without login and retains manual provider settings", () => observe(cdp),
           p => joinedActivationAccepted(p, expectedDirect, state.url));
         await captureScenarioScreenshot({ cdp, sink, name: `join-config-${mode}-device-ready`, owner });
         await sink.record("join-config-completed", { mode, request_id: pending.request_id, device_id: joined.network.device_id,
-          direct: directRouteIdentity(joined.desktop), principal: joined.shared.principal, login_visible: joined.loginVisible,
+          retained_direct: expectedDirect, effective_route: directRouteIdentity(joined.desktop), principal: joined.shared.principal, login_visible: joined.loginVisible,
           scope: "Actual native review, public trust import, browser device approval and automatic device access; no project membership or model generation." }, { phase: "executing", owner });
         if (mainWindow) {
           const same = await probeExactOwnedWindow({ ...native, candidate: mainWindow });
@@ -246,7 +254,7 @@ function createJoinConfigScenario(mode, options) {
           if (!sameWindow.live || !sameWindow.exact_identity) throw fail("Endpoint move replaced the original Desktop window", sameWindow);
           await captureScenarioScreenshot({ cdp, sink, name: "join-config-same-person-new-address", owner });
           await sink.record("join-config-endpoint-moved", { old_url: previousUrl, new_url: state.url, user_id: userId,
-            device_id: joined.network.device_id, trust_unchanged: true, direct_unchanged: true, login_commands: 0,
+            device_id: joined.network.device_id, trust_unchanged: true, manual_provider_settings_unchanged: true, effective_route: directRouteIdentity(moved.desktop), login_commands: 0,
             surface: moved.surface, remembered_store_present: true,
             scope: "Controller PC; same authenticated Hub/device at a new actual listener, remembered ordinary person, native review and rejected different CA. Runner shutdown is a separate gate." }, { phase: "executing", owner });
         }

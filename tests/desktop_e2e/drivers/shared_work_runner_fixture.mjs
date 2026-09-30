@@ -9,7 +9,7 @@ import { prepareDesktopFixtureEnvironment, desktopLaunchEnvironment } from "../c
 import { onboardingImplementationReply } from "../fixtures/onboarding_implementation.mjs";
 
 const execute = promisify(execFile);
-export async function startSharedWorkflowProvider() {
+export async function startSharedWorkflowProvider({ reply } = {}) {
   const requests = [], failures = [], sockets = new Set();
   let release;
   const childGate = new Promise(resolve => { release = resolve; });
@@ -27,7 +27,7 @@ export async function startSharedWorkflowProvider() {
       const tool = id => messages.filter(m => m.role === "tool" && m.tool_call_id === id);
       const call = (id, name, args) => ({ role: "assistant", tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] });
       let delta, finish = "stop";
-      const implementation = onboardingImplementationReply(messages);
+      const implementation = reply ? await reply(request) : onboardingImplementationReply(messages);
       if (implementation) {
         ({ delta, finish } = implementation);
       } else if (latestUser.includes("desktop-conversation-revised")) {

@@ -3,7 +3,8 @@ mod data;
 pub mod external;
 mod journal;
 #[cfg(all(test, windows))]
-mod process_fixture;
+pub(super) mod process_fixture;
+mod progress;
 mod protocol;
 pub(crate) mod provisioning;
 mod settings;
@@ -43,7 +44,7 @@ pub struct RetainedServiceProjection {
     pub project_id: String,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     pub local_state: String,
     pub uncertain: bool,
 }
@@ -65,16 +66,12 @@ pub struct SharedAttemptProjection {
     pub local_state: Option<super::LocalRunState>,
 }
 
-/// Kept by the process entrypoint until its final local outcomes have reached the journal.
-pub struct SharedWorker {
-    task: tokio::task::JoinHandle<()>,
-}
+/// The RunnerHost owns the task through its final journal pass, regardless of
+/// whether shared execution was installed before or after the process started.
+pub struct SharedWorker;
 
 impl SharedWorker {
-    pub async fn start(
-        host: RunnerHost,
-        mut settings: SharedSettings,
-    ) -> Result<Self, RunnerError> {
+    pub async fn start(host: RunnerHost, mut settings: SharedSettings) -> Result<(), RunnerError> {
         let receipts = host
             .inner
             .operations
@@ -90,7 +87,15 @@ impl SharedWorker {
         crate::runtime::resource_admission::register(&settings)?;
         let (sender, commands) = tokio::sync::mpsc::channel(16);
         let (external_sender, external) = tokio::sync::mpsc::channel(16);
+        let mut task = host.inner.shared_worker.lock().await;
         {
+            // Keep the established operations -> state lock order. Closing and
+            // worker publication cannot pass each other before the task is owned.
+            let mut store = host
+                .inner
+                .operations
+                .lock()
+                .map_err(|_| RunnerError::new("Runner operations unavailable"))?;
             let mut state = host
                 .inner
                 .state
@@ -101,41 +106,28 @@ impl SharedWorker {
                     "Shared mode must be selected before any Runner work is accepted",
                 ));
             }
+            let mut next = store.installed.clone();
+            next.settings = Some(settings.clone());
+            store.update(next)?;
             state.shared_mode = true;
             state.shared_projection = Some(SharedProjection::default());
             state.shared_commands = Some(sender);
             state.external_commands = Some(external_sender);
+            *task = Some(tokio::spawn(
+                Controller {
+                    host: host.clone(),
+                    settings,
+                    client,
+                    journal,
+                    checkpoint_cursor: String::new(),
+                    commands: Some(commands),
+                    external: Some(external),
+                    local_project_id: None,
+                }
+                .run(),
+            ));
         }
-        {
-            let mut store = host
-                .inner
-                .operations
-                .lock()
-                .map_err(|_| RunnerError::new("Runner operations unavailable"))?;
-            let mut next = store.installed.clone();
-            next.settings = Some(settings.clone());
-            store.update(next)?;
-        }
-        let task = tokio::spawn(
-            Controller {
-                host,
-                settings,
-                client,
-                journal,
-                checkpoint_cursor: String::new(),
-                commands: Some(commands),
-                external: Some(external),
-                local_project_id: None,
-            }
-            .run(),
-        );
-        Ok(Self { task })
-    }
-
-    pub async fn wait(self) -> Result<(), RunnerError> {
-        self.task
-            .await
-            .map_err(|_| RunnerError::new("Shared Runner controller stopped unexpectedly"))
+        Ok(())
     }
 }
 
@@ -557,8 +549,15 @@ impl Controller {
         if retained.is_empty() {
             return Ok(());
         }
-        let leases = self.client.services().await?;
+        let leases = match self.client.services().await {
+            Ok(leases) => leases,
+            Err(error) => {
+                self.cancel_retained_services();
+                return Err(error.into());
+            }
+        };
         if leases.len() > 128 {
+            self.cancel_retained_services();
             return Err(RunnerError::new(
                 "Hub retained-service count exceeds the Runner bound",
             ));
@@ -592,7 +591,9 @@ impl Controller {
                 self.journal.service_stopped(&mut entry)?;
                 continue;
             }
-            let expired = service.expires_at_ms <= super::operations::now_ms();
+            let expired = service
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= super::operations::now_ms());
             if lease.is_none() || lease.is_some_and(|lease| lease.stop_requested) || expired {
                 shells.cancel_retained_service(service.service_id);
             }
@@ -769,6 +770,7 @@ impl Controller {
         match assignments.as_ref() {
             Some(Ok(assignments)) => {
                 if assignments.len() > 128 {
+                    self.cancel_retained_services();
                     self.stop_fenced_executions(None).await?;
                     return Err(RunnerError::new(
                         "Hub assignment count exceeds the Runner reconciliation bound",
@@ -776,6 +778,7 @@ impl Controller {
                 }
                 for assignment in assignments {
                     if let Err(error) = self.validate_assignment(assignment) {
+                        self.cancel_retained_services();
                         self.stop_fenced_executions(None).await?;
                         return Err(error);
                     }
@@ -786,6 +789,7 @@ impl Controller {
                 // If this Runner cannot observe the Hub's current fence, stop its
                 // active workers. Keep the journal and capacity until exact drain and
                 // acknowledgement; a reconnect must never replay their effects.
+                self.cancel_retained_services();
                 self.stop_fenced_executions(None).await?;
             }
             None => {}
@@ -799,7 +803,6 @@ impl Controller {
                     }
                     continue;
                 }
-                self.expire_approval(&entry);
                 self.collect_outcome(&mut entry)?;
             }
         }
@@ -856,6 +859,26 @@ impl Controller {
         for mut entry in self.journal.active()? {
             if entry.phase == Phase::Executing {
                 self.relay_approval(&mut entry).await?;
+                if entry.external.is_none()
+                    && assignments.iter().any(|current| {
+                        current.attempt_id == entry.assignment.attempt_id
+                            && current.generation == entry.assignment.generation
+                            && current.job.id == entry.assignment.job.id
+                            && current.job.state == JobState::Running
+                            && !current.stop_requested
+                            && current.supports_progress_reports
+                    })
+                {
+                    // Display delivery cannot fail execution or release resources.
+                    // It uses the existing bounded control request. A lost ACK is retried
+                    // with the same canonical revision on the existing next tick.
+                    if let Err(error) = self.publish_progress(&mut entry).await {
+                        eprintln!(
+                            "Could not publish shared execution progress for {}: {}",
+                            entry.assignment.attempt_id, error.message
+                        );
+                    }
+                }
             }
         }
         let active = self.journal.active()?;
@@ -946,6 +969,13 @@ impl Controller {
 
     fn validate_assignment(&self, assignment: &Assignment) -> Result<(), RunnerError> {
         assignment.require_supported_capabilities()?;
+        if assignment.project_context.as_ref().is_some_and(|project| {
+            project.project_id != assignment.job.project_id || !project.validate()
+        }) {
+            return Err(RunnerError::new(
+                "Hub assignment project context is invalid",
+            ));
+        }
         let ids = [
             &assignment.attempt_id,
             &assignment.runner_id,
@@ -1149,33 +1179,6 @@ impl Controller {
         Ok(())
     }
 
-    fn expire_approval(&self, entry: &Entry) {
-        let Some(Report {
-            outcome:
-                ReportOutcome::ApprovalRequested {
-                    approval_id,
-                    expires_at_ms,
-                    ..
-                },
-            ..
-        }) = &entry.approval_report
-        else {
-            return;
-        };
-        let expired = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(true, |now| now.as_millis() >= u128::from(*expires_at_ms));
-        if expired {
-            if let Ok(id) = approval_id.parse() {
-                self.host.inner.approvals.answer(
-                    entry.run_id,
-                    id,
-                    super::LocalApprovalDecision::Stop,
-                );
-            }
-        }
-    }
-
     async fn start(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
         let current_mapping = self
             .settings
@@ -1290,6 +1293,7 @@ impl Controller {
             }
         };
         let context = crate::agent::shared::SharedRunContext {
+            project_context: entry.assignment.project_context.clone(),
             job_id: entry.assignment.job.id.clone(),
             attempt_id: entry.assignment.attempt_id.clone(),
             generation: entry.assignment.generation,
@@ -1491,7 +1495,7 @@ impl Controller {
                         shells.cancel_retained_service(service.service_id);
                         self.journal.fail_retained_handoff(
                             entry,
-                            "Hub rejected the finite service lease before the turn completed",
+                            "Hub rejected the retained service before the turn completed",
                         )?;
                         return Ok(());
                     }

@@ -92,7 +92,7 @@ test("confirmation requires the actual named target, consequence, focus and enab
   const expected={title:"alpha [000002]",detail:ALPHA,verb:"アーカイブ",confirmationAction:"confirm-local-archive-state"};
   const ready={errors:0,dialog_count:1,confirmation:{visible:true,aria_modal:"true",focus_inside:true,
     title:"チャットをアーカイブしますか？",summary:expected.title,target:ALPHA,
-    consequence:"履歴、実行証跡、ワークスペース内の実ファイルは削除しません。",
+    consequence:"このチャットを通常の一覧から隠します。履歴、実行記録、作業フォルダー内のファイルは削除しません。",
     actions:["cancel-local-confirm","confirm-local-archive-state"].map(action=>({action,enabled:true,visible:true})),
   }};
   assert.equal(managementConfirmationReady(ready,expected),true);
@@ -114,8 +114,21 @@ test("confirmation requires the actual named target, consequence, focus and enab
   }
   const restored=structuredClone(ready);
   restored.confirmation.title="チャットを復元しますか？";
-  restored.confirmation.consequence="履歴、実行証跡、ワークスペース内の実ファイルは変更しません。";
+  restored.confirmation.consequence="このチャットを通常の一覧に戻します。履歴、実行記録、作業フォルダー内のファイルは変更しません。";
   assert.equal(managementConfirmationReady(restored,{...expected,verb:"復元"}),true);
+  for (const [title, consequence] of [
+    ["チャットを削除しますか？", "このチャットの履歴を削除します。作業フォルダー内のファイルは残ります。"],
+    ["プロジェクトを削除しますか？", "チャットと履歴を削除します。作業フォルダー内のファイルは残ります。"],
+  ]) {
+    const deleted=structuredClone(ready);
+    deleted.confirmation.title=title;
+    deleted.confirmation.consequence=consequence;
+    deleted.confirmation.actions[1].action="confirm-local-delete";
+    const deletion={...expected,verb:"削除",confirmationAction:"confirm-local-delete"};
+    assert.equal(managementConfirmationReady(deleted,deletion),true);
+    deleted.confirmation.consequence="チャットと履歴を削除します。";
+    assert.equal(managementConfirmationReady(deleted,deletion),false,"deletion must explain that workspace files remain");
+  }
 });
 
 test("search distinguishes matching results from the one retained open session",()=>{

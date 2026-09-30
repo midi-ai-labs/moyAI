@@ -382,7 +382,7 @@ pub fn project_turn_item_for_run_event(
                 tool_status(
                     *tool_call_id,
                     *tool,
-                    ToolLifecycleStatus::Completed,
+                    completed_tool_display_status(metadata),
                     title.clone(),
                     summary.clone(),
                 )
@@ -685,6 +685,17 @@ fn metadata_success(metadata: &Value) -> Option<bool> {
         .or_else(|| metadata.get("success").and_then(Value::as_bool))
 }
 
+/// A completed tool invocation can report an unsuccessful operation (for example
+/// a shell process exiting with a nonzero code). Keep transport lifecycle and
+/// durable success evidence unchanged, but present that outcome as a failure.
+pub(crate) fn completed_tool_display_status(metadata: &Value) -> ToolLifecycleStatus {
+    if metadata_success(metadata) == Some(false) {
+        ToolLifecycleStatus::Failed
+    } else {
+        ToolLifecycleStatus::Completed
+    }
+}
+
 fn permission_decision(approved: bool) -> PermissionDecision {
     if approved {
         PermissionDecision::Approved
@@ -713,7 +724,7 @@ fn file_changes_summary(changes: &[crate::edit::ChangeSummary]) -> String {
         .join("; ")
 }
 
-fn user_turn_text(turn: &crate::protocol::UserTurn) -> String {
+pub(crate) fn user_turn_text(turn: &crate::protocol::UserTurn) -> String {
     turn.content_parts()
         .iter()
         .map(|part| match part {

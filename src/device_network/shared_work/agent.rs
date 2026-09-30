@@ -641,25 +641,10 @@ impl DeviceNetworkService {
         let connection = self
             .shared_connection()
             .ok_or_else(|| "Hub is not connected from this device".to_string())?;
-        let session: LoginSession = request(
-            &connection.client,
-            "device-session",
-            None,
-            Some(json!({})),
-            &[],
-        )
-        .await
-        .map_err(|error| error.message().to_string())?;
-        if session.token.is_empty()
-            || session.token.len() > 4096
-            || session.expires_at_ms <= now_ms()
-            || !super::super::stable_id(&session.principal.user_id)
-            || self
-                .shared_connection()
-                .is_none_or(|current| current.binding != connection.binding)
-        {
-            return Err("Hub device identity or session changed".into());
-        }
+        let session = self
+            .shared_device_session(&connection)
+            .await
+            .map_err(|error| error.message().to_string())?;
         Ok((connection, session))
     }
 
@@ -861,7 +846,7 @@ impl DeviceNetworkService {
                 "project_id":project_id,
                 "environment_id":environment_id,"title":title,
                 "input":{"version":2,"prompt":prompt,"input_refs":input_refs},
-                "descendant_budget":8,"start_before_ms":now_ms().saturating_add(24*60*60*1000)}),
+                "descendant_budget":8,"start_before_ms":null}),
         };
         self.shared_work_projection();
         {

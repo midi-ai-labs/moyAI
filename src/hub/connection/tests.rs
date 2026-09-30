@@ -1,4 +1,5 @@
 use super::*;
+use crate::hub::HubWaitPolicy;
 use axum::{
     Json, Router,
     extract::State,
@@ -29,6 +30,7 @@ struct ServerState {
     responses_stream: std::sync::Mutex<String>,
     reject_gateway_review: AtomicBool,
     hub_id: std::sync::Mutex<String>,
+    catalog_override: std::sync::Mutex<Value>,
     revision: AtomicU64,
     registrations: AtomicUsize,
     heartbeats: AtomicUsize,
@@ -140,15 +142,14 @@ async fn catalog(
         state.catalog_started.notify_one();
         state.catalog_gate.acquire().await.unwrap().forget();
     }
-    (
-        StatusCode::OK,
-        Json(
-            json!({"hub_id":*state.hub_id.lock().unwrap(), "software_version":"0.1.0",
+    let mut catalog = json!({"hub_id":*state.hub_id.lock().unwrap(), "software_version":"0.1.0",
         "revision":state.revision.load(Ordering::SeqCst).to_string(),"changes":[],
         "models":[{"id":"fast","label":"Fast","capabilities":["chat"]},
-        {"id":"deep","label":"Deep","capabilities":["chat"]}]}),
-        ),
-    )
+        {"id":"deep","label":"Deep","capabilities":["chat"]}]});
+    for (key, value) in state.catalog_override.lock().unwrap().as_object().unwrap() {
+        catalog[key] = value.clone();
+    }
+    (StatusCode::OK, Json(catalog))
 }
 async fn register_device(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<Value>) {
     let mut headers = HeaderMap::new();
@@ -349,6 +350,7 @@ impl Server {
             hub_id: std::sync::Mutex::new("hub-test".into()),
             revision: AtomicU64::new(1),
             registrations: AtomicUsize::new(0),
+            catalog_override: std::sync::Mutex::new(json!({})),
             heartbeats: AtomicUsize::new(0),
             activities: Default::default(),
             heartbeat_turns: Default::default(),
@@ -544,6 +546,12 @@ async fn managed_default_sources_are_independent_durable_and_reset_without_hub_c
     assert_eq!(current.main_mode, HubRouteMode::Hub);
     assert_eq!(current.side_chat_mode, HubRouteMode::Hub);
     assert!(current.main_uses_default && current.side_chat_uses_default);
+    assert_eq!(current.main_confirmation, HubReviewConfirmation::Confirmed);
+    assert_eq!(
+        current.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert!(current.can_enable_main_hub && current.can_enable_side_chat_hub);
     let explicit = save(&service, &current, HubReviewContext::SideChat, "deep")
         .await
         .unwrap();
@@ -568,6 +576,449 @@ async fn managed_default_sources_are_independent_durable_and_reset_without_hub_c
     assert!(reset.main_review.is_none() && reset.side_chat_review.is_none());
     assert!(!reset.main_uses_default && !reset.side_chat_uses_default);
 }
+
+#[tokio::test]
+async fn managed_rejoin_reconfirms_unchanged_models_but_keeps_changed_catalog_unreviewed() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    let http = crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    let first = service
+        .connect_device(&server.endpoint, http.clone(), true, None)
+        .await
+        .unwrap();
+    let saved = persisted.load().unwrap();
+    let rejoined = service
+        .connect_device(&server.endpoint, http.clone(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(rejoined.main_confirmation, HubReviewConfirmation::Confirmed);
+    assert_eq!(
+        rejoined.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert_eq!(rejoined.settings_revision, first.settings_revision);
+    assert_eq!(persisted.load().unwrap(), saved);
+    server.state.revision.store(2, Ordering::SeqCst);
+    let changed = service
+        .connect_device(&server.endpoint, http, true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.main_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(
+        changed.side_chat_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert!(!changed.can_enable_main_hub && !changed.can_enable_side_chat_hub);
+    assert_eq!(persisted.load().unwrap(), saved);
+    service.shutdown().await;
+}
+
+fn managed_http() -> crate::device_network::ManagedHubHttp {
+    crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    )
+}
+
+async fn managed_device_owner(
+    temp: &tempfile::TempDir,
+    endpoint: &str,
+) -> crate::device_network::DeviceNetworkService {
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+    let root = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let paths = StoragePaths {
+        data_dir: root.join("data"),
+        database_path: root.join("data/db.sqlite3"),
+        truncation_dir: root.join("data/output"),
+    };
+    let sqlite = SqliteStore::open(&paths).unwrap();
+    sqlite.migrate().unwrap();
+    let store = StoreBundle::new(sqlite);
+    let runtime = crate::app::AppBootstrap::create_process_runtime(store.clone())
+        .await
+        .unwrap();
+    let jobs = crate::remote_agent::RemoteJobService::new(runtime).unwrap();
+    let mut config = crate::config::ResolvedConfig::default();
+    // The model protocol fixture uses loopback HTTP. Only configured-device
+    // route ownership is needed here; no enrollment or device polling is run.
+    config.device_network.hub_url = endpoint.into();
+    let publish = crate::mcp_publish::PublishService::new(
+        root.join("manual-publish.json"),
+        store.clone(),
+        config.clone(),
+    );
+    crate::device_network::DeviceNetworkService::new(
+        root.join("device"),
+        store,
+        config,
+        jobs,
+        publish,
+    )
+}
+
+async fn managed_revision_during_active_scope(context: HubReviewContext, delegated: bool) {
+    let server = Server::start(100).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let device = managed_device_owner(&temp, &server.endpoint).await;
+    let service = HubConnection::new(persisted.clone());
+    service.attach_device_network(device.downgrade());
+    let connected = service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    let before = persisted.load().unwrap();
+    let cancel = CancellationToken::new();
+    let parent = service
+        .begin_turn(context, cancel.clone())
+        .unwrap()
+        .unwrap();
+    let route = if delegated {
+        let child = parent.fork_delegated(cancel.clone()).unwrap();
+        parent.finish().await;
+        child
+    } else {
+        parent
+    };
+    server.state.revision.store(2, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.projection_now().error != Some(HubError::ReviewRequired.code()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = service.projection_now();
+    assert_eq!(
+        pending.connection_generation,
+        connected.connection_generation
+    );
+    assert_eq!(
+        pending.catalog.as_ref().unwrap().revision,
+        CatalogRevision::new(1).unwrap()
+    );
+    assert_eq!(server.state.registrations.load(Ordering::SeqCst), 1);
+    assert!(!cancel.is_cancelled());
+    assert_eq!(route.logical_model(), "fast");
+    let heartbeats = server.state.heartbeats.load(Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.state.heartbeats.load(Ordering::SeqCst) < heartbeats + 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("catalog review must not end heartbeats while an active scope prevents reconnect");
+    assert_eq!(server.state.registrations.load(Ordering::SeqCst), 1);
+    assert!(!cancel.is_cancelled());
+    route.finish().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = service.projection_now();
+            if current.status == HubConnectionStatus::Connected
+                && current
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.revision == CatalogRevision::new(2).unwrap())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the same heartbeat owner must refresh after the final active scope ends");
+    let refreshed = service.projection_now();
+    assert_eq!(
+        refreshed.main_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(
+        refreshed.side_chat_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(persisted.load().unwrap(), before);
+    let side = save(&service, &refreshed, HubReviewContext::SideChat, "deep")
+        .await
+        .unwrap();
+    assert_eq!(
+        side.main_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(
+        side.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    let heartbeats = server.state.heartbeats.load(Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.state.heartbeats.load(Ordering::SeqCst) < heartbeats + 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.shutdown().await;
+    device.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_catalog_refresh_keeps_heartbeats_during_main_turn() {
+    managed_revision_during_active_scope(HubReviewContext::Main, false).await;
+}
+
+#[tokio::test]
+async fn managed_catalog_refresh_keeps_heartbeats_during_side_turn() {
+    managed_revision_during_active_scope(HubReviewContext::SideChat, false).await;
+}
+
+#[tokio::test]
+async fn managed_catalog_refresh_keeps_heartbeats_after_parent_finishes_with_active_child() {
+    managed_revision_during_active_scope(HubReviewContext::Main, true).await;
+}
+
+#[tokio::test]
+async fn catalog_restore_rejects_same_revision_replacement_across_reconnect_restart_and_worker() {
+    for replacement in [
+        json!({"software_version":"0.2.0"}),
+        json!({"models":[{"id":"fast","label":"Renamed","capabilities":["chat"]},
+            {"id":"deep","label":"Deep","capabilities":["chat","vision"]}]}),
+    ] {
+        let server = Server::start(60_000).await;
+        let temp = tempfile::tempdir().unwrap();
+        let persisted = store(&temp);
+        let service = HubConnection::new(persisted.clone());
+        service
+            .connect_device(&server.endpoint, managed_http(), true, None)
+            .await
+            .unwrap();
+        let saved = persisted.load().unwrap();
+        let review_count = server.state.reviews.lock().unwrap().len();
+        *server.state.catalog_override.lock().unwrap() = replacement;
+        assert_eq!(
+            service
+                .connect_device(&server.endpoint, managed_http(), true, None)
+                .await
+                .unwrap_err(),
+            HubError::InvalidCatalog,
+        );
+        service.shutdown().await;
+        let restarted = HubConnection::new(persisted.clone());
+        assert_eq!(
+            restarted
+                .connect_device(&server.endpoint, managed_http(), true, None)
+                .await
+                .unwrap_err(),
+            HubError::InvalidCatalog,
+        );
+        let current = restarted.projection_now();
+        assert!(!current.can_enable_main_hub && !current.can_enable_side_chat_hub);
+        assert_eq!(
+            restarted
+                .connect(
+                    server.endpoint.clone(),
+                    BOOTSTRAP.into(),
+                    "Desktop".into(),
+                    current.settings_revision,
+                    current.connection_generation
+                )
+                .await
+                .unwrap_err(),
+            HubError::InvalidCatalog,
+        );
+        assert_eq!(
+            HubConnection::device_worker_route_with_settings(
+                &server.endpoint,
+                managed_http(),
+                Some(saved.clone()),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+            HubError::InvalidCatalog,
+        );
+        assert_eq!(server.state.reviews.lock().unwrap().len(), review_count);
+        assert_eq!(persisted.load().unwrap(), saved);
+        assert!(server.state.prepares.lock().unwrap().is_empty());
+        restarted.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn catalog_restore_rejects_rollback_against_the_newer_independent_review() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    server.state.revision.store(2, Ordering::SeqCst);
+    let next = service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    save(&service, &next, HubReviewContext::SideChat, "deep")
+        .await
+        .unwrap();
+    let saved = persisted.load().unwrap();
+    service.shutdown().await;
+    server.state.revision.store(1, Ordering::SeqCst);
+    let restarted = HubConnection::new(persisted.clone());
+    assert_eq!(
+        restarted
+            .connect_device(&server.endpoint, managed_http(), true, None)
+            .await
+            .unwrap_err(),
+        HubError::RevisionRollback,
+    );
+    assert_eq!(persisted.load().unwrap(), saved);
+    assert_eq!(
+        HubConnection::device_worker_route_with_settings(
+            &server.endpoint,
+            managed_http(),
+            Some(saved),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err(),
+        HubError::RevisionRollback,
+    );
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn catalog_restore_missing_legacy_baseline_requires_only_that_context_to_be_saved() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    service.shutdown().await;
+    let mut legacy = persisted.load().unwrap();
+    legacy.main_catalog_baseline = None;
+    let legacy = persisted.save(&legacy).unwrap();
+    let restarted = HubConnection::new(persisted.clone());
+    let connected = restarted
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        connected.main_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(
+        connected.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert_eq!(
+        connected.main_catalog_comparison.status,
+        super::super::HubCatalogComparisonStatus::BaselineUnavailable
+    );
+    assert_eq!(persisted.load().unwrap(), legacy);
+    assert_eq!(
+        HubConnection::device_worker_route_with_settings(
+            &server.endpoint,
+            managed_http(),
+            Some(legacy.clone()),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap_err(),
+        HubError::ReviewRequired,
+    );
+    let confirmed = save(&restarted, &connected, HubReviewContext::Main, "fast")
+        .await
+        .unwrap();
+    assert_eq!(
+        confirmed.main_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert_eq!(confirmed.side_chat_review, connected.side_chat_review);
+    assert_eq!(
+        persisted.load().unwrap().side_chat_catalog_baseline,
+        legacy.side_chat_catalog_baseline
+    );
+    let route = HubConnection::device_worker_route_with_settings(
+        &server.endpoint,
+        managed_http(),
+        Some(persisted.load().unwrap()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    route.finish().await;
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn catalog_restore_reconnect_ignores_journal_pruning_but_keeps_revision_review_gate() {
+    let server = Server::start(60_000).await;
+    *server.state.catalog_override.lock().unwrap() =
+        json!({"changes":[{"revision":"1","at_ms":1,"summary":"Initial catalog"}]});
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    let saved = persisted.load().unwrap();
+    service.shutdown().await;
+    *server.state.catalog_override.lock().unwrap() = json!({});
+    let restarted = HubConnection::new(persisted.clone());
+    let connected = restarted
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        connected.main_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert_eq!(
+        connected.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert_eq!(persisted.load().unwrap(), saved);
+    server.state.revision.store(2, Ordering::SeqCst);
+    let changed = restarted
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.main_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(
+        changed.side_chat_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    let side = save(&restarted, &changed, HubReviewContext::SideChat, "deep")
+        .await
+        .unwrap();
+    assert_eq!(
+        side.main_confirmation,
+        HubReviewConfirmation::ReviewRequired
+    );
+    assert_eq!(
+        side.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert_eq!(
+        persisted.load().unwrap().main_catalog_baseline,
+        saved.main_catalog_baseline
+    );
+    restarted.shutdown().await;
+}
+
 fn selection(model: &str) -> HubSelection {
     HubSelection {
         allowed_model_ids: [model.to_string()].into(),
@@ -739,8 +1190,17 @@ fn route_request() -> crate::llm::ChatRequest {
 struct Output {
     text: String,
     phases: Vec<crate::llm::ProviderPhaseEvent>,
+    prepared: Vec<crate::llm::ChatRequest>,
 }
 impl crate::llm::LlmEventSink for Output {
+    fn request_prepared(
+        &mut self,
+        request: &crate::llm::ChatRequest,
+        _public_endpoint: &str,
+    ) -> Result<(), crate::error::LlmError> {
+        self.prepared.push(request.clone());
+        Ok(())
+    }
     fn push(&mut self, event: crate::llm::LlmEvent) -> Result<(), crate::error::LlmError> {
         if let crate::llm::LlmEvent::TextDelta(text) = event {
             self.text.push_str(&text);
@@ -1092,6 +1552,171 @@ async fn heartbeat_reports_current_main_and_side_owners_and_drops_cancelled_or_f
     })
     .await;
     assert!(server.state.prepares.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn actual_model_prompt_is_reviewed_reserved_and_composed_once_for_main_child_and_side() {
+    let server = Server::start(60_000).await;
+    *server.state.catalog_override.lock().unwrap() = json!({"models":[
+        {"id":"fast","label":"Fast","capabilities":["chat"],"system_prompt":"Preferred model only"},
+        {"id":"deep","label":"Deep","capabilities":["chat"],"system_prompt":"日本語で回答してください。\n固有名詞を保持してください。"}
+    ]});
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    let mut fallback = selection("fast");
+    fallback.allowed_model_ids.insert("deep".into());
+    fallback.wait_policy = HubWaitPolicy::AllowSelectedFallback;
+    let reviewed = service
+        .save_review(
+            HubReviewContext::Main,
+            fallback,
+            connected.hub_id.clone().unwrap(),
+            connected.catalog.as_ref().unwrap().revision,
+            connected.settings_revision,
+            connected.connection_generation,
+        )
+        .await
+        .unwrap();
+    let side = save(&service, &reviewed, HubReviewContext::SideChat, "deep")
+        .await
+        .unwrap();
+    let main = enable(&service, side, HubReviewContext::Main).await;
+    enable(&service, main, HubReviewContext::SideChat).await;
+    *server.state.prepare_response.lock().unwrap() = grant(&server, "deep");
+    let parent = service
+        .begin_turn(HubReviewContext::Main, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let child = parent.fork_delegated(CancellationToken::new()).unwrap();
+    let side = service
+        .begin_turn(HubReviewContext::SideChat, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let mut output = Output::default();
+    for route in [&parent, &child, &side] {
+        let client = route.client();
+        let mut template = route_request();
+        let baseline = crate::context::ContextWindowTokenStatus::for_request(&template, 0)
+            .active_context_tokens;
+        template.pending_system_prompt_tokens = client.pending_system_prompt_tokens();
+        let reserved = template.pending_system_prompt_tokens.unwrap();
+        assert!(reserved > 0);
+        assert_eq!(
+            crate::context::ContextWindowTokenStatus::for_request(&template, 0)
+                .active_context_tokens,
+            baseline + reserved as u32
+        );
+        // Each request, including a compaction-style clone, starts from the uncomposed template.
+        for _ in 0..2 {
+            client
+                .stream_chat(template.clone(), CancellationToken::new(), &mut output)
+                .await
+                .unwrap();
+        }
+        assert!(!template.system_prompt.contains("Hub model system prompt"));
+    }
+    assert_eq!(output.prepared.len(), 6);
+    for request in &output.prepared {
+        assert_eq!(request.model.name, "deep");
+        assert!(request.pending_system_prompt_tokens.is_none());
+        assert!(
+            request
+                .system_prompt
+                .starts_with("Keep the user's system instruction")
+        );
+        assert_eq!(
+            request
+                .system_prompt
+                .matches("## Hub model system prompt")
+                .count(),
+            1
+        );
+        assert!(
+            request
+                .system_prompt
+                .ends_with("日本語で回答してください。\n固有名詞を保持してください。")
+        );
+        assert!(!request.system_prompt.contains("Preferred model only"));
+        assert!(
+            crate::llm::request_diagnostics::http_request_wire_diagnostic(request)
+                .unwrap()
+                .serialized_body_bytes
+                > 0
+        );
+    }
+    assert!(
+        server
+            .state
+            .prepares
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|body| body["supports_model_system_prompt"] == true)
+    );
+    assert_eq!(
+        store(&temp)
+            .load()
+            .unwrap()
+            .main_catalog_baseline
+            .unwrap()
+            .models[1]
+            .system_prompt,
+        "日本語で回答してください。\n固有名詞を保持してください。"
+    );
+    parent.finish().await;
+    child.finish().await;
+    side.finish().await;
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn model_prompt_overflow_fails_before_allocation_and_final_wire_limit_releases_permit() {
+    for wire_limit in [false, true] {
+        let server = Server::start(60_000).await;
+        *server.state.catalog_override.lock().unwrap() = json!({"models":[
+            {"id":"deep","label":"Deep","capabilities":["chat"],"system_prompt":"日本語".repeat(100)}
+        ]});
+        let temp = tempfile::tempdir().unwrap();
+        let service = HubConnection::new(store(&temp));
+        let connected = connect_service(&service, &server).await;
+        let reviewed = save(&service, &connected, HubReviewContext::Main, "deep")
+            .await
+            .unwrap();
+        enable(&service, reviewed, HubReviewContext::Main).await;
+        *server.state.prepare_response.lock().unwrap() = grant(&server, "deep");
+        let route = service
+            .begin_turn(HubReviewContext::Main, CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let mut request = route_request();
+        if wire_limit {
+            let mut provider = request.provider_target().clone();
+            let mut limits = provider.request_limits();
+            limits.max_serialized_body_bytes = 600;
+            provider.replace_request_limits(limits);
+            request.replace_provider_target(provider);
+        } else {
+            request.model.context_window = 64;
+        }
+        let error = route
+            .client()
+            .stream_chat(request, CancellationToken::new(), &mut Output::default())
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert!(server.state.gateway_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            server.state.prepares.lock().unwrap().len(),
+            usize::from(wire_limit)
+        );
+        if wire_limit {
+            assert_eq!(server.state.closes.lock().unwrap().len(), 1);
+            assert!(service.projection_now().active_main.is_none());
+        }
+        route.finish().await;
+        service.shutdown().await;
+    }
 }
 
 #[tokio::test]

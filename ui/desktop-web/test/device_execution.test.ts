@@ -188,6 +188,100 @@ test("execution controls follow capabilities even while a running task temporari
   assert.equal(deviceExecutionActionEnabled(local, "resume"), false);
 });
 
+test("running work or retained apps block both first folder selection and replacement", async () => {
+  const projects = [null, "C:/Existing"].map((directory, i) => ({ id: `project-${i}`, label: `Project ${i}`,
+    can_control: false, can_execute: true, environment_id: `env-${i}`, directory,
+    preparation_state: "waiting_setup" as const, error: null }));
+  const { local, context } = fixture(projection({ state: "ready", directory: "C:/Root", projects, folder_change_blocked: true }));
+  for (const project of projects) assert.equal(projectFolderBindingEnabled(local, project.id), false);
+  assert.match(renderDeviceExecution(local), /このPCの仕事と起動中のアプリを停止してから/);
+  let calls = 0;
+  await withInvoke(async () => { calls++; throw new Error("blocked before native picker"); }, async () => {
+    await bindProjectFolder(context, projects[0].id);
+  });
+  assert.equal(calls, 0);
+  local.execution!.folder_change_blocked = false;
+  for (const project of projects) assert.equal(projectFolderBindingEnabled(local, project.id), true);
+});
+
+test("folder action errors survive status polling and polling failures until another action or connection", async () => {
+  const project = { id: "project-a", label: "Project", can_control: false, can_execute: true,
+    environment_id: "env-a", directory: null, preparation_state: "waiting_setup" as const, error: null };
+  const current = projection({ state: "ready", directory: "C:/Root", projects: [project] });
+  const { local, context } = fixture(current);
+  const failure = "このPCの仕事と起動中のアプリを停止してください。";
+  let failPoll = false;
+  await withInvoke(async name => {
+    if (name === "browse_shared_project_folder") return "C:/Selected";
+    if (name === "device_execution_projection") { if (failPoll) throw new Error("offline"); return current; }
+    if (name === "shared_work_projection") return { generation: "7" };
+    if (name === "shared_work_command") return { error: failure };
+    throw new Error(name);
+  }, async () => {
+    await bindProjectFolder(context, project.id);
+    assert.equal(local.executionError, failure);
+    await refreshDeviceExecution(context);
+    assert.equal(local.executionError, failure);
+    failPoll = true; await refreshDeviceExecution(context);
+    assert.equal(local.executionError, failure);
+    assert.match(renderDeviceExecution(local), /仕事と起動中のアプリを停止/);
+    failPoll = false; await refreshDeviceExecution(context);
+    assert.equal(local.executionError, failure);
+    acceptDeviceNetworkProjection(local, deviceProjection({ revision: "4", generation: "8", device_id: "other-device" }));
+    assert.equal(local.executionError, "");
+  });
+});
+
+test("folder picker rechecks occupied state before sending the selected path", async () => {
+  const project = { id: "project-a", label: "Project", can_control: false, can_execute: true,
+    environment_id: "env-a", directory: null, preparation_state: "waiting_setup" as const, error: null };
+  const current = projection({ state: "ready", directory: "C:/Root", projects: [project] });
+  const { local, context } = fixture(current);
+  const calls: string[] = [];
+  await withInvoke(async name => {
+    calls.push(name);
+    if (name === "browse_shared_project_folder") return "C:/Selected";
+    if (name === "device_execution_projection") return { ...current, folder_change_blocked: true };
+    if (name === "shared_work_projection") return { generation: "7" };
+    if (name === "shared_work_command") return { error: null };
+    throw new Error(name);
+  }, async () => { await bindProjectFolder(context, project.id); });
+  assert.deepEqual(calls, ["browse_shared_project_folder", "device_execution_projection"]);
+  assert.match(local.executionError, /このPCの仕事と起動中のアプリを停止してから/);
+});
+
+test("a recovered execution observation clears only its own failure", async () => {
+  const { local, context } = fixture();
+  let fail = true;
+  await withInvoke(async () => { if (fail) throw new Error("offline"); return projection(); }, async () => {
+    await refreshDeviceExecution(context);
+    assert.match(renderDeviceExecution(local), /このPCの実行設定を確認できません/);
+    assert.equal(local.executionError, "");
+    fail = false; await refreshDeviceExecution(context);
+    assert.doesNotMatch(renderDeviceExecution(local), /このPCの実行設定を確認できません/);
+  });
+});
+
+test("folder selection does not cross a connection change during its final status read", async () => {
+  const project = { id: "project-a", label: "Project", can_control: false, can_execute: true,
+    environment_id: "env-a", directory: null, preparation_state: "waiting_setup" as const, error: null };
+  const current = projection({ state: "ready", directory: "C:/Root", projects: [project] });
+  const { local, context } = fixture(current);
+  const calls: string[] = [];
+  await withInvoke(async name => {
+    calls.push(name);
+    if (name === "browse_shared_project_folder") return "C:/Selected";
+    if (name === "device_execution_projection") {
+      acceptDeviceNetworkProjection(local, deviceProjection({ revision: "4", generation: "8", device_id: "other-device" }));
+      return current;
+    }
+    throw new Error(name);
+  }, async () => { await bindProjectFolder(context, project.id); });
+  assert.deepEqual(calls, ["browse_shared_project_folder", "device_execution_projection"]);
+  assert.equal(local.execution, null);
+  assert.equal(local.executionError, "");
+});
+
 test("execution polling ignores an older response and a response after the Hub view closes", async () => {
   const { local, context, view } = fixture();
   const resolves: ((value: DeviceExecutionProjection) => void)[] = [];

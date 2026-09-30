@@ -407,6 +407,7 @@ pub(super) fn fixture() -> (tempfile::TempDir, SharedSettings, camino::Utf8PathB
 
 pub(super) fn assignment() -> Assignment {
     Assignment {
+        project_context: None,
         attempt_id: "attempt".into(),
         generation: 1,
         authority_generation: 1,
@@ -437,12 +438,22 @@ pub(super) fn assignment() -> Assignment {
         allowed_child_candidates: vec![],
         retained_services: vec![],
         required_runner_capabilities: vec![],
+        supports_progress_reports: false,
     }
 }
 
 #[test]
 fn assignment_capability_requirement_defaults_for_legacy_hub_and_rejects_unknown_features() {
     let mut legacy = serde_json::to_value(assignment()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("supports_progress_reports");
+    assert!(
+        !serde_json::from_value::<Assignment>(legacy.clone())
+            .unwrap()
+            .supports_progress_reports
+    );
     legacy
         .as_object_mut()
         .unwrap()
@@ -517,6 +528,86 @@ fn journal_reopen_distinguishes_unexecuted_intent_from_possible_effects() {
     assert_eq!(journal.active().unwrap().len(), 1);
 }
 
+#[test]
+fn progress_delivery_is_one_exact_receipt_and_final_outcome_retires_it() {
+    let (_temp, settings, path) = fixture();
+    let mut journal = Journal::open(&path, &settings).unwrap();
+    let mut entry = journal
+        .intent(assignment(), settings.environments[0].clone())
+        .unwrap();
+    let progress = Report::for_assignment(
+        &entry.assignment,
+        "progress:2",
+        ReportOutcome::Progress {
+            revision: 2,
+            items: vec![super::protocol::ProgressItem {
+                position: 2,
+                kind: "error".into(),
+                payload: json!({"message":"Public record"}),
+            }],
+            truncated: false,
+        },
+    );
+    assert!(
+        journal
+            .queue_progress(&mut entry, progress.clone())
+            .is_err()
+    );
+    journal.executing(&mut entry).unwrap();
+    let mut foreign = progress.clone();
+    foreign.generation += 1;
+    assert!(journal.queue_progress(&mut entry, foreign).is_err());
+    journal
+        .queue_progress(&mut entry, progress.clone())
+        .unwrap();
+    assert!(
+        journal
+            .queue_progress(&mut entry, progress.clone())
+            .is_err()
+    );
+    assert!(journal.progress_reported(&mut entry, 3).is_err());
+    drop(journal);
+    let mut journal = Journal::open(&path, &settings).unwrap();
+    let mut entry = journal.get("attempt").unwrap().unwrap();
+    assert_eq!(entry.progress_report, Some(progress.clone()));
+    assert_eq!(entry.progress_revision, 0);
+    journal.progress_reported(&mut entry, 2).unwrap();
+    assert_eq!(entry.progress_revision, 2);
+    assert!(entry.progress_report.is_none());
+    assert!(journal.queue_progress(&mut entry, progress).is_err());
+    let next = Report::for_assignment(
+        &entry.assignment,
+        "progress:3",
+        ReportOutcome::Progress {
+            revision: 3,
+            items: vec![super::protocol::ProgressItem {
+                position: 3,
+                kind: "error".into(),
+                payload: json!({"message":"Next record"}),
+            }],
+            truncated: false,
+        },
+    );
+    journal.queue_progress(&mut entry, next).unwrap();
+    let finished = Report::for_assignment(
+        &entry.assignment,
+        "finished",
+        ReportOutcome::Finished {
+            success: true,
+            result: json!({}),
+            resources_released: true,
+        },
+    );
+    journal.outcome(&mut entry, finished).unwrap();
+    assert_eq!(entry.phase, Phase::ReportPending);
+    assert!(entry.progress_report.is_none());
+    let mut legacy = serde_json::to_value(&entry).unwrap();
+    legacy.as_object_mut().unwrap().remove("progress_report");
+    legacy.as_object_mut().unwrap().remove("progress_revision");
+    let legacy: super::journal::Entry = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.progress_revision, 0);
+    assert!(legacy.progress_report.is_none());
+}
 #[test]
 fn journal_path_recovers_only_an_empty_uninitialized_legacy_file() {
     let (_temp, settings, fixture_path) = fixture();
@@ -623,7 +714,7 @@ fn retained_service_receipt_survives_handoff_and_requires_stopped_ack() {
     journal.executing(&mut entry).unwrap();
     let service = crate::tool::shell::RetainedService {
         service_id: ulid::Ulid::new(),
-        expires_at_ms: super::super::operations::now_ms() + 60_000,
+        expires_at_ms: Some(super::super::operations::now_ms() + 60_000),
         retain_after_turn: false,
     };
     let checkpoint = json!({"checkpoint_id":"exact-child"});
@@ -669,7 +760,7 @@ fn completed_turn_keeps_only_an_explicit_finite_preview_receipt() {
     journal.executing(&mut entry).unwrap();
     let mut service = crate::tool::shell::RetainedService {
         service_id: ulid::Ulid::new(),
-        expires_at_ms: super::super::operations::now_ms() + 60_000,
+        expires_at_ms: Some(super::super::operations::now_ms() + 60_000),
         retain_after_turn: false,
     };
     let completed = Report::for_assignment(
@@ -698,6 +789,15 @@ fn completed_turn_keeps_only_an_explicit_finite_preview_receipt() {
 
 #[tokio::test]
 async fn shared_completed_turn_keeps_its_preview_process_until_explicit_stop() {
+    completed_preview_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn hub_control_loss_stops_completed_preview_without_releasing_unacknowledged_capacity() {
+    completed_preview_cleanup(true).await;
+}
+
+async fn completed_preview_cleanup(control_loss: bool) {
     use crate::runner::Execution;
     use crate::runtime::{OwnedTaskHandle, RunControl};
     use tokio_util::sync::CancellationToken;
@@ -798,7 +898,13 @@ async fn shared_completed_turn_keeps_its_preview_process_until_explicit_stop() {
         entry.report.as_ref().map(|report| &report.outcome),
         Some(ReportOutcome::Finished { success: true, .. })
     ));
-    assert!(shells.cancel_retained_service(preview.service_id));
+    assert_eq!(preview.expires_at_ms, None);
+    if control_loss {
+        assert!(controller.tick().await.is_err());
+        assert_eq!(controller.journal.retained_services().unwrap().len(), 1);
+    } else {
+        assert!(shells.cancel_retained_service(preview.service_id));
+    }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while shells.has_local_work_in_scope(session_id, entry.run_id) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

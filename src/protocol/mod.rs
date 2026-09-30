@@ -17,6 +17,8 @@ mod projection;
 mod recording;
 mod store;
 
+pub(crate) use projection::{completed_tool_display_status, user_turn_text};
+
 pub use projection::{
     ProtocolRunEventProjection, project_inter_agent_communication,
     project_inter_agent_communication_with_history_item_id, project_protocol_run_event,

@@ -16,7 +16,7 @@ use crate::tool::context::{ToolContext, ToolEffectAdmission, ToolFormatterPlan};
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{
     MAX_EDIT_RECOVERY_PATHS, MAX_EDIT_RECOVERY_REASON_BYTES, delete_file_conditionally,
-    read_text_file_with_identity, to_summary, write_text_file_conditionally,
+    post_commit_failure, read_text_file_with_identity, to_summary, write_text_file_conditionally,
 };
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, GuardedPath, PathGuard, Workspace};
@@ -309,23 +309,29 @@ async fn commit_admitted_patch(
         &committed_mutations,
         ctx.config.file_guard.max_inline_read_bytes,
     ) {
-        rollback_patch_commit(
-            &commit.mutations,
-            &applied,
-            ctx.workspace,
-            Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
-        )?;
-        return Err(ToolError::from(error));
+        return Err(post_commit_failure(
+            "apply_patch atomic commit",
+            ToolError::from(error),
+            rollback_patch_commit(
+                &commit.mutations,
+                &applied,
+                ctx.workspace,
+                Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
+            ),
+        ));
     }
 
     if let Err(error) = ctx.run_mutation_fence.assert_owned().await {
-        rollback_patch_commit(
-            &commit.mutations,
-            &applied,
-            ctx.workspace,
-            Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
-        )?;
-        return Err(error);
+        return Err(post_commit_failure(
+            "apply_patch atomic commit",
+            error,
+            rollback_patch_commit(
+                &commit.mutations,
+                &applied,
+                ctx.workspace,
+                Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
+            ),
+        ));
     }
 
     if commit.changes.is_empty() {
@@ -340,15 +346,16 @@ async fn commit_admitted_patch(
         .await
     {
         Ok(change_ids) => Ok(change_ids),
-        Err(error) => {
+        Err(error) => Err(post_commit_failure(
+            "apply_patch atomic commit",
+            ToolError::from(error),
             rollback_patch_commit(
                 &commit.mutations,
                 &applied,
                 ctx.workspace,
                 Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
-            )?;
-            Err(ToolError::from(error))
-        }
+            ),
+        )),
     }
 }
 

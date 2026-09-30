@@ -5,6 +5,8 @@ pub struct DesktopComposerState {
     pub draft_prompt: String,
     pub image_attachment_input: String,
     pub image_attachment_paths: Vec<camino::Utf8PathBuf>,
+    /// Original image bytes retained by text-only message editing. Never reload source paths.
+    pub retained_images: Vec<crate::session::ImagePart>,
     owner_workspace_path: String,
     owner_session_id: Option<SessionId>,
     owner_generation: u64,
@@ -55,6 +57,7 @@ impl DesktopComposerState {
         self.draft_prompt.clear();
         self.image_attachment_input.clear();
         self.image_attachment_paths.clear();
+        self.retained_images.clear();
     }
 
     fn advance_owner_generation(&mut self) {

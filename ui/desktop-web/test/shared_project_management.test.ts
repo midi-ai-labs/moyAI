@@ -65,7 +65,7 @@ test("shared chat rename, delete and local departure send exact Hub identities",
       { kind: "select_conversation", project_id: "project-a", conversation_id: "conversation-a" },
       { kind: "rename_conversation", project_id: "project-a", conversation_id: "conversation-a", title: "TODOアプリ改訂" },
       { kind: "delete_conversation", project_id: "project-a", conversation_id: "conversation-a" },
-      { kind: "leave_project", project_id: "project-a" },
+      { kind: "leave_project", project_id: "project-a", expected_participation_generation: 1 },
     ]);
   } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
 });
@@ -179,7 +179,7 @@ test("an execution-only PC can confirm leaving from Settings and retains the dur
   try {
     await confirmExecutionProjectLeave(context);
     assert.deepEqual(calls.find(call => call.name === "shared_work_command")?.args,
-      { expectedGeneration: "1", request: { kind: "leave_project", project_id: "project-a" } });
+      { expectedGeneration: "1", request: { kind: "leave_project", project_id: "project-a", expected_participation_generation: 7 } });
     assert.equal(device.executionLeaveConfirmation, null);
     assert.equal(shared.projection?.leave_pending_project_id, "project-a");
     assert.match(renderDeviceExecution(device, sharedWorkPresentation(shared)), /このPCの離脱処理待ちです/);
@@ -303,7 +303,7 @@ test("a conversation awaiting deletion cannot receive follow-ups or revisions", 
   assert.equal(sharedWorkActionEnabled(local, "submit", ""), false);
 });
 
-test("the latest shared request with attachments explains why editing is unavailable", () => {
+test("the latest shared request with attachments permits text editing and explains retention", () => {
   const local = sharedUiFixture();
   const job = { ...sharedProjection().status!.jobs[0], state: "succeeded", can_revise: true };
   local.projection = sharedProjection({ selected_job_id: job.id, selected_conversation_id: conversation.id,
@@ -313,8 +313,14 @@ test("the latest shared request with attachments explains why editing is unavail
       can_revise: true }, conversation_history: { project_id: "project-a", conversation_id: conversation.id,
       snapshot: 1, next_before: null, jobs: [{ job, input: { prompt: "解析", input_refs: ["asset-a"] }, result: null,
         artifacts: [], more_artifacts: false }] } });
-  assert.equal(sharedWorkActionEnabled(local, "start-revise", job.id), false);
-  assert.match(renderSharedWork(sharedWorkPresentation(local)), /添付付きの依頼は編集できません。新しい依頼として送ってください。/);
+  assert.equal(sharedWorkActionEnabled(local, "start-revise", job.id), true);
+  local.editingJobId = job.id;
+  local.editingJobRevision = 7;
+  local.revisionDraft = "画像を使って再解析";
+  assert.equal(sharedWorkActionEnabled(local, "save-revise", ""), true);
+  assert.match(renderSharedWork(sharedWorkPresentation(local)), /元の依頼の添付をそのまま保持して再送します。本文だけを編集できます。/);
+  local.editingJobRevision = 6;
+  assert.equal(sharedWorkActionEnabled(local, "save-revise", ""), false);
 });
 
 test("an unupdated Hub project shows why sending is unavailable", () => {

@@ -13,7 +13,7 @@ pub(super) struct ServiceLeaseView {
     pub generation: u64,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     pub stop_requested: bool,
 }
 

@@ -110,7 +110,7 @@ pub(crate) fn review_text(
         )
     } else if current.configured() && current != shared {
         format!(
-            "\n現在の接続先 {} から切り替えます。本人ログインと、このHubでのPC参加・project許可を確認してください。\n",
+            "\n現在の接続先 {} から切り替えます。このHubでPCの参加承認とプロジェクトへの割当を確認してください。\n",
             current.hub_url
         )
     } else {
@@ -122,7 +122,7 @@ pub(crate) fn review_text(
         "このHubへのPC参加を申請します。"
     };
     Ok(format!(
-        "接続先: {}\n公開CAのSHA256: {}\n{}\n信頼できる管理者から受け取った接続先であることを確認してください。OKで{}\n\n取り込むのは公開接続情報です。既存のモデル設定と実行権限は保持します。本人設定とproject参加は、この後の共有仕事画面で案内します。",
+        "接続先: {}\n公開CAのSHA256: {}\n{}\n信頼できる管理者から受け取った接続先であることを確認してください。OKで{}\n\n取り込むのは公開接続情報です。既存のモデル設定と実行権限は保持します。接続後のPC参加・プロジェクト設定は「moyAI Hub」で確認できます。",
         shared.hub_url, fingerprint, change, action
     ))
 }

@@ -19,6 +19,8 @@ pub(super) struct Environment {
     pub(super) project_ids: Vec<String>,
     #[serde(default)]
     pub(super) enabled: bool,
+    #[serde(default)]
+    pub(super) workspace_bound: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ProvisionDelivery {
@@ -49,7 +51,7 @@ impl Controller {
     async fn resource_catalog(&mut self) -> Result<Vec<Environment>, RunnerError> {
         let environments: Vec<Environment> = self
             .client
-            .request("/v1/shared/runner/environments", None)
+            .request("/v1/shared/runner/environments?current_only=true", None)
             .await?;
         if environments.len() > 128 {
             return Err(RunnerError::new(
@@ -119,7 +121,12 @@ impl Controller {
                     catalog
                         .iter()
                         .find(|env| env.id == receipt.environment_id)
-                        .is_some_and(|env| !env.enabled && env.project_ids.is_empty())
+                        // The endpoint is a complete bounded catalog, never a
+                        // page. Transport/parse/size failures are rejected before
+                        // this function. Older Hubs include retired rows explicitly.
+                        .is_none_or(|env| {
+                            !env.enabled && env.project_ids.is_empty() && !env.workspace_bound
+                        })
                 })
                 .map(|receipt| receipt.environment_id.clone())
                 .collect::<std::collections::BTreeSet<_>>()

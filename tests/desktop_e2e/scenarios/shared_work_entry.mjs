@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { normalizeHubBrowserOptions, startHubBrowserResource } from "../drivers/hub_browser_resource.mjs";
 import { WebviewInput } from "../drivers/webview_input.mjs";
-import { DesktopCommandProbe } from "../drivers/desktop_command_probe.mjs";
+import { DesktopCommandProbe, assertExactDesktopCommandSequence } from "../drivers/desktop_command_probe.mjs";
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { action, byId, hubSettingsCloseTarget, trustedClick, trustedFocus, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { hubProjectReady, observeSharedWorkSurface, sharedWorkSurfaceMatches, openHubProjectSurface, openSharedDisclosure, rememberedRestartAccepted, sharedActionTarget, openSharedJob, bindHubDevice } from "./shared_work_navigation.mjs";
+import { hubProjectReady, observeSharedWorkSurface, sharedWorkSurfaceMatches, openHubProjectSurface, openSharedDisclosure, rememberedRestartAccepted, sharedActionTarget, openSharedJob, bindHubDevice, waitForSharedComposer } from "./shared_work_navigation.mjs";
 
 const ID = "settings.shared-work", OWNER = `scenario:${ID}`;
 const failure = (message, evidence) => new DesktopE2eError("product", "shared-work-mismatch", message, evidence);
@@ -20,15 +21,26 @@ export function sharedSettingsClosed(value, before) {
     && value.startup?.initial_setup_required === before.startup.initial_setup_required
     && value.startup?.status === before.startup.status;
 }
+export function sharedApprovalParked(value, expected) {
+  const approval = value?.approval;
+  return value?.detail?.id === expected.jobId && value.detail.state === "running"
+    && approval?.id === expected.approvalId && approval.attempt_id === expected.attemptId
+    && approval.context?.job_id === expected.jobId && approval.status === "expired"
+    && approval.decision === null && approval.can_decide === false && approval.can_reconfirm === true
+    && Number.isFinite(approval.expires_at_ms) && value.observed_at_ms >= approval.expires_at_ms
+    && value.status?.environments?.some(row => row.id === expected.environmentId && row.occupied === 1);
+}
 export function createSharedWorkEntryScenario(options = {}) {
   const settings = normalizeHubBrowserOptions(options);
-  const state = { resource: null, input: null, commands: null, nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false, failures: [], close: null };
+  const state = { resource: null, input: null, commands: null, nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false, failures: [], close: null, notificationLog: null };
   async function settle() {
     if (state.input) { try { await state.input.cleanup(); } catch { state.failures.push("input-cleanup"); } state.input = null; }
     if (state.commands) { try { await state.commands.remove(); } catch { state.failures.push("command-cleanup"); } state.commands = null; }
   }
   return Object.freeze({ id: ID, productOracle: "pass", manualGate: "pending", databaseRequired: true,
+    get environment() { return state.notificationLog ? { MOYAI_NOTIFICATION_DEBUG_LOG: state.notificationLog } : {}; },
     async prepare(args) {
+      state.notificationLog = path.join(args.context.root, "native-notifications.log");
       await prepareDesktopFixture({ ...args, owner: OWNER, configMode: "absent", sentinelName: null, sentinelText: "" });
       state.resource = await startHubBrowserResource({ ...args, options: settings });
     },
@@ -45,7 +57,8 @@ export function createSharedWorkEntryScenario(options = {}) {
         await settle();
         const result = await host.restart({ context, scenario: thisScenario, sink, driver: cdp });
         cdp = result.driver; await attach();
-        await wait("Team entry resumes automatically without local model setup", () => invokeDesktopCommand(cdp, "desktop_state"), hubProjectReady);
+        await wait("Restart keeps setup complete without local model setup", () => invokeDesktopCommand(cdp, "desktop_state"),
+          p => p.overlay === "none" && !p.busy && !p.startup.initial_setup_required);
         await openHubProjectSurface(input, cdp, sink);
         return result.restart;
       }
@@ -71,6 +84,13 @@ export function createSharedWorkEntryScenario(options = {}) {
         const bob = (await participant.sharedDeviceSession()).principal;
         await bindHubDevice(resource, approved.deviceId, resource.administrator.user_id);
         await participant.sharedDeviceSession();
+        // A PC label is deliberately public to its authorized project. Give
+        // the private actor a distinct name so the privacy oracle can tell
+        // the actor from that legitimately displayed execution PC.
+        bob.display_name = "非公開の利用者 Bob";
+        const actorSetup = await participant.sharedCall("snapshot");
+        await participant.sharedCall("command", { request_id: randomUUID(), expected_revision: actorSetup.revision,
+          request: { kind: "update_user", user_id: bob.user_id, display_name: bob.display_name, administrator: false, disabled: false } });
         await page.locator('nav a[href="#device-network"]').click();
         const enrolled = await enrollDesktopFromHubBrowser({ resource, context, runtime, cdp, input, sink, nativeState: state, entry: "shared-work" });
         const alice = (await wait("New Desktop uses its dedicated device actor", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.principal && !p.principal.administrator)).principal;
@@ -84,10 +104,18 @@ export function createSharedWorkEntryScenario(options = {}) {
         const occupied = await participant.sharedCall("submit", { request_id: randomUUID(), project_id: "project-b", environment_id: "env-project-b", title: "Bobだけが見える仕事", input: { version: 1, prompt: "Fixture retained shared work" }, descendant_budget: 0 });
         const assignment = await participant.sharedCall("claim", { environment_ids: ["env-project-b"] });
         async function fill(id, value, tag = "INPUT") {
-          const target = byId(id, tag); await trustedClick(input, cdp, target, sink); await input.insertText(target, value);
+          // The composer is already visible. Use the shared pointer driver;
+          // keyboard traversal after replacing a new-chat form is a separate gate.
+          const target = byId(id, tag);
+          await waitForSharedComposer(input, target);
+          await input.click(target, { stableHitSamples: 3 });
+          await input.insertText(target, value);
+          await wait("Composer retains the exact entered draft", () => cdp.evaluate(`document.getElementById(${JSON.stringify(id)})?.value`), actual => actual === value);
         }
         async function click(name, value) {
-          await trustedClick(input, cdp, sharedActionTarget(name, value), sink);
+          const target = sharedActionTarget(name, value);
+          await waitForSharedComposer(input, target);
+          await trustedClick(input, cdp, target, sink);
         }
         const aliceView = await wait("Alice sees only her project and redacted occupied resource", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.principal?.user_id === alice.user_id && p.projects.length === 1 && p.status?.environments[0]?.other_occupants === 1);
         const credentialCalls = (await state.commands.snapshot()).calls.filter(call => ["login", "setup_password"].includes(call.args?.request?.kind));
@@ -139,7 +167,9 @@ export function createSharedWorkEntryScenario(options = {}) {
           const job = p.status?.jobs.find(row => row.id === occupied.id);
           const environment = p.status?.environments.find(row => row.id === "env-project-b");
           return { job, environment, detail: p.detail, observed_at_ms: p.observed_at_ms,
-            text: await cdp.evaluate(`Object.fromEntries(["environments", "detail"].map(name => [name, document.querySelector('[data-shared-region="' + name + '"]')?.textContent ?? ""]))`) };
+            // The current conversation shows PC contact in its right pane;
+            // the former separate job-detail region no longer exists.
+            text: { environments: await cdp.evaluate("document.querySelector('[data-shared-region=\"environments\"]')?.textContent ?? ''") } };
         };
         const contactState = (value, state) => value.job?.state === "running" && value.detail?.id === occupied.id
           && value.detail.state === "running" && value.environment?.occupied === 1
@@ -166,21 +196,88 @@ export function createSharedWorkEntryScenario(options = {}) {
           last_contact_ms: lastContact, stale_contact_ms: stale.detail.runner_contact.last_contact_ms, recovered_contact_ms: recovered.detail.runner_contact.last_contact_ms,
           desktop_observation_advanced: stale.observed_at_ms > recent.observed_at_ms, occupancy_before: recent.environment.occupied, occupancy_stale: stale.environment.occupied, occupancy_after: recovered.environment.occupied,
           scope: "Actual Desktop and real mTLS Hub assignments API; fixture controls its own Runner-role contact, with the default 15-second Hub threshold and no clock override. Process liveness and progress are not inferred." }, { phase: "executing", owner: OWNER });
-        await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: assignment.attempt_id, generation: assignment.generation, outcome: { kind: "approval_requested", approval_id: approvalId, expires_at_ms: Date.now() + 300000, request: { access: "shell", summary: "解析環境で入力ファイルの確認を実行", details: ["実行予定: Get-ChildItem -LiteralPath ."], targets: [context.paths.workspace], outside_workspace: false, risks: ["unclassified_shell"] } } });
-        await openSharedJob(input, cdp, sink, occupied.id);
+        // Same person on a different PC does not inherit approval authority.
+        // Finish the fixture's own job and submit the reviewed work from this
+        // actual Desktop, so the GUI is the captured originating controller.
+        await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: assignment.attempt_id, generation: assignment.generation,
+          outcome: { kind: "finished", success: true, result: { text: "Contact fixture complete" }, resources_released: true } });
+        await click("new-conversation");
+        await fill("shared-prompt", "このPCから依頼する承認試験", "TEXTAREA");
+        await input.keyDown("Control"); try { await input.pressKey("Enter"); } finally { await input.keyUp("Control"); }
+        const reviewJob = await wait("Desktop-origin approval work is queued", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+          p => p.detail?.title === "このPCから依頼する承認試験" && p.detail.state === "queued");
+        const reviewAssignment = await participant.sharedCall("claim", { environment_ids: ["env-project-b"] });
+        if (reviewAssignment?.job?.id !== reviewJob.detail.id) throw failure("Runner claimed a different approval job", {});
+        await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: reviewAssignment.attempt_id, generation: reviewAssignment.generation, outcome: { kind: "started" } });
+        // This fixture uses the existing Hub permission lifetime contract; no product clock or timeout override.
+        const approvalExpiresAt = Date.now() + 60_000;
+        const approvalRequest = { access: "shell", summary: "解析環境で入力ファイルの確認を実行", details: ["Command: Get-ChildItem -LiteralPath .", `Workdir: ${context.paths.workspace}`], targets: [context.paths.workspace], outside_workspace: false, risks: ["unclassified_shell"] };
+        await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: reviewAssignment.attempt_id, generation: reviewAssignment.generation,
+          outcome: { kind: "approval_requested", approval_id: approvalId, expires_at_ms: approvalExpiresAt, request: approvalRequest } });
+        await openSharedJob(input, cdp, sink, reviewJob.detail.id);
         await wait("Shared detail receives the pending approval", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.approval?.id === approvalId && p.approval.status === "pending" && p.approval.can_decide);
         if (!(await cdp.evaluate("document.querySelector('[data-shared-region=approval]').textContent")).includes("Get-ChildItem -LiteralPath .")) throw failure("Approval omitted concrete operation details", {});
-        await click("approve", approvalId);
-        await wait("Explicit GUI approval is recorded for this exact request", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.approval?.id === approvalId && p.approval.status === "decided" && p.approval.decision === "approve" && !p.approval.can_decide);
+        const pendingReview = await invokeDesktopCommand(cdp, "shared_work_projection");
+        if (pendingReview.approval.context.controller_device_id !== enrolled.network.device_id
+          || pendingReview.approval.context.execution_device_id !== approved.deviceId) throw failure("Approval confused origin and execution PCs", {});
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-approval-pending-target", owner: OWNER });
+        await wait("Origin Desktop delivers a Windows approval balloon", async () => {
+          try { return await readFile(state.notificationLog, "utf8"); } catch (error) { if (error.code === "ENOENT") return ""; throw error; }
+        }, text => text.split(/\r?\n/).some(line => line.includes("このPCから依頼する承認試験") && line.includes("操作の承認を待っています") && line.includes("native balloon result=true")), 15000);
+        const parkedTarget = { jobId: reviewJob.detail.id, approvalId, attemptId: reviewAssignment.attempt_id, environmentId: "env-project-b" };
+        const expired = await wait("The real Hub clock expires only the permission while the same work stays occupied", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+          p => sharedApprovalParked(p, parkedTarget), 90_000);
+        const consume = id => participant.sharedConsumeApproval(id, reviewAssignment.attempt_id, reviewAssignment.generation);
+        for (let poll = 0; poll < 2; poll++) {
+          if (await consume(approvalId) !== null) throw failure("Expired approval delivered a decision instead of parking", {});
+        }
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-approval-expired-parked", owner: OWNER });
+        const beforeReconfirm = (await state.commands.snapshot()).sequence;
+        await click("reconfirm-approval", approvalId);
+        const reconfirmation = await wait("The exact expired request requires a fresh review only after the origin click", () => consume(approvalId),
+          value => value?.approval_id === approvalId && value.reconfirmation_required === true && value.decision === undefined);
+        const reconfirmCommand = assertExactDesktopCommandSequence(await state.commands.snapshot(beforeReconfirm), {
+          afterSequence: beforeReconfirm, expected: [{ command: "shared_work_command", args: { expectedGeneration: expired.generation,
+            request: { kind: "reconfirm_approval", project_id: "project-b", job_id: reviewJob.detail.id, approval_id: approvalId } } }],
+        });
+        const renewedApprovalId = randomUUID();
+        await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: reviewAssignment.attempt_id, generation: reviewAssignment.generation,
+          outcome: { kind: "approval_requested", approval_id: renewedApprovalId, expires_at_ms: Date.now() + 300_000, request: approvalRequest } });
+        const renewed = await wait("The same paused operation is shown with a new approval identity", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+          p => p.detail?.id === reviewJob.detail.id && p.detail.state === "running" && p.approval?.id === renewedApprovalId
+            && p.approval.attempt_id === reviewAssignment.attempt_id && p.approval.status === "pending" && p.approval.can_decide);
+        if (JSON.stringify(renewed.approval.request) !== JSON.stringify(pendingReview.approval.request)
+          || renewed.approval.context.controller_device_id !== enrolled.network.device_id
+          || renewed.approval.context.execution_device_id !== approved.deviceId) throw failure("Reconfirmation changed the operation or its origin/execution device", {});
+        if ((await consume(approvalId))?.reconfirmation_required !== true) throw failure("An expired approval became usable after reissue", {});
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-approval-reconfirmed-target", owner: OWNER });
+        await click("approve", renewedApprovalId);
+        await wait("Explicit GUI approval is recorded for the replacement request", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+          p => p.approval?.id === renewedApprovalId && p.approval.status === "decided" && p.approval.decision === "approve" && !p.approval.can_decide);
+        const answer = await consume(renewedApprovalId);
+        if (answer?.approval_id !== renewedApprovalId || answer.decision !== "approve" || answer.reconfirmation_required !== undefined) throw failure("The Runner did not receive the exact replacement approval", {});
         await captureScenarioScreenshot({ cdp, sink, name: "shared-approval-decided", owner: OWNER });
+        await sink.record("shared-approval-expiry-reconfirmation", { job_id: reviewJob.detail.id, attempt_id: reviewAssignment.attempt_id, generation: reviewAssignment.generation,
+          original_approval_id: approvalId, replacement_approval_id: renewedApprovalId, expires_at_ms: approvalExpiresAt, expired_observed_at_ms: expired.observed_at_ms,
+          occupancy_while_expired: 1, expired_consume_results: [null, null], reconfirmation, reconfirm_command: reconfirmCommand, replacement_answer: answer,
+          scope: "Actual Tauri input and real Hub clock/API with a 60-second fixture-reported permission. The fixture emulates the Runner's consume/reissue exchange; no real Runner 15-minute soak or approved shell effect." }, { phase: "executing", owner: OWNER });
+        await participant.sharedCall("report", { event_id: randomUUID(), attempt_id: reviewAssignment.attempt_id, generation: reviewAssignment.generation,
+          outcome: { kind: "finished", success: true, result: { text: "Approval protocol fixture complete; no shell effect executed" }, resources_released: true } });
+        await wait("The fixture's completed work releases its capacity", () => invokeDesktopCommand(cdp, "shared_work_projection"),
+          p => p.detail?.id === reviewJob.detail.id && p.detail.state === "succeeded" && p.status?.environments.some(row => row.id === "env-project-b" && row.occupied === 0));
         const beforeSettings = await invokeDesktopCommand(cdp, "desktop_state");
         await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
         await trustedClick(input, cdp, hubSettingsCloseTarget, sink);
         await wait("Closing connection settings keeps the project surface and current setup readiness", () => invokeDesktopCommand(cdp, "desktop_state"), value => sharedSettingsClosed(value, beforeSettings));
         if (resource.provider.requests.some(r => r.method !== "GET")) throw failure("Projectless tracking attempted model generation", {});
-        await sink.record("shared-work-complete", { initial_entry_setup_required: entry.startup.initial_setup_required, setup_status_before_settings: beforeSettings.startup.status, setup_required_before_settings: beforeSettings.startup.initial_setup_required, device_id: enrolled.network.device_id, alice_project_count: aliceView.projects.length, bob_project_count: bobView.projects.length, submitted_job: job.id, cancelled: true, previous_actor_cleared: true, approval_id: approvalId, approval_decision: "approve", credentials_in_webview_projection: false, scope: "Real Tauri input, native public trust import, Hub browser device approval, automatic device session, project membership, occupancy redaction, submit/detail/cancel, and explicit administrator reassociation. Explicit human approval decision for a fixture-reported request; no solver/model execution or approved shell effect." }, { phase: "executing", owner: OWNER });
+        await sink.record("shared-work-complete", { initial_entry_setup_required: entry.startup.initial_setup_required, setup_status_before_settings: beforeSettings.startup.status, setup_required_before_settings: beforeSettings.startup.initial_setup_required, device_id: enrolled.network.device_id, alice_project_count: aliceView.projects.length, bob_project_count: bobView.projects.length, submitted_job: job.id, cancelled: true, previous_actor_cleared: true, expired_approval_id: approvalId, approval_id: renewedApprovalId, approval_decision: "approve", credentials_in_webview_projection: false, scope: "Real Tauri input, native public trust import, Hub browser device approval, automatic device session, project membership, occupancy redaction, submit/detail/cancel, and explicit administrator reassociation. Real-clock expiry parks the fixture-reported permission; the originating Desktop explicitly requests a fresh review and approves its replacement identity. No solver/model execution, real Runner 15-minute soak, or approved shell effect." }, { phase: "executing", owner: OWNER });
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
+        await resource.screenshot("shared-hub-failure");
+        await sink.record("shared-hub-failure-observation", {
+          notice: await page.locator("#shared-admin-notice").textContent(),
+          form_error: await page.locator("#shared-admin-form-error").count() ? await page.locator("#shared-admin-form-error").textContent() : null,
+        }, { phase: "executing", owner: OWNER });
         await sink.record("shared-failure-observation", { view: await invokeDesktopCommand(cdp, "shared_work_projection"), fields: await cdp.evaluate("({credential_fields:document.querySelectorAll('#shared-username, #shared-password').length,active:document.activeElement?.id})"), commands: await state.commands.snapshot() }, { phase: "executing", owner: OWNER });
         await captureScenarioScreenshot({ cdp, sink, name: "shared-failure", owner: OWNER });
         throw error;

@@ -139,12 +139,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 Some(path) => Some(moyai::runner::shared::SharedSettings::load(&path)?),
                 None => host.installed_shared_settings()?,
             };
-            let shared = match installed {
-                Some(settings) => Some(runtime.block_on(
-                    moyai::runner::shared::SharedWorker::start(host.clone(), settings),
-                )?),
-                None => None,
-            };
+            if let Some(settings) = installed {
+                runtime.block_on(moyai::runner::shared::SharedWorker::start(
+                    host.clone(),
+                    settings,
+                ))?;
+            }
             println!(
                 "{}",
                 serde_json::to_string(&RunnerResponse::Identity {
@@ -159,10 +159,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             });
             let result = listener.serve(host.clone(), &runtime);
             host.begin_shutdown()?;
-            runtime.block_on(host.wait_stopped());
-            if let Some(shared) = shared {
-                runtime.block_on(shared.wait())?;
-            }
+            runtime.block_on(host.wait_shutdown())?;
             result?;
             return Ok(());
         }

@@ -12,6 +12,7 @@ param(
   [string]$HubBinaryPath = '',
   [string]$HubBuildIdentityPath = '',
   [string]$HubCompatibilityResultsPath = '',
+  [string]$HubDocumentationPath = '',
   [switch]$SkipManualGuiStGate,
   [switch]$SkipBuild,
   [switch]$AllowDirtySource
@@ -123,6 +124,7 @@ function Remove-ReleaseOutputDirectory([string]$OutputRootPath, [string]$Path, [
 
 $repoRoot = Resolve-RepoRoot
 . (Join-Path $repoRoot 'scripts\deployment\common.ps1')
+. (Join-Path $repoRoot 'scripts\release-guides.ps1')
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
   $OutputRoot = Join-Path (Split-Path -Parent $repoRoot) "project_sandbox\releases"
 }
@@ -198,6 +200,8 @@ try {
     Assert-MoyaiX64Pe $HubBinaryPath
     if ((Get-FileHash -LiteralPath $HubBinaryPath -Algorithm SHA256).Hash -ine $hubIdentity.sha256) { throw 'Hub binary does not match its build identity checksum.' }
     if (-not $AllowDirtySource -and $hubIdentity.source_clean -ne $true) { throw 'A published Hub bundle requires a clean Hub source identity.' }
+    if (-not $HubDocumentationPath) { $HubDocumentationPath = Join-Path (Split-Path -Parent $repoRoot) 'moyAI-Hub/docs' }
+    Assert-MoyaiHubReleaseGuides $HubDocumentationPath
     if ($HubCompatibilityResultsPath) {
       $hubResults = Get-Content -LiteralPath $HubCompatibilityResultsPath -Raw -Encoding UTF8
       foreach ($marker in @('Desktop Hub Gate: PASS', "Desktop Git Commit: $commit", "Hub Git Commit: $($hubIdentity.git_commit)", "Hub SHA256: $($hubIdentity.sha256)")) {
@@ -353,7 +357,6 @@ try {
   foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd')) {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$launcher") (Join-Path $releaseRoot $launcher)
   }
-  Copy-RequiredFile (Join-Path $repoRoot 'docs\user\windows-setup.md') (Join-Path $releaseRoot 'docs\user\windows-setup.md')
   if ($RuntimeMode -eq 'Bundled') {
     New-Item -ItemType Directory -Path (Join-Path $releaseRoot 'runtime\webview2') -Force | Out-Null
     foreach ($item in Get-ChildItem -LiteralPath $WebView2FixedRuntimePath -Force) { Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $releaseRoot 'runtime\webview2') -Recurse -Force }
@@ -376,8 +379,8 @@ try {
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
   Copy-RequiredFile (Join-Path $repoRoot "config.example.toml") (Join-Path $releaseRoot "config.example.toml")
-  Copy-RequiredFile (Join-Path $repoRoot "docs\user\getting-started.md") (Join-Path $releaseRoot "docs\user\getting-started.md")
-  foreach ($runnerGuide in @("runner-local.md", "runner-shared.md", "shared-work-desktop.md")) {
+  Copy-MoyaiReleaseGuides $repoRoot $releaseRoot $HubDocumentationPath $(if ($hubIdentity) { $hubIdentity.git_commit } else { '' })
+  foreach ($runnerGuide in @('runner-local.md', 'runner-shared.md', 'shared-work-desktop.md', 'desktop-first-use.md', 'hub-device-network-guide.md', 'hub-integration.md', 'mcp-history-guide.md', 'managed-shell-guide.md')) {
     Copy-RequiredFile (Join-Path $repoRoot "docs\$runnerGuide") (Join-Path $releaseRoot "docs\$runnerGuide")
   }
   if ($manualGuiStResultsResolved) {
@@ -389,6 +392,7 @@ try {
   Copy-Item -LiteralPath (Join-Path $repoRoot "logo") -Destination (Join-Path $releaseRoot "app\logo") -Recurse -Force
 
   Write-Utf8File (Join-Path $releaseRoot "RELEASE_NOTES.md") $notes
+  Update-MoyaiReleaseGuideLinks $releaseRoot $commit $(if ($hubIdentity) { $hubIdentity.git_commit } else { '' })
 
   $deployment = [ordered]@{
     schema = 1

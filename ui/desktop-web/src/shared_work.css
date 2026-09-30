@@ -17,10 +17,10 @@
 .shared-stop-all button { color:var(--danger-color, #ed9e94); }
 .shared-thread { min-width:0; }
 .shared-thread .shared-card { border:0; padding:12px 0; background:transparent; }
-.shared-header { display:flex; align-items:center; justify-content:space-between; gap:24px; margin-bottom:0; }
-.shared-header p { margin:5px 0 0; color:var(--muted); font-size:12px; }
-.shared-header h1 { margin:0 0 8px; font-size:24px; }
 .shared-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.shared-work button.local-mode { max-width:100%; white-space:normal; overflow-wrap:anywhere; text-align:left; }
+.shared-work button.local-mode:hover:not(:disabled) { border-color:var(--accent); }
+.shared-work button.local-mode:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .shell.hub-project-shell { grid-template-columns:260px minmax(0, 1fr); }
 .hub-project-heading, .hub-chat-row { display:flex; align-items:center; min-width:0; }
 .hub-project-heading > .rail-item, .hub-chat-row > button:first-child { flex:1; min-width:0; text-align:left; }
@@ -40,6 +40,7 @@
 .device-project-folder { border-top:1px solid var(--line); padding:10px 0; }
 .device-project-folder p { margin:5px 0; overflow-wrap:anywhere; }
 .shared-project-status { min-width:0; min-height:0; overflow:hidden; }
+.shared-project-status .output-scroll > .shared-card { padding:16px; }
 .shared-conversation-record { border:0!important; padding-left:0!important; padding-right:0!important; }
 .shared-user-message { padding:16px; border-radius:12px; background:var(--bg-hover, #303846); margin:20px 0; }
 .shared-conversation > .shared-composer { position:relative; grid-row:4; justify-self:center; left:auto; bottom:auto; transform:none; margin:0 0 18px; max-height:min(34vh, 320px); overflow:auto; }
@@ -54,7 +55,9 @@
 .shared-composer textarea { resize:vertical; overflow-y:auto; }
 .shared-composer details { margin:8px 0; }
 .shared-composer .shared-card > button { margin:6px 0; padding:8px 20px; }
-.shared-header details { min-width:120px; }
+.shared-header details { min-width:0; max-width:100%; }
+.shared-header summary { cursor:pointer; }
+.shared-header summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .shared-card { border:1px solid var(--border-color, #444); border-radius:10px; padding:20px; margin:18px 0; }
 .shared-card h2 { margin:0 0 16px; font-size:18px; }
 .shared-card h3 { font-size:14px; margin:10px 0; }
@@ -72,7 +75,16 @@
 .shared-approval-review:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
 .shared-approval-review .shared-approval-operation, .shared-approval-pending .shared-approval-review pre { max-height:none; overflow:visible; }
 .shared-approval-pending .shared-actions { margin:12px 0; }
+.shared-approval-decisions button { min-height:36px; padding:6px 12px; border:1px solid var(--quiet); border-radius:7px; background:var(--panel-raised); font-size:13px; font-weight:600; }
+.shared-approval-decisions button[data-action="shared-approve"] { border-color:var(--accent); background:var(--accent); color:var(--bg); }
+.shared-approval-decisions button:hover:not(:disabled) { filter:brightness(1.12); }
+.shared-approval-decisions button:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
 .shared-approval-decisions { padding:1px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel, #20242d); }
+.shared-approval-context { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:6px 14px; }
+.shared-approval-context dt { color:var(--muted); }
+.shared-approval-context dd { margin:0; overflow-wrap:anywhere; }
+.shared-approval-decisions p { margin:4px 0 8px; font-size:12px; }
+.shared-approval-review pre { white-space:pre-wrap; overflow-wrap:anywhere; }
 .shared-notice-actionable { border-left:3px solid var(--accent-color, #729eed); padding-left:10px; }
 .shared-record-waiting { color:var(--muted); }
 .shared-approval-record { padding:12px 16px; }
@@ -109,4 +121,4 @@
 .origin-work-row small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .origin-work .run-stop-button { position:static; }
 @media (max-width:1050px) { .shared-work { grid-template-columns:minmax(0, 1fr) 250px; } }
-@media (max-width:850px) { .shared-work { grid-template-columns:minmax(0, 1fr); grid-template-rows:minmax(0, 1fr) minmax(160px, 30vh); } .shared-header { flex-direction:column; align-items:stretch; } }
+@media (max-width:850px) { .shared-work { grid-template-columns:minmax(0, 1fr); grid-template-rows:minmax(0, 1fr) minmax(160px, 30vh); } }

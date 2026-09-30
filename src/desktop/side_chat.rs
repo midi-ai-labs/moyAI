@@ -1356,7 +1356,7 @@ pub(crate) async fn run_side_chat_request(
         .into_iter()
         .map(side_chat_history_to_model_message)
         .collect();
-    let request = ChatRequest::new(
+    let mut request = ChatRequest::new(
         target,
         model,
         profile.system_prompt,
@@ -1366,6 +1366,7 @@ pub(crate) async fn run_side_chat_request(
         ProviderReasoningCapability::Unsupported,
         profile.extra_headers,
     );
+    request.pending_system_prompt_tokens = client.pending_system_prompt_tokens();
     let mut sink = SideChatSink {
         output: String::new(),
         saw_tool_call: false,

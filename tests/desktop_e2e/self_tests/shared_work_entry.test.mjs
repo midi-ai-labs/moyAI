@@ -1,8 +1,58 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sharedEntryReady, sharedSettingsClosed } from "../scenarios/shared_work_entry.mjs";
-import { rememberedRestartAccepted, sharedActionTarget, sharedWorkSurfaceMatches } from "../scenarios/shared_work_navigation.mjs";
+import { sharedEntryReady, sharedSettingsClosed, sharedApprovalParked } from "../scenarios/shared_work_entry.mjs";
+import { rememberedRestartAccepted, sharedActionTarget, sharedWorkSurfaceMatches, waitForSharedComposer } from "../scenarios/shared_work_navigation.mjs";
 import { action, hubSettingsCloseTarget } from "../scenarios/hub_browser_enrollment.mjs";
+
+test("a shared action waits through project-switch pending before dispatch becomes eligible", async () => {
+  const target = sharedActionTarget("new-conversation");
+  const ready = { count: 1, visible: true, enabled: true, center_hit: true };
+  const frames = [ready, { ...ready, enabled: false }, ready, ready, ready];
+  let samples = 0;
+  const input = {
+    observeExactTarget: async actual => {
+      assert.equal(actual, target);
+      return { observation: frames[Math.min(samples++, frames.length - 1)] };
+    },
+  };
+  await waitForSharedComposer(input, target);
+  assert.equal(samples, 5);
+});
+
+const parkedTarget = { jobId: "job-approval", approvalId: "permission-old", attemptId: "attempt-1", environmentId: "env-b" };
+const parkedProjection = () => ({ observed_at_ms: 60_100, detail: { id: "job-approval", state: "running" },
+  approval: { id: "permission-old", attempt_id: "attempt-1", context: { job_id: "job-approval" }, status: "expired", decision: null,
+    expires_at_ms: 60_000, can_decide: false, can_reconfirm: true }, status: { environments: [{ id: "env-b", occupied: 1 }] } });
+
+test("permission expiry oracle requires the exact operation to stay running and occupy its environment", () => {
+  assert.equal(sharedApprovalParked(parkedProjection(), parkedTarget), true);
+  for (const patch of [{ state: "cancelled" }, { state: "succeeded" }, { id: "other-job" }]) {
+    const p = parkedProjection(); Object.assign(p.detail, patch);
+    assert.equal(sharedApprovalParked(p, parkedTarget), false);
+  }
+  for (const environments of [[], [{ id: "other-env", occupied: 1 }], [{ id: "env-b", occupied: 0 }]]) {
+    const p = parkedProjection(); p.status.environments = environments;
+    assert.equal(sharedApprovalParked(p, parkedTarget), false);
+  }
+});
+
+test("permission expiry oracle rejects a still-valid, consumed, replaced, or actionable approval", () => {
+  for (const patch of [{ id: "permission-new" }, { attempt_id: "attempt-2" }, { context: { job_id: "other-job" } },
+    { status: "pending" }, { status: "consumed" }, { decision: "stop" }, { decision: "approve" },
+    { can_decide: true }, { can_reconfirm: false }, { expires_at_ms: 70_000 }, { expires_at_ms: null }]) {
+    const p = parkedProjection(); Object.assign(p.approval, patch);
+    assert.equal(sharedApprovalParked(p, parkedTarget), false, JSON.stringify(patch));
+  }
+  assert.equal(sharedApprovalParked(null, parkedTarget), false);
+});
+
+test("reconfirm targets the exact expired approval inside the shared conversation", () => {
+  const target = sharedActionTarget("reconfirm-approval", "permission-old");
+  assert.match(target.selector, /^\.shared-work /);
+  assert.match(target.selector, /permission-old/);
+  assert.deepEqual(target.identity, { tag: "BUTTON", action: "shared-reconfirm-approval" });
+});
+
 test("Hub projects occupy main while local model setup can remain unfinished", () => {
   const projection = { hub_project_open: true, overlay: "none", startup: { initial_setup_required: true }, busy: false };
   assert.equal(sharedEntryReady(projection), true);

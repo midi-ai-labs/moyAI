@@ -523,6 +523,7 @@ pub struct SessionEditForkResult {
     pub forked_session: SessionRecord,
     pub edited_turn_id: TurnId,
     pub editable_text: String,
+    pub retained_images: Vec<ImagePart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

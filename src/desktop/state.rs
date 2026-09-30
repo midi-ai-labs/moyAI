@@ -896,6 +896,12 @@ impl DesktopState {
     }
 
     fn image_attachment_mutation_admission_open(&mut self) -> bool {
+        if !self.composer.retained_images.is_empty() {
+            self.set_status_message(
+                "元の依頼の画像を保持しています。編集では本文だけを変更できます。",
+            );
+            return false;
+        }
         if self.app_state.prompt_review.is_none() {
             return true;
         }
@@ -1362,9 +1368,20 @@ impl DesktopState {
         self.app_state.progress.active_step = reason.to_string();
     }
 
-    pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
-        self.app_state
-            .apply_durable_prompt_dispatch(prompt_dispatch);
+    pub fn apply_durable_prompt_dispatch(
+        &mut self,
+        prompt_dispatch: &PromptDispatchPart,
+        user_turn: Option<&crate::protocol::UserTurn>,
+    ) {
+        // Use the same representation as canonical UserMessage projection, including
+        // immutable image labels. A text-only live row cannot overlap that history.
+        let user_text = user_turn.map(crate::protocol::user_turn_text);
+        self.app_state.apply_durable_prompt_dispatch(
+            prompt_dispatch,
+            user_text
+                .as_deref()
+                .unwrap_or(&prompt_dispatch.dispatch_prompt_text),
+        );
     }
 
     pub fn begin_prompt_enhance_at(
@@ -1513,7 +1530,7 @@ impl DesktopState {
             .replace_effective_config(self.global_config.clone());
         self.view.artifact_selected_index = 0;
         self.view.overlay = DesktopOverlay::None;
-        self.set_status_message("new chat ready");
+        self.set_status_message("新しいチャットを開始できます。");
     }
 
     fn finish_prompt_enhance_transport(&mut self, request_id: u64) {

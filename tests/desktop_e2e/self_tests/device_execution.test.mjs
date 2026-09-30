@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { createScenario } from "../scenario_registry.mjs";
-import { managedExecutionReady, oneTimeExecutionSetup, observeConnectionDiagnosis, quiesceDeviceExecutionResources } from "../scenarios/device_execution.mjs";
+import { managedExecutionReady, oneTimeExecutionSetup, observeConnectionDiagnosis, gatewayConnectionDiagnosed, saveExecutionProject, quiesceDeviceExecutionResources } from "../scenarios/device_execution.mjs";
 
 test("execution scenario uses the common lifecycle and requires explicit isolated Runner input only at preparation", () => {
   const scenario = createScenario("settings.device-execution");
@@ -29,13 +29,59 @@ test("connection diagnosis reads the exact scope key including its JSON attribut
   const rows = [
     ["device-network-diagnostic-hub", "obsolete locator"],
     ['device-network-diagnostic-["hub",""]', "共有仕事の接続"],
-    ['device-network-diagnostic-["gateway",""]', "モデルGatewayへのTLS接続"],
+    ['device-network-diagnostic-["gateway",""]', "AI中継サーバーへの暗号化接続 確認済み"],
     ['device-network-diagnostic-["peer","hub"]', "different peer"],
   ].map(([key, textContent]) => ({ textContent, getAttribute: name => name === "data-settings-passive" ? key : null }));
   const cdp = { evaluate: async expression => runInNewContext(expression, { document: { querySelectorAll: () => rows } }) };
   assert.equal(await observeConnectionDiagnosis(cdp, "hub"), "共有仕事の接続");
-  assert.equal(await observeConnectionDiagnosis(cdp, "gateway"), "モデルGatewayへのTLS接続");
+  const gateway = await observeConnectionDiagnosis(cdp, "gateway");
+  assert.equal(gateway, "AI中継サーバーへの暗号化接続 確認済み");
+  assert.equal(gatewayConnectionDiagnosed(gateway), true);
+  assert.equal(gatewayConnectionDiagnosed(await observeConnectionDiagnosis(cdp, "hub")), false);
   assert.equal(await observeConnectionDiagnosis(cdp, "receiver"), "");
+});
+
+test("AI connection scope waits for its own current public stage, not a certificate or unrelated diagnosis", () => {
+  assert.equal(gatewayConnectionDiagnosed("診断日時: 本日 AI中継サーバーへの暗号化接続 確認できません"), true);
+  for (const text of ["", "接続を診断しています…", "AI中継サーバーの証明書更新 確認済み", "共有仕事の接続 確認済み", "モデルGatewayへのTLS接続"]) {
+    assert.equal(gatewayConnectionDiagnosed(text), false);
+  }
+});
+
+function projectEditor({ conflict = false, error = "", changedDraft = false } = {}) {
+  const calls = [], records = [], label = "実行試験", draft = [{ name: "label", value: label, checked: null },
+    { name: "controller_device_ids", value: "pc-a", checked: true }, { name: "runner_device_ids", value: "pc-a", checked: true }];
+  let saved = 0, compared = false;
+  const page = { evaluate: async () => ({ closed: !conflict && !error, conflict, error }), locator(selector) {
+    return {
+      evaluate: async () => compared && changedDraft ? draft.slice(0, 2) : structuredClone(draft),
+      innerText: async () => `今回の入力: ${label}`,
+      waitFor: async ({ state }) => {
+        if (selector === "#shared-admin-form") assert.equal(saved, conflict ? 2 : 1);
+        else assert.equal(state, "visible");
+      },
+      click: async () => { calls.push(selector); if (selector === "#shared-admin-save") saved++; if (selector === "#shared-admin-accept-comparison") compared = true; },
+    };
+  } };
+  return { page, label, calls, records, sink: { record: async (...args) => records.push(args) } };
+}
+
+test("execution project saves once or explicitly compares a preserved conflict before its second save", async () => {
+  for (const conflict of [false, true]) {
+    const f = projectEditor({ conflict });
+    assert.deepEqual(await saveExecutionProject(f.page, f.sink, f.label), { saves: conflict ? 2 : 1, conflict_reviewed: conflict });
+    assert.deepEqual(f.calls, conflict ? ["#shared-admin-save", "#shared-admin-review-conflict", "#shared-admin-accept-comparison", "#shared-admin-save"] : ["#shared-admin-save"]);
+    assert.equal(f.records.length, conflict ? 1 : 0);
+  }
+});
+
+test("execution project never retries validation errors or a changed PC selection", async () => {
+  for (const [options, expected] of [[{ error: "PCの設定を確認してください" }, /PCの設定を確認/], [{ conflict: true, changedDraft: true }, /changed the project draft/]]) {
+    const f = projectEditor(options);
+    await assert.rejects(saveExecutionProject(f.page, f.sink, f.label), expected);
+    assert.equal(f.calls.filter(value => value === "#shared-admin-save").length, 1);
+    assert.equal(f.records.length, 0);
+  }
 });
 
 test("execution cleanup closes every independent resource after a failure and preserves its reason", async () => {

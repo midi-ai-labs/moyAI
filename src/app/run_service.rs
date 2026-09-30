@@ -256,6 +256,7 @@ pub struct RunService {
     agent_runtime: Weak<crate::app::AgentRuntime>,
     hub_route: Option<crate::hub::HubTurnRoute>,
     shared_run: Option<SharedRunContext>,
+    retained_edit_images: Option<(crate::session::SessionId, Vec<ImagePart>)>,
 }
 
 impl RunService {
@@ -278,6 +279,7 @@ impl RunService {
             agent_runtime: Arc::downgrade(&agent_runtime),
             hub_route: None,
             shared_run: None,
+            retained_edit_images: None,
         }
     }
 
@@ -294,6 +296,35 @@ impl RunService {
         service.agent_loop = service.agent_loop.with_hub_turn(route.clone());
         service.hub_route = Some(route);
         service
+    }
+
+    /// The text-edit command supplies canonical snapshots for this exact draft session.
+    /// Continuation turns reuse canonical history and must not append these images again.
+    pub(crate) fn with_retained_edit_images(
+        &self,
+        session_id: crate::session::SessionId,
+        images: Vec<ImagePart>,
+    ) -> Self {
+        let mut service = self.clone();
+        service.retained_edit_images = Some((session_id, images));
+        service
+    }
+
+    fn run_image_attachments(&self, request: &RunRequest) -> Result<Vec<ImagePart>, AppRunError> {
+        let mut images = load_image_attachments(&request.cwd, &request.image_paths)?;
+        if matches!(request.admission_kind, RunAdmissionKind::NewUserRun)
+            && let Some((session_id, retained)) = &self.retained_edit_images
+        {
+            if request.session_id != Some(*session_id) || self.shared_run.is_some() {
+                return Err(AppRunError::Message(
+                    "編集する会話が変わりました。元の発言から編集を開き直してください。".into(),
+                ));
+            }
+            images.extend(retained.iter().cloned());
+            crate::llm::image_validation::validate_retained_images(&images)
+                .map_err(AppRunError::Message)?;
+        }
+        Ok(images)
     }
 
     pub(crate) fn with_delegated_hub_execution(
@@ -1505,7 +1536,7 @@ impl RunService {
                 .as_deref()
                 .is_none_or(is_placeholder_session_title)
             && !request.prompt.trim().is_empty();
-        let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
+        let image_parts = self.run_image_attachments(&request)?;
         let prepared = if self.shared_run.is_some() {
             PreparedRunTurn {
                 prompt: request.prompt.clone(),
@@ -4221,6 +4252,45 @@ mod tests {
                 .decode(&images[0].data_base64)
                 .expect("base64"),
             bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_edit_images_are_exact_and_scoped_to_the_initial_draft_turn() {
+        let config = ResolvedConfig::default();
+        let (service, _store, workspace, _runtime) = run_service_fixture(config.clone()).await;
+        let path = workspace.cwd.join("original.png");
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend(1_u32.to_be_bytes());
+        bytes.extend(1_u32.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let snapshots = super::load_image_attachments(&workspace.cwd, &[path.clone()]).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let session_id = crate::session::SessionId::new();
+        let edited = service.with_retained_edit_images(session_id, snapshots.clone());
+        let mut request = control_run_request(config, &workspace, session_id, "edited text");
+        let loaded = edited.run_image_attachments(&request).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].data_base64, snapshots[0].data_base64);
+        assert!(service.run_image_attachments(&request).unwrap().is_empty());
+        request.session_id = Some(crate::session::SessionId::new());
+        assert!(edited.run_image_attachments(&request).is_err());
+        request.session_id = Some(session_id);
+        request.admission_kind = crate::app::RunAdmissionKind::RootContinuation {
+            predecessor_turn_id: crate::protocol::TurnId::new(),
+            predecessor_revision: 1,
+        };
+        assert!(edited.run_image_attachments(&request).unwrap().is_empty());
+        let mut corrupt = snapshots;
+        corrupt[0].data_base64 = "invalid image".into();
+        request.admission_kind = crate::app::RunAdmissionKind::NewUserRun;
+        assert!(
+            service
+                .with_retained_edit_images(session_id, corrupt)
+                .run_image_attachments(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("保存済みの画像を読み込めません")
         );
     }
 

@@ -46,11 +46,11 @@ Hub同梱版では「チーム環境を用意する」からHubの管理画面�
 
 | セットアップに表示されるもの | 終了する方法 |
 | --- | --- |
-| moyAIの画面 | タスクトレイのmoyAIアイコンから「終了」。画面の×だけでは終了しません。 |
-| 仕事の実行機能（Runner） | 実行PCの担当者が、下の手順で現在のRunnerを確認して終了します。Desktopを終了してもRunnerは動き続けます。 |
+| moyAIの画面 | 「ファイル」→「終了」、またはタスクトレイのmoyAIアイコンから「終了」。このPCの接続中Runnerの仕事・保持アプリを正常停止し、Runnerの実プロセス終了を確認してから画面も終了します。×はトレイ格納で、仕事は続きます。 |
+| 仕事の実行機能（Runner） | 通常は上のDesktopの「終了」で一緒に終了します。この終了連携を含まない従来の配布物、またはCLIだけで運用する場合は、下の手順で現在のRunnerを確認して終了します。 |
 | チーム管理（Hub） | Hub管理者が、表示された導入先の `hub/bin/moyai-hub.exe --stop` を実行します。独自の保存先を使う場合は起動時と同じ `--data-dir` も指定します。ブラウザーを閉じたりHubのネットワークだけを停止したりしても、Hub本体は終了しません。 |
 
-Runnerを終了する場合は、同じWindows利用者のPowerShellで、セットアップに表示された導入先を使います。`identity` の応答の `runner_id` を確認し、その値を `shutdown --runner` へ渡します。実行中の仕事がある状態で終了すると中断するため、先に上記の受付停止と完了確認を行ってください。保存先を環境変数で切り替えている運用では、起動時と同じ環境で実行します。
+従来版からの更新では、新しい終了連携は更新前のDesktopには反映されません。Runnerが残っている場合は、同じWindows利用者のPowerShellで、セットアップに表示された導入先を使います。`identity` の応答の `runner_id` を確認し、その値を `shutdown --runner` へ渡します。実行中の仕事がある状態で終了すると中断するため、先に上記の受付停止と完了確認を行ってください。保存先を環境変数で切り替えている運用では、起動時と同じ環境で実行します。
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\moyAI\app\bin\moyai-runner.exe" identity
@@ -102,5 +102,7 @@ Desktop Git Commit: <Desktopの40文字commit>
 Hub Git Commit: <Hubの40文字commit>
 Hub SHA256: <Hub実行ファイルの64文字SHA256>
 ```
+
+Hub同梱時は、同じHubソースの `docs` から準備・受信許可・Web管理の3ガイドも `hub/docs` へ同梱し、この導入手順とのリンクを配布物内で解決します。既定の参照元は隣の `moyAI-Hub/docs` です。別の配置でビルドした場合は `-HubDocumentationPath` を指定してください。必要なガイドが欠けている場合はビルド前に中止します。Desktop単体の配布にはHubソースを要求せず、Hub手順の参照先は公式リポジトリーになります。
 
 未公開の診断packageのみ既存の `-SkipManualGuiStGate` を使えます。同梱資材の存在・x64形式・checksumの検査はfresh PCの実行証拠ではありません。実ランタイムを用いた新PC導入、実Desktop、同梱Hub、最初の仕事、更新後の保持を別途確認します。package manifestの `fresh_pc_verified` は、このスクリプトだけでは常に `false` です。

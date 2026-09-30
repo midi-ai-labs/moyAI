@@ -112,6 +112,7 @@ impl ContextWindowTokenStatus {
 
 fn estimate_request_tokens(request: &ChatRequest) -> u32 {
     let estimated = REQUEST_OVERHEAD_TOKENS
+        .saturating_add(request.pending_system_prompt_tokens.unwrap_or_default())
         .saturating_add(estimate_text_tokens(&request.system_prompt))
         .saturating_add(
             request

@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ShellFamily;
@@ -480,7 +480,7 @@ async fn execute_shell_command_with_resolved_programs(
         shell,
         workdir,
         command_text,
-        timeout_ms,
+        Some(timeout_ms),
         max_output_bytes,
         cancel,
         sandbox_plan,
@@ -497,7 +497,7 @@ async fn execute_shell_command_observed(
     shell: &crate::config::ShellConfig,
     workdir: &Utf8Path,
     command_text: &str,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
     max_output_bytes: usize,
     cancel: CancellationToken,
     sandbox_plan: &ProcessSandboxPlan,
@@ -628,10 +628,13 @@ async fn execute_shell_command_observed(
     }
     let wait_outcome = tokio::select! {
         _ = cancel.cancelled() => ShellWaitOutcome::Cancelled,
-        result = timeout(Duration::from_millis(timeout_ms), process.wait()) => match result {
-            Ok(result) => ShellWaitOutcome::Exited(result),
-            Err(_) => ShellWaitOutcome::TimedOut,
-        }
+        result = process.wait() => ShellWaitOutcome::Exited(result),
+        _ = async {
+            match timeout_ms {
+                Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => ShellWaitOutcome::TimedOut,
     };
     let (completed, timed_out, cancelled, execution_error) = match wait_outcome {
         ShellWaitOutcome::Exited(Ok(status)) => {

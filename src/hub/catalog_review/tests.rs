@@ -11,6 +11,7 @@ fn catalog(revision: u64) -> HubCatalog {
         models: ["keep", "remove", "rename"]
             .into_iter()
             .map(|id| HubModel {
+                system_prompt: String::new(),
                 id: id.into(),
                 label: format!("Model {id}"),
                 capabilities: ["chat".into()].into(),
@@ -63,6 +64,7 @@ fn comparison_returns_public_before_after_and_never_invents_missing_or_invalid_b
     current.models[1].label = "New label".into();
     current.models[1].capabilities.insert("vision".into());
     current.models.push(HubModel {
+        system_prompt: String::new(),
         id: "new".into(),
         label: "Added".into(),
         capabilities: ["chat".into()].into(),
@@ -238,6 +240,8 @@ fn settings_store_fits_two_maximum_public_catalogs_and_rejects_over_limit_input(
     let mut large = catalog(1);
     large.models = (0..128)
         .map(|index| HubModel {
+            system_prompt: "\u{1}"
+                .repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS),
             id: format!("{index:03}{}", "m".repeat(125)),
             label: "L".repeat(256),
             capabilities: (0..32)
@@ -252,9 +256,9 @@ fn settings_store_fits_two_maximum_public_catalogs_and_rejects_over_limit_input(
     let saved = store.save(&proposed).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.len() > 128 * 1024);
-    assert!(bytes.len() <= 1024 * 1024);
+    assert!(bytes.len() <= crate::hub::settings::MAX_SETTINGS_BYTES);
     assert_eq!(store.load().unwrap(), saved);
-    let too_large = vec![b' '; 1024 * 1024 + 1];
+    let too_large = vec![b' '; crate::hub::settings::MAX_SETTINGS_BYTES + 1];
     std::fs::write(&path, &too_large).unwrap();
     assert_eq!(store.load(), Err(HubError::SettingsInvalid));
     assert_eq!(store.save(&saved), Err(HubError::SettingsInvalid));

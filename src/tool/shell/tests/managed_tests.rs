@@ -432,7 +432,7 @@ async fn managed_start_returns_live_identity_and_status_preserves_actual_failure
 }
 
 #[tokio::test]
-async fn managed_lifetime_and_retained_receipt_inherit_model_timeout() {
+async fn managed_lifetime_and_retained_receipt_are_independent_of_model_timeout() {
     for (configured, requested) in [
         (3_600_000, None),
         (1_234_567, None),
@@ -464,11 +464,17 @@ async fn managed_lifetime_and_retained_receipt_inherit_model_timeout() {
             .managed_shells
             .completion_service_in_scope(fixture.session.session.id, scope)
             .expect("running server can be retained after completion");
-        let expected = requested.unwrap_or(configured);
+        let expected = serde_json::json!(requested);
         assert_eq!(start.metadata["timeout_ms"], expected);
         assert_eq!(start.metadata["process_id"], service.service_id.to_string());
         assert!(service.retain_after_turn);
-        assert!((before + expected..=after + expected).contains(&service.expires_at_ms));
+        if let Some(duration) = requested {
+            assert!(
+                (before + duration..=after + duration).contains(&service.expires_at_ms.unwrap())
+            );
+        } else {
+            assert_eq!(service.expires_at_ms, None);
+        }
 
         // Later configuration changes must not renew an already issued service deadline.
         fixture.config.model.request_timeout_ms = 10_000;
@@ -518,7 +524,7 @@ async fn managed_timeout_stops_the_os_process_and_preserves_terminal_facts() {
     let start = managed_call(
         &fixture,
         &ShellStartTool,
-        serde_json::json!({"command":command}),
+        serde_json::json!({"command":command,"timeout_ms":1500}),
         &control,
         &fence,
     )
@@ -643,7 +649,7 @@ async fn managed_start_rejects_cancelled_admission_and_invalid_lifetime_before_e
     let mut fixture = shell_tool_fixture().await;
     fixture.config.model.request_timeout_ms = 9000;
     let (control, fence) = admit_test_run(&fixture).await;
-    for lifetime in [0, fixture.config.model.request_timeout_ms + 1] {
+    for lifetime in [0, u64::MAX] {
         assert!(
             execute_tool_in_test_run(
                 &fixture,

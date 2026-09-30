@@ -53,6 +53,12 @@ pub(crate) struct Entry {
     pub service_uncertain_ack: bool,
     #[serde(default)]
     pub service_reconciliation: Option<serde_json::Value>,
+    /// Delivery acknowledgement only; the history remains owned by the session.
+    #[serde(default)]
+    pub progress_revision: u64,
+    /// One immutable delivery receipt until ACK; never a second history owner.
+    #[serde(default)]
+    pub progress_report: Option<Report>,
 }
 
 impl Entry {
@@ -339,6 +345,8 @@ impl Journal {
             service_stopped_ack: false,
             service_uncertain_ack: false,
             service_reconciliation: None,
+            progress_revision: 0,
+            progress_report: None,
         };
         let encoded = serde_json::to_string(&entry).map_err(error)?;
         self.db
@@ -377,6 +385,41 @@ impl Journal {
         Ok(())
     }
 
+    pub(crate) fn queue_progress(
+        &mut self,
+        entry: &mut Entry,
+        report: Report,
+    ) -> Result<(), RunnerError> {
+        let ReportOutcome::Progress { revision, .. } = &report.outcome else {
+            return Err(RunnerError::new("Not a progress delivery"));
+        };
+        if entry.phase != Phase::Executing
+            || entry.progress_report.is_some()
+            || report.attempt_id != entry.assignment.attempt_id
+            || report.generation != entry.assignment.generation
+            || *revision <= entry.progress_revision
+        {
+            return Err(RunnerError::new("Progress delivery is not current"));
+        }
+        entry.progress_report = Some(report);
+        self.save(entry)
+    }
+
+    pub(crate) fn progress_reported(
+        &mut self,
+        entry: &mut Entry,
+        revision: u64,
+    ) -> Result<(), RunnerError> {
+        if entry.phase != Phase::Executing || revision <= entry.progress_revision
+            || !entry.progress_report.as_ref().is_some_and(|report|
+                matches!(&report.outcome, ReportOutcome::Progress { revision: pending, .. } if *pending == revision))
+        {
+            return Err(RunnerError::new("Progress acknowledgement is not current"));
+        }
+        entry.progress_revision = revision;
+        entry.progress_report = None;
+        self.save(entry)
+    }
     /// Commit this before calling anything that could start a provider or tool effect.
     pub(crate) fn executing(&mut self, entry: &mut Entry) -> Result<(), RunnerError> {
         if entry.phase != Phase::Intent {
@@ -439,10 +482,11 @@ impl Journal {
             && retained_service.is_some_and(|service| !service.retain_after_turn)
         {
             return Err(RunnerError::new(
-                "A completed turn requires an explicitly requested finite preview",
+                "A completed turn requires an explicitly requested preview",
             ));
         }
         entry.phase = Phase::ReportPending;
+        entry.progress_report = None;
         entry.retained_service = retained_service;
         entry.local_checkpoint = local_checkpoint.or_else(|| match &report.outcome {
             ReportOutcome::YieldToChild { checkpoint, .. } => Some(checkpoint.clone()),
@@ -532,6 +576,7 @@ impl Journal {
         entry.fallback_report = entry.report.take();
         entry.report = Some(report);
         entry.phase = Phase::ReportPending;
+        entry.progress_report = None;
         self.save(entry)
     }
 

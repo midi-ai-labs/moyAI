@@ -191,6 +191,7 @@ struct Host {
     approvals: approval::LocalApprovals,
     stopped: CancellationToken,
     operations: Mutex<operations::OperationsStore>,
+    shared_worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -292,6 +293,7 @@ impl RunnerHost {
                 approvals: Default::default(),
                 stopped: CancellationToken::new(),
                 operations: Mutex::new(operations),
+                shared_worker: tokio::sync::Mutex::new(None),
             }),
         })
     }
@@ -310,6 +312,21 @@ impl RunnerHost {
 
     pub async fn wait_stopped(&self) {
         self.inner.stopped.cancelled().await;
+    }
+
+    /// Entry points must keep their runtime alive through the shared worker's
+    /// final journal/report pass, including workers installed after startup.
+    pub async fn wait_shutdown(&self) -> Result<(), RunnerError> {
+        self.wait_stopped().await;
+        let mut worker = self.inner.shared_worker.lock().await;
+        if let Some(task) = worker.as_mut() {
+            let result = task
+                .await
+                .map_err(|_| RunnerError::new("Shared Runner controller stopped unexpectedly"));
+            worker.take();
+            result?;
+        }
+        Ok(())
     }
 
     /// Every mutating command names the incarnation the client actually observed. In particular,

@@ -37,6 +37,7 @@ export async function waitForSemanticTargetSettlement({
   expectedIdentity = locator?.identity,
   timeoutMs = 10_000,
   pollMs = 16,
+  consecutiveReadySamples = 1,
 }) {
   if (input === null || typeof input !== "object" || typeof input.observeExactTarget !== "function") {
     throw new TypeError("semantic target settlement requires a WebView input owner");
@@ -47,18 +48,26 @@ export async function waitForSemanticTargetSettlement({
   if (typeof label !== "string" || label.length === 0) {
     throw new TypeError("semantic target settlement requires a label");
   }
+  if (!Number.isSafeInteger(consecutiveReadySamples) || consecutiveReadySamples < 1 || consecutiveReadySamples > 10) {
+    throw new TypeError("consecutiveReadySamples must be an integer from 1 to 10");
+  }
+  let readySamples = 0;
   return waitForObservation({
     label,
     timeoutMs,
     pollMs,
     sample: async () => {
       const target = await input.observeExactTarget(locator);
+      const classified = classifySemanticTargetSettlement(target, { expectedIdentity });
+      readySamples = classified.decision === "pass" ? readySamples + 1 : 0;
       return {
         target,
-        classified: classifySemanticTargetSettlement(target, { expectedIdentity }),
+        classified,
+        readySamples,
       };
     },
-    accept: ({ classified }) => classified.decision !== "pending",
+    accept: ({ classified, readySamples }) => classified.decision === "fail"
+      || (classified.decision === "pass" && readySamples >= consecutiveReadySamples),
     retrySampleErrors: false,
   });
 }

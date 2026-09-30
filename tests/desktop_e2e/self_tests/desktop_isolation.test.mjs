@@ -50,6 +50,14 @@ test("preserved Desktop ownership includes start time and executable, not just P
   assert.equal(desktopOwnersMatch([existing], []), false);
   assert.equal(desktopOwnersMatch([existing], [existing, b]), false);
   assert.equal(desktopOwnersMatch([existing], [existing, existing], [existing]), false);
+  // One admission owns both PCs across independent Desktop generations. The
+  // outside owner stays immutable; only the PC actually restarted changes.
+  const a2 = owner(40, "789"), b2 = owner(50, "790");
+  assert.equal(desktopOwnersMatch([existing], [existing, b], [b]), true);
+  assert.equal(desktopOwnersMatch([existing], [existing, a2, b], [a2, b]), true);
+  assert.equal(desktopOwnersMatch([existing], [existing, a2, b2], [a2, b2]), true);
+  assert.equal(desktopOwnersMatch([existing], [existing, a, b2], [a2, b2]), false);
+  assert.equal(desktopOwnersMatch([existing], [existing, a2, b2, a], [a2, b2]), false);
 });
 
 test("launch environment discards inherited fixture identities and owns all virtual PC paths", () => {

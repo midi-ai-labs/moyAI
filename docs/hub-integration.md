@@ -1,6 +1,6 @@
 # Desktop・RunnerとHubのモデル連携
 
-2026-09-24更新。Hubによるモデル選択・カタログ確認・要求許可と、Desktop/Runnerへの接続を記す。端末参加は [接続ガイド](hub-device-network-guide.md)、共有仕事・会話は [複数PCセッション](design/multi-device-session.md)、Gatewayのwire・制限は [HubのGateway契約](../../moyAI-Hub/docs/gateway.md) を参照する。
+2026-09-27更新。Hubによるモデル選択・カタログ確認・要求許可と、Desktop/Runnerへの接続を記す。端末参加は [接続ガイド](hub-device-network-guide.md)、共有仕事・会話は [複数PCセッション](design/multi-device-session.md)、Gatewayのwire・制限は [HubのGateway契約](../../moyAI-Hub/docs/gateway.md) を参照する。
 
 ## 責任の分離
 
@@ -33,11 +33,25 @@ Hubのモデル登録は、入力されたendpointのモデル一覧から参照
 
 「一覧あり」は期限内の一覧にmodel IDが存在すること。「未確認」「接続不能」「モデルなし」「保守中」を分け、load情報がないことを不在とみなさない。未ロードモデルの生成可否はproviderが判断する。観測と管理設定を分け、単なるhealth更新でreview revisionを増やさない。
 
-Main/Sideの比較元は最後に確認・保存した公開catalogで、モデル追加・削除・表示名・機能・software変更を表示する。保存と同じatomic操作で更新し、取得・再接続・画面終了だけでは確認済みにしない。旧設定に比較元がなければ未保存と表示し、現在値を過去の値に見せない。
+Main/Sideの比較元は最後に確認・保存した公開catalogで、モデル追加・削除・表示名・機能・software変更を表示する。保存と同じatomic操作で更新し、取得・再接続・画面終了だけでは確認済みにしない。旧設定に比較元がなければ選択を保持し、該当するMain/Sideを明示保存するまで確認待ちとする。現在値を過去の値に見せず、一方の保存で他方の比較元を補わない。
 
 新revisionを取得しても入力中draftを消さない。利用者が最新情報を確認してcontextごとに保存する。表示差分がなくてもrevisionが違えばreview gateを適用する。同revisionの内容置換・逆行・Hub identityの置換や、古いconnection generationの応答は拒否する。
 
+再接続・Desktop再起動・Runnerの新しいモデル接続でも、保存済み比較元と公開catalogのidentity・revision・モデル・softwareを照合してから再確認する。どちらかのcontextで既に確認したrevisionより古いcatalogも拒否する。保存されない変更履歴の刈り込みは、この公開情報の置換と区別する。比較元と一致する同revisionだけは以前の確認を再利用でき、同revisionの別内容へ復元されたHubを自動的に確認済みにしない。
+
 更新時に既に開始したmodel requestは元targetで終了させるが、次のmodel requestには新permitを出さない。同じuser turnのtool loop・retry・compactionも確認待ちになり、中断理由と結果を履歴へ残す。lease保持ではこのgateを迂回できない。
+
+端末接続の再登録が必要な一覧更新は、Main/Side・子agentの最後の実行scopeが終わるまで保留する。その間も既存のheartbeatを継続し、終了後に同じownerが最新一覧を取得する。接続中の表示だけを残してheartbeatを終了したり、別の再試行timerを持ったりしない。
+
+### モデル単位のシステムプロンプト
+
+Hub管理画面のモデル登録・編集で、論理モデルごとの任意の指示を設定する。同じ論理モデルの別ホストでも共有し、空欄は追加なしとする。最大16,384 Unicode文字で、外側の空白だけを除き、本文と改行を保存する。変更はcatalog revisionを進め、Main/Sideの確認画面に現在の指示と前回からの差分を表示する。既存JSONの未設定値は空として読み、Hubのcatalog schema 1–3は保存ownerがschema 4へ前進移行する。
+
+Desktop/Runnerは確認済みcatalogをturnで捕捉し、各要求の割当で返された実際のlogical modelに対応する指示を、既存のsystem promptの末尾へ一度追加する。ローカルの指示、built-in、WorldState等の既存合成は維持する。Main・Side・子agent・Guardian・compactionとも同じHub routeを通る要求に適用する。Gateway側で重ねて追加せず、モデルの回答自体を言語別に加工しない。
+
+割当前には選択候補の追加指示の最大token見積りを入力予算に含め、最終合成後にもcontextとwire上限を検査する。収まらなければ送信せず、取得済みpermitは既存のturn終了経路で解放する。実要求の診断は実際のmodel・合成済みprompt・wireから一度記録する。公開catalogは16 MiB、Main/Sideの二つの比較元を含む設定ファイルは32 MiB以内に制限する（128モデル×16,384文字のJSON escapeを含む）。
+
+指示のある候補を使う新clientだけが既存Prepareに`supports_model_system_prompt:true`を付ける。Hubは未対応clientに、その候補のpermitを発行せず更新を要求する。指示が空ならfieldを送らず、従来Hubとの互換性を維持する。プロジェクト概要は環境の事実としてWorldStateへ入り、このモデル指示とは別の所有境界を持つ。
 
 ## モデル要求の寿命
 

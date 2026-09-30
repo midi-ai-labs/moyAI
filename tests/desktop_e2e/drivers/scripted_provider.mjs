@@ -172,12 +172,18 @@ function scriptedTurns(value, fallbackPrompt, fallbackResponseText) {
     throw new TypeError(`scripted provider turns must contain 1 through ${SCRIPTED_PROVIDER_MAX_TURNS} entries`);
   }
   return Object.freeze(value.map((turn, index) => {
-    if (!exactKeys(turn, ["prompt", "responseText"])) {
+    const keys = Object.hasOwn(turn ?? {}, "imageDataUrl") ? ["prompt", "responseText", "imageDataUrl"] : ["prompt", "responseText"];
+    if (!exactKeys(turn, keys)) {
       throw new TypeError(`scripted provider turn ${index} must use its exact schema`);
+    }
+    if (turn.imageDataUrl !== undefined && (typeof turn.imageDataUrl !== "string"
+      || turn.imageDataUrl.length > 16_384 || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(turn.imageDataUrl))) {
+      throw new TypeError("scripted imageDataUrl must be a bounded PNG data URL");
     }
     return Object.freeze({
       prompt: nonEmptyString(turn.prompt, `turns[${index}].prompt`),
       responseText: nonEmptyString(turn.responseText, `turns[${index}].responseText`),
+      ...(turn.imageDataUrl === undefined ? {} : { imageDataUrl: turn.imageDataUrl }),
     });
   }));
 }
@@ -698,11 +704,13 @@ function decodeJsonBody(body) {
   }
 }
 
-function exactUserInput(body) {
+function exactUserInput(body, imageDataUrl = undefined) {
   if (!Array.isArray(body?.input) || body.input.length !== 1) return null;
   const [message] = body.input;
   if (message?.type !== "message" || message?.role !== "user") return null;
-  if (!Array.isArray(message.content) || message.content.length !== 1) return null;
+  if (!Array.isArray(message.content) || message.content.length !== (imageDataUrl === undefined ? 1 : 2)) return null;
+  if (imageDataUrl !== undefined && (!exactKeys(message.content[1], ["type", "image_url"])
+    || message.content[1].type !== "input_image" || message.content[1].image_url !== imageDataUrl)) return null;
   const [content] = message.content;
   if (content?.type !== "input_text" || typeof content.text !== "string") return null;
   return content.text;
@@ -825,9 +833,9 @@ function clientGenerationContract(body) {
   };
 }
 
-function requestContract(body, modelId, expectedPrompt) {
+function requestContract(body, modelId, expectedPrompt, imageDataUrl = undefined) {
   const model = typeof body?.model === "string" ? body.model : null;
-  const inputText = exactUserInput(body);
+  const inputText = exactUserInput(body, imageDataUrl);
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
   const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
     ? Object.keys(body).sort()
@@ -848,6 +856,10 @@ function requestContract(body, modelId, expectedPrompt) {
     max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     stream_true: body?.stream === true,
     store_false: body?.store === false,
+    ...(imageDataUrl === undefined ? {} : {
+      image_sha256: typeof body?.input?.[0]?.content?.[1]?.image_url === "string"
+        ? sha256(Buffer.from(body.input[0].content[1].image_url, "utf8")) : null,
+    }),
   };
   return {
     ...contract,
@@ -4465,7 +4477,7 @@ export class ScriptedProvider {
         this.turns,
         this.#acceptedResponseCount,
       )
-      : requestContract(decoded.value, this.modelId, turn.prompt);
+      : requestContract(decoded.value, this.modelId, turn.prompt, turn.imageDataUrl);
     if (!row.contract.pass) {
       row.response_phase = "rejected";
       row.response_status = 422;

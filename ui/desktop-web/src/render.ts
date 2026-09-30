@@ -184,6 +184,13 @@ export function renderDesktopMarkup(
   model: DesktopRenderModel,
   options: DesktopMarkupOptions,
 ): string {
+  const exitNotice = model.view.exit_requested
+    ? '<div class="desktop-exit-notice" role="status" aria-live="polite"><strong>moyAIの終了処理</strong><span>このPCの仕事と起動したアプリの停止を確認しています。</span></div>'
+    : "";
+  return exitNotice + renderDesktopContent(model, options);
+}
+
+function renderDesktopContent(model: DesktopRenderModel, options: DesktopMarkupOptions): string {
   const state = model.view;
   const local = model.local;
   const localConfirmationPending = local.modal.localConfirmation !== null;
@@ -1042,14 +1049,14 @@ function sessionRowSubtitle(
   if (activity) {
     const turn =
       typeof row.active_turn_sequence_no === "number"
-        ? `turn ${row.active_turn_sequence_no}`
+        ? `依頼 ${row.active_turn_sequence_no}`
         : row.active_turn_id
-          ? `turn ${row.active_turn_id.slice(0, 8)}`
-          : "active turn";
+          ? `依頼 ${row.active_turn_id.slice(0, 8)}`
+          : "現在の依頼";
     return `${activity.label} · ${turn}`;
   }
   if (row.loaded_status === "system_error") {
-    return "状態取得エラー";
+    return row.status === "failed" ? "実行に失敗しました · 会話を開いて確認" : "状態を確認できません · 会話を開いて確認";
   }
   return fallback;
 }
@@ -1313,7 +1320,7 @@ export function renderComposer(
           ? "Hubの接続・モデル確認と、実行中の処理を確認してください"
           : hubRoute ? "メインチャットで選んだHubモデルを使って、依頼文を整えます" : "依頼文を整える";
   const controlsVisible = local.attachmentTrayOpen || state.image_input.trim().length > 0;
-  const trayVisible = controlsVisible || state.attached_images.length > 0;
+  const trayVisible = controlsVisible || state.attached_images.length > 0 || Boolean(state.retained_image_names?.length);
   const goalHint = goalSlashCommandHint(state.draft_prompt);
   return `
     <section class="composer ${goalHint ? "goal-command" : ""}" data-run-target="${escapeHtml(JSON.stringify(state.run_target))}">
@@ -1358,7 +1365,7 @@ function renderAttachmentTray(state: DesktopWebState, controlsVisible: boolean):
   return `
     <div class="attachment-tray ${controlsVisible ? "expanded" : "compact"}">
       <div class="attachment-row">
-        ${renderAttachedImages(state)}
+        ${state.retained_image_names?.length ? `<span class="attachment-empty">元の依頼の画像を保持: ${state.retained_image_names.map(escapeHtml).join("、")}（本文だけを編集できます）</span>` : renderAttachedImages(state)}
       </div>
       ${
         controlsVisible

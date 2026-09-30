@@ -45,6 +45,14 @@ tests/desktop_e2e/
 
 `onboarding.win-a-to-win-b` は、一覧に表示されるHubプロジェクトの通常のチャット欄を使う。独立したローカルチャットから別途Hubへ新規委任する旧経路は対象外で、同じHub会話への追加依頼は `settings.shared-work-continuation` が確認する。
 
+`project.four-device-acceptance` は隔離された実Desktop 4 profilesで、A=操作+UI/API実行、B=Worker実行、C=DB実行、D=操作のみを準備する。Hubの実ブラウザーでモデルsystem prompt、PC用途、環境ID付きproject overviewを設定し、Desktopで実行同意と各作業フォルダーを選ぶ。通常のチャットへ目的と観測用の成果物契約を送り、配置やtool手順は指示しない。`runnerBinary`、`runnerTestBinary`、Hub optionsに加えて `liveProvider: {provider_base_url, model}` を指定した場合だけ、実LLMによるアプリ生成を検査する。生成するソースはfixtureに含めない。`liveProvider` を省略した場合は固定応答で委任・承認・3環境の保持・Dの容量待ち・Aの全停止・Dの独立依頼完了を確認する制御経路の試験であり、アプリ開発の証拠には数えない。
+
+実LLMの生成物は `acceptance.json` と最小HTTP/UI契約で検査する。各componentの実PIDが担当Runnerの子孫であり、別環境のフォルダーへ配置されていること、Web投入の固定入力の結果、Worker実停止中のPENDING、再開後の同一job完了、1job限定の実例外とFAILED永続化、その後の通常job成功、DB実再起動後の履歴を確認する。AとDは独立した会話と承認を持ち、他端末由来の通常操作と担当交代UIが存在しないことを確認する。最後にAの通常の会話全停止と実process終了・枠解放後のD実行を観測する。同一Windows上の試験基盤であり、物理4台・LAN配置の成功証拠ではない。
+
+生成完了後の `live-source-review.json` は、source path/hashと6件の確認項目を持つ。実装担当agentが生成sourceを読み、DBの実永続化、実処理の例外からFAILEDへ進むこと、環境分離、起動・停止の所有関係を監査してから `live-source-review-decision.json` に `{request_sha256,decision:"approve",checked:[1,2,3,4,5,6],notes:"具体的な監査結果"}` を保存する。harnessはhashを再検査した後にアプリを操作する。実PIDのcommand line、entrypointとDBのrealpath、各component URLのlisten PIDもOSから照合する。Worker本体とHTTP監視processが分かれていてもよいが、双方が担当Runnerのprocess treeに属することを確認し、アプリの自己申告だけで成功としない。
+
+API keyが必要な既存接続では、`upstreamCredentialFile` に同endpointの既存credential JSONの絶対pathを指定できる。値はmemoryで読みendpoint一致後に隔離HubのAPI key入力へ渡し、config/evidenceへ転記しない。Live承認はexecution rootの `live-approval-N.json` を検査して、対応する `live-approval-N-decision.json` に `{approval_id,request_sha256,decision:"approve"}` を保存した後、harnessが依頼元の実GUIで許可する。各実行profileの `data/http-request-capture` に既存 `MOYAI_HTTP_REQUEST_CAPTURE_DIR` 経路で実効requestを保存する。秘匿を含む可能性があるため、このtask内のローカル検証資料として扱う。
+
 `onboarding.win-a-to-win-b` は同一Windows内の隔離された実Desktop A/Bで、Aのチーム参加・PC承認後の自動認証、Bの実行PC専用入口からAI設定・PC参加・実行同意、Hub画面のPC・プロジェクト割当、AのCSV添付、Bのスクリプト作成と実PowerShell実行、Aの成果2ファイル保存を通す。Aは実行PC欄を空欄のまま「WinBをホスト」と依頼し、Bへの配置を確認する。Bでは通常チャットの下書きを保持し、受信仕事の表示・停止操作・送信の一時抑止・終了後の解除を確認する。Hubはプロジェクトの編集中に別タブで設定を更新し、競合時に入力を残して比較→継続→明示保存する。Hubでは次の操作と対象PCの案内を確認する。承認ボタンはfocus/scroll前の可視性を記録し、日本語の影響説明とコマンド全文、元データの開閉保持、判断後とSHAの折畳みを確認する。Aへ保存した2成果のhashをHub・B実ファイルと照合する。共通のcompanion/managed Runner/native picker/cleanup ownerを使用する。`runnerBinary` と固定コピーした `runnerTestBinary` をHub optionsに追加する。providerは固定tool計画で、LLM品質・物理別PC・fresh Windows導入の証明ではない。画面と経過時間は自動操作の観察資料であり、初見利用者の所要時間を表さない。
 
 同scenarioのconfigに `liveProvider: { "provider_base_url": "http://host:port/v1", "model": "model-id" }` を明示すると、固定応答providerを起動せず指定済みの実LLMを使用する。外部providerは起動・停止しない。実装待ちは最大15分とし、結果の2行形式を依頼に明記する。実LLMの承認は自動許可せず、execution rootの `live-approval-N.json` に操作と実行先を保存する。担当者が内容と対象スクリプトを確認した後、同rootの `live-approval-N-decision.json` に一致する `approval_id`、`request_sha256`、`decision: "approve"` を記録した場合だけGUI承認する（各承認の確認待ちは最大5分）。このファイルは今回の隔離試験専用で、製品の権限設定を変更しない。実モデルのtool数はmock requestから推測せず、保存された実行履歴から別途確認する。
@@ -79,12 +87,16 @@ node tests/desktop_e2e/manual_session.mjs --binary <absolute-desktop-e2e-binary>
 ```jsonl
 {"command":"start-b"}
 {"command":"capture-runner","pc":"b"}
+{"command":"restart","pc":"b","startupTarget":"preferences"}
+{"command":"capture-runner","pc":"b"}
 {"command":"finish","verdict":"pending","observations":["GUI で確認した操作と未確認項目を記録する"]}
 ```
 
 `start-b` は同じ execution に B を一度だけ追加する。GUI で実行機能を有効にし、「実行機能が動作中」まで待ってから、その PC（`a` または `b`）へ `capture-runner` を送る。同じ設定の Runner の本人性と exact process owner を記録する処理であり、起動待ちの代用にはしない。固定応答の承認・ファイル作成を試す依頼には `desktop-transfer-child` を含める。この provider は手順確認用であり、外部 LLM や物理別 PC の検証にはならない。
 
 確認を終えたら、ウィンドウを閉じずに `finish` を送る。`verdict` は `pass` / `fail` / `pending`、`observations` は手動所見の配列で、`pass` には一件以上の所見が必要である。共通 host が Desktop、捕捉済み Runner、Hub/provider を終了し、DB の閉鎖確認と証跡の seal を行って `finished` JSON を返す。手動判定と cleanup の成否は別に保存する。EOF や捕捉失敗は未完了として扱うため、通常終了には Ctrl+C やプロセス強制終了を使わない。
+
+`restart` は指定したPCのDesktopへ通常の「終了」を要求し、Desktop/WebViewと捕捉済みRunnerの実プロセス終了を確認してから、同じ隔離設定で再起動する。ほかのPCとHubは継続する。`startupTarget` は `workspace`（fixtureフォルダーを明示）または `preferences`（`--dir`を省略し保存済みフォルダー・会話を復元）を指定する。Runnerを有効にしたPCでは再起動前に`capture-runner`を済ませ、再起動後もGUIで「実行機能が動作中」を確認してから、同じPCへもう一度`capture-runner`を送る。自動捕捉や自動リトライは行わない。旧ownerの証跡は保持し、新Runnerの捕捉前に`finish`するとcleanupは不合格になる。`restarted` JSONの新しいDesktop PID・世代を次のGUI操作に使い、`runner_capture_required`を確認する。CLI引数と再起動境界は共通hostの証跡に残る。
 
 ## Execution state machine
 
@@ -264,7 +276,11 @@ Hubの管理画面はブラウザーへ移行したため、旧Hubネイティ�
 
 `settings.shared-work` はconfig/model/local Projectを用意せず起動し、共有入口、native共通設定import、Hubブラウザーの端末承認、登録PCによる自動認証、利用できるprojectと占有の秘匿、通常プロジェクトのサイドバーとチャットから投入・詳細・取消を実Tauriで操作する。同じ保存先でのDesktop再起動後にログイン操作なしでPCに対応する利用者と既存仕事が戻ること、管理者がPCを別の利用者へ明示的に対応付け直すと以前の利用者の表示や操作権限が残らないことも確認する。初回の未設定状態から共有入口を開けることを確認する。共通設定の保存・再起動後はHub設定によって準備済みになり得るため、設定画面の開閉ではその時点の初期設定判定を保持することを確認する。Hubのfixture専用mTLS参加者が2人の所属と共通資源上の待機仕事を実APIで用意する。製品GUIからの投入とfixture準備を証跡で区別し、solver実行・物理別PC・受付応答喪失の実通信試験はこのシナリオの範囲へ含めない。共通Hub browser resourceはHubの起動操作で得た一度だけ使えるアクセス情報で実ブラウザーを開く。アクセス情報は証跡へ記録しない。
 
-`settings.device-execution` は、nativeフォルダー選択と1回の実行許可、Desktopによる実行機能の自動起動、Hubのプロジェクト画面で操作PC・実行PCを保存する操作を確認する。各プロジェクトの既存フォルダー選択は `settings.shared-work-continuation` と `onboarding.win-a-to-win-b` で確認する。Desktopを通常終了・再起動しても同じ独立Runnerが継続し、再同意や手動起動を要求しないことを確認する。
+`settings.device-execution` は、nativeフォルダー選択と1回の実行許可、Desktopによる実行機能の自動起動、HubのAI登録・プロジェクト画面でのPC割当を確認する。保存競合は入力を保持して比較し、Desktopでプロジェクトの作業フォルダーを明示選択する。通常のサイドバーとチャットで短文の共有依頼を成功させた後、Desktopの通常終了で旧Runnerが実際に終了し、再起動後は保存済み同意・フォルダーから新Runnerが動作することを確認する。再同意や手動起動は行わない。このシナリオはCSVサンプルの成果保存を対象とせず、その経路は `onboarding.win-a-to-win-b` が扱う。
+
+`settings.shared-work` の承認は、試験用Runnerと同じ利用者でも別PCへ承認権限を移さないよう、実Desktopから新しい仕事を依頼して確認する。具体的な実行PC・依頼元PCを照合し、Windows通知のnative API成功を記録する。fixtureは既存Hub APIで60秒期限の操作を報告し、実時計で期限が切れても同じ仕事・占有が残り、Runnerへの回答が未決定のままであることを確認する。依頼元の実GUIで「この操作を再確認」を押し、同一操作を新IDで再提示してから許可する。正確な対象を持つDesktop commandと新IDだけへの許可を記録し、通常の完了報告後に占有の解放を確認する。時計・DBの書換えは行わず、Runnerのconsume・再提示はfixtureが担う。実Runnerの15分実時間待機や許可後のshell副作用の証拠には含めない。fixtureの利用者名は公開PC名と区別する。別接続の設定更新と競合した場合は通常の比較・保存を通し、再起動後は通常入口からHubの会話を開く。新チャット入力は可視・有効状態を待ったtrusted pointer操作で、Tab到達性の試験とは分ける。
+
+WindowsでCargo検証と隔離GUIを並行する場合は、GUI用binaryをtask配下へ固定コピーし、同じhashを記録して使う。`cargo test` もintegration用binaryを再生成するため、実行中の `target/debug/` のexeへ上書きしようとすると検証自体が失敗する。
 
 実行機能の試験には `cargo build --offline --features desktop-e2e --bin moyai-desktop` の専用Desktopに加えてcurrent libtestを使う。通常の配布buildには実行先の差し替え処理を含めない。scenario configの `runnerTestBinary` にcurrent libtest、`runnerBinary` に通常Runner CLI、`hubBinary` にcurrent Hubの絶対pathを指定する。共通scenario environmentの `MOYAI_DESKTOP_E2E_RUNNER` は、この専用buildが既存の `cfg(test)` RunnerHostへ起動をつなぐためのものである。fixtureモードの `MOYAI_TEST_RESOURCE_REGISTRY` は共通hostが端末root内に固定し、ProgramData本体へ書かない。専用buildの投影markerがない場合は、GUIの実行許可操作前に試験を拒否する。通常Runner CLIの実プロセスgateは別途実行し、専用buildと配布buildのidentityを区別して記録する。
 
@@ -276,7 +292,7 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 `run.latest-message-edit` はローカルチャットで完了済みの最新依頼だけに編集ボタンが出ること、編集で元の会話を保持した新チャットへ分岐し、元の本文が入力欄に戻ること、修正して再送できることを実Tauri画面で確認する。実行先やHubの設定は不要で、隔離したscripted providerを使う。
 
-`settings.project-folder-recovery` は `settings.shared-work-continuation` と同じ初期設定・Hub登録・native pickerを使い、既存フォルダーを選んだ後にDesktopとRunnerを停止する。隔離fixtureのHub/Runner双方を旧 `desktop-default` 形式へ合わせ、作成先ごとフォルダーを移動してから再起動する。実行機能が起動したまま対象プロジェクトの問題と選び直し操作を表示すること、GUIから作業フォルダーと新規作成先をそれぞれ保存できること、再度両プロセスを起動しても保存先・既存ファイルを保持し、古いフォルダーを勝手に再作成しないことを確認する。共通hostの `beforeRelaunch` は対象Desktop/WebViewが完全に終了した後だけfixture準備を行い、独立Runnerはscenario自身が正確な所有情報で停止する。Hub/Runnerの構造を旧形式にする操作はfixture準備であり、復旧操作は実GUIを通す。物理別PC・UNC疎通は対象外。実行引数とscenario configは `settings.shared-work-continuation` と共通で、scenario名だけを指定し直す。
+`settings.project-folder-recovery` は `settings.shared-work-continuation` と同じ初期設定・Hub登録・native pickerを使い、既存フォルダーを選んだ後にDesktopとRunnerを停止する。隔離fixtureのHub/Runner双方を旧 `desktop-default` 形式へ合わせ、作成先ごとフォルダーを移動してから再起動する。実行機能が起動したまま対象プロジェクトの問題と選び直し操作を表示すること、GUIから作業フォルダーと新規作成先をそれぞれ保存できること、再度両プロセスを起動しても保存先・既存ファイルを保持し、古いフォルダーを勝手に再作成しないことを確認する。共通hostの `beforeRelaunch` は対象Desktop/WebViewが完全に終了し、Runnerも捕捉済み所有情報で終了確認できた後だけfixtureを準備する。再起動後は新Runnerを捕捉する。Hub/Runnerの構造を旧形式にする操作はfixture準備であり、復旧操作は実GUIを通す。物理別PC・UNC疎通は対象外。実行引数とscenario configは `settings.shared-work-continuation` と共通で、scenario名だけを指定し直す。
 
 共有チャットの入力欄は、ローカルと同じく自然文を送る導線とする。実行先はHubの許可範囲を参照して自動で決まり、送信画面にPC・仕事種別・タイトルの指定欄を置かない。
 
@@ -301,6 +317,10 @@ native pickerの絶対パス入力は、実測したdialog→ComboBoxEx32→Comb
 `side-chat.quote` の最終停止は、Rustの取消とprovider接続終了に加え、同じSide ownerの画面が「停止済み」へ変わり、停止ボタンが消え、入力欄を再利用できるところまで待って撮影する。停止要求直後の中間表示を停止完了の目視証拠にしない。
 
 ## Artifact layout
+
+`manual_session.mjs` は同じ隔離・終了処理を使い、画面操作を試験者へ渡す。
+必須の `--binary` / `--hub-binary` / `--runner-binary` / `--runner-test-binary` / `--artifact-parent` は絶対パスで指定する。
+任意の `--config-file` に明示した開発用設定を指定すると、制御した応答サーバーを起動せずLive LLM用の設定を各PCへ読み込む。設定本文は証跡へ記録しない。HubのAI接続先・認証・モデル登録と端末承認は引き続き管理画面から操作する。入力のNDJSONは `start-b`、`capture-runner`、PC単位の `restart`、観測を添えた `finish` のみであり、設定の直接書換えやGUI操作の代行APIではない。
 
 実行結果はrepository外の `project_sandbox/<task>/<execution-id>/` に置く。
 

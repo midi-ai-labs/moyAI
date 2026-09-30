@@ -340,6 +340,27 @@ impl HubTurnRoute {
         })
     }
 
+    pub(crate) fn model_system_prompt_reservation(&self) -> usize {
+        self.inner
+            .catalog
+            .models
+            .iter()
+            .filter(|model| {
+                self.inner
+                    .review
+                    .selection
+                    .allowed_model_ids
+                    .contains(&model.id)
+            })
+            .map(|model| {
+                crate::context::context_window::estimate_text_tokens(
+                    &crate::system_prompt::hub_model_system_prompt_section(&model.system_prompt),
+                )
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
     fn ensure_current(&self) -> Result<(), LlmError> {
         if self
             .inner
@@ -564,6 +585,10 @@ fn gateway_review_rejection(error: &LlmError) -> Option<HubError> {
 
 #[async_trait::async_trait(?Send)]
 impl LlmClient for HubRoutedClient {
+    fn pending_system_prompt_tokens(&self) -> Option<usize> {
+        Some(self.route.model_system_prompt_reservation())
+    }
+
     async fn stream_chat(
         &self,
         mut request: ChatRequest,
@@ -571,6 +596,15 @@ impl LlmClient for HubRoutedClient {
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
         self.route.ensure_current()?;
+        request.pending_system_prompt_tokens = self.pending_system_prompt_tokens();
+        if crate::context::ContextWindowTokenStatus::for_request(&request, 0).token_limit_reached {
+            return Err(LlmError::Message(
+                "Hubモデルのシステムプロンプトを含む入力がモデルのコンテキスト上限を超えています。"
+                    .into(),
+            ));
+        }
+        let supports_model_system_prompt =
+            request.pending_system_prompt_tokens.unwrap_or_default() > 0;
         let operation = async {
             let request_id = ulid::Ulid::new().to_string();
             let deadline = tokio::time::Instant::now()
@@ -598,7 +632,7 @@ impl LlmClient for HubRoutedClient {
                 let result = tokio::select! {
                 _ = cancel.cancelled() => return Err(LlmError::Message("Hub request cancelled".into())),
                 _ = tokio::time::sleep_until(deadline) => return Err(LlmError::Hub(HubError::Deadline)),
-                result = self.route.inner.client.prepare(self.route.inner.context, self.route.inner.purpose, &self.route.inner.turn_id, &request_id, &self.route.inner.review) => result,
+                result = self.route.inner.client.prepare(self.route.inner.context, self.route.inner.purpose, &self.route.inner.turn_id, &request_id, &self.route.inner.review, supports_model_system_prompt) => result,
             }.map_err(|error| { self.route.review_rejected(error); LlmError::Hub(error) })?;
                 match result {
                     PreparedRequest::Waiting {
@@ -700,7 +734,7 @@ impl LlmClient for HubRoutedClient {
             }
             self.route.ensure_current()?;
             let deadlines = request.provider_target().deadlines();
-            let target = ProviderTarget::new(
+            let mut target = ProviderTarget::new(
                 &gateway_base_url,
                 &logical_model_id,
                 gateway_profile,
@@ -710,7 +744,40 @@ impl LlmClient for HubRoutedClient {
                 },
             )
             .map_err(|_| LlmError::Hub(HubError::InvalidCatalog))?;
+            target.replace_request_limits(request.provider_target().request_limits());
             request.route_through_hub(target, request_token);
+            let model = self
+                .route
+                .inner
+                .catalog
+                .models
+                .iter()
+                .find(|model| model.id == logical_model_id)
+                .ok_or(LlmError::Hub(HubError::InvalidCatalog))?;
+            request
+                .system_prompt
+                .push_str(&crate::system_prompt::hub_model_system_prompt_section(
+                    &model.system_prompt,
+                ));
+            request.pending_system_prompt_tokens = None;
+            let finalized = if crate::context::ContextWindowTokenStatus::for_request(&request, 0)
+                .token_limit_reached
+            {
+                Err(LlmError::Message("Hubモデルのシステムプロンプトを含む入力がモデルのコンテキスト上限を超えています。".into()))
+            } else {
+                request
+                    .validate_provider_lifecycle()
+                    .and_then(|()| {
+                        crate::llm::request_diagnostics::http_request_wire_diagnostic(&request)
+                            .map(|_| ())
+                    })
+                    .and_then(|()| sink.request_prepared(&request, self.route.hub_endpoint()))
+            };
+            if let Err(error) = finalized {
+                // No generation was sent. The existing exact turn owner releases its permit.
+                self.route.finish().await;
+                return Err(error);
+            }
             self.route
                 .inner
                 .used_models

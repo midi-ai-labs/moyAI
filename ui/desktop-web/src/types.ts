@@ -449,12 +449,14 @@ export interface DesktopWebState {
   draft_prompt: string;
   image_input: string;
   attached_images: string[];
+  retained_image_names?: string[];
   composer_submit_mode: ComposerSubmitMode;
   can_submit: boolean;
   can_cancel_run: boolean;
   run_target: RunMutationTarget;
   stop_target: StopMutationTarget | null;
   busy: boolean;
+  exit_requested?: boolean;
   task_activity_state: TaskActivityState;
   async_polling_required: boolean;
   pending_async_operations: string[];

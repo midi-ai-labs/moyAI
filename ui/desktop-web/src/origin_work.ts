@@ -14,7 +14,7 @@ interface OriginJob {
 interface OriginService {
   project_id: string;
   service: { service_id: string; conversation_id: string; environment_id: string;
-    expires_at_ms: number; stop_requested: boolean; uncertain: boolean; can_stop: boolean };
+    expires_at_ms: number | null; stop_requested: boolean; uncertain: boolean; can_stop: boolean };
 }
 export interface OriginWorkProjection {
   origin_session_ref: string;
@@ -169,7 +169,7 @@ export function renderOriginWork(local: DeviceNetworkPresentation, sessionId: st
     <strong>この会話で使った別のPC</strong>
     <div class="origin-work-rows">${latestJobs.map(row => `<div class="origin-work-row"><span>${esc(row.job.device_label ?? row.job.environment_label)} · ${esc(row.job.title)} · ${esc(jobState(row.job.state))}</span>${(row.artifacts ?? []).map(asset => `<small>成果: ${esc(asset.name)} · ID ${esc(asset.id)} · ${esc(String(asset.byte_length))} bytes</small>`).join("")}${row.more_artifacts ? '<small>ほかの成果はHubのプロジェクトで確認できます</small>' : ""}</div>`).join("")}
     ${work.jobs.length > latestJobs.length ? `<small>ほか ${work.jobs.length - latestJobs.length} 件の仕事</small>` : ""}
-    ${work.retained_services.map(row => `<div class="origin-work-row"><span>起動中のアプリ · ${esc(row.service.environment_id)} · ${row.service.uncertain ? "状態不明" : row.service.stop_requested ? "停止確認中" : `保持期限 ${esc(new Date(row.service.expires_at_ms).toLocaleString("ja-JP"))}`}</span></div>`).join("")}
+    ${work.retained_services.map(row => `<div class="origin-work-row"><span>起動中のアプリ · ${esc(row.service.environment_id)} · ${row.service.uncertain ? "状態不明" : row.service.stop_requested ? "停止確認中" : row.service.expires_at_ms == null ? "停止まで保持" : `保持期限 ${esc(new Date(row.service.expires_at_ms).toLocaleString("ja-JP"))}`}</span></div>`).join("")}
     ${work.hidden_active_work ? '<small>現在の権限では詳細を表示できない別PCの仕事があります。Hub管理者に利用権限を確認してください。</small>' : ""}
     ${work.stop_pending ? '<small>この会話から依頼した実行の停止受付をHubで確認中です。</small>' : ""}
     ${work.stop_error ? '<small class="shared-error">停止受付をHubで確認できません。接続が戻ると再確認します。</small>' : ""}

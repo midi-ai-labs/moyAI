@@ -621,7 +621,13 @@ impl LocalResourceLease {
         let title = title.chars().take(256).collect::<String>();
         let (runner, assignment) = tokio::task::spawn_blocking(move || {
             let RunnerResponse::Identity { identity } =
-                super::super::windows::request_for_config(&RunnerCommand::Identity, &target)?
+                super::super::windows::request_for_config(&RunnerCommand::Identity, &target)
+                    .map_err(|error| {
+                        RunnerError::new(format!(
+                            "このPCに登録された共有実行機能に接続できません。共有実行を設定したDesktopの「moyAI Hub」→「PCの接続」で実行状態を確認してください。\n詳細: {}",
+                            error.message
+                        ))
+                    })?
             else {
                 return Err(RunnerError::new("Unexpected resource provider identity"));
             };
@@ -898,6 +904,7 @@ mod tests {
                 capacity: 1,
                 project_ids: vec![project.into()],
                 enabled,
+                workspace_bound: false,
             },
         );
         assert_eq!(

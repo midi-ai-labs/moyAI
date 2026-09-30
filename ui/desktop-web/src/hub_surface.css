@@ -63,6 +63,9 @@
 .hub-catalog-diff th:first-child { width: 23%; }
 .hub-catalog-diff thead { color: var(--muted); border-bottom: 1px solid var(--line); }
 .hub-catalog-diff tbody th { font-weight: 400; color: var(--muted); }
+.hub-catalog-diff td { white-space: pre-wrap; }
+.hub-model-prompt { margin: 10px 0; }
+.hub-model-prompt pre { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .hub-history p { display: flex; gap: 18px; font-size: 11px; color: var(--muted); line-height: 1.7; }
 .hub-history strong { flex: 0 0 65px; color: var(--accent); }
 .hub-modal-footer { padding: 14px 28px; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-top: 1px solid var(--line); font-size: 11px; color: var(--quiet); flex: 0 0 auto; }

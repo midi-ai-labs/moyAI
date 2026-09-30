@@ -59,6 +59,24 @@ mod lifecycle_tests {
         (temp, service)
     }
     #[tokio::test]
+    async fn shutdown_waits_for_in_flight_execution_management_before_runner_exit() {
+        let (_temp, service) = fixture().await;
+        let lane = service.inner.execution.lane.lock().await;
+        let stopping_service = service.clone();
+        let stopping = tokio::spawn(async move { stopping_service.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(service.inner.state.lock().unwrap().closing);
+        assert!(
+            !stopping.is_finished(),
+            "Runner startup may still own the management lane"
+        );
+        drop(lane);
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
     async fn receiver_confirmation_is_reused_only_for_the_same_authority() {
         let (_temp, service) = fixture().await;
         let first = service
@@ -1597,6 +1615,9 @@ impl DeviceNetworkService {
     }
     pub async fn shutdown(&self) {
         self.begin_shutdown();
+        // A refresh already in this lane can still be starting its Runner.
+        // Drain it before Desktop stops the Runner, so it cannot respawn after Exit.
+        let _execution_lane = self.inner.execution.lane.lock().await;
         self.stop_receiver_transport().await;
         self.cancel_all_outgoing().await;
     }

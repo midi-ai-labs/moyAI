@@ -55,7 +55,9 @@ try {
 export function managedShellFixtureConfig(baseUrl) {
   // This isolated fixture checks lifecycle; permission decision behavior has its
   // own scenarios. No user's saved configuration or OS policy is changed.
-  return providerChatToolContinuationFixtureConfig(baseUrl).replace('access_mode = "default"', 'access_mode = "full_access"');
+  return providerChatToolContinuationFixtureConfig(baseUrl)
+    .replace(/^request_timeout_ms = \d+$/m, "request_timeout_ms = 120000")
+    .replace('access_mode = "default"', 'access_mode = "full_access"');
 }
 
 export function probeManagedShell(port, marker) {

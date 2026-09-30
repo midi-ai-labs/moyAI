@@ -26,7 +26,7 @@ pub struct OriginServiceView {
     pub service_id: String,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     pub stop_requested: bool,
     pub uncertain: bool,
     #[serde(default)]

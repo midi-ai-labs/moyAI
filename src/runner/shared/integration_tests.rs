@@ -111,34 +111,39 @@ impl Hub {
             assert!(Instant::now() < deadline, "Hub startup deadline");
             tokio::time::sleep(Duration::from_millis(80)).await;
         }
+        hub.authenticate_browser(hub.process.id() as u64).await;
+        hub
+    }
+
+    async fn authenticate_browser(&mut self, host_pid: u64) {
         let session = body(
-            hub.browser
-                .get(format!("{}/admin/session", hub.url))
+            self.browser
+                .get(format!("{}/admin/session", self.url))
                 .send()
                 .await
                 .unwrap(),
         )
         .await;
-        hub.csrf = session["csrf"].as_str().unwrap().into();
+        self.csrf = session["csrf"].as_str().unwrap().into();
         // Obtain the launch capability through this fixture's verified local host,
         // exactly as the Hub launcher does. It never enters process logs.
         let descriptor: Value = serde_json::from_slice(
-            &std::fs::read(hub.directory.join("host-control.json")).unwrap(),
+            &std::fs::read(self.directory.join("host-control.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(descriptor["pid"].as_u64(), Some(hub.process.id() as u64));
+        assert_eq!(descriptor["pid"].as_u64(), Some(host_pid));
         assert_eq!(
             descriptor["catalog_path"]
                 .as_str()
                 .map(std::path::PathBuf::from),
             Some(
-                std::fs::canonicalize(&hub.directory)
+                std::fs::canonicalize(&self.directory)
                     .unwrap()
                     .join("catalog.json")
             ),
         );
         let access = body(
-            hub.browser
+            self.browser
                 .post(format!(
                     "http://127.0.0.1:{}/host/command",
                     descriptor["port"].as_u64().unwrap()
@@ -152,22 +157,22 @@ impl Hub {
         .await;
         assert_eq!(access["ok"], true);
         let access_url = reqwest::Url::parse(access["value"]["url"].as_str().unwrap()).unwrap();
-        assert_eq!(access_url.origin().ascii_serialization(), hub.url);
+        assert_eq!(access_url.origin().ascii_serialization(), self.url);
         let ticket = access_url
             .fragment()
             .unwrap()
             .strip_prefix("access=")
             .unwrap();
-        let response = hub
+        let response = self
             .browser
-            .post(format!("{}/admin/access", hub.url))
-            .header("Origin", &hub.url)
-            .header("X-Moyai-Csrf", &hub.csrf)
+            .post(format!("{}/admin/access", self.url))
+            .header("Origin", &self.url)
+            .header("X-Moyai-Csrf", &self.csrf)
             .json(&json!({"ticket":ticket}))
             .send()
             .await
             .unwrap();
-        hub.cookie = response
+        self.cookie = response
             .headers()
             .get(reqwest::header::SET_COOKIE)
             .unwrap()
@@ -178,12 +183,11 @@ impl Hub {
             .unwrap()
             .into();
         let session = body(response).await;
-        hub.session = session["authentication"]["session_id"]
+        self.session = session["authentication"]["session_id"]
             .as_str()
             .unwrap()
             .into();
-        hub.csrf = session["csrf"].as_str().unwrap().into();
-        hub
+        self.csrf = session["csrf"].as_str().unwrap().into();
     }
 
     async fn admin(&self, name: &str, args: Value) -> Value {
@@ -239,23 +243,33 @@ impl Hub {
             assert!(Instant::now() < deadline, "Hub shutdown deadline");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let log = std::fs::OpenOptions::new()
-            .append(true)
-            .open(self.directory.join("process.log"))
-            .unwrap();
-        self.process = command(&self.executable)
-            .args([
-                "--launch",
-                "--no-browser",
-                "--data-dir",
-                self.directory.as_str(),
-                "--web-port",
-                "0",
-            ])
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+        let output = bounded_output(command(&self.executable).args([
+            "--launch",
+            "--no-browser",
+            "--data-dir",
+            self.directory.as_str(),
+            "--web-port",
+            "0",
+        ]))
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "Hub restart failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        // The local management port and browser authentication belong to this
+        // host lifetime. The saved TLS job endpoint is independently preserved.
+        self.url = reqwest::Url::parse(report["web_url"].as_str().unwrap())
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        self.authenticate_browser(report["pid"].as_u64().unwrap())
+            .await;
+        assert!(
+            self.admin("hub_shared_snapshot", json!({})).await["revision"].is_string(),
+            "Restarted Hub must accept management commands with fresh authentication"
+        );
     }
 }
 
@@ -400,6 +414,19 @@ struct Provider {
     task: tokio::task::JoinHandle<()>,
 }
 
+fn fixture_task_text(request: &Value) -> String {
+    // A child's WorldState includes its root's objective. Route this scripted
+    // response by the current assignment, not inherited context or tool history.
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .map(|message| message["content"].to_string())
+        .unwrap_or_default()
+}
+
 impl Provider {
     async fn start() -> Self {
         let parent_calls = Arc::new(AtomicUsize::new(0));
@@ -418,7 +445,7 @@ impl Provider {
                 let (parents,children,released,captured)=(parents.clone(),children.clone(),released.clone(),captured.clone());
                 async move {
                     captured.lock().unwrap().push(request.clone());
-                    let task_text = request["messages"].to_string();
+                    let task_text = fixture_task_text(&request);
                     let approval_case = task_text.contains("approval-fixture") || task_text.contains("cancel-fixture");
                     let (delta,finish) = if task_text.contains("guardian-handoff-fixture") {
                         let is_guardian = request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "system" && message["content"].as_str().is_some_and(|content| content.contains("independent permission guardian")));
@@ -463,6 +490,12 @@ impl Provider {
                             released.notified().await;
                             (json!({"role":"assistant","tool_calls":[{"index":0,"id":"local-clock","type":"function","function":{"name":"current_time","arguments":"{}"}}]}),"tool_calls")
                         }
+                    } else if task_text.contains("child-decision-parent-fixture") {
+                        if request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool" && message["tool_call_id"] == "decision-child-call") {
+                            (json!({"role":"assistant","content":"A denied child must never resume this parent"}),"stop")
+                        } else {
+                            (json!({"role":"assistant","tool_calls":[{"index":0,"id":"decision-child-call","type":"function","function":{"name":"shared_delegate","arguments":json!({"environment_id":"solver","title":"Confirm on the originating PC","prompt":"cancel-fixture: request the controlled write"}).to_string()}}]}),"tool_calls")
+                        }
                     } else if task_text.contains("paused-parent-fixture") {
                         (json!({"role":"assistant","tool_calls":[{"index":0,"id":"paused-parent-call","type":"function","function":{"name":"shared_delegate","arguments":json!({"environment_id":"solver","title":"Wait for approval","prompt":"cancel-fixture: request the controlled write"}).to_string()}}]}),"tool_calls")
                     } else if approval_case {
@@ -490,10 +523,11 @@ impl Provider {
                         assert_eq!(request["model"],"fixture-child");
                         let step=children.fetch_add(1,Ordering::SeqCst);
                         if step==0 {
-                            released.notified().await;
+
                             (json!({"role":"assistant","tool_calls":[{"index":0,"id":"child-clock","type":"function","function":{"name":"current_time","arguments":"{}"}}]}),"tool_calls")
                         } else {
                             assert_eq!(step,1,"Child effects must not be repeated");
+                            released.notified().await;
                             assert!(request["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool"&&message["content"].as_str().is_some_and(|text|text.contains("unix_ms"))));
                             (json!({"role":"assistant","content":"solver result"}),"stop")
                         }
@@ -522,6 +556,48 @@ impl Provider {
 impl Drop for Provider {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn scripted_provider_routes_child_assignment_separately_from_root_context() {
+    let provider = Provider::start().await;
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for root_prompt in ["paused-parent-fixture", "child-decision-parent-fixture"] {
+        for (assignment, expected_tool) in [
+            (root_prompt, "shared_delegate"),
+            ("cancel-fixture: request the controlled write", "shell"),
+        ] {
+            let response = http
+                .post(format!("{}/chat/completions", provider.endpoint))
+                .json(&json!({
+                    "model": "fixture-child",
+                    "messages": [
+                        {"role": "system", "content": format!("<shared_project_context><overall_request>{root_prompt}</overall_request></shared_project_context>")},
+                        {"role": "user", "content": assignment},
+                    ],
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let stream = response.text().await.unwrap();
+            let first: Value = serde_json::from_str(
+                stream
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                first["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], expected_tool,
+                "Inherited root context must not select the parent's scripted action"
+            );
+        }
     }
 }
 
@@ -810,6 +886,51 @@ async fn real_hub_scenario() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    // The real child has completed a public operation, but its final response is
+    // held at the existing provider barrier. The origin reads it before archive.
+    let progress_deadline = Instant::now() + Duration::from_secs(20);
+    let activity = loop {
+        let page = body(
+            http.get(format!("{url}/v1/shared/jobs/{root_id}/transcript"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        if page["activity"]["items"].as_array().is_some_and(|items| {
+            items.iter().any(|call| {
+                call["kind"] == "tool_call"
+                    && call["payload"]["tool_name"] == "current_time"
+                    && items.iter().any(|item| {
+                        item["kind"] == "tool_output"
+                            && item["payload"]["call_id"] == call["payload"]["call_id"]
+                    })
+            })
+        }) {
+            break page["activity"].clone();
+        }
+        assert!(
+            Instant::now() < progress_deadline,
+            "Root did not receive active child progress: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let clock_call_id = activity["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "tool_call" && item["payload"]["tool_name"] == "current_time")
+        .unwrap()["payload"]["call_id"]
+        .clone();
+    assert_eq!(activity["job_id"], child_id);
+    assert_eq!(activity["environment_id"], "solver");
+    assert_eq!(job(http, &url, token, &child_id).await["state"], "running");
+    std::fs::write(
+        root.join("active-child-progress.json"),
+        serde_json::to_vec_pretty(&activity).unwrap(),
+    )
+    .unwrap();
     let occupancy = body(
         http.get(format!("{url}/v1/shared/environments?project_id=project"))
             .bearer_auth(token)
@@ -897,6 +1018,30 @@ async fn real_hub_scenario() {
     provider.release_child.notify_one();
     let child_completed = wait_job(http, &url, token, &child_id, "succeeded").await;
     assert_eq!(child_completed["result"]["text"], "solver result");
+    let child_transcript = body(
+        http.get(format!("{url}/v1/shared/jobs/{child_id}/transcript"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        child_transcript["activity"].is_null(),
+        "Final archive replaces intermediate activity"
+    );
+    assert_eq!(
+        child_transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(
+                |item| item["kind"] == "tool_output" && item["payload"]["call_id"] == clock_call_id
+            )
+            .count(),
+        1,
+        "The final canonical record contains the operation exactly once"
+    );
     assert_eq!(provider.parent_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.child_calls.load(Ordering::SeqCst), 2);
     assert_eq!(job(http, &url, token, root_id).await["state"], "queued");
@@ -1017,8 +1162,9 @@ async fn real_hub_scenario() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // A terminal model turn can still hold managed processes. Hub Cancel must reach that
-    // exact resource lifetime and wait for its process drain before releasing capacity.
+    // A terminal local model turn can still hold managed processes. An explicit
+    // Hub management stop must reach that exact resource lifetime and wait for
+    // its process drain before releasing capacity.
     let mut config = std::fs::read_to_string(&caller.config).unwrap();
     config.push_str("\n[permissions]\naccess_mode = \"full_access\"\n");
     std::fs::write(&caller.config, config).unwrap();
@@ -1073,17 +1219,38 @@ async fn real_hub_scenario() {
     .await;
     assert_eq!(bob_login["principal"]["user_id"], bob["user_id"]);
     let bob_token = bob_login["token"].as_str().unwrap();
-    // Local work belongs to this provided device's actor, so its owner cancels it.
+    // A local capacity admission has no Hub conversation-origin controller.
+    // Even its actor cannot turn the normal conversation API into an admin stop.
+    let before_stop = job(&identities[1].http, &url, bob_token, &local_job).await;
+    assert_eq!(before_stop["can_cancel"], false);
+    let denied = identities[1]
+        .http
+        .post(format!("{url}/v1/shared/jobs/{local_job}/cancel"))
+        .bearer_auth(bob_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        job(&identities[1].http, &url, bob_token, &local_job).await["state"],
+        before_stop["state"]
+    );
+    caller.run_state(&managed_id, "processes_running").await;
+    // Grant only this fixture's explicit management operation, then restore the
+    // contributor role before the executor-vs-origin approval/cancel checks.
+    hub.management(json!({"kind":"project_member","project_id":"project","user_id":bob["user_id"],"role":"manager"})).await;
     shared_post(
         &identities[1].http,
         &url,
         bob_token,
-        &format!("jobs/{local_job}/cancel"),
+        &format!("admin/jobs/{local_job}/cancel"),
         json!({}),
     )
     .await;
     caller.settled_run(&managed_id).await;
     wait_job(http, &url, token, &local_job, "cancelled").await;
+    hub.management(json!({"kind":"project_member","project_id":"project","user_id":bob["user_id"],"role":"contributor"})).await;
     caller.stop().await;
     let child_workspace = root.join("child/workspace");
     for (request_id, prompt, decision) in [
@@ -1137,33 +1304,35 @@ async fn real_hub_scenario() {
             "Shared approval must not be authorized through local IPC"
         );
         assert!(!child_workspace.join(filename).exists());
-        let old_approval_id = approval_id.to_owned();
-        let before_handover = job(http, &url, token, id).await;
+        let before_retired_request = job(http, &url, token, id).await;
         let model_requests = provider.requests.lock().unwrap().len();
-        shared_post(
-            http,
-            &url,
-            token,
-            &format!("jobs/{id}/handover"),
-            json!({"expected_revision":before_handover["revision"],"new_assignee_id":bob["user_id"]}),
-        ).await;
-        let renewed = wait_approval(http, &url, token, id).await;
-        let approval_id = renewed["id"].as_str().unwrap();
-        assert_ne!(approval_id, old_approval_id);
-        assert_eq!(renewed["attempt_id"], approval["attempt_id"]);
-        assert_eq!(renewed["request"], approval["request"]);
+        let retired = http
+            .post(format!("{url}/v1/shared/jobs/{id}/handover"))
+            .bearer_auth(token)
+            .json(&json!({"expected_revision":before_retired_request["revision"],"new_assignee_id":bob["user_id"]}))
+            .send().await.unwrap();
+        assert_eq!(retired.status(), reqwest::StatusCode::GONE);
+        let unchanged = wait_approval(http, &url, token, id).await;
+        assert_eq!(unchanged["id"], approval_id);
+        assert_eq!(unchanged["attempt_id"], approval["attempt_id"]);
+        assert_eq!(unchanged["request"], approval["request"]);
+        assert_eq!(unchanged["can_decide"], true);
         assert_eq!(
             provider.requests.lock().unwrap().len(),
             model_requests,
-            "Reconfirmation must not replay the model or tool"
+            "A retired control request must not replay the model or tool"
         );
         assert!(!child_workspace.join(filename).exists());
-        let after_handover = job(http, &url, token, id).await;
-        assert_eq!(after_handover["state"], "running");
-        assert_eq!(after_handover["assignee_id"], alice["user_id"]);
+        let after_retired_request = job(http, &url, token, id).await;
+        assert_eq!(after_retired_request["state"], "running");
+        assert_eq!(after_retired_request["assignee_id"], alice["user_id"]);
         assert_eq!(
-            after_handover["authority_generation"],
-            before_handover["authority_generation"]
+            after_retired_request["authority_generation"],
+            before_retired_request["authority_generation"]
+        );
+        assert_eq!(
+            after_retired_request["revision"],
+            before_retired_request["revision"]
         );
         let capacity = body(
             http.get(format!("{url}/v1/shared/environments?project_id=project"))
@@ -1182,14 +1351,14 @@ async fn real_hub_scenario() {
                 .unwrap()["occupied"],
             1
         );
-        let renewed_runs: Value = serde_json::from_slice(
+        let unchanged_runs: Value = serde_json::from_slice(
             &workers[1]
                 .command(&["list", "--runner", &workers[1].incarnation])
                 .stdout,
         )
         .unwrap();
         assert_eq!(
-            renewed_runs["runs"]
+            unchanged_runs["runs"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1197,22 +1366,24 @@ async fn real_hub_scenario() {
                 .unwrap()["run_id"],
             run_id
         );
-        for (caller, credential, request) in [
-            (http, token, old_approval_id.as_str()),
-            (&identities[1].http, bob_token, approval_id),
+        for (suffix, payload) in [
+            (
+                format!("approvals/{approval_id}/decision"),
+                json!({"decision":"approve"}),
+            ),
+            ("cancel".to_owned(), json!({})),
         ] {
-            let rejected = caller
-                .post(format!(
-                    "{url}/v1/shared/jobs/{id}/approvals/{request}/decision"
-                ))
-                .bearer_auth(credential)
-                .json(&json!({"decision":"approve"}))
+            let rejected = identities[1]
+                .http
+                .post(format!("{url}/v1/shared/jobs/{id}/{suffix}"))
+                .bearer_auth(bob_token)
+                .json(&payload)
                 .send()
                 .await
                 .unwrap();
             assert!(
-                !rejected.status().is_success(),
-                "Invalidated approval and pending new assignee cannot authorize the operation"
+                rejected.status() == reqwest::StatusCode::FORBIDDEN,
+                "The execution PC cannot approve or cancel another PC's instruction"
             );
         }
         assert!(!child_workspace.join(filename).exists());
@@ -1325,11 +1496,7 @@ async fn real_hub_scenario() {
         let requests = provider.requests.lock().unwrap();
         let handoff_requests = requests
             .iter()
-            .filter(|request| {
-                request["messages"]
-                    .to_string()
-                    .contains("guardian-handoff-fixture")
-            })
+            .filter(|request| fixture_task_text(request).contains("guardian-handoff-fixture"))
             .collect::<Vec<_>>();
         assert_eq!(
             handoff_requests.len(),
@@ -1408,17 +1575,108 @@ async fn real_hub_scenario() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|request| {
-            request["messages"]
-                .to_string()
-                .contains("paused-parent-fixture")
-        })
+        .filter(|request| fixture_task_text(request).contains("paused-parent-fixture"))
         .count();
     assert_eq!(
         paused_parent_calls, 1,
         "Cancellation settlement must never reenter the model"
     );
     wait_job(http, &url, token, paused_child, "cancelled").await;
+    // A child approval is controlled by the original PC. Denial and Stop must
+    // settle the whole lineage without ever sending the child error to the model
+    // as an invitation to choose another tool or repeat the operation.
+    for decision in ["deny", "stop"] {
+        let prompt = format!("child-decision-parent-fixture: {decision}");
+        let accepted = shared_post(
+            http,
+            &url,
+            token,
+            "jobs",
+            json!({
+                "request_id": format!("child-{decision}-request"), "project_id": "project",
+                "environment_id": "analysis", "title": "Child permission decision",
+                "input": {"version": 1, "prompt": prompt}, "descendant_budget": 1
+            }),
+        )
+        .await;
+        let id = accepted["id"].as_str().unwrap();
+        let waiting = wait_job(http, &url, token, id, "waiting_child").await;
+        let child = waiting["awaiting_child_id"].as_str().unwrap();
+        let approval = wait_approval(http, &url, token, child).await;
+        let approval_id = approval["id"].as_str().unwrap();
+        assert_eq!(approval["can_decide"], true);
+        assert!(!child_workspace.join("cancelled.txt").exists());
+        let executor_login = body(
+            identities[1]
+                .http
+                .post(format!("{url}/v1/shared/device-session"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(executor_login["principal"]["user_id"], bob["user_id"]);
+        let executor_reply = identities[1]
+            .http
+            .post(format!(
+                "{url}/v1/shared/jobs/{child}/approvals/{approval_id}/decision"
+            ))
+            .bearer_auth(executor_login["token"].as_str().unwrap())
+            .json(&json!({"decision":"approve"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            executor_reply.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "The authenticated executor cannot approve the controller's operation"
+        );
+        shared_post(
+            http,
+            &url,
+            token,
+            &format!("jobs/{child}/approvals/{approval_id}/decision"),
+            json!({"decision": decision}),
+        )
+        .await;
+        wait_job(http, &url, token, id, "cancelled").await;
+        wait_job(http, &url, token, child, "cancelled").await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let runs: Value = serde_json::from_slice(
+                &workers[1]
+                    .command(&["list", "--runner", &workers[1].incarnation])
+                    .stdout,
+            )
+            .unwrap();
+            let pending = runs["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["approval"]["approval_id"] == approval_id);
+            if !pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Denied child approval stayed pending: {runs}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!child_workspace.join("cancelled.txt").exists());
+        assert_eq!(
+            provider
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| fixture_task_text(request).contains(&prompt))
+                .count(),
+            1,
+            "Child {decision} must not resume the parent model"
+        );
+    }
     // Unlike the durable checkpoint case above, shutting down Hub during generation
     // interrupts its Gateway request. Report that failure without replay or Direct fallback.
     let interrupted = shared_post(http,&url,token,"jobs",json!({"request_id":"gateway-interruption","project_id":"project","environment_id":"solver","title":"Interrupt active Gateway request","input":{"version":1,"prompt":"gateway-interruption-fixture"},"descendant_budget":0})).await;
@@ -1429,11 +1687,7 @@ async fn real_hub_scenario() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| {
-                request["messages"]
-                    .to_string()
-                    .contains("gateway-interruption-fixture")
-            })
+            .filter(|request| fixture_task_text(request).contains("gateway-interruption-fixture"))
             .count()
     };
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -1528,11 +1782,7 @@ async fn real_hub_scenario() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| {
-                request["messages"]
-                    .to_string()
-                    .contains("shared-active-stop-fixture")
-            })
+            .filter(|request| fixture_task_text(request).contains("shared-active-stop-fixture"))
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -1663,9 +1913,7 @@ async fn real_hub_scenario() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| request["messages"]
-                .to_string()
-                .contains("shared-retained-stop-fixture"))
+            .filter(|request| fixture_task_text(request).contains("shared-retained-stop-fixture"))
             .count(),
         2,
         "Retained preview turn must not replay after stop"

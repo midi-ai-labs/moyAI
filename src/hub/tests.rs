@@ -7,6 +7,7 @@ fn catalog(revision: u64) -> HubCatalog {
         software_version: "0.1.0".into(),
         revision: CatalogRevision::new(revision).unwrap(),
         models: vec![HubModel {
+            system_prompt: String::new(),
             id: "coding".into(),
             label: "Coding".into(),
             capabilities: BTreeSet::from(["tools".into(), "text".into()]),
@@ -49,6 +50,30 @@ fn revision_wire_is_lossless_and_rejects_noncanonical_or_numeric_values() {
     ] {
         assert!(serde_json::from_str::<CatalogRevision>(raw).is_err());
     }
+}
+
+#[test]
+fn model_prompt_missing_defaults_empty_and_changes_require_a_new_review_revision() {
+    let previous = catalog(1);
+    let encoded = serde_json::to_value(&previous).unwrap();
+    assert!(encoded["models"][0].get("system_prompt").is_none());
+    assert_eq!(
+        serde_json::from_value::<HubCatalog>(encoded).unwrap(),
+        previous
+    );
+    let mut changed = previous.clone();
+    changed.models[0].system_prompt =
+        "日本語で回答してください。\n詳しい説明は必要なときだけ。".into();
+    assert_eq!(changed.diff(&previous), Err(HubError::InvalidCatalog));
+    changed.revision = CatalogRevision::new(2).unwrap();
+    assert_eq!(changed.diff(&previous).unwrap().changed, ["coding"]);
+    assert_eq!(
+        review(&previous).check_admission(&changed),
+        Err(HubError::ReviewRequired)
+    );
+    changed.models[0].system_prompt =
+        "界".repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS + 1);
+    assert_eq!(changed.validate(), Err(HubError::InvalidCatalog));
 }
 
 #[test]
@@ -121,6 +146,7 @@ fn selection_never_substitutes_removed_unselected_or_incapable_models() {
 fn selection_capability_intersection_matches_hub_wait_and_fallback_policies() {
     let mut current = catalog(1);
     current.models.push(HubModel {
+        system_prompt: String::new(),
         id: "text-only".into(),
         label: "Text only".into(),
         capabilities: BTreeSet::from(["text".into()]),
@@ -150,6 +176,7 @@ fn selection_limit_matches_the_hub_core_limit() {
     for index in 1..128 {
         let id = format!("alternative-{index}");
         current.models.push(HubModel {
+            system_prompt: String::new(),
             id: id.clone(),
             label: id.clone(),
             capabilities: BTreeSet::from(["tools".into()]),
@@ -161,6 +188,7 @@ fn selection_limit_matches_the_hub_core_limit() {
     selected.allowed_model_ids.insert("one-too-many".into());
     assert_eq!(selected.validate(&current), Err(HubError::InvalidSelection));
     current.models.push(HubModel {
+        system_prompt: String::new(),
         id: "one-too-many".into(),
         label: "One too many".into(),
         capabilities: BTreeSet::new(),
@@ -199,12 +227,15 @@ fn catalog_tokens_match_hub_vocabulary_while_labels_allow_unicode() {
 }
 
 #[test]
-fn maximum_public_catalog_fits_the_one_megabyte_transport_budget() {
+fn maximum_public_catalog_with_model_prompts_fits_transport_and_two_saved_baselines() {
     let mut current = catalog(u64::MAX);
     current.hub_id = "h".repeat(128);
     current.software_version = "\"".repeat(128);
     current.models = (0..128)
         .map(|index| HubModel {
+            // Six JSON bytes per scalar is the worst escaping expansion.
+            system_prompt: "\u{1}"
+                .repeat(crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS),
             id: format!("{index:03}{}", "m".repeat(125)),
             // Quotes need escaping in JSON, so this exercises the worst label expansion.
             label: "\"".repeat(256),
@@ -222,11 +253,42 @@ fn maximum_public_catalog_fits_the_one_megabyte_transport_budget() {
         .collect();
     current.validate().unwrap();
     let wire = serde_json::to_vec(&current).unwrap();
-    assert!(wire.len() <= 1024 * 1024);
+    assert!(wire.len() > 1024 * 1024);
+    assert!(wire.len() <= super::client::MAX_CATALOG_BYTES);
     assert_eq!(
         serde_json::from_slice::<HubCatalog>(&wire).unwrap(),
         current
     );
+    let model_id = current.models[0].id.clone();
+    let reviewed = ReviewedHubSelection::review(
+        &current,
+        &current.hub_id,
+        current.revision,
+        HubSelection {
+            allowed_model_ids: [model_id.clone()].into(),
+            preferred_model_id: model_id,
+            required_capabilities: BTreeSet::new(),
+            wait_policy: HubWaitPolicy::WaitForPreferred,
+            affinity_turns: 1,
+        },
+    )
+    .unwrap();
+    let baseline = HubCatalogBaseline::capture(&current);
+    let settings = HubSettings {
+        endpoint: "http://127.0.0.1:9470/".into(),
+        hub_id: Some(current.hub_id.clone()),
+        main_review: Some(reviewed.clone()),
+        side_chat_review: Some(reviewed),
+        main_catalog_baseline: Some(baseline.clone()),
+        side_chat_catalog_baseline: Some(baseline),
+        ..HubSettings::default()
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = HubSettingsStore::new(
+        camino::Utf8PathBuf::from_path_buf(directory.path().join("settings.json")).unwrap(),
+    );
+    let saved = store.save(&settings).unwrap();
+    assert_eq!(store.load().unwrap(), saved);
 }
 
 #[test]
@@ -235,6 +297,7 @@ fn diff_includes_add_remove_and_capability_change() {
     let mut new = catalog(2);
     new.models[0].capabilities.insert("vision".into());
     new.models.push(HubModel {
+        system_prompt: String::new(),
         id: "small".into(),
         label: "Small".into(),
         capabilities: BTreeSet::new(),
@@ -401,9 +464,11 @@ async fn unauthorized_and_large_responses_have_bounded_safe_errors() {
         .await;
     server.abort();
     assert_eq!(result, Err(HubError::Unauthorized));
-    let (endpoint, server) =
-        serve(Router::new().route("/v1/catalog", get(|| async { "x".repeat(1024 * 1024 + 1) })))
-            .await;
+    let (endpoint, server) = serve(Router::new().route(
+        "/v1/catalog",
+        get(|| async { "x".repeat(super::client::MAX_CATALOG_BYTES + 1) }),
+    ))
+    .await;
     let result = HubCatalogClient::new(&endpoint, "test-secret-0123456789-0123456789~", 1000)
         .unwrap()
         .catalog()

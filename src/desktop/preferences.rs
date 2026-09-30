@@ -22,6 +22,8 @@ pub enum DesktopOnboardingIntent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DesktopPreferences {
     pub last_workspace: Option<Utf8PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_id: Option<crate::session::SessionId>,
     pub window_opacity_percent: Option<i32>,
     #[serde(default)]
     pub deleted_project_roots: Vec<Utf8PathBuf>,
@@ -87,6 +89,7 @@ impl DesktopPreferences {
             .is_some_and(|workspace| workspace.starts_with(root))
         {
             self.last_workspace = None;
+            self.last_session_id = None;
         }
     }
 
@@ -170,6 +173,14 @@ mod tests {
             toml::from_str(&toml::to_string(&legacy).unwrap()).unwrap();
         assert_eq!(loaded.onboarding_intent, None);
         assert_eq!(loaded.window_opacity_percent, Some(95));
+        assert_eq!(loaded.last_session_id, None);
+        let with_session = DesktopPreferences {
+            last_session_id: Some(crate::session::SessionId::new()),
+            ..loaded
+        };
+        let roundtrip: DesktopPreferences =
+            toml::from_str(&toml::to_string(&with_session).unwrap()).unwrap();
+        assert_eq!(roundtrip.last_session_id, with_session.last_session_id);
     }
 
     #[test]
@@ -178,6 +189,7 @@ mod tests {
         let nested_workspace = root.join("bbb");
         let mut preferences = DesktopPreferences {
             last_workspace: Some(nested_workspace),
+            last_session_id: Some(crate::session::SessionId::new()),
             window_opacity_percent: Some(95),
             deleted_project_roots: Vec::new(),
             onboarding_intent: None,
@@ -188,6 +200,7 @@ mod tests {
 
         assert_eq!(preferences.deleted_project_roots, vec![root.to_path_buf()]);
         assert!(preferences.last_workspace.is_none());
+        assert!(preferences.last_session_id.is_none());
         assert!(preferences.is_project_deleted(root));
 
         preferences.unmark_project_deleted(root);
@@ -201,6 +214,7 @@ mod tests {
         let sibling = Utf8PathBuf::from("C:/workspace/deleted-sibling");
         let mut preferences = DesktopPreferences {
             last_workspace: Some(sibling.clone()),
+            last_session_id: None,
             window_opacity_percent: Some(95),
             deleted_project_roots: Vec::new(),
             onboarding_intent: None,

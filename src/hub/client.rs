@@ -10,7 +10,8 @@ use super::{
 };
 use crate::config::ProviderEndpoint;
 
-const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+// 128 models × 16,384 Unicode scalars, including JSON escaping and metadata.
+pub(super) const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn validated_endpoint(endpoint: &str) -> Result<reqwest::Url, HubError> {
     if endpoint.len() > 2048 {
@@ -293,6 +294,9 @@ impl HubCatalogClient {
                         Some("invalid_selection") => HubError::InvalidSelection,
                         Some("model_removed") => HubError::ModelRemoved,
                         Some("capability_mismatch") => HubError::CapabilityMismatch,
+                        Some("model_system_prompt_unsupported") => {
+                            HubError::ModelSystemPromptUnsupported
+                        }
                         Some("active_turn") => HubError::RouteBusy,
                         Some("lease_expired") => HubError::LeaseExpired,
                         Some("permit_expired") => HubError::PermitExpired,
@@ -410,12 +414,16 @@ impl RegisteredHubClient {
         turn_id: &str,
         request_id: &str,
         review: &ReviewedHubSelection,
+        supports_model_system_prompt: bool,
     ) -> Result<PreparedRequest, HubError> {
         let mut body = serde_json::json!({
             "id":self.id, "context":context, "turn_id":turn_id, "request_id":request_id,
             "expected_hub_id":review.hub_id, "reviewed_revision":review.reviewed_revision,
         });
         // Omission keeps ordinary turns compatible with older Hub releases.
+        if supports_model_system_prompt {
+            body["supports_model_system_prompt"] = serde_json::json!(true);
+        }
         // Preparation is explicit and cannot silently count as a user turn there.
         if purpose != HubRequestPurpose::UserTurn {
             body["purpose"] = serde_json::json!(purpose);
@@ -671,6 +679,7 @@ mod tests {
                 "same-turn",
                 "request-1",
                 &review,
+                false,
             )
             .await
             .unwrap();
@@ -684,6 +693,7 @@ mod tests {
                 "same-turn",
                 "request-2",
                 &review,
+                false,
             )
             .await
             .unwrap();

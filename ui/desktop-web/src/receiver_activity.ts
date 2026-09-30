@@ -21,7 +21,7 @@ export interface ReceiverService {
   project_id: string;
   conversation_id: string;
   environment_id: string;
-  expires_at_ms: number;
+  expires_at_ms: number | null;
   local_state: "running" | "stopping" | "stopped" | "unknown";
   uncertain: boolean;
 }
@@ -155,7 +155,7 @@ export function renderReceiverActivity(local: DeviceNetworkPresentation, shared?
         : service.local_state === "stopping" ? "停止を確認中"
         : service.local_state === "stopped" ? "停止済み・Hubへの報告待ち" : "このPCでアプリを起動中";
       const stop = receiverServiceStopEnabled(local, receiverServiceKey(service));
-      return `<div class="receiver-activity-item"><span>${esc(state)} · ${esc(detail)} · 保持期限 ${esc(new Date(service.expires_at_ms).toLocaleString("ja-JP"))}</span>${stop ? `<button class="run-stop-button danger" data-action="receiver-service-stop" data-value="${esc(receiverServiceKey(service))}" aria-label="このPCのアプリを停止">停止</button>` : ""}</div>`;
+      return `<div class="receiver-activity-item"><span>${esc(state)} · ${esc(detail)} · ${service.expires_at_ms == null ? "停止まで保持" : `保持期限 ${esc(new Date(service.expires_at_ms).toLocaleString("ja-JP"))}`}</span>${stop ? `<button class="run-stop-button danger" data-action="receiver-service-stop" data-value="${esc(receiverServiceKey(service))}" aria-label="このPCのアプリを停止">停止</button>` : ""}</div>`;
     }).join("")}</div>
     <small>同じ実行枠を使う新しい仕事は待機または拒否されます。入力や閲覧は続けられます。</small>
     ${activity.unavailable ? `<small>最終確認: ${activity.observed_at_ms === null ? "未確認" : esc(new Date(activity.observed_at_ms).toLocaleString("ja-JP"))}</small>` : ""}

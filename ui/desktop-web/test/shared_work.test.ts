@@ -53,7 +53,7 @@ test("continuation requires the Hub capability and sends the selected job revisi
     assert.deepEqual(sent, { expectedGeneration: "1", request: { kind: "continue", project_id: "project-a", job_id: "finished-a", expected_revision: 7, prompt: "追加の分析", start_before_ms: null } });
   } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
 });
-test("a chosen start deadline crosses the command boundary unchanged and invalid dates do not submit", async () => {
+test("normal chat submits without a total deadline even when an old draft contains one", async () => {
   const local = sharedUiFixture();
   local.title = "Timed work"; local.prompt = "Run when available"; local.environmentId = "env-a";
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -63,26 +63,17 @@ test("a chosen start deadline crosses the command boundary unchanged and invalid
   } } } });
   try {
     const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
-    for (const deadline of ["invalid-date", "2000-01-01T00:00"]) {
-      local.draft.startBefore = deadline;
-      await sharedWorkAction(context, "submit");
-      assert.equal(calls.length, 0);
-      assert.equal(local.pending, null);
-      assert.match(local.error, /未来の日時/);
-    }
-    const future = new Date(Date.now() + 86_400_000).toISOString();
-    local.draft.startBefore = future;
+    local.draft.startBefore = "2000-01-01T00:00";
     await sharedWorkAction(context, "submit");
-    assert.equal((calls[0].request as Record<string, unknown>).start_before_ms, new Date(future).getTime());
-    assert.equal(local.draft.startBefore, future);
+    assert.equal((calls[0].request as Record<string, unknown>).start_before_ms, null);
     await sharedWorkAction(context, "retry_submission");
     assert.deepEqual(calls[1].request, { kind: "retry_submission" });
   } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
 });
-test("new person and new detail clear continuation and handover drafts", () => {
-  const local = sharedUiFixture(); local.draft.followup = "private continuation"; local.draft.assigneeId = "private-user";
+test("new person and new detail clear continuation drafts", () => {
+  const local = sharedUiFixture(); local.draft.followup = "private continuation";
   acceptSharedWork(local, sharedProjection({ revision: "2", selected_job_id: "other-job" }));
-  assert.equal(local.draft.followup, ""); assert.equal(local.draft.assigneeId, "");
+  assert.equal(local.draft.followup, "");
   local.draft.followup = "private again";
   acceptSharedWork(local, sharedProjection({ revision: "3", generation: "2", principal: null }));
   assert.equal(Object.values(local.draft).join(""), "");
@@ -141,7 +132,7 @@ test("pending approval precedes the conversation with exact decision controls an
   local.projection!.approval.can_decide = false;
   html = renderSharedWork(sharedWorkPresentation(local));
   assert.doesNotMatch(html, /data-action="shared-(?:approve|deny|stop)"/);
-  assert.match(html, /担当者の承認待ち/);
+  assert.match(html, /依頼元の承認待ち/);
 });
 test("an actionable child approval is visible from its parent conversation and opens the exact notification", async () => {
   const local = sharedUiFixture();
@@ -227,4 +218,35 @@ test("a newer device generation clears drafts and a late poll cannot restore pri
   assert.equal(acceptSharedWork(local, sharedProjection({ revision: "2" })), false);
   assert.equal(local.projection?.principal, null);
   assert.doesNotMatch(renderSharedWork(local), /試験の仕事|利用者 A/);
+});
+
+ test("support UI has no transfer controls and rejects retired handover actions", () => {
+  const local = sharedUiFixture();
+  const html = renderWorkDetails(sharedWorkPresentation(local), "support");
+  assert.doesNotMatch(html, /担当の引継ぎ|次の担当者|data-shared-action="handover"/);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "handover", ""), false);
+});
+
+
+test("expired child reconfirmation sends only the currently projected origin target", async () => {
+  const local = sharedUiFixture();
+  local.projection!.approval = { id:"expired-a",attempt_id:"attempt-a",status:"expired",decision:null,
+    expires_at_ms:1,can_decide:false,can_reconfirm:true,request:{access:"shell",summary:"run",details:[],targets:[],outside_workspace:false,risks:[]},
+    context:{job_id:"child-b",project_id:"project-a",root_id:"job-a",conversation_id:"job-a",job_title:"Child",
+      controller_device_id:"WinA",controller_device_label:"WinA",execution_device_id:"WinB",execution_device_label:"WinB"} };
+  const original = Object.getOwnPropertyDescriptor(globalThis,"window");
+  const calls: Record<string,unknown>[] = [];
+  Object.defineProperty(globalThis,"window",{configurable:true,value:{__TAURI_INTERNALS__:{invoke:async (_name:string,args:Record<string,unknown>) => {
+    calls.push(args);return {...local.projection,revision:"2"};
+  }}}});
+  try {
+    const context = {uiState:{sharedWork:local},getViewState:()=>({overlay:"none",hub_project_open:true}),rerender:()=>{}} as unknown as ActionContext;
+    await sharedWorkAction(context,"reconfirm_approval","stale-id");
+    assert.equal(calls.length,0);
+    await sharedWorkAction(context,"reconfirm_approval","expired-a");
+    assert.deepEqual(calls[0],{expectedGeneration:"1",request:{kind:"reconfirm_approval",project_id:"project-a",job_id:"child-b",approval_id:"expired-a"}});
+    local.projection!.approval!.can_reconfirm = false;
+    await sharedWorkAction(context,"reconfirm_approval","expired-a");
+    assert.equal(calls.length,1);
+  } finally {if(original) Object.defineProperty(globalThis,"window",original);else delete (globalThis as Record<string,unknown>).window;}
 });

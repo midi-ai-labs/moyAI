@@ -72,6 +72,8 @@ pub struct DeviceExecutionProjection {
     pub access_mode: Option<AccessMode>,
     pub accepting: bool,
     #[serde(default)]
+    pub folder_change_blocked: bool,
+    #[serde(default)]
     pub autostart: bool,
     pub can_pause: bool,
     pub can_resume: bool,
@@ -104,7 +106,7 @@ pub struct ReceiverServiceProjection {
     pub project_id: String,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     pub local_state: String,
     pub uncertain: bool,
 }
@@ -659,6 +661,7 @@ impl DeviceNetworkService {
             view.access_mode = Some(template.access_mode);
         }
         view.accepting = status.accepting;
+        view.folder_change_blocked = status.folder_change_blocked;
         view.autostart = status.autostart;
         view.can_pause = status.mode == "shared" && status.state == "available";
         view.can_resume = status.mode == "shared"

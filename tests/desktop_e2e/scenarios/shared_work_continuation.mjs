@@ -11,13 +11,31 @@ import { snapshotOwnedTopLevelWindows, selectFreshOwnedRootWindow, openFilePathI
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot, invokeDesktopCommand } from "./observations.mjs";
 import { action, byId, hubSettingsCloseTarget, trustedClick, wait, enrollDesktopFromHubBrowser, requestHubEnrollmentExit } from "./hub_browser_enrollment.mjs";
-import { openHubProjectSurface, sharedActionTarget } from "./shared_work_navigation.mjs";
+import { openHubProjectSurface, sharedActionTarget, waitForSharedComposer } from "./shared_work_navigation.mjs";
 import { quiesceDeviceExecutionResources } from "./device_execution.mjs";
 import { exerciseProjectFolderRecovery } from "./project_folder_recovery.mjs";
 
 const fail = (message, evidence = {}) => new DesktopE2eError("product", "shared-continuation-mismatch", message, evidence);
 export const sameFixtureFolder = (actual, expected) => typeof actual === "string"
   && path.toNamespacedPath(path.resolve(actual)).toLowerCase() === path.toNamespacedPath(path.resolve(expected)).toLowerCase();
+
+export function sharedTurnSettled(projection, previousJobId = null) {
+  const job = projection.detail;
+  const admitted = Boolean(job?.id && job.id !== previousJobId && !job.parent_id);
+  if (!admitted) return Boolean(projection.error);
+  if (["failed", "cancelled"].includes(job.state) || job.uncertainty_reason) return true;
+  // A receipt can admit the new root before its following refresh encounters
+  // read backpressure. Await the ordinary poll's successful terminal projection.
+  return job.state === "succeeded" && !projection.error;
+}
+
+export function sharedTurnIdentityMatches(job, expected) {
+  return Boolean(job?.id && !job.parent_id && job.id !== expected.previousJobId
+    && (!expected.id || job.id === expected.id) && job.project_id === expected.projectId
+    && job.title === expected.title && job.input?.prompt === expected.prompt
+    && job.conversation_id === (expected.conversationId ?? job.id)
+    && (job.revises_job_id ?? null) === (expected.revisesJobId ?? null));
+}
 
 /** One actual Desktop and its independent Runner exercise the normal Hub chat twice. */
 export function createProjectFolderRecoveryScenario(options = {}) {
@@ -52,14 +70,23 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
       const { page, hub } = state.resource;
       const shared = () => invokeDesktopCommand(cdp, "shared_work_projection");
       const execution = () => invokeDesktopCommand(cdp, "device_execution_projection");
+      async function waitForTurn(label, expected) {
+        let admittedId = null;
+        return wait(label, shared, projection => {
+          const job = projection.detail;
+          if (job?.id && job.id !== expected.previousJobId && !job.parent_id) {
+            if (!sharedTurnIdentityMatches(job, { ...expected, id: admittedId }))
+              throw fail("The observed root differs from the submitted turn", { detail: job, expected: { ...expected, id: admittedId } });
+            admittedId ??= job.id;
+          }
+          return sharedTurnSettled(projection, expected.previousJobId);
+        }, 60000);
+      }
       async function click(target) { await trustedClick(state.input, cdp, target, sink); }
       async function fill(target, value) {
         // The conversation textarea is reached by a visible pointer click;
         // settings-dialog tab traversal does not model the chat composer.
-        await wait("The shared chat input is ready", () => cdp.evaluate(`(() => {
-          const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
-          return nodes.length === 1 && !nodes[0].disabled && !nodes[0].closest('[hidden]');
-        })()`), ready => ready === true, 15000);
+        await waitForSharedComposer(state.input, target);
         for (let attempt = 0; attempt < 3; attempt++) {
           await state.input.click(target, { stableHitSamples: 3 });
           await state.input.keyDown("Control"); await state.input.pressKey("a"); await state.input.keyUp("Control");
@@ -175,20 +202,24 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
         await click({ selector: `.sidebar button[data-action="open-hub-project"][data-value=${JSON.stringify(projectId)}]`, identity: { tag: "BUTTON", action: "open-hub-project" } });
         if (await cdp.evaluate(`Boolean(document.querySelector('#shared-environment, #shared-title, #shared-job-kind'))`))
           throw fail("The shared chat still asks the person to choose a PC, title or job type");
-        await fill(byId("shared-prompt", "TEXTAREA"), "desktop-conversation-start: このプロジェクトで短く答えてください。");
+        const firstPrompt = "desktop-conversation-start: このプロジェクトで短く答えてください。";
+        const title = Array.from(firstPrompt).slice(0, 64).join("");
+        await fill(byId("shared-prompt", "TEXTAREA"), firstPrompt);
         await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-before-send", owner: OWNER });
         await click(sharedActionTarget("submit"));
-        const first = await wait("Ordinary Send creates one Hub job and completes it", shared,
-          p => p.detail?.state === "succeeded" || p.error, 60000);
-        if (first.error || !first.detail?.id || !first.detail.conversation_id) throw fail("Common Send did not create a Hub job", { error: first.error, detail: first.detail });
+        const first = await waitForTurn("Ordinary Send creates one Hub job and completes it", { projectId, title, prompt: firstPrompt });
+        if (first.error || first.detail?.state !== "succeeded" || first.detail.uncertainty_reason || !first.detail.conversation_id)
+          throw fail("Common Send did not complete a Hub job", { error: first.error, detail: first.detail });
         const firstJobId = first.detail.id, conversationId = first.detail.conversation_id;
         await wait("First request and result appear in the same ordinary chat", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
           text => text?.includes("desktop-conversation-start") && text.includes("最初の依頼をこのプロジェクトで実行しました。"));
-        await fill(byId("shared-followup", "TEXTAREA"), "desktop-conversation-followup: 同じ会話で続けてください。");
+        const followupPrompt = "desktop-conversation-followup: 同じ会話で続けてください。";
+        await fill(byId("shared-followup", "TEXTAREA"), followupPrompt);
         await click(sharedActionTarget("continue"));
-        const second = await wait("Additional Send creates a later turn in the same Hub conversation", shared,
-          p => p.detail?.id !== firstJobId && (p.detail?.state === "succeeded" || p.error), 60000);
-        if (second.error || second.detail?.conversation_id !== conversationId) throw fail("Follow-up left the original conversation", { error: second.error, detail: second.detail, conversationId });
+        const second = await waitForTurn("Additional Send creates a later turn in the same Hub conversation",
+          { projectId, title, prompt: followupPrompt, previousJobId: firstJobId, conversationId });
+        if (second.error || second.detail?.state !== "succeeded" || second.detail.uncertainty_reason || second.detail.conversation_id !== conversationId)
+          throw fail("Follow-up did not complete in the original conversation", { error: second.error, detail: second.detail, conversationId });
         await wait("Both user turns and answers remain readable", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
           text => text?.includes("desktop-conversation-start") && text.includes("desktop-conversation-followup")
             && text.includes("最初の依頼をこのプロジェクトで実行しました。") && text.includes("追加の依頼にも、同じ共有チャットで回答しました。"));
@@ -211,11 +242,14 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
           input: Boolean(document.querySelector('#shared-revise-prompt')),
           warning: document.querySelector('[data-shared-region="revision-editor"]')?.innerText || ''
         })`), value => value.input && value.warning.includes("作成済みのファイルや起動中のアプリは元に戻りません"));
-        await fill(byId("shared-revise-prompt", "TEXTAREA"), "desktop-conversation-revised: 停止した最新の依頼を修正して回答してください。");
+        const revisedPrompt = "desktop-conversation-revised: 停止した最新の依頼を修正して回答してください。";
+        await fill(byId("shared-revise-prompt", "TEXTAREA"), revisedPrompt);
         await click(sharedActionTarget("save-revise"));
-        const revised = await wait("Resend creates a new job in the same conversation", shared,
-          p => p.detail?.id !== stoppedJobId && (p.detail?.state === "succeeded" || p.error), 60000);
-        if (revised.error || revised.detail?.conversation_id !== conversationId || revised.detail?.revises_job_id !== stoppedJobId)
+        const revised = await waitForTurn("Resend creates a new job in the same conversation",
+          { projectId, title: Array.from(revisedPrompt).slice(0, 64).join(""), prompt: revisedPrompt,
+            previousJobId: stoppedJobId, conversationId, revisesJobId: stoppedJobId });
+        if (revised.error || revised.detail?.state !== "succeeded" || revised.detail.uncertainty_reason
+          || revised.detail.conversation_id !== conversationId || revised.detail.revises_job_id !== stoppedJobId)
           throw fail("The edited latest message did not create the expected conversation revision", { error: revised.error,
             detail: revised.detail, conversationId, stoppedJobId });
         await wait("The revised answer and prior turns stay readable", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),

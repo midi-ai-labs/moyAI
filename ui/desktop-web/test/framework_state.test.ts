@@ -2678,6 +2678,111 @@ test("a stationary pointer keeps the DOM stable until lost capture releases only
   });
 });
 
+for (const altCode of ["AltLeft", "AltRight"]) {
+  for (const menuCode of [null, "Space", "F4"]) {
+    test(`native system menu leaves projections live when ${altCode} keyup is consumed (chord delivered: ${menuCode})`, () => {
+      withInteractionGate(({ documentTarget, windowTarget, input, lifecycle, applied, queueProjection }) => {
+        documentTarget.dispatch("keydown", { target: input, code: altCode, altKey: true, isComposing: false });
+        if (menuCode) {
+          documentTarget.dispatch("keydown", { target: input, code: menuCode, altKey: true, isComposing: false });
+        }
+        // The native menu consumes the corresponding keyups and Escape. No blur,
+        // web event, manual refresh, or inactivity recovery follows its dismissal.
+        windowTarget.advanceBy(0);
+        queueProjection(2);
+        assert.equal(lifecycle.active, false);
+        assert.deepEqual(applied, [2], "a new approval/progress projection must not remain hidden");
+        queueProjection(3);
+        assert.deepEqual(applied, [2, 3]);
+      });
+    });
+  }
+}
+
+for (const key of ["Alt", " ", "F4"]) {
+  test(`native system key without a physical code keeps projections live: ${JSON.stringify(key)}`, () => {
+    withInteractionGate(({ documentTarget, windowTarget, body, lifecycle, applied, queueProjection }) => {
+      // Actual WebView observation: trusted keydown Alt, code="", altKey=true,
+      // target BODY; the native menu consumes every following key and keyup.
+      documentTarget.dispatch("keydown", { target: body, key, code: "", altKey: true, isComposing: false });
+      windowTarget.advanceBy(0);
+      queueProjection(2);
+      queueProjection(3);
+      assert.equal(lifecycle.active, false);
+      assert.deepEqual(applied, [2, 3], "pending approvals/progress remain visible without blur recovery");
+    });
+  });
+}
+
+for (const key of [" ", "a", "AltGraph"]) {
+  test(`ordinary key without a physical code retains its existing hold: ${JSON.stringify(key)}`, () => {
+    withInteractionGate(({ documentTarget, windowTarget, input, body, lifecycle, applied, queueProjection }) => {
+      documentTarget.dispatch("keydown", { target: input, key, code: "", altKey: false, isComposing: false });
+      queueProjection(2);
+      assert.equal(lifecycle.active, true);
+      assert.deepEqual(applied, []);
+      documentTarget.dispatch("keyup", { target: body, key, code: "", altKey: false });
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, false);
+      assert.deepEqual(applied, [2]);
+    });
+  });
+}
+
+test("native Alt without a physical code does not end unrelated pointer or composition owners", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, body, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 47 });
+    documentTarget.dispatch("compositionstart");
+    documentTarget.dispatch("keydown", { target: body, key: "Alt", code: "", altKey: true, isComposing: false });
+    queueProjection(2);
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 47 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    documentTarget.dispatch("compositionend");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
+test("native menu keys do not release a separate pointer or IME interaction", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 31 });
+    documentTarget.dispatch("compositionstart");
+    documentTarget.dispatch("keydown", { target: input, code: "AltLeft", altKey: true, isComposing: false });
+    documentTarget.dispatch("keydown", { target: input, code: "Space", altKey: true, isComposing: false });
+    queueProjection(2);
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 31 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true, "composition still owns its draft");
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("compositionend");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
+test("Alt-modified text keys retain their own interaction through keyup across focus", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, body, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("keydown", { target: input, code: "AltRight", altKey: true, isComposing: false });
+    documentTarget.dispatch("keydown", { target: input, code: "KeyE", altKey: true, isComposing: false });
+    queueProjection(2);
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("keyup", { target: body, code: "KeyE", altKey: false });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
 test("a held key keeps the DOM stable until window blur explicitly recovers the lifecycle", () => {
   withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
     documentTarget.dispatch("keydown", {
@@ -3415,9 +3520,19 @@ test("project and quick-chat rows expose selected and background task activity",
   }));
   const selectedQuickChat = buttonFor(quickSidebar, `chat-session:${SESSION_A}`);
   assert.match(selectedQuickChat, /data-task-activity="running"/);
-  assert.match(selectedQuickChat, /<small>実行中 · active turn<\/small>/);
+  assert.match(selectedQuickChat, /<small>実行中 · 現在の依頼<\/small>/);
   assert.match(buttonFor(quickSidebar, "chat-session:session-c"), /data-task-activity="attention"/);
   assert.doesNotMatch(buttonFor(quickSidebar, "chat-session:session-d"), /task-activity-indicator/);
+});
+
+test("sidebar distinguishes a failed run from unavailable session state", () => {
+  for (const status of ["failed", "completed"] as const) {
+    const base = projection();
+    const row = { ...base.session_rows[0]!, status, loaded_status: "system_error" as const };
+    const html = renderSidebar(projection({ session_rows: [row], chat_session_rows: [row] }));
+    assert.match(html, status === "failed" ? /実行に失敗しました · 会話を開いて確認/ : /状態を確認できません · 会話を開いて確認/);
+    assert.doesNotMatch(html, /状態取得エラー/);
+  }
 });
 
 test("access-mode control consumes the Rust mutation capability", () => {

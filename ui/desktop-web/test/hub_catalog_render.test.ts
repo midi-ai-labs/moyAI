@@ -44,6 +44,16 @@ test("missing legacy, disconnected and invalid baselines never claim unchanged",
   assert.match(policyOnly, /割当方針などの変更は下の変更履歴も確認/);
 });
 
+test("model prompt changes display escaped reviewed and current instructions", () => {
+  const before = { id: "jp", label: "日本語モデル", capabilities: ["chat"], system_prompt: "Old rule" };
+  const after = { ...before, system_prompt: "日本語で回答。\n<script>unchanged text</script>" };
+  const html = renderHubCatalogComparison(comparison({ models: [{ id: "jp", before, after }], software_after: "0.1.0" }), "main");
+  assert.match(html, /システムプロンプト/);
+  assert.match(html, /Old rule/);
+  assert.match(html, /日本語で回答。\n&lt;script&gt;unchanged text&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+});
+
 test("Main and Side show their own reviewed revisions inside independent retained settings regions", () => {
   const state = createHubUiState();
   state.projection = {

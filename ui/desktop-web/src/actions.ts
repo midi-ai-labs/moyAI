@@ -1581,7 +1581,7 @@ const ACTION_DEFINITIONS = [
   { id: "receiver-service-stop", label: "このPCのアプリを停止", enabled: (_state, payload, model) => receiverServiceStopEnabled(model.local.deviceNetwork, payload.value), run: (_state, context, payload) => stopReceiverService(context, payload.value) },
   { id: "origin-stop-apps", label: "この会話の起動中のアプリを停止", enabled: (state, _payload, model) => !state.hub_project_open && originAppsStopEnabled(model.local.deviceNetwork), run: (_state, context) => stopOriginApps(context) },
   { id: "origin-stop-all", label: "この会話の実行をすべて停止", enabled: (state, _payload, model) => !state.hub_project_open && originAllStopEnabled(model.local.deviceNetwork), run: (_state, context) => stopOriginAll(context) },
-  ...["refresh", "open-management", "new-conversation", "detail", "retry-submission", "cancel", "stop-service", "stop-conversation", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "history-next", "handover", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
+  ...["refresh", "open-management", "new-conversation", "detail", "retry-submission", "cancel", "stop-service", "stop-conversation", "next-jobs", "next-environments", "reconnect", "import", "approve", "deny", "stop", "reconfirm-approval", "prepare-sample", "upload-inputs", "remove-input", "save-asset", "import-asset", "transcript-next", "history-next", "inbox-open", "inbox-next", "inbox-latest"].map(kind => ({
     id: `shared-${kind}`, label: "共有仕事の操作",
     enabled: (state: DesktopViewState, payload: ActionPayload, model: DesktopRenderModel) => state.hub_project_open === true && sharedWorkActionEnabled(model.local.sharedWork, kind, payload.value),
     run: (_state: DesktopViewState, context: ActionContext, payload: ActionPayload) => sharedWorkAction(context, kind.replaceAll("-", "_"), payload.value),
@@ -2534,7 +2534,7 @@ const ACTION_DEFINITIONS = [
     run: async (_state, context) => context.setWindowMaximized(await command<boolean>("toggle_maximize_window")),
   },
   { id: "close-window", label: "ウィンドウを閉じる（トレイに格納）", enabled: always, run: (_state, context) => command("hide_to_tray").catch(() => context.desktopWindow.hide()) },
-  { id: "exit-app", label: "moyAIを終了", menu: "file", palette: true, enabled: always, run: () => command("exit_app") },
+  { id: "exit-app", label: "moyAIを終了（このPCの仕事も停止）", menu: "file", palette: true, enabled: always, run: () => command("exit_app") },
 ] satisfies readonly ActionSourceDefinition[];
 
 export type ActionId = typeof ACTION_DEFINITIONS[number]["id"];

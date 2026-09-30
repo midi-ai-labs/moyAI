@@ -46,7 +46,9 @@ export function renderConfirmation(
   const targets = confirmation.targets.length > 0 ? confirmation.targets.join(", ") : "(なし)";
   const risks = confirmation.risks.length > 0 ? confirmation.risks.map(permissionRiskLabel).join("、") : "追加の検出事項なし";
   const reviewReason = permissionReviewReason(confirmation.details);
-  const details = confirmation.details.length > 0 ? confirmation.details.filter(detail => !detail.startsWith(guardianReasonPrefix)).map(permissionDetailLabel).join("\n\n") : "なし";
+  const operationDetails = confirmation.details.filter(detail => !detail.startsWith(guardianReasonPrefix));
+  const details = operationDetails.length > 0 ? [...operationDetails.filter(detail => detail.startsWith("Workdir: ")),
+    ...operationDetails.filter(detail => !detail.startsWith("Workdir: "))].map(permissionDetailLabel).join("\n\n") : "なし";
   const agentPath = state.confirmation?.agent_path?.trim() ?? "";
   const agentTaskName = state.confirmation?.agent_task_name?.trim() ?? "";
   const remote = state.confirmation?.remote;
@@ -83,21 +85,21 @@ export function renderConfirmation(
     <div class="modal-backdrop">
       <section class="modal confirmation permission-confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1" data-permission-id="${escapeHtml(requestId)}" ${pending ? 'aria-busy="true"' : ""}>
         <header class="permission-header">
-          <h2 id="permission-title">${remote ? "受入タスクの操作を確認" : "確認が必要です"}</h2>
+          <h2 id="permission-title">あなたの承認を待っています</h2>
           ${remote || agentPath ? `<dl class="confirm-details permission-context">
             ${remote ? `<dt>依頼元</dt><dd title="${escapeHtml(remote.requester_label || "登録端末")}">${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd title="${escapeHtml(remote.target_label)}">${escapeHtml(remote.target_label)}</dd>` : ""}
             ${agentPath ? `<dt>要求元</dt><dd>${renderPermissionAgentIdentity(agentPath, agentTaskName)}</dd>` : ""}
           </dl>` : ""}
         </header>
         <section class="permission-review-body" role="region" aria-label="操作の詳細" tabindex="0" data-focus-key="permission:${escapeHtml(requestId)}:details">
-          ${reviewReason ? `<p><strong>確認が必要な理由</strong><br>${escapeHtml(reviewReason)}</p>` : ""}
           <div class="confirm-summary" id="permission-summary">${escapeHtml(permissionDetailLabel(confirmation.summary))}</div>
+          <dl class="confirm-details"><dt>対象</dt><dd>${escapeHtml(targets)}</dd></dl>
+          <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
+          ${reviewReason ? `<p><strong>確認が必要な理由</strong><br>${escapeHtml(reviewReason)}</p>` : ""}
           <dl class="confirm-details">
             ${remote ? `<dt>依頼元</dt><dd>${escapeHtml(remote.requester_label || "登録端末")}</dd><dt>受入場所</dt><dd>${escapeHtml(remote.target_label)}</dd><dt>受入タスク</dt><dd>${escapeHtml(remote.job_id)}</dd>` : ""}
-            <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
-            <dt>操作前の確認事項</dt><dd>${escapeHtml(risks)}<br><small>実際の動作は、下の操作内容を確認してください。</small></dd>
+            <dt>操作前の確認事項</dt><dd>${escapeHtml(risks)}<br><small>実際の動作は、上の操作内容を確認してください。</small></dd>
           </dl>
-          <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
           ${confirmation.details.length ? `<details><summary>操作情報の原文</summary><pre class="confirm-command">${escapeHtml(confirmation.details.join("\n"))}</pre></details>` : ""}
         </section>
         <footer class="permission-footer">

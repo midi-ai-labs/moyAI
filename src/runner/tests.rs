@@ -2,6 +2,57 @@ use super::*;
 use crate::cli::{ConfirmationOutcome, ConfirmationPrompt};
 use crate::protocol::ToolApprovalDecision;
 
+#[tokio::test]
+async fn runner_shutdown_waits_for_final_shared_work_before_all_waiters_finish() {
+    let base = camino::Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("project_sandbox/desktop-runner-shutdown");
+    std::fs::create_dir_all(&base).unwrap();
+    let temp = tempfile::tempdir_in(base).unwrap();
+    let root = camino::Utf8Path::from_path(temp.path()).unwrap();
+    let paths = StoragePaths {
+        data_dir: root.join("data"),
+        database_path: root.join("data/db.sqlite3"),
+        truncation_dir: root.join("data/output"),
+    };
+    let sqlite = SqliteStore::open(&paths).unwrap();
+    sqlite.migrate().unwrap();
+    let process = AppBootstrap::create_process_runtime(StoreBundle::new(sqlite))
+        .await
+        .unwrap();
+    let host = RunnerHost::from_process(process).unwrap();
+    let (release, pending) = tokio::sync::oneshot::channel::<()>();
+    let settled = root.join("final-journal-pass");
+    let marker = settled.clone();
+    *host.inner.shared_worker.lock().await = Some(tokio::spawn(async move {
+        pending.await.unwrap();
+        std::fs::write(marker, "settled").unwrap();
+    }));
+    host.begin_shutdown().unwrap();
+    host.wait_stopped().await;
+    let a = host.clone();
+    let b = host.clone();
+    let mut first = tokio::spawn(async move { a.wait_shutdown().await });
+    let mut second = tokio::spawn(async move { b.wait_shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut first)
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut second)
+            .await
+            .is_err()
+    );
+    assert!(!settled.exists());
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert!(settled.is_file());
+    assert!(host.inner.shared_worker.lock().await.is_none());
+}
+
 #[test]
 fn local_approval_is_bound_to_one_run_and_consumed_once() {
     let approvals = approval::LocalApprovals::default();

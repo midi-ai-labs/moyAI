@@ -59,7 +59,7 @@ test("long permission details have a keyboard-readable region separate from iden
   assert.ok(header, "permission identity must be outside the scrollable operation details");
   assert.ok(review, "complete details must remain accessible in their own named region");
   assert.ok(footer, "decision actions and status must remain outside the details region");
-  assert.match(header, /id="permission-title">受入タスクの操作を確認/);
+  assert.match(header, /id="permission-title">あなたの承認を待っています/);
   assert.match(header, /依頼元/);
   assert.match(header, /受入場所/);
   assert.match(header, /WinA &lt;controller&gt;/);

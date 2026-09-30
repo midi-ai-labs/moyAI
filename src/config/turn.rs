@@ -355,7 +355,6 @@ impl ProviderTarget {
         self.stream_limits
     }
 
-    #[cfg(test)]
     pub(crate) fn replace_request_limits(&mut self, request_limits: ProviderRequestLimits) {
         self.request_limits = request_limits;
     }

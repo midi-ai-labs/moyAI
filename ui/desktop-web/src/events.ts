@@ -1,5 +1,5 @@
 import { command } from "./api.ts";
-import { editHubField } from "./hub_state.ts";
+import { clearHubError, editHubField } from "./hub_state.ts";
 import { editDeviceNetworkField } from "./device_network_state.ts";
 import { editSharedWork } from "./shared_work_state.ts";
 import { editMcpPeerField } from "./mcp_peer.ts";
@@ -679,7 +679,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     if (target.dataset.hubField !== undefined) {
       if (!["hub", "config"].includes(context.getViewState()?.overlay ?? "")) return;
       editHubField(context.uiState.hub, target.dataset.hubField ?? "", target.value, target instanceof HTMLInputElement && target.checked);
-      context.uiState.hub.error = "";
+      clearHubError(context.uiState.hub);
       context.rerender();
       return;
     }

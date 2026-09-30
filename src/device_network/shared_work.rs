@@ -17,7 +17,7 @@ mod origin;
 mod providing;
 mod receipts;
 mod runner_service;
-pub use collaboration::{WorkHandover, WorkInbox};
+pub use collaboration::WorkInbox;
 pub use files::WorkAsset;
 pub use origin::OriginWorkProjection;
 use receipts::{Receipt, ReceiptOperation, ReceiptStore};
@@ -102,8 +102,6 @@ pub struct WorkSummary {
     pub can_revise: bool,
     #[serde(default)]
     pub revises_job_id: Option<String>,
-    #[serde(default)]
-    pub can_handover: bool,
     #[serde(default)]
     pub conversation_epoch: u64,
     pub revision: u64,
@@ -196,8 +194,6 @@ pub struct WorkDetail {
     #[serde(default)]
     pub revises_job_id: Option<String>,
     #[serde(default)]
-    pub can_handover: bool,
-    #[serde(default)]
     pub conversation_epoch: u64,
     #[serde(default)]
     pub retained_services: Vec<WorkRetainedService>,
@@ -207,7 +203,7 @@ pub struct WorkDetail {
 pub struct WorkRetainedService {
     pub service_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     pub stop_requested: bool,
     pub uncertain: bool,
     #[serde(default)]
@@ -217,6 +213,20 @@ pub struct WorkRetainedService {
 pub struct WorkTranscript {
     pub items: Vec<WorkTranscriptItem>,
     pub next_after: Option<u64>,
+    #[serde(default)]
+    pub activity: Option<WorkActivity>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkActivity {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub environment_id: String,
+    pub runner_id: String,
+    pub revision: u64,
+    pub observed_at_ms: u64,
+    pub items: Vec<WorkTranscriptItem>,
+    pub truncated: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkTranscriptItem {
@@ -308,7 +318,6 @@ pub struct SharedWorkProjection {
     pub assets: Vec<WorkAsset>,
     pub transcript: Option<WorkTranscript>,
     pub conversation_history: Option<WorkConversationHistory>,
-    pub handover: Option<WorkHandover>,
     pub inbox: Option<WorkInbox>,
     pub provider: Option<crate::runner::operations::RunnerOperationsProjection>,
     pub provider_draft: Option<crate::runner::provision::ProvisionTemplate>,
@@ -347,6 +356,7 @@ pub enum SharedWorkCommand {
     },
     LeaveProject {
         project_id: String,
+        expected_participation_generation: u64,
     },
     BindProjectFolder {
         project_id: String,
@@ -418,12 +428,6 @@ pub enum SharedWorkCommand {
         project_id: String,
         conversation_id: String,
     },
-    Handover {
-        project_id: String,
-        job_id: String,
-        expected_revision: u64,
-        new_assignee_id: String,
-    },
     InboxNext,
     InboxLatest,
     InboxOpen {
@@ -458,6 +462,11 @@ pub enum SharedWorkCommand {
         project_id: String,
         service_id: String,
     },
+    ReconfirmApproval {
+        project_id: String,
+        job_id: String,
+        approval_id: String,
+    },
     Decide {
         project_id: String,
         job_id: String,
@@ -474,6 +483,39 @@ pub struct WorkApproval {
     pub decision: Option<String>,
     pub expires_at_ms: u64,
     pub can_decide: bool,
+    #[serde(default)]
+    pub can_reconfirm: bool,
+    #[serde(default)]
+    pub context: Option<WorkApprovalContext>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkApprovalContext {
+    pub job_id: String,
+    pub project_id: String,
+    pub root_id: String,
+    pub conversation_id: String,
+    pub job_title: String,
+    pub controller_device_id: Option<String>,
+    pub controller_device_label: Option<String>,
+    pub execution_device_id: String,
+    pub execution_device_label: Option<String>,
+}
+impl WorkApproval {
+    fn target_for_detail<'a>(&'a self, detail: &'a WorkDetail) -> Option<&'a str> {
+        match &self.context {
+            Some(context)
+                if context.project_id == detail.project_id
+                    && context.root_id == detail.root_id
+                    && context.conversation_id
+                        == detail.conversation_id.as_deref().unwrap_or(&detail.root_id)
+                    && super::stable_id(&context.job_id) =>
+            {
+                Some(&context.job_id)
+            }
+            Some(_) => None,
+            None => Some(&detail.id),
+        }
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -495,7 +537,11 @@ struct Session {
     #[serde(default)]
     project_access: Option<String>,
 }
-pub(super) struct SharedWorkOwner(Mutex<Runtime>, tokio::sync::Mutex<()>);
+pub(super) struct SharedWorkOwner(
+    Mutex<Runtime>,
+    tokio::sync::Mutex<()>,
+    tokio::sync::Mutex<()>,
+);
 impl SharedWorkOwner {
     pub fn new(path: camino::Utf8PathBuf) -> Self {
         Self(
@@ -503,6 +549,7 @@ impl SharedWorkOwner {
                 receipts: ReceiptStore::new(path),
                 ..Runtime::default()
             }),
+            tokio::sync::Mutex::new(()),
             tokio::sync::Mutex::new(()),
         )
     }
@@ -656,14 +703,19 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn submission_start_deadline(requested: Option<u64>, now: u64) -> Result<u64, RequestError> {
-    let deadline = requested.unwrap_or_else(|| now.saturating_add(24 * 60 * 60 * 1000));
+fn submission_start_deadline(
+    requested: Option<u64>,
+    now: u64,
+) -> Result<Option<u64>, RequestError> {
+    let Some(deadline) = requested else {
+        return Ok(None);
+    };
     if deadline <= now || deadline > i64::MAX as u64 {
         return Err(RequestError::Local(
-            "開始期限には未来の日時を指定してください。空欄の場合は投入から24時間です。",
+            "開始期限には未来の日時を指定してください。省略した場合、待機時間の上限はありません。",
         ));
     }
-    Ok(deadline)
+    Ok(Some(deadline))
 }
 
 impl DeviceNetworkService {
@@ -773,7 +825,7 @@ impl DeviceNetworkService {
         let Some(connection) = self.shared_connection() else {
             return self.shared_failure(RequestError::Unavailable);
         };
-        let (generation, query, token) = {
+        let (generation, query, _) = {
             let mut runtime = self.inner.shared_work.0.lock().unwrap();
             if expected_generation != runtime.generation.to_string() {
                 return runtime.projection(true, connection.client.endpoint());
@@ -781,7 +833,7 @@ impl DeviceNetworkService {
             runtime.begin_command(&command)
         };
         let result = self
-            .shared_execute(&connection, generation, query, token.as_deref(), command)
+            .shared_execute(&connection, generation, query, command)
             .await;
         if self.shared_current(&connection, generation, query) {
             if let Err(error) = result {
@@ -820,11 +872,10 @@ impl DeviceNetworkService {
         connection: &Connection,
         generation: u64,
         query: u64,
-        token: Option<&str>,
         command: SharedWorkCommand,
     ) -> Result<(), RequestError> {
         let current_token = self
-            .shared_authenticate(connection, generation, query, token)
+            .shared_authenticate(connection, generation, query)
             .await?;
         let token = current_token.as_str();
         match command {
@@ -851,7 +902,6 @@ impl DeviceNetworkService {
                 runtime.view.assets.clear();
                 runtime.view.transcript = None;
                 runtime.view.conversation_history = None;
-                runtime.view.handover = None;
                 runtime.transcript_after = 0;
                 runtime.history_before = None;
                 runtime.before = None;
@@ -868,7 +918,6 @@ impl DeviceNetworkService {
                 runtime.view.assets.clear();
                 runtime.view.transcript = None;
                 runtime.view.conversation_history = None;
-                runtime.view.handover = None;
                 runtime.transcript_after = 0;
                 runtime.history_before = None;
             }
@@ -895,7 +944,6 @@ impl DeviceNetworkService {
                 runtime.view.assets.clear();
                 runtime.view.transcript = None;
                 runtime.view.conversation_history = None;
-                runtime.view.handover = None;
                 runtime.transcript_after = 0;
                 runtime.history_before = None;
             }
@@ -979,8 +1027,11 @@ impl DeviceNetworkService {
                     "会話の停止を依頼しました。停止を確認すると一覧から削除されます。".into()
                 });
             }
-            SharedWorkCommand::LeaveProject { project_id } => {
-                if !super::stable_id(&project_id) {
+            SharedWorkCommand::LeaveProject {
+                project_id,
+                expected_participation_generation,
+            } => {
+                if !super::stable_id(&project_id) || expected_participation_generation == 0 {
                     return Err(RequestError::Invalid);
                 }
                 // A receiver-only PC does not appear in the controller's /projects list.
@@ -1017,7 +1068,9 @@ impl DeviceNetworkService {
                         .find(|project| project.id == project_id && project.can_execute)
                         .map(|project| project.participation_generation)
                 });
-                if projected_generation != Some(current_generation) {
+                if projected_generation != Some(expected_participation_generation)
+                    || current_generation != expected_participation_generation
+                {
                     return Err(RequestError::Local(
                         "このPCのプロジェクト参加が更新されました。最新の状態を確認してください。",
                     ));
@@ -1101,7 +1154,6 @@ impl DeviceNetworkService {
                 runtime.view.assets.clear();
                 runtime.view.transcript = None;
                 runtime.view.conversation_history = None;
-                runtime.view.handover = None;
                 runtime.transcript_after = 0;
                 runtime.history_before = None;
             }
@@ -1289,14 +1341,6 @@ impl DeviceNetworkService {
                     let detail = runtime.view.detail.as_ref().ok_or(RequestError::Local(
                         "編集する発言の最新状態を確認してください。",
                     ))?;
-                    if detail.input["input_refs"]
-                        .as_array()
-                        .is_some_and(|refs| !refs.is_empty())
-                    {
-                        return Err(RequestError::Local(
-                            "添付付きの依頼は編集できません。新しい依頼として送ってください。",
-                        ));
-                    }
                     if detail.id != job_id
                         || detail.project_id != project_id
                         || detail.conversation_id.as_deref().unwrap_or(&detail.root_id)
@@ -1314,6 +1358,11 @@ impl DeviceNetworkService {
                             "停止した最新の発言だけを編集できます。現在の会話を確認してください。",
                         ));
                     }
+                    let retained_inputs = detail
+                        .input
+                        .get("input_refs")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
                     let user_id = runtime
                         .view
                         .principal
@@ -1334,7 +1383,7 @@ impl DeviceNetworkService {
                             "revises_job_id":job_id,
                             "expected_revised_revision":expected_revision,
                             "title":title,
-                            "input":{"version":2,"prompt":prompt,"input_refs":runtime.view.inputs.iter().map(|asset|asset.id.as_str()).collect::<Vec<_>>()},
+                            "input":{"version":2,"prompt":prompt,"input_refs":retained_inputs},
                             "descendant_budget":8,
                             "start_before_ms":null
                         }),
@@ -1476,24 +1525,6 @@ impl DeviceNetworkService {
                         .into(),
                 );
             }
-            SharedWorkCommand::Handover {
-                project_id,
-                job_id,
-                expected_revision,
-                new_assignee_id,
-            } => {
-                self.shared_handover(
-                    connection,
-                    generation,
-                    query,
-                    token,
-                    &project_id,
-                    &job_id,
-                    expected_revision,
-                    &new_assignee_id,
-                )
-                .await?;
-            }
             SharedWorkCommand::InboxNext => {
                 let mut runtime = self.inner.shared_work.0.lock().unwrap();
                 runtime.require_current(generation, query)?;
@@ -1597,6 +1628,37 @@ impl DeviceNetworkService {
                 )
                 .await?;
             }
+            SharedWorkCommand::ReconfirmApproval {
+                project_id,
+                job_id,
+                approval_id,
+            } => {
+                {
+                    let runtime = self.inner.shared_work.0.lock().unwrap();
+                    runtime.require_project(&project_id, generation, query)?;
+                    if !runtime.view.approval.as_ref().is_some_and(|approval| {
+                        approval.id == approval_id
+                            && approval.status == "expired"
+                            && approval.can_reconfirm
+                            && runtime.view.detail.as_ref().is_some_and(|detail| {
+                                runtime.view.selected_job_id.as_deref() == Some(&detail.id)
+                                    && approval.target_for_detail(detail) == Some(job_id.as_str())
+                            })
+                    }) {
+                        return Err(RequestError::Local(
+                            "最新の確認待ちの操作を確認してください。",
+                        ));
+                    }
+                }
+                request::<Value>(
+                    &connection.client,
+                    &format!("jobs/{job_id}/approvals/{approval_id}/reconfirm"),
+                    Some(token),
+                    Some(json!({})),
+                    &[],
+                )
+                .await?;
+            }
             SharedWorkCommand::Decide {
                 project_id,
                 job_id,
@@ -1606,14 +1668,16 @@ impl DeviceNetworkService {
                 {
                     let runtime = self.inner.shared_work.0.lock().unwrap();
                     runtime.require_project(&project_id, generation, query)?;
-                    if runtime.view.selected_job_id.as_deref() != Some(&job_id)
-                        || !runtime.view.approval.as_ref().is_some_and(|a| {
-                            a.id == approval_id
-                                && a.status == "pending"
-                                && a.can_decide
-                                && a.expires_at_ms > now_ms()
-                        })
-                    {
+                    if !runtime.view.approval.as_ref().is_some_and(|a| {
+                        a.id == approval_id
+                            && a.status == "pending"
+                            && a.can_decide
+                            && a.expires_at_ms > now_ms()
+                            && runtime.view.detail.as_ref().is_some_and(|detail| {
+                                runtime.view.selected_job_id.as_deref() == Some(&detail.id)
+                                    && a.target_for_detail(detail) == Some(job_id.as_str())
+                            })
+                    }) {
                         return Err(RequestError::Local("最新の承認依頼を確認してください。"));
                     }
                 }
@@ -1752,7 +1816,13 @@ impl DeviceNetworkService {
                 .receipts
                 .remove_confirmed(&receipt)?;
         }
-        let job = result?;
+        let job = result.map_err(|error| {
+            if receipt.payload.get("revises_job_id").is_some()
+                && matches!(error, RequestError::Http(404))
+            {
+                RequestError::Local("元の依頼または添付が見つからないため、再送していません。最新の会話を確認し、必要なら添付し直して新しい依頼を送ってください。")
+            } else { error }
+        })?;
         if !self.shared_current(connection, generation, query) {
             return Ok(());
         }
@@ -1775,9 +1845,19 @@ impl DeviceNetworkService {
             runtime.view.conversation_history = None;
         }
         runtime.view.detail = Some(job);
-        runtime.view.inputs.clear();
+        // Consume only this receipt's attachments. A text revision retains the original
+        // immutable references and must not silently discard an unrelated upload draft.
+        let submitted_inputs = receipt
+            .payload
+            .get("input")
+            .unwrap_or(&receipt.payload)
+            .get("input_refs")
+            .and_then(Value::as_array);
+        runtime.view.inputs.retain(|asset| {
+            !submitted_inputs
+                .is_some_and(|refs| refs.iter().any(|id| id.as_str() == Some(asset.id.as_str())))
+        });
         runtime.view.approval = None;
-        runtime.view.handover = None;
         runtime.transcript_after = 0;
         runtime.history_before = None;
         runtime.before = None;
@@ -1840,6 +1920,54 @@ impl DeviceNetworkService {
             runtime.view.principal = Some(session.principal);
             runtime.view.expires_at_ms = Some(session.expires_at_ms);
             runtime.view.project_access = session.project_access;
+            let selected_rejoined =
+                runtime
+                    .view
+                    .selected_project_id
+                    .as_ref()
+                    .is_some_and(|selected| {
+                        runtime
+                            .view
+                            .projects
+                            .iter()
+                            .find(|old| &old.id == selected)
+                            .is_some_and(|old| {
+                                projects
+                                    .iter()
+                                    .find(|next| next.id == old.id)
+                                    .is_some_and(|next| {
+                                        next.participation_generation
+                                            != old.participation_generation
+                                    })
+                            })
+                    });
+            if selected_rejoined {
+                // A rejoin is a new participation, even if both observations have
+                // the same project ID. Retire old UI targets before another command
+                // can attach them to the newly authorized participation.
+                runtime.generation += 1;
+                runtime.query += 1;
+                runtime.view.projects = projects;
+                runtime.view.projects_stale = false;
+                runtime.view.conversations.clear();
+                runtime.view.conversation_revision.clear();
+                runtime.view.selected_conversation_id = None;
+                runtime.view.selected_job_id = None;
+                runtime.view.status = None;
+                runtime.view.detail = None;
+                runtime.view.approval = None;
+                runtime.view.inputs.clear();
+                runtime.view.assets.clear();
+                runtime.view.transcript = None;
+                runtime.view.conversation_history = None;
+                runtime.view.inbox = None;
+                runtime.transcript_after = 0;
+                runtime.history_before = None;
+                runtime.before = None;
+                runtime.environment_before = None;
+                runtime.view.observed_at_ms = Some(now_ms());
+                return Ok(());
+            }
             if !projects
                 .iter()
                 .any(|p| Some(&p.id) == runtime.view.selected_project_id.as_ref())
@@ -1856,7 +1984,6 @@ impl DeviceNetworkService {
                 runtime.view.assets.clear();
                 runtime.view.transcript = None;
                 runtime.view.conversation_history = None;
-                runtime.view.handover = None;
                 runtime.transcript_after = 0;
                 runtime.history_before = None;
                 runtime.before = None;
@@ -1981,20 +2108,6 @@ impl DeviceNetworkService {
                 } else {
                     (Vec::new(), None)
                 };
-            let handover: Option<WorkHandover> = if let Some(job) = &job {
-                Some(
-                    request(
-                        &connection.client,
-                        &format!("jobs/{job}/handover"),
-                        Some(token),
-                        None,
-                        &[],
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
             let (detail, approval): (Option<WorkDetail>, Option<WorkApproval>) = match job {
                 Some(job) => (
                     Some(
@@ -2012,7 +2125,7 @@ impl DeviceNetworkService {
                         &format!("jobs/{job}/approval"),
                         Some(token),
                         None,
-                        &[],
+                        &[("include_descendants", "true")],
                     )
                     .await?,
                 ),
@@ -2080,6 +2193,11 @@ impl DeviceNetworkService {
             }
             if status.project_id != project
                 || detail.as_ref().is_some_and(|d| d.project_id != project)
+                || approval.as_ref().is_some_and(|approval| {
+                    detail
+                        .as_ref()
+                        .is_none_or(|detail| approval.target_for_detail(detail).is_none())
+                })
             {
                 return Err(RequestError::Invalid);
             }
@@ -2104,7 +2222,6 @@ impl DeviceNetworkService {
                 merge_conversation_history(runtime.view.conversation_history.as_ref(), page, older)
             });
             runtime.history_before = None;
-            runtime.view.handover = handover;
             runtime.view.observed_at_ms = Some(now_ms());
         }
         Ok(())

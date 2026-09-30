@@ -17,7 +17,7 @@ const PROMPT = { selector: "textarea#prompt", identity: { tag: "TEXTAREA", id: "
 const canonicalPath = value => path.resolve(value).toLowerCase();
 
 export function workspaceSelectionSucceeded(surface, destination) {
-  const prefix = "workspace set to ";
+  const prefix = "作業フォルダー: ";
   return surface.fatal===0 && surface.errors.length===0 && !surface.dialog && surface.p.overlay==="none"
     && !surface.p.navigation_loading && surface.p.navigation_admission_open
     && canonicalPath(surface.p.workspace_path)===canonicalPath(destination)
@@ -125,7 +125,7 @@ export function createWorkspaceControlsScenario() {
         const baseline=await wait(cdp,sink,"original draft",v=>v.prompt==="workspace original draft");
         const opened=await openDialog(input,cdp,sink);
         if(canonicalPath(opened.path)!==canonicalPath(baseline.p.workspace_path)) throw new DesktopE2eError("product","workspace-initial-path","Workspace dialog did not show current path",opened);
-        for(const [name,text,reason] of [["empty","","workspace path is empty"],["missing",path.join(context.root,"does-not-exist"),"workspace path is not accessible"],["file",state.file,"workspace path is not a directory"]]) {
+        for(const [name,text,reason] of [["empty","","作業フォルダーを入力してください。"],["missing",path.join(context.root,"does-not-exist"),"作業フォルダーを開けません:"],["file",state.file,"フォルダーを指定してください:"]]) {
           await replace(input,PATH_INPUT,text,sink);
           const start=(await probe.snapshot()).sequence;
           await click(input,button("switch-workspace",`${DIALOG} `),sink);

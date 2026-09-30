@@ -45,6 +45,12 @@ export function createManagedExecutionRunner({ context, sink, runnerBinary, runn
     return result;
   }
   async function capture(parentProcessId = expectedParentProcessId) {
+    if (identity !== null) {
+      if (!(await verifyExited()).pass) throw new DesktopE2eError("product", "managed-runner-still-live", "The previous managed Runner is still live; its owner cannot be replaced");
+      // The old immutable owner file remains in evidence. A failed capture of
+      // the next generation must not make cleanup reuse the retired identity.
+      identity = null; ownerPath = null; settlement = null;
+    }
     captureAttempted = true;
     captureParentProcessId = parentProcessId;
     const result = await commandWhenAvailable(["identity"]);
@@ -56,6 +62,14 @@ export function createManagedExecutionRunner({ context, sink, runnerBinary, runn
     identity = current;
     return { identity: structuredClone(identity), owner };
   }
+  async function verifyExited() {
+    if (identity === null || ownerPath === null) return { pass: false, not_captured: true };
+    const observed = await processCommand("ObserveOwner", { ExecutionRoot: context.root, OwnerPath: ownerPath });
+    if (observed?.process_id !== identity.process_id || typeof observed.live !== "boolean") {
+      throw new DesktopE2eError("harness", "managed-runner-observation-invalid", "Exact Runner observation did not match its captured owner");
+    }
+    return { pass: !observed.live, process_id: identity.process_id };
+  }
   async function settle() {
     // A failed capture is not evidence of absence. Reacquire the same scoped IPC
     // and expected Desktop parent before cleanup; never discover arbitrary hosts.
@@ -63,20 +77,27 @@ export function createManagedExecutionRunner({ context, sink, runnerBinary, runn
       if (!captureAttempted) return { pass: true, not_started: true };
       await capture(captureParentProcessId);
     }
+    const alreadyExited = () => ({ pass: true, normal_shutdown: false, already_exited: true, forced: false, process_id: identity.process_id });
+    if ((await verifyExited()).pass) return alreadyExited();
     let normal = false;
     const wait = (label, sample) => observe({ label, sample, accept: Boolean, timeoutMs: 25000, retrySampleErrors: false });
     try {
       await commandWhenAvailable(["shutdown", "--runner", identity.runner_id]);
       await wait("Managed Runner closes authenticated IPC", () => command(["identity"]).then(() => false, error => !isBusyPipe(error)));
-      await wait("Managed Runner process exits", () => processCommand("Capture", { ProcessId: identity.process_id, ExpectedExecutable: runnerTestBinary }).then(() => false, () => true));
+      await wait("Managed Runner process exits", async () => (await verifyExited()).pass);
       normal = true;
     } catch {}
+    if (normal) return { pass: true, normal_shutdown: true, forced: false, process_id: identity.process_id };
+    // A concurrent graceful Desktop exit or lost shutdown ACK is acceptable
+    // only when the captured process really ended, never from IPC failure alone.
+    if ((await verifyExited()).pass) return alreadyExited();
     const stopped = await processCommand("StopOwner", { ExecutionRoot: context.root, OwnerPath: ownerPath });
-    return { pass: normal && !stopped.stopped, normal_shutdown: normal, forced: stopped.stopped, process_id: identity.process_id };
+    return { pass: false, normal_shutdown: false, forced: stopped.stopped, process_id: identity.process_id };
   }
   return Object.freeze({
     command,
     capture,
+    verifyExited,
     get identity() { return identity === null ? null : structuredClone(identity); },
     quiesce() { settlement ??= settle(); return settlement; },
   });

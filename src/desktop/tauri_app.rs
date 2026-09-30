@@ -51,6 +51,9 @@ struct McpHistoryExportGate(Mutex<()>);
 #[derive(Default)]
 struct JoinConfigActivationGate(Mutex<()>);
 
+#[derive(Default)]
+struct DesktopExitGate(Arc<Mutex<()>>);
+
 // Keep the wire-visible Desktop command registry in one place. The handler
 // and its contract tests consume this same identifier list, so a renamed or
 // unannotated command fails at compile time instead of becoming a runtime-only
@@ -468,11 +471,27 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .manage(remote_jobs)
         .manage(McpHistoryExportGate::default())
         .manage(JoinConfigActivationGate::default())
+        .manage(DesktopExitGate::default())
         .manage(device_network)
         .manage(managed_shells.clone())
         .setup(|app| {
             install_tray(app.handle())?;
             let network = app.state::<DeviceNetworkService>().inner().clone();
+            let attention_network = network.downgrade();
+            tauri::async_runtime::spawn(async move {
+                let mut attention = super::attention::SharedAttention::default();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let Some(network) = attention_network.upgrade() else {
+                        break;
+                    };
+                    if let Some((identity, inbox)) = network.shared_notification_inbox().await {
+                        for body in attention.observe(&identity, &inbox) {
+                            super::app::send_windows_desktop_notification("moyAI", &body);
+                        }
+                    }
+                }
+            });
             let handle = app.handle().clone();
             let arguments = std::env::args().collect::<Vec<_>>();
             let cwd = std::env::current_dir()
@@ -490,6 +509,15 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                if window
+                    .app_handle()
+                    .state::<DesktopExitGate>()
+                    .0
+                    .try_lock()
+                    .is_err()
+                {
+                    return;
+                }
                 disconnect_hub(window.app_handle(), false);
                 let _ = window.hide();
             }
@@ -639,7 +667,7 @@ async fn review_join_config_activation(
     controller.choose_initial_setup_purpose(super::preferences::DesktopOnboardingIntent::Team)?;
     service.update_runtime_config(controller.state.global_config().clone());
     controller.state.set_status_message(
-        "接続情報を保存しました。PC参加と本人設定の続きは共有仕事画面で確認できます。",
+        "接続情報を保存しました。「moyAI Hub」でこのPCの参加状態を確認できます。",
     );
     drop(controller);
     if endpoint_changed {
@@ -684,7 +712,13 @@ fn start_windows_caption_drag(window: &tauri::WebviewWindow) -> Result<(), Strin
 
 fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open_moyai", "Open moyAI", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit_moyai", "終了", true, None::<&str>)?;
+    let quit = MenuItem::with_id(
+        app,
+        "quit_moyai",
+        "終了（このPCの仕事も停止）",
+        true,
+        None::<&str>,
+    )?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     let mut builder = TrayIconBuilder::with_id("moyai-tray")
         .tooltip("moyAI")
@@ -727,6 +761,9 @@ fn restore_main_window(app: &tauri::AppHandle) {
 
 #[tauri::command]
 fn hide_to_tray(app: tauri::AppHandle) {
+    if app.state::<DesktopExitGate>().0.try_lock().is_err() {
+        return;
+    }
     disconnect_hub(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
@@ -770,37 +807,107 @@ fn exit_app(app: tauri::AppHandle) {
 }
 
 fn disconnect_hub(app: &tauri::AppHandle, exit: bool) {
+    if exit {
+        exit_desktop_and_runner(app);
+        return;
+    }
+    // Closing the window only hides it; an explicit Exit owns Runner shutdown.
+    if app.state::<DesktopExitGate>().0.try_lock().is_err() {
+        return;
+    }
+    let connection = app.state::<HubConnection>().inner().clone();
+    let publish = app.state::<PublishService>().inner().clone();
+    let network = app.state::<DeviceNetworkService>().inner().clone();
+    let hidden_receiver = network.window_hide_requested();
+    let hidden_profiles = publish.window_hide_requested();
+    tauri::async_runtime::spawn(async move {
+        connection.shutdown().await;
+        network.finish_window_hide(hidden_receiver).await;
+        publish.finish_window_hide(hidden_profiles).await;
+    });
+}
+
+fn exit_desktop_and_runner(app: &tauri::AppHandle) {
+    let Ok(exit_guard) = app.state::<DesktopExitGate>().0.clone().try_lock_owned() else {
+        return;
+    };
     let connection = app.state::<HubConnection>().inner().clone();
     let publish = app.state::<PublishService>().inner().clone();
     let network = app.state::<DeviceNetworkService>().inner().clone();
     let managed_shells = app.state::<ManagedShells>().inner().clone();
-    let hidden_receiver = if exit {
-        managed_shells.begin_shutdown();
-        network.begin_shutdown();
-        false
-    } else {
-        network.window_hide_requested()
-    };
-    let hidden_profiles = if exit {
-        publish.begin_shutdown();
-        Vec::new()
-    } else {
-        publish.window_hide_requested()
-    };
+    // Close admission before any asynchronous wait, including the background
+    // management lane which could otherwise start a replacement Runner.
+    managed_shells.begin_shutdown();
+    network.begin_shutdown();
+    publish.begin_shutdown();
+    restore_main_window(app);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title("moyAI — このPCの仕事を停止して終了しています");
+        let _ = window.set_enabled(false);
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        connection.shutdown().await;
-        if exit {
+        let _exit_guard = exit_guard;
+        let stopped: Result<(), String> = async {
+            let runtime = {
+                let controller = app.state::<SharedController>();
+                let mut controller = controller.lock().await;
+                controller.begin_exit()?;
+                controller.state.set_status_message(
+                    "このPCの仕事とアプリを停止しています。停止を確認してからmoyAIを終了します。",
+                );
+                controller.app.process_runtime.agent_runtime()
+            };
+            let _ = app.emit_to("main", "desktop-state-changed", ());
+            connection.shutdown().await;
             network.shutdown().await;
-            // Keep ownership until in-flight tools and listener tasks have settled.
+            loop {
+                if app
+                    .state::<SharedController>()
+                    .lock()
+                    .await
+                    .local_exit_settled()?
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             while !publish.shutdown().await {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             managed_shells.shutdown().await;
-            app.exit(0);
+            // Local work returns its shared capacity through this Runner. Keep
+            // it alive until worker cleanup and ExternalFinish have settled.
+            runtime.wait_for_resource_drains().await?;
+            tauri::async_runtime::spawn_blocking(crate::runner::operations::shutdown_existing)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.message)
+        }
+        .await;
+        if let Err(error) = stopped {
+            let message = format!(
+                "このPCの仕事や実行機能の終了を確認できなかったため、moyAIの画面を残しています。\nもう一度「終了」を選んでください。解消しない場合は、この表示を管理者へ伝えてください。\n\n{error}"
+            );
+            app.state::<SharedController>()
+                .lock()
+                .await
+                .state
+                .set_status_message(&message);
+            let _ = app.emit_to("main", "desktop-state-changed", ());
+            let mut dialog = rfd::AsyncMessageDialog::new()
+                .set_title("moyAIを終了できませんでした")
+                .set_description(&message)
+                .set_level(rfd::MessageLevel::Error)
+                .set_buttons(rfd::MessageButtons::Ok);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title("moyAI");
+                let _ = window.set_enabled(true);
+                dialog = dialog.set_parent(&window);
+            }
+            let _ = dialog.show().await;
         } else {
-            network.finish_window_hide(hidden_receiver).await;
-            publish.finish_window_hide(hidden_profiles).await;
+            app.exit(0);
         }
     });
 }
@@ -1891,7 +1998,8 @@ async fn prepare_latest_message_edit(
                 "the chat changed while preparing the edit; open the new draft chat from the sidebar",
             ));
         }
-        if !controller.open_created_edit_fork(prepared.forked_session.id) {
+        if !controller.open_created_edit_fork(prepared.forked_session.id, prepared.retained_images)
+        {
             return Err(DesktopCommandConflict::new(
                 "the new draft chat could not be opened",
             ));

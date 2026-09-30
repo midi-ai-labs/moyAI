@@ -706,23 +706,46 @@ impl AppState {
                 tool,
                 title,
                 summary,
-                ..
+                metadata,
             } => {
-                self.progress.tool_calls_completed += 1;
+                let failed = crate::protocol::completed_tool_display_status(metadata)
+                    == ToolLifecycleStatus::Failed;
+                if failed {
+                    self.progress.tool_calls_failed += 1;
+                } else {
+                    self.progress.tool_calls_completed += 1;
+                }
                 self.progress.current_phase = RunProgressPhase::Tool;
-                self.progress.active_step = format!("{}を完了しました", tool_action_label(*tool));
+                self.progress.active_step = if failed {
+                    format!("{}に失敗しました", tool_action_label(*tool))
+                } else {
+                    format!("{}を完了しました", tool_action_label(*tool))
+                };
                 update_tool_status(
                     &mut self.tool_statuses,
                     *tool_call_id,
                     *tool,
                     title,
-                    ToolCallStatus::Completed,
-                    Some(summary.clone()),
-                    None,
+                    if failed {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    },
+                    (!failed).then(|| summary.clone()),
+                    failed.then(|| summary.clone()),
                 );
                 self.transcript_entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Tool,
-                    title: "実行済コマンド".to_string(),
+                    kind: if failed {
+                        TranscriptKind::Error
+                    } else {
+                        TranscriptKind::Tool
+                    },
+                    title: if failed {
+                        "操作に失敗しました"
+                    } else {
+                        "実行済コマンド"
+                    }
+                    .to_string(),
                     body: format!("{}: {title}\n{summary}", tool),
                     response_id: None,
                     tool_call_id: Some(*tool_call_id),
@@ -966,7 +989,11 @@ impl AppState {
         self.progress.active_step = "依頼を受け付けました".to_string();
     }
 
-    pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
+    pub fn apply_durable_prompt_dispatch(
+        &mut self,
+        prompt_dispatch: &PromptDispatchPart,
+        user_text: &str,
+    ) {
         self.route = Route::Session;
         if should_render_prompt_dispatch_summary(prompt_dispatch) {
             self.transcript_entries.push(TranscriptEntry {
@@ -980,7 +1007,7 @@ impl AppState {
         self.transcript_entries.push(TranscriptEntry {
             kind: TranscriptKind::User,
             title: "User".to_string(),
-            body: prompt_dispatch.dispatch_prompt_text.clone(),
+            body: user_text.to_string(),
             response_id: None,
             tool_call_id: None,
         });
@@ -2956,6 +2983,70 @@ mod tests {
             &[terminal_item],
         ));
         assert_eq!(unowned.progress.tool_calls_completed, 41);
+    }
+
+    #[test]
+    fn unsuccessful_completed_tool_is_failed_in_live_and_reloaded_presentation() {
+        for (metadata, expected) in [
+            (
+                serde_json::json!({"success": true, "tool_metadata": {"success": false, "exit_code": 7}}),
+                ToolCallStatus::Failed,
+            ),
+            (
+                serde_json::json!({"success": false}),
+                ToolCallStatus::Failed,
+            ),
+            (
+                serde_json::json!({"success": false, "tool_metadata": {"success": true, "exit_code": 0}}),
+                ToolCallStatus::Completed,
+            ),
+            (serde_json::json!({}), ToolCallStatus::Completed),
+        ] {
+            let event = RunEvent::ToolCallCompleted {
+                tool_call_id: ToolCallId::new(),
+                tool: ToolName::Shell,
+                title: "python example.py".into(),
+                summary: "process output".into(),
+                metadata,
+            };
+            let mut live = AppState::default();
+            live.apply_run_event(&event);
+            let projected = crate::protocol::project_protocol_run_event(
+                &event,
+                Some(SessionId::new()),
+                TurnId::new(),
+                1,
+            )
+            .unwrap();
+            let reloaded = tool_statuses_from_turn_items(&[projected.turn_item.unwrap()]);
+            assert_eq!(live.tool_statuses[0].status, expected);
+            assert_eq!(live.tool_statuses, reloaded);
+            assert_eq!(
+                live.progress.tool_calls_failed,
+                usize::from(expected == ToolCallStatus::Failed)
+            );
+            assert_eq!(
+                live.progress.tool_calls_completed,
+                usize::from(expected == ToolCallStatus::Completed)
+            );
+            if expected == ToolCallStatus::Failed {
+                assert!(live.progress.active_step.contains("失敗"));
+                assert_eq!(
+                    live.transcript_entries.last().unwrap().kind,
+                    TranscriptKind::Error
+                );
+            }
+            let crate::protocol::RuntimeEventMsg::ToolLifecycle { envelope } =
+                projected.runtime_event.msg
+            else {
+                panic!("tool lifecycle")
+            };
+            assert_eq!(envelope.status, ToolLifecycleStatus::Completed);
+            assert_eq!(
+                envelope.success,
+                Some(expected == ToolCallStatus::Completed)
+            );
+        }
     }
 
     #[test]

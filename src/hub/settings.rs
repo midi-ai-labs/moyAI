@@ -8,7 +8,7 @@ use super::HubRouteMode;
 use super::{HubCatalogBaseline, HubError, ReviewedHubSelection, bounded_text, valid_id};
 
 // Two bounded public catalog snapshots (128 models / 32 capabilities each), plus preferences.
-const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_SETTINGS_BYTES: usize = 32 * 1024 * 1024;
 
 /// Application-owned preferences only. Runtime credentials and provider allocations cannot
 /// be represented by this strict, versioned document. Revision zero means never saved.

@@ -34,6 +34,8 @@ test("shell approval presents the exact command and real permission effect befor
   assert.match(visible, /実行コマンド/);
   assert.ok(visible.includes(escapeHtml("& './Summarize-Numbers.ps1'\nGet-Content './onboarding-result.md'")));
   assert.match(visible, /実行するフォルダー/);
+  assert.ok(visible.indexOf("実行するフォルダー") < visible.indexOf("実行コマンド"));
+  assert.ok(visible.indexOf("Get-Content &#039;./onboarding-result.md&#039;") < visible.indexOf("<strong>対象:</strong>"), "shell targets must not push the actual command below the first review screen");
   assert.match(visible, /C:\/Approved/);
   assert.match(visible, /作業フォルダー内に限定する保護を外して実行/);
   assert.match(visible, /対象以外のファイル操作や外部通信も可能/);
@@ -45,11 +47,11 @@ test("shell approval presents the exact command and real permission effect befor
   assert.ok(section.includes(escapeHtml(JSON.stringify(local.projection!.approval!.request, null, 2))), "original evidence is retained without translation or omission");
 });
 
-test("Guardian reason precedes long shared commands and stays escaped", () => {
+test("exact command precedes Guardian explanation and both stay escaped", () => {
   const reason = "外部接続先 <target> の確認が必要です。";
   const { visible } = approval({ details: ["Command: echo test\n".repeat(64), `代理承認からの確認: ${reason}`] });
   assert.match(visible, /確認が必要な理由/);
-  assert.ok(visible.indexOf(escapeHtml(reason)) < visible.indexOf("実行コマンド"));
+  assert.ok(visible.indexOf("実行コマンド") < visible.indexOf(escapeHtml(reason)));
   assert.doesNotMatch(visible, /<target>/);
 });
 
@@ -99,4 +101,32 @@ test("descriptive approval details remain escaped and cannot replace actual path
   assert.match(visible, /対象: &lt;server&gt;|未知: &lt;keep&gt;/);
   assert.match(section, /操作種別: &lt;stop&gt;/);
   assert.doesNotMatch(section, /<stop>|<server>|<keep>/);
+});
+
+test("child approval identifies the executing PC and originating controller before the command", () => {
+  const { local } = approval();
+  local.projection!.approval!.context = { job_id: "child-b", project_id: "project-a", root_id: "job-a",
+    conversation_id: "job-a", job_title: "時計 <test>", controller_device_id: "device-a",
+    controller_device_label: "WinA", execution_device_id: "device-b", execution_device_label: "WinB" };
+  const html = renderSharedWork(local);
+  assert.ok(html.indexOf("実行PC") < html.indexOf("実行コマンド"));
+  assert.match(html, /実行PC<\/dt><dd>WinB/);
+  assert.match(html, /承認するPC<\/dt><dd>WinA/);
+  assert.match(html, /時計 &lt;test&gt;/);
+  assert.doesNotMatch(html, /<test>/);
+});
+
+
+test("expired approval parks the operation and offers only origin-controlled reconfirmation", () => {
+  const { local } = approval();
+  local.projection!.approval!.status = "expired";
+  local.projection!.approval!.can_decide = false;
+  local.projection!.approval!.can_reconfirm = true;
+  let html = renderSharedWork(local);
+  assert.match(html, /操作の再確認を待っています/);
+  assert.match(html, /data-action="shared-reconfirm-approval" data-value="approval-a"/);
+  assert.doesNotMatch(html, /data-action="shared-approve"/);
+  local.projection!.approval!.can_reconfirm = false;
+  html = renderSharedWork(local);
+  assert.doesNotMatch(html, /data-action="shared-reconfirm-approval"/);
 });

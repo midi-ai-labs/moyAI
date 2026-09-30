@@ -2241,14 +2241,15 @@ impl SqliteSessionRepository {
             ));
         };
         let mut text_parts = Vec::with_capacity(content.len());
+        let mut retained_images = Vec::new();
         for part in content {
-            let ContentPart::Text { text } = part else {
-                return Err(StorageError::Message(
-                    "a message with an image cannot be edited in the text composer".into(),
-                ));
-            };
-            text_parts.push(text);
+            match part {
+                ContentPart::Text { text } => text_parts.push(text),
+                ContentPart::Image { image } => retained_images.push(image),
+            }
         }
+        crate::llm::image_validation::validate_retained_images(&retained_images)
+            .map_err(StorageError::Message)?;
         let editable_text = text_parts.join("\n");
         if editable_text.trim().is_empty() {
             return Err(StorageError::Message(
@@ -2298,6 +2299,7 @@ impl SqliteSessionRepository {
             forked_session,
             edited_turn_id: expected_turn_id,
             editable_text,
+            retained_images,
         })
     }
 
@@ -25022,6 +25024,92 @@ mod tests {
             .expect_err("fork must fail closed without an active turn");
 
         assert!(error.to_string().contains("durable run admission"));
+    }
+
+    #[tokio::test]
+    async fn edit_fork_retains_canonical_image_bytes_without_source_file() {
+        use base64::Engine as _;
+        let (store, source) = test_repo().await;
+        let repository = store.session_repo();
+        let turn_id = TurnId::new();
+        let admission = repository
+            .admit_session_turn(source, turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .admission_id;
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend(1_u32.to_be_bytes());
+        bytes.extend(1_u32.to_be_bytes());
+        let image = crate::session::ImagePart {
+            source_path: Some("missing-original.png".into()),
+            mime_type: "image/png".into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            byte_len: bytes.len() as u64,
+        };
+        repository
+            .append_user_turn_with_protocol_bundle(
+                source,
+                admission,
+                &UserTurn {
+                    turn_id,
+                    items: vec![
+                        UserInputItem::Text {
+                            text: "edit with this image".into(),
+                        },
+                        UserInputItem::Image {
+                            image: image.clone(),
+                        },
+                    ],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+                turn_id,
+                0,
+            )
+            .await
+            .unwrap();
+        repository
+            .terminalize_admitted_turn_with_protocol_event(
+                source,
+                admission,
+                &completed_terminal(source),
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let revision = repository
+            .active_turn_expectation_for_session(source)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision();
+        let revisions = repository
+            .origin_history_revisions_for_session_tree(source, 2)
+            .unwrap();
+        let fork = repository
+            .fork_latest_turn_for_edit_checked(source, turn_id, revision, &revisions)
+            .await
+            .unwrap();
+        assert_eq!(fork.editable_text, "edit with this image");
+        assert_eq!(fork.retained_images.len(), 1);
+        assert_eq!(fork.retained_images[0].data_base64, image.data_base64);
+        assert_eq!(fork.retained_images[0].source_path, image.source_path);
+        assert!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(fork.forked_session.id)
+                .unwrap()
+                .iter()
+                .all(|item| item.turn_id() != Some(turn_id))
+        );
+        let source_history = store
+            .protocol_event_store()
+            .list_history_items_for_session(source)
+            .unwrap();
+        assert!(source_history.iter().any(|item| matches!(&item.payload, HistoryItemPayload::UserTurn { content, .. } if content.iter().any(|part| matches!(part, ContentPart::Image { image: saved } if saved.data_base64 == image.data_base64)))));
     }
 
     #[tokio::test]

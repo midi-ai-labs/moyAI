@@ -12,7 +12,10 @@ use crate::edit::CommittedFileMutation;
 use crate::error::ToolError;
 use crate::tool::context::{ToolContext, targets_configured_instruction_authority};
 use crate::tool::registry::Tool;
-use crate::tool::write_support::{delete_file_conditionally, write_bytes_file_conditionally};
+use crate::tool::write_support::{
+    delete_file_conditionally, post_commit_failure, validate_write_parent,
+    write_bytes_file_conditionally,
+};
 use crate::tool::{
     PermissionRisk, ToolEffectClass, ToolEffectPolicy, ToolName, ToolResult, ToolSpec,
 };
@@ -639,7 +642,7 @@ impl Tool for SharedSaveArtifactTool {
         ToolSpec {
             name: ToolName::SharedSaveArtifact,
             effect: ToolEffectPolicy::mutation(),
-            description: "Save one child job artifact of at most 8 MiB into a new path in this PC's bound project folder. Supply the exact job_id and asset_id from shared_job_artifacts. Hub verifies the asset and its hash; an existing file is never overwritten.",
+            description: "Save one child job artifact of at most 8 MiB into a new path in this PC's bound project folder. Supply the exact job_id and asset_id from shared_job_artifacts and a new path whose parent already exists. Hub verifies the asset and its hash; an existing file is never overwritten.",
             input_schema: json!({"type":"object","additionalProperties":false,
                 "required":["job_id","asset_id","path"],
                 "properties":{"job_id":{"type":"string"},"asset_id":{"type":"string"},
@@ -741,7 +744,18 @@ async fn save_artifact(
         ));
     }
     let path = guarded.absolute.clone();
-    let mut risks = ToolEffectClass::Mutation.permission_risks();
+    // Check actionable local preconditions before asking the user or downloading.
+    // The locked commit below still revalidates the path and create-new condition.
+    validate_write_parent(&guarded)?;
+    ctx.services
+        .edit_safety
+        .assert_fresh_create(ctx.session.session.id, &path)?;
+    ctx.services
+        .edit_safety
+        .assert_path_unchanged(&path, None)?;
+    // This operation reads from the Hub and writes a local file. It does not
+    // mutate an external service merely because its tool effect is Mutation.
+    let mut risks = vec![PermissionRisk::Network];
     if PathGuard::targets_protected_workspace_authority(&ctx.workspace.root, &guarded)
         || targets_configured_instruction_authority(ctx.config, ctx.workspace, &path)
     {
@@ -796,8 +810,11 @@ async fn save_artifact(
                 )],
                 8 * 1024 * 1024,
             ) {
-                delete_file_conditionally(&guarded, &identity)?;
-                return Err(ToolError::from(error));
+                return Err(post_commit_failure(
+                    "artifact save",
+                    ToolError::from(error),
+                    delete_file_conditionally(&guarded, &identity).map_err(ToolError::from),
+                ));
             }
             Ok::<(), ToolError>(())
         })

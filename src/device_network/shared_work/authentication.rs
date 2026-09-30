@@ -58,24 +58,60 @@ impl DeviceNetworkService {
         connection: &Connection,
         generation: u64,
         query: u64,
-        current_token: Option<&str>,
     ) -> Result<String, RequestError> {
         {
             let runtime = self.inner.shared_work.0.lock().unwrap();
             runtime.require_current(generation, query)?;
-            if let Some(token) = current_token.filter(|_| {
-                runtime.binding == connection.binding
-                    && runtime
-                        .view
-                        .expires_at_ms
-                        .is_some_and(|time| time > now_ms().saturating_add(60_000))
-            }) {
-                return Ok(token.to_owned());
-            }
         }
+        let session = self.shared_device_session(connection).await?;
+        self.inner
+            .shared_work
+            .0
+            .lock()
+            .unwrap()
+            .require_current(generation, query)?;
+        Ok(session.token)
+    }
+
+    /// Foreground, notifications and team tools share one credential owner.
+    /// Renewal is independent of which conversation a concurrent UI query selects.
+    pub(super) async fn shared_device_session(
+        &self,
+        connection: &Connection,
+    ) -> Result<LoginSession, RequestError> {
+        let _authentication = self.inner.shared_work.2.lock().await;
+        if self
+            .shared_connection()
+            .is_none_or(|current| current.binding != connection.binding)
+        {
+            return Err(RequestError::Local("端末または接続先が変わりました。"));
+        }
+        let generation = {
+            let mut runtime = self.inner.shared_work.0.lock().unwrap();
+            if runtime.binding != connection.binding
+                && (runtime.token.is_some() || !runtime.view.projects.is_empty())
+            {
+                runtime.clear();
+            }
+            if runtime.binding == connection.binding
+                && let (Some(token), Some(principal), Some(expires_at_ms)) = (
+                    &runtime.token,
+                    &runtime.view.principal,
+                    runtime.view.expires_at_ms,
+                )
+                && expires_at_ms > now_ms().saturating_add(60_000)
+            {
+                return Ok(LoginSession {
+                    token: token.clone(),
+                    principal: principal.clone(),
+                    expires_at_ms,
+                });
+            }
+            runtime.generation
+        };
         // mTLS identifies this device. Old remembered human credentials are neither
         // restored nor replaced, and there is no password fallback.
-        let session: LoginSession = request(
+        let session: Result<LoginSession, RequestError> = request(
             &connection.client,
             "device-session",
             None,
@@ -88,7 +124,26 @@ impl DeviceNetworkService {
                 "Hubを更新してください。このHubは端末の承認だけで利用する方式に対応していません。",
             ),
             error => error,
-        })?;
+        });
+        if self
+            .shared_connection()
+            .is_none_or(|current| current.binding != connection.binding)
+        {
+            return Err(RequestError::Local("端末または接続先が変わりました。"));
+        }
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                if matches!(error, RequestError::Http(401 | 403)) {
+                    let mut runtime = self.inner.shared_work.0.lock().unwrap();
+                    if runtime.generation == generation {
+                        runtime.clear();
+                        runtime.view.error = Some(error.message().into());
+                    }
+                }
+                return Err(error);
+            }
+        };
         if session.token.is_empty()
             || session.token.len() > 4096
             || !super::super::stable_id(&session.principal.user_id)
@@ -96,11 +151,10 @@ impl DeviceNetworkService {
         {
             return Err(RequestError::Invalid);
         }
-        if !self.shared_current(connection, generation, query) {
-            return Err(RequestError::Local("端末または表示対象が変わりました。"));
-        }
         let mut runtime = self.inner.shared_work.0.lock().unwrap();
-        runtime.require_current(generation, query)?;
+        if runtime.generation != generation {
+            return Err(RequestError::Local("端末または接続先が変わりました。"));
+        }
         if runtime
             .view
             .principal
@@ -115,9 +169,9 @@ impl DeviceNetworkService {
         runtime.binding = connection.binding.clone();
         runtime.hub_binding = connection.hub_binding.clone();
         runtime.token = Some(session.token.clone());
-        runtime.view.principal = Some(session.principal);
+        runtime.view.principal = Some(session.principal.clone());
         runtime.view.expires_at_ms = Some(session.expires_at_ms);
-        Ok(session.token)
+        Ok(session)
     }
 }
 

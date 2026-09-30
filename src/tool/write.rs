@@ -14,7 +14,7 @@ use crate::tool::context::{
 };
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{
-    delete_file_conditionally, read_text_file_with_identity, to_summary,
+    delete_file_conditionally, post_commit_failure, read_text_file_with_identity, to_summary,
     write_text_file_conditionally,
 };
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
@@ -309,25 +309,31 @@ async fn commit_write_change(
         )],
         maximum_edit_read_bytes,
     ) {
-        rollback_write_commit(
-            path,
-            guarded,
-            &rollback_state,
-            &committed_identity,
-            Some((&services.edit_safety, session_id, &baseline_snapshot)),
-        )?;
-        return Err(ToolError::from(error));
+        return Err(post_commit_failure(
+            "write atomic commit",
+            ToolError::from(error),
+            rollback_write_commit(
+                path,
+                guarded,
+                &rollback_state,
+                &committed_identity,
+                Some((&services.edit_safety, session_id, &baseline_snapshot)),
+            ),
+        ));
     }
 
     if let Err(error) = run_mutation_fence.assert_owned().await {
-        rollback_write_commit(
-            path,
-            guarded,
-            &rollback_state,
-            &committed_identity,
-            Some((&services.edit_safety, session_id, &baseline_snapshot)),
-        )?;
-        return Err(error);
+        return Err(post_commit_failure(
+            "write atomic commit",
+            error,
+            rollback_write_commit(
+                path,
+                guarded,
+                &rollback_state,
+                &committed_identity,
+                Some((&services.edit_safety, session_id, &baseline_snapshot)),
+            ),
+        ));
     }
 
     match services
@@ -343,16 +349,17 @@ async fn commit_write_change(
                 change_ids,
             })
         }
-        Err(error) => {
+        Err(error) => Err(post_commit_failure(
+            "write atomic commit",
+            ToolError::from(error),
             rollback_write_commit(
                 path,
                 guarded,
                 &rollback_state,
                 &committed_identity,
                 Some((&services.edit_safety, session_id, &baseline_snapshot)),
-            )?;
-            Err(ToolError::from(error))
-        }
+            ),
+        )),
     }
 }
 

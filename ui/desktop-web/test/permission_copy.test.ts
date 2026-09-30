@@ -27,7 +27,7 @@ test("translated approval preserves exact command, Guardian explanation and orig
   assert.match(html, /ネットワーク通信を含む可能性/);
   assert.match(html, /削除を含む可能性/);
   assert.ok(html.includes(reason));
-  assert.ok(html.indexOf(reason) < html.indexOf("実行コマンド:"), "reason must precede long operation details");
+  assert.ok(html.indexOf("実行コマンド:") < html.indexOf(reason), "the actual operation must be visible before its review explanation");
   assert.match(html, /コマンドを実行: preview/);
   assert.ok(html.includes("実行コマンド: Write-Output &#039;&lt;remote&gt;&#039;\nGet-Content ./projectbrief.md"));
   assert.match(html, /操作情報の原文/);

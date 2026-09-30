@@ -102,6 +102,8 @@ pub struct RunnerOperationsProjection {
     pub mode: String,
     pub state: String,
     pub accepting: bool,
+    #[serde(default)]
+    pub folder_change_blocked: bool,
     pub maintenance_until_ms: Option<u64>,
     pub autostart: bool,
     pub templates: Vec<ProvisionTemplate>,
@@ -297,6 +299,9 @@ impl RunnerHost {
             .map(|value| value.attempts.clone())
             .unwrap_or_default();
         let active = state.runs.values().any(|value| !value.processes_drained);
+        let folder_change_blocked = active
+            || !attempts.is_empty()
+            || shared.is_some_and(|value| !value.retained_services.is_empty());
         let label = if state.closing {
             "stopping"
         } else {
@@ -316,6 +321,7 @@ impl RunnerHost {
             }
             .into(),
             state: label.into(),
+            folder_change_blocked,
             accepting: !state.closing
                 && store.installed.mode == ProvisionMode::Available
                 && shared.is_none_or(|value| value.accepting),
@@ -398,9 +404,7 @@ impl RunnerHost {
                     next.templates = templates;
                     store.update(next)?;
                 }
-                // The task owns the host until explicit shutdown; dropping this join handle
-                // does not cancel already accepted work.
-                let _worker = super::shared::SharedWorker::start(self.clone(), settings).await?;
+                super::shared::SharedWorker::start(self.clone(), settings).await?;
             }
             RunnerOperation::InstallDesktop {
                 mut settings,
@@ -462,8 +466,7 @@ impl RunnerHost {
                     store.update(next)?;
                 }
                 if !shared {
-                    let _worker =
-                        super::shared::SharedWorker::start(self.clone(), settings).await?;
+                    super::shared::SharedWorker::start(self.clone(), settings).await?;
                 }
             }
             RunnerOperation::UpdateTemplates {
@@ -540,6 +543,21 @@ pub fn remove_autostart_after_reset() -> Result<(), RunnerError> {
 /// Launch the adjacent product Runner in the current OS account, without a shell or elevation.
 pub fn launch() -> Result<(), RunnerError> {
     launch_process().map(|_| ())
+}
+
+/// Stop the existing Runner in this Desktop's authenticated IPC namespace.
+/// This never starts a host, and returns only after the captured process exits.
+/// The caller must first drain its execution-management lane to prevent restart.
+pub fn shutdown_existing() -> Result<(), RunnerError> {
+    #[cfg(windows)]
+    {
+        let config = crate::config::loader::global_config_path().map_err(error)?;
+        super::windows::shutdown_existing_for_config(&config)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
 }
 
 fn launch_process() -> Result<std::process::Child, RunnerError> {

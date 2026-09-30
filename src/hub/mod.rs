@@ -73,6 +73,8 @@ pub struct HubModel {
     pub id: String,
     pub label: String,
     pub capabilities: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub system_prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +108,9 @@ impl HubCatalog {
                 || !bounded_text(&model.label, 256)
                 || !ids.insert(&model.id)
                 || model.capabilities.len() > MAX_CAPABILITIES
+                || model.system_prompt.chars().count()
+                    > crate::system_prompt::MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS
+                || model.system_prompt.trim() != model.system_prompt
                 || model
                     .capabilities
                     .iter()
@@ -315,6 +320,8 @@ pub struct DesktopHubRoutes {
 /// Safe public errors intentionally omit URL, response body and credential material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum HubError {
+    #[error("このモデルのシステムプロンプトには、対応するDesktopとRunnerへの更新が必要です。")]
+    ModelSystemPromptUnsupported,
     #[error("このHubは子エージェントの独立実行に未対応です。Hubを更新してください。")]
     DelegatedExecutionUnsupported,
     #[error("A Hub turn is already active for this context")]
@@ -370,6 +377,7 @@ pub enum HubError {
 impl HubError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::ModelSystemPromptUnsupported => "model_system_prompt_unsupported",
             Self::DelegatedExecutionUnsupported => "delegated_execution_unsupported",
             Self::RouteBusy => "route_busy",
             Self::GatewayUnavailable => "gateway_unavailable",

@@ -3,6 +3,17 @@ import { action, byId, trustedClick, wait } from "./hub_browser_enrollment.mjs";
 
 export const hubProjectReady = value => value?.hub_project_open === true && value.overlay === "none" && !value.busy;
 
+/** Project selection may render an old enabled frame before its command is busy. */
+export async function waitForSharedComposer(input, target, timeoutMs = 15000) {
+  let readySamples = 0;
+  return wait("Composer is ready after the preceding command", () => input.observeExactTarget(target), value => {
+    const ready = value.observation.count === 1 && value.observation.visible
+      && value.observation.enabled && value.observation.center_hit;
+    readySamples = ready ? readySamples + 1 : 0;
+    return readySamples >= 3;
+  }, timeoutMs);
+}
+
 export function sharedActionTarget(kind, value = "") {
   if (kind === "submit" || kind === "continue") {
     return { selector: '.shared-work button[data-action="send"]', identity: { tag: "BUTTON", action: "send" } };
@@ -62,6 +73,19 @@ export async function bindHubDevice(resource, deviceId, userId) {
   await page.locator(`[data-sa-operation="bind_device_principal"][data-sa-id=${JSON.stringify(deviceId)}]`).click();
   await page.locator("#shared-admin-user_id").selectOption(userId ?? "");
   await page.locator("#shared-admin-save").click();
+  // Fixture actors also change Hub state. Preserve the normal CAS contract:
+  // explicitly review a visible conflict instead of retrying an old revision.
+  await page.waitForFunction(() => !document.querySelector("#shared-admin-form")
+    || Boolean(document.querySelector("#shared-admin-review-conflict")?.getClientRects().length));
+  if (await page.locator("#shared-admin-form").count()) {
+    await page.locator("#shared-admin-review-conflict").click();
+    await page.locator("#shared-admin-accept-comparison").waitFor({ state: "visible" });
+    if (await page.locator("#shared-admin-user_id").inputValue() !== (userId ?? "")) {
+      throw new Error("Device association conflict changed the requested actor");
+    }
+    await page.locator("#shared-admin-accept-comparison").click();
+    await page.locator("#shared-admin-save").click();
+  }
   await page.locator("#shared-admin-form").waitFor({ state: "detached" });
 }
 

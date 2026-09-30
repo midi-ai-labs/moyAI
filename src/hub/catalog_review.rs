@@ -1,5 +1,6 @@
 //! Public catalog facts captured with an explicit, durable Main/Side review.
-//! This is a comparison baseline, never an allocation or a second review gate.
+//! The same baseline validates catalog continuity when a model session is recreated.
+//! It never allocates a model or independently records review confirmation.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,13 @@ impl HubCatalogBaseline {
 
     pub(super) fn validate(&self, review: &ReviewedHubSelection) -> Result<(), HubError> {
         review.check_admission(&self.catalog())
+    }
+
+    pub(super) fn check_successor(&self, catalog: &HubCatalog) -> Result<(), HubError> {
+        // The bounded journal can be pruned independently of public model/software facts.
+        // Use the same identity/revision/content rules as the live client's observations.
+        Self::capture(catalog).catalog().diff(&self.catalog())?;
+        Ok(())
     }
 }
 
@@ -98,10 +106,9 @@ impl HubCatalogComparison {
         };
         // Journal entries are intentionally absent from the baseline. Compare the same public
         // model/software facts on both sides, retaining revision/identity validation.
-        let current = HubCatalogBaseline::capture(catalog).catalog();
         if baseline.validate(review).is_err()
             || catalog.validate().is_err()
-            || current.diff(&baseline.catalog()).is_err()
+            || baseline.check_successor(catalog).is_err()
         {
             result.status = Status::Invalid;
             return result;

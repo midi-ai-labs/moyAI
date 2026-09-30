@@ -3,7 +3,7 @@
 
 #[test]
 #[ignore = "Dedicated child process: prepare an isolated enrolled Desktop Runner"]
-fn prepare_endpoint_change_configuration() {
+pub(crate) fn prepare_endpoint_change_configuration() {
     use crate::device_network::{DeviceIdentityStore, DeviceSettings, DeviceSettingsStore};
     use crate::runner::operations::{OperationsStore, ProvisionMode};
     use sha2::{Digest, Sha256};
@@ -98,11 +98,11 @@ fn isolated_runner_process() {
             .installed_shared_settings()
             .expect("installed fixture settings"),
     };
-    let shared = settings.map(|settings| {
+    if let Some(settings) = settings {
         runtime
             .block_on(SharedWorker::start(host.clone(), settings))
             .expect("fixture shared worker")
-    });
+    }
     println!(
         "{}",
         serde_json::to_string(&RunnerResponse::Identity {
@@ -112,9 +112,6 @@ fn isolated_runner_process() {
     );
     let result = listener.serve(host.clone(), &runtime);
     host.begin_shutdown().unwrap();
-    runtime.block_on(host.wait_stopped());
-    if let Some(shared) = shared {
-        runtime.block_on(shared.wait()).unwrap();
-    }
+    runtime.block_on(host.wait_shutdown()).unwrap();
     result.unwrap();
 }

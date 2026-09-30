@@ -919,12 +919,22 @@ function representativeSurfaces(): RenderedSurface[] {
   shared.projection!.conversation_history = { project_id: "project-a", conversation_id: "job-a", snapshot: 1, next_before: 1,
     jobs: [{ job: { ...shared.projection!.status!.jobs[0], conversation_id: "job-a" }, input: { prompt: "前の依頼" }, result: { text: "完了" }, artifacts: [], more_artifacts: false }] };
   shared.projection!.detail.retained_services = [{ service_id: "service-a", environment_id: "env-a", expires_at_ms: 9_999_999_999_999, stop_requested: false, uncertain: false, can_stop: true }];
-  shared.projection!.handover = { candidates: [{ user_id: "user-b", display_name: "次の担当" }], pending: null, can_handover: true };
   shared.projection!.inbox = { items: [{ id: "finished:job-a", project_id: "project-a", job_id: "job-a", kind: "finished", title: "完了", created_at_ms: 1, read_at_ms: null, can_act: true, approval_id: null }], unread_count: 1, next_before: "older" };
   shared.projection!.transcript = { items: [], next_after: 100 };
   surfaces.push({ name: "shared-work-authenticated", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.projection!.submission_uncertain = false;
   surfaces.push({ name: "shared-work-stop-all", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  const parked = structuredClone(shared);
+  parked.projection!.detail!.state = "running";
+  parked.projection!.detail!.can_continue = false;
+  parked.projection!.approval = {
+    ...parked.projection!.approval!,
+    status: "expired", expires_at_ms: 1, can_decide: false, can_reconfirm: true,
+    context: { job_id: "child-b", project_id: "project-a", root_id: "job-a", conversation_id: "job-a",
+      job_title: "実行の確認", controller_device_id: "WinA", controller_device_label: "WinA",
+      execution_device_id: "WinB", execution_device_label: "WinB" },
+  };
+  surfaces.push({ name: "shared-work-expired-child-approval", html: renderSharedWork(sharedWorkPresentation(parked)) });
   shared.projection!.submission_uncertain = true;
   const receiver = deviceUiFixture();
   receiver.receiverActivity = { runner_id: "01K5RSWRDNYVZ5QNS5FD6C0FTM", observed_at_ms: 1, unavailable: false,
@@ -935,7 +945,7 @@ function representativeSurfaces(): RenderedSurface[] {
   surfaces.push({ name: "shared-work-sidebar", html: renderSidebar({ ...base, hub_project_open: true }, sharedWorkPresentation(shared)) });
   surfaces.push({ name: "shared-work-sidebar-legacy-list", html: renderSidebar({ ...base, hub_project_open: true },
     sharedWorkPresentation({ ...shared, projection: { ...shared.projection!, conversations: undefined } })) });
-  shared.confirmation = { kind: "delete_conversation", projectId: "project-a", conversationId: "job-a", generation: "1", title: "試験の会話" };
+  shared.confirmation = { kind: "delete_conversation", projectId: "project-a", participationGeneration: 1, conversationId: "job-a", generation: "1", title: "試験の会話" };
   surfaces.push({ name: "shared-work-delete-confirmation", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.confirmation = null;
   shared.projection!.detail!.can_revise = true;
@@ -1526,6 +1536,7 @@ test("an unavailable Session Settings underlay becomes inert below its dirty-clo
 
 test("each primary GUI surface retains its required action routes", () => {
   const requiredActionsBySurface = {
+    "shared-work-expired-child-approval": ["shared-reconfirm-approval"],
     titlebar: [
       "show-file-menu",
       "show-edit-menu",
@@ -1936,12 +1947,12 @@ test("quick-chat activity uses the selected chat identity and keeps background r
   assert.match(selectedRow, /aria-current="page"/);
   assert.match(selectedRow, /class="task-activity-indicator" data-task-activity="finalizing" aria-hidden="true"/);
   assert.doesNotMatch(selectedRow, /class="task-activity-indicator small"/);
-  assert.match(selectedRow, /<small>最終反映中 · turn 4<\/small>/);
+  assert.match(selectedRow, /<small>最終反映中 · 依頼 4<\/small>/);
   assert.doesNotMatch(selectedRow, /\[実行中\]/);
   assert.ok(backgroundRow);
   assert.doesNotMatch(backgroundRow, /aria-current="page"/);
   assert.match(backgroundRow, /class="task-activity-indicator small" data-task-activity="running" aria-hidden="true"/);
-  assert.match(backgroundRow, /<small>実行中 · turn 4<\/small>/);
+  assert.match(backgroundRow, /<small>実行中 · 依頼 4<\/small>/);
   assert.doesNotMatch(backgroundRow, /\[実行中\]/);
   assert.match(html, /data-task-activity-row="finalizing"/);
   assert.match(html, /data-task-activity-row="running"/);
@@ -1969,7 +1980,7 @@ test("a selected active row keeps the Rust state and removes its duplicate durab
     /class="task-activity-indicator" data-task-activity="running" aria-hidden="true"/,
   );
   assert.match(html, /<span>Active session active<\/span>/);
-  assert.match(html, /<small>実行中 · turn 4<\/small>/);
+  assert.match(html, /<small>実行中 · 依頼 4<\/small>/);
   assert.doesNotMatch(html, /\[実行中\]/);
   assert.doesNotMatch(html, /class="task-activity-indicator[^>]*aria-label=/);
 });

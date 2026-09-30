@@ -895,7 +895,7 @@ fn turn_work_history_text(group: &TurnTranscriptGroup) -> String {
     rows.extend(group.tool_rows.iter().take(12).cloned());
     let assistant_previews = folded_intermediate_assistant_history_rows(group);
     if !assistant_previews.is_empty() {
-        rows.push("- 中間応答: primary reading path から折りたたみ".to_string());
+        rows.push("- 作業途中の応答".to_string());
         rows.extend(assistant_previews);
     }
     rows.join("\n")
@@ -3699,7 +3699,13 @@ mod tests {
         );
         assert!(!primary_text.contains("Turn control projection surface"));
         assert!(!primary_text.contains("Invalid tool arguments"));
-        assert!(work_summary.body.contains("中間応答"));
+        assert!(work_summary.body.contains("作業途中の応答"));
+        assert!(
+            work_summary
+                .body
+                .contains("Turn control projection surface")
+        );
+        assert!(work_summary.body.contains("Invalid tool arguments"));
     }
 
     #[test]

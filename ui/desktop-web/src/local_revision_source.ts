@@ -35,8 +35,8 @@ export function localRevisionActionEnabled(state: DesktopWebState, pending: bool
 function messageEditError(error: unknown): string {
   const detail = typeof error === "string" ? error : error && typeof error === "object" && "message" in error
     ? String(error.message) : "";
-  return detail.includes("message with an image cannot be edited")
-    ? "画像付きの依頼は編集できません。新しい依頼として送ってください。"
+  return detail.includes("保存済みの画像を読み込めません")
+    ? "保存済みの画像を読み込めないため、編集を始められません。画像を添付し直して新しい依頼を送ってください。"
     : "依頼の編集を始められません。実行と起動中のアプリを停止し、最新の会話を確認してください。";
 }
 

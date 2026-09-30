@@ -73,6 +73,7 @@ impl crate::llm::LlmClient for ChildThenAnswer {
 fn context() -> SharedRunContext {
     SharedRunContext {
         job_id: "parent-job".into(),
+        project_context: None,
         attempt_id: "test-attempt".into(),
         generation: 1,
         project_id: "shared-project".into(),
@@ -138,6 +139,21 @@ async fn pause_named(
     ResolvedConfig,
     SharedYield,
 ) {
+    pause_with_project(job, None).await
+}
+
+async fn pause_with_project(
+    job: &str,
+    project_context: Option<crate::context::world_state::SharedProjectContext>,
+) -> (
+    Arc<super::super::RunService>,
+    StoreBundle,
+    crate::workspace::Workspace,
+    Arc<crate::app::AgentRuntime>,
+    Arc<ChildThenAnswer>,
+    ResolvedConfig,
+    SharedYield,
+) {
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".into();
     config.model.base_url = "http://local".into();
@@ -151,6 +167,7 @@ async fn pause_named(
             request(config.clone(), &workspace),
             SharedRunContext {
                 job_id: job.into(),
+                project_context,
                 ..context()
             },
             &mut crate::cli::HumanRenderer::new(),
@@ -162,6 +179,152 @@ async fn pause_named(
         panic!("a child wait must not manufacture a completed turn")
     };
     (service, store, workspace, runtime, llm, config, yielded)
+}
+
+#[tokio::test]
+async fn shared_project_snapshot_reaches_provider_on_initial_and_checkpoint_resumed_steps() {
+    let project = crate::context::world_state::SharedProjectContext {
+        project_id: "shared-project".into(),
+        label: "Text analysis team".into(),
+        overview: "PROJECT_OVERVIEW_SNAPSHOT: general is API, solver is Worker".into(),
+        revision: "17".into(),
+        root_prompt: "Build and verify the distributed application".into(),
+        origin_device_id: Some("WinA".into()),
+    };
+    let (service, _store, workspace, _runtime, llm, config, yielded) =
+        pause_with_project("parent-job", Some(project.clone())).await;
+    let mut resumed = resume(&yielded);
+    resumed.project_context = Some(project);
+    let outcome = service
+        .execute_shared(
+            request(config, &workspace),
+            resumed,
+            &mut crate::cli::HumanRenderer::new(),
+            &mut NoPrompt,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SharedRunOutcome::Completed(_)));
+    let requests = llm.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request
+                .system_prompt
+                .matches("PROJECT_OVERVIEW_SNAPSHOT")
+                .count(),
+            1
+        );
+        assert!(
+            request
+                .system_prompt
+                .contains("<origin_device_id>WinA</origin_device_id>")
+        );
+        assert!(
+            request
+                .system_prompt
+                .contains("<current_environment_id>general</current_environment_id>")
+        );
+        assert!(
+            request
+                .system_prompt
+                .contains("<overview_revision>17</overview_revision>")
+        );
+        assert!(
+            request
+                .system_prompt
+                .contains("Build and verify the distributed application")
+        );
+    }
+}
+
+#[derive(Default)]
+struct ContextAnswer {
+    requests: Mutex<Vec<ChatRequest>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::llm::LlmClient for ContextAnswer {
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+        sink: &mut dyn LlmEventSink,
+    ) -> Result<LlmResponseSummary, crate::error::LlmError> {
+        self.requests.lock().unwrap().push(request);
+        sink.push(LlmEvent::TextDelta("Completed the assigned scope.".into()))?;
+        Ok(LlmResponseSummary {
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            response_id: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn child_and_redelegated_context_keep_origin_but_identify_their_own_execution_environment() {
+    let project = crate::context::world_state::SharedProjectContext {
+        project_id: "shared-project".into(),
+        label: "Text analysis team".into(),
+        overview: "general=API; solver=Worker; database=DB".into(),
+        revision: "18".into(),
+        root_prompt: "Build and verify the async application".into(),
+        origin_device_id: Some("WinA".into()),
+    };
+    for environment in ["solver", "database"] {
+        let mut config = ResolvedConfig::default();
+        config.model.model = "scripted".into();
+        config.model.base_url = "http://local".into();
+        config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        config.multi_agent.enabled = false;
+        let llm = Arc::new(ContextAnswer::default());
+        let (service, _store, workspace, _runtime) =
+            run_service_fixture_with_llm(config.clone(), llm.clone()).await;
+        let mut child_request = request(config, &workspace);
+        child_request.prompt = "全体目標: 非同期解析。工程: 接続契約の検証。担当: この環境の保存を調べる。完了条件: 永続化を確認。返す成果: 試験結果と未解決事項。".into();
+        let child_context = SharedRunContext {
+            job_id: format!("child-{environment}"),
+            environment_id: environment.into(),
+            project_context: Some(project.clone()),
+            ..context()
+        };
+        let outcome = service
+            .execute_shared(
+                child_request.clone(),
+                child_context,
+                &mut crate::cli::HumanRenderer::new(),
+                &mut NoPrompt,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SharedRunOutcome::Completed(_)));
+        let requests = llm.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let provider = &requests[0];
+        assert!(provider.system_prompt.contains(&format!(
+            "<current_environment_id>{environment}</current_environment_id>"
+        )));
+        assert!(
+            provider
+                .system_prompt
+                .contains("<origin_device_id>WinA</origin_device_id>")
+        );
+        assert!(
+            provider
+                .system_prompt
+                .contains("general=API; solver=Worker; database=DB")
+        );
+        assert!(
+            provider
+                .system_prompt
+                .contains("Build and verify the async application")
+        );
+        assert!(
+            serde_json::to_string(&provider.messages)
+                .unwrap()
+                .contains(&child_request.prompt)
+        );
+    }
 }
 
 #[tokio::test]

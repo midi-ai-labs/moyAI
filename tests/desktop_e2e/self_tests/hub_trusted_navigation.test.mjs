@@ -3,14 +3,15 @@ import test from "node:test";
 import vm from "node:vm";
 import { trustedClick, trustedFocus } from "../scenarios/hub_browser_enrollment.mjs";
 
-function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = true, focusAfterTabs = null, disabledChecks = 0, initialFocusIndex = null } = {}) {
+function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = true, focusAfterTabs = null, disabledChecks = 0, missingChecks = 0, initialFocusIndex = null } = {}) {
   const target = { selector: "#older-versions > summary", identity: { tag: "DETAILS", detailsKey: "older-versions" } };
   const controls = Array.from({ length: count }, () => ({ disabled: false, closest: () => null }));
   const node = controls[targetIndex];
   let disabledReads = 0;
   Object.defineProperty(node, "disabled", { get: () => disabledReads++ < disabledChecks });
   controls.forEach((control, index) => { control.compareDocumentPosition = other => other === node ? targetIndex < index ? 2 : targetIndex > index ? 4 : 0 : 0; });
-  const document = { activeElement: initialFocusIndex === null ? null : controls[initialFocusIndex], querySelectorAll: selector => selector === target.selector ? [node] : controls };
+  let missingReads = 0;
+  const document = { activeElement: initialFocusIndex === null ? null : controls[initialFocusIndex], querySelectorAll: selector => selector === target.selector ? missingReads++ < missingChecks ? [] : [node] : controls };
   const cdp = { evaluate: async source => vm.runInNewContext(source, { document }) };
   const keys = [], clicks = [], events = [], records = [];
   let position = initialFocusIndex ?? -1, shift = false;
@@ -79,4 +80,12 @@ test("Hub clicks wait for a temporarily disabled control before focus and pointe
   await trustedClick(f.input, f.cdp, f.target, f.sink);
   assert.equal(f.keys.length, 131);
   assert.equal(f.clicks.length, 1);
+});
+
+test("a control inserted after an opener click is awaited before keyboard focus and pointer input", async () => {
+  const f = fixture({ targetIndex: 2, count: 5, missingChecks: 2 });
+  await trustedClick(f.input, f.cdp, f.target, f.sink);
+  assert.equal(f.keys.length, 3);
+  assert.equal(f.clicks.length, 1);
+  assert.equal(f.records[0][1].probe.events.length, 3);
 });

@@ -51,6 +51,7 @@ import { createSharedWorkIsolationScenario } from "./scenarios/shared_work_isola
 import { createSharedWorkContinuationScenario, createProjectFolderRecoveryScenario } from "./scenarios/shared_work_continuation.mjs";
 import { createDeviceExecutionScenario } from "./scenarios/device_execution.mjs";
 import { createOnboardingWinAbScenario } from "./scenarios/onboarding_winab.mjs";
+import { createFourDeviceAcceptanceScenario } from "./scenarios/four_device_acceptance.mjs";
 import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
 import { createMenuEntryControlsScenario, createPaletteEntryControlsScenario } from "./scenarios/shell_entry_controls.mjs";
@@ -79,6 +80,7 @@ const factories = new Map([
   ["run.latest-message-edit", createLocalLatestMessageEditScenario],
   ["settings.device-execution", createDeviceExecutionScenario],
   ["onboarding.win-a-to-win-b", createOnboardingWinAbScenario],
+  ["project.four-device-acceptance", createFourDeviceAcceptanceScenario],
   ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
   ["hub.receiver-settings-controls", createHubReceiverSettingsScenario],
   ["hub.outgoing-controls", createOutgoingControlsScenario],
@@ -159,6 +161,7 @@ const configurableScenarios = new Set([
   "settings.project-folder-recovery",
   "settings.device-execution",
   "onboarding.win-a-to-win-b",
+  "project.four-device-acceptance",
   "agent.interrupt",
   "navigation.external-rejoin",
   "navigation.external-sidebar-stop",
