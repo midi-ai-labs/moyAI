@@ -31,6 +31,8 @@ moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects t
 - Hub projects for work across approved PCs. They appear with a `Hub` badge in the project list, and requests use the same chat interface. The AI can select among the project's permitted execution PCs.
 - A Windows Runner that executes jobs independently of the Desktop window. Hub stores shared conversations, inputs and published results.
 
+Documentation and explanatory comments use built-in writing guidance inspired by [yomiyasu](https://github.com/nanaism/yomiyasu). It instructs the AI to preserve meaning and technical conditions while removing redundancy and unnatural phrasing. No setup or skill installation is required.
+
 ## Quick Start
 
 For a current development Windows package:

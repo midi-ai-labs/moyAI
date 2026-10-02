@@ -5442,9 +5442,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     async fn main_system_prompt_reaches_the_first_chat_request_after_builtin_instructions() {
         const MARKER: &str = "MAIN_SYSTEM_PROMPT_WIRE_MARKER";
         let builtin = format!(
-            "{}\n\n{}",
+            "{}\n\n{}\n\n{}",
             include_str!("../../assets/prompts/system.md").trim(),
-            include_str!("../../assets/prompts/profile_default.md").trim()
+            include_str!("../../assets/prompts/profile_default.md").trim(),
+            crate::system_prompt::DOCUMENTATION_INSTRUCTIONS.trim()
         );
         let mut config = ResolvedConfig::default();
         config.model.system_prompt = format!("  {MARKER}  ");
@@ -12057,6 +12058,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     #[test]
     fn prompt_asset_stays_small() {
         assert!(include_str!("../../assets/prompts/system.md").len() < 8 * 1024);
+        assert!(crate::system_prompt::DOCUMENTATION_INSTRUCTIONS.len() < 2 * 1024);
         assert!(include_str!("../../assets/prompts/profile_default.md").len() < 2 * 1024);
         assert!(include_str!("../../assets/prompts/collaboration_plan.md").len() < 2 * 1024);
     }

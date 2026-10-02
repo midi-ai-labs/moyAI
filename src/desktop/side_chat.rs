@@ -30,7 +30,12 @@ use crate::system_prompt::append_user_configured_system_prompt;
 const SIDE_CHAT_SYSTEM_PROMPT: &str = include_str!("../../assets/prompts/side_chat.md");
 
 pub(crate) fn side_chat_system_prompt(configured: &str) -> String {
-    append_user_configured_system_prompt(SIDE_CHAT_SYSTEM_PROMPT, Some(configured))
+    let builtin = format!(
+        "{}\n\n{}",
+        SIDE_CHAT_SYSTEM_PROMPT.trim_end(),
+        crate::system_prompt::DOCUMENTATION_INSTRUCTIONS.trim()
+    );
+    append_user_configured_system_prompt(&builtin, Some(configured))
 }
 // `ModelProfile` still carries this retired compatibility field. Provider
 // serializers omit it, so side chat supplies a fixed inert value instead of a
@@ -1734,7 +1739,14 @@ mod tests {
         .expect("custom side prompt request");
 
         assert!(effective.starts_with(SIDE_CHAT_SYSTEM_PROMPT.trim_end()));
+        assert_eq!(
+            effective
+                .matches(crate::system_prompt::DOCUMENTATION_INSTRUCTIONS.trim())
+                .count(),
+            1
+        );
         assert_eq!(effective.matches("SIDE_CHAT_CUSTOM_MARKER").count(), 1);
+        assert!(effective.ends_with("\n\nSIDE_CHAT_CUSTOM_MARKER"));
     }
 
     #[tokio::test]

@@ -73,9 +73,10 @@ impl ModelPolicy {
             config.session.overflow_margin_tokens,
         );
         let builtin_instructions = format!(
-            "{}\n\n{}",
+            "{}\n\n{}\n\n{}",
             include_str!("../../assets/prompts/system.md").trim(),
-            include_str!("../../assets/prompts/profile_default.md").trim()
+            include_str!("../../assets/prompts/profile_default.md").trim(),
+            crate::system_prompt::DOCUMENTATION_INSTRUCTIONS.trim()
         );
         Self {
             id: config.model.model.clone(),
@@ -221,9 +222,10 @@ mod tests {
     #[test]
     fn main_system_prompt_is_appended_after_the_unchanged_builtin_prompt() {
         let builtin = format!(
-            "{}\n\n{}",
+            "{}\n\n{}\n\n{}",
             include_str!("../../assets/prompts/system.md").trim(),
-            include_str!("../../assets/prompts/profile_default.md").trim()
+            include_str!("../../assets/prompts/profile_default.md").trim(),
+            crate::system_prompt::DOCUMENTATION_INSTRUCTIONS.trim()
         );
         let config = ResolvedConfig::default();
         assert_eq!(ModelPolicy::from_config(&config).base_instructions, builtin);
