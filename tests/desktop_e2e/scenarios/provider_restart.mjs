@@ -21,11 +21,11 @@ const SHOW_PROVIDER = Object.freeze({
   identity: { tag: "BUTTON", action: "show-provider" },
 });
 const LOAD_MODELS = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="load-provider-models"]',
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] #settings-provider button[data-action="load-provider-models"]',
   identity: { tag: "BUTTON", action: "load-provider-models" },
 });
 const CLOSE_PROVIDER = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="close-overlay"]',
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]',
   identity: { tag: "BUTTON", action: "close-overlay" },
 });
 const PROMPT_TARGET = Object.freeze({
@@ -539,7 +539,7 @@ export function createProviderRestartScenario() {
           label: "provider overlay after trusted activation",
           timeoutMs: 10_000,
           sample: () => invokeDesktopProjection(firstCdp),
-          decide: (projection) => projection?.overlay === "provider" && projection?.provider_loading === false ? "pass" : "pending",
+          decide: (projection) => projection?.overlay === "config" && projection?.provider_loading === false ? "pass" : "pending",
           code: "provider-overlay-did-not-open",
           message: "trusted provider activation did not open the provider surface",
         });

@@ -943,8 +943,6 @@ function representativeSurfaces(): RenderedSurface[] {
   surfaces.push({ name: "receiver-activity", html: renderReceiverActivity(deviceNetworkPresentation(receiver), sharedWorkPresentation(shared)) });
   shared.projection!.status!.next_before = "older";
   surfaces.push({ name: "shared-work-sidebar", html: renderSidebar({ ...base, hub_project_open: true }, sharedWorkPresentation(shared)) });
-  surfaces.push({ name: "shared-work-sidebar-legacy-list", html: renderSidebar({ ...base, hub_project_open: true },
-    sharedWorkPresentation({ ...shared, projection: { ...shared.projection!, conversations: undefined } })) });
   shared.confirmation = { kind: "delete_conversation", projectId: "project-a", participationGeneration: 1, conversationId: "job-a", generation: "1", title: "試験の会話" };
   surfaces.push({ name: "shared-work-delete-confirmation", html: renderSharedWork(sharedWorkPresentation(shared)) });
   shared.confirmation = null;

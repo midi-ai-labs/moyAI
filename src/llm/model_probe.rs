@@ -384,6 +384,7 @@ fn model_availability_passes(
 
 fn build_probe_client(config: &ResolvedConfig) -> Result<reqwest::Client, LlmError> {
     Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(config.model.connect_timeout_ms))
         .timeout(PROVIDER_READINESS_REQUEST_TIMEOUT)
         .build()?)
@@ -1255,6 +1256,94 @@ mod tests {
         assert!(config.supports_images);
         assert!(config.supports_tools);
         assert_eq!(config.max_parallel_predictions, 4);
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_does_not_forward_credentials_through_redirects() {
+        use axum::{Json, Router, http::HeaderMap, http::StatusCode};
+        use std::sync::{Arc, Mutex};
+
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect target");
+        let target_url = format!("http://{}/models", target_listener.local_addr().unwrap());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let target_capture = received.clone();
+        let target = tokio::spawn(async move {
+            axum::serve(
+                target_listener,
+                Router::new().fallback(move |headers: HeaderMap| {
+                    let received = target_capture.clone();
+                    async move {
+                        received
+                            .lock()
+                            .unwrap()
+                            .push(headers.contains_key("x-api-key"));
+                        Json(serde_json::json!({
+                            "data": [{"id": "foreign-model"}],
+                            "models": [{"key": "foreign-model", "type": "llm"}]
+                        }))
+                    }
+                }),
+            )
+            .await
+            .expect("serve redirect target");
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind configured provider");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let source_paths = paths.clone();
+        let source = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move |uri: axum::http::Uri| {
+                    source_paths.lock().unwrap().push(uri.path().to_string());
+                    let target_url = target_url.clone();
+                    async move {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, target_url)],
+                            "redirect",
+                        )
+                    }
+                }),
+            )
+            .await
+            .expect("serve configured provider");
+        });
+        let mut results = Vec::new();
+        for profile in [ProviderProfile::OpenAiCompatible, ProviderProfile::LmStudio] {
+            let mut config = ResolvedConfig::default();
+            config.model.provider_profile = profile;
+            config.model.base_url = endpoint.clone();
+            config.model.api_key_env = None;
+            config
+                .model
+                .extra_headers
+                .insert("X-Api-Key".to_string(), "fixture-only-key".to_string());
+            results.push(fetch_provider_model_infos(&config, &endpoint).await);
+        }
+        source.abort();
+        target.abort();
+        let _ = source.await;
+        let _ = target.await;
+
+        assert_eq!(
+            *paths.lock().unwrap(),
+            ["/v1/models", "/api/v1/models"],
+            "one request to each configured metadata route"
+        );
+        let observed = received.lock().unwrap();
+        assert!(
+            observed.is_empty(),
+            "unapproved listener received custom credentials: {observed:?}"
+        );
+        for result in results {
+            let error = result.expect_err("redirect must not supply another provider's catalog");
+            assert!(error.to_string().contains("307"));
+        }
     }
 
     #[tokio::test]

@@ -1081,7 +1081,7 @@ pub(crate) fn desktop_web_state_with_permission(
             desktop_run_phase_label(state.app_state.progress.current_phase).to_string()
         },
         run_active_step: if pre_admission_active {
-            "durable run admissionを確定しています".to_string()
+            "依頼を保存しています".to_string()
         } else {
             display_run_step(&state.app_state.progress.active_step)
         },

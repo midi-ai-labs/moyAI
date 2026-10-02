@@ -199,3 +199,18 @@ test("an upstream stream failure remains a failed stream without fabricated comp
   assert.equal(metadata.completed, false); assert.equal(metadata.failure, "comparison-request-failed");
   assert.equal((await readFile(path.join(f.captureDirectory, "000001.response.bin"))).toString(), "data: first\n\n");
 });
+
+test("a discovery connection reset retains its transport code without retry or error text", { timeout: 10000 }, async t => {
+  const f = await fixture(t, "preserve", (_row, res) => res.destroy());
+  f.state.expectedProxyFailure = true;
+  const response = await fetch(`${f.proxy.baseUrl}/models`);
+  assert.equal(response.status, 502); await response.text();
+  await assert.rejects(f.proxy.close(), /Comparison proxy failed/);
+  assert.equal(f.received.length, 1);
+  const metadata = JSON.parse(await readFile(path.join(f.captureDirectory, "000001.metadata.json")));
+  assert.equal(metadata.status, null); assert.equal(metadata.completed, false);
+  assert.equal(metadata.failure, "comparison-request-failed");
+  assert.equal(metadata.error_code, "ECONNRESET");
+  assert.equal("error_message" in metadata, false);
+  assert.equal("headers" in metadata, false);
+});

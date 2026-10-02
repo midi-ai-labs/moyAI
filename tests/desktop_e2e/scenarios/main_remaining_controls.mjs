@@ -156,7 +156,7 @@ export async function observeGoalQuery(d) {
   if(before.p.busy||before.p.run_target?.expectedState?.kind!=='idle'||!before.p.run_target.sessionId) throw fail(d,'Goal query requires settled existing session',before);
   const typed=await replacePrompt(d,'/goal');
   await d.captureScenarioScreenshot({cdp:d.cdp,sink:d.sink,name:'main-goal-query-before-send',owner:d.owner});
-  if(!typed.hint.visible||!typed.hint.text.includes('現在のgoalを表示')) throw fail(d,'Goal query hint does not explain current operation',typed);
+  if(!typed.hint.visible||!typed.hint.text.includes('現在の目標を表示')) throw fail(d,'Goal query hint does not explain current operation',typed);
   await submit(d,'/goal');
   const result=await d.wait('Goal control finishes or exposes failure',()=>observe(d),v=>
     !v.p.busy&&!v.p.post_run_refresh_pending&&!v.p.background_mutation_pending&&v.p.can_submit

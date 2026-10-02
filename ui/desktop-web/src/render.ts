@@ -1079,11 +1079,11 @@ export function renderSidebar(state: DesktopWebState, shared?: import("./shared_
         <button class="tiny-button icon-only" data-action="create-project-from-picker" title="このPCにローカルプロジェクトを作成" aria-label="このPCにローカルプロジェクトを作成" ${navigationDisabled ? "disabled" : ""}>${icon("folder-plus")}</button>
       </div>
       <div class="row-list project-list">
-        ${hub?.projects_stale && hub.projects.length ? hub.projects.map(project => `<div class="hub-project-row hub-project-stale"><div class="hub-project-heading"><button class="rail-item" type="button" disabled title="Hubから最新の参加状況を確認できません"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small class="project-source-badge">MCP · 未更新</small></button></div></div>`).join("") : hub?.principal ? hub.projects.map(project => {
+        ${hub?.projects_stale && hub.projects.length ? hub.projects.map(project => `<div class="hub-project-row hub-project-stale"><div class="hub-project-heading"><button class="rail-item" type="button" disabled title="Hubから最新の参加状況を確認できません"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small class="project-source-badge">Hub · 未更新</small></button></div></div>`).join("") : hub?.principal ? hub.projects.map(project => {
           const selected = state.hub_project_open === true && hub.selected_project_id === project.id;
           const confirmation = shared?.confirmation?.kind === "leave_project" && shared.confirmation.projectId === project.id;
-          const chats = selected ? sharedConversationRows(hub.status?.jobs ?? [], hub.selected_job_id, hub.conversations, hub.selected_conversation_id) : [];
-          return `<div class="hub-project-row"><div class="hub-project-heading"><button class="rail-item ${selected ? "active" : ""}" data-action="open-hub-project" data-value="${escapeHtml(project.id)}" title="Hubで共有するプロジェクト"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small class="project-source-badge">MCP</small></button><button class="tiny-button icon-only" data-action="shared-request-leave-project" data-value="${escapeHtml(project.id)}" title="プロジェクトから離脱" aria-label="${escapeHtml(project.label)}から離脱" ${hub.leave_pending_project_id === project.id ? "disabled" : ""}>${icon("x")}</button></div>${hub.leave_pending_project_id === project.id ? '<p class="hub-project-pending" role="status">離脱処理待ちです。確認できるまで、このPCから新しい仕事は開始しません。</p>' : ""}${confirmation ? `<div class="hub-project-confirmation" role="group" aria-label="プロジェクトから離脱"><p>このPCが「${escapeHtml(project.label)}」から離脱します。他のPC、共有チャット、各PCのファイルは残ります。</p><button data-action="shared-confirm-confirmation">離脱する</button><button data-action="shared-cancel-confirmation">戻る</button></div>` : ""}${selected ? `<div class="hub-project-chats">${chats.map(chat => `<div class="hub-chat-row"><button data-action="${hub.conversations ? "shared-select-conversation" : "shared-detail"}" data-value="${escapeHtml(hub.conversations ? chat.conversationId : chat.jobId ?? "")}" class="${chat.selected ? "active" : ""}" title="${escapeHtml(chat.title)}">${escapeHtml(chat.title)}${chat.deletePending ? " · 削除処理中" : ""}</button>${hub.conversations ? `<button class="tiny-button icon-only" data-action="shared-start-rename-conversation" data-value="${escapeHtml(chat.conversationId)}" title="チャット名を変更" aria-label="${escapeHtml(chat.title)}の名前を変更" ${chat.deletePending || chat.canRename === false ? "disabled" : ""}>${icon("edit")}</button><button class="tiny-button icon-only" data-action="shared-request-delete-conversation" data-value="${escapeHtml(chat.conversationId)}" title="共有チャットを削除" aria-label="${escapeHtml(chat.title)}を削除" ${chat.deletePending || chat.canDelete === false ? "disabled" : ""}>${icon("x")}</button>` : ""}</div>`).join("")}${hub.status?.next_before && !hub.conversations ? '<button data-action="shared-next-jobs">以前のチャット</button>' : ""}<button data-action="shared-new-conversation">＋ 新しいチャット</button></div>` : ""}</div>`;
+          const chats = selected ? sharedConversationRows(hub.conversations, hub.selected_conversation_id, hub.selected_job_id) : [];
+          return `<div class="hub-project-row"><div class="hub-project-heading"><button class="rail-item ${selected ? "active" : ""}" data-action="open-hub-project" data-value="${escapeHtml(project.id)}" title="Hubで共有するプロジェクト"><span class="rail-icon">${icon("folder")}</span><span>${escapeHtml(project.label)}</span><small class="project-source-badge">Hub</small></button><button class="tiny-button icon-only" data-action="shared-request-leave-project" data-value="${escapeHtml(project.id)}" title="プロジェクトから離脱" aria-label="${escapeHtml(project.label)}から離脱" ${hub.leave_pending_project_id === project.id ? "disabled" : ""}>${icon("x")}</button></div>${hub.leave_pending_project_id === project.id ? '<p class="hub-project-pending" role="status">離脱処理待ちです。確認できるまで、このPCから新しい仕事は開始しません。</p>' : ""}${confirmation ? `<div class="hub-project-confirmation" role="group" aria-label="プロジェクトから離脱"><p>このPCが「${escapeHtml(project.label)}」から離脱します。他のPC、共有チャット、各PCのファイルは残ります。</p><button data-action="shared-confirm-confirmation">離脱する</button><button data-action="shared-cancel-confirmation">戻る</button></div>` : ""}${selected ? `<div class="hub-project-chats">${chats.map(chat => `<div class="hub-chat-row"><button data-action="shared-select-conversation" data-value="${escapeHtml(chat.conversationId)}" class="${chat.selected ? "active" : ""}" title="${escapeHtml(chat.title)}">${escapeHtml(chat.title)}${chat.deletePending ? " · 削除処理中" : ""}</button><button class="tiny-button icon-only" data-action="shared-start-rename-conversation" data-value="${escapeHtml(chat.conversationId)}" title="チャット名を変更" aria-label="${escapeHtml(chat.title)}の名前を変更" ${chat.deletePending || chat.canRename === false ? "disabled" : ""}>${icon("edit")}</button><button class="tiny-button icon-only" data-action="shared-request-delete-conversation" data-value="${escapeHtml(chat.conversationId)}" title="共有チャットを削除" aria-label="${escapeHtml(chat.title)}を削除" ${chat.deletePending || chat.canDelete === false ? "disabled" : ""}>${icon("x")}</button></div>`).join("")}<button data-action="shared-new-conversation">＋ 新しいチャット</button></div>` : ""}</div>`;
         }).join("") : hub?.hub_url ? `<button class="rail-item" data-action="show-shared-work">${hub.connected ? "Hubのプロジェクトを確認" : "Hubへの参加状況"}</button>` : ""}
         ${state.project_rows
           .map((row, index) => renderProjectRowWithSessions(localState, row, index))
@@ -1272,7 +1272,7 @@ function renderEmptyThread(state: DesktopWebState): string {
   return `
     <div class="empty-thread">
       <span class="empty-eyebrow">moyAI Desktop <b>LYNX</b></span>
-      <h2>${state.selected_project_index >= 0 ? "このプロジェクトで何を作りますか？" : "何に取り組みますか？"}</h2>
+      <h2>${state.selected_project_index >= 0 ? "このプロジェクトで何に取り組みますか？" : "何に取り組みますか？"}</h2>
       <p>相談、調査、コードの作成。<br>下の入力欄から、やりたいことを伝えてください。</p>
       ${state.selected_project_index >= 0 ? `<div class="empty-status"><span>${escapeHtml(selectedProjectDisplayLabel(state))}</span></div>` : ""}
       ${state.model_label.trim().length === 0 ? '<p class="empty-setup-hint">上のモデル欄で接続先を設定できます。</p>' : ""}
@@ -1864,7 +1864,6 @@ function renderSessionSettingsOverlay(
           <div class="settings-header">
             <div>
               <h2 id="session-settings-dialog-title">チャットの設定</h2>
-              <p>${escapeHtml(projection.unavailable_reason || "メインチャットを開くと設定できます。")}</p>
             </div>
             <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>
           </div>
@@ -1951,7 +1950,7 @@ function renderSessionSettingsOverlay(
               <div class="settings-field" ${managed ? "hidden" : ""}>
                 <label for="session-settings-model">モデル</label>
                 <input id="session-settings-model" class="session-settings-control" data-session-setting="model" value="${escapeHtml(draft.model)}" autocomplete="off" spellcheck="false" aria-describedby="session-settings-model-help session-settings-status" ${fieldInvalid("model") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
-                <small id="session-settings-model-help" class="settings-field-help">このsessionで使用するモデル IDです。</small>
+                <small id="session-settings-model-help" class="settings-field-help">このチャットで使うモデルIDです。</small>
               </div>
               <div class="settings-field">
                 <label for="session-settings-context-window">moyAIの入力整理上限 <span class="inherited-badge" data-settings-passive="session-context-inherited-badge" ${projection.context_window_inherited ? "" : "hidden"}>継承中</span></label>
@@ -2490,7 +2489,7 @@ function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = "", in
     parts.push(`範囲: ${field.max_value}以下。`);
   }
   if (includeTechnical && field.options.length > 0) parts.push(`選択肢: ${field.options.join(" / ")}。`);
-  if (field.required) parts.push("必須入力です。");
+  if (field.required && field.value_type !== "boolean") parts.push("必須入力です。");
   if (includeTechnical && field.env_override) parts.push(`環境変数: ${field.env_override}。`);
   if (field.sensitive) {
     parts.push(field.configured
@@ -2642,7 +2641,7 @@ function mainProviderCatalogStatus(state: DesktopViewState): DesktopWebState["pr
   if (mainProviderCatalogMatchesSettings(state) && state.provider_model_ids.length > 0) {
     return { kind: "success", title: `${state.provider_model_ids.length}件のメインチャットモデルから選択できます。`, hint: "", details: "" };
   }
-  return { kind: "idle", title: "「モデル読込」で入力中のURLと接続方式に対応する候補を取得できます。", hint: "保存済み・手入力のモデルIDは候補に追加しません。", details: "" };
+  return { kind: "idle", title: "「モデル読込」で接続先のモデル一覧を取得します。", hint: "モデルIDを手入力することもできます。", details: "" };
 }
 
 function renderDoclingReadiness(

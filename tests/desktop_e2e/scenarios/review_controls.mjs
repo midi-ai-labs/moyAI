@@ -43,7 +43,13 @@ export function createReviewControlsScenario() {
       const result=await wait("Review action starts and completes the scoped canonical review",async()=>({p:await invokeDesktopCommand(cdp,"desktop_state"),ledger:state.provider.requestLedger}),
         value=>value.ledger.some(row=>row.contract?.pass&&row.response_phase==="completed")&&value.p.run_status_key==="completed"&&value.p.can_submit);
       if(result.ledger.filter(row=>row.route==="responses").length!==1)throw new DesktopE2eError("product","review-duplicate-request","Review produced an unexpected model request count",result);
-      if(await cdp.evaluate(`document.body.textContent.includes(${JSON.stringify(FINAL)})`)!==true)throw new DesktopE2eError("product","review-result-missing","Completed review result is not visible",result);
+      const finalRows=result.p.transcript_rows.filter(row=>row.row_kind==="assistant"&&row.body===FINAL);
+      if(finalRows.length!==1||!finalRows[0].stable_history_identity)throw new DesktopE2eError("product","review-result-missing","Completed review must contain one canonical result",result);
+      await wait("The canonical review result is visibly rendered",()=>cdp.evaluate(`(() => {
+        const rows=[...document.querySelectorAll('#thread [data-history-identity]')].filter(row=>row.dataset.historyIdentity===${JSON.stringify(finalRows[0].stable_history_identity)});
+        const row=rows.length===1?rows[0]:null, rect=row?.getBoundingClientRect();
+        return Boolean(row?.isConnected&&rect?.width>0&&rect.height>0&&getComputedStyle(row).visibility!=='hidden'&&row.innerText.includes(${JSON.stringify(FINAL)}));
+      })()`),visible=>visible===true);
       await captureScenarioScreenshot({cdp,sink,name:"review-uncommitted-finished",owner:OWNER});
       if(await readFile(path.join(context.paths.workspace,"E2E_REVIEW.txt"),"utf8")!=="Review this one isolated untracked file.\n")throw new Error("Review modified the sentinel");
       await sink.record("uncommitted-review-control",result,{phase:"executing",owner:OWNER});

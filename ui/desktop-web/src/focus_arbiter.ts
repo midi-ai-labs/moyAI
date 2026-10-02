@@ -154,6 +154,14 @@ export class PostRenderFocusArbiter<Handle> {
     this.cancelPending("superseded");
   }
 
+  /** Restore focus before the next snapshot; DOM moves can leave temporary BODY focus. */
+  settleBeforeRender(): void {
+    const pending = this.pending;
+    if (!pending) return;
+    if (pending.handle !== null) this.scheduler.cancel(pending.handle);
+    this.execute(pending);
+  }
+
   private execute(pending: PendingFocusCommit<Handle>): void {
     if (this.pending?.token !== pending.token) return;
     this.pending = null;

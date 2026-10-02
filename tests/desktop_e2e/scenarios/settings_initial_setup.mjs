@@ -377,7 +377,7 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
     && surface?.wizard?.count === 1
     && surface.wizard.visible === true
     && surface.wizard.current_step === expectedStep
-    && sameValue(surface.wizard.step_rows.map((row) => row.step), INITIAL_SETUP_STEPS)
+    && sameValue(surface.wizard.step_rows.map((row) => row.step), expectedStep === "start" ? ["start"] : INITIAL_SETUP_STEPS)
     && surface.wizard.step_rows.filter((row) => row.current === "step").length <= 1
     && Number.isFinite(rect?.left)
     && Math.abs(rect.left) <= 1

@@ -144,26 +144,38 @@ test("a retained app stays visible in the same conversation and its stop targets
 });
 test("Hub projects and chats occupy the normal sidebar and logout removes them", () => {
   const local = sharedUiFixture();
-  local.projection!.status!.jobs[0].title = "<private-job>";
+  local.projection!.conversations[0].title = "<private-conversation>";
   const state = { overlay: "none", hub_project_open: true, navigation_admission_open: true, project_rows: [], chat_session_rows: [] } as unknown as DesktopWebState;
   const html = renderSidebar(state, local);
   assert.match(html, /data-action="open-hub-project" data-value="project-a"/);
-  assert.match(html, /data-action="shared-detail" data-value="job-a"/);
-  assert.match(html, /class="project-source-badge">MCP<\/small>/);
-  assert.match(html, /&lt;private-job&gt;/);
-  assert.doesNotMatch(html, /<private-job>|<span>共有仕事<\/span>|<span>過去の連携履歴<\/span>/);
+  assert.match(html, /data-action="shared-select-conversation" data-value="job-a"/);
+  assert.match(html, /class="project-source-badge">Hub<\/small>/);
+  assert.match(html, /&lt;private-conversation&gt;/);
+  assert.doesNotMatch(html, /<private-conversation>|<span>共有仕事<\/span>|<span>過去の連携履歴<\/span>/);
   local.conceal = true;
-  assert.doesNotMatch(renderSidebar(state, local), /project-a|job-a|private-job/);
+  assert.doesNotMatch(renderSidebar(state, local), /project-a|job-a|private-conversation/);
 });
-test("children and continuations keep one Hub conversation while a private-origin job stays in its local chat", () => {
-  const first = sharedProjection().status!.jobs[0];
-  const jobs = [
-    { ...first, id: "root", conversation_id: "root", parent_id: null, root_id: "root", title: "TODO アプリ", created_at_ms: 1 },
-    { ...first, id: "child", conversation_id: "root", parent_id: "root", root_id: "root", title: "WinB の作業", created_at_ms: 2 },
-    { ...first, id: "continuation", conversation_id: "root", parent_id: null, root_id: "root", title: "変更を確認", created_at_ms: 3 },
-    { ...first, id: "private-job", conversation_id: "private-job", origin_session_ref: "local-session", parent_id: null, root_id: "private-job", created_at_ms: 4 },
-  ];
-  assert.deepEqual(sharedConversationRows(jobs, "continuation"), [{ conversationId: "root", title: "TODO アプリ", jobId: "continuation", selected: true }]);
+test("sidebar follows persisted conversation names and selection even when the job page differs", () => {
+  const local = sharedUiFixture();
+  const conversation = { id: "conversation", title: "名前を変更した会話", latest_job_id: "continuation-not-on-page", updated_at_ms: 4,
+    delete_pending: false, can_rename: false, can_delete: false };
+  local.projection!.conversations = [conversation];
+  local.projection!.selected_conversation_id = conversation.id;
+  local.projection!.selected_job_id = "selected-child";
+  assert.deepEqual(sharedConversationRows([conversation], conversation.id, "selected-child"), [{
+    conversationId: conversation.id, title: conversation.title, jobId: conversation.latest_job_id, selected: true,
+    deletePending: false, canRename: false, canDelete: false,
+  }]);
+  const state = { overlay: "none", hub_project_open: true, navigation_admission_open: true, project_rows: [], chat_session_rows: [] } as unknown as DesktopWebState;
+  const html = renderSidebar(state, local);
+  assert.match(html, /data-action="shared-select-conversation" data-value="conversation" class="active"/);
+  assert.match(html, /名前を変更した会話/);
+  assert.doesNotMatch(html, /試験の仕事|data-action="shared-detail"|data-action="shared-next-jobs"/);
+  assert.match(html, /data-action="shared-start-rename-conversation"[^>]+disabled/);
+  assert.match(html, /data-action="shared-request-delete-conversation"[^>]+disabled/);
+  local.projection!.conversations = [];
+  assert.doesNotMatch(renderSidebar(state, local), /hub-chat-row|試験の仕事|data-action="shared-next-jobs"/);
+  assert.match(renderSidebar(state, local), /data-action="shared-new-conversation"/);
 });
 test("background refresh populates projects without opening a separate mode", async () => {
   const local = sharedUiFixture(), calls: string[] = [];

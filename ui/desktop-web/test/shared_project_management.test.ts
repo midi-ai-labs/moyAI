@@ -13,7 +13,7 @@ import { sharedProjection, sharedUiFixture } from "./shared_work_fixture.ts";
 const conversation = { id: "conversation-a", title: "TODO アプリ", latest_job_id: "job-a", updated_at_ms: 4,
   revision: 2, delete_pending: false, can_rename: true, can_delete: true };
 
-test("one project list shows Hub projects by ID with an MCP badge and authoritative shared chats", () => {
+test("one project list shows Hub projects by ID with a Hub badge and authoritative shared chats", () => {
   const local = sharedUiFixture();
   local.projection = sharedProjection({ conversations: [conversation], selected_conversation_id: conversation.id });
   const state = { overlay: "none", hub_project_open: true, navigation_admission_open: true,
@@ -21,7 +21,7 @@ test("one project list shows Hub projects by ID with an MCP badge and authoritat
     chat_session_rows: [] } as unknown as DesktopWebState;
   const html = renderSidebar(state, sharedWorkPresentation(local));
   assert.match(html, /data-action="open-hub-project" data-value="project-a"/);
-  assert.match(html, /class="project-source-badge">MCP<\/small>/);
+  assert.match(html, /class="project-source-badge">Hub<\/small>/);
   assert.match(html, /デスクトップ時計アプリの作成/);
   assert.match(html, /data-action="shared-select-conversation" data-value="conversation-a"/);
   assert.match(html, /data-action="shared-start-rename-conversation" data-value="conversation-a"/);
@@ -34,7 +34,7 @@ test("a temporarily unavailable Hub retains its last confirmed projects as read-
   const state = { overlay: "none", hub_project_open: false, navigation_admission_open: true,
     project_rows: [], chat_session_rows: [] } as unknown as DesktopWebState;
   const html = renderSidebar(state, sharedWorkPresentation(local));
-  assert.match(html, /project-source-badge">MCP · 未更新/);
+  assert.match(html, /project-source-badge">Hub · 未更新/);
   assert.match(html, /解析 A/);
   assert.doesNotMatch(html, /data-action="open-hub-project"/);
   assert.doesNotMatch(html, /data-action="shared-request-leave-project"/);

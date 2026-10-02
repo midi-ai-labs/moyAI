@@ -9,6 +9,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { DesktopE2eError } from "../core/execution.mjs";
+import { waitForObservation } from "../core/deadline.mjs";
 import {
   PERMISSION_TEMP_ESCALATION_COMMAND,
   PERMISSION_TEMP_ESCALATION_GUARDIAN_DELAY_MS,
@@ -24,6 +25,7 @@ import {
   createPermissionTempEscalationTerminalDecision,
   exactPermissionTempEscalationLedger,
   normalizePermissionTempEscalationLmStudioOptions,
+  observePermissionTempTerminalDetail,
   parsePermissionTempEscalationCaptureJson,
   permissionTempEscalationFixtureConfig,
   permissionTempEscalationHeldDecision,
@@ -53,6 +55,18 @@ const ROLES = Object.freeze([
   "temp_guardian",
   "temp_continuation",
 ]);
+
+function restrictedErrorRow() {
+  return {
+    row_kind: "error",
+    title: "エラー - Tool shell",
+    body: `Command: ${PERMISSION_TEMP_ESCALATION_COMMAND}\n\nExit code: 1\n\nStdout:\nE PermissionError: [WinError 5] Access is denied: 'C:\\temp\\moyai-sandbox-effect-owned\\pytest-of-owner'\n1 error\n\nStderr:\n(empty)`,
+  };
+}
+
+const completedSummary = (projection) => projection.transcript_rows.find(
+  (row) => row.row_kind === "work_summary_completed",
+);
 
 function restrictedEvidence(overrides = {}) {
   return {
@@ -147,10 +161,10 @@ function baseProjection(overrides = {}) {
     draft_prompt: "",
     composer_submit_mode: "new_request",
     can_submit: true,
-    progress_text: "Completed\nツール: 2件開始 / 2件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
+    progress_text: "Completed\nツール: 2件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 1件失敗",
     tool_status_text: [
       "ツール:",
-      "- [完了] first: output",
+      "- [失敗] first: output",
       "- [完了] second: output",
     ].join("\n"),
     draft_target: { sessionId: SESSION_ID },
@@ -164,6 +178,7 @@ function baseProjection(overrides = {}) {
     },
     transcript_rows: [
       { row_kind: "user", body: PERMISSION_TEMP_ESCALATION_PROMPT },
+      restrictedErrorRow(),
       {
         row_kind: "work_summary_completed",
         body: [
@@ -173,7 +188,7 @@ function baseProjection(overrides = {}) {
           "",
           "### 作業履歴",
           "- [待機] shell",
-          "- [完了] shell",
+          "- [失敗] shell",
           "- [待機] shell",
           "- [完了] shell",
         ].join("\n"),
@@ -553,6 +568,7 @@ test("live LM Studio terminal uses the same settled two-shell workspace owner", 
   const liveProjection = baseProjection({
     transcript_rows: [
       { row_kind: "user", body: PERMISSION_TEMP_ESCALATION_LIVE_PROMPT },
+      restrictedErrorRow(),
       {
         row_kind: "work_summary_completed",
         body: [
@@ -560,7 +576,7 @@ test("live LM Studio terminal uses the same settled two-shell workspace owner", 
           "- コマンド/ツール: 4件",
           "### 作業履歴",
           "- [待機] shell",
-          "- [完了] shell",
+          "- [失敗] shell",
           "- [待機] shell",
           "- [完了] shell",
         ].join("\n"),
@@ -595,7 +611,7 @@ test("live LM Studio terminal uses the same settled two-shell workspace owner", 
   assert.equal(decision(exact), "pass");
 
   const extraTool = structuredClone(exact);
-  extraTool.projection.transcript_rows[1].body += "\n- [完了] read";
+  completedSummary(extraTool.projection).body += "\n- [完了] read";
   assert.ok(permissionTempEscalationLiveTerminalFailures(extraTool).includes(
     "live-terminal-tool-history-mismatch",
   ));
@@ -708,11 +724,13 @@ test("permission TEMP SQLite oracle requires nested failure and elevated success
     "persistence-elevated-success-projection-mismatch",
   ));
 
-  const incomplete = structuredClone(exact);
-  incomplete.rows[0].status = "running";
-  assert.ok(permissionTempEscalationPersistenceFailures(incomplete, owner).includes(
-    "persistence-tool-output-0-identity-mismatch",
-  ));
+  for (const status of ["running", "failed"]) {
+    const wrongLifecycle = structuredClone(exact);
+    wrongLifecycle.rows[0].status = status;
+    assert.ok(permissionTempEscalationPersistenceFailures(wrongLifecycle, owner).includes(
+      "persistence-tool-output-0-identity-mismatch",
+    ));
+  }
 
   const missingElevated = structuredClone(exact);
   missingElevated.rows.pop();
@@ -866,7 +884,7 @@ test("permission TEMP persistence reader queries the exact turn through sqlite3 
   ]);
 });
 
-test("permission TEMP escalation terminal requires exact retry and two completed shell lifecycles", () => {
+test("permission TEMP terminal shows one restricted failure followed by the successful retry", () => {
   const exact = { surface: surface(), ledger: ledger() };
   assert.deepEqual(permissionTempEscalationTerminalFailures(exact), []);
 
@@ -884,7 +902,7 @@ test("permission TEMP escalation terminal requires exact retry and two completed
   ));
 
   const oneTool = structuredClone(exact);
-  oneTool.surface.projection.transcript_rows[1].body = oneTool.surface.projection.transcript_rows[1].body
+  completedSummary(oneTool.surface.projection).body = completedSummary(oneTool.surface.projection).body
     .replace("2件", "1件")
     .replace("\n- [完了] shell", "");
   assert.ok(permissionTempEscalationTerminalFailures(oneTool).includes("terminal-tool-history-mismatch"));
@@ -894,6 +912,103 @@ test("permission TEMP escalation terminal requires exact retry and two completed
   assert.ok(permissionTempEscalationTerminalFailures(visibleError).includes(
     "terminal-surface-not-settled",
   ));
+});
+
+test("permission TEMP history rejects hidden, repeated, reordered or unrelated shell failures", () => {
+  const exact = { surface: surface(), ledger: ledger() };
+  for (const mutate of [
+    value => { completedSummary(value.surface.projection).body = completedSummary(value.surface.projection).body.replace("[失敗]", "[完了]"); },
+    value => { completedSummary(value.surface.projection).body = completedSummary(value.surface.projection).body.replace("[完了]", "[失敗]"); },
+    value => { completedSummary(value.surface.projection).body = completedSummary(value.surface.projection).body.replace("[失敗]", "[running]").replace("[完了]", "[失敗]").replace("[running]", "[完了]"); },
+    value => { value.surface.projection.transcript_rows = value.surface.projection.transcript_rows.filter(row => row.row_kind !== "error"); },
+    value => { value.surface.projection.transcript_rows.push(restrictedErrorRow()); },
+    value => { value.surface.projection.transcript_rows.find(row => row.row_kind === "error").body = restrictedErrorRow().body.replace(PERMISSION_TEMP_ESCALATION_COMMAND, "python unrelated.py"); },
+    value => { value.surface.projection.transcript_rows.find(row => row.row_kind === "error").body = restrictedErrorRow().body.replace("Exit code: 1", "Exit code: 0"); },
+    value => { value.surface.projection.transcript_rows.find(row => row.row_kind === "error").body = restrictedErrorRow().body.replace("WinError 5", "WinError 2"); },
+  ]) {
+    const drift = structuredClone(exact);
+    mutate(drift);
+    assert.ok(permissionTempEscalationTerminalFailures(drift).includes("terminal-tool-history-mismatch"));
+  }
+});
+
+test("permission TEMP canonical terminal does not infer tool results from transient detail counters", () => {
+  const exact = { surface: surface(), ledger: ledger() };
+  // The saved actual failure had already committed both canonical outputs while
+  // the live detail panel still showed the second shell as running.
+  exact.surface.projection.progress_text = "Completed\nツール: 2件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗";
+  exact.surface.projection.tool_status_text = "- [失敗] first: output\n- [実行中] shell";
+  assert.deepEqual(permissionTempEscalationTerminalFailures(exact), []);
+
+  for (const mutate of [
+    value => { value.ledger.splice(3, 1); },
+    value => { value.ledger.splice(3, 0, structuredClone(value.ledger[3])); },
+    value => { value.ledger[2].contract.role_evidence.restricted_output.command_matches = false; },
+    value => { value.ledger.at(-1).contract.role_evidence.elevated_output.command_matches = false; },
+    value => { value.surface.projection.transcript_rows.find(row => row.row_kind === "assistant").body = "not the canonical answer"; },
+  ]) {
+    const drift = structuredClone(exact);
+    mutate(drift);
+    assert.notDeepEqual(permissionTempEscalationTerminalFailures(drift), []);
+  }
+});
+
+function detailObservationClock() {
+  let now = 0;
+  return { observe: options => waitForObservation({ ...options,
+    now: () => now, sleep: async milliseconds => { now += milliseconds; } }) };
+}
+
+test("permission TEMP detail diagnosis observes convergence without changing terminal acceptance", async () => {
+  const initial = surface(), samples = [];
+  initial.projection.tool_status_text = "- [失敗] shell\n- [実行中] shell";
+  for (let index = 0; index < 3; index += 1) {
+    const next = structuredClone(initial);
+    next.visible_tool_detail = { present_count: 0, visible_count: 0, text: "" };
+    if (index === 2) next.projection.tool_status_text = "- [失敗] shell\n- [完了] shell";
+    samples.push(next);
+  }
+  const result = await observePermissionTempTerminalDetail(initial, async () => samples.shift(), detailObservationClock());
+  assert.equal(result.status, "converged");
+  assert.equal(result.same_owner, true);
+  assert.equal(result.attempts, 3);
+  assert.equal(result.elapsed_ms, 200);
+  assert.equal(result.typed_pending, false);
+  assert.equal(result.visible_pending, false);
+  assert.deepEqual(permissionTempEscalationTerminalFailures({ surface: initial, ledger: ledger() }), []);
+});
+
+test("permission TEMP detail timeout separates hidden typed activity from visible activity", async () => {
+  for (const visible of [false, true]) {
+    const initial = surface();
+    initial.projection.tool_status_text = "- [失敗] shell\n- [実行中] shell";
+    const next = { ...initial, visible_tool_detail: { present_count: Number(visible),
+      visible_count: Number(visible), text: visible ? initial.projection.tool_status_text : "" } };
+    const result = await observePermissionTempTerminalDetail(initial, async () => next, detailObservationClock());
+    assert.equal(result.status, "not_converged");
+    assert.equal(result.elapsed_ms, 3000);
+    assert.equal(result.typed_pending, true);
+    assert.equal(result.visible_pending, visible);
+    assert.deepEqual(permissionTempEscalationTerminalFailures({ surface: initial, ledger: ledger() }), []);
+  }
+});
+
+test("permission TEMP detail diagnosis cannot call a changed session, turn or generation converged", async () => {
+  for (const mutate of [
+    target => { target.sessionId = TURN_ID; },
+    target => { target.expectedState.latestTurnId = SESSION_ID; },
+    target => { target.runtimeOwnerToken = "root:2"; },
+  ]) {
+    const initial = surface();
+    initial.projection.run_target.runtimeOwnerToken = "root:1";
+    const next = structuredClone(initial);
+    next.visible_tool_detail = { present_count: 0, visible_count: 0, text: "" };
+    mutate(next.projection.run_target);
+    const result = await observePermissionTempTerminalDetail(initial, async () => next, detailObservationClock());
+    assert.equal(result.status, "owner_changed");
+    assert.equal(result.same_owner, false);
+    assert.equal(result.attempts, 1);
+  }
 });
 
 test("permission TEMP terminal waits for DOM convergence and confirms canonical mismatch", () => {
@@ -914,8 +1029,8 @@ test("permission TEMP terminal waits for DOM convergence and confirms canonical 
   assert.equal(domDecision(exact), "pass");
 
   const canonicalMismatch = structuredClone(exact);
-  canonicalMismatch.surface.projection.transcript_rows[1].body = canonicalMismatch
-    .surface.projection.transcript_rows[1].body.replace(
+  const wrongSummary = completedSummary(canonicalMismatch.surface.projection);
+  wrongSummary.body = wrongSummary.body.replace(
       "- コマンド/ツール: 4件",
       "- コマンド/ツール: 3件",
     );

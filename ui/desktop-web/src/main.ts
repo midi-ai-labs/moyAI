@@ -1044,6 +1044,7 @@ function renderCommitted(
   settingsAction: SettingsActionFocusContinuation | null,
 ): void {
   const state = model.view;
+  postRenderFocusArbiter.settleBeforeRender();
   const revealGeneration = ++threadEndRevealGeneration;
   const postRenderFocusIntents: PostRenderFocusIntent[] = [];
   const postRenderFocusResultHandlers: Array<(result: FocusArbiterResult) => void> = [];

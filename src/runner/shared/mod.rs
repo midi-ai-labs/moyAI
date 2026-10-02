@@ -467,13 +467,7 @@ impl Controller {
         loop {
             self.process_external().await;
             self.process_operations().await;
-            let result = self.tick().await;
-            let connected = result.is_ok();
-            if !connected {
-                // A retained server may not continue serving after the Hub authority
-                // becomes unreachable. Keep the lease occupied until drain is proven.
-                self.cancel_retained_services();
-            }
+            let (connected, result) = self.tick().await;
             // Delivery of old checkpoint cleanup is not admission for current work. It has
             // no execution effects and runs after current stop/approval/claim processing.
             let cleanup = if connected && !self.closing() {
@@ -563,24 +557,44 @@ impl Controller {
             ));
         }
         let shells = self.host.inner.process.managed_shells();
-        for mut entry in retained {
+        let mut identity_changed = false;
+        // Apply every fence from this control response before delivering receipts.
+        // One unavailable report endpoint must not postpone another service's stop.
+        for entry in &retained {
             if !entry.retention_reported {
                 continue;
             }
             let service = entry.retained_service.expect("retained-service query");
             let id = service.service_id.to_string();
             let lease = leases.iter().find(|lease| lease.service_id == id);
-            if let Some(lease) = lease {
-                if lease.attempt_id != entry.assignment.attempt_id
+            let changed = lease.is_some_and(|lease| {
+                lease.attempt_id != entry.assignment.attempt_id
                     || lease.generation != entry.assignment.generation
                     || lease.conversation_id != entry.assignment.job.conversation_id
                     || lease.environment_id != entry.assignment.job.environment_id
                     || lease.expires_at_ms != service.expires_at_ms
-                {
-                    shells.cancel_retained_service(service.service_id);
-                    return Err(RunnerError::new("Hub retained-service identity changed"));
-                }
+            });
+            identity_changed |= changed;
+            let expired = service
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= super::operations::now_ms());
+            if changed
+                || lease.is_none()
+                || lease.is_some_and(|lease| lease.stop_requested)
+                || expired
+            {
+                shells.cancel_retained_service(service.service_id);
             }
+        }
+        if identity_changed {
+            return Err(RunnerError::new("Hub retained-service identity changed"));
+        }
+        for mut entry in retained {
+            if !entry.retention_reported {
+                continue;
+            }
+            let service = entry.retained_service.expect("retained-service query");
+            let id = service.service_id.to_string();
             if entry.service_reconciliation.is_some() {
                 let report = Report::for_assignment(
                     &entry.assignment,
@@ -590,12 +604,6 @@ impl Controller {
                 self.client.report(&report).await?;
                 self.journal.service_stopped(&mut entry)?;
                 continue;
-            }
-            let expired = service
-                .expires_at_ms
-                .is_some_and(|deadline| deadline <= super::operations::now_ms());
-            if lease.is_none() || lease.is_some_and(|lease| lease.stop_requested) || expired {
-                shells.cancel_retained_service(service.service_id);
             }
             match shells.retained_service_state(service) {
                 RetainedServiceState::Stopped => {
@@ -737,6 +745,7 @@ impl Controller {
                 connected,
                 accepting: accepting
                     && connected
+                    && error.is_none()
                     && !state.closing
                     && attempts.is_empty()
                     && retained_services.is_empty()
@@ -752,12 +761,13 @@ impl Controller {
         }
     }
 
-    async fn tick(&mut self) -> Result<(), RunnerError> {
+    async fn tick(&mut self) -> (bool, Result<(), RunnerError>) {
         let retired = self.client.connection_retired().unwrap_or(true);
         if retired {
-            self.host.begin_shutdown()?;
+            if let Err(error) = self.host.begin_shutdown() {
+                return (false, Err(error));
+            }
         }
-        self.host.refresh_maintenance()?;
         // Observe Hub stop fences before collecting a terminal result or publishing a
         // retained process. The Hub still serializes reports with the stop transaction,
         // but this ordering closes the avoidable local window where a stopped worker
@@ -767,6 +777,19 @@ impl Controller {
         } else {
             Some(self.client.assignments(&self.settings).await)
         };
+        // Connection observation belongs to this control poll, not to later local
+        // provisioning, journal delivery, or admission. Their errors remain visible
+        // without stopping unrelated services whose control was just confirmed.
+        let connected = assignments.as_ref().is_some_and(Result::is_ok);
+        let result = self.reconcile_tick(retired, assignments).await;
+        (connected, result)
+    }
+
+    async fn reconcile_tick(
+        &mut self,
+        retired: bool,
+        assignments: Option<Result<Vec<Assignment>, RunnerError>>,
+    ) -> Result<(), RunnerError> {
         match assignments.as_ref() {
             Some(Ok(assignments)) => {
                 if assignments.len() > 128 {
@@ -819,6 +842,7 @@ impl Controller {
         // An already accepted retained lease may have been fenced after the
         // previous tick. Stop and reconcile it before reporting its turn terminal.
         self.reconcile_retained_services().await?;
+        self.host.refresh_maintenance()?;
         for mut entry in self.journal.active()? {
             if entry.phase == Phase::ReportPending {
                 self.flush_report(&mut entry).await?;
@@ -1603,19 +1627,24 @@ impl Controller {
                             .managed_shells()
                             .cancel_retained_service(service.service_id);
                     }
-                    let fallback = Report::for_assignment(
-                        &entry.assignment,
-                        "yield_rejected",
-                        ReportOutcome::Finished {
-                            success: false,
-                            result: json!({"version":1,"error":"Hub did not accept the child handoff"}),
-                            resources_released: true,
-                        },
-                    );
-                    // Keep the original: a previously timed-out report may still commit before
-                    // this fallback. Replaying it first resolves that race without reexecution.
-                    self.journal
-                        .retain_rejected_yield_fallback(entry, fallback)?;
+                    if entry.fallback_report.is_none() {
+                        let fallback = Report::for_assignment(
+                            &entry.assignment,
+                            "yield_rejected",
+                            ReportOutcome::Finished {
+                                success: false,
+                                result: json!({"version":1,"error":format!(
+                                    "Hubへの子仕事の依頼が拒否されました（HTTP {}）。",
+                                    status.as_u16()
+                                )}),
+                                resources_released: true,
+                            },
+                        );
+                        // Keep the original for a lost yield acknowledgement, and keep the
+                        // fallback payload identical across later rejections and upgrades.
+                        self.journal
+                            .retain_rejected_yield_fallback(entry, fallback)?;
+                    }
                     self.client
                         .report(entry.fallback_report.as_ref().expect("saved fallback"))
                         .await

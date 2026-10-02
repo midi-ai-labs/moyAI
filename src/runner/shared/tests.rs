@@ -900,7 +900,7 @@ async fn completed_preview_cleanup(control_loss: bool) {
     ));
     assert_eq!(preview.expires_at_ms, None);
     if control_loss {
-        assert!(controller.tick().await.is_err());
+        assert!(controller.tick().await.1.is_err());
         assert_eq!(controller.journal.retained_services().unwrap().len(), 1);
     } else {
         assert!(shells.cancel_retained_service(preview.service_id));

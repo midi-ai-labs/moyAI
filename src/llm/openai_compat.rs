@@ -434,7 +434,7 @@ impl OpenAiCompatClient {
         // attempt exists so invalid configuration cannot project provider lifecycle.
         let headers = self.request_headers(request)?;
         let deadlines = request.provider_target().deadlines();
-        let client_builder = reqwest::Client::builder();
+        let client_builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         let client_builder = if deadlines.connect_timeout_ms > 0 {
             client_builder.connect_timeout(Duration::from_millis(deadlines.connect_timeout_ms))
         } else {
@@ -4825,6 +4825,111 @@ mod tests {
                 && terminal_failure.status.is_none()
                 && terminal_failure.code.as_deref() == Some("unknown")
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_chat_does_not_follow_redirects_outside_the_captured_target() {
+        assert_direct_generation_does_not_follow_redirect(ProviderApiMode::ChatCompletions).await;
+    }
+
+    #[tokio::test]
+    async fn direct_responses_does_not_follow_redirects_outside_the_captured_target() {
+        assert_direct_generation_does_not_follow_redirect(ProviderApiMode::Responses).await;
+    }
+
+    async fn assert_direct_generation_does_not_follow_redirect(api_mode: ProviderApiMode) {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect target");
+        let target_url = format!("http://{}/receive", target_listener.local_addr().unwrap());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let target_capture = received.clone();
+        let target = tokio::spawn(async move {
+            axum::serve(
+                target_listener,
+                Router::new().fallback(move |headers: axum::http::HeaderMap, body: Bytes| {
+                    let received = target_capture.clone();
+                    async move {
+                        received.lock().unwrap().push((
+                            headers.contains_key("x-api-key"),
+                            String::from_utf8_lossy(&body).contains("fixture-private-prompt"),
+                        ));
+                        (StatusCode::BAD_REQUEST, "redirect target reached")
+                    }
+                }),
+            )
+            .await
+            .expect("serve redirect target");
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider target");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let source_posts = posts.clone();
+        let source = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move || {
+                    source_posts.fetch_add(1, Ordering::SeqCst);
+                    let target_url = target_url.clone();
+                    async move {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, target_url)],
+                            "redirect",
+                        )
+                    }
+                }),
+            )
+            .await
+            .expect("serve provider target");
+        });
+        let mut request = match api_mode {
+            ProviderApiMode::ChatCompletions => {
+                let mut request = reasoning_fixture_request();
+                replace_provider_endpoint(&mut request, &endpoint);
+                request
+            }
+            ProviderApiMode::Responses => responses_fixture_request(&endpoint, Vec::new()),
+        };
+        request.system_prompt = "fixture-private-prompt".to_string();
+        request.messages.clear();
+        request.replace_extra_headers(BTreeMap::from([(
+            "X-Api-Key".to_string(),
+            "fixture-only-key".to_string(),
+        )]));
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                request_timeout_ms: 5_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let mut sink = RecordingLlmEventSink::default();
+        let result = OpenAiCompatClient::new(None)
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await;
+        source.abort();
+        target.abort();
+        let _ = source.await;
+        let _ = target.await;
+
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "one exact provider POST");
+        let observed = received.lock().unwrap();
+        assert!(
+            observed.is_empty(),
+            "unapproved listener received (custom credential, generation body): {observed:?}"
+        );
+        let error = result.expect_err("redirect must terminate the generation request");
+        let failure = error.provider_failure().expect("typed provider failure");
+        assert_eq!(failure.kind, ProviderFailureKind::HttpStatus);
+        assert_eq!(failure.status, Some(307));
+        assert!(
+            sink.events.is_empty(),
+            "no model output from another target"
+        );
     }
 
     #[tokio::test]

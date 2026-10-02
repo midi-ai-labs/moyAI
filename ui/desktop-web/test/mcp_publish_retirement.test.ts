@@ -25,7 +25,7 @@ test("retained legacy data is explained without offering restart or implicit aut
   assert.match(legacy, /旧手動配信は廃止/);
   assert.match(legacy, /設定・証明書・履歴は保持/);
   assert.match(legacy, /旧配信は再開しません/);
-  assert.match(legacy, /対象と権限を確認/);
+  assert.match(legacy, /Hubのプロジェクトから依頼/);
   for (const html of [fresh, legacy]) {
     assert.match(html, /data-action="show-hub"/);
     assert.doesNotMatch(html, /data-action="(?:show-mcp-publish|mcp-publish-)/);

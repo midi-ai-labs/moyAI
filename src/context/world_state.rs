@@ -91,8 +91,16 @@ impl WorldStateSection for SharedProjectSection<'_> {
     }
 
     fn render(&self) -> String {
+        let overall_request = if self.project.root_prompt.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<overall_request>{}</overall_request>\n",
+                escape_xml_text(&self.project.root_prompt)
+            )
+        };
         format!(
-            "<shared_project_context source=\"hub\" kind=\"descriptive\">\n<project_id>{}</project_id>\n<project_name>{}</project_name>\n<overview_revision>{}</overview_revision>\n<project_overview>{}</project_overview>\n<origin_device_id>{}</origin_device_id>\n<current_environment_id>{}</current_environment_id>\n<overall_request>{}</overall_request>\n</shared_project_context>",
+            "<shared_project_context source=\"hub\" kind=\"descriptive\">\n<project_id>{}</project_id>\n<project_name>{}</project_name>\n<overview_revision>{}</overview_revision>\n<project_overview>{}</project_overview>\n<origin_device_id>{}</origin_device_id>\n<current_environment_id>{}</current_environment_id>\n{overall_request}</shared_project_context>",
             escape_xml_text(&self.project.project_id),
             escape_xml_text(&self.project.label),
             escape_xml_text(&self.project.revision),
@@ -104,7 +112,6 @@ impl WorldStateSection for SharedProjectSection<'_> {
                     .unwrap_or("unknown")
             ),
             escape_xml_text(self.environment_id),
-            escape_xml_text(&self.project.root_prompt),
         )
     }
 }

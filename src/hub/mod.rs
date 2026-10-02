@@ -195,6 +195,18 @@ pub struct HubSelection {
 }
 
 impl HubSelection {
+    pub(super) fn selectable_models<'a>(
+        &'a self,
+        catalog: &'a HubCatalog,
+    ) -> impl Iterator<Item = &'a HubModel> {
+        catalog.models.iter().filter(|model| {
+            self.allowed_model_ids.contains(&model.id)
+                && self.required_capabilities.is_subset(&model.capabilities)
+                && (self.wait_policy == HubWaitPolicy::AllowSelectedFallback
+                    || model.id == self.preferred_model_id)
+        })
+    }
+
     pub fn validate_shape(&self) -> Result<(), HubError> {
         if self.allowed_model_ids.is_empty()
             || self.allowed_model_ids.len() > MAX_SELECTED_MODELS

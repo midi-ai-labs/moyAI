@@ -51,7 +51,7 @@ export async function observeModalKeyboard(cdp, plan) {
       focus:describe(document.activeElement),focusIndex:controls.indexOf(document.activeElement),targets:controls.map(describe),
       hubReady:${JSON.stringify(plan.overlay)}!=='hub'||Boolean(d?.querySelector('#hub-tab-devices[aria-pressed="true"]')
         &&shown(d?.querySelector('#device-network-import:not(:disabled)'))&&shown(d?.querySelector('#device-network-open-shared:not(:disabled)'))
-        &&d?.querySelector('[data-settings-passive="device-execution-status"]')?.textContent.trim()==='Hubへの接続待ち'),
+        &&d?.querySelector('[data-settings-passive="device-execution-status"]')?.textContent.trim()==='先に上の「Hubへの接続」で、このPCの参加を完了してください。'),
       closeTargets:${JSON.stringify(plan.closes)}.map(selector=>{const matches=d?[...d.querySelectorAll(selector)]:[];return {selector,count:matches.length,index:controls.indexOf(matches[0])};}),
       values:d?[...d.querySelectorAll('input,textarea,select')].map(e=>({id:e.id,key:e.dataset.configKey??null,value:e.value,checked:e.checked??null})):[],
       errors:[...document.querySelectorAll('.fatal,.ui-error-notice')].filter(shown).map(e=>e.textContent)};

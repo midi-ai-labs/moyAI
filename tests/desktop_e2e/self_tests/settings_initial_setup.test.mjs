@@ -59,7 +59,7 @@ function surface(step = "start", overrides = {}) {
       visible: true,
       current_step: step,
       rect: { left: 0, top: 0, width: 1440, height: 900 },
-      step_rows: INITIAL_SETUP_STEPS.map((row) => ({
+      step_rows: (step === "start" ? ["start"] : INITIAL_SETUP_STEPS).map((row) => ({
         step: row,
         visible: true,
         current: row === step ? "step" : null,
@@ -109,10 +109,13 @@ function surface(step = "start", overrides = {}) {
   };
 }
 
-test("Initial Setup predicate requires the exact fullscreen six-step zero-network owner", () => {
+test("Initial Setup predicate requires the exact fullscreen welcome or settings steps and zero-network owner", () => {
   for (const step of INITIAL_SETUP_STEPS) {
     assert.equal(initialSetupStepReady(surface(step), [], step, workspace), true, step);
   }
+  const staleWelcome = surface("start");
+  staleWelcome.wizard.step_rows = INITIAL_SETUP_STEPS.map(step => ({ step, visible: true, current: step === "start" ? "step" : null }));
+  assert.equal(initialSetupStepReady(staleWelcome, [], "start", workspace), false, "welcome must display only its current purpose step");
   assert.equal(initialSetupStepReady(surface("provider"), [{ pathname: "/v1/models" }], "provider", workspace), false);
   assert.equal(initialSetupStepReady(surface("provider", { visible_shell_count: 1 }), [], "provider", workspace), false);
   assert.equal(initialSetupStepReady(surface("provider", {

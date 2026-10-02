@@ -91,18 +91,25 @@ impl Controller {
         Ok(environments)
     }
     fn retire_removed_local_folders(&mut self, catalog: &[Environment]) -> Result<(), RunnerError> {
-        if !self.journal.active()?.is_empty()
-            || !self.journal.retained_services()?.is_empty()
-            || self
-                .host
-                .inner
-                .state
-                .lock()
-                .map_err(|_| RunnerError::new("Runner unavailable"))?
-                .runs
-                .values()
-                .any(|run| !run.processes_drained)
+        let protected = self
+            .journal
+            .active()?
+            .into_iter()
+            .chain(self.journal.retained_services()?)
+            .collect::<Vec<_>>();
+        if self
+            .host
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RunnerError::new("Runner unavailable"))?
+            .runs
+            .iter()
+            .any(|(id, run)| {
+                !run.processes_drained && !protected.iter().any(|entry| entry.run_id == *id)
+            })
         {
+            // Unattributed local work has no environment receipt to narrow removal safely.
             return Ok(());
         }
         let retired = {
@@ -117,6 +124,11 @@ impl Controller {
                 .provisions
                 .iter()
                 .filter(|receipt| receipt.project_folder_environment())
+                .filter(|receipt| {
+                    !protected
+                        .iter()
+                        .any(|entry| entry.assignment.job.environment_id == receipt.environment_id)
+                })
                 .filter(|receipt| {
                     catalog
                         .iter()

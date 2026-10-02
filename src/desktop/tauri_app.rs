@@ -463,6 +463,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
                 shared.lock().await.state.set_status_message(
                     "moyAI は既に起動しています。既存のウィンドウを表示しました。",
                 );
+                let _ = app.emit_to("main", "desktop-state-changed", ());
             });
         }))
         .manage(shared)
@@ -6484,7 +6485,7 @@ async fn apply_session_settings(
         if patch.is_empty() {
             controller
                 .state
-                .set_status_message("session settings already match the saved root-session values");
+                .set_status_message("チャットの設定は保存済みの内容と同じです。");
             return Ok((
                 controller
                     .next_web_state()

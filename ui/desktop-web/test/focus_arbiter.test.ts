@@ -345,6 +345,117 @@ test("a newer scheduled commit supersedes the older callback even if cancellatio
   assert.equal(nextTarget.focusCalls, 1);
 });
 
+test("back-to-back passive renders keep the focused editor or history disclosure", () => {
+  for (const name of ["prompt", "history-summary"]) {
+    const environment = new MutableEnvironment();
+    environment.body = target("body", environment);
+    const focused = target(name, environment);
+    environment.active = focused;
+    const scheduler = new ManualScheduler();
+    const arbiter = new PostRenderFocusArbiter(scheduler, environment);
+    const render = () => {
+      // main.ts snapshots the connected focus owner, moves/replaces its DOM, then
+      // schedules restoration. Another passive render may arrive before that RAF.
+      arbiter.settleBeforeRender();
+      const snapshot = environment.active === environment.body ? null : environment.active;
+      environment.active = environment.body;
+      environment.renderCommit += 1;
+      arbiter.schedule({
+        renderCommit: environment.renderCommit,
+        interactionEpoch: environment.interactionEpoch,
+        intents: snapshot ? [intent("focus-snapshot", "exact-restore", snapshot)] : [],
+      });
+    };
+
+    render();
+    render();
+    scheduler.flush();
+
+    assert.equal(environment.active, focused, `${name} must remain the focus owner after both renders settle`);
+  }
+});
+
+test("before-render settlement keeps interaction, owner, and target fences", () => {
+  for (const change of [
+    "stale-render", "stale-interaction", "interaction-active", "stale-intent", "unavailable", "owned",
+  ] as const) {
+    const environment = new MutableEnvironment();
+    environment.body = target("body", environment);
+    environment.active = environment.body;
+    const previous = target("previous", environment);
+    const next = target("explicit-focus", environment);
+    let ownerCurrent = true;
+    let resolvedTarget: FocusTargetElement | null = previous;
+    const scheduler = new ManualScheduler();
+    const arbiter = new PostRenderFocusArbiter(scheduler, environment);
+    const results: FocusArbiterResult[] = [];
+    arbiter.schedule({
+      renderCommit: 1,
+      interactionEpoch: 1n,
+      intents: [intent("focus-snapshot", "exact-restore", previous, {
+        isCurrent: () => ownerCurrent,
+        candidates: [{ resolve: () => resolvedTarget }],
+      })],
+      onResult: (result) => results.push(result),
+    });
+    if (change === "stale-render") environment.renderCommit += 1;
+    if (change === "stale-interaction") environment.interactionEpoch += 1n;
+    if (change === "interaction-active") environment.activeInteraction = true;
+    if (change === "stale-intent") ownerCurrent = false;
+    if (change === "unavailable") resolvedTarget = null;
+    if (change === "owned") environment.active = next;
+
+    arbiter.settleBeforeRender();
+    scheduler.flush();
+
+    assert.equal(previous.focusCalls, 0, change);
+    assert.equal(environment.active, change === "owned" ? next : environment.body, change);
+    assert.deepEqual(results, [{ kind: change, source: "focus-snapshot" }], change);
+  }
+});
+
+test("before-render settlement preserves modal priority and cannot replay over the next explicit focus", () => {
+  class LeakyScheduler extends ManualScheduler {
+    override cancel(_handle: number): void {
+      // A callback already queued by the host may still run after synchronous settlement.
+    }
+  }
+  const environment = new MutableEnvironment();
+  environment.body = target("body", environment);
+  environment.active = environment.body;
+  const previous = target("prompt", environment);
+  const modal = target("modal", environment);
+  const next = target("next-modal", environment);
+  const scheduler = new LeakyScheduler();
+  const arbiter = new PostRenderFocusArbiter(scheduler, environment);
+  const results: FocusArbiterResult[] = [];
+  arbiter.schedule({
+    renderCommit: 1,
+    interactionEpoch: 1n,
+    intents: [
+      intent("focus-snapshot", "exact-restore", previous),
+      intent("modal-primary", "modal-containment", modal, { claim: { kind: "force" } }),
+    ],
+    onResult: (result) => results.push(result),
+  });
+
+  arbiter.settleBeforeRender();
+  assert.equal(environment.active, modal);
+  environment.renderCommit += 1;
+  arbiter.schedule({
+    renderCommit: environment.renderCommit,
+    interactionEpoch: environment.interactionEpoch,
+    intents: [intent("modal-primary", "modal-containment", next, { claim: { kind: "force" } })],
+  });
+  scheduler.flush();
+
+  assert.equal(environment.active, next);
+  assert.equal(previous.focusCalls, 0);
+  assert.equal(modal.focusCalls, 1);
+  assert.equal(next.focusCalls, 1);
+  assert.deepEqual(results, [{ kind: "focused", source: "modal-primary" }]);
+});
+
 test("common target eligibility rejects disconnected, disabled, hidden, aria-disabled, and inert targets", () => {
   const environment = new MutableEnvironment();
   const cases: Array<[string, TargetOptions]> = [

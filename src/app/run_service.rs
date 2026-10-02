@@ -1658,6 +1658,15 @@ impl RunService {
             .as_ref()
             .map(|checkpoint| checkpoint.turn_id)
             .unwrap_or_else(crate::protocol::TurnId::new);
+        let resumed_turn_time = shared_checkpoint
+            .as_ref()
+            .map(|checkpoint| {
+                self.store
+                    .session_repo()
+                    .shared_turn_start_time(checkpoint.session_id, checkpoint.turn_id)
+            })
+            .transpose()?
+            .flatten();
         let initial_user_turn = build_initial_user_turn(
             protocol_turn_id,
             &prepared,
@@ -2080,7 +2089,8 @@ impl RunService {
             policy: turn_policy,
             config: Arc::clone(&turn_config),
             goal: admitted_goal,
-            current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
+            current_time: resumed_turn_time
+                .unwrap_or_else(crate::context::current_time::CurrentTimeSnapshot::now),
         });
         let admitted_result: Result<AgentRunOutcome, AppRunError> =
             run_admitted_inner_with_cancel_grace(&request.run_control, async {

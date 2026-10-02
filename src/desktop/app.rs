@@ -8048,8 +8048,8 @@ mod command_projection_owner_tests {
             .status_message
             .as_deref()
             .expect("failure status");
-        assert!(status.contains("next permission decision"));
-        assert!(status.contains("already displayed confirmation is unchanged"));
+        assert!(status.contains("次の承認判断から適用されます"));
+        assert!(status.contains("表示中の承認依頼は変更しません"));
     }
 
     #[tokio::test]
@@ -8097,8 +8097,8 @@ mod command_projection_owner_tests {
             .status_message
             .as_deref()
             .expect("failure status");
-        assert!(status.contains("next permission decision"));
-        assert!(status.contains("already displayed confirmation is unchanged"));
+        assert!(status.contains("次の承認判断から適用されます"));
+        assert!(status.contains("表示中の承認依頼は変更しません"));
     }
 
     #[tokio::test]
@@ -12371,7 +12371,7 @@ impl DesktopController {
             .map(|row| row.session_id)
         else {
             self.state
-                .set_status_message("session selection is no longer available");
+                .set_status_message("選択したチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         self.invalidate_session_target_requests();
@@ -12411,8 +12411,9 @@ impl DesktopController {
             .get(index)
             .map(|row| Utf8PathBuf::from(&row.path))
         else {
-            self.state
-                .set_status_message("project selection is no longer available");
+            self.state.set_status_message(
+                "選択したプロジェクトが見つかりません。一覧を更新してください。",
+            );
             return false;
         };
         if path == self.app.workspace.root {
@@ -12434,18 +12435,19 @@ impl DesktopController {
         }
         let Some(row) = self.state.snapshot.session_rows.get(index) else {
             self.state
-                .set_status_message("session selection is no longer available");
+                .set_status_message("選択したチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         if row.loaded_status != LoadedSessionStatus::Active {
-            self.state
-                .set_status_message("selected session is not an active loaded session");
+            self.state.set_status_message(
+                "選択したチャットでは実行中の処理が見つかりません。一覧を更新してください。",
+            );
             return false;
         }
         let session_id = row.session_id;
         self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("rejoining running session {session_id}..."));
+            .set_status_message("実行中のチャットを開いています…");
         let request_id = self.state.begin_session_load(session_id);
         self.spawn_session_rejoin(session_id, request_id);
         true
@@ -12651,19 +12653,18 @@ impl DesktopController {
             .find(|row| row.session_id == session_id)
         else {
             self.state
-                .set_status_message("chat rollback target is no longer available");
+                .set_status_message("巻き戻すチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         if row.loaded_status == LoadedSessionStatus::Active {
-            self.state
-                .set_status_message("running sessions cannot be rolled back");
+            self.state.set_status_message(
+                "実行中のチャットは巻き戻せません。停止してから操作してください。",
+            );
             return false;
         }
         self.invalidate_session_target_requests();
-        self.state.set_status_message(format!(
-            "rolling back latest turn in chat {}...",
-            session_id
-        ));
+        self.state
+            .set_status_message("最後の依頼と回答を履歴から削除しています…");
         let operation_id = self.state.begin_session_rollback_mutation();
         let target = SessionMutationRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -12691,13 +12692,13 @@ impl DesktopController {
             .find(|row| row.session_id == session_id)
         else {
             self.state
-                .set_status_message("chat fork target is no longer available");
+                .set_status_message("分岐元のチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         let title = format!("{} fork", row.title);
         self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("forking chat {}...", session_id));
+            .set_status_message("この会話を元に、新しいチャットを作成しています…");
         let operation_id = self.state.begin_session_maintenance_mutation();
         let target = SessionMutationRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -12730,7 +12731,7 @@ impl DesktopController {
             .any(|row| row.session_id == session_id)
         {
             self.state
-                .set_status_message("running chat target is no longer available");
+                .set_status_message("停止するチャットが見つかりません。一覧を更新してください。");
             return false;
         }
         self.invalidate_session_target_requests();
@@ -12739,7 +12740,7 @@ impl DesktopController {
             return true;
         }
         self.state
-            .set_status_message(format!("interrupting running chat {}...", session_id));
+            .set_status_message("選択したチャットの停止を要求しています…");
         let operation_id = self.state.begin_session_maintenance_mutation();
         let target = SessionMutationRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -12900,7 +12901,7 @@ impl DesktopController {
         match result {
             Ok(()) => self
                 .state
-                .set_status_message(format!("saved transcript markdown to {}", export_path)),
+                .set_status_message(format!("会話をMarkdownで保存しました: {}", export_path)),
             Err(error) => self
                 .state
                 .set_status_message(format!("transcript markdown export failed: {error}")),
@@ -12929,8 +12930,7 @@ impl DesktopController {
                 .set_status_message("history export target is no longer available");
             return;
         }
-        self.state
-            .set_status_message("exporting history markdown...");
+        self.state.set_status_message("履歴をMarkdownで保存中…");
         let target = HistoryExportRequestTarget {
             workspace_authority_root: self.app.workspace.authority_root().to_path_buf(),
             session_id,
@@ -13722,8 +13722,9 @@ impl DesktopController {
             .get(index)
             .map(|row| Utf8PathBuf::from(&row.path))
         else {
-            self.state
-                .set_status_message("project selection is no longer available");
+            self.state.set_status_message(
+                "選択したプロジェクトが見つかりません。一覧を更新してください。",
+            );
             return false;
         };
         self.invalidate_session_target_requests();
@@ -14314,8 +14315,9 @@ impl DesktopController {
             return false;
         };
         self.reset_effective_config_without_network(config);
-        self.state
-            .set_status_message("applied provider selection to this UI session");
+        self.state.set_status_message(
+            "AIの接続設定を一時的に適用しました。設定ファイルには保存していません。",
+        );
         if !setup_overlay {
             self.state.hide_overlay();
         }
@@ -14364,8 +14366,9 @@ impl DesktopController {
         ) {
             Ok(config) => {
                 self.reset_effective_config_without_network(config);
-                self.state
-                    .set_status_message("applied config to this UI session");
+                self.state.set_status_message(
+                    "設定を一時的に適用しました。設定ファイルには保存していません。",
+                );
                 true
             }
             Err(error) => {
@@ -14383,7 +14386,14 @@ impl DesktopController {
         let saved = result?;
         self.app.config = saved.resolved_config.clone();
         self.adopt_global_config_without_network(saved.resolved_config);
-        Ok(saved.message)
+        Ok(if saved.preserved_unknown_top_level_sections.is_empty() {
+            "共通設定を保存しました。".to_string()
+        } else {
+            format!(
+                "共通設定を保存しました。未対応の設定（{}セクション）はファイルに残し、適用していません。",
+                saved.preserved_unknown_top_level_sections.len()
+            )
+        })
     }
 
     pub(crate) fn root_run_generation(&self) -> Option<u64> {
@@ -14695,9 +14705,8 @@ impl DesktopController {
         self.app.config = global_config.clone();
         self.state.replace_global_config(global_config);
         self.state.set_status_message(format!(
-            "global config access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
-            access_mode_display_label(pending.target.access_mode),
-            pending.remembered_path
+            "共通設定の承認方法を「{}」に保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。",
+            access_mode_display_label(pending.target.access_mode)
         ));
     }
 
@@ -14729,7 +14738,7 @@ impl DesktopController {
             .next();
         let old_global_access_mode = self.app.config.permissions.access_mode;
         let current_root_session_id = self.state.app_state.current_session_id;
-        let remembered_path = match persist_desktop_access_mode_owners(
+        let _remembered_path = match persist_desktop_access_mode_owners(
             old_global_access_mode,
             access_mode,
             current_root_session_id,
@@ -14766,14 +14775,13 @@ impl DesktopController {
             }
         }
         let scope = if current_root_session_id.is_some() {
-            "global config and current root session"
+            "共通設定とこのチャット"
         } else {
-            "global config"
+            "共通設定"
         };
         let config_message = format!(
-            "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
-            access_mode_display_label(access_mode),
-            remembered_path
+            "{scope}の承認方法を「{}」に保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。",
+            access_mode_display_label(access_mode)
         );
         self.state.set_status_message(config_message);
         true
@@ -14921,12 +14929,12 @@ impl DesktopController {
         self.state.view.overlay = super::state::DesktopOverlay::SessionSettings;
         self.state.set_status_message(if update.changed {
             if result.access_only {
-                "saved access mode for this root session; it applies to the next permission decision and does not rewrite an already pending request"
+                "承認方法を保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。"
             } else {
-                "saved settings for this root session; provider and model values apply to the next admitted turn"
+                "チャットの設定を保存しました。AIの接続先とモデルは次の依頼から適用されます。"
             }
         } else {
-            "session settings already match the saved root-session values"
+            "チャットの設定は保存済みの内容と同じです。"
         });
         true
     }
@@ -16857,7 +16865,7 @@ impl DesktopController {
                     match result {
                         Ok(draft) => {
                             if self.state.finish_prompt_enhance(request_id, draft) {
-                                self.state.set_status_message("review enhanced draft");
+                                self.state.set_status_message("改善案を確認してください。");
                             }
                         }
                         Err(error) => {
@@ -17177,7 +17185,7 @@ impl DesktopController {
                                         Some((loaded.read.session.id, records));
                                 }
                                 self.state.set_status_message(format!(
-                                    "loaded earlier history {start}-{end} of {total}"
+                                    "以前の履歴を読み込みました（全{total}件中 {start}〜{end}件）。"
                                 ));
                             } else {
                                 self.state.set_status_message(
@@ -17385,7 +17393,7 @@ impl DesktopController {
                     match result {
                         Ok(path) => self
                             .state
-                            .set_status_message(format!("exported history markdown to {}", path)),
+                            .set_status_message(format!("履歴をMarkdownで保存しました: {}", path)),
                         Err(error) => self
                             .state
                             .set_status_message(format!("history markdown export failed: {error}")),
@@ -17490,14 +17498,13 @@ impl DesktopController {
                                 continue;
                             }
                             let scope = if committed_session_id.is_some() {
-                                "global config and current root session"
+                                "共通設定とこのチャット"
                             } else {
-                                "global config"
+                                "共通設定"
                             };
                             let config_message = format!(
-                                "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
-                                access_mode_display_label(target.access_mode),
-                                commit.remembered_path
+                                "{scope}の承認方法を「{}」に保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。",
+                                access_mode_display_label(target.access_mode)
                             );
                             self.state.set_status_message(config_message);
                         }

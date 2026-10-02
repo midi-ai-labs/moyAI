@@ -1288,7 +1288,7 @@ function validateSettingsForm(
       ? initialSetup
         ? "入力形式は問題ありません。"
         : context.uiState.configDirty
-          ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+          ? "未保存の設定があります。適用、保存、または変更を破棄してから別画面の設定を変更できます。"
           : "入力形式は問題ありません。"
       : `${visibleValidation.invalidKey}: ${visibleValidation.message}`;
     validation.classList.toggle("ok", visibleValidation.ok);

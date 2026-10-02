@@ -1,6 +1,6 @@
 # 一つのセッションで複数PCを使う設計
 
-2026-09-27更新。Hubプロジェクトの会話・PC利用・参加と離脱・アプリの寿命の正本。実装位置は [authority index](../../../docs/design/current-authority-index.md)、認証と導入は [onboarding](../../../docs/design/onboarding.md)、実行の永続化は [共有仕事と独立Runner](../../../docs/design/shared-work-runner.md) を参照する。
+2026-10-02更新。Hubプロジェクトの会話・PC利用・参加と離脱・アプリの寿命の正本。実装位置は [authority index](../../../docs/design/current-authority-index.md)、認証と導入は [onboarding](../../../docs/design/onboarding.md)、実行の永続化は [共有仕事と独立Runner](../../../docs/design/shared-work-runner.md) を参照する。
 
 仮想WinA–WinBではLiveのPC使い分け・保持・CRUD・追加修正・停止を確認した。物理試験は委任・成果転送・再検証まで進んだが、UNC編集で不整合を検出した。最新の修正・受入状況は末尾の証跡とTODOに集約する。
 
@@ -8,7 +8,7 @@
 
 導入後に利用者が送信先PC・仕事の種類・保存先を毎回設定する問題を解消する。Hubで利用範囲と各PCの作業場所を準備し、通常の入力欄へ目的を送れば、一つの会話でAIが工程と使用PCを判断する。専用フォームを詳細へ隠すだけでは、この方針を満たさない。
 
-- 左側は一つの「プロジェクト」一覧と既存の「チャット」。Hub由来の行だけ小さな `[MCP]` 印を付ける。
+- 左側は一つの「プロジェクト」一覧と既存の「チャット」。Hub由来の行だけ小さな `Hub` 印を付ける。
 - ローカルとHubで入力・添付・承認・停止・成果の基本操作を共通にする。共有範囲はプロジェクトの属性として示す。
 - 操作PC／実行PCはmoyAIの利用権限であり、作るアプリのサーバー／クライアントとは別。WinAを両用途、WinBを実行専用にできる。
 - AIが工程を選び、Harnessは現在の権限・端末ID・作業場所・資源・結果の対応を検証する。自然言語を固定キーワードで配送先へ変換する仕組みや別の計画エンジンを追加しない。
@@ -65,13 +65,15 @@ AIへ渡す候補は会話のプロジェクトと実行許可で限定し、端
 
 Hubのプロジェクト編集に自然言語の概要を一つ保存する。既存の管理者認証・管理revisionを使い、前後の空白だけを除いて本文の改行を保持する。上限はUTF-8で8 KiB、未設定・旧データは空。省略した旧管理要求では既存概要を消さない。
 
-Hubは根依頼の受付時に、プロジェクトID・名前・概要・採用revision・全体の依頼・依頼元PCを根仕事へ一度保存する。子と再委任先、checkpointからの親再開は根仕事の同じsnapshotを参照する。同じ会話の次の依頼は新しいsnapshotを持つ。過去の仕事へ現在の概要を遡及して付けない。
+Hubは根依頼の受付時に、プロジェクトID・名前・概要・採用revision・全体の依頼・依頼元PCを根仕事へ一度保存する。子と再委任先、checkpointからの親再開は根仕事の同じsnapshotを参照する。全体の依頼は子の文脈へ渡し、根仕事では通常のcanonical user historyと既存compactionに任せてStateへ重ねない。同じ会話の次の依頼は新しいsnapshotを持つ。過去の仕事へ現在の概要を遡及して付けない。
 
-AssignmentからSharedRunContextへ渡し、既存WorldStateを毎step組み直す際に説明情報として描画する。現在の実行環境IDは各Assignmentから取り、依頼元PCとは別に示す。概要はモデルへのsystem指示や権限ではない。現在の参加・認可・環境候補・停止は既存のHub/Runner境界で照合し、snapshotに固定しない。Hubを使わない会話にはこの節を追加しない。
+AssignmentからSharedRunContextへ渡し、既存WorldStateを毎step組み直す際に説明情報として描画する。現在の実行環境IDは各Assignmentから取り、依頼元PCとは別に示す。概要はモデルへのsystem指示や権限ではない。Guardianではこの節をdescriptive_world_stateへ分離し、trusted_world_stateやcanonical user authorizationへ含めない。現在の参加・認可・環境候補・停止は既存のHub/Runner境界で照合し、snapshotに固定しない。Hubを使わない会話にはこの節を追加しない。
 
 全体の設計・配置・分割・統合・最終確認は通常の親agentが判断する。shared_delegateの既存promptに、全体目標、委任時点の工程、担当範囲と制約、完了条件、返す結果を短く示す。環境事実を毎回自由文へ転記させず、利用者にこの書式の入力を要求しない。独自planner・必須Planning工程・端末名の固定配送は追加しない。子の再委任可否は既存の契約に従う。
 
-共有agentは現在のregistryを通じてPC照会、子への依頼、選択ファイルの転送、成果取得、停止を行う。子待ちでは保存されたcheckpointから再開し、状態確認だけのモデル呼出しを繰り返さない。CLI/TUIから同じagentを使っても認可・結果・停止を迂回できない。Side Chatには実行toolを追加しない。
+通常Desktopからの子仕事枠8件は、根仕事配下の未完了数に適用する。完了済みの子は履歴を残して枠を返すため、工程の進行や再開回数を8回で打ち切らない。入れ子の待機と取消処理中は枠を占有する。Hub全体の保存件数等の上限は維持する。詳細は[Hubの受付条件](../../../moyAI-Hub/docs/shared-work.md)を参照する。
+
+共有agentは現在のregistryを通じてPC照会、子への依頼、選択ファイルの転送、成果取得、停止を行う。shared_delegateが広告されるstepではparallel_tool_callsをfalseとして、単一の子仕事を待つcheckpointと広告を合わせる。子待ちでは保存されたcheckpointから再開し、状態確認だけのモデル呼出しを繰り返さない。同じturnの再開では最初のcanonical WorldStateから開始時刻だけを復元し、環境や指示の更新は維持する。時計snapshotのない旧履歴は従来どおり現在時刻を使う。CLI/TUIから同じagentを使っても認可・結果・停止を迂回できない。Side Chatには実行toolを追加しない。
 
 ### 実行途中の記録
 

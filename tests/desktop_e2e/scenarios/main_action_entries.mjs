@@ -110,7 +110,7 @@ export async function exerciseShortcutRows(d){
   if(filesBefore.length)throw fail(d,'Isolated transcript export directory must initially be empty',filesBefore);
   const exported=await activateMainActionEntry(d,'export-transcript','shortcuts');
   const exportAfter=await d.wait('F9 row directly saves current transcript',()=>observeMainControls(d),v=>
-    v.p.status_message.startsWith('saved transcript markdown to ')&&v.prompt.value===unsent&&!v.p.busy&&v.visibleErrors.length===0);
+    v.p.status_message.startsWith('会話をMarkdownで保存しました: ')&&v.prompt.value===unsent&&!v.p.busy&&v.visibleErrors.length===0);
   const files=await readdir(directory),file=files.length===1?files[0]:null;
   if(!file||!file.endsWith('.md'))throw fail(d,'F9 row must create one Markdown file',files);
   const text=await readFile(path.join(directory,file),'utf8');

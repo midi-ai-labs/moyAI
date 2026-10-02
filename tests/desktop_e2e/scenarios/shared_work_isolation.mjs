@@ -30,11 +30,12 @@ export function isolatedDevicesAccepted(a, b) {
 
 export function personalProjectAccepted(value, expected) {
   return hubProjectReady(value?.desktop) && value.shared?.connected === true
-    && value.shared.principal?.user_id === expected.user_id && value.shared.principal.administrator === false
+    && value.shared.principal?.user_id === expected.user_id && value.shared.principal.display_name === expected.display_name
+    && value.shared.principal.administrator === false
     && value.shared.projects?.length === 1 && value.shared.projects[0].id === expected.project_id
     && value.shared.selected_project_id === expected.project_id && Array.isArray(value.shared.status?.jobs)
     && value.visible_project_ids?.length === 1 && value.visible_project_ids[0] === expected.project_id
-    && value.person_text?.includes(expected.display_name) === true && value.project_heading === expected.project_label
+    && value.project_heading === expected.project_label
     && value.login_visible === false;
 }
 
@@ -94,7 +95,6 @@ export function createSharedWorkIsolationScenario(options = {}) {
         const shared = await invokeDesktopCommand(pc.driver, "shared_work_projection");
         const visible = await pc.driver.evaluate(`({
           visible_project_ids: [...document.querySelectorAll('.sidebar button[data-action="open-hub-project"]')].filter(node => node.getClientRects().length).map(node => node.dataset.value),
-          person_text: document.querySelector('.shared-header > div > p')?.textContent ?? '',
           project_heading: document.querySelector('#shared-heading')?.textContent ?? '',
           login_visible: Boolean(document.querySelector('.shared-work #shared-username')?.getClientRects().length)
         })`);

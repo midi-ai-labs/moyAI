@@ -6,8 +6,8 @@ import { createSharedWorkIsolationScenario, isolatedDevicesAccepted, personalPro
 const expected = { user_id: "bob", display_name: "Bob", project_id: "project-b", project_label: "Bob project" };
 function personal() {
   return { desktop: { hub_project_open: true, overlay: "none", busy: false },
-    shared: { connected: true, principal: { user_id: "bob", administrator: false }, projects: [{ id: "project-b" }], selected_project_id: "project-b", status: { jobs: [] }, observed_at_ms: 101 },
-    visible_project_ids: ["project-b"], person_text: "Bob · project", project_heading: "Bob project", login_visible: false };
+    shared: { connected: true, principal: { user_id: "bob", display_name: "Bob", administrator: false }, projects: [{ id: "project-b" }], selected_project_id: "project-b", status: { jobs: [] }, observed_at_ms: 101 },
+    visible_project_ids: ["project-b"], project_heading: "Bob project", login_visible: false };
 }
 function accessRemoved() {
   return { desktop: { hub_project_open: true, overlay: "none", busy: false },
@@ -50,7 +50,7 @@ test("person isolation requires exact membership, selected project and visible s
     value => { value.shared.principal.administrator = true; },
     value => { value.shared.projects.push({ id: "project-a" }); },
     value => { value.visible_project_ids.push("project-a"); },
-    value => { value.person_text = "Alice · project"; },
+    value => { value.shared.principal.display_name = "Alice"; },
     value => { value.project_heading = "Alice project"; },
     value => { value.shared.selected_project_id = "project-a"; },
     value => { value.shared.status = null; },

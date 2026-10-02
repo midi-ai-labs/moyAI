@@ -28,7 +28,7 @@ moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects t
 - Three operation modes: ask for approval, AI review of approvals, and full access. Windows workspace restrictions apply in the first two modes; see [permission limits](#permissions-and-platform-limits).
 - Recursive subagents, progress plans, long-conversation compaction and Markdown conversation export.
 - Local project instructions and Skills; optional external HTTP MCP tools and Docling for documents.
-- Hub projects for work across approved PCs. The normal project list marks them with `MCP`; the same chat interface accepts the request. The AI can select among the project's permitted execution PCs.
+- Hub projects for work across approved PCs. They appear with a `Hub` badge in the project list, and requests use the same chat interface. The AI can select among the project's permitted execution PCs.
 - A Windows Runner that executes jobs independently of the Desktop window. Hub stores shared conversations, inputs and published results.
 
 ## Quick Start
@@ -65,7 +65,9 @@ The user-wide Windows configuration is `%APPDATA%\midi-ai-labs\moyai\config\conf
 
 Use **設定 → AIの接続** for Main and Side Chat. Without Hub configuration, enter the endpoint and connection type: LM Studio Responses or OpenAI-compatible Chat Completions, such as oMLX. Load the model list or enter a model ID. API credentials, when required, are referenced by environment-variable name rather than saved as secret text.
 
-When Hub is configured, this same screen shows Hub-managed connection information and lets you select the standard or another registered model. Main and Side selections are independent. Shared Runner jobs use the executing PC's Main selection. Hub outages do not silently switch to manual settings. **接続設定をリセット** works without a Hub response, preserves local conversations/files and manual AI settings, and lets you join a replacement Hub.
+When Hub is configured, this screen shows the Hub connection and lets you choose the standard or another registered model. Main and Side selections are independent. Shared Runner jobs use the executing PC's Main selection. Hub outages do not automatically switch to manual settings.
+
+**接続設定をリセット** works without a Hub response. It preserves local conversations, files and manual AI settings, and lets you join a replacement Hub.
 
 Global settings apply to future work; session settings can override the selected local Main conversation. Side Chat has its own global connection. `context_window` controls moyAI's local accounting and compaction; model loading, sampling and generation output limits belong to the LLM host. See [config.example.toml](config.example.toml) and [Hub model integration](docs/hub-integration.md).
 
@@ -92,7 +94,7 @@ Windows x64 is the primary supported and verified deployment. Distribution needs
 
 **Ask for approval** and **Approve for me** share Windows workspace restrictions; the latter uses an AI reviewer for permission decisions. **Full access** runs approved processes with the current Windows user's authority. These restrictions are not a complete OS isolation boundary. Native process sandboxing is Windows-only; restricted process operations fail closed elsewhere. Unix updates/deletes may return a partial-commit error with a preserved backup, which must be reviewed.
 
-Stop and editing a request do not undo files already written or applications already started. Only the latest user message is editable; local messages with images and Hub messages with attached inputs are excluded from text-only edit/resend. A shared job's accepted cancellation is not proof that its process has stopped.
+Stop and editing a request do not undo files already written or applications already started. Only the latest user message can be edited and resent. Text edits keep the original images and attachments; to change them, send a new request. A shared job's accepted cancellation is not proof that its process has stopped.
 
 Runner operates while its Windows user is logged in. Windows service operation, automatic Hub root-CA replacement, and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
 

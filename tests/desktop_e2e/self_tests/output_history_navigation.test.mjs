@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { OUTPUT_HISTORY_DRAFT, createOutputHistoryNavigationScenario, outputHistoryDraftBaseline, outputHistoryDraftFailures,
-  outputHistoryDestinationIdentity, outputHistoryKeyboardProof, outputHistoryNavigationFailures, outputHistoryOwner } from "../scenarios/output_history_navigation.mjs";
+  outputHistoryDestinationIdentity, outputHistoryKeyboardProof, outputHistoryNavigationFailures, outputHistoryOwner,
+  outputHistoryRouteReady } from "../scenarios/output_history_navigation.mjs";
 
 const owner = { workspace: "C:\\fixture", session: "session-a", turn: "turn-a", admission: "3" };
 const baseline = { target: { workspacePath: owner.workspace, sessionId: owner.session, ownerGeneration: "2" },
@@ -51,6 +52,25 @@ test("running and completed history navigation require an open visible focused d
   assert.deepEqual(outputHistoryNavigationFailures(surface(), options), []);
   assert.deepEqual(outputHistoryNavigationFailures(surface("completed"), { ...options, phase: "completed" }), []);
   assert.deepEqual(outputHistoryOwner(surface().projection), outputHistoryOwner(surface("completed").projection));
+});
+
+test("route readiness waits for the same canonical destination before capturing its identity", () => {
+  const settled = { ...surface(), pane: { mode: "output", collapsed: false } };
+  const early = structuredClone(settled);
+  early.destination = { count: 0, anchor: null, history_identity: null, summary_focus_key: null };
+  assert.equal(outputHistoryDestinationIdentity(early), null);
+  assert.equal(outputHistoryRouteReady(early, owner), false, "a visible route may precede its canonical DOM destination");
+  assert.equal(outputHistoryRouteReady(settled, owner), true);
+  for (const change of [
+    (v) => { v.destination.history_identity = "turn:other:work-summary"; },
+    (v) => { v.destination.count = 2; },
+    (v) => { v.destination.summary_focus_key = null; },
+    (v) => { v.route.target = "other-anchor"; },
+    (v) => { v.projection.run_target.expectedState.turnId = "other-turn"; },
+  ]) {
+    const invalid = structuredClone(settled); change(invalid);
+    assert.equal(outputHistoryRouteReady(invalid, owner), false);
+  }
 });
 
 test("completed history requires the canonical disclosure after the running-only route retires", () => {

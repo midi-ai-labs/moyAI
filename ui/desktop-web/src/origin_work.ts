@@ -48,7 +48,7 @@ export function originAppsStopEnabled(local: DeviceNetworkPresentation): boolean
 
 export function originAllStopEnabled(local: DeviceNetworkPresentation): boolean {
   const work = local.originWork;
-  const active = work?.jobs.some(row => ["queued", "offered", "running", "waiting_child", "awaiting_approval", "cancelling", "unknown"].includes(row.job.state))
+  const active = work?.jobs.some(row => ["queued", "assigned", "offered", "running", "waiting_child", "awaiting_approval", "cancelling", "unknown"].includes(row.job.state))
     || work?.retained_services.some(row => !row.service.stop_requested);
   return Boolean(local.originOwner && work && !local.originPending && !local.originStopPending
     && !work.stop_pending && /^[1-9][0-9]*$/.test(work.admission_revision) && active);
@@ -154,7 +154,7 @@ export async function stopOriginAll(context: ActionContext): Promise<void> {
   }
 }
 
-const jobState = (state: string): string => ({ queued: "待機中", offered: "引渡し中", running: "実行中",
+const jobState = (state: string): string => ({ queued: "待機中", assigned: "実行準備中", offered: "引渡し中", running: "実行中", waiting_child: "サブエージェントの結果待ち",
   awaiting_approval: "承認待ち", cancelling: "停止確認中", succeeded: "完了", failed: "失敗", cancelled: "取消済み", unknown: "状態不明" }[state] ?? "状態不明");
 
 export function renderOriginWork(local: DeviceNetworkPresentation, sessionId: string | null, currentTurnCanStop = false): string {
@@ -171,12 +171,12 @@ export function renderOriginWork(local: DeviceNetworkPresentation, sessionId: st
     ${work.jobs.length > latestJobs.length ? `<small>ほか ${work.jobs.length - latestJobs.length} 件の仕事</small>` : ""}
     ${work.retained_services.map(row => `<div class="origin-work-row"><span>起動中のアプリ · ${esc(row.service.environment_id)} · ${row.service.uncertain ? "状態不明" : row.service.stop_requested ? "停止確認中" : row.service.expires_at_ms == null ? "停止まで保持" : `保持期限 ${esc(new Date(row.service.expires_at_ms).toLocaleString("ja-JP"))}`}</span></div>`).join("")}
     ${work.hidden_active_work ? '<small>現在の権限では詳細を表示できない別PCの仕事があります。Hub管理者に利用権限を確認してください。</small>' : ""}
-    ${work.stop_pending ? '<small>この会話から依頼した実行の停止受付をHubで確認中です。</small>' : ""}
-    ${work.stop_error ? '<small class="shared-error">停止受付をHubで確認できません。接続が戻ると再確認します。</small>' : ""}
+    ${work.stop_pending ? '<small>Hubが停止要求を受け付けたか確認しています。</small>' : ""}
+    ${work.stop_error ? '<small class="shared-error">Hubが停止要求を受け付けたか確認できません。接続が戻ると再確認します。</small>' : ""}
     ${local.originError ? `<small class="shared-error">${esc(local.originError)}（最終確認: ${esc(new Date(work.observed_at_ms).toLocaleString("ja-JP"))}）</small>` : ""}</div>
-    ${canStopAll ? `<button class="run-stop-button danger" data-action="origin-stop-all" aria-label="この会話の実行をすべて停止">この会話の実行をすべて停止</button><small>${currentTurnCanStop ? "現在の回答と" : ""}別PCの仕事、起動中のアプリが対象です。Hub受付後も停止を確認してください。</small>` : ""}
+    ${canStopAll ? `<button class="run-stop-button danger" data-action="origin-stop-all" aria-label="この会話の実行をすべて停止">この会話の実行をすべて停止</button><small>${currentTurnCanStop ? "現在の回答、" : ""}別PCの仕事、起動中のアプリに停止を要求します。Hubの受付後も、停止したことを確認してください。</small>` : ""}
     ${canStop ? '<button class="run-stop-button danger" data-action="origin-stop-apps" aria-label="この会話の起動中のアプリを停止">起動中のアプリを停止</button>' : ""}
     ${latestJobs.some(row => row.artifacts?.length) ? '<small>成果ファイルの保存はこの会話で依頼できます。保存時にHubが権限を再確認します。</small>' : ""}
-    ${work.retained_services.length ? '<small>この操作は起動中のアプリを停止します。現在の回答や実行中の仕事は別に停止してください。</small>' : ""}
+    ${work.retained_services.length ? '<small>アプリの停止では、現在の回答や実行中の仕事は止まりません。これらは別に停止してください。</small>' : ""}
   </section>`;
 }

@@ -55,7 +55,7 @@ export async function sharedWorkAction(context: ActionContext, kind: string, val
   const request: Record<string, unknown> = { kind };
   if (kind === "project") request.project_id = value;
   if (kind === "leave_project") Object.assign(request, { project_id: value, expected_participation_generation: expectedParticipation });
-  if (["new_conversation", "detail", "cancel", "stop_service", "stop_conversation", "next_jobs", "next_environments", "latest", "submit", "continue", "revise", "prepare_sample", "upload_inputs", "remove_input", "save_asset", "import_asset", "transcript_next", "history_next", "select_conversation", "rename_conversation", "delete_conversation"].includes(kind)) request.project_id = projection.selected_project_id;
+  if (["new_conversation", "detail", "cancel", "stop_service", "stop_conversation", "next_environments", "latest", "submit", "continue", "revise", "prepare_sample", "upload_inputs", "remove_input", "save_asset", "import_asset", "transcript_next", "history_next", "select_conversation", "rename_conversation", "delete_conversation"].includes(kind)) request.project_id = projection.selected_project_id;
   if (["select_conversation", "rename_conversation", "delete_conversation"].includes(kind)) request.conversation_id = value;
   if (kind === "rename_conversation") request.title = local.renameDraft.trim();
   if (kind === "detail" || kind === "cancel") request.job_id = value;

@@ -120,9 +120,10 @@ export async function startContextComparisonProxy({ endpoint, model, credentialF
       }
       metadata.completed = true;
       res.end();
-    } catch {
+    } catch (error) {
       metadata.aborted = controller.signal.aborted;
       metadata.failure = metadata.aborted ? "request-aborted" : "comparison-request-failed";
+      metadata.error_code = typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : null;
       if (!metadata.aborted && !closing) failures.push({ sequence: metadata.sequence, code: metadata.failure });
       if (!res.headersSent && !res.destroyed) { res.writeHead(502, { "content-type": "application/json" }); res.end('{"error":"comparison proxy request failed"}'); }
       else if (!res.destroyed) res.destroy();

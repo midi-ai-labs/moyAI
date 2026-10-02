@@ -29,7 +29,7 @@ impl Tool for SharedServicesTool {
         ToolSpec {
             name: ToolName::SharedServices,
             effect: ToolEffectPolicy::read(),
-            description: "List finite servers retained for this exact shared conversation, including another PC. Use their service_id for shared_stop_service and distinguish running, stop requested, and uncertain states. A retained process alone does not prove the app is reachable.",
+            description: "List servers retained for this exact shared conversation, including another PC. Use their service_id for shared_stop_service and distinguish running, stop requested, and uncertain states. A retained process alone does not prove the app is reachable.",
             input_schema: json!({"type":"object","additionalProperties":false}),
         }
     }

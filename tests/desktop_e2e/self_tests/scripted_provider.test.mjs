@@ -153,7 +153,7 @@ async function waitFor(predicate, timeoutMs = 2_000) {
 }
 
 test("scripted provider never publishes a Fetch-forbidden loopback port", async (context) => {
-  for (const port of [1, 21, 2_049, 5_060, 6_000, 6_665, 6_669, 10_080]) {
+  for (const port of [1, 21, 2_049, 4_190, 5_060, 6_000, 6_665, 6_669, 6_679, 10_080]) {
     assert.equal(scriptedProviderPortIsFetchSafe(port), false, `port ${port}`);
   }
   for (const port of [80, 1_024, 10_081, 49_152, 65_535]) {

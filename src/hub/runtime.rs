@@ -313,16 +313,9 @@ impl HubTurnRoute {
         // All selectable fallback models must support the advertised turn envelope.
         let models: Vec<_> = self
             .inner
-            .catalog
-            .models
-            .iter()
-            .filter(|model| {
-                self.inner
-                    .review
-                    .selection
-                    .allowed_model_ids
-                    .contains(&model.id)
-            })
+            .review
+            .selection
+            .selectable_models(&self.inner.catalog)
             .collect();
         config.model.supports_tools = models
             .iter()
@@ -342,16 +335,9 @@ impl HubTurnRoute {
 
     pub(crate) fn model_system_prompt_reservation(&self) -> usize {
         self.inner
-            .catalog
-            .models
-            .iter()
-            .filter(|model| {
-                self.inner
-                    .review
-                    .selection
-                    .allowed_model_ids
-                    .contains(&model.id)
-            })
+            .review
+            .selection
+            .selectable_models(&self.inner.catalog)
             .map(|model| {
                 crate::context::context_window::estimate_text_tokens(
                     &crate::system_prompt::hub_model_system_prompt_section(&model.system_prompt),
@@ -686,21 +672,8 @@ impl LlmClient for HubRoutedClient {
                     .inner
                     .review
                     .selection
-                    .allowed_model_ids
-                    .contains(&logical_model_id)
-                || (self.route.inner.review.selection.wait_policy
-                    == crate::hub::HubWaitPolicy::WaitForPreferred
-                    && self.route.inner.review.selection.preferred_model_id != logical_model_id)
-                || !self.route.inner.catalog.models.iter().any(|model| {
-                    model.id == logical_model_id
-                        && self
-                            .route
-                            .inner
-                            .review
-                            .selection
-                            .required_capabilities
-                            .is_subset(&model.capabilities)
-                })
+                    .selectable_models(&self.route.inner.catalog)
+                    .any(|model| model.id == logical_model_id)
                 || decimal(&expires_at_ms).is_none()
             {
                 return Err(LlmError::Hub(HubError::InvalidCatalog));

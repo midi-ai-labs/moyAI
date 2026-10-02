@@ -532,7 +532,7 @@ test("Main Settings never offers model rows from a catalog owned by another URL"
   assert.doesNotMatch(main, /<option value="current-model"/);
   assert.match(main, /id="main-provider-model-manual"[^>]*value="current-model"/);
   assert.doesNotMatch(main, /stale-model|Stale model/);
-  assert.match(main, /入力中のURLと接続方式に対応する候補を取得/);
+  assert.match(main, /モデルIDを手入力/);
 });
 
 test("Settings model dropdown exposes loaded options and retains a current model outside the catalog", () => {

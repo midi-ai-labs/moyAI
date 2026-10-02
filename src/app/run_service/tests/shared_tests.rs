@@ -31,10 +31,12 @@ impl crate::llm::LlmClient for ChildThenAnswer {
                 .iter()
                 .any(|tool| tool.name == "shared_delegate")
         );
-        assert!(!request.tools.iter().any(|tool| matches!(
-            tool.name.as_str(),
-            "mcp_call" | "wait_remote_tasks" | "spawn_agent"
-        )));
+        assert!(
+            !request
+                .tools
+                .iter()
+                .any(|tool| matches!(tool.name.as_str(), "wait_remote_tasks" | "spawn_agent"))
+        );
         self.requests.lock().unwrap().push(request);
         let finish_reason = if has_result
             && !self
@@ -111,6 +113,129 @@ fn resume(yielded: &SharedYield) -> SharedRunContext {
     }
 }
 
+fn shared_turn_clocks(
+    store: &StoreBundle,
+    yielded: &SharedYield,
+) -> Vec<crate::context::current_time::CurrentTimeSnapshot> {
+    store
+        .protocol_event_store()
+        .list_history_items(yielded.session_id, yielded.turn_id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|item| match item.payload {
+            crate::protocol::HistoryItemPayload::WorldState { snapshot, .. } => Some(
+                serde_json::from_value(snapshot.sections["current_time"]["snapshot"].clone())
+                    .unwrap(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+fn seed_world_state_clock(
+    store: &StoreBundle,
+    session_id: SessionId,
+    turn_id: crate::protocol::TurnId,
+    sequence_no: i64,
+    clock_section: Option<serde_json::Value>,
+) {
+    let mut snapshot = crate::context::world_state::WorldStateSnapshot::default();
+    if let Some(section) = clock_section {
+        snapshot.sections.insert("current_time".into(), section);
+    }
+    store
+        .protocol_event_store()
+        .seed_history_item_for_test(&crate::protocol::HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            scope: crate::protocol::HistoryScope::Turn { turn_id },
+            sequence_no,
+            created_at_ms: 0,
+            payload: crate::protocol::HistoryItemPayload::WorldState {
+                snapshot,
+                rendered: String::new(),
+            },
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shared_turn_start_time_uses_first_snapshot_of_exact_session_and_turn() {
+    let (_service, store, _workspace, _runtime) =
+        run_service_fixture(ResolvedConfig::default()).await;
+    let session = SessionId::new();
+    let other_session = SessionId::new();
+    let turn = crate::protocol::TurnId::new();
+    let other_turn = crate::protocol::TurnId::new();
+    let first = crate::context::current_time::CurrentTimeSnapshot {
+        utc: "1970-01-01T00:00:00Z".into(),
+        local: "1970-01-01T00:00:00+00:00".into(),
+        timezone: "+00:00".into(),
+        unix_ms: 0,
+    };
+    let later = crate::context::current_time::CurrentTimeSnapshot {
+        utc: "1970-01-01T00:00:01Z".into(),
+        local: "1970-01-01T00:00:01+00:00".into(),
+        unix_ms: 1000,
+        ..first.clone()
+    };
+    for (session_id, turn_id, sequence, clock) in [
+        (session, turn, 1, &first),
+        (session, turn, 2, &later),
+        (session, other_turn, 1, &later),
+        (other_session, turn, 1, &later),
+    ] {
+        seed_world_state_clock(
+            &store,
+            session_id,
+            turn_id,
+            sequence,
+            Some(json!({"snapshot": clock})),
+        );
+    }
+    let repo = store.session_repo();
+    assert_eq!(
+        repo.shared_turn_start_time(session, turn).unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        repo.shared_turn_start_time(session, other_turn).unwrap(),
+        Some(later.clone())
+    );
+    assert_eq!(
+        repo.shared_turn_start_time(other_session, turn).unwrap(),
+        Some(later)
+    );
+    assert_eq!(
+        repo.shared_turn_start_time(session, crate::protocol::TurnId::new())
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn shared_turn_start_time_allows_missing_or_legacy_clock_snapshots() {
+    let (_service, store, _workspace, _runtime) =
+        run_service_fixture(ResolvedConfig::default()).await;
+    let session = SessionId::new();
+    for clock in [
+        None,
+        Some(json!({})),
+        Some(json!({"snapshot": {"utc": "1970-01-01T00:00:00Z"}})),
+    ] {
+        let turn = crate::protocol::TurnId::new();
+        seed_world_state_clock(&store, session, turn, 1, clock);
+        assert_eq!(
+            store
+                .session_repo()
+                .shared_turn_start_time(session, turn)
+                .unwrap(),
+            None,
+            "older clock projections must leave the existing current-time fallback available"
+        );
+    }
+}
+
 fn hub_parent(yielded: &SharedYield, state: &str) -> serde_json::Value {
     json!({"id":"parent-job","project_id":"shared-project","environment_id":"general",
         "checkpoint":yielded.checkpoint,"state":state,"result":null})
@@ -183,12 +308,26 @@ async fn pause_with_project(
 
 #[tokio::test]
 async fn shared_project_snapshot_reaches_provider_on_initial_and_checkpoint_resumed_steps() {
+    shared_project_checkpoint_fixture(false).await;
+}
+
+#[tokio::test]
+async fn shared_root_checkpoint_keeps_canonical_request_without_state_duplication() {
+    shared_project_checkpoint_fixture(true).await;
+}
+
+async fn shared_project_checkpoint_fixture(root: bool) {
     let project = crate::context::world_state::SharedProjectContext {
         project_id: "shared-project".into(),
         label: "Text analysis team".into(),
         overview: "PROJECT_OVERVIEW_SNAPSHOT: general is API, solver is Worker".into(),
         revision: "17".into(),
-        root_prompt: "Build and verify the distributed application".into(),
+        root_prompt: if root {
+            ""
+        } else {
+            "Build and verify the distributed application"
+        }
+        .into(),
         origin_device_id: Some("WinA".into()),
     };
     let (service, _store, workspace, _runtime, llm, config, yielded) =
@@ -230,11 +369,20 @@ async fn shared_project_snapshot_reaches_provider_on_initial_and_checkpoint_resu
                 .system_prompt
                 .contains("<overview_revision>17</overview_revision>")
         );
-        assert!(
-            request
-                .system_prompt
-                .contains("Build and verify the distributed application")
-        );
+        if root {
+            assert!(!request.system_prompt.contains("<overall_request>"));
+            assert!(
+                serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("Delegate the computation and use its result")
+            );
+        } else {
+            assert!(
+                request
+                    .system_prompt
+                    .contains("Build and verify the distributed application")
+            );
+        }
     }
 }
 
@@ -331,6 +479,7 @@ async fn child_and_redelegated_context_keep_origin_but_identify_their_own_execut
 async fn shared_archive_restores_into_another_store_without_replaying_completed_effects() {
     let (_source, source_store, _source_workspace, _source_runtime, source_llm, _, yielded) =
         pause().await;
+    let original_clock = shared_turn_clocks(&source_store, &yielded)[0].clone();
     let archive = source_store
         .session_repo()
         .export_shared_archive("parent-job", source_store.paths())
@@ -357,6 +506,11 @@ async fn shared_archive_restores_into_another_store_without_replaying_completed_
         .await
         .unwrap();
     assert!(matches!(result, SharedRunOutcome::Completed(_)));
+    assert_eq!(
+        shared_turn_clocks(&target_store, &yielded),
+        vec![original_clock.clone(), original_clock],
+        "portable resume must retain this turn's clock instead of the target store's clock"
+    );
     assert_eq!(source_llm.requests.lock().unwrap().len(), 1);
     assert_eq!(target_llm.requests.lock().unwrap().len(), 2); // unrelated pause, then only the resumed model response
     assert_eq!(
@@ -584,6 +738,7 @@ async fn shared_archive_v68_forward_migration_preserves_v67_paused_execution() {
 #[tokio::test]
 async fn shared_checkpoint_resumes_same_turn_and_consumes_child_once_after_reopen() {
     let (service, store, workspace, _runtime, llm, config, yielded) = pause().await;
+    let original_clock = shared_turn_clocks(&store, &yielded)[0].clone();
     assert_eq!(llm.requests.lock().unwrap().len(), 1);
     assert_eq!(
         store
@@ -632,6 +787,8 @@ async fn shared_checkpoint_resumes_same_turn_and_consumes_child_once_after_reope
             .is_none(),
         "ordinary local admission cannot take a shared paused turn"
     );
+    let updated_instruction = "When reporting checks, include the executed command.";
+    std::fs::write(workspace.root.join("AGENTS.md"), updated_instruction).unwrap();
     let outcome = service
         .execute_shared(
             request(config.clone(), &workspace),
@@ -649,6 +806,11 @@ async fn shared_checkpoint_resumes_same_turn_and_consumes_child_once_after_reope
     assert_eq!(summary.status(), SessionStatus::Completed);
     assert_eq!(summary.tool_call_count(), 1);
     assert_eq!(summary.metrics().model_request_count, 2);
+    assert_eq!(
+        shared_turn_clocks(&store, &yielded),
+        vec![original_clock.clone(), original_clock],
+        "resuming the same canonical turn must keep its original clock, including milliseconds"
+    );
     assert_eq!(
         store
             .session_repo()
@@ -673,6 +835,8 @@ async fn shared_checkpoint_resumes_same_turn_and_consumes_child_once_after_reope
     );
     let requests = llm.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
+    assert!(!requests[0].system_prompt.contains(updated_instruction));
+    assert!(requests[1].system_prompt.contains(updated_instruction));
     assert_eq!(
         requests[1]
             .messages

@@ -1083,9 +1083,9 @@ mod windows {
             )));
         }
 
+        // FILE_GENERIC_WRITE also contains read-only READ_CONTROL/SYNCHRONIZE bits.
         let unsafe_mask = GENERIC_ALL
             | GENERIC_WRITE_MASK
-            | FILE_GENERIC_WRITE
             | FILE_WRITE_DATA
             | FILE_APPEND_DATA
             | FILE_WRITE_EA
@@ -1153,12 +1153,15 @@ mod windows {
         {
             return false;
         }
-        let write_mask = FILE_GENERIC_WRITE
+        // Test only mutating rights, including rights that can widen the DACL.
+        let write_mask = GENERIC_ALL
+            | GENERIC_WRITE_MASK
             | FILE_WRITE_DATA
             | FILE_APPEND_DATA
             | FILE_WRITE_EA
             | FILE_WRITE_ATTRIBUTES
-            | GENERIC_WRITE_MASK
+            | WRITE_DAC
+            | WRITE_OWNER
             | DELETE
             | 0x0000_0040;
         for index in 0..info.AceCount {
@@ -2847,6 +2850,200 @@ mod windows {
             assert!(message.contains("Everyone-writable sandbox audit candidate"));
             assert!(message.contains("before spawn"));
             assert!(message.contains("WRITE_DAC failure"));
+        }
+
+        fn shared_acl_fixture() -> tempfile::TempDir {
+            let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../project_sandbox/sandbox-acl-tests");
+            std::fs::create_dir_all(&parent).expect("private ACL fixture parent");
+            tempfile::Builder::new()
+                .prefix("shared-read-")
+                .tempdir_in(parent)
+                .expect("private ACL fixture")
+        }
+
+        fn set_fixture_shared_allow(
+            path: &camino::Utf8Path,
+            shared_sid: *mut std::ffi::c_void,
+            mask: u32,
+        ) {
+            let handle = super::open_audit_candidate(path, super::READ_CONTROL | super::WRITE_DAC)
+                .expect("open private ACL fixture");
+            let token = open_current_process_token().expect("current token");
+            let mut user = token_user_sid(token.raw()).expect("current user SID");
+            let mut system = super::system_sid().expect("SYSTEM SID");
+            let entries = [
+                (user.as_mut_ptr().cast(), GENERIC_ALL),
+                (system.as_mut_ptr().cast(), GENERIC_ALL),
+                (shared_sid, mask),
+            ]
+            .map(|(sid, mask)| super::EXPLICIT_ACCESS_W {
+                grfAccessPermissions: mask,
+                grfAccessMode: super::SET_ACCESS,
+                grfInheritance: CONTAINER_AND_OBJECT_INHERIT,
+                Trustee: super::TRUSTEE_W {
+                    pMultipleTrustee: std::ptr::null_mut(),
+                    MultipleTrusteeOperation: 0,
+                    TrusteeForm: super::TRUSTEE_IS_SID,
+                    TrusteeType: super::TRUSTEE_IS_UNKNOWN,
+                    ptstrName: sid.cast(),
+                },
+            });
+            let mut dacl = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    super::SetEntriesInAclW(
+                        entries.len() as u32,
+                        entries.as_ptr(),
+                        std::ptr::null_mut(),
+                        &mut dacl,
+                    )
+                },
+                super::ERROR_SUCCESS,
+            );
+            let dacl = super::LocalAcl(dacl);
+            assert_eq!(
+                unsafe {
+                    super::SetSecurityInfo(
+                        handle.raw(),
+                        super::SE_FILE_OBJECT,
+                        super::DACL_SECURITY_INFORMATION
+                            | super::PROTECTED_DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        dacl.0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                super::ERROR_SUCCESS,
+            );
+        }
+
+        fn shared_acl_access_cases() -> Vec<(&'static str, u32, bool)> {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+                FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+                SYNCHRONIZE,
+            };
+            vec![
+                ("read", FILE_GENERIC_READ, false),
+                (
+                    "read-execute",
+                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                    false,
+                ),
+                ("read-control", super::READ_CONTROL, false),
+                ("synchronize", SYNCHRONIZE, false),
+                ("write", FILE_GENERIC_WRITE, true),
+                ("write-data", FILE_WRITE_DATA, true),
+                ("append", FILE_APPEND_DATA, true),
+                ("write-ea", FILE_WRITE_EA, true),
+                ("write-attributes", FILE_WRITE_ATTRIBUTES, true),
+                ("delete", DELETE, true),
+                ("delete-child", 0x40, true),
+                ("generic-write", super::GENERIC_WRITE_MASK, true),
+                ("generic-all", GENERIC_ALL, true),
+                ("write-dac", super::WRITE_DAC, true),
+                ("write-owner", super::WRITE_OWNER, true),
+            ]
+        }
+
+        #[test]
+        fn effect_temp_creation_distinguishes_shared_read_from_write_acl() {
+            let fixture = shared_acl_fixture();
+            let root =
+                Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("UTF-8 fixture");
+            let workspace_root = root.join("workspace");
+            std::fs::create_dir(&workspace_root).expect("workspace");
+            let config = crate::config::ResolvedConfig::default();
+            let workspace =
+                crate::workspace::WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+                    .expect("workspace discovery");
+            let token = open_current_process_token().expect("current token");
+            let mut world = world_sid().expect("World SID");
+            let mut logon = token_logon_sid(token.raw()).expect("logon SID");
+            let mut observations = Vec::new();
+            for (label, sid) in [
+                ("World SID", world.as_mut_ptr().cast()),
+                ("current logon SID", logon.as_mut_ptr().cast()),
+            ] {
+                for (access, mask, mutating) in shared_acl_access_cases() {
+                    let base = root.join(format!("{label}-{access}"));
+                    std::fs::create_dir(&base).expect("temp base");
+                    set_fixture_shared_allow(&base, sid, mask);
+                    let mut profile =
+                        super::WorkspaceWriteSandboxProfile::compile(&workspace, [base.clone()])
+                            .expect("sandbox profile");
+                    let mut environment = HashMap::new();
+                    let outcome =
+                        match super::create_effect_local_temp(&mut profile, &mut environment) {
+                            Ok(directory) => {
+                                let effect_path = directory.path().to_path_buf();
+                                assert_eq!(
+                                    environment.get("TEMP").map(String::as_str),
+                                    effect_path.to_str(),
+                                );
+                                assert!(effect_path.is_dir());
+                                assert!(super::close_effect_local_temp(directory).is_empty());
+                                assert!(!effect_path.exists(), "effect temp was not removed");
+                                Ok(())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        };
+                    assert_eq!(
+                        std::fs::read_dir(&base).expect("temp base entries").count(),
+                        0
+                    );
+                    observations.push((label, access, mutating, outcome));
+                }
+            }
+            fixture.close().expect("remove private ACL fixture");
+            for (label, access, mutating, outcome) in observations {
+                if !mutating {
+                    assert!(
+                        outcome.is_ok(),
+                        "{label} {access} grant rejected: {outcome:?}"
+                    );
+                } else {
+                    let message = outcome.expect_err("shared write must remain rejected");
+                    assert!(
+                        message.contains(label) && message.contains("write or ACL-control"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn world_write_audit_distinguishes_shared_read_from_write_acl() {
+            let fixture = shared_acl_fixture();
+            let root =
+                Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("UTF-8 fixture");
+            let mut world = world_sid().expect("World SID");
+            let mut observations = Vec::new();
+            for (label, mask, mutating) in shared_acl_access_cases() {
+                let candidate = root.join(label);
+                std::fs::create_dir(&candidate).expect("audit candidate");
+                set_fixture_shared_allow(&candidate, world.as_mut_ptr().cast(), mask);
+                let handle = super::open_audit_candidate(&candidate, super::READ_CONTROL)
+                    .expect("open audit candidate");
+                let world_writable = super::opened_acl_allows_world_write(
+                    handle.raw(),
+                    &candidate,
+                    world.as_mut_ptr().cast(),
+                )
+                .expect("audit opened candidate");
+                observations.push((label, world_writable, mutating));
+            }
+            fixture.close().expect("remove private ACL fixture");
+            let mismatches = observations
+                .into_iter()
+                .filter(|(_, observed, expected)| observed != expected)
+                .collect::<Vec<_>>();
+            assert!(
+                mismatches.is_empty(),
+                "audit misclassifications: {mismatches:?}"
+            );
         }
 
         #[test]

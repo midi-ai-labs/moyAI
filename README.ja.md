@@ -17,7 +17,7 @@
 
 ## moyAI（もやい）とは
 
-moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトの調査、ファイル編集、コマンド実行、会話と成果の保存を行います。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
+moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
 **このブランチはDesktop 3.0.0とmoyAI Hub 0.1.0の開発版で、正式リリースではありません。** 公開済みv2.1.1のZIPは従来の配置と機能です。開発版の実装内容と未検証範囲は[リリースノート](docs/release/v3.0.0.md)を参照してください。
 
@@ -28,7 +28,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 - 「承認を求める」「代理で承認」「フルアクセス」の操作権限。前二つにはWindowsの作業フォルダー保護が適用されます。
 - 子エージェントとの分担、進捗計画、長い会話の圧縮、Markdownへの会話保存。
 - プロジェクト内の指示・Skills、外部HTTP MCPツール、文書処理用Doclingとの接続。
-- Hubで許可した複数PCを使うプロジェクト。左の通常のプロジェクト一覧に `MCP` 印で表示し、いつもの入力欄から依頼します。AIはプロジェクト内で許可された実行PCを選択できます。
+- Hubで許可した複数PCを使うプロジェクト。左のプロジェクト一覧に `Hub` 印で表示し、いつもの入力欄から依頼します。AIはプロジェクト内で許可された実行PCを選択できます。
 - Desktop画面と独立して仕事を実行するWindows Runner。共有の会話・入力・公開した成果はHubへ保存します。
 
 ## Quick Start
@@ -51,7 +51,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 moyAIのID・パスワード入力は不要です。同じWindowsユーザー名でも各PCは別のIDと鍵を持ちます。Hubへ参加しただけで全プロジェクトが使えるわけではありません。
 
-Desktopの×ボタンはトレイへ格納します。もう一度起動すると同じ画面に戻ります。完全終了はトレイの **終了** を使います。RunnerとHubは別に稼働します。
+Desktopの×ボタンを押すとトレイに入り、仕事は続きます。もう一度起動すると同じ画面に戻ります。メニューまたはトレイの **終了** は、このPCのRunnerの仕事と起動中アプリを停止します。Runnerの終了を確認してからDesktopも終了します。Hubは別に管理します。
 
 詳しい手順は[使い始める](docs/user/getting-started.md)、[Windowsへの導入と更新](docs/user/windows-setup.md)、[初回設定と再開](docs/desktop-first-use.md)、[Hubプロジェクトの操作](docs/shared-work-desktop.md)を参照してください。公開済みv2.1.1は `bin/moyai-desktop.exe` から起動します。
 
@@ -61,9 +61,11 @@ Windowsの共通設定は `%APPDATA%\midi-ai-labs\moyai\config\config.toml` で�
 
 **設定 → AIの接続** でメインとサイドを設定します。Hub設定がない場合は、接続方式・URL・モデルを入力します。LM Studio Responses、oMLXなどのOpenAI互換Chat Completionsに対応し、モデル一覧の取得とモデルIDの直接入力ができます。API認証が必要な場合は、秘密情報そのものではなく、それを保持する環境変数名を指定します。
 
-Hub設定がある場合は同じ欄にHubの接続情報を表示し、標準モデルまたは登録済みモデルを選びます。メインとサイドは別々に保存し、共有Runnerは実行PCのメインの選択を使います。Hub停止中に手入力先へ自動で切り替わりません。**接続設定をリセット** はHubが応答しなくても使え、手入力のAI設定・ローカル会話・成果を保持して別Hubへ登録し直せます。
+Hub設定がある場合は同じ欄にHubの接続情報を表示し、標準モデルまたは登録済みモデルを選びます。メインとサイドは別々に保存し、共有Runnerは実行PCのメインの選択を使います。Hub停止中に手入力の接続先へ自動で切り替わりません。
 
-共通設定と、選択したローカル会話のメイン用設定は別です。サイドは独立した共通設定を使います。`context_window` はmoyAI内の会話量計算と圧縮に使い、モデルのロード・生成量・samplingはAIホストで設定します。[設定例](config.example.toml)と[Hubモデル接続](docs/hub-integration.md)を参照してください。
+**接続設定をリセット** はHubが応答しなくても使えます。手入力のAI設定・ローカル会話・成果を保持して、別Hubへ登録し直せます。
+
+共通設定と、選択したローカル会話のメイン用設定は別です。サイドは独立した共通設定を使います。`context_window` はmoyAI内の会話量の計算と圧縮に使います。モデルの読み込み・生成量・サンプリングはAIホストで設定します。[設定例](config.example.toml)と[Hubモデル接続](docs/hub-integration.md)を参照してください。
 
 ## CLI・TUI
 
@@ -74,7 +76,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-開発版配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRust coreと利用者設定を共有します。引数の詳細は `moyai --help` と各コマンドのhelpで確認してください。
+開発版配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 ## プロジェクトごとの指示
 
@@ -88,7 +90,7 @@ moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile 
 
 「承認を求める」と「代理で承認」は同じWindowsの作業フォルダー保護を使い、後者はAIが操作の許可を審査します。「フルアクセス」は現在のWindows利用者の権限で実行します。これはOS全体の完全隔離を保証するものではありません。ネイティブなプロセス保護はWindowsのみで、他OSでは保護が必要なプロセス操作を拒否します。Unixの既存ファイル更新・削除は、バックアップを残した部分完了エラーになる場合があり、表示された保存先の確認が必要です。
 
-停止や発言の編集は、作成済みファイルや起動済みアプリを元に戻しません。編集できるのは最新の発言だけで、ローカル会話の画像付き発言とHub会話の添付付き発言は文字編集対象外です。停止要求の受付と、実プロセスの停止確認は別です。
+停止や発言の編集は、作成済みファイルや起動済みアプリを元に戻しません。編集・再送できるのは最新の発言だけです。本文を編集しても元の画像や添付は保持します。添付を変更する場合は、新しい依頼として送ってください。停止要求の受付と、実プロセスの停止確認は別です。
 
 RunnerはWindows利用者のログオン中に動作します。OSサービス運用、HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
 
@@ -110,7 +112,7 @@ npm run test:desktop-web
 npm run verify:gui -- --suite smoke
 ```
 
-[GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・Live LLMとfixtureによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、近傍のtestsを参照してください。
+[GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
 公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanupを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 

@@ -50,7 +50,7 @@ export interface SharedWorkProjection {
   projects_stale?: boolean;
   principal: (WorkPerson & { administrator: boolean }) | null; expires_at_ms: number | null;
   projects: WorkProject[]; selected_project_id: string | null; selected_job_id: string | null;
-  selected_conversation_id?: string | null; conversations?: WorkConversation[]; conversation_revision?: string | null;
+  selected_conversation_id: string | null; conversations: WorkConversation[]; conversation_revision: string;
   leave_pending_project_id?: string | null;
   project_access?: "no_membership" | "device_not_allowed" | "ready" | null;
   status: { project_id: string; jobs: WorkSummary[]; environments: WorkEnvironment[]; execution_devices?: WorkExecutionDevice[]; next_before: string | null; next_environment_before: string | null } | null;
@@ -76,8 +76,8 @@ export type SharedWorkPresentation = Omit<SharedWorkUiState, "serial" | "polling
 export interface SharedConversationRow { conversationId: string; title: string; jobId: string | null; selected: boolean; deletePending?: boolean; canRename?: boolean; canDelete?: boolean; }
 
 /** Only the Hub's persisted identity can merge jobs into one visible conversation. */
-export function sharedConversationRows(jobs: WorkSummary[], selectedJobId: string | null, conversations?: WorkConversation[], selectedConversationId?: string | null): SharedConversationRow[] {
-  if (conversations) return conversations.map(row => ({
+export function sharedConversationRows(conversations: WorkConversation[], selectedConversationId: string | null, selectedJobId: string | null): SharedConversationRow[] {
+  return conversations.map(row => ({
     conversationId: row.id,
     title: row.title,
     jobId: row.latest_job_id,
@@ -86,22 +86,6 @@ export function sharedConversationRows(jobs: WorkSummary[], selectedJobId: strin
     canRename: row.can_rename,
     canDelete: row.can_delete,
   }));
-  const groups = new Map<string, WorkSummary[]>();
-  for (const job of jobs) {
-    if (job.origin_session_ref != null) continue;
-    const id = job.conversation_id || job.id;
-    const group = groups.get(id) ?? [];
-    group.push(job);
-    groups.set(id, group);
-  }
-  return Array.from(groups, ([conversationId, group]) => {
-    const selected = group.find(job => job.id === selectedJobId);
-    const first = group.find(job => job.id === conversationId && job.parent_id === null)
-      ?? group.filter(job => job.parent_id === null).sort((a, b) => a.created_at_ms - b.created_at_ms)[0]
-      ?? group[0];
-    const latest = group.filter(job => job.parent_id === null).sort((a, b) => b.created_at_ms - a.created_at_ms)[0] ?? group[0];
-    return { conversationId, title: first.title, jobId: selected?.id ?? latest.id, selected: Boolean(selected) };
-  });
 }
 export function createSharedWorkUiState(): SharedWorkUiState {
   return { projection: null, title: "", prompt: "", pending: null, serial: 0, polling: false, error: "", conceal: false, confirmation: null,
@@ -272,7 +256,6 @@ export function sharedWorkActionEnabled(local: SharedWorkPresentation, kind: str
   if (kind === "detail") return p.status?.jobs.some(row => row.id === value) ?? false;
   if (kind === "reconfirm-approval") return Boolean(p.approval?.can_reconfirm && p.approval.status === "expired" && p.approval.id === value);
   if (["approve", "deny", "stop"].includes(kind)) return Boolean(p.approval?.can_decide && p.approval.status === "pending" && p.approval.id === value);
-  if (kind === "next-jobs") return Boolean(p.status?.next_before);
   if (kind === "next-environments") return Boolean(p.status?.next_environment_before);
   return true;
 }

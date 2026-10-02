@@ -58,6 +58,16 @@ export function outputHistoryDestinationIdentity(surface) {
   return { anchor: target.anchor, historyIdentity: target.history_identity, focusKey: target.summary_focus_key };
 }
 
+export function outputHistoryRouteReady(surface, owner) {
+  const destination = outputHistoryDestinationIdentity(surface);
+  return surface?.pane?.mode === "output" && !surface.pane.collapsed
+    && surface?.route?.count === 1 && surface.route.enabled
+    && owner != null && same(outputHistoryOwner(surface.projection), owner)
+    && surface?.destination?.count === 1 && destination !== null
+    && destination.historyIdentity === `turn:${owner.turn}:work-summary`
+    && surface.route.target === destination.anchor;
+}
+
 /** Observable behavior only: the action must resolve the displayed canonical history destination. */
 export function outputHistoryNavigationFailures(surface, { owner, phase, draft, selection, baseline, destinationIdentity,
   revealed = true, focus = "summary" } = {}) {
@@ -90,7 +100,8 @@ async function observe(cdp, barrier) {
   const projection = barrier?.installed ? await barrier.sampleBackend() : await invokeDesktopCommand(cdp, "desktop_state");
   const owner = outputHistoryOwner(projection);
   const historyIdentity = owner ? `turn:${owner.turn}:work-summary` : null;
-  const dom = await cdp.evaluate(`(() => {
+  const dom = await cdp.evaluate(`(async () => {
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     const visible = (element) => {
       if (!(element instanceof HTMLElement) || !element.isConnected) return false;
       const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
@@ -114,6 +125,9 @@ async function observe(cdp, barrier) {
     const prompts = document.querySelectorAll('section.composer textarea#prompt'), prompt = prompts[0];
     const memory = globalThis[Symbol.for('${NODE_KEY}')];
     return {
+      active_element: { tag: document.activeElement?.tagName ?? null, id: document.activeElement?.id ?? null,
+        action: document.activeElement?.getAttribute('data-action') ?? null,
+        focus_key: document.activeElement?.getAttribute('data-focus-key') ?? null },
       pane: { collapsed: document.querySelector('.app-frame')?.classList.contains('artifact-collapsed') ?? true,
         mode: document.querySelector('.artifact-pane')?.getAttribute('data-pane-mode') ?? null },
       route: { count: routes.length, target: anchor, visible: visible(route),
@@ -249,8 +263,7 @@ export function createOutputHistoryNavigationScenario() {
           && outputHistoryOwner(surface.projection) !== null && surface.projection.transcript_rows.some((row) => row.row_kind === "work_summary_running"));
         const owner = outputHistoryOwner(held.projection);
         if (held.pane.collapsed) await recordClick(input, PANE, sink);
-        held = await wait(cdp, null, "Output pane history route is available", (surface) => surface.pane.mode === "output"
-          && !surface.pane.collapsed && surface.route.count === 1 && surface.route.enabled);
+        held = await wait(cdp, null, "Output pane history route is available", (surface) => outputHistoryRouteReady(surface, owner));
         await type(input, OUTPUT_HISTORY_DRAFT, sink);
         await input.keyDown("Shift");
         try { await input.pressKey("Home"); } finally { await input.keyUp("Shift"); }
@@ -258,7 +271,26 @@ export function createOutputHistoryNavigationScenario() {
         const selection = [0, OUTPUT_HISTORY_DRAFT.length];
         const draft = { owner, phase: "running", draft: OUTPUT_HISTORY_DRAFT, selection,
           baseline: outputHistoryDraftBaseline(held.projection), destinationIdentity: outputHistoryDestinationIdentity(held), focus: "prompt" };
-        await wait(cdp, null, "Running editor retains the unsent draft", (surface) => outputHistoryNavigationFailures(surface, draft).length === 0);
+        await sink.record("output-history-running-draft-expectation", {
+          expected: draft,
+          held: { owner: outputHistoryOwner(held.projection), run_target: held.projection.run_target,
+            baseline: outputHistoryDraftBaseline(held.projection), destination: held.destination, route: held.route },
+        }, { phase: "executing", owner: OWNER });
+        let draftReady;
+        try {
+          draftReady = await wait(cdp, null, "Running editor retains the unsent draft", (surface) => outputHistoryNavigationFailures(surface, draft).length === 0);
+        } catch (error) {
+          const observed = error?.evidence?.observation?.last_value;
+          await sink.record("output-history-running-draft-mismatch", {
+            expected: draft,
+            failures: outputHistoryNavigationFailures(observed, draft),
+            observed: observed ? { owner: outputHistoryOwner(observed.projection),
+              baseline: outputHistoryDraftBaseline(observed.projection), destination: observed.destination, route: observed.route,
+              prompt: observed.prompt, active_element: observed.active_element } : null,
+          }, { phase: "executing", owner: OWNER });
+          throw error;
+        }
+        await sink.record("output-history-running-draft-before-stability", draftReady, { phase: "executing", owner: OWNER });
         await stable(cdp, null, sink, "output-history-running-draft-focus", draft);
         await recordClick(input, summaryTarget(held), sink);
         await wait(cdp, null, "Running history collapsed through its summary", (surface) => surface.destination.details_open === false);

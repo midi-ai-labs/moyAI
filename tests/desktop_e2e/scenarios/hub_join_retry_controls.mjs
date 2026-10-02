@@ -73,6 +73,7 @@ export function createHubJoinRetryControlsScenario(options={}){
         await wait('Real network has stopped while browser management remains available',()=>hub.observeNetwork(),s=>s.server.running===false);
         await page.locator('#network-ip').fill('127.0.0.1');await page.locator('#network-port').fill(String(hub.networkPort));
         await importDesktopHubParticipationFile({context,runtime,cdp,input,sink,nativeState:state,importPath});
+        await trustedClick(input,cdp,{selector:'#device-network-details > summary',identity:{tag:'DETAILS',detailsKey:'device-network-details'}},sink);
         const failed=await wait('Failed import preserves configured endpoint and enables explicit participation retry',()=>observeJoinRetry(cdp),s=>failedJoinReady(s,url));
         await captureScenarioScreenshot({cdp,sink,name:'join-retry-offline-import',owner:OWNER});
         await sink.record('join-retry-unregistered',{url,network:failed.network,join:failed.join,error:failed.feedback},{phase:'executing',owner:OWNER});
@@ -108,7 +109,9 @@ export function createHubJoinRetryControlsScenario(options={}){
         await page.locator('nav a[href="#clients"]').click();
         const row=page.locator(`[data-id="request:${pending.surface.network.request_id}"]`);await row.waitFor();
         await resource.screenshot('join-retry-hub-pending');await row.locator('button[data-network-action]').click();
-        const active=await wait('Approval adopts exactly one registered device',async()=>({surface:await observeJoinRetry(cdp),snapshot:await hub.observeNetwork()}),v=>acceptedRetryIdentity(v.surface.network,v.snapshot)&&!v.surface.join.enabled&&v.surface.enrollmentText.includes('参加済み'),45_000);
+        await page.locator('#join-project-save').click();
+        await page.locator('#join-project-dialog').waitFor({state:'hidden'});
+        const active=await wait('Approval adopts exactly one registered device',async()=>({surface:await observeJoinRetry(cdp),snapshot:await hub.observeNetwork()}),v=>acceptedRetryIdentity(v.surface.network,v.snapshot)&&!v.surface.join.enabled&&v.surface.enrollmentText.includes('Hubに接続済み'),45_000);
         const deviceId=active.surface.network.device_id,stableStart=performance.now();
         do{
           const current=await observeJoinRetry(cdp),snapshot=await hub.observeNetwork();

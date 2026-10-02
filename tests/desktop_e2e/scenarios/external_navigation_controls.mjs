@@ -3,6 +3,7 @@ import process from 'node:process';
 import {mkdir,readFile} from 'node:fs/promises';
 import {isDeepStrictEqual as same} from 'node:util';
 import {DesktopE2eError} from '../core/execution.mjs';
+import {desktopLaunchEnvironment} from '../core/desktop_isolation.mjs';
 import {waitForSemanticTargetSettlement} from '../core/semantic_target_settlement.mjs';
 import {DesktopCommandProbe,assertExactDesktopCommandSequence} from '../drivers/desktop_command_probe.mjs';
 import {WebviewInput,assertTrustedProbeSequence,assertTrustedTextInsertion} from '../drivers/webview_input.mjs';
@@ -112,7 +113,7 @@ function createExternalNavigationScenario(options,variant,entry='row'){
       const stdoutPath=path.join(context.paths.logs,'external-root.stdout.jsonl'),stderrPath=path.join(context.paths.logs,'external-root.stderr.log');
       const executable=path.resolve(options.cliBinary??path.join(path.dirname(context.binary),'moyai.exe'));
       state.external=runWindowsExternalProcess({executionRoot:context.root,executable,args:['run','--dir',context.paths.workspace,...(sameSession?['--session',main.sessionId]:['--title',`external-${variant}`]),'--format','json',EXTERNAL],
-        cwd:context.paths.workspace,env:{...process.env,MOYAI_CONFIG_PATH:context.paths.config_file,MOYAI_DATA_DIR:context.paths.data,RUST_BACKTRACE:'1'},
+        cwd:context.paths.workspace,env:desktopLaunchEnvironment({context,processTemp:path.join(path.dirname(context.paths.config),'temp'),inherited:process.env}),
         stdoutPath,stderrPath,timeoutMs:60000,maxOutputBytes:2*1024*1024,label:`external-${variant}`,
         onOwner:externalOwner=>{state.ownerReceipt=sink.record('external-root-process-owner',externalOwner,{phase:'executing',owner}).catch(error=>{state.failures.push('external-owner-evidence:'+error.message);});}
       }).then(value=>{state.externalResult=value;return value;},error=>{state.externalError=error;return null;});

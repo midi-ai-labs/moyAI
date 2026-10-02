@@ -52,7 +52,7 @@ async fn invalid_project_context_is_rejected_before_runner_admission_or_preparat
             external: None,
             local_project_id: None,
         };
-        let result = controller.tick().await;
+        let (_, result) = controller.tick().await;
         server.await.unwrap();
         assert!(
             controller.journal.get("attempt").unwrap().is_none(),
@@ -204,7 +204,7 @@ async fn active_progress_delivery(supported: bool, lose_first_ack: bool) {
         external: None,
         local_project_id: None,
     };
-    controller.tick().await.unwrap();
+    controller.tick().await.1.unwrap();
     assert_eq!(
         controller
             .journal
@@ -239,7 +239,7 @@ async fn active_progress_delivery(supported: bool, lose_first_ack: bool) {
                 .unwrap();
         }
     }
-    controller.tick().await.unwrap();
+    controller.tick().await.1.unwrap();
     assert!(!control.is_cancelled());
     assert_eq!(
         controller
@@ -772,6 +772,314 @@ async fn complete_environment_catalog_retires_only_drained_project_folder_permis
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn leaving_idle_project_preserves_another_projects_retained_service() {
+    retained_service_survives_local_catalog_change(false).await;
+}
+
+#[tokio::test]
+async fn retained_report_failure_cannot_delay_another_services_observed_stop_fence() {
+    use crate::tool::shell::{RetainedService, RetainedServiceState};
+    use tokio_util::sync::CancellationToken;
+
+    let (_temp, settings, path) = super::tests::fixture();
+    let root = path.parent().unwrap();
+    let paths = crate::storage::StoragePaths {
+        data_dir: root.join("data"),
+        database_path: root.join("data/db.sqlite3"),
+        truncation_dir: root.join("data/output"),
+    };
+    let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+    sqlite.migrate().unwrap();
+    let process =
+        crate::app::AppBootstrap::create_process_runtime(crate::storage::StoreBundle::new(sqlite))
+            .await
+            .unwrap();
+    let host = RunnerHost::from_process(process).unwrap();
+    let mut journal = Journal::open(&path, &settings).unwrap();
+    let mut unknown = journal
+        .intent(super::tests::assignment(), settings.environments[0].clone())
+        .unwrap();
+    let mut second_assignment = super::tests::assignment();
+    second_assignment.attempt_id = "attempt-z".into();
+    let mut live = journal
+        .intent(second_assignment, settings.environments[0].clone())
+        .unwrap();
+    let shells = host
+        .inner
+        .process
+        .managed_shells()
+        .with_lifetime(CancellationToken::new(), live.run_id);
+    let live_service = shells
+        .start_preview_for_test(crate::session::SessionId::new())
+        .await;
+    let unknown_service = RetainedService {
+        service_id: ulid::Ulid::new(),
+        expires_at_ms: None,
+        retain_after_turn: true,
+    };
+    for (entry, service) in [(&mut unknown, unknown_service), (&mut live, live_service)] {
+        journal.executing(entry).unwrap();
+        let report = Report::for_assignment(
+            &entry.assignment,
+            "outcome",
+            ReportOutcome::Finished {
+                success: true,
+                result: json!({"text":"Preview"}),
+                resources_released: true,
+            },
+        );
+        journal
+            .outcome_with_retention(entry, report, None, Some(service))
+            .unwrap();
+        journal.retention_reported(entry).unwrap();
+        journal.settled(entry).unwrap();
+    }
+    let leases = [(&unknown, unknown_service, false), (&live, live_service, true)].map(|(entry, service, stop)| json!({
+        "service_id":service.service_id.to_string(),"attempt_id":entry.assignment.attempt_id,
+        "generation":entry.assignment.generation,"conversation_id":entry.assignment.job.conversation_id,
+        "environment_id":entry.assignment.job.environment_id,"expires_at_ms":null,"stop_requested":stop,
+    }));
+    let (client, requests, server) = tls_script(
+        root,
+        vec![
+            Some((200, json!(leases))),
+            Some((503, json!({"error":"report temporarily unavailable"}))),
+        ],
+    )
+    .await;
+    let mut controller = Controller {
+        host: host.clone(),
+        settings,
+        client,
+        journal,
+        checkpoint_cursor: String::new(),
+        commands: None,
+        external: None,
+        local_project_id: None,
+    };
+    assert!(controller.reconcile_retained_services().await.is_err());
+    let service_state = shells.retained_service_state(live_service);
+    let unknown_after = controller
+        .journal
+        .get(&unknown.assignment.attempt_id)
+        .unwrap()
+        .unwrap();
+    let live_after = controller
+        .journal
+        .get(&live.assignment.attempt_id)
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+    let reports = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, body)| body["outcome"]["kind"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    shells.cancel_retained_service(live_service.service_id);
+    host.begin_shutdown().unwrap();
+    host.wait_stopped().await;
+    assert_ne!(
+        service_state,
+        RetainedServiceState::Running,
+        "an earlier report failure must not delay a stop already observed in the same lease response"
+    );
+    assert_eq!(reports, ["service_uncertain"]);
+    assert!(!unknown_after.service_uncertain_ack);
+    assert!(!live_after.service_stopped_ack);
+    assert_eq!(
+        controller.journal.retained_services().unwrap().len(),
+        2,
+        "neither an attempted report nor local stop releases unacknowledged capacity"
+    );
+}
+
+#[tokio::test]
+async fn local_catalog_error_does_not_reclassify_live_hub_control_or_stop_retained_service() {
+    retained_service_survives_local_catalog_change(true).await;
+}
+
+async fn retained_service_survives_local_catalog_change(invalid_capacity: bool) {
+    use crate::runner::Execution;
+    use crate::runtime::{OwnedTaskHandle, RunControl};
+    use crate::tool::shell::RetainedServiceState;
+    use tokio_util::sync::CancellationToken;
+
+    let (_temp, mut settings, path) = super::tests::fixture();
+    let root = path.parent().unwrap();
+    settings.resource_scope = ResourceScope::Device;
+    settings.environments[0].directory = root.join("active-project");
+    std::fs::create_dir(&settings.environments[0].directory).unwrap();
+    let mut retired = settings.environments[0].clone();
+    retired.environment_id = "retired-environment".into();
+    retired.directory = root.join("retired-project");
+    std::fs::create_dir(&retired.directory).unwrap();
+    std::fs::write(retired.directory.join("human-work.txt"), "keep me").unwrap();
+    settings.environments.push(retired.clone());
+    settings.resolve().unwrap();
+    let paths = crate::storage::StoragePaths {
+        data_dir: root.join("data"),
+        database_path: root.join("data/db.sqlite3"),
+        truncation_dir: root.join("data/output"),
+    };
+    let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+    sqlite.migrate().unwrap();
+    let process =
+        crate::app::AppBootstrap::create_process_runtime(crate::storage::StoreBundle::new(sqlite))
+            .await
+            .unwrap();
+    let host = RunnerHost::from_process(process).unwrap();
+    {
+        let mut store = host.inner.operations.lock().unwrap();
+        let mut installed = store.installed.clone();
+        installed.settings = Some(settings.clone());
+        installed.provisions.push(
+            serde_json::from_value(json!({
+                "environment_id":retired.environment_id,"template_id":"local-folder",
+                "generation":1,"success":true,"error":null
+            }))
+            .unwrap(),
+        );
+        store.update(installed).unwrap();
+    }
+    let mut journal = Journal::open(&path, &settings).unwrap();
+    let mut entry = journal
+        .intent(super::tests::assignment(), settings.environments[0].clone())
+        .unwrap();
+    journal.executing(&mut entry).unwrap();
+    let session = crate::session::SessionId::new();
+    let lifetime = CancellationToken::new();
+    let shells = host
+        .inner
+        .process
+        .managed_shells()
+        .with_lifetime(lifetime.clone(), entry.run_id);
+    let service = shells.start_preview_for_test(session).await;
+    let worker = OwnedTaskHandle::new(1, tokio::spawn(async {}));
+    while !worker.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    host.inner.state.lock().unwrap().runs.insert(
+        entry.run_id,
+        Execution {
+            managed_scope_id: entry.run_id,
+            request: LocalRunRequest {
+                directory: settings.environments[0].directory.clone(),
+                prompt: "Retain preview".into(),
+                session_id: Some(session),
+                title: None,
+                single_agent: true,
+            },
+            session_id: Some(session),
+            control: RunControl::new(),
+            process_lifetime: lifetime,
+            processes_drained: false,
+            service: None,
+            worker: Some(worker),
+            result: None,
+            response: None,
+            shared: true,
+            resource: None,
+        },
+    );
+    let report = Report::for_assignment(
+        &entry.assignment,
+        "outcome",
+        ReportOutcome::Finished {
+            success: true,
+            result: json!({"text":"Preview is running"}),
+            resources_released: true,
+        },
+    );
+    journal
+        .outcome_with_retention(&mut entry, report, None, Some(service))
+        .unwrap();
+    journal.retention_reported(&mut entry).unwrap();
+    journal.settled(&mut entry).unwrap();
+    let catalog = json!([{"id":"environment","resource_id":"device-resource",
+        "capacity":if invalid_capacity {2} else {1}, "project_ids":["project"],
+        "enabled":true,"workspace_bound":true}]);
+    let mut responses = vec![
+        Some((200, json!([]))),
+        Some((
+            200,
+            json!([{"service_id":service.service_id.to_string(),
+            "attempt_id":entry.assignment.attempt_id,"generation":entry.assignment.generation,
+            "conversation_id":entry.assignment.job.conversation_id,
+            "environment_id":"environment","expires_at_ms":null,"stop_requested":false}]),
+        )),
+        Some((200, json!({"saved":true}))),
+        Some((200, catalog.clone())),
+    ];
+    if !invalid_capacity {
+        responses.extend([
+            Some((200, json!([]))),
+            Some((200, catalog)),
+            Some((200, json!(null))),
+        ]);
+    }
+    let (client, requests, server) = tls_script(root, responses).await;
+    let controller = Controller {
+        host: host.clone(),
+        settings,
+        client,
+        journal,
+        checkpoint_cursor: String::new(),
+        commands: None,
+        external: None,
+        local_project_id: None,
+    };
+    let task = tokio::spawn(controller.run());
+    let projection = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(projection) = host.inner.state.lock().unwrap().shared_projection.clone() {
+                break projection;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Capture the first completed control cycle before the fixture ends its transport.
+    let service_state = shells.retained_service_state(service);
+    let installed = host.installed_shared_settings().unwrap().unwrap();
+    let claims = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/v1/shared/runner/claim")
+        .count();
+    task.abort();
+    let _ = task.await;
+    server.abort();
+    let _ = server.await;
+    shells.cancel_retained_service(service.service_id);
+    host.begin_shutdown().unwrap();
+    host.wait_stopped().await;
+    assert_eq!(
+        service_state,
+        RetainedServiceState::Running,
+        "unrelated local catalog changes must not stop an acknowledged service"
+    );
+    assert!(
+        projection.connected,
+        "the assignment and service control polls succeeded"
+    );
+    assert_eq!(projection.error.is_some(), invalid_capacity);
+    assert!(!projection.retained_services.is_empty());
+    assert_eq!(claims, usize::from(!invalid_capacity));
+    assert_eq!(
+        installed.mapping(&retired.environment_id).is_ok(),
+        invalid_capacity
+    );
+    assert!(installed.mapping("environment").is_ok());
+    assert_eq!(
+        std::fs::read_to_string(retired.directory.join("human-work.txt")).unwrap(),
+        "keep me"
+    );
 }
 
 #[tokio::test]
@@ -1319,7 +1627,13 @@ async fn assignment_poll_names_only_its_mapped_environments_and_preserves_empty_
 
 #[tokio::test]
 async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_tls() {
-    for earlier_yield_committed in [true, false] {
+    for (earlier_yield_committed, rejection_status, lose_fallback_ack, legacy_fallback) in [
+        (true, 403, false, false),
+        (false, 403, false, false),
+        (false, 429, false, false),
+        (false, 429, true, false),
+        (false, 403, false, true),
+    ] {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../project_sandbox/runner-shared-tests");
         std::fs::create_dir_all(&base).unwrap();
@@ -1381,7 +1695,7 @@ async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_
         let responses = if earlier_yield_committed {
             vec![
                 None,
-                Some((403, json!({"error":"stopped"}))),
+                Some((rejection_status, json!({"error":"stopped"}))),
                 Some((
                     200,
                     serde_json::to_value(AttemptStatus {
@@ -1395,9 +1709,18 @@ async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_
                     .unwrap(),
                 )),
             ]
+        } else if lose_fallback_ack {
+            vec![
+                Some((rejection_status, json!({"error":"not admitted"}))),
+                Some((403, json!({"error":"revoked"}))),
+                None,
+                Some((403, json!({"error":"revoked"}))),
+                Some((403, json!({"error":"revoked"}))),
+                Some((200, serde_json::to_value(reported_job).unwrap())),
+            ]
         } else {
             vec![
-                Some((403, json!({"error":"revoked"}))),
+                Some((rejection_status, json!({"error":"not admitted"}))),
                 Some((403, json!({"error":"revoked"}))),
                 Some((200, serde_json::to_value(reported_job).unwrap())),
             ]
@@ -1433,6 +1756,28 @@ async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_
             },
         );
         journal.outcome(&mut entry, original.clone()).unwrap();
+        let expected_error = if legacy_fallback {
+            "Hub did not accept the child handoff".to_string()
+        } else {
+            format!("Hubへの子仕事の依頼が拒否されました（HTTP {rejection_status}）。")
+        };
+        if legacy_fallback {
+            let saved_fallback = Report::for_assignment(
+                &entry.assignment,
+                "yield_rejected",
+                ReportOutcome::Finished {
+                    success: false,
+                    result: json!({"version":1,"error":expected_error}),
+                    resources_released: true,
+                },
+            );
+            journal
+                .retain_rejected_yield_fallback(&mut entry, saved_fallback)
+                .unwrap();
+            drop(journal);
+            journal = Journal::open(&root.join("runner.sqlite3"), &settings).unwrap();
+            entry = journal.get("attempt").unwrap().unwrap();
+        }
         let mut controller = Controller {
             host: host.clone(),
             settings,
@@ -1448,6 +1793,20 @@ async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_
             assert_eq!(entry.phase, Phase::ReportPending);
             assert_eq!(entry.report, Some(original.clone()));
         }
+        let saved_fallback = if lose_fallback_ack {
+            assert!(controller.flush_report(&mut entry).await.is_err());
+            assert_eq!(entry.phase, Phase::ReportPending);
+            assert_eq!(entry.report, Some(original.clone()));
+            let saved = entry.fallback_report.clone().unwrap();
+            drop(controller.journal);
+            controller.journal =
+                Journal::open(&root.join("runner.sqlite3"), &controller.settings).unwrap();
+            entry = controller.journal.get("attempt").unwrap().unwrap();
+            assert_eq!(entry.fallback_report, Some(saved.clone()));
+            Some(saved)
+        } else {
+            entry.fallback_report.clone()
+        };
         controller.flush_report(&mut entry).await.unwrap();
         assert_eq!(entry.phase, Phase::Settled);
         assert_eq!(entry.report, Some(original));
@@ -1464,8 +1823,35 @@ async fn lost_yield_ack_then_admission_denial_reconciles_the_original_over_real_
             assert_eq!(kinds, vec!["yield_to_child", "yield_to_child"]);
             assert!(entry.fallback_report.is_none());
         } else {
-            assert_eq!(kinds, vec!["yield_to_child", "finished"]);
-            assert!(entry.fallback_report.is_some());
+            let expected_kinds = if lose_fallback_ack {
+                vec!["yield_to_child", "finished", "yield_to_child", "finished"]
+            } else {
+                vec!["yield_to_child", "finished"]
+            };
+            assert_eq!(kinds, expected_kinds);
+            let fallback = entry.fallback_report.as_ref().unwrap();
+            if let Some(saved) = saved_fallback {
+                assert_eq!(fallback, &saved);
+                assert_eq!(
+                    observed.last().unwrap().1,
+                    serde_json::to_value(saved).unwrap()
+                );
+            }
+            if lose_fallback_ack {
+                assert_eq!(observed[2].1, observed[5].1);
+            }
+            assert!(matches!(
+                &fallback.outcome,
+                ReportOutcome::Finished {
+                    success: false,
+                    result,
+                    resources_released: true,
+                } if result["error"] == expected_error
+            ));
+            assert_eq!(
+                observed.last().unwrap().1["outcome"]["result"]["error"],
+                expected_error
+            );
         }
         drop(observed);
         host.begin_shutdown().unwrap();

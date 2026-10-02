@@ -31,8 +31,20 @@ export function createRunningNavigationScenario() {
         p: await invokeDesktopCommand(cdp, "desktop_state"), ledger: state.provider.requestLedger,
       }), value => value.p.run_status_key === "running" && value.ledger.filter(row => row.route === "responses").length === 1
         && value.ledger.some(row => row.contract?.pass && row.response_phase === "held"));
+      await sink.record("running-navigation-before-refresh", { run_target: running.p.run_target, stop_target: running.p.stop_target,
+        busy: running.p.busy, run_status_key: running.p.run_status_key }, { phase: "executing", owner: OWNER });
       await trustedClick(input, cdp, action("refresh", "aside.sidebar"), sink);
-      const refreshed = await wait("Manual refresh preserves the same running owner", () => invokeDesktopCommand(cdp, "desktop_state"),
+      const observedTargets = new Set();
+      const refreshed = await wait("Manual refresh preserves the same running owner", async () => {
+        const value = await invokeDesktopCommand(cdp, "desktop_state");
+        const key = JSON.stringify({ target: value.run_target, status: value.run_status_key });
+        if (!observedTargets.has(key) && observedTargets.size < 6) {
+          observedTargets.add(key);
+          await sink.record("running-navigation-after-refresh", { run_target: value.run_target, stop_target: value.stop_target,
+            busy: value.busy, run_status_key: value.run_status_key }, { phase: "executing", owner: OWNER });
+        }
+        return value;
+      },
         value => value.run_status_key === "running" && JSON.stringify(value.run_target) === JSON.stringify(running.p.run_target));
       const rowIndex = refreshed.session_rows.findIndex(row => row.loaded_status === "active");
       if (rowIndex < 0) throw fail("No active session row for the running fixture", refreshed.session_rows);

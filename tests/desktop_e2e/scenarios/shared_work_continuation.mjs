@@ -213,6 +213,17 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
         const firstJobId = first.detail.id, conversationId = first.detail.conversation_id;
         await wait("First request and result appear in the same ordinary chat", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
           text => text?.includes("desktop-conversation-start") && text.includes("最初の依頼をこのプロジェクトで実行しました。"));
+        await click(sharedActionTarget("new-conversation"));
+        await wait("New chat clears the selected shared conversation", shared,
+          p => p.selected_conversation_id === null && p.selected_job_id === null && p.detail === null);
+        await wait("The persisted conversation is present in the sidebar", shared,
+          p => p.conversations.some(row => row.id === conversationId && row.latest_job_id === firstJobId));
+        await click({ selector: `.sidebar button[data-action="shared-select-conversation"][data-value=${JSON.stringify(conversationId)}]`,
+          identity: { tag: "BUTTON", action: "shared-select-conversation" } });
+        await wait("Sidebar selection restores the exact conversation and completed root", shared,
+          p => p.selected_conversation_id === conversationId && p.selected_job_id === firstJobId
+            && p.detail?.id === firstJobId && p.detail.state === "succeeded" && p.conversation_history?.conversation_id === conversationId);
+        await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-sidebar-selected", owner: OWNER });
         const followupPrompt = "desktop-conversation-followup: 同じ会話で続けてください。";
         await fill(byId("shared-followup", "TEXTAREA"), followupPrompt);
         await click(sharedActionTarget("continue"));

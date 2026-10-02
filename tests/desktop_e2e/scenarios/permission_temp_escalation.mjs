@@ -618,25 +618,62 @@ function terminalSettled(surface) {
     && surface?.visible_modal_backdrop_count === 0;
 }
 
-function exactTwoShellLifecycleHistory(projection, completedSummary) {
+function exactRestrictedRetryHistory(projection, completedSummary) {
   const body = completedSummary?.body ?? "";
-  const lifecycleRows = body.match(
-    /^- \[(?:待機|実行中|完了|拒否|キャンセル|失敗)\] /gmu,
-  ) ?? [];
-  const pendingRows = body.match(/^- \[待機\] shell$/gmu) ?? [];
-  const completedRows = body.match(/^- \[完了\] /gmu) ?? [];
-  const nonSuccessRows = body.match(/^- \[(?:実行中|拒否|キャンセル|失敗)\] /gmu) ?? [];
-  const toolStatusText = projection?.tool_status_text ?? "";
+  const lifecycle = [...body.matchAll(
+    /^- \[(待機|実行中|完了|拒否|キャンセル|失敗)\] /gmu,
+  )].map(match => match[1]);
+  const errors = rowsOfKind(projection, "error");
+  const output = errors[0]?.body ?? "";
+  // Completed + success=false is durable tool evidence, but its canonical
+  // history presentation is Failed and includes the shell error row. Live
+  // detail counters are a separate projection, not this history's authority.
   return body.includes("- コマンド/ツール: 4件")
-    && lifecycleRows.length === 4
-    && pendingRows.length === 2
-    && completedRows.length === 2
-    && nonSuccessRows.length === 0
-    && (toolStatusText.match(/\[完了\]/gu) ?? []).length === 2
-    && !/\[(?:待機|実行中|拒否|キャンセル|失敗)\]/u.test(toolStatusText)
-    && (projection?.progress_text ?? "").includes(
-      "ツール: 2件開始 / 2件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
-    );
+    && isDeepStrictEqual(lifecycle, ["待機", "失敗", "待機", "完了"])
+    && (body.match(/^- \[待機\] shell$/gmu) ?? []).length === 2
+    && errors.length === 1
+    && errors[0].title === "エラー - Tool shell"
+    && output.split(/\r?\n/u).includes(`Command: ${PERMISSION_TEMP_ESCALATION_COMMAND}`)
+    && output.split(/\r?\n/u).includes("Exit code: 1")
+    && /^.*permissionerror: \[winerror 5\].*moyai-sandbox-effect-.*$/imu.test(output);
+}
+
+export async function observePermissionTempTerminalDetail(terminal, sample, {
+  observe = waitForObservation,
+} = {}) {
+  const snapshot = (surface) => ({
+    run_target: surface?.projection?.run_target ?? null,
+    run_status_key: surface?.projection?.run_status_key ?? null,
+    busy: surface?.projection?.busy ?? null,
+    tool_status_text: surface?.projection?.tool_status_text ?? null,
+    progress_text: surface?.projection?.progress_text ?? null,
+    visible_tool_detail: surface?.visible_tool_detail ?? null,
+  });
+  const initial = snapshot(terminal);
+  let last = initial;
+  const active = text => typeof text === "string" && /\[(?:実行中|待機)\]/u.test(text);
+  const sameOwner = value => initial.run_target !== null
+    && isDeepStrictEqual(value.run_target, initial.run_target);
+  let result, status;
+  try {
+    result = await observe({
+      label: "TEMP terminal live detail convergence (diagnostic only)",
+      timeoutMs: 3000, pollMs: 100, retrySampleErrors: false,
+      sample: async () => { last = snapshot(await sample()); return last; },
+      accept: value => !sameOwner(value) || (typeof value.tool_status_text === "string"
+        && !active(value.tool_status_text)
+        && value.visible_tool_detail !== null && !active(value.visible_tool_detail.text)),
+    });
+    status = sameOwner(last) ? "converged" : "owner_changed";
+  } catch (error) {
+    status = error?.code === "observation-timeout" ? "not_converged" : "observation_error";
+    result = { attempts: error?.evidence?.attempts ?? null,
+      elapsed_ms: error?.evidence?.elapsed_ms ?? null, error: errorObservation(error) };
+  }
+  return { diagnostic_only: true, timeout_ms: 3000, status, initial, last,
+    same_owner: sameOwner(last), typed_pending: active(last.tool_status_text),
+    visible_pending: last.visible_tool_detail === null ? null : active(last.visible_tool_detail.text),
+    attempts: result.attempts, elapsed_ms: result.elapsed_ms, error: result.error ?? null };
 }
 
 export function permissionTempEscalationTerminalFailures(sample) {
@@ -670,10 +707,10 @@ export function permissionTempEscalationTerminalFailures(sample) {
   if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_RESPONSE])) {
     failures.push("terminal-assistant-response-mismatch");
   }
-  if (errors.length !== 0 || running.length !== 0 || completed.length !== 1) {
+  if (errors.length !== 1 || running.length !== 0 || completed.length !== 1) {
     failures.push("terminal-history-cardinality-mismatch");
   }
-  if (completed.length === 1 && !exactTwoShellLifecycleHistory(projection, completed[0])) {
+  if (completed.length === 1 && !exactRestrictedRetryHistory(projection, completed[0])) {
     failures.push("terminal-tool-history-mismatch");
   }
   if (surface?.users?.length !== 1
@@ -1524,10 +1561,10 @@ export function permissionTempEscalationLiveTerminalFailures(surface) {
   if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_LIVE_RESPONSE])) {
     failures.push("live-terminal-assistant-response-mismatch");
   }
-  if (errors.length !== 0 || running.length !== 0 || completed.length !== 1) {
+  if (errors.length !== 1 || running.length !== 0 || completed.length !== 1) {
     failures.push("live-terminal-history-cardinality-mismatch");
   }
-  if (completed.length === 1 && !exactTwoShellLifecycleHistory(projection, completed[0])) {
+  if (completed.length === 1 && !exactRestrictedRetryHistory(projection, completed[0])) {
     failures.push("live-terminal-tool-history-mismatch");
   }
   if (surface?.users?.length !== 1
@@ -2038,6 +2075,21 @@ export function createPermissionTempEscalationScenario() {
           "the elevated pytest retry changed the fixture or created a workspace TEMP workaround",
           { failures: finalWorkspaceFailures, baseline: state.workspaceBaseline, observed: finalWorkspace },
         );
+        const detailObservation = await observePermissionTempTerminalDetail(terminal.surface, async () => {
+          const surface = await observeProviderTurnSurface(cdp);
+          const visible_tool_detail = await cdp.evaluate(`(() => {
+            const nodes = Array.from(document.querySelectorAll('.output-activity-section .output-activity-group'))
+              .filter(node => node.querySelector('h4')?.textContent.trim() === 'ツール');
+            const visible = nodes.filter(node => {
+              const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+                && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+            });
+            return { present_count: nodes.length, visible_count: visible.length,
+              text: visible.map(node => node.querySelector('pre')?.innerText ?? '').join(String.fromCharCode(10)) };
+          })()`);
+          return { ...surface, visible_tool_detail };
+        });
         const commandLifetime = assertExactDesktopCommandSequence(
           await commands.snapshot(submit.commandStart),
           { afterSequence: submit.commandStart, expected: [submit.expected] },
@@ -2049,6 +2101,7 @@ export function createPermissionTempEscalationScenario() {
           held,
           provider_release: release,
           terminal,
+          terminal_detail_observation: detailObservation,
           canonical_persistence: state.persistenceEvidence,
           workspace: finalWorkspace,
           provider_ledger: state.acceptedLedger,

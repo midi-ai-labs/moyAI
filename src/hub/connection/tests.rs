@@ -1555,6 +1555,101 @@ async fn heartbeat_reports_current_main_and_side_owners_and_drops_cancelled_or_f
 }
 
 #[tokio::test]
+async fn runtime_envelope_uses_only_selectable_models() {
+    let preferred_prompt = "Use the preferred model's instructions.";
+    let fallback_prompt = "Fallback instructions. ".repeat(200).trim_end().to_string();
+    for (wait_policy, required, expected_tools, expected_prompt, allocated) in [
+        (
+            HubWaitPolicy::WaitForPreferred,
+            "chat",
+            true,
+            preferred_prompt,
+            "fast",
+        ),
+        (
+            HubWaitPolicy::AllowSelectedFallback,
+            "tools",
+            true,
+            preferred_prompt,
+            "fast",
+        ),
+        (
+            HubWaitPolicy::AllowSelectedFallback,
+            "chat",
+            false,
+            fallback_prompt.as_str(),
+            "deep",
+        ),
+    ] {
+        let server = Server::start(60_000).await;
+        *server.state.catalog_override.lock().unwrap() = json!({"models":[
+            {"id":"fast","label":"Fast","capabilities":["chat","tools","vision"],"system_prompt":preferred_prompt},
+            {"id":"deep","label":"Deep","capabilities":["chat"],"system_prompt":fallback_prompt},
+            {"id":"unselected","label":"Other","capabilities":["chat"],"system_prompt":"x".repeat(16000)}
+        ]});
+        let temp = tempfile::tempdir().unwrap();
+        let service = HubConnection::new(store(&temp));
+        let connected = connect_service(&service, &server).await;
+        let mut chosen = selection("fast");
+        chosen.allowed_model_ids.insert("deep".into());
+        chosen.required_capabilities = [required.to_string()].into();
+        chosen.wait_policy = wait_policy;
+        let reviewed = service
+            .save_review(
+                HubReviewContext::Main,
+                chosen,
+                connected.hub_id.unwrap(),
+                connected.catalog.unwrap().revision,
+                connected.settings_revision,
+                connected.connection_generation,
+            )
+            .await
+            .unwrap();
+        enable(&service, reviewed, HubReviewContext::Main).await;
+        let route = service
+            .begin_turn(HubReviewContext::Main, CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let runtime = route.runtime_config(&crate::config::ResolvedConfig::default());
+        let expected_reservation = crate::context::context_window::estimate_text_tokens(
+            &crate::system_prompt::hub_model_system_prompt_section(expected_prompt),
+        );
+        assert_eq!(
+            (
+                runtime.model.supports_tools,
+                runtime.model.supports_images,
+                route.model_system_prompt_reservation()
+            ),
+            (expected_tools, expected_tools, expected_reservation),
+            "unreachable models must not alter the advertised envelope or its budget"
+        );
+        *server.state.prepare_response.lock().unwrap() = grant(&server, allocated);
+        let mut request = route_request();
+        let baseline = crate::context::ContextWindowTokenStatus::for_request(&request, 0)
+            .active_context_tokens;
+        request.model.context_window = baseline + expected_reservation as u32 + 1;
+        let mut output = Output::default();
+        route
+            .client()
+            .stream_chat(request, CancellationToken::new(), &mut output)
+            .await
+            .expect("the reachable model prompt fits the request budget");
+        assert_eq!(output.prepared.len(), 1);
+        assert_eq!(output.prepared[0].model.name, allocated);
+        assert_eq!(
+            output.prepared[0]
+                .system_prompt
+                .matches("## Hub model system prompt")
+                .count(),
+            1
+        );
+        assert!(output.prepared[0].system_prompt.ends_with(expected_prompt));
+        route.finish().await;
+        service.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn actual_model_prompt_is_reviewed_reserved_and_composed_once_for_main_child_and_side() {
     let server = Server::start(60_000).await;
     *server.state.catalog_override.lock().unwrap() = json!({"models":[

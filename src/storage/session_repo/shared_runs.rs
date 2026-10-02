@@ -9,6 +9,36 @@ fn invalid(message: &str) -> StorageError {
 }
 
 impl SqliteSessionRepository {
+    pub(crate) fn shared_turn_start_time(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<Option<crate::context::current_time::CurrentTimeSnapshot>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items
+                 WHERE session_id=?1 AND scope_kind='turn' AND turn_id=?2
+                   AND json_extract(payload_json,'$.kind')='world_state'
+                 ORDER BY sequence_no ASC LIMIT 1",
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Older snapshots may omit the clock; retain the existing now() fallback.
+        Ok(payload
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<HistoryItemPayload>(raw).ok())
+            .and_then(|payload| match payload {
+                HistoryItemPayload::WorldState { snapshot, .. } => snapshot
+                    .sections
+                    .get("current_time")
+                    .and_then(|section| section.get("snapshot"))
+                    .and_then(|clock| serde_json::from_value(clock.clone()).ok()),
+                _ => None,
+            }))
+    }
+
     /// Reconcile a prepared remote Stop against the local exact UserStop that
     /// won the admission CAS. The request row may have been removed after the
     /// turn terminalized, so the canonical terminal is also authoritative.
