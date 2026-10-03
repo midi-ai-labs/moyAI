@@ -45,13 +45,20 @@ impl StepContext {
     }
 
     pub fn refresh_world_state(&mut self, workspace: &Workspace) -> Result<(), WorkspaceError> {
-        self.refresh_world_state_with_project(workspace, None)
+        let access_mode = self
+            .turn
+            .resolved_config()
+            .runtime_config()
+            .permissions
+            .access_mode;
+        self.refresh_world_state_with_project(workspace, None, access_mode)
     }
 
     pub(crate) fn refresh_world_state_with_project(
         &mut self,
         workspace: &Workspace,
         shared: Option<(&crate::context::world_state::SharedProjectContext, &str)>,
+        access_mode: crate::config::AccessMode,
     ) -> Result<(), WorkspaceError> {
         let config = self.turn.resolved_config().runtime_config();
         self.world_state = WorldState::build_at_with_project(
@@ -59,6 +66,7 @@ impl StepContext {
             config,
             self.turn.current_time.clone(),
             shared,
+            access_mode,
         )?;
         Ok(())
     }
@@ -166,6 +174,32 @@ mod tests {
         assert!(
             !step.world_state.rendered.contains(">read, write<"),
             "diagnostic tool names must not leak into model-visible world state"
+        );
+
+        step.refresh_world_state_with_project(
+            &workspace,
+            None,
+            crate::config::AccessMode::FullAccess,
+        )
+        .expect("refresh current permission mode");
+        let environment = &step.world_state.snapshot.sections["environment"];
+        assert_eq!(environment["access_mode"], "full_access");
+        assert_eq!(
+            environment["process_execution_policy"]["default_profile"],
+            "unrestricted"
+        );
+        assert_eq!(
+            step.turn
+                .resolved_config()
+                .runtime_config()
+                .permissions
+                .access_mode,
+            crate::config::AccessMode::Default,
+            "current permission mode must not rewrite admitted turn config"
+        );
+        assert_eq!(
+            step.world_state.snapshot.sections.get("current_time"),
+            Some(&expected_time)
         );
     }
 }

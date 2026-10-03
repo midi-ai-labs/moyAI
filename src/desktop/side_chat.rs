@@ -603,6 +603,8 @@ pub(crate) async fn execute_admitted_canonical_side_chat(
             model_request_count,
         } => (outcome, None, token_usage, model_request_count),
     };
+    let mut cumulative_token_usage = crate::session::CumulativeTokenUsage::default();
+    cumulative_token_usage.record_response(token_usage.as_ref());
     let terminal = DurableTurnTerminal {
         outcome: outcome.clone(),
         final_response_id,
@@ -613,6 +615,7 @@ pub(crate) async fn execute_admitted_canonical_side_chat(
             model_request_count,
             elapsed_ms: Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
             token_usage,
+            cumulative_token_usage: Some(cumulative_token_usage),
             config: Some(RunConfigSnapshot {
                 model: profile.hub_route.as_ref().map_or(
                     profile.model.clone(),
@@ -2465,6 +2468,13 @@ mod tests {
             TurnTerminalOutcome::Failed { error } if error.contains(&missing_env)
         ));
         assert_eq!(terminal_events[0].metrics.model_request_count, 0);
+        let cumulative = terminal_events[0]
+            .metrics
+            .cumulative_token_usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(cumulative.reported_request_count, 0);
+        assert_eq!(cumulative.total_tokens, 0);
     }
 
     #[tokio::test]
@@ -2508,5 +2518,12 @@ mod tests {
             }
         ));
         assert_eq!(terminal_events[0].metrics.model_request_count, 0);
+        let cumulative = terminal_events[0]
+            .metrics
+            .cumulative_token_usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(cumulative.reported_request_count, 0);
+        assert_eq!(cumulative.total_tokens, 0);
     }
 }

@@ -487,6 +487,7 @@ impl AgentLoop {
         let mut tool_calls_by_name = progress.tool_calls_by_name;
         let mut failed_tool_calls_by_name = progress.failed_tool_calls_by_name;
         let mut latest_usage: Option<TokenUsage> = progress.latest_usage;
+        let mut cumulative_token_usage = progress.cumulative_token_usage.unwrap_or_default();
         let goal_snapshot = request.turn.goal().cloned();
         let active_goal_id_for_turn = goal_snapshot
             .as_ref()
@@ -513,6 +514,7 @@ impl AgentLoop {
                             &request,
                             last_model_response_id,
                             latest_usage.clone(),
+                            &cumulative_token_usage,
                             tool_call_count,
                             failed_tool_count,
                             change_count,
@@ -562,11 +564,18 @@ impl AgentLoop {
                 )?;
                 let tool_plan =
                     crate::tool::spec_plan::ToolSpecPlan::build(&step, &step_registry);
+                let access_mode = crate::tool::context::current_permission_access_mode(
+                    &self.store,
+                    request.session.session.id,
+                    request.agent_context.as_ref(),
+                )
+                .await?;
                 step.refresh_world_state_with_project(
                     &request.session.workspace,
                     self.shared_run.as_ref().and_then(|shared| {
                         shared.project_context.as_ref().map(|project| (project, shared.environment_id.as_str()))
                     }),
+                    access_mode,
                 )?;
                 let supports_images = request
                     .turn
@@ -646,6 +655,7 @@ impl AgentLoop {
                             pre_turn_item_id,
                             &mut model_request_count,
                             &mut latest_usage,
+                            &mut cumulative_token_usage,
                             sink,
                         )
                         .await
@@ -772,6 +782,7 @@ impl AgentLoop {
                             &request,
                             last_model_response_id,
                             latest_usage.clone(),
+                            &cumulative_token_usage,
                             tool_call_count,
                             failed_tool_count,
                             change_count,
@@ -784,6 +795,10 @@ impl AgentLoop {
                         )
                         .await.map(shared::AgentRunOutcome::Completed);
                 };
+                match &response_result {
+                    Ok(response) => cumulative_token_usage.record_response(response.usage.as_ref()),
+                    Err(error) => cumulative_token_usage.record_response(error.token_usage()),
+                }
                 ensure_admission_active(&self.store, &request).await?;
                 let response = match response_result {
                     Ok(response) => response,
@@ -822,6 +837,7 @@ impl AgentLoop {
                             &request,
                             last_model_response_id,
                             latest_usage.clone(),
+                            &cumulative_token_usage,
                             tool_call_count,
                             failed_tool_count,
                             change_count,
@@ -840,6 +856,7 @@ impl AgentLoop {
                             &request,
                             last_model_response_id,
                             latest_usage.clone(),
+                            &cumulative_token_usage,
                             tool_call_count,
                             failed_tool_count,
                             change_count,
@@ -978,6 +995,7 @@ impl AgentLoop {
                             started_at,
                             model_request_count,
                             latest_usage.clone(),
+                            &cumulative_token_usage,
                             &tool_calls_by_name,
                             &failed_tool_calls_by_name,
                         ),
@@ -992,6 +1010,7 @@ impl AgentLoop {
                                 &request,
                                 last_model_response_id,
                                 latest_usage.clone(),
+                                &cumulative_token_usage,
                                 tool_call_count,
                                 failed_tool_count,
                                 change_count,
@@ -1129,6 +1148,7 @@ impl AgentLoop {
                                 tool_calls_by_name: tool_calls_by_name.clone(),
                                 failed_tool_calls_by_name: failed_tool_calls_by_name.clone(),
                                 latest_usage: latest_usage.clone(),
+                                cumulative_token_usage: Some(cumulative_token_usage.clone()),
                             },
                         }));
                     }
@@ -1141,6 +1161,7 @@ impl AgentLoop {
                                 &request,
                                 last_model_response_id,
                                 latest_usage.clone(),
+                                &cumulative_token_usage,
                                 tool_call_count,
                                 failed_tool_count,
                                 change_count,
@@ -1172,6 +1193,7 @@ impl AgentLoop {
                             &collector.text,
                             &prior_guardian_tool_results,
                             &mut model_request_count,
+                            &mut cumulative_token_usage,
                             prompt,
                             sink,
                         )
@@ -1210,6 +1232,7 @@ impl AgentLoop {
                                     &request,
                                     last_model_response_id,
                                     latest_usage.clone(),
+                                    &cumulative_token_usage,
                                     tool_call_count,
                                     failed_tool_count,
                                     change_count,
@@ -1248,6 +1271,7 @@ impl AgentLoop {
                             &request,
                             last_model_response_id,
                             latest_usage.clone(),
+                            &cumulative_token_usage,
                             tool_call_count,
                             failed_tool_count,
                             change_count,
@@ -1285,6 +1309,7 @@ impl AgentLoop {
                                 &request,
                                 last_model_response_id,
                                 latest_usage.clone(),
+                                &cumulative_token_usage,
                                 tool_call_count,
                                 failed_tool_count,
                                 change_count,
@@ -1315,6 +1340,7 @@ impl AgentLoop {
                                 &request,
                                 last_model_response_id,
                                 latest_usage.clone(),
+                                &cumulative_token_usage,
                                 tool_call_count,
                                 failed_tool_count,
                                 change_count,
@@ -1344,6 +1370,7 @@ impl AgentLoop {
                         started_at,
                         model_request_count,
                         latest_usage.clone(),
+                        &cumulative_token_usage,
                         &tool_calls_by_name,
                         &failed_tool_calls_by_name,
                     ),
@@ -1505,6 +1532,7 @@ impl AgentLoop {
         excluded_item_id: Option<HistoryItemId>,
         model_request_count: &mut usize,
         latest_usage: &mut Option<TokenUsage>,
+        cumulative_token_usage: &mut crate::session::CumulativeTokenUsage,
         sink: &mut dyn RunEventSink,
     ) -> Result<bool, AgentError> {
         let excluded_item_ids = excluded_item_id.into_iter().collect::<HashSet<_>>();
@@ -1555,6 +1583,7 @@ impl AgentLoop {
                     &compaction_source_template,
                     model_request_count,
                     latest_usage,
+                    cumulative_token_usage,
                     sink,
                 )
                 .await?
@@ -1934,6 +1963,7 @@ impl AgentLoop {
         request_template: &ChatRequest,
         model_request_count: &mut usize,
         latest_usage: &mut Option<TokenUsage>,
+        cumulative_token_usage: &mut crate::session::CumulativeTokenUsage,
         sink: &mut dyn RunEventSink,
     ) -> Result<CompactionSummaryOutcome, AgentError> {
         let compaction_request =
@@ -1946,6 +1976,7 @@ impl AgentLoop {
                 compaction_request,
                 model_request_count,
                 latest_usage,
+                cumulative_token_usage,
                 sink,
             )
             .await
@@ -1966,6 +1997,7 @@ impl AgentLoop {
         mut compaction_request: ChatRequest,
         model_request_count: &mut usize,
         latest_usage: &mut Option<TokenUsage>,
+        cumulative_token_usage: &mut crate::session::CumulativeTokenUsage,
         sink: &mut dyn RunEventSink,
     ) -> Result<CompactionSummaryOutcome, AgentError> {
         if compaction_request.pending_system_prompt_tokens.is_none() {
@@ -2031,6 +2063,7 @@ impl AgentLoop {
         {
             Ok(response) => response,
             Err(error) => {
+                cumulative_token_usage.record_response(error.token_usage());
                 if let Some(usage) = error.token_usage() {
                     *latest_usage = Some(usage.clone());
                     if let Some(goal) = request.turn.goal() {
@@ -2048,6 +2081,7 @@ impl AgentLoop {
             }
         };
         *latest_usage = response.usage.clone();
+        cumulative_token_usage.record_response(response.usage.as_ref());
         let collector = collector.into_inner();
         if let Some(goal) = request.turn.goal() {
             self.store
@@ -2110,6 +2144,7 @@ impl AgentLoop {
         committed_assistant_text: &str,
         prior_committed_tool_results: &[PermissionGuardianPriorToolResult],
         model_request_count: &mut usize,
+        cumulative_token_usage: &mut crate::session::CumulativeTokenUsage,
         prompt: &mut dyn ConfirmationPrompt,
         sink: &mut dyn RunEventSink,
     ) -> Result<ToolDispatchOutcome, AgentError> {
@@ -2167,6 +2202,7 @@ impl AgentLoop {
             committed_tool_request: &call,
             prior_committed_tool_results,
             model_request_count,
+            cumulative_token_usage,
             sink,
             pending_retry_lease: None,
             review_retry_lease: None,
@@ -2591,6 +2627,7 @@ impl AgentLoop {
         request: &AgentRunRequest,
         _final_response_id: Option<ModelResponseId>,
         usage: Option<TokenUsage>,
+        cumulative_token_usage: &crate::session::CumulativeTokenUsage,
         tool_call_count: usize,
         failed_tool_count: usize,
         change_count: usize,
@@ -2615,6 +2652,7 @@ impl AgentLoop {
                         started_at,
                         model_request_count,
                         usage,
+                        cumulative_token_usage,
                         &tool_calls_by_name,
                         &failed_tool_calls_by_name,
                     ),
@@ -2650,6 +2688,7 @@ impl AgentLoop {
                         started_at,
                         model_request_count,
                         usage,
+                        cumulative_token_usage,
                         &tool_calls_by_name,
                         &failed_tool_calls_by_name,
                     ),
@@ -3222,6 +3261,7 @@ struct AgentPermissionGuardian<'a> {
     committed_tool_request: &'a ModelToolCall,
     prior_committed_tool_results: &'a [PermissionGuardianPriorToolResult],
     model_request_count: &'a mut usize,
+    cumulative_token_usage: &'a mut crate::session::CumulativeTokenUsage,
     sink: &'a mut dyn RunEventSink,
     pending_retry_lease: Option<crate::storage::PermissionReviewLease>,
     review_retry_lease: Option<crate::storage::PermissionReviewLease>,
@@ -3435,6 +3475,8 @@ impl AgentPermissionGuardian<'_> {
         };
         let response = match response_result {
             Ok(response) => {
+                self.cumulative_token_usage
+                    .record_response(response.usage.as_ref());
                 if response.finish_reason == FinishReason::Cancelled {
                     return Err(PermissionGuardianError::Cancelled);
                 }
@@ -3448,6 +3490,8 @@ impl AgentPermissionGuardian<'_> {
                 response
             }
             Err(error) => {
+                self.cumulative_token_usage
+                    .record_response(error.token_usage());
                 account_permission_guardian_goal_usage(
                     &guardian_store,
                     guardian_session_id,
@@ -4109,6 +4153,7 @@ fn run_metrics(
     started_at: Instant,
     model_request_count: usize,
     token_usage: Option<TokenUsage>,
+    cumulative_token_usage: &crate::session::CumulativeTokenUsage,
     tool_calls_by_name: &BTreeMap<String, usize>,
     failed_tool_calls_by_name: &BTreeMap<String, usize>,
 ) -> RunMetrics {
@@ -4116,6 +4161,7 @@ fn run_metrics(
         model_request_count,
         elapsed_ms: Some(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
         token_usage,
+        cumulative_token_usage: Some(cumulative_token_usage.clone()),
         tool_calls_by_name: tool_calls_by_name.clone(),
         failed_tool_calls_by_name: failed_tool_calls_by_name.clone(),
         config: Some(RunConfigSnapshot {
@@ -5500,7 +5546,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ScriptedOutcome::Error(error) => return Err(error),
             };
             let scripted_usage = response.events.iter().find_map(|event| match event {
-                LlmEvent::Finished { usage, .. } => usage.clone(),
+                LlmEvent::Finished { usage, .. } => Some(usage.clone()),
                 _ => None,
             });
             let transport_error_usage = if response.finish_reason == FinishReason::Error {
@@ -5525,7 +5571,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             }
             Ok(LlmResponseSummary {
                 finish_reason: response.finish_reason,
-                usage: scripted_usage.or(Some(TokenUsage {
+                usage: scripted_usage.unwrap_or(Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
@@ -7437,6 +7483,16 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .expect("canonical failure terminal");
         assert_eq!(terminal.final_response_id, None);
         assert_eq!(terminal.metrics.token_usage, Some(second_usage));
+        let cumulative = terminal.metrics.cumulative_token_usage.unwrap();
+        assert_eq!(terminal.metrics.model_request_count, 4);
+        assert_eq!(cumulative.reported_request_count, 4);
+        assert_eq!(cumulative.reasoning_reported_request_count, 2);
+        assert_eq!(cumulative.reasoning_tokens, Some(2_200));
+        assert_eq!(
+            cumulative.total_tokens,
+            15 + u64::from(budget.hard_continuation_total_tokens)
+                + 2 * u64::from(budget.saturated_total_tokens),
+        );
     }
 
     #[tokio::test]
@@ -8041,6 +8097,49 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         output_chars: usize,
     }
 
+    struct AccessModeSwitchTool {
+        from: AccessMode,
+        to: AccessMode,
+    }
+
+    #[async_trait(?Send)]
+    impl crate::tool::registry::Tool for AccessModeSwitchTool {
+        fn spec(&self) -> crate::tool::ToolSpec {
+            crate::tool::ToolSpec {
+                name: ToolName::Write,
+                effect: crate::tool::ToolEffectPolicy::mutation(),
+                description: "simulate a committed permission mode change during a tool step",
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _raw_arguments: Value,
+            ctx: crate::tool::context::ToolContext<'_>,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            ctx.services
+                .store
+                .session_repo()
+                .compare_and_set_root_session_access_mode(
+                    ctx.session.session.id,
+                    self.from,
+                    self.to,
+                )
+                .await?
+                .expect("matching root permission mode");
+            Ok(ToolResult {
+                title: "permission mode changed".to_string(),
+                output_text: "mode change committed".to_string(),
+                metadata: serde_json::json!({"success": true}),
+                truncated_output_path: None,
+                recorded_changes: Vec::new(),
+                change_summaries: Vec::new(),
+                _internal_file_lease: None,
+            })
+        }
+    }
+
     #[async_trait(?Send)]
     impl crate::tool::registry::Tool for LargeReadOutputTool {
         fn spec(&self) -> crate::tool::ToolSpec {
@@ -8437,6 +8536,167 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
+    async fn cumulative_usage_counts_tool_continuation_without_replacing_latest_usage() {
+        let first_usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 7,
+            total_tokens: 17,
+            reasoning_tokens: Some(3),
+        };
+        let final_usage = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 5,
+            total_tokens: 25,
+            reasoning_tokens: None,
+        };
+        let mut tool_response = scripted_write_call("cumulative_usage_write");
+        tool_response.events[1] = LlmEvent::ToolCallArgsDelta {
+            call_id: "cumulative_usage_write".to_string(),
+            delta: r#"{"path":"usage.txt","content":"written"}"#.to_string(),
+        };
+        tool_response.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(first_usage),
+        });
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let run = run_scripted(
+            config,
+            vec![
+                tool_response,
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta("done".to_string()),
+                        LlmEvent::Finished {
+                            finish_reason: FinishReason::Stop,
+                            usage: Some(final_usage.clone()),
+                        },
+                    ],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("scripted continuation");
+        let summary = run.summary.expect("completed continuation");
+        assert_eq!(summary.metrics().model_request_count, 2);
+        assert_eq!(summary.failed_tool_count(), 0);
+        assert_eq!(summary.metrics().token_usage, Some(final_usage));
+        assert_eq!(
+            serde_json::to_value(summary.metrics()).expect("metrics JSON")["cumulative_token_usage"],
+            serde_json::json!({
+                "reported_request_count": 2,
+                "reasoning_reported_request_count": 1,
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "total_tokens": 42,
+                "reasoning_tokens": 3,
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_keeps_reported_cost_when_other_responses_omit_usage() {
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 7,
+            total_tokens: 17,
+            reasoning_tokens: Some(3),
+        };
+        for (first_usage, final_usage) in [
+            (Some(usage.clone()), None),
+            (None, Some(usage.clone())),
+            (None, None),
+        ] {
+            let mut tool_response = scripted_write_call("partial_usage_write");
+            tool_response.events.push(LlmEvent::Finished {
+                finish_reason: FinishReason::ToolCall,
+                usage: first_usage.clone(),
+            });
+            let run = run_scripted(
+                ResolvedConfig::default(),
+                vec![
+                    tool_response,
+                    ScriptedResponse {
+                        events: vec![
+                            LlmEvent::TextDelta("done".to_string()),
+                            LlmEvent::Finished {
+                                finish_reason: FinishReason::Stop,
+                                usage: final_usage.clone(),
+                            },
+                        ],
+                        finish_reason: FinishReason::Stop,
+                    },
+                ],
+            )
+            .await
+            .expect("scripted omitted-usage continuation");
+            let summary = run.summary.expect("completed continuation");
+            assert_eq!(summary.metrics().token_usage, final_usage);
+            assert_eq!(summary.metrics().model_request_count, 2);
+            let cumulative = summary.metrics().cumulative_token_usage.as_ref().unwrap();
+            let reported = usize::from(first_usage.is_some() || final_usage.is_some());
+            assert_eq!(cumulative.reported_request_count, reported);
+            assert_eq!(cumulative.reasoning_reported_request_count, reported);
+            assert_eq!(cumulative.total_tokens, if reported == 0 { 0 } else { 17 });
+            assert_eq!(cumulative.reasoning_tokens, (reported != 0).then_some(3));
+        }
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_counts_provider_error_report_once() {
+        let mut tool_response = scripted_read_call("before_provider_error");
+        tool_response.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 7,
+                total_tokens: 17,
+                reasoning_tokens: Some(3),
+            }),
+        });
+        let error_usage = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 5,
+            total_tokens: 25,
+            reasoning_tokens: None,
+        };
+        let run = run_scripted(
+            ResolvedConfig::default(),
+            vec![
+                tool_response,
+                ScriptedResponse {
+                    events: vec![LlmEvent::Finished {
+                        finish_reason: FinishReason::Error,
+                        usage: Some(error_usage.clone()),
+                    }],
+                    finish_reason: FinishReason::Error,
+                },
+            ],
+        )
+        .await
+        .expect("scripted provider error");
+        assert!(run.summary.is_err());
+        let terminal = run
+            .store
+            .protocol_event_store()
+            .list_runtime_events_for_session(run.session_id)
+            .expect("runtime events")
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.msg {
+                crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(terminal),
+                _ => None,
+            })
+            .expect("failure terminal");
+        assert_eq!(terminal.metrics.token_usage, Some(error_usage));
+        assert_eq!(terminal.metrics.model_request_count, 2);
+        let cumulative = terminal.metrics.cumulative_token_usage.unwrap();
+        assert_eq!(cumulative.reported_request_count, 2);
+        assert_eq!(cumulative.total_tokens, 42);
+    }
+
+    #[tokio::test]
     async fn thin_loop_runs_scripted_provider_tool_turn() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::FullAccess;
@@ -8633,6 +8893,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(summary.status(), SessionStatus::Completed);
         assert_eq!(summary.metrics().model_request_count, 3);
         assert_eq!(run.confirmations.len(), 0);
+        let cumulative = summary.metrics().cumulative_token_usage.as_ref().unwrap();
+        assert_eq!(cumulative.reported_request_count, 3);
+        assert_eq!(cumulative.total_tokens, 45);
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
@@ -9870,6 +10133,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
             assert_eq!(summary.metrics().model_request_count, 5, "{label}");
             assert_eq!(run.confirmations.len(), 1, "{label}");
+            let cumulative = summary.metrics().cumulative_token_usage.as_ref().unwrap();
+            assert_eq!(cumulative.reported_request_count, 5, "{label}");
+            assert_eq!(cumulative.total_tokens, 75, "{label}");
             let details = run.confirmations[0].details.join("\n");
             assert!(
                 details.contains("echo first >> approved.txt"),
@@ -10193,7 +10459,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         )
         .await
         .expect("run");
-        run.summary.expect("summary");
+        let summary = run.summary.expect("summary");
+        let cumulative = summary.metrics().cumulative_token_usage.as_ref().unwrap();
+        assert_eq!(summary.metrics().model_request_count, 2);
+        assert_eq!(cumulative.reported_request_count, 2);
+        assert_eq!(cumulative.total_tokens, 52);
 
         assert_canonical_tool_statuses(
             &run.store,
@@ -10416,6 +10686,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(summary.metrics().model_request_count, 2);
         assert_eq!(run.requests.len(), 2);
         assert_eq!(run.confirmations.len(), 1);
+        let cumulative = summary.metrics().cumulative_token_usage.as_ref().unwrap();
+        assert_eq!(cumulative.reported_request_count, 2);
+        assert_eq!(cumulative.total_tokens, 30);
         assert!(!run.root.join("denied.txt").exists());
         assert!(run.requests[1].messages.iter().any(|message| {
             matches!(
@@ -11527,6 +11800,74 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 .iter()
                 .any(|item| matches!(item.payload, HistoryItemPayload::Compaction { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn next_model_request_projects_current_permission_mode_without_rewriting_turn_config() {
+        for (from, to) in [
+            (AccessMode::Default, AccessMode::FullAccess),
+            (AccessMode::FullAccess, AccessMode::AutoReview),
+            (AccessMode::AutoReview, AccessMode::Default),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.permissions.access_mode = from;
+            let run = run_scripted_with_control_and_tool(
+                config,
+                vec![
+                    scripted_write_call("switch-mode"),
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta("done".to_string())],
+                        finish_reason: FinishReason::Stop,
+                    },
+                ],
+                RunControl::new(),
+                Arc::new(AccessModeSwitchTool { from, to }),
+            )
+            .await
+            .expect("mode switch run");
+            let environments = run
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    RunEvent::WorldStateUpdated { snapshot, .. } => {
+                        Some(&snapshot.sections["environment"])
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(run.requests.len(), 2);
+            assert_eq!(environments.len(), 2);
+            for ((request, environment), mode) in
+                run.requests.iter().zip(environments).zip([from, to])
+            {
+                assert_eq!(environment["access_mode"], mode.as_str());
+                assert_eq!(
+                    environment["process_execution_policy"]["default_profile"],
+                    if mode == AccessMode::FullAccess {
+                        "unrestricted"
+                    } else {
+                        "workspace_write"
+                    }
+                );
+                assert!(request.system_prompt.contains("<process_execution_policy>"));
+                assert!(
+                    request
+                        .system_prompt
+                        .contains(&format!("<access_mode>{}</access_mode>", mode.as_str()))
+                );
+            }
+            let summary = run.summary.expect("mode switch summary");
+            assert_eq!(
+                summary
+                    .metrics()
+                    .config
+                    .as_ref()
+                    .expect("turn config")
+                    .access_mode,
+                from,
+                "the effective permission mode must not rewrite the admitted turn config"
+            );
+        }
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ import {
 import { captureScenarioScreenshot, selectedNavigationIdentity } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 
-const OWNER = "scenario:provider.chat-tool-continuation";
+const DEFAULT_OWNER = "scenario:provider.chat-tool-continuation";
 const CONTROL_TOKENS = Object.freeze(["<|im_start|>", "<|im_end|>"]);
 const CHAT_ROLES = Object.freeze(["chat_tool_initial", "chat_continuation"]);
 const TOOL_PROGRESS = "ツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗";
@@ -89,7 +89,7 @@ function sha256Identity(value) {
   return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
-function exactRoleEvidence(row, index) {
+function exactRoleEvidence(row, index, outputMaxBytes) {
   const evidence = row?.contract?.role_evidence;
   if (index === 0) {
     return evidence?.message_count === 2
@@ -115,11 +115,11 @@ function exactRoleEvidence(row, index) {
     && evidence.tool_output_shape_matches === true
     && Number.isSafeInteger(evidence.tool_output_size_bytes)
     && evidence.tool_output_size_bytes > 0
-    && evidence.tool_output_size_bytes <= 512
+    && evidence.tool_output_size_bytes <= outputMaxBytes
     && sha256Identity(evidence.tool_output_sha256);
 }
 
-function acceptedChatRow(row, index, phase) {
+function acceptedChatRow(row, index, phase, outputMaxBytes) {
   const contract = row?.contract;
   const tools = contract?.tools;
   return row?.route === "chat_completions"
@@ -144,15 +144,15 @@ function acceptedChatRow(row, index, phase) {
     && tools.unique_tool_names === true
     && tools.current_time_present === true
     && tools.current_time_schema_matches === true
-    && exactRoleEvidence(row, index);
+    && exactRoleEvidence(row, index, outputMaxBytes);
 }
 
-export function exactChatToolContinuationLedger(ledger, phases) {
+export function exactChatToolContinuationLedger(ledger, phases, outputMaxBytes = 512) {
   return Array.isArray(ledger)
     && Array.isArray(phases)
     && phases.length === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES
     && ledger.length === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES
-    && ledger.every((row, index) => acceptedChatRow(row, index, phases[index]))
+    && ledger.every((row, index) => acceptedChatRow(row, index, phases[index], outputMaxBytes))
     && ledger[0].contract.role_evidence.system_content_sha256
       === ledger[1].contract.role_evidence.system_content_sha256
     && ledger[0].contract.role_evidence.user_content_sha256
@@ -236,7 +236,7 @@ function blockingSurfaceFailure(surface) {
     || ["failed", "cancelled", "incomplete"].includes(surface?.projection?.run_status_key);
 }
 
-function exactTurnOwner(projection, kind) {
+export function exactTurnOwner(projection, kind) {
   const expected = projection?.run_target?.expectedState;
   if (expected?.kind !== kind
     || !canonicalUlid(projection?.run_target?.sessionId)
@@ -290,7 +290,7 @@ export function chatToolContinuationHeldFailures(sample) {
   return [...new Set(failures)];
 }
 
-function terminalSettled(surface) {
+export function terminalSettled(surface) {
   const projection = surface?.projection;
   return projection?.run_status_key === "completed"
     && projection?.task_activity_state === "idle"
@@ -385,7 +385,7 @@ export function chatToolContinuationTerminalFailures(sample, heldTime = null) {
   return [...new Set(failures)];
 }
 
-async function observeChatToolContinuationSurface(cdp) {
+export async function observeChatToolContinuationSurface(cdp) {
   return cdp.evaluate(`(async () => {
     const invoke = window.__TAURI_INTERNALS__?.invoke;
     if (typeof invoke !== 'function') throw new Error('tauri-invoke-unavailable');
@@ -484,14 +484,14 @@ async function trustedClick(input, locator) {
   return { target, probe, sequence: snapshot.sequence };
 }
 
-async function trustedPromptInput(input) {
+async function trustedPromptInput(input, prompt = SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT) {
   const focus = await trustedClick(input, PROMPT);
   const start = (await input.snapshotProbe()).sequence;
-  const insertion = await input.insertText(PROMPT, SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT);
+  const insertion = await input.insertText(PROMPT, prompt);
   const probe = assertTrustedTextInsertion(await input.snapshotProbe(start), {
     afterSequence: start,
     identity: PROMPT.identity,
-    text: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT,
+    text: prompt,
   });
   return { focus, insertion, probe };
 }
@@ -513,7 +513,12 @@ async function settleResources(state, input, commands, primaryError) {
   }
 }
 
-export function createProviderChatToolContinuationScenario() {
+export function createProviderChatToolContinuationScenario({ profile = null } = {}) {
+  const OWNER = profile?.owner ?? DEFAULT_OWNER;
+  const prompt = profile?.prompt ?? SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
+  const heldFailures = profile?.heldFailures ?? chatToolContinuationHeldFailures;
+  const terminalFailures = profile?.terminalFailures ?? chatToolContinuationTerminalFailures;
+  const blockingFailure = profile?.blockingFailure ?? blockingSurfaceFailure;
   const state = {
     provider: null,
     acceptedLedger: null,
@@ -521,16 +526,16 @@ export function createProviderChatToolContinuationScenario() {
     resourceOutcome: null,
   };
   return Object.freeze({
-    id: "provider.chat-tool-continuation",
+    id: profile?.id ?? "provider.chat-tool-continuation",
     productOracle: "pass",
     manualGate: "not_required",
     databaseRequired: true,
     requestGracefulExit,
     async prepare({ context, sink, phase }) {
       state.provider = await startScriptedProvider({
-        expectedPrompt: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT,
+        expectedPrompt: prompt,
         responseBehavior: "hold_until_release",
-        script: createChatToolContinuationProviderScript(),
+        script: createChatToolContinuationProviderScript(profile?.call ? { call: profile.call(context) } : {}),
       });
       await prepareDesktopFixture({
         context,
@@ -538,12 +543,12 @@ export function createProviderChatToolContinuationScenario() {
         phase,
         owner: OWNER,
         configText: providerChatToolContinuationFixtureConfig(state.provider.baseUrl),
-        sentinelName: "E2E_PROVIDER_CHAT_TOOL_CONTINUATION.txt",
-        sentinelText: "moyAI Desktop E2E Chat tool-continuation fixture.\n",
+        sentinelName: profile?.sentinelName ?? "E2E_PROVIDER_CHAT_TOOL_CONTINUATION.txt",
+        sentinelText: profile?.sentinelText ?? "moyAI Desktop E2E Chat tool-continuation fixture.\n",
       });
       await sink.record("scripted-provider-started", state.provider.resourceObservation(), { phase, owner: OWNER });
     },
-    async execute({ context, driver: cdp, sink }) {
+    async execute({ context, driver: cdp, sink, host }) {
       const provider = state.provider;
       if (provider === null) throw new Error("scripted Chat provider was not prepared");
       await acquireInteractiveShell({ context, driver: cdp, sink }, {
@@ -567,19 +572,19 @@ export function createProviderChatToolContinuationScenario() {
       try {
         await input.installProbe();
         await commands.install();
-        const typed = await trustedPromptInput(input);
+        const typed = await trustedPromptInput(input, prompt);
         const ready = await observeChatToolContinuationSurface(cdp);
-        if (ready.prompt.value !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT) {
+        if (ready.prompt.value !== prompt) {
           throw productFailure(
             "provider-chat-tool-prompt-drift",
             "trusted text insertion did not produce the exact Chat tool prompt",
-            { expected: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT, surface: ready },
+            { expected: prompt, surface: ready },
           );
         }
         const expectedCommand = {
           command: "submit_prompt",
           args: {
-            text: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT,
+            text: prompt,
             expectedTarget: structuredClone(ready.projection.draft_target),
             expectedRunTarget: structuredClone(ready.projection.run_target),
           },
@@ -607,11 +612,11 @@ export function createProviderChatToolContinuationScenario() {
           }),
           decide: (sample) => {
             if (impossibleLedgerPrefix(sample?.ledger)
-              || blockingSurfaceFailure(sample?.surface)
+              || blockingFailure(sample?.surface)
               || controlTokenLeaks(sample?.surface).length > 0
               || sample?.surface?.assistants?.length > 0
               || rowsOfKind(sample?.surface?.projection, "assistant").length > 0) return "fail";
-            return chatToolContinuationHeldFailures(sample).length === 0 ? "pass" : "pending";
+            return heldFailures(sample).length === 0 ? "pass" : "pending";
           },
           code: "provider-chat-tool-held-contract-mismatch",
           message: "the Chat continuation did not remain held behind a clean tool-only projection",
@@ -621,6 +626,7 @@ export function createProviderChatToolContinuationScenario() {
           expected: [expectedCommand],
         });
         const heldTime = currentTimeFromToolStatus(held.value.surface.projection);
+        if (profile?.observeHeld) await profile.observeHeld({ cdp, input, sink, held: held.value });
         const heldScreenshot = await captureScenarioScreenshot({
           cdp,
           sink,
@@ -637,9 +643,9 @@ export function createProviderChatToolContinuationScenario() {
           }),
           decide: (sample) => {
             if (impossibleLedgerPrefix(sample?.ledger)
-              || blockingSurfaceFailure(sample?.surface)
+              || blockingFailure(sample?.surface)
               || controlTokenLeaks(sample?.surface).length > 0) return "fail";
-            return chatToolContinuationTerminalFailures(sample, heldTime).length === 0
+            return terminalFailures(sample, heldTime, held.value).length === 0
               ? "pass"
               : "pending";
           },
@@ -666,6 +672,7 @@ export function createProviderChatToolContinuationScenario() {
           held_command: heldCommand,
           final_command: finalCommand,
           held: {
+            projection: profile === null ? undefined : held.value.surface.projection,
             ledger: held.value.ledger,
             time: heldTime,
             projection_revision: held.value.surface.projection.projection_revision,
@@ -674,6 +681,7 @@ export function createProviderChatToolContinuationScenario() {
           },
           release,
           terminal: {
+            projection: profile === null ? undefined : terminal.value.surface.projection,
             ledger: state.acceptedLedger,
             projection_revision: terminal.value.surface.projection.projection_revision,
             selected_navigation: selectedNavigationIdentity(terminal.value.surface.projection),
@@ -685,12 +693,17 @@ export function createProviderChatToolContinuationScenario() {
           },
           provider_resource: provider.resourceObservation(),
         }, { phase: "executing", owner: OWNER });
+        if (profile?.afterTerminal) {
+          await settleResources(state, input, commands, null);
+          await profile.afterTerminal({ context, cdp, sink, host, scenario: this, provider,
+            terminal: terminal.value, waitForProductStage });
+        }
         return { acquisition: "pass", oracle: "pass", manual: "not_required" };
       } catch (error) {
         primaryError = error;
         throw error;
       } finally {
-        await settleResources(state, input, commands, primaryError);
+        if (state.resourceOutcome === null) await settleResources(state, input, commands, primaryError);
       }
     },
     async quiesce({ inputs }) {

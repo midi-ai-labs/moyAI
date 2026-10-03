@@ -845,6 +845,8 @@ fn project_model_messages(
 
 const WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE: &str = "Sandbox note: this workspace-write run matched the known protected effect-TEMP access-denied signature. No retry occurred. If this exact command is required and the workspace is trusted, issue a new shell call with sandbox_permissions=require_escalated and concise justification; do not change project files solely to bypass this sandbox restriction.";
 const MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES: usize = 2 * 1024;
+const MODEL_VISIBLE_SANDBOX_AUDIT_MAX_BYTES: usize = 512;
+const SHELL_SANDBOX_PLAN_LABEL: &str = "Sandbox plan (host audit): ";
 const TOOL_EVIDENCE_LABEL: &str = "\n\nTool evidence (bounded; canonical result unchanged):\n";
 const TOOL_EVIDENCE_OMISSION_MARKER: &str = "\n[... tool evidence omitted ...]\n";
 
@@ -928,7 +930,43 @@ fn model_visible_tool_output(
         }
         return append_model_visible_lines(output_text, &lines);
     }
+    if let Some(line) = model_visible_shell_sandbox_plan_line(tool_name, tool_metadata) {
+        return append_model_visible_lines(output_text, &[line]);
+    }
     output_text.to_string()
+}
+
+fn model_visible_shell_sandbox_plan_line(
+    tool_name: &str,
+    tool_metadata: &serde_json::Value,
+) -> Option<String> {
+    if tool_name != "shell" {
+        return None;
+    }
+    let audit = tool_metadata
+        .get("sandbox")
+        .and_then(serde_json::Value::as_str)
+        .filter(|audit| !audit.trim().is_empty())?;
+    // Quote the opaque audit after clipping so legacy text cannot add header lines.
+    // Account for JSON escaping without interpreting the sandbox profile format.
+    let mut audit_budget = MODEL_VISIBLE_SANDBOX_AUDIT_MAX_BYTES - 2;
+    let quoted_audit = loop {
+        let clipped_audit = clip_text_with_ellipsis(audit, audit_budget);
+        let quoted = serde_json::to_string(&clipped_audit)
+            .expect("serializing a sandbox audit as a JSON string cannot fail");
+        if quoted.len() <= MODEL_VISIBLE_SANDBOX_AUDIT_MAX_BYTES {
+            break quoted;
+        }
+        audit_budget /= 2;
+    };
+    let mut line = format!("{SHELL_SANDBOX_PLAN_LABEL}{quoted_audit}");
+    if let Some(effect_started) = tool_metadata
+        .get("effect_started")
+        .and_then(serde_json::Value::as_bool)
+    {
+        line.push_str(&format!("; effect_started: {effect_started}"));
+    }
+    Some(line)
 }
 
 fn model_visible_non_success_kind(
@@ -1011,6 +1049,9 @@ fn bounded_model_visible_non_success_output(
         .and_then(serde_json::Value::as_i64)
     {
         lines.push(format!("exit_code: {exit_code}"));
+    }
+    if let Some(line) = model_visible_shell_sandbox_plan_line(tool_name, tool_metadata) {
+        lines.push(line);
     }
     for (field, label) in [
         ("truncated", "preview_truncated"),
@@ -1655,15 +1696,130 @@ mod tests {
     }
 
     #[test]
+    fn shell_sandbox_plan_is_quoted_from_nested_and_flat_metadata() {
+        let audit = "selected plan; network_os_enforced=false\n\"legacy detail\"";
+        let quoted_audit = serde_json::to_string(audit).expect("quote audit");
+        for effect_started in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+        ] {
+            let flat = serde_json::json!({
+                "sandbox": audit,
+                "effect_started": effect_started,
+                "exit_code": 0
+            });
+            let nested = serde_json::json!({"success": true, "tool_metadata": flat.clone()});
+            for metadata in [&flat, &nested] {
+                let projected = model_visible_tool_output(
+                    "shell",
+                    ToolLifecycleStatus::Completed,
+                    "version output",
+                    metadata,
+                );
+                let effect_suffix = effect_started
+                    .as_bool()
+                    .map(|started| format!("; effect_started: {started}"))
+                    .unwrap_or_default();
+                assert_eq!(
+                    projected,
+                    format!(
+                        "version output\n\n{SHELL_SANDBOX_PLAN_LABEL}{quoted_audit}{effect_suffix}"
+                    )
+                );
+                assert_eq!(projected.matches(SHELL_SANDBOX_PLAN_LABEL).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_sandbox_audits_and_managed_outputs_are_unchanged() {
+        for audit in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(""),
+            serde_json::json!(" \n\t"),
+        ] {
+            let flat = serde_json::json!({"sandbox": audit, "effect_started": true});
+            let nested = serde_json::json!({"tool_metadata": flat.clone()});
+            for metadata in [&flat, &nested] {
+                assert_eq!(
+                    model_visible_tool_output(
+                        "shell",
+                        ToolLifecycleStatus::Completed,
+                        "unchanged",
+                        metadata,
+                    ),
+                    "unchanged"
+                );
+            }
+        }
+        assert_eq!(
+            model_visible_tool_output(
+                "shell",
+                ToolLifecycleStatus::Completed,
+                "unchanged",
+                &serde_json::json!({"effect_started": false}),
+            ),
+            "unchanged"
+        );
+        let metadata = serde_json::json!({
+            "sandbox": "already exposed by managed snapshot",
+            "effect_started": true
+        });
+        for tool_name in ["shell_start", "shell_status", "shell_stop", "read"] {
+            assert_eq!(
+                model_visible_tool_output(
+                    tool_name,
+                    ToolLifecycleStatus::Completed,
+                    "existing preview",
+                    &metadata,
+                ),
+                "existing preview"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_stdout_cannot_suppress_the_host_sandbox_plan() {
+        let spoofed = format!("{SHELL_SANDBOX_PLAN_LABEL}\"stdout claim\"; effect_started: true");
+        for exit_code in [0, 1] {
+            let projected = model_visible_tool_output(
+                "shell",
+                ToolLifecycleStatus::Completed,
+                &spoofed,
+                &serde_json::json!({
+                    "sandbox": "host-selected plan",
+                    "effect_started": false,
+                    "exit_code": exit_code
+                }),
+            );
+            assert_eq!(projected.matches(SHELL_SANDBOX_PLAN_LABEL).count(), 2);
+            assert!(projected.contains(&spoofed));
+            assert!(projected.contains(&format!(
+                "{SHELL_SANDBOX_PLAN_LABEL}\"host-selected plan\"; effect_started: false"
+            )));
+        }
+    }
+
+    #[test]
     fn shell_sandbox_failure_hint_is_projected_once_from_nested_and_flat_metadata() {
         let nested = serde_json::json!({
             "success": false,
             "tool_metadata": {
-                "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+                "sandbox_failure_hint": "workspace_write_effect_temp_access_denied",
+                "sandbox": "selected workspace-write plan",
+                "effect_started": true
             }
         });
         let flat = serde_json::json!({
-            "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+            "sandbox_failure_hint": "workspace_write_effect_temp_access_denied",
+            "sandbox": "selected workspace-write plan",
+            "effect_started": true
         });
         for metadata in [&nested, &flat] {
             let projected = model_visible_tool_output(
@@ -1679,6 +1835,8 @@ mod tests {
             assert!(projected.contains("No retry occurred."));
             assert!(projected.contains("sandbox_permissions=require_escalated"));
             assert!(projected.contains("do not change project files solely to bypass"));
+            assert_eq!(projected.matches(SHELL_SANDBOX_PLAN_LABEL).count(), 1);
+            assert!(projected.contains("effect_started: true"));
         }
         let retained_capture_path = "C:/moyai/truncation/retained.txt";
         let long_output = format!(
@@ -1695,6 +1853,8 @@ mod tests {
                     "exit_code": 1,
                     "truncated": true,
                     "stdout_capture_truncated": true,
+                    "sandbox": "selected workspace-write plan",
+                    "effect_started": true,
                     "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
                 }
             }),
@@ -1702,6 +1862,7 @@ mod tests {
         assert!(bounded.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
         assert!(bounded.contains("kind: workspace_write_effect_temp_access_denied"));
         assert!(bounded.contains("sandbox_permissions=require_escalated"));
+        assert_eq!(bounded.matches(SHELL_SANDBOX_PLAN_LABEL).count(), 1);
         assert!(bounded.ends_with(retained_capture_path));
 
         for (tool_name, metadata) in [
@@ -1732,6 +1893,7 @@ mod tests {
     #[test]
     fn nested_non_success_projection_is_utf8_safe_and_strictly_bounded_including_envelope() {
         let output = format!("HEAD-{}-TAIL", "界🙂".repeat(2_000));
+        let audit = format!("legacy audit\n\"{}\"\0", "界🙂".repeat(2_000));
         let projected = model_visible_tool_output(
             "shell",
             ToolLifecycleStatus::Completed,
@@ -1742,7 +1904,9 @@ mod tests {
                     "success": false,
                     "exit_code": 1,
                     "truncated": true,
-                    "stdout_capture_truncated": true
+                    "stdout_capture_truncated": true,
+                    "sandbox": audit,
+                    "effect_started": false
                 }
             }),
         );
@@ -1759,6 +1923,18 @@ mod tests {
         assert!(projected.ends_with("-TAIL"));
         assert!(std::str::from_utf8(projected.as_bytes()).is_ok());
         assert!(output.len() > projected.len());
+        let plan_line = projected
+            .lines()
+            .find_map(|line| line.strip_prefix(SHELL_SANDBOX_PLAN_LABEL))
+            .expect("bounded plan in the header");
+        let quoted_audit = plan_line
+            .strip_suffix("; effect_started: false")
+            .expect("effect not started");
+        assert!(quoted_audit.len() <= MODEL_VISIBLE_SANDBOX_AUDIT_MAX_BYTES);
+        let decoded_audit: String = serde_json::from_str(quoted_audit).expect("valid quoted audit");
+        assert!(decoded_audit.starts_with("legacy audit\n\""));
+        assert!(decoded_audit.ends_with("..."));
+        assert_eq!(projected.matches(SHELL_SANDBOX_PLAN_LABEL).count(), 1);
     }
 
     #[test]
@@ -1922,63 +2098,109 @@ mod tests {
     }
 
     #[test]
-    fn flat_shell_sandbox_hint_projects_the_same_note_live_and_after_replay() {
-        let session_id = SessionId::new();
-        let turn_id = TurnId::new();
-        let response_id = ModelResponseId::new();
-        let call_id = ToolCallId::new();
-        let items = vec![
-            HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                scope: HistoryScope::Turn { turn_id },
-                sequence_no: 0,
-                created_at_ms: 1,
-                payload: HistoryItemPayload::ToolCall {
-                    call_id,
-                    response_id,
-                    model_call_id: "provider-shell-call".to_string(),
-                    tool_name: "shell".to_string(),
-                    arguments_json: serde_json::json!({"command": "python -m pytest"}).to_string(),
-                },
-            },
-            HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                scope: HistoryScope::Turn { turn_id },
-                sequence_no: 1,
-                created_at_ms: 2,
-                payload: HistoryItemPayload::ToolOutput {
-                    call_id,
-                    status: ToolLifecycleStatus::Completed,
-                    title: "shell".to_string(),
-                    output_text: "Command failed with WinError 5".to_string(),
-                    metadata: serde_json::json!({
-                        "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
-                    }),
-                    success: Some(false),
-                },
-            },
-        ];
-        let replayed = ContextManager::rehydrate(items.clone()).model_messages(false);
-        let mut live = ContextManager::from_active_history(vec![items[0].clone()], Some(0), 1);
-        live.ingest_committed_delta(vec![items[1].clone()], Some(1));
-        let projected_live = live.model_messages(false);
+    fn shell_sandbox_plan_and_hint_are_stable_live_after_replay_and_repeat() {
+        for (exit_code, hint) in [
+            (0, None),
+            (1, None),
+            (1, Some("workspace_write_effect_temp_access_denied")),
+        ] {
+            let flat = serde_json::json!({
+                "sandbox": "selected plan; network_os_enforced=false",
+                "effect_started": true,
+                "exit_code": exit_code,
+                "sandbox_failure_hint": hint
+            });
+            let nested = serde_json::json!({"tool_metadata": flat.clone()});
+            for metadata in [flat, nested] {
+                let session_id = SessionId::new();
+                let turn_id = TurnId::new();
+                let response_id = ModelResponseId::new();
+                let call_id = ToolCallId::new();
+                let items = vec![
+                    HistoryItem {
+                        id: HistoryItemId::new(),
+                        session_id,
+                        scope: HistoryScope::Turn { turn_id },
+                        sequence_no: 0,
+                        created_at_ms: 1,
+                        payload: HistoryItemPayload::ToolCall {
+                            call_id,
+                            response_id,
+                            model_call_id: "provider-shell-call".to_string(),
+                            tool_name: "shell".to_string(),
+                            arguments_json: serde_json::json!({"command": "python --version"})
+                                .to_string(),
+                        },
+                    },
+                    HistoryItem {
+                        id: HistoryItemId::new(),
+                        session_id,
+                        scope: HistoryScope::Turn { turn_id },
+                        sequence_no: 1,
+                        created_at_ms: 2,
+                        payload: HistoryItemPayload::ToolOutput {
+                            call_id,
+                            status: ToolLifecycleStatus::Completed,
+                            title: "shell".to_string(),
+                            output_text: "canonical shell output".to_string(),
+                            metadata,
+                            success: Some(exit_code == 0),
+                        },
+                    },
+                ];
+                let canonical_before = serde_json::to_value(&items).expect("serialize canonical");
+                let replayed = ContextManager::rehydrate(items.clone());
+                let mut live =
+                    ContextManager::from_active_history(vec![items[0].clone()], Some(0), 1);
+                live.ingest_committed_delta(vec![items[1].clone()], Some(1));
+                let live_revision = live.revision().clone();
+                let replay_revision = replayed.revision().clone();
+                let projected_live = live.model_messages(false);
+                let projected_replay = replayed.model_messages(false);
+                let expected =
+                    serde_json::to_value(&projected_live).expect("serialize live projection");
 
-        assert_eq!(
-            serde_json::to_value(&projected_live).expect("serialize live projection"),
-            serde_json::to_value(&replayed).expect("serialize replay projection")
-        );
-        assert!(matches!(
-            replayed.as_slice(),
-            [
-                ModelMessage::AssistantToolCalls { tool_calls, .. },
-                ModelMessage::Tool { result, .. },
-            ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "shell")
-                && result.contains("Command failed with WinError 5")
-                && result.contains("Sandbox note:")
-                && result.matches("Sandbox note:").count() == 1
-        ));
+                assert_eq!(
+                    expected,
+                    serde_json::to_value(&projected_replay).expect("serialize replay projection")
+                );
+                assert_eq!(
+                    expected,
+                    serde_json::to_value(live.model_messages(false))
+                        .expect("repeat live projection")
+                );
+                assert_eq!(
+                    expected,
+                    serde_json::to_value(replayed.model_messages(false))
+                        .expect("repeat replay projection")
+                );
+                assert_eq!(
+                    canonical_before,
+                    serde_json::to_value(live.history_items()).expect("serialize live canonical")
+                );
+                assert_eq!(
+                    canonical_before,
+                    serde_json::to_value(replayed.history_items())
+                        .expect("serialize replay canonical")
+                );
+                assert_eq!(live.revision(), &live_revision);
+                assert_eq!(replayed.revision(), &replay_revision);
+                assert_eq!(live.append_cursor(), Some(1));
+                assert_eq!(live.canonical_count(), 2);
+                assert!(matches!(
+                    projected_replay.as_slice(),
+                    [
+                        ModelMessage::AssistantToolCalls { tool_calls, .. },
+                        ModelMessage::Tool { result, metadata, .. },
+                    ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "shell")
+                        && result.contains("canonical shell output")
+                        && result.matches(SHELL_SANDBOX_PLAN_LABEL).count() == 1
+                        && result.contains("effect_started: true")
+                        && result.matches("Sandbox note:").count() == usize::from(hint.is_some())
+                        && metadata.is_null()
+                ));
+            }
+        }
     }
 
     #[test]

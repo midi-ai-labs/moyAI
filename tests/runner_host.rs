@@ -365,7 +365,8 @@ async fn runner_stop_and_shutdown_drain_a_real_blocked_run() {
 async fn tool_provider(tool: &str, arguments: Value) -> (String, tokio::task::JoinHandle<()>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let tool = tool.to_owned();
-    let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+    // Consume the request before replying so an unread body cannot race the SSE response.
+    let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |axum::Json(_body): axum::Json<Value>| {
         let calls = calls.clone(); let tool = tool.clone(); let arguments = arguments.clone();
         async move {
             let (delta, finish) = if calls.fetch_add(1, Ordering::SeqCst) % 2 == 0 {

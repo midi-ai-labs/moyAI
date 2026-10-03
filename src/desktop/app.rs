@@ -5928,6 +5928,12 @@ mod command_projection_owner_tests {
         controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
         controller.state.begin_agent_run();
         controller.run_lifecycle.begin(17, RunControl::new());
+        controller.state.apply_run_event(&RunEvent::ToolCallFailed {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            error: "shell invocation failed before the interruption".to_string(),
+            metadata: serde_json::json!({}),
+        });
         let summary = RunSummary::from_terminal(
             session_id,
             crate::protocol::TurnId::new(),
@@ -6148,6 +6154,7 @@ mod command_projection_owner_tests {
     async fn rejoined_running_session_observes_an_exact_terminal_committed_by_another_store() {
         use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
+        use crate::storage::session_repo::{ModelResponseWrite, PendingToolCallWrite};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
@@ -6291,18 +6298,62 @@ mod command_projection_owner_tests {
         let external_sqlite =
             crate::storage::SqliteStore::open(&paths).expect("external sqlite connection");
         let external_store = crate::storage::StoreBundle::new(external_sqlite);
+        let failed_calls = [
+            crate::session::ToolCallId::new(),
+            crate::session::ToolCallId::new(),
+        ];
+        external_store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session.id,
+                admission.admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: crate::protocol::ModelResponseId::new(),
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: failed_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, id)| PendingToolCallWrite {
+                            id: *id,
+                            model_call_id: format!("external-failed-call-{index}"),
+                            tool_name: "shell".to_string(),
+                            arguments_json: serde_json::json!({"command": "python -m unittest"})
+                                .to_string(),
+                            protocol_sequence_no: None,
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("external pending calls");
+        for call in failed_calls {
+            external_store
+                .session_repo()
+                .fail_tool_call_with_protocol_bundle(
+                    session.id,
+                    admission.admission_id,
+                    call,
+                    crate::tool::ToolName::Shell,
+                    "external shell invocation failed",
+                    serde_json::json!({}),
+                    turn_id,
+                    None,
+                )
+                .await
+                .expect("external tool failure")
+                .expect("external failed call settled");
+        }
         let terminal = crate::session::DurableTurnTerminal {
             outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
                 cause: crate::protocol::TurnInterruptionCause::UserStop,
             },
             final_response_id: None,
-            tool_call_count: 7,
+            tool_call_count: 2,
             failed_tool_count: 2,
-            change_count: 3,
-            metrics: crate::session::RunMetrics {
-                model_request_count: 5,
-                ..Default::default()
-            },
+            change_count: 0,
+            metrics: Default::default(),
         };
         external_store
             .session_repo()
@@ -6340,7 +6391,8 @@ mod command_projection_owner_tests {
             .expect("duplicate live wake is harmless");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while controller.state.app_state.run_status == crate::tui::state::RunStatus::Running
+        while (controller.state.app_state.run_status == crate::tui::state::RunStatus::Running
+            || controller.state.post_run_refresh_pending())
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -6355,8 +6407,9 @@ mod command_projection_owner_tests {
             controller.state.app_state.interruption_cause,
             Some(crate::protocol::TurnInterruptionCause::UserStop)
         );
-        assert_eq!(controller.state.app_state.progress.model_requests, 5);
-        assert_eq!(controller.state.app_state.progress.tool_calls_started, 7);
+        assert!(!controller.state.post_run_refresh_pending());
+        assert_eq!(controller.state.app_state.progress.model_requests, 0);
+        assert_eq!(controller.state.app_state.progress.tool_calls_started, 2);
         assert_eq!(controller.state.app_state.progress.tool_calls_failed, 2);
         assert!(controller.session_runtime_listener.is_none());
         assert_eq!(
@@ -6435,7 +6488,7 @@ mod command_projection_owner_tests {
                 pending_turn_inputs: Vec::new(),
                 turn_elapsed_ms: Default::default(),
                 session_token_usage: Default::default(),
-                active_turn_progress: None,
+                turn_progress: None,
                 latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,

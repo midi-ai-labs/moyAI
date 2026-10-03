@@ -66,7 +66,12 @@ impl crate::llm::LlmClient for ChildThenAnswer {
         };
         Ok(LlmResponseSummary {
             finish_reason,
-            usage: None,
+            usage: Some(crate::session::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                reasoning_tokens: None,
+            }),
             response_id: None,
         })
     }
@@ -738,6 +743,14 @@ async fn shared_archive_v68_forward_migration_preserves_v67_paused_execution() {
 #[tokio::test]
 async fn shared_checkpoint_resumes_same_turn_and_consumes_child_once_after_reopen() {
     let (service, store, workspace, _runtime, llm, config, yielded) = pause().await;
+    assert_eq!(
+        yielded.checkpoint["progress"]["cumulative_token_usage"]["reported_request_count"],
+        1
+    );
+    assert_eq!(
+        yielded.checkpoint["progress"]["cumulative_token_usage"]["total_tokens"],
+        15
+    );
     let original_clock = shared_turn_clocks(&store, &yielded)[0].clone();
     assert_eq!(llm.requests.lock().unwrap().len(), 1);
     assert_eq!(
@@ -806,6 +819,13 @@ async fn shared_checkpoint_resumes_same_turn_and_consumes_child_once_after_reope
     assert_eq!(summary.status(), SessionStatus::Completed);
     assert_eq!(summary.tool_call_count(), 1);
     assert_eq!(summary.metrics().model_request_count, 2);
+    assert_eq!(
+        summary.metrics().token_usage.as_ref().unwrap().total_tokens,
+        15
+    );
+    let cumulative = summary.metrics().cumulative_token_usage.as_ref().unwrap();
+    assert_eq!(cumulative.reported_request_count, 2);
+    assert_eq!(cumulative.total_tokens, 30);
     assert_eq!(
         shared_turn_clocks(&store, &yielded),
         vec![original_clock.clone(), original_clock],
@@ -946,6 +966,9 @@ async fn shared_cancelled_checkpoint_settles_after_reopen_and_releases_local_del
     ));
     assert_eq!(terminal.tool_call_count, 1);
     assert_eq!(terminal.metrics.model_request_count, 1);
+    let cumulative = terminal.metrics.cumulative_token_usage.as_ref().unwrap();
+    assert_eq!(cumulative.reported_request_count, 1);
+    assert_eq!(cumulative.total_tokens, 15);
     assert!(
         reopened
             .session_repo()

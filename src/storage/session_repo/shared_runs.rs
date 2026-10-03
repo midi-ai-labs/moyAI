@@ -389,6 +389,7 @@ impl SqliteSessionRepository {
                 metrics: crate::session::RunMetrics {
                     model_request_count: checkpoint.progress.model_request_count,
                     token_usage: checkpoint.progress.latest_usage.clone(),
+                    cumulative_token_usage: checkpoint.progress.cumulative_token_usage.clone(),
                     tool_calls_by_name: checkpoint.progress.tool_calls_by_name.clone(),
                     failed_tool_calls_by_name: failed_by_name,
                     ..Default::default()

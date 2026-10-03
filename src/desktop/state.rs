@@ -1095,11 +1095,15 @@ impl DesktopState {
                     active_turn_expectation.latest_turn_id(),
                 );
         } else {
-            self.app_state
-                .load_turn_items_with_active_turn(&session, &turn_items, active_turn_id);
+            self.app_state.load_turn_items_with_active_turn(
+                &session,
+                &turn_items,
+                active_turn_id,
+                active_turn_expectation.latest_turn_id(),
+            );
         }
         self.app_state.active_turn_expectation = active_turn_expectation;
-        self.reconcile_current_active_turn_progress();
+        self.reconcile_current_turn_progress();
         self.status_code = self
             .app_state
             .interruption_cause
@@ -1124,6 +1128,7 @@ impl DesktopState {
         if self.merge_open_session_history(read) {
             self.apply_canonical_terminal_to_running_session(read);
             self.reconcile_current_terminal_tool_projection();
+            self.reconcile_current_turn_progress();
             return true;
         }
         let preserved = self
@@ -1153,6 +1158,7 @@ impl DesktopState {
         self.update_session_row_status(session.id, session.status);
         self.apply_canonical_terminal_to_running_session(read);
         self.reconcile_current_terminal_tool_projection();
+        self.reconcile_current_turn_progress();
         false
     }
 
@@ -1214,6 +1220,7 @@ impl DesktopState {
         let session_id = summary.session_id();
         let session_status = summary.status();
         self.app_state.apply_run_summary(summary);
+        self.reconcile_current_turn_progress();
         self.status_code = self
             .app_state
             .interruption_cause
@@ -1274,17 +1281,23 @@ impl DesktopState {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.open_session = Some(open_session);
-        self.reconcile_current_active_turn_progress();
+        self.reconcile_current_turn_progress();
         self.snapshot.replace_detail(detail);
         self.update_session_title_projection(session.id, &session.title);
         self.update_session_row_status(session.id, session.status);
     }
 
-    fn reconcile_current_active_turn_progress(&mut self) {
+    fn reconcile_current_turn_progress(&mut self) {
         if let Some(open_session) = &self.open_session
-            && let Some(progress) = open_session.active_turn_progress()
+            && let Some(progress) = open_session.turn_progress()
+            && (self.app_state.run_status == RunStatus::Running
+                || (open_session.active_turn_id().is_none()
+                    && matches!(
+                        open_session.session().status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    )))
         {
-            self.app_state.reconcile_active_turn_progress(
+            self.app_state.reconcile_turn_progress(
                 open_session.session_id(),
                 progress,
                 open_session.turn_items(),
@@ -2544,7 +2557,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
-            active_turn_progress: None,
+            turn_progress: None,
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -2902,7 +2915,7 @@ mod tests {
         assert!(
             !serde_json::to_string(&completed)
                 .unwrap()
-                .contains("active_turn_progress"),
+                .contains("turn_progress"),
             "the process-local projection does not alter stored/exported contracts"
         );
     }
@@ -3348,6 +3361,78 @@ mod tests {
             SessionStatus::Cancelled
         );
         assert!(!state.snapshot.session_rows[0].label.contains("[実行中]"));
+    }
+
+    #[test]
+    fn terminal_progress_uses_canonical_counts_when_tool_rows_are_outside_the_loaded_page() {
+        let session_id = SessionId::new();
+        let turn_id = crate::protocol::TurnId::new();
+        let session = session_record(session_id);
+        let mut read = canonical_read(
+            &session,
+            Vec::new(),
+            vec![turn_item(
+                session_id,
+                turn_id,
+                20,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            )],
+        );
+        read.turns.limit = 1;
+        read.turns.total = 21;
+        read.turns.has_more = true;
+        read.turn_progress = Some(crate::session::model::CanonicalTurnProgress {
+            turn_id,
+            model_request_count: 3,
+            tool_call_count: 4,
+            completed_tool_count: 2,
+            declined_tool_count: 1,
+            cancelled_tool_count: 0,
+            failed_tool_count: 1,
+            compaction_count: 0,
+        });
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&read);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+        let summary = crate::session::RunSummary::from_terminal(
+            session_id,
+            turn_id,
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 4,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        );
+        state.apply_run_summary(summary.clone());
+        state.load_open_session_preserving_history(&read);
+        assert_eq!(state.app_state.progress.tool_calls_completed, 2);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+        state.apply_run_summary(summary);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+
+        let mut stale = read.clone();
+        stale.session.status = SessionStatus::Running;
+        stale.turns.session.status = SessionStatus::Running;
+        stale.active_turn_id = Some(turn_id);
+        stale.turn_progress.as_mut().unwrap().failed_tool_count = 0;
+        state.load_open_session_preserving_history(&stale);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+        assert_eq!(state.app_state.run_status, RunStatus::Completed);
     }
 
     #[test]

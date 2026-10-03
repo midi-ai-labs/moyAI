@@ -500,7 +500,7 @@ pub(crate) struct CanonicalSessionStorageSnapshot {
     pub active_turn_position: Option<(TurnId, i64)>,
     pub pending_turn_inputs: Vec<crate::session::PendingTurnInputProjection>,
     pub admission_revision: u64,
-    pub active_turn_progress: Option<crate::session::model::CanonicalActiveTurnProgress>,
+    pub turn_progress: Option<crate::session::model::CanonicalTurnProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1662,11 +1662,11 @@ impl SqliteSessionRepository {
         } else {
             None
         };
-        let active_turn_progress = active_turn_position
-            .map(|(turn_id, _)| {
-                active_turn_progress_in_connection(&transaction, session_id, turn_id)
-            })
-            .transpose()?;
+        let turn_progress = active_turn_position
+            .or(protocol.latest_turn_position)
+            .map(|(turn_id, _)| turn_progress_in_connection(&transaction, session_id, turn_id))
+            .transpose()?
+            .flatten();
         transaction.commit()?;
         Ok(CanonicalSessionStorageSnapshot {
             session,
@@ -1674,7 +1674,7 @@ impl SqliteSessionRepository {
             active_turn_position,
             pending_turn_inputs,
             admission_revision,
-            active_turn_progress,
+            turn_progress,
         })
     }
 
@@ -7474,19 +7474,20 @@ struct CanonicalTurnSnapshot {
     unsettled_tool_calls: Vec<(ToolCallId, crate::tool::ToolName)>,
 }
 
-fn active_turn_progress_in_connection(
+fn turn_progress_in_connection(
     connection: &Connection,
     session_id: SessionId,
     turn_id: TurnId,
-) -> Result<crate::session::model::CanonicalActiveTurnProgress, StorageError> {
+) -> Result<Option<crate::session::model::CanonicalTurnProgress>, StorageError> {
     // Aggregate canonical events inside the caller's read transaction. The UI's
     // paged history and replayed wakeups never own or increment these counts.
-    connection.query_row(
+    let progress = connection.query_row(
         "WITH events AS (
              SELECT sequence_no, msg_json AS payload_json FROM protocol_runtime_events
              WHERE session_id = ?1 AND turn_id = ?2
          ), tool_states AS (
              SELECT json_extract(payload_json, '$.envelope.status') AS status,
+                    json_extract(payload_json, '$.envelope.success') AS success,
                     ROW_NUMBER() OVER (
                         PARTITION BY json_extract(payload_json, '$.envelope.call_id')
                         ORDER BY sequence_no DESC
@@ -7496,14 +7497,14 @@ fn active_turn_progress_in_connection(
          SELECT
              (SELECT COUNT(*) FROM events WHERE json_extract(payload_json, '$.kind') = 'model_request_prepared'),
              COUNT(*),
-             COUNT(*) FILTER (WHERE status = 'completed'),
+             COUNT(*) FILTER (WHERE status = 'completed' AND COALESCE(success, 1) != 0),
              COUNT(*) FILTER (WHERE status = 'declined'),
              COUNT(*) FILTER (WHERE status = 'cancelled'),
-             COUNT(*) FILTER (WHERE status = 'failed'),
+             COUNT(*) FILTER (WHERE status = 'failed' OR (status = 'completed' AND success = 0)),
              (SELECT COUNT(*) FROM events WHERE json_extract(payload_json, '$.kind') = 'context_compacted')
          FROM tool_states WHERE latest = 1",
         params![session_id.to_string(), turn_id.to_string()],
-        |row| Ok(crate::session::model::CanonicalActiveTurnProgress {
+        |row| Ok(crate::session::model::CanonicalTurnProgress {
             turn_id,
             model_request_count: row.get(0)?,
             tool_call_count: row.get(1)?,
@@ -7513,7 +7514,35 @@ fn active_turn_progress_in_connection(
             failed_tool_count: row.get(5)?,
             compaction_count: row.get(6)?,
         }),
-    ).map_err(StorageError::from)
+    ).map_err(StorageError::from)?;
+    // Migrated canonical tool evidence can predate runtime lifecycle events.
+    // A partial aggregate must not erase a call still owned by that history.
+    if connection.query_row(
+        "WITH canonical_calls AS (
+             SELECT json_extract(payload_json, '$.call_id') AS call_id
+             FROM protocol_history_items
+             WHERE session_id = ?1 AND turn_id = ?2
+               AND json_extract(payload_json, '$.kind') IN ('tool_call', 'tool_output')
+             UNION
+             SELECT json_extract(payload_json, '$.call_id') AS call_id
+             FROM protocol_turn_items
+             WHERE session_id = ?1 AND turn_id = ?2
+               AND json_extract(payload_json, '$.call_id') IS NOT NULL
+         ) SELECT EXISTS (
+             SELECT 1 FROM canonical_calls AS canonical
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM protocol_runtime_events AS runtime
+                 WHERE runtime.session_id = ?1 AND runtime.turn_id = ?2
+                   AND json_extract(runtime.msg_json, '$.kind') = 'tool_lifecycle'
+                   AND json_extract(runtime.msg_json, '$.envelope.call_id') = canonical.call_id
+             )
+         )",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(progress))
 }
 
 fn canonical_turn_snapshot_in_transaction(
@@ -11981,6 +12010,7 @@ fn validate_pending_agent_terminal(terminal: &DurableTurnTerminal) -> Result<(),
         || terminal.metrics.model_request_count != 0
         || terminal.metrics.elapsed_ms.is_some()
         || terminal.metrics.token_usage.is_some()
+        || terminal.metrics.cumulative_token_usage.is_some()
         || !terminal.metrics.tool_calls_by_name.is_empty()
         || !terminal.metrics.failed_tool_calls_by_name.is_empty()
         || terminal.metrics.config.is_some()
@@ -17335,6 +17365,15 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn pending_agent_terminal_rejects_cumulative_metrics_before_admission() {
+        let mut terminal = pre_admission_failed_terminal("launch did not start");
+        validate_pending_agent_terminal(&terminal).expect("unstarted terminal without metrics");
+        terminal.metrics.cumulative_token_usage =
+            Some(crate::session::CumulativeTokenUsage::default());
+        assert!(validate_pending_agent_terminal(&terminal).is_err());
     }
 
     #[tokio::test]
@@ -24077,6 +24116,803 @@ mod tests {
                 .expect("schema query");
             assert!(!exists, "retired table {retired} must not exist after V33");
         }
+    }
+
+    async fn record_progress_shell_calls(
+        store: &StoreBundle,
+        session_id: SessionId,
+        admission_id: AdmissionId,
+        turn_id: TurnId,
+        call_ids: &[ToolCallId],
+    ) {
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: call_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(index, id)| PendingToolCallWrite {
+                            id: *id,
+                            model_call_id: format!("progress-call-{index}"),
+                            tool_name: "shell".into(),
+                            arguments_json: serde_json::json!({"command": "python -m unittest"})
+                                .to_string(),
+                            protocol_sequence_no: None,
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("pending progress calls");
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_progress_counts_display_outcomes_beyond_page_and_latest_turn() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (older_admission, older_turn) = active_turn(&store, session_id).await;
+        let older_call = ToolCallId::new();
+        record_progress_shell_calls(
+            &store,
+            session_id,
+            older_admission,
+            older_turn,
+            &[older_call],
+        )
+        .await;
+        repository
+            .fail_tool_call_with_protocol_bundle(
+                session_id,
+                older_admission,
+                older_call,
+                crate::tool::ToolName::Shell,
+                "older invocation failed",
+                serde_json::json!({}),
+                older_turn,
+                None,
+            )
+            .await
+            .expect("older typed failure")
+            .expect("older call settled");
+        let mut older_terminal = completed_terminal_for_response(session_id, None);
+        if let RunEvent::TurnTerminal { terminal, .. } = &mut older_terminal {
+            terminal.tool_call_count = 1;
+            terminal.failed_tool_count = 1;
+        }
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    older_admission,
+                    &older_terminal,
+                    older_turn,
+                    None,
+                    None,
+                )
+                .await
+                .expect("older terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let calls = [ToolCallId::new(), ToolCallId::new(), ToolCallId::new()];
+        record_progress_shell_calls(&store, session_id, admission_id, turn_id, &calls).await;
+        repository
+            .complete_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                calls[0],
+                crate::tool::ToolName::Shell,
+                "unsuccessful operation",
+                serde_json::json!({"success": true, "tool_metadata": {"success": false, "exit_code": 7}}),
+                "Exit code: 7",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .expect("non-success completion")
+            .expect("non-success call settled");
+        let initial = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Latest { limit: 1 },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("bounded active snapshot");
+        assert_eq!(initial.protocol.history.items.len(), 1);
+        assert_eq!(initial.protocol.turns.items.len(), 1);
+        let initial_progress = initial.turn_progress.expect("active display aggregate");
+        assert_eq!(initial_progress.turn_id, turn_id);
+        assert_eq!(initial_progress.tool_call_count, 3);
+        assert_eq!(initial_progress.completed_tool_count, 0);
+        assert_eq!(initial_progress.failed_tool_count, 1);
+        assert!(
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("non-success runtime evidence")
+                .iter()
+                .any(|event| matches!(
+                    &event.msg,
+                    RuntimeEventMsg::ToolLifecycle { envelope }
+                        if envelope.call_id == calls[0]
+                            && envelope.status == ToolLifecycleStatus::Completed
+                            && envelope.success == Some(false)
+                ))
+        );
+
+        repository
+            .fail_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                calls[1],
+                crate::tool::ToolName::Shell,
+                "typed invocation failure",
+                serde_json::json!({}),
+                turn_id,
+                None,
+            )
+            .await
+            .expect("typed failure")
+            .expect("failed call settled");
+        repository
+            .complete_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                calls[2],
+                crate::tool::ToolName::Shell,
+                "legacy completion without success",
+                serde_json::json!({}),
+                "completed",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .expect("legacy-compatible completion")
+            .expect("completed call settled");
+        let legacy_event = store
+            .protocol_event_store()
+            .list_runtime_events(session_id, turn_id)
+            .expect("runtime evidence")
+            .into_iter()
+            .find(|event| {
+                matches!(
+                    &event.msg,
+                    RuntimeEventMsg::ToolLifecycle { envelope }
+                        if envelope.call_id == calls[2]
+                            && envelope.status == ToolLifecycleStatus::Completed
+                )
+            })
+            .expect("completed runtime event");
+        let mut legacy_message = serde_json::to_value(&legacy_event.msg).expect("runtime JSON");
+        legacy_message["envelope"]["success"] = serde_json::Value::Null;
+        let legacy_json = serde_json::to_string(&legacy_message).expect("legacy runtime JSON");
+        repository
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute(
+                "UPDATE protocol_runtime_events SET msg_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                params![
+                    &legacy_json,
+                    format!("{:x}", Sha256::digest(legacy_json.as_bytes())),
+                    legacy_event.id.to_string(),
+                ],
+            )
+            .expect("nullable legacy success fixture");
+
+        let active = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Offset {
+                    offset: 0,
+                    limit: 1,
+                },
+                ProtocolPageRequest::Offset {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("older page of active snapshot");
+        assert_eq!(active.protocol.turns.items[0].turn_id, older_turn);
+        let expected_progress = active.turn_progress.expect("latest turn aggregate");
+        assert_eq!(expected_progress.turn_id, turn_id);
+        assert_eq!(expected_progress.tool_call_count, 3);
+        assert_eq!(expected_progress.completed_tool_count, 1);
+        assert_eq!(expected_progress.failed_tool_count, 2);
+        assert_eq!(expected_progress.declined_tool_count, 0);
+        assert_eq!(expected_progress.cancelled_tool_count, 0);
+
+        let mut terminal = completed_terminal_for_response(session_id, None);
+        if let RunEvent::TurnTerminal { terminal, .. } = &mut terminal {
+            terminal.tool_call_count = 3;
+            terminal.failed_tool_count = 1;
+        }
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("latest terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        let terminal_snapshot = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Latest { limit: 1 },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("bounded terminal snapshot");
+        assert!(terminal_snapshot.active_turn_position.is_none());
+        assert_eq!(terminal_snapshot.session.status, SessionStatus::Completed);
+        assert_eq!(
+            terminal_snapshot.turn_progress,
+            Some(expected_progress.clone())
+        );
+        assert_eq!(
+            repository
+                .durable_terminal_for_turn(session_id, turn_id)
+                .await
+                .expect("durable terminal")
+                .expect("terminal exists")
+                .failed_tool_count,
+            1,
+            "display failure counts do not change engine typed failures"
+        );
+
+        let sqlite = SqliteStore::open(store.paths()).expect("reopen store");
+        sqlite.migrate().expect("migrate reopened store");
+        let reopened = StoreBundle::new(sqlite);
+        let reloaded = reopened
+            .session_repo()
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Offset {
+                    offset: 0,
+                    limit: 1,
+                },
+                ProtocolPageRequest::Offset {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("bounded reopened snapshot");
+        assert_eq!(reloaded.protocol.turns.items[0].turn_id, older_turn);
+        assert_eq!(reloaded.turn_progress, Some(expected_progress));
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_progress_omits_incomplete_mixed_native_and_legacy_tool_evidence() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let calls = [ToolCallId::new(), ToolCallId::new()];
+        record_progress_shell_calls(&store, session_id, admission_id, turn_id, &calls).await;
+        for (call_id, success) in [(calls[0], true), (calls[1], false)] {
+            repository
+                .complete_tool_call_with_protocol_bundle(
+                    session_id,
+                    admission_id,
+                    call_id,
+                    crate::tool::ToolName::Shell,
+                    "operation result",
+                    serde_json::json!({"success": success}),
+                    "process result",
+                    None,
+                    turn_id,
+                    None,
+                )
+                .await
+                .expect("canonical completion")
+                .expect("call settled");
+        }
+        let mut terminal = completed_terminal_for_response(session_id, None);
+        if let RunEvent::TurnTerminal { terminal, .. } = &mut terminal {
+            terminal.tool_call_count = 2;
+        }
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        {
+            let mut connection = repository.connection.lock().expect("sqlite mutex");
+            let transaction = connection
+                .transaction()
+                .expect("mixed legacy fixture transaction");
+            transaction
+                .execute(
+                    "DELETE FROM protocol_item_append_order
+                     WHERE session_id = ?1 AND source_kind = 'runtime_event'
+                       AND source_id IN (
+                           SELECT id FROM protocol_runtime_events
+                           WHERE session_id = ?1 AND turn_id = ?2
+                             AND json_extract(msg_json, '$.kind') = 'tool_lifecycle'
+                             AND json_extract(msg_json, '$.envelope.call_id') = ?3
+                       )",
+                    params![
+                        session_id.to_string(),
+                        turn_id.to_string(),
+                        calls[1].to_string()
+                    ],
+                )
+                .expect("remove legacy call lifecycle append rows");
+            transaction
+                .execute(
+                    "DELETE FROM protocol_runtime_events
+                     WHERE session_id = ?1 AND turn_id = ?2
+                       AND json_extract(msg_json, '$.kind') = 'tool_lifecycle'
+                       AND json_extract(msg_json, '$.envelope.call_id') = ?3",
+                    params![
+                        session_id.to_string(),
+                        turn_id.to_string(),
+                        calls[1].to_string()
+                    ],
+                )
+                .expect("retain native lifecycle and legacy canonical evidence");
+            transaction.commit().expect("mixed legacy fixture commit");
+        }
+        let runtime = store
+            .protocol_event_store()
+            .list_runtime_events(session_id, turn_id)
+            .expect("mixed runtime evidence");
+        assert!(runtime.iter().any(|event| matches!(
+            &event.msg,
+            RuntimeEventMsg::ToolLifecycle { envelope }
+                if envelope.call_id == calls[0]
+                    && envelope.status == ToolLifecycleStatus::Completed
+                    && envelope.success == Some(true)
+        )));
+        assert!(!runtime.iter().any(|event| matches!(
+            &event.msg,
+            RuntimeEventMsg::ToolLifecycle { envelope } if envelope.call_id == calls[1]
+        )));
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_history_items(session_id, turn_id)
+                .expect("retained canonical calls")
+                .iter()
+                .filter(|item| matches!(&item.payload, HistoryItemPayload::ToolCall { .. }))
+                .count(),
+            2
+        );
+        let snapshot = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Latest { limit: 1 },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("bounded mixed legacy snapshot");
+        assert!(matches!(
+            &snapshot.protocol.history.items[0].payload,
+            HistoryItemPayload::ToolOutput { call_id, success: Some(false), .. }
+                if *call_id == calls[1]
+        ));
+        assert!(
+            snapshot.turn_progress.is_none(),
+            "partial runtime coverage must not hide the legacy call's unsuccessful operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_page_reprojects_legacy_completed_non_success_tool_status() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let call_id = ToolCallId::new();
+        record_progress_shell_calls(&store, session_id, admission_id, turn_id, &[call_id]).await;
+        repository
+            .complete_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                call_id,
+                crate::tool::ToolName::Shell,
+                "unsuccessful operation",
+                serde_json::json!({"success": false, "exit_code": 7}),
+                "Exit code: 7",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .expect("canonical completion")
+            .expect("call settled");
+
+        let native = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Offset {
+                    offset: 0,
+                    limit: 1,
+                },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("current projector snapshot");
+        let current_statuses =
+            crate::tui::state::tool_statuses_from_turn_items(&native.protocol.turns.items);
+        assert_eq!(current_statuses.len(), 1);
+        assert_eq!(
+            current_statuses[0].status,
+            crate::session::ToolCallStatus::Failed
+        );
+        let mut legacy_item = native.protocol.turns.items[0].clone();
+        let source_id = legacy_item.source_item_id.expect("exact history source");
+        let source = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history evidence")
+            .into_iter()
+            .find(|item| item.id == source_id)
+            .expect("completion source");
+        assert_eq!(source.session_id, session_id);
+        assert!(matches!(source.scope, HistoryScope::Turn { turn_id: owner } if owner == turn_id));
+        assert_eq!(source.sequence_no, legacy_item.sequence_no);
+        assert!(matches!(
+            &source.payload,
+            HistoryItemPayload::ToolOutput {
+                call_id: owner,
+                status: ToolLifecycleStatus::Completed,
+                success: Some(false),
+                ..
+            } if *owner == call_id
+        ));
+        let runtime = store
+            .protocol_event_store()
+            .list_runtime_events(session_id, turn_id)
+            .expect("runtime evidence")
+            .into_iter()
+            .find(|event| event.sequence_no == legacy_item.sequence_no)
+            .expect("same-sequence completion runtime");
+        assert!(matches!(
+            &runtime.msg,
+            RuntimeEventMsg::ToolLifecycle { envelope }
+                if envelope.call_id == call_id
+                    && envelope.status == ToolLifecycleStatus::Completed
+                    && envelope.success == Some(false)
+        ));
+
+        let TurnItemPayload::ToolStatus { status, .. } = &mut legacy_item.payload else {
+            panic!("completion display item");
+        };
+        *status = ToolLifecycleStatus::Completed;
+        let legacy_json = serde_json::to_string(&legacy_item.payload).expect("legacy display JSON");
+        let legacy_hash = format!("{:x}", Sha256::digest(legacy_json.as_bytes()));
+        let source_json = serde_json::to_string(&source.payload).expect("source JSON");
+        let source_hash = format!("{:x}", Sha256::digest(source_json.as_bytes()));
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE protocol_turn_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                        params![&legacy_json, &legacy_hash, legacy_item.id.to_string()],
+                    )
+                    .expect("old projector display fixture"),
+                1
+            );
+        }
+
+        let sqlite = SqliteStore::open(store.paths()).expect("reopen old display record");
+        sqlite.migrate().expect("migrate reopened store");
+        let reopened = StoreBundle::new(sqlite);
+        let replay = reopened
+            .session_repo()
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Offset {
+                    offset: 0,
+                    limit: 1,
+                },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("bounded legacy display snapshot");
+        assert!(
+            !replay
+                .protocol
+                .history
+                .items
+                .iter()
+                .any(|item| item.id == source_id)
+        );
+        let progress = replay.turn_progress.expect("complete runtime aggregate");
+        assert_eq!(progress.tool_call_count, 1);
+        assert_eq!(progress.completed_tool_count, 0);
+        assert_eq!(progress.failed_tool_count, 1);
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            let persisted_display: (String, String) = connection
+                .query_row(
+                    "SELECT payload_json, payload_sha256 FROM protocol_turn_items WHERE id = ?1",
+                    params![legacy_item.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("persisted legacy display");
+            assert_eq!(persisted_display, (legacy_json, legacy_hash));
+            let persisted_source: (String, String) = connection
+                .query_row(
+                    "SELECT payload_json, payload_sha256 FROM protocol_history_items WHERE id = ?1",
+                    params![source_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("persisted completion source");
+            assert_eq!(persisted_source, (source_json, source_hash));
+        }
+        let statuses =
+            crate::tui::state::tool_statuses_from_turn_items(&replay.protocol.turns.items);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].tool_call_id, call_id);
+        assert_eq!(
+            statuses[0].status,
+            crate::session::ToolCallStatus::Failed,
+            "legacy display status must agree with its exact unsuccessful operation and runtime aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_page_keeps_legacy_completion_without_explicit_source_success() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let call_id = ToolCallId::new();
+        record_progress_shell_calls(&store, session_id, admission_id, turn_id, &[call_id]).await;
+        repository
+            .complete_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                call_id,
+                crate::tool::ToolName::Shell,
+                "legacy operation",
+                serde_json::json!({}),
+                "completed without operation outcome evidence",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .expect("canonical completion")
+            .expect("call settled");
+        let mut display = store
+            .protocol_event_store()
+            .list_turn_items(session_id, turn_id)
+            .expect("display evidence")
+            .into_iter()
+            .find(|item| {
+                matches!(
+                    &item.payload,
+                    TurnItemPayload::ToolStatus {
+                        call_id: owner,
+                        status: ToolLifecycleStatus::Completed,
+                        ..
+                    } if *owner == call_id
+                )
+            })
+            .expect("completion display");
+        let source_id = display.source_item_id.expect("source identity");
+        let mut source = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history evidence")
+            .into_iter()
+            .find(|item| item.id == source_id)
+            .expect("completion source");
+        let TurnItemPayload::ToolStatus { status, .. } = &mut display.payload else {
+            panic!("tool display");
+        };
+        *status = ToolLifecycleStatus::Completed;
+        let HistoryItemPayload::ToolOutput { success, .. } = &mut source.payload else {
+            panic!("tool output source");
+        };
+        *success = None;
+        let mut runtime = store
+            .protocol_event_store()
+            .list_runtime_events(session_id, turn_id)
+            .expect("runtime evidence")
+            .into_iter()
+            .find(|event| event.sequence_no == display.sequence_no)
+            .expect("same-sequence completion runtime");
+        let RuntimeEventMsg::ToolLifecycle { envelope } = &mut runtime.msg else {
+            panic!("tool completion runtime");
+        };
+        assert_eq!(envelope.call_id, call_id);
+        assert_eq!(envelope.status, ToolLifecycleStatus::Completed);
+        envelope.success = None;
+        let display_json = serde_json::to_string(&display.payload).expect("old display JSON");
+        let source_json = serde_json::to_string(&source.payload).expect("old source JSON");
+        let runtime_json = serde_json::to_string(&runtime.msg).expect("old runtime JSON");
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute(
+                    "UPDATE protocol_turn_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                    params![
+                        &display_json,
+                        format!("{:x}", Sha256::digest(display_json.as_bytes())),
+                        display.id.to_string(),
+                    ],
+                )
+                .expect("old completion display fixture");
+            connection
+                .execute(
+                    "UPDATE protocol_history_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                    params![
+                        &source_json,
+                        format!("{:x}", Sha256::digest(source_json.as_bytes())),
+                        source_id.to_string(),
+                    ],
+                )
+                .expect("legacy source without explicit success fixture");
+            connection
+                .execute(
+                    "UPDATE protocol_runtime_events SET msg_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                    params![
+                        &runtime_json,
+                        format!("{:x}", Sha256::digest(runtime_json.as_bytes())),
+                        runtime.id.to_string(),
+                    ],
+                )
+                .expect("matching legacy runtime without explicit success fixture");
+        }
+        let snapshot = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Latest { limit: 1 },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("legacy snapshot without explicit operation outcome");
+        assert!(matches!(
+            &snapshot.protocol.history.items[0].payload,
+            HistoryItemPayload::ToolOutput { success: None, metadata, .. }
+                if metadata.as_object().is_some_and(|object| object.is_empty())
+        ));
+        let progress = snapshot.turn_progress.expect("legacy runtime aggregate");
+        assert_eq!(progress.completed_tool_count, 1);
+        assert_eq!(progress.failed_tool_count, 0);
+        let statuses =
+            crate::tui::state::tool_statuses_from_turn_items(&snapshot.protocol.turns.items);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].tool_call_id, call_id);
+        assert_eq!(
+            statuses[0].status,
+            crate::session::ToolCallStatus::Completed,
+            "legacy completion without explicit outcome evidence remains completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_progress_preserves_legacy_tool_evidence_without_runtime_lifecycle() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let call_id = ToolCallId::new();
+        record_progress_shell_calls(&store, session_id, admission_id, turn_id, &[call_id]).await;
+        repository
+            .complete_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                call_id,
+                crate::tool::ToolName::Shell,
+                "unsuccessful operation",
+                serde_json::json!({"success": false}),
+                "Exit code: 7",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .expect("canonical completion")
+            .expect("call settled");
+        let mut terminal = completed_terminal_for_response(session_id, None);
+        if let RunEvent::TurnTerminal { terminal, .. } = &mut terminal {
+            terminal.tool_call_count = 1;
+        }
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        {
+            let mut connection = repository.connection.lock().expect("sqlite mutex");
+            let transaction = connection
+                .transaction()
+                .expect("legacy fixture transaction");
+            transaction
+                .execute(
+                    "DELETE FROM protocol_item_append_order
+                     WHERE session_id = ?1 AND source_kind = 'runtime_event'
+                       AND source_id IN (
+                           SELECT id FROM protocol_runtime_events
+                           WHERE session_id = ?1 AND turn_id = ?2
+                             AND json_extract(msg_json, '$.kind') = 'tool_lifecycle'
+                       )",
+                    params![session_id.to_string(), turn_id.to_string()],
+                )
+                .expect("remove lifecycle append rows");
+            transaction
+                .execute(
+                    "DELETE FROM protocol_runtime_events
+                     WHERE session_id = ?1 AND turn_id = ?2
+                       AND json_extract(msg_json, '$.kind') = 'tool_lifecycle'",
+                    params![session_id.to_string(), turn_id.to_string()],
+                )
+                .expect("legacy tool evidence without runtime lifecycle");
+            transaction.commit().expect("legacy fixture commit");
+        }
+        let snapshot = repository
+            .canonical_session_protocol_snapshot(
+                session_id,
+                ProtocolPageRequest::Latest { limit: 1 },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .await
+            .expect("bounded legacy snapshot");
+        assert!(snapshot.active_turn_position.is_none());
+        assert_eq!(
+            snapshot.protocol.latest_turn_position.map(|(id, _)| id),
+            Some(turn_id)
+        );
+        assert!(matches!(
+            &snapshot.protocol.history.items[0].payload,
+            HistoryItemPayload::ToolOutput { call_id: stored_call, success: Some(false), .. }
+                if *stored_call == call_id
+        ));
+        assert!(
+            store
+                .protocol_event_store()
+                .list_turn_items(session_id, turn_id)
+                .expect("retained canonical display evidence")
+                .iter()
+                .any(|item| matches!(
+                    &item.payload,
+                    TurnItemPayload::ToolStatus { call_id: stored_call, status: ToolLifecycleStatus::Failed, .. }
+                        if *stored_call == call_id
+                ))
+        );
+        assert!(
+            snapshot.turn_progress.is_none(),
+            "missing runtime lifecycle evidence must not replace historical display counts with zero"
+        );
     }
 
     #[tokio::test]

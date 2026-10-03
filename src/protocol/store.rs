@@ -2776,24 +2776,33 @@ fn session_token_usage_from_connection(
             ));
         };
         summary.terminal_turn_count = summary.terminal_turn_count.saturating_add(1);
-        let Some(usage) = terminal.metrics.token_usage.as_ref() else {
+        summary.model_request_count = summary
+            .model_request_count
+            .saturating_add(terminal.metrics.model_request_count);
+        let Some(usage) = terminal.metrics.cumulative_token_usage.as_ref() else {
+            summary.unrecorded_turn_count = summary.unrecorded_turn_count.saturating_add(1);
             continue;
         };
+        summary.reported_request_count = summary
+            .reported_request_count
+            .saturating_add(usage.reported_request_count);
+        summary.reasoning_reported_request_count = summary
+            .reasoning_reported_request_count
+            .saturating_add(usage.reasoning_reported_request_count);
+        if usage.reported_request_count == 0 {
+            continue;
+        }
         summary.measured_turn_count = summary.measured_turn_count.saturating_add(1);
-        summary.prompt_tokens = summary
-            .prompt_tokens
-            .saturating_add(u64::from(usage.prompt_tokens));
+        summary.prompt_tokens = summary.prompt_tokens.saturating_add(usage.prompt_tokens);
         summary.completion_tokens = summary
             .completion_tokens
-            .saturating_add(u64::from(usage.completion_tokens));
-        summary.total_tokens = summary
-            .total_tokens
-            .saturating_add(u64::from(usage.total_tokens));
+            .saturating_add(usage.completion_tokens);
+        summary.total_tokens = summary.total_tokens.saturating_add(usage.total_tokens);
         if let Some(reasoning_tokens) = usage.reasoning_tokens {
             summary.reasoning_measured_turn_count =
                 summary.reasoning_measured_turn_count.saturating_add(1);
             let accumulated = summary.reasoning_tokens.get_or_insert(0);
-            *accumulated = accumulated.saturating_add(u64::from(reasoning_tokens));
+            *accumulated = accumulated.saturating_add(reasoning_tokens);
         }
     }
     Ok(summary)
@@ -3732,12 +3741,18 @@ fn turn_item_page_from_connection(
     };
     let mut statement = connection.prepare(
         "SELECT turn_item.id, turn_item.turn_id, turn_item.source_item_id,
-                turn_item.sequence_no, turn_item.payload_json, append_order.append_position
+                turn_item.sequence_no, turn_item.payload_json, append_order.append_position,
+                source_history.payload_json
          FROM protocol_turn_items AS turn_item
          INNER JOIN protocol_item_append_order AS append_order
            ON append_order.session_id = turn_item.session_id
           AND append_order.source_kind = 'turn_item'
           AND append_order.source_id = turn_item.id
+         LEFT JOIN protocol_history_items AS source_history
+           ON source_history.id = turn_item.source_item_id
+          AND source_history.session_id = turn_item.session_id
+          AND source_history.turn_id = turn_item.turn_id
+          AND source_history.sequence_no = turn_item.sequence_no
          WHERE turn_item.session_id = ?1
            AND (?4 IS NULL OR append_order.append_position > ?4)
          ORDER BY append_order.append_position ASC
@@ -3758,13 +3773,33 @@ fn turn_item_page_from_connection(
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         },
     )?;
     let mut items = Vec::new();
     let mut next_cursor = None;
     for row in rows {
-        let (id, turn_id, source_item_id, sequence_no, payload_json, append_position) = row?;
+        let (id, turn_id, source_item_id, sequence_no, payload_json, append_position, source_json) =
+            row?;
+        let mut payload = serde_json::from_str::<TurnItemPayload>(&payload_json)?;
+        // Earlier projectors stored Completed even for an unsuccessful operation.
+        // Rebuild only the display from its exact source; retained JSON stays intact.
+        if let TurnItemPayload::ToolStatus {
+            call_id, status, ..
+        } = &mut payload
+            && *status == crate::protocol::ToolLifecycleStatus::Completed
+            && let Some(source_json) = source_json
+            && let HistoryItemPayload::ToolOutput {
+                call_id: source_call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                success: Some(false),
+                ..
+            } = serde_json::from_str::<HistoryItemPayload>(&source_json)?
+            && *call_id == source_call_id
+        {
+            *status = crate::protocol::ToolLifecycleStatus::Failed;
+        }
         items.push(TurnItem {
             id: parse_protocol_id::<TurnItemId>(&id, "turn item")?,
             session_id,
@@ -3773,7 +3808,7 @@ fn turn_item_page_from_connection(
                 .map(|id| parse_protocol_id::<HistoryItemId>(&id, "turn item source"))
                 .transpose()?,
             sequence_no,
-            payload: serde_json::from_str::<TurnItemPayload>(&payload_json)?,
+            payload,
         });
         next_cursor = Some(append_position);
     }
@@ -7209,6 +7244,44 @@ mod tests {
     }
 
     #[test]
+    fn canonical_session_usage_does_not_relabel_legacy_latest_usage_as_cumulative() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let mut legacy = completed_terminal_event(session_id, TurnId::new(), 0);
+        let RuntimeEventMsg::TurnTerminal { terminal } = &mut legacy.msg else {
+            unreachable!("terminal fixture");
+        };
+        terminal.metrics.model_request_count = 2;
+        terminal.metrics.token_usage = Some(crate::session::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            reasoning_tokens: None,
+        });
+        store
+            .seed_runtime_event_for_test(&legacy)
+            .expect("legacy terminal");
+        let usage = {
+            let locked = connection.lock().expect("sqlite mutex");
+            session_token_usage_from_connection(&locked, session_id).expect("session usage")
+        };
+        assert_eq!(usage.terminal_turn_count, 1);
+        assert_eq!(usage.measured_turn_count, 0);
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(
+            serde_json::to_value(usage).expect("usage JSON")["unrecorded_turn_count"],
+            1,
+        );
+    }
+
+    #[test]
     fn canonical_session_usage_aggregates_measured_terminal_telemetry_without_zero_filling() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),
@@ -7229,11 +7302,29 @@ mod tests {
             total_tokens: 1_500,
             reasoning_tokens: Some(80),
         });
+        terminal.metrics.model_request_count = 3;
+        terminal.metrics.cumulative_token_usage = Some(crate::session::CumulativeTokenUsage {
+            reported_request_count: 2,
+            reasoning_reported_request_count: 1,
+            prompt_tokens: 1_200,
+            completion_tokens: 300,
+            total_tokens: 1_500,
+            reasoning_tokens: Some(80),
+        });
         let mut reasoning_unreported = completed_terminal_event(session_id, TurnId::new(), 0);
         let RuntimeEventMsg::TurnTerminal { terminal } = &mut reasoning_unreported.msg else {
             unreachable!("completed terminal fixture projects a terminal runtime event");
         };
         terminal.metrics.token_usage = Some(crate::session::TokenUsage {
+            prompt_tokens: 400,
+            completion_tokens: 100,
+            total_tokens: 500,
+            reasoning_tokens: None,
+        });
+        terminal.metrics.model_request_count = 1;
+        terminal.metrics.cumulative_token_usage = Some(crate::session::CumulativeTokenUsage {
+            reported_request_count: 1,
+            reasoning_reported_request_count: 0,
             prompt_tokens: 400,
             completion_tokens: 100,
             total_tokens: 500,
@@ -7259,6 +7350,10 @@ mod tests {
         assert_eq!(usage.terminal_turn_count, 3);
         assert_eq!(usage.measured_turn_count, 2);
         assert_eq!(usage.reasoning_measured_turn_count, 1);
+        assert_eq!(usage.model_request_count, 4);
+        assert_eq!(usage.reported_request_count, 3);
+        assert_eq!(usage.reasoning_reported_request_count, 1);
+        assert_eq!(usage.unrecorded_turn_count, 1);
         assert_eq!(usage.prompt_tokens, 1_600);
         assert_eq!(usage.completion_tokens, 400);
         assert_eq!(usage.total_tokens, 2_000);
@@ -7275,6 +7370,14 @@ mod tests {
             completion_tokens: 5,
             total_tokens: 15,
             reasoning_tokens: None,
+        });
+        terminal.metrics.model_request_count = 1;
+        terminal.metrics.cumulative_token_usage = Some(crate::session::CumulativeTokenUsage {
+            reported_request_count: 1,
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
         });
         store
             .seed_runtime_event_for_test(&reasoning_missing)

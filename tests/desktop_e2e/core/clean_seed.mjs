@@ -76,21 +76,22 @@ function isSameOrDescendant(root, candidate) {
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-function exclusionFor(relativePath, kind) {
+function exclusionFor(relativePath, kind, copyRule) {
   const normalized = relativePath.replaceAll("\\", "/").toLowerCase();
   const segments = normalized.split("/");
-  const excludedDirectoryNames = new Set(CASE5_2_CLEAN_SEED_COPY_RULE.excluded_directory_names);
+  const excludedDirectoryNames = new Set(copyRule.excluded_directory_names);
   if (segments.some((segment) => excludedDirectoryNames.has(segment))) return "excluded-directory-name";
-  if (segments.some((segment) => CASE5_2_CLEAN_SEED_COPY_RULE.excluded_directory_suffixes.some((suffix) => segment.endsWith(suffix)))) {
+  if (segments.some((segment) => copyRule.excluded_directory_suffixes.some((suffix) => segment.endsWith(suffix)))) {
     return "excluded-directory-suffix";
   }
-  if (CASE5_2_CLEAN_SEED_COPY_RULE.excluded_relative_directories.some(
+  if (copyRule.excluded_relative_directories.some(
     (directory) => normalized === directory || normalized.startsWith(`${directory}/`),
   )) return "excluded-relative-directory";
   if (kind === "file") {
     const leaf = segments.at(-1);
-    if (CASE5_2_CLEAN_SEED_COPY_RULE.excluded_file_names.includes(leaf)) return "excluded-file-name";
-    if (CASE5_2_CLEAN_SEED_COPY_RULE.excluded_file_suffixes.some((suffix) => leaf.endsWith(suffix))) {
+    if (copyRule.excluded_file_names.includes(leaf)) return "excluded-file-name";
+    if (!(copyRule.preserved_file_names ?? []).includes(leaf) && (copyRule.excluded_file_prefixes ?? []).some(prefix => leaf.startsWith(prefix))) return "excluded-file-prefix";
+    if (copyRule.excluded_file_suffixes.some((suffix) => leaf.endsWith(suffix))) {
       return "excluded-file-suffix";
     }
   }
@@ -113,7 +114,7 @@ async function assertEmptyDirectory(candidate, label) {
   return directory;
 }
 
-async function inspectSource(sourceRoot) {
+async function inspectSource(sourceRoot, copyRule) {
   const directories = [];
   const files = [];
 
@@ -135,7 +136,7 @@ async function inspectSource(sourceRoot) {
         throw new Error(`clean seed source realpath escaped its root: ${candidate} -> ${physical}`);
       }
       const kind = item.isDirectory() ? "directory" : "file";
-      if (exclusionFor(relativePath, kind) !== null) continue;
+      if (exclusionFor(relativePath, kind, copyRule) !== null) continue;
       if (item.isDirectory()) {
         directories.push(relativePath);
         await visit(physical);
@@ -161,11 +162,11 @@ async function inspectSource(sourceRoot) {
   return { directories, files };
 }
 
-function publicCopyRule() {
-  return JSON.parse(JSON.stringify(CASE5_2_CLEAN_SEED_COPY_RULE));
+function publicCopyRule(copyRule) {
+  return JSON.parse(JSON.stringify(copyRule));
 }
 
-function publicInventory(sourceDirectory, inventory, destination = undefined) {
+function publicInventory(sourceDirectory, inventory, destination, copyRule) {
   const files = inventory.files.map(({ path: relativePath, sha256: digest, bytes }) => ({
     path: relativePath,
     sha256: digest,
@@ -178,7 +179,7 @@ function publicInventory(sourceDirectory, inventory, destination = undefined) {
     schema_version: "desktop-e2e.clean-seed.v1",
     source: sourceDirectory.physical,
     ...(destination === undefined ? {} : { destination }),
-    copy_rule: publicCopyRule(),
+    copy_rule: publicCopyRule(copyRule),
     file_count: files.length,
     byte_count: byteCount,
     aggregate_sha256: sha256(Buffer.from(aggregate, "utf8")),
@@ -186,18 +187,18 @@ function publicInventory(sourceDirectory, inventory, destination = undefined) {
   };
 }
 
-export async function inventoryCase52CleanSeed(source) {
+export async function inventoryCase52CleanSeed(source, { copyRule = CASE5_2_CLEAN_SEED_COPY_RULE } = {}) {
   if (typeof source !== "string" || source.length === 0) throw new TypeError("clean seed source must be a path string");
   const sourceDirectory = await physicalDirectory(source, "clean seed source");
-  const inventory = await inspectSource(sourceDirectory.physical);
-  return publicInventory(sourceDirectory, inventory);
+  const inventory = await inspectSource(sourceDirectory.physical, copyRule);
+  return publicInventory(sourceDirectory, inventory, undefined, copyRule);
 }
 
 /**
  * Copy a case5_2 clean seed into a run context's already-created empty workspace.
  * Validation and source inventory complete before the first destination write.
  */
-export async function copyCase52CleanSeed({ source, destination }) {
+export async function copyCase52CleanSeed({ source, destination, copyRule = CASE5_2_CLEAN_SEED_COPY_RULE }) {
   if (typeof source !== "string" || source.length === 0) throw new TypeError("clean seed source must be a path string");
   if (typeof destination !== "string" || destination.length === 0) {
     throw new TypeError("clean seed destination must be a path string");
@@ -212,7 +213,7 @@ export async function copyCase52CleanSeed({ source, destination }) {
     throw new Error("clean seed source and destination must be disjoint directories");
   }
 
-  const inventory = await inspectSource(sourceDirectory.physical);
+  const inventory = await inspectSource(sourceDirectory.physical, copyRule);
   const recheckedDestination = await assertEmptyDirectory(destinationDirectory.physical, "clean seed destination");
   if (recheckedDestination.physical !== destinationDirectory.physical) {
     throw new Error("clean seed destination identity changed during validation");
@@ -237,5 +238,5 @@ export async function copyCase52CleanSeed({ source, destination }) {
     await writeFile(path.join(destinationDirectory.physical, ...entry.path.split("/")), bytes, { flag: "wx" });
   }
 
-  return publicInventory(sourceDirectory, inventory, destinationDirectory.physical);
+  return publicInventory(sourceDirectory, inventory, destinationDirectory.physical, copyRule);
 }

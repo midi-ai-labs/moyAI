@@ -395,6 +395,7 @@ export function normalizeCase52Options(options) {
     "provider_base_url",
     "provider_profile",
     "provider_lifecycle",
+    "api_key_env",
     "configure_main_via_gui",
     "main_model",
     "side_model",
@@ -403,6 +404,10 @@ export function normalizeCase52Options(options) {
   ]);
   const unknown = Object.keys(options).filter((key) => !allowed.has(key));
   if (unknown.length > 0) throw new TypeError(`unknown manual.case5_2 option: ${unknown.join(",")}`);
+  const apiKeyEnv = options.api_key_env === undefined ? "" : options.api_key_env;
+  if (typeof apiKeyEnv !== "string" || (apiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(apiKeyEnv))) {
+    throw new TypeError("manual.case5_2 api_key_env must be an environment variable name or empty string");
+  }
   if (typeof options.fixture_source !== "string" || !path.isAbsolute(options.fixture_source)) {
     throw new TypeError("manual.case5_2 fixture_source must be an absolute path");
   }
@@ -429,6 +434,7 @@ export function normalizeCase52Options(options) {
     providerProfile,
     mainModel: modelIdentity(options.main_model, "main_model"),
     configureMainViaGui: options.configure_main_via_gui ?? false,
+    ...(apiKeyEnv === "" ? {} : { apiKeyEnv }),
   };
   if (providerProfile === OPENAI_COMPATIBLE_PROFILE) {
     const legacyFields = ["side_model", "expected_main_variant", "expected_side_variant"]
@@ -477,7 +483,7 @@ provider_api_mode = "responses"`;
   return `[model]
 base_url = ${JSON.stringify(initialBaseUrl)}
 model = ${JSON.stringify(initialModel)}
-${providerConnection}
+${!options.configureMainViaGui && options.apiKeyEnv ? `api_key_env = ${JSON.stringify(options.apiKeyEnv)}\n` : ""}${providerConnection}
 connect_timeout_ms = 10000
 request_timeout_ms = ${QUALITY_REQUEST_TIMEOUT_MS}
 max_retries = 0
@@ -607,14 +613,26 @@ function providerEndpoint(baseUrl, pathname) {
   return new URL(pathname.replace(/^\/+/, ""), `${baseUrl}/`).toString();
 }
 
-async function providerJson(baseUrl, pathname, { method = "GET", body = undefined, timeoutMs = 300_000 } = {}) {
+export function case52ProviderHeaders(apiKeyEnv = "", environment = process.env) {
+  if (apiKeyEnv === "") return {};
+  if (typeof apiKeyEnv !== "string" || !/^[A-Za-z0-9_]+$/.test(apiKeyEnv)) throw new TypeError("invalid provider API key environment variable name");
+  const value = environment[apiKeyEnv];
+  if (typeof value !== "string" || value.trim() === "") throw new DesktopE2eError("environment", "case5_2-api-key-missing", `provider API key environment variable is unavailable: ${apiKeyEnv}`, { api_key_env: apiKeyEnv });
+  return { authorization: `Bearer ${value.trim()}` };
+}
+
+export function case52ExternalEnvironment(apiKeyEnv = "", environment = process.env) {
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => apiKeyEnv === "" || key.toLowerCase() !== apiKeyEnv.toLowerCase()));
+}
+
+async function providerJson(baseUrl, pathname, { method = "GET", body = undefined, timeoutMs = 300_000, apiKeyEnv = "" } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
   try {
     const response = await fetch(providerEndpoint(baseUrl, pathname), {
       method,
-      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      headers: { ...case52ProviderHeaders(apiKeyEnv), ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: controller.signal,
     });
@@ -623,7 +641,7 @@ async function providerJson(baseUrl, pathname, { method = "GET", body = undefine
     try { value = text.length === 0 ? null : JSON.parse(text); }
     catch { throw new Error(`provider returned non-JSON HTTP ${response.status}`); }
     if (!response.ok) {
-      throw new Error(`provider returned HTTP ${response.status}: ${text.slice(0, 1000)}`);
+      throw new Error(`provider returned HTTP ${response.status}${apiKeyEnv === "" ? `: ${text.slice(0, 1000)}` : ""}`);
     }
     return { endpoint: response.url, status: response.status, elapsed_ms: Date.now() - started, value };
   } finally {
@@ -641,7 +659,7 @@ function exactCatalogRow(snapshot, key) {
 
 async function providerSnapshot(options) {
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
-    const models = await providerJson(options.providerBaseUrl, "/models");
+    const models = await providerJson(options.providerBaseUrl, "/models", { apiKeyEnv: options.apiKeyEnv });
     return {
       captured_at: new Date().toISOString(),
       provider_profile: options.providerProfile,
@@ -649,8 +667,8 @@ async function providerSnapshot(options) {
     };
   }
   const [v1, v0] = await Promise.all([
-    providerJson(options.providerBaseUrl, "/api/v1/models"),
-    providerJson(options.providerBaseUrl, "/api/v0/models"),
+    providerJson(options.providerBaseUrl, "/api/v1/models", { apiKeyEnv: options.apiKeyEnv }),
+    providerJson(options.providerBaseUrl, "/api/v0/models", { apiKeyEnv: options.apiKeyEnv }),
   ]);
   return { captured_at: new Date().toISOString(), v1, v0 };
 }
@@ -990,6 +1008,7 @@ export async function loadMainProvider({ options, sink, state, phase, providerIo
   const issueLoad = providerIo.load ?? ((body) => providerJson(options.providerBaseUrl, "/api/v1/models/load", {
     method: "POST",
     body,
+    apiKeyEnv: options.apiKeyEnv,
   }));
   const response = await issueLoad(request);
   state.providerLoadResponseObserved = true;
@@ -1117,6 +1136,7 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
   const unloadInstance = providerIo.unload ?? ((instanceId) => providerJson(options.providerBaseUrl, "/api/v1/models/unload", {
     method: "POST",
     body: { instance_id: instanceId },
+    apiKeyEnv: options.apiKeyEnv,
   }));
   const wait = providerIo.delay ?? delay;
   const now = providerIo.now ?? (() => Date.now());
@@ -1401,7 +1421,7 @@ export async function readCase52ExternalOutput(candidate, expected) {
   }
 }
 
-async function ownedProcessEnvironment(context, label, extra = {}) {
+async function ownedProcessEnvironment(context, label, extra = {}, apiKeyEnv = "") {
   if (typeof label !== "string" || !/^[a-z0-9][a-z0-9._-]{1,95}$/.test(label)) {
     throw new TypeError(`invalid external process label: ${label}`);
   }
@@ -1423,7 +1443,7 @@ async function ownedProcessEnvironment(context, label, extra = {}) {
     throw new TypeError(`external process caller cannot override execution-owned ${override}`);
   }
   return {
-    ...process.env,
+    ...case52ExternalEnvironment(apiKeyEnv),
     ...extra,
     TEMP: temporary,
     TMP: temporary,
@@ -1457,7 +1477,7 @@ async function resolveExecutable(name, state, context) {
     executable: where,
     args: [name],
     cwd: context.root,
-    env: await ownedProcessEnvironment(context, `resolve-${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`),
+    env: await ownedProcessEnvironment(context, `resolve-${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`, {}, state.apiKeyEnv),
     timeoutMs: 10_000,
     state,
     label: `resolve-${name}`,
@@ -1715,7 +1735,7 @@ async function pythonSiteRoots(python, context, state) {
     env: await ownedProcessEnvironment(context, "python-site-roots", {
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONPYCACHEPREFIX: path.join(context.paths.logs, "python-site-probe-cache"),
-    }),
+    }, state.apiKeyEnv),
     timeoutMs: 30_000,
     state,
     label: "python-site-roots",
@@ -1977,7 +1997,7 @@ function mainConnectionDesired(options) {
     baseUrl: options.providerBaseUrl,
     model: options.mainModel,
     providerProfile: options.providerProfile,
-    apiKeyEnv: MAIN_API_KEY_ENV,
+    apiKeyEnv: options.apiKeyEnv ?? MAIN_API_KEY_ENV,
   };
 }
 
@@ -2329,6 +2349,9 @@ async function configureMainConnectionViaGui({ cdp, input, sink, options, state 
       action: "main-provider-model",
       sink,
     });
+    if (desired.apiKeyEnv !== MAIN_API_KEY_ENV) await replaceExactText({
+      cdp, input, locator: MAIN_API_KEY, text: desired.apiKeyEnv, action: "main-provider-api-key-env", sink,
+    });
     const dirty = await waitForMainPreferencesObservation({
       action: "editing the Main connection draft",
       label: "case5_2 exact dirty Main Preferences",
@@ -2355,7 +2378,7 @@ async function configureMainConnectionViaGui({ cdp, input, sink, options, state 
       accept: (value) => exactMainSettingsControls(value, desired, { dirty: false })
         && advancedConfigTarget(value?.projection?.config_target, baselineTarget)
         && mainConfigurationFailures(value.projection, options).length === 0
-        && configField(value.projection, "model.api_key_env") === MAIN_API_KEY_ENV,
+        && configField(value.projection, "model.api_key_env") === desired.apiKeyEnv,
     });
     const commandSnapshot = await waitForMainPreferencesObservation({
       action: "saving the Main connection command",
@@ -2852,6 +2875,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
   const expectedFields = new Map([
     ["model.base_url", options.providerBaseUrl],
     ["model.model", options.mainModel],
+    ["model.api_key_env", options.apiKeyEnv ?? MAIN_API_KEY_ENV],
     ["model.provider_profile", options.providerProfile],
     ["model.request_timeout_ms", String(QUALITY_REQUEST_TIMEOUT_MS)],
     ["model.max_retries", "0"],
@@ -2870,6 +2894,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
   for (const [key, expected, actual] of [
     ["provider_effective_base_url", options.providerBaseUrl, projection?.provider_effective_base_url],
     ["provider_effective_model_id", options.mainModel, projection?.provider_effective_model_id],
+    ["provider_effective_api_key_env", options.apiKeyEnv ?? MAIN_API_KEY_ENV, projection?.provider_effective_api_key_env],
     ["provider_effective_context_window", String(QUALITY_CONTEXT_WINDOW), projection?.provider_effective_context_window],
     ["provider_effective_profile", options.providerProfile, projection?.provider_effective_profile],
   ]) {
@@ -2881,6 +2906,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
       ["session_settings.available", true, settings?.available],
       ["session_settings.base_url", options.providerBaseUrl, settings?.base_url],
       ["session_settings.model", options.mainModel, settings?.model],
+      ["session_settings.api_key_env", options.apiKeyEnv ?? MAIN_API_KEY_ENV, settings?.api_key_env],
       ["session_settings.provider_profile", options.providerProfile, settings?.provider_profile],
       ["session_settings.access_mode", "auto_review", settings?.access_mode],
       ["session_settings.context_window", "", settings?.context_window],
@@ -3430,7 +3456,7 @@ async function runPythonTest({ context, sink, state, python, name, cwd, args, ex
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONPYCACHEPREFIX: cacheRoot,
       ...extraEnv,
-    }),
+    }, state.apiKeyEnv),
     timeoutMs: 30 * 60 * 1000,
     state,
     label: name,
@@ -4102,6 +4128,7 @@ async function cleanupWebviewInput(input, state, label) {
 export function createCase52Scenario(rawOptions = {}) {
   const options = normalizeCase52Options(rawOptions);
   const state = {
+    apiKeyEnv: options.apiKeyEnv ?? "",
     baseline: null,
     seed: null,
     promptInputs: null,

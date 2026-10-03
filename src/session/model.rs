@@ -796,12 +796,12 @@ pub struct CanonicalSessionRead {
     /// Cumulative usage derived from canonical terminal events for this session.
     ///
     /// `terminal_turn_count` includes every durable terminal, while
-    /// `measured_turn_count` includes only terminals whose provider reported
-    /// token usage. `reasoning_measured_turn_count` separately tracks the
-    /// optional reasoning field within those reports; `reasoning_tokens` is
+    /// `measured_turn_count` includes only terminals with reported cumulative
+    /// usage. Request counts retain gaps within a turn, and `unrecorded_turn_count`
+    /// records terminals without cumulative telemetry. `reasoning_tokens` is
     /// absent until at least one provider reports it and is only a partial sum
-    /// while that count trails `measured_turn_count`. Consumers must preserve
-    /// both distinctions instead of presenting missing telemetry as zero.
+    /// while `reasoning_reported_request_count` trails `reported_request_count`.
+    /// Consumers must preserve these gaps instead of presenting missing reports as zero.
     #[serde(default)]
     pub session_token_usage: CanonicalSessionTokenUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,13 +812,15 @@ pub struct CanonicalSessionRead {
     pub active_turn_sequence_no: Option<i64>,
     #[serde(default)]
     pub admission_revision: u64,
-    /// Read-only aggregate from the same SQLite snapshot, independent of page limits.
+    /// Latest turn's display progress from the same SQLite snapshot, independent
+    /// of page limits. Unsuccessful completed operations count as display failures;
+    /// durable terminal failure metrics retain their dispatch lifecycle meaning.
     #[serde(skip)]
-    pub active_turn_progress: Option<CanonicalActiveTurnProgress>,
+    pub turn_progress: Option<CanonicalTurnProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalActiveTurnProgress {
+pub struct CanonicalTurnProgress {
     pub turn_id: TurnId,
     pub model_request_count: usize,
     pub tool_call_count: usize,
@@ -835,6 +837,14 @@ pub struct CanonicalSessionTokenUsage {
     pub measured_turn_count: usize,
     #[serde(default)]
     pub reasoning_measured_turn_count: usize,
+    #[serde(default)]
+    pub model_request_count: usize,
+    #[serde(default)]
+    pub reported_request_count: usize,
+    #[serde(default)]
+    pub reasoning_reported_request_count: usize,
+    #[serde(default)]
+    pub unrecorded_turn_count: usize,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
@@ -1064,6 +1074,11 @@ pub struct RunMetrics {
     pub elapsed_ms: Option<u64>,
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    /// Provider usage across the requests made by this turn, including
+    /// compaction and permission review. Missing reports remain countable gaps.
+    /// `token_usage` retains its historical latest-response meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_token_usage: Option<CumulativeTokenUsage>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_calls_by_name: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1130,6 +1145,40 @@ pub struct TokenUsage {
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CumulativeTokenUsage {
+    pub reported_request_count: usize,
+    pub reasoning_reported_request_count: usize,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl CumulativeTokenUsage {
+    /// Account once when a model request returns its typed response or error.
+    /// Request attempts are owned by RunMetrics::model_request_count.
+    pub(crate) fn record_response(&mut self, usage: Option<&TokenUsage>) {
+        let Some(usage) = usage else { return };
+        self.reported_request_count = self.reported_request_count.saturating_add(1);
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(u64::from(usage.prompt_tokens));
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(u64::from(usage.completion_tokens));
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(u64::from(usage.total_tokens));
+        if let Some(reasoning_tokens) = usage.reasoning_tokens {
+            self.reasoning_reported_request_count =
+                self.reasoning_reported_request_count.saturating_add(1);
+            let accumulated = self.reasoning_tokens.get_or_insert(0);
+            *accumulated = accumulated.saturating_add(u64::from(reasoning_tokens));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1454,6 +1503,49 @@ impl RunEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_usage_preserves_missing_reports_and_exceeds_single_response_width() {
+        let mut cumulative = CumulativeTokenUsage::default();
+        cumulative.record_response(None);
+        assert_eq!(cumulative.reported_request_count, 0);
+        assert_eq!(cumulative.reasoning_tokens, None);
+
+        let usage = TokenUsage {
+            prompt_tokens: u32::MAX,
+            completion_tokens: 10,
+            total_tokens: u32::MAX,
+            reasoning_tokens: Some(0),
+        };
+        cumulative.record_response(Some(&usage));
+        cumulative.record_response(None);
+        cumulative.record_response(Some(&usage));
+        assert_eq!(cumulative.reported_request_count, 2);
+        assert_eq!(cumulative.reasoning_reported_request_count, 2);
+        assert_eq!(cumulative.total_tokens, 2 * u64::from(u32::MAX));
+        assert_eq!(cumulative.reasoning_tokens, Some(0));
+    }
+
+    #[test]
+    fn legacy_run_metrics_keep_latest_usage_without_inventing_cumulative_usage() {
+        let legacy: RunMetrics = serde_json::from_value(serde_json::json!({
+            "model_request_count": 3,
+            "token_usage": {
+                "prompt_tokens": 10, "completion_tokens": 5,
+                "total_tokens": 15, "reasoning_tokens": null
+            }
+        }))
+        .expect("legacy run metrics");
+        assert_eq!(legacy.model_request_count, 3);
+        assert_eq!(legacy.token_usage.as_ref().unwrap().total_tokens, 15);
+        assert!(legacy.cumulative_token_usage.is_none());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("cumulative_token_usage")
+                .is_none()
+        );
+    }
 
     #[test]
     fn run_event_durability_keeps_only_display_telemetry_runtime_only() {

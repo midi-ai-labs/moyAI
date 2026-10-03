@@ -35,6 +35,7 @@ import {
   createPermissionTempEscalationScenario,
 } from "./scenarios/permission_temp_escalation.mjs";
 import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
+import { createToolOperationFailureScenario } from "./scenarios/tool_operation_failure.mjs";
 import { createProviderResponsesCompactionRetryScenario } from "./scenarios/provider_responses_compaction_retry.mjs";
 import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
@@ -60,6 +61,13 @@ import { createGlobalAdditionalControlsScenario, createInitialAdditionalControls
 import { createAgentInterruptScenario } from "./scenarios/agent_interrupt.mjs";
 import { createExternalRejoinScenario, createExternalSidebarStopScenario, createExternalPaletteRejoinScenario } from "./scenarios/external_navigation_controls.mjs";
 import { createCase52Scenario } from "./scenarios/case5_2.mjs";
+import { createManualCase1Scenario } from "./scenarios/manual_case1.mjs";
+import { createManualCase2Scenario } from "./scenarios/manual_case2.mjs";
+import { createManualCase3Scenario } from "./scenarios/manual_case3.mjs";
+import { createManualCase4Scenario } from "./scenarios/manual_case4.mjs";
+import { createManualCase5Scenario } from "./scenarios/manual_case5.mjs";
+import { createManualCase6Scenario } from "./scenarios/manual_case6.mjs";
+import { createManualCase7Scenario } from "./scenarios/manual_case7.mjs";
 import { createHistoryRestartPrependScenario } from "./scenarios/history_restart_prepend.mjs";
 import { createHistoryTerminalReconcileScenario } from "./scenarios/history_terminal_reconcile.mjs";
 
@@ -95,6 +103,13 @@ const factories = new Map([
   ["mcp.receiver-approve", options => createMcpReceiverPermissionScenario({ ...options, decision: "approved" })],
   ["mcp.receiver-deny", options => createMcpReceiverPermissionScenario({ ...options, decision: "denied" })],
   ["mcp.receiver-abort", options => createMcpReceiverPermissionScenario({ ...options, decision: "abort" })],
+  ["manual.case1", createManualCase1Scenario],
+  ["manual.case2", createManualCase2Scenario],
+  ["manual.case3", createManualCase3Scenario],
+  ["manual.case4", createManualCase4Scenario],
+  ["manual.case5", createManualCase5Scenario],
+  ["manual.case6", createManualCase6Scenario],
+  ["manual.case7", createManualCase7Scenario],
   ["manual.case5_2", createCase52Scenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
@@ -126,6 +141,7 @@ const factories = new Map([
   ["permission.guardian-handoff-abort", () => createGuardianHandoffScenario("abort")],
   ["permission.temp-escalation", createPermissionTempEscalationScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
+  ["history.tool-operation-failure", createToolOperationFailureScenario],
   ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],
   ["provider.responses-progress", createProviderResponsesProgressScenario],
   ["provider.restart", createProviderRestartScenario],
@@ -177,6 +193,13 @@ const configurableScenarios = new Set([
   "mcp.receiver-approve",
   "mcp.receiver-deny",
   "mcp.receiver-abort",
+  "manual.case1",
+  "manual.case2",
+  "manual.case3",
+  "manual.case4",
+  "manual.case5",
+  "manual.case6",
+  "manual.case7",
   "manual.case5_2",
   "manual.provider-openai-compatible",
   "manual.provider-lm-studio-thinking",

@@ -26,6 +26,30 @@ pub(crate) enum ProcessSandboxPlan {
     Unrestricted,
 }
 
+/// The default process policy, before an individual action is reviewed.
+/// Selecting it does not inspect or admit any filesystem objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSandboxPolicy {
+    WorkspaceWrite,
+    Unrestricted,
+}
+
+impl ProcessSandboxPolicy {
+    pub(crate) fn for_access_mode(access_mode: AccessMode) -> Self {
+        match access_mode {
+            AccessMode::Default | AccessMode::AutoReview => Self::WorkspaceWrite,
+            AccessMode::FullAccess => Self::Unrestricted,
+        }
+    }
+
+    pub(crate) fn audit_label(self) -> &'static str {
+        match self {
+            Self::WorkspaceWrite => "workspace_write",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+}
+
 impl ProcessSandboxPlan {
     #[cfg(test)]
     pub(crate) fn for_access_mode(
@@ -40,11 +64,11 @@ impl ProcessSandboxPlan {
         workspace: &Workspace,
         config: &ResolvedConfig,
     ) -> Result<Self, SandboxProfileError> {
-        match access_mode {
-            AccessMode::Default | AccessMode::AutoReview => Ok(Self::WorkspaceWrite(
+        match ProcessSandboxPolicy::for_access_mode(access_mode) {
+            ProcessSandboxPolicy::WorkspaceWrite => Ok(Self::WorkspaceWrite(
                 WorkspaceWriteSandboxProfile::from_workspace(workspace, config)?,
             )),
-            AccessMode::FullAccess => Ok(Self::Unrestricted),
+            ProcessSandboxPolicy::Unrestricted => Ok(Self::Unrestricted),
         }
     }
 
@@ -117,6 +141,9 @@ pub(crate) enum WindowsSandboxObjectIdentity {
 }
 
 impl WorkspaceWriteSandboxProfile {
+    pub(crate) const NETWORK_POLICY: SandboxNetworkPolicy =
+        SandboxNetworkPolicy::AdvisoryOfflineEnvironment;
+
     pub(crate) fn from_workspace(
         workspace: &Workspace,
         config: &ResolvedConfig,
@@ -256,7 +283,7 @@ impl WorkspaceWriteSandboxProfile {
             read_only_roots,
             effect_temp_base,
             effect_temp_directory: None,
-            network: SandboxNetworkPolicy::AdvisoryOfflineEnvironment,
+            network: Self::NETWORK_POLICY,
         })
     }
 

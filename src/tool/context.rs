@@ -702,18 +702,28 @@ impl<'a> ToolContext<'a> {
     }
 
     async fn current_permission_access_mode(&self) -> Result<AccessMode, ToolError> {
-        let owner_session_id = self
-            .agent
-            .map(crate::app::AgentRunContext::root_session_id)
-            .unwrap_or(self.session.session.id);
-        Ok(self
-            .services
-            .store
-            .session_repo()
-            .get_session(owner_session_id)
-            .await?
-            .access_mode)
+        Ok(current_permission_access_mode(
+            &self.services.store,
+            self.session.session.id,
+            self.agent,
+        )
+        .await?)
     }
+}
+
+pub(crate) async fn current_permission_access_mode(
+    store: &StoreBundle,
+    session_id: SessionId,
+    agent: Option<&crate::app::AgentRunContext>,
+) -> Result<AccessMode, crate::error::StorageError> {
+    let owner_session_id = agent
+        .map(crate::app::AgentRunContext::root_session_id)
+        .unwrap_or(session_id);
+    Ok(store
+        .session_repo()
+        .get_session(owner_session_id)
+        .await?
+        .access_mode)
 }
 
 fn process_sandbox_plan_for_admission(
@@ -729,7 +739,7 @@ fn process_sandbox_plan_for_admission(
     }
 }
 
-fn approved_process_sandbox_plan(access: AccessKind) -> ProcessSandboxPlan {
+pub(crate) fn approved_process_sandbox_plan(access: AccessKind) -> ProcessSandboxPlan {
     if access == AccessKind::Shell {
         ProcessSandboxPlan::Unrestricted
     } else {

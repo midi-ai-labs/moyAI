@@ -7,6 +7,30 @@ use crate::tool::executable::ResolvedExecutable;
 use crate::tool::os_sandbox::WorkspaceWriteSandboxProfile;
 use crate::tool::truncate::BoundedPipeOutput;
 
+pub(crate) const WORKSPACE_WRITE_PLATFORM_SUPPORTED: bool = cfg!(windows);
+pub(crate) const ADVISORY_PROXY_VARIABLES: [&str; 3] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+pub(crate) const ADVISORY_OFFLINE_PROXY: &str = "http://127.0.0.1:9";
+pub(crate) const ADVISORY_PROXY_BYPASS: &str = "";
+pub(crate) const EFFECT_TEMP_VARIABLES: [&str; 3] = ["TEMP", "TMP", "TMPDIR"];
+
+#[cfg(any(windows, test))]
+fn apply_advisory_offline_environment(environment: &mut HashMap<String, String>) {
+    for key in ADVISORY_PROXY_VARIABLES {
+        environment.insert(key.to_string(), ADVISORY_OFFLINE_PROXY.to_string());
+    }
+    for (key, value) in [
+        ("SBX_NONET_ACTIVE", "1"),
+        ("NO_PROXY", ADVISORY_PROXY_BYPASS),
+        ("PIP_NO_INDEX", "1"),
+        ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+        ("NPM_CONFIG_OFFLINE", "true"),
+        ("CARGO_NET_OFFLINE", "true"),
+        ("GIT_ALLOW_PROTOCOL", ""),
+    ] {
+        environment.insert(key.to_string(), value.to_string());
+    }
+}
+
 pub(crate) fn captured_process_environment(
     shell: &crate::config::ShellConfig,
 ) -> HashMap<String, String> {
@@ -164,8 +188,8 @@ mod windows {
     };
 
     use super::{
-        SandboxExecutionError, SandboxedProcessOutput, SandboxedProcessRequest,
-        WorkspaceWriteSandboxProfile,
+        EFFECT_TEMP_VARIABLES, SandboxExecutionError, SandboxedProcessOutput,
+        SandboxedProcessRequest, WorkspaceWriteSandboxProfile, apply_advisory_offline_environment,
     };
     use crate::tool::os_sandbox::{
         MAX_PINNED_PROTECTED_FILE_BYTES, SandboxPathSnapshot, WindowsSandboxObjectIdentity,
@@ -546,11 +570,11 @@ mod windows {
                     )));
                 }
                 environment.retain(|key, _| {
-                    !["TEMP", "TMP", "TMPDIR"]
+                    !EFFECT_TEMP_VARIABLES
                         .iter()
                         .any(|candidate| key.eq_ignore_ascii_case(candidate))
                 });
-                for key in ["TEMP", "TMP", "TMPDIR"] {
+                for key in EFFECT_TEMP_VARIABLES {
                     environment.insert(key.to_string(), path.to_string());
                 }
                 Ok(())
@@ -2628,25 +2652,6 @@ mod windows {
         })
     }
 
-    fn apply_advisory_offline_environment(
-        environment: &mut std::collections::HashMap<String, String>,
-    ) {
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-            environment.insert(key.to_string(), "http://127.0.0.1:9".to_string());
-        }
-        for (key, value) in [
-            ("SBX_NONET_ACTIVE", "1"),
-            ("NO_PROXY", ""),
-            ("PIP_NO_INDEX", "1"),
-            ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
-            ("NPM_CONFIG_OFFLINE", "true"),
-            ("CARGO_NET_OFFLINE", "true"),
-            ("GIT_ALLOW_PROTOCOL", ""),
-        ] {
-            environment.insert(key.to_string(), value.to_string());
-        }
-    }
-
     fn environment_block(environment: &std::collections::HashMap<String, String>) -> Vec<u16> {
         let mut entries = environment.iter().collect::<Vec<_>>();
         entries.sort_by(|(left, _), (right, _)| {
@@ -3273,6 +3278,41 @@ mod windows {
                 0,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn advisory_offline_environment_preserves_the_existing_overrides() {
+        let mut environment = HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://previous-proxy".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "localhost".to_string()),
+            ("KEEP".to_string(), "inherited".to_string()),
+        ]);
+        apply_advisory_offline_environment(&mut environment);
+        let expected = HashMap::from([
+            ("HTTP_PROXY", "http://127.0.0.1:9"),
+            ("HTTPS_PROXY", "http://127.0.0.1:9"),
+            ("ALL_PROXY", "http://127.0.0.1:9"),
+            ("SBX_NONET_ACTIVE", "1"),
+            ("NO_PROXY", ""),
+            ("PIP_NO_INDEX", "1"),
+            ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+            ("NPM_CONFIG_OFFLINE", "true"),
+            ("CARGO_NET_OFFLINE", "true"),
+            ("GIT_ALLOW_PROTOCOL", ""),
+            ("KEEP", "inherited"),
+        ])
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<HashMap<_, _>>();
+        assert_eq!(environment, expected);
     }
 }
 

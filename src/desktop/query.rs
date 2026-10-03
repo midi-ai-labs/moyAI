@@ -331,7 +331,7 @@ pub(crate) fn build_session_detail_with_roots(
     if let (Some(storage_root), Some(display_root)) = (storage_root, display_root) {
         ui_state.set_file_change_display_roots(storage_root, display_root);
     }
-    ui_state.load_turn_items_with_active_turn(session, turn_items, read.active_turn_id);
+    ui_state.load_canonical_session_read(read);
     let file_changes =
         file_change_rows_from_turn_items_with_roots(turn_items, storage_root, display_root);
     let mut detail = build_session_detail_from_app_state(&ui_state);
@@ -381,7 +381,7 @@ struct TurnTranscriptGroup {
     user_history_item_id: Option<crate::protocol::HistoryItemId>,
     assistant_bodies: Vec<String>,
     assistant_history_item_ids: Vec<Option<crate::protocol::HistoryItemId>>,
-    tool_rows: Vec<String>,
+    tool_rows: Vec<(crate::session::ToolCallId, String)>,
     file_change_items: Vec<crate::protocol::TurnItem>,
     system_rows: Vec<DesktopTranscriptRow>,
     agent_rows: Vec<DesktopTranscriptRow>,
@@ -520,11 +520,11 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots
                 }
             }
             crate::protocol::TurnItemPayload::ToolStatus {
+                call_id,
                 tool,
                 title,
                 status,
                 summary,
-                ..
             } => {
                 if *status == crate::protocol::ToolLifecycleStatus::Failed {
                     current.system_rows.push(desktop_transcript_row(
@@ -535,10 +535,9 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots
                         Vec::new(),
                     ));
                 }
-                current.tool_rows.push(format_tool_history_row(
-                    *status,
-                    title.trim(),
-                    summary.trim(),
+                current.tool_rows.push((
+                    *call_id,
+                    format_tool_history_row(*status, title.trim(), summary.trim()),
                 ));
             }
             crate::protocol::TurnItemPayload::FileChange { .. } => {
@@ -892,7 +891,7 @@ fn turn_work_summary_body(
 
 fn turn_work_history_text(group: &TurnTranscriptGroup) -> String {
     let mut rows = Vec::new();
-    rows.extend(group.tool_rows.iter().take(12).cloned());
+    rows.extend(group.tool_rows.iter().take(12).map(|(_, row)| row.clone()));
     let assistant_previews = folded_intermediate_assistant_history_rows(group);
     if !assistant_previews.is_empty() {
         rows.push("- 作業途中の応答".to_string());
@@ -957,7 +956,13 @@ fn turn_summary_text(
         ));
     }
     if !group.tool_rows.is_empty() {
-        lines.push(format!("- コマンド/ツール: {}件", group.tool_rows.len()));
+        let tool_call_count = group
+            .tool_rows
+            .iter()
+            .map(|(call_id, _)| *call_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        lines.push(format!("- コマンド/ツール: {tool_call_count}件"));
     }
     lines.join("\n")
 }
@@ -1363,7 +1368,7 @@ fn work_summary_body(state: &AppState, file_changes: &[DesktopFileChangeRow]) ->
             "### 完了\n- 状態: {}\n- ツール: {}件実行 / {}件失敗\n- ファイル変更: {}件",
             format_session_status(summary.status()),
             summary.tool_call_count(),
-            summary.failed_tool_count(),
+            state.progress.tool_calls_failed,
             summary.change_count()
         ));
     }
@@ -1394,27 +1399,11 @@ fn current_run_summary_text(state: &AppState, file_changes: &[DesktopFileChangeR
                 .join(", ")
         ));
     }
-    if !state.tool_statuses.is_empty() {
-        let completed = state
-            .tool_statuses
-            .iter()
-            .filter(|tool| tool.status == ToolCallStatus::Completed)
-            .count();
-        let failed = state
-            .tool_statuses
-            .iter()
-            .filter(|tool| tool.status == ToolCallStatus::Failed)
-            .count();
-        let declined = state
-            .tool_statuses
-            .iter()
-            .filter(|tool| tool.status == ToolCallStatus::Declined)
-            .count();
-        let cancelled = state
-            .tool_statuses
-            .iter()
-            .filter(|tool| tool.status == ToolCallStatus::Cancelled)
-            .count();
+    if state.progress.tool_calls_started > 0 {
+        let completed = state.progress.tool_calls_completed;
+        let failed = state.progress.tool_calls_failed;
+        let declined = state.progress.tool_calls_declined;
+        let cancelled = state.progress.tool_calls_cancelled;
         let mut counts = vec![format!("{completed}件完了")];
         if declined > 0 {
             counts.push(format!("{declined}件拒否"));
@@ -1643,13 +1632,21 @@ fn format_run_status_text(state: &AppState) -> String {
 fn format_session_usage_projection(
     usage: &crate::session::CanonicalSessionTokenUsage,
 ) -> (String, String, String) {
-    if usage.measured_turn_count == 0 {
+    let unrecorded = if usage.unrecorded_turn_count > 0 {
+        format!(
+            "全応答の累計が記録されていない依頼{}件は含みません。",
+            usage.unrecorded_turn_count
+        )
+    } else {
+        String::new()
+    };
+    if usage.reported_request_count == 0 {
         let title = if usage.terminal_turn_count == 0 {
             "完了した依頼のトークン使用量は、まだ記録されていません。".to_string()
         } else {
             format!(
-                "完了した{}件の依頼について、AIから使用量が報告されていません。使用量は不明です。",
-                usage.terminal_turn_count
+                "完了した{}件の依頼について、モデル要求 0 / {}回を計測。使用量は不明です。{}",
+                usage.terminal_turn_count, usage.model_request_count, unrecorded
             )
         };
         return (
@@ -1659,12 +1656,13 @@ fn format_session_usage_projection(
         );
     }
 
-    let total_partial = usage.measured_turn_count < usage.terminal_turn_count;
-    let reasoning_partial = usage.reasoning_measured_turn_count < usage.measured_turn_count;
+    let total_partial =
+        usage.reported_request_count < usage.model_request_count || usage.unrecorded_turn_count > 0;
+    let reasoning_partial = usage.reasoning_reported_request_count < usage.reported_request_count;
     let partial = total_partial || reasoning_partial;
     let label_suffix = if total_partial {
         "（一部）"
-    } else if usage.reasoning_measured_turn_count == 0 {
+    } else if usage.reasoning_reported_request_count == 0 {
         "（思考分は未計測）"
     } else if reasoning_partial {
         "（思考分は一部のみ）"
@@ -1678,15 +1676,17 @@ fn format_session_usage_projection(
     );
     let reasoning = match usage.reasoning_tokens {
         None => format!(
-            "思考分は未計測（{}件すべて未報告）",
-            usage.measured_turn_count
+            "思考分は未計測（{}回すべて未報告）",
+            usage.reported_request_count
         ),
         Some(reasoning_tokens)
-            if usage.reasoning_measured_turn_count < usage.measured_turn_count =>
+            if usage.reasoning_reported_request_count < usage.reported_request_count =>
         {
             format!(
-                "思考分 {}（{} / {}件の計測分のみ）",
-                reasoning_tokens, usage.reasoning_measured_turn_count, usage.measured_turn_count
+                "思考分 {}（{} / {}回の計測分のみ）",
+                reasoning_tokens,
+                usage.reasoning_reported_request_count,
+                usage.reported_request_count
             )
         }
         Some(reasoning_tokens) => format!("思考分 {reasoning_tokens}"),
@@ -1695,21 +1695,23 @@ fn format_session_usage_projection(
         (true, true) => {
             "使用量とそのうちの思考分は、どちらも報告された分だけの合計です。未報告分は含みません。"
         }
-        (true, false) => "報告された分だけの合計です。使用量が不明な依頼は含みません。",
+        (true, false) => "報告された分だけの合計です。未報告分は含みません。",
         (false, true) => {
-            "合計使用量はすべての依頼で計測済みです。そのうち思考分は、報告された分だけを表示します。"
+            "合計使用量は完了した依頼のすべてのモデル要求で計測済みです。そのうち思考分は、報告された分だけを表示します。"
         }
         (false, false) => "完了した依頼の累計です。",
     };
     let title = format!(
-        "完了した依頼のうち {} / {}件を計測。入力 {}、出力 {}、{}、合計 {} トークン。{}",
-        usage.measured_turn_count,
+        "完了した依頼{}件、モデル要求 {} / {}回を計測。入力 {}、出力 {}、{}、合計 {} トークン。{}{}",
         usage.terminal_turn_count,
+        usage.reported_request_count,
+        usage.model_request_count,
         usage.prompt_tokens,
         usage.completion_tokens,
         reasoning,
         usage.total_tokens,
-        completeness
+        completeness,
+        unrecorded
     );
     (
         label,
@@ -1894,7 +1896,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms,
             session_token_usage: Default::default(),
-            active_turn_progress: None,
+            turn_progress: None,
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -1946,6 +1948,62 @@ mod tests {
     }
 
     #[test]
+    fn session_usage_projection_preserves_request_coverage_and_legacy_unknowns() {
+        let partial: crate::session::CanonicalSessionTokenUsage =
+            serde_json::from_value(serde_json::json!({
+                "terminal_turn_count": 1,
+                "measured_turn_count": 1,
+                "reasoning_measured_turn_count": 1,
+                "model_request_count": 3,
+                "reported_request_count": 2,
+                "reasoning_reported_request_count": 2,
+                "unrecorded_turn_count": 0,
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "total_tokens": 42,
+                "reasoning_tokens": 4
+            }))
+            .unwrap();
+        let (label, title, state) = format_session_usage_projection(&partial);
+        assert_eq!(label, "このチャットの累計: 42 トークン（一部）");
+        assert_eq!(state, "partial");
+        assert!(title.contains("モデル要求 2 / 3回を計測"));
+        assert!(!title.contains("すべての依頼で計測済み"));
+
+        let mut mixed = partial;
+        mixed.terminal_turn_count = 2;
+        mixed.reported_request_count = 3;
+        mixed.reasoning_reported_request_count = 3;
+        mixed.unrecorded_turn_count = 1;
+        let (label, title, state) = format_session_usage_projection(&mixed);
+        assert_eq!(label, "このチャットの累計: 42 トークン（一部）");
+        assert_eq!(state, "partial");
+        assert!(title.contains("累計が記録されていない依頼1件は含みません"));
+
+        let legacy: crate::session::CanonicalSessionTokenUsage =
+            serde_json::from_value(serde_json::json!({
+                "terminal_turn_count": 1,
+                "measured_turn_count": 0,
+                "reasoning_measured_turn_count": 0,
+                "model_request_count": 3,
+                "reported_request_count": 0,
+                "reasoning_reported_request_count": 0,
+                "unrecorded_turn_count": 1,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "reasoning_tokens": null
+            }))
+            .unwrap();
+        let (label, title, state) = format_session_usage_projection(&legacy);
+        assert_eq!(label, "このチャットの累計: 未計測");
+        assert_eq!(state, "missing");
+        assert!(title.contains("累計が記録されていない依頼1件"));
+        assert!(title.contains("全応答の累計"));
+        assert!(!title.contains("0 トークン"));
+    }
+
+    #[test]
     fn session_usage_projection_distinguishes_missing_partial_and_complete() {
         let (label, title, state) =
             format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage::default());
@@ -1958,6 +2016,10 @@ mod tests {
                 terminal_turn_count: 3,
                 measured_turn_count: 2,
                 reasoning_measured_turn_count: 1,
+                model_request_count: 5,
+                reported_request_count: 4,
+                reasoning_reported_request_count: 2,
+                unrecorded_turn_count: 0,
                 prompt_tokens: 1_200,
                 completion_tokens: 300,
                 total_tokens: 1_500,
@@ -1965,8 +2027,8 @@ mod tests {
             });
         assert_eq!(label, "このチャットの累計: 1.5k トークン（一部）");
         assert_eq!(state, "partial");
-        assert!(title.contains("2 / 3件を計測"));
-        assert!(title.contains("思考分 80（1 / 2件の計測分のみ）"));
+        assert!(title.contains("モデル要求 4 / 5回を計測"));
+        assert!(title.contains("思考分 80（2 / 4回の計測分のみ）"));
         assert!(title.contains("どちらも報告された分だけの合計"));
 
         let (label, title, state) =
@@ -1974,6 +2036,10 @@ mod tests {
                 terminal_turn_count: 2,
                 measured_turn_count: 2,
                 reasoning_measured_turn_count: 0,
+                model_request_count: 3,
+                reported_request_count: 3,
+                reasoning_reported_request_count: 0,
+                unrecorded_turn_count: 0,
                 prompt_tokens: 900,
                 completion_tokens: 100,
                 total_tokens: 1_000,
@@ -1981,15 +2047,19 @@ mod tests {
             });
         assert_eq!(label, "このチャットの累計: 1k トークン（思考分は未計測）");
         assert_eq!(state, "partial");
-        assert!(title.contains("思考分は未計測（2件すべて未報告）"));
+        assert!(title.contains("思考分は未計測（3回すべて未報告）"));
         assert!(!title.contains("思考分 0"));
-        assert!(title.contains("合計使用量はすべての依頼で計測済み"));
+        assert!(title.contains("すべてのモデル要求で計測済み"));
 
         let (label, title, state) =
             format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
                 terminal_turn_count: 2,
                 measured_turn_count: 2,
                 reasoning_measured_turn_count: 2,
+                model_request_count: 3,
+                reported_request_count: 3,
+                reasoning_reported_request_count: 3,
+                unrecorded_turn_count: 0,
                 prompt_tokens: 900,
                 completion_tokens: 100,
                 total_tokens: 1_000,
@@ -3338,6 +3408,32 @@ mod tests {
     }
 
     #[test]
+    fn current_work_summary_counts_operations_outside_the_loaded_tool_page() {
+        let session_id = SessionId::new();
+        let mut state = AppState::default();
+        state.current_session_id = Some(session_id);
+        state.progress.tool_calls_started = 4;
+        state.progress.tool_calls_completed = 2;
+        state.progress.tool_calls_declined = 1;
+        state.progress.tool_calls_failed = 1;
+        state.apply_run_summary(crate::session::RunSummary::from_terminal(
+            session_id,
+            crate::protocol::TurnId::new(),
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 4,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        ));
+        assert!(state.tool_statuses.is_empty());
+        assert!(current_run_summary_text(&state, &[]).contains("2件完了 / 1件拒否 / 1件失敗"));
+        assert!(work_summary_body(&state, &[]).contains("4件実行 / 1件失敗"));
+    }
+
+    #[test]
     fn live_completed_work_summary_uses_terminal_elapsed_not_session_elapsed() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
@@ -3367,6 +3463,95 @@ mod tests {
             .expect("completed work summary");
 
         assert_eq!(row.title, "50s作業しました");
+    }
+
+    #[test]
+    fn stored_turn_work_summary_counts_tool_calls_by_identity() {
+        use crate::protocol::ToolLifecycleStatus;
+        use crate::session::ToolCallId;
+        use crate::session::markdown::{MarkdownExportEvent, render_codex_turn_block_markdown};
+
+        for (terminal_status, terminal_label) in [
+            (ToolLifecycleStatus::Completed, "完了"),
+            (ToolLifecycleStatus::Failed, "失敗"),
+            (ToolLifecycleStatus::Declined, "拒否"),
+            (ToolLifecycleStatus::Cancelled, "キャンセル"),
+        ] {
+            for call_count in [1, 2] {
+                let session = session_record(ProjectId::new(), "tool lifecycle");
+                let turn_id = crate::protocol::TurnId::new();
+                let item = |sequence_no, payload| TurnItem {
+                    id: crate::protocol::TurnItemId::new(),
+                    session_id: session.id,
+                    turn_id,
+                    source_item_id: None,
+                    sequence_no,
+                    payload,
+                };
+                let mut turn_items = vec![item(
+                    1,
+                    TurnItemPayload::UserMessage {
+                        text: "Run the command.".to_string(),
+                    },
+                )];
+                for _ in 0..call_count {
+                    let call_id = ToolCallId::new();
+                    for status in [
+                        ToolLifecycleStatus::Pending,
+                        ToolLifecycleStatus::Running,
+                        terminal_status,
+                    ] {
+                        turn_items.push(item(
+                            turn_items.len() as i64 + 1,
+                            TurnItemPayload::ToolStatus {
+                                call_id,
+                                tool: crate::tool::ToolName::Shell,
+                                status,
+                                title: "shell".to_string(),
+                                summary: String::new(),
+                            },
+                        ));
+                    }
+                }
+                turn_items.push(item(
+                    turn_items.len() as i64 + 1,
+                    TurnItemPayload::Terminal {
+                        outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    },
+                ));
+                let read = canonical_read_with_elapsed(&session, turn_items, Default::default());
+                let detail = build_session_detail(&read, None);
+                let row = detail
+                    .transcript_rows
+                    .iter()
+                    .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+                    .expect("stored work summary");
+                let count_line = format!("- コマンド/ツール: {call_count}件");
+
+                assert!(
+                    row.body.lines().any(|line| line == count_line),
+                    "{terminal_status:?}, {call_count} distinct calls: {}",
+                    row.body
+                );
+                for label in ["待機", "実行中", terminal_label] {
+                    let history_line = format!("- [{label}] shell");
+                    assert_eq!(
+                        row.body.matches(history_line.as_str()).count(),
+                        call_count,
+                        "each call must retain its {label} lifecycle row"
+                    );
+                }
+                let markdown = render_codex_turn_block_markdown(
+                    &session.title,
+                    &[
+                        MarkdownExportEvent::user("Run the command."),
+                        MarkdownExportEvent::detail(&row.title, &row.body),
+                    ],
+                    &[],
+                );
+                assert!(markdown.lines().any(|line| line == count_line));
+            }
+        }
     }
 
     #[test]

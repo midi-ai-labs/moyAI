@@ -372,16 +372,21 @@ function chatToolContinuationScript(value) {
   }
   if (!Object.hasOwn(value, "call")) return Object.freeze({ kind: value.kind });
   const call = value.call;
-  if (!exactKeys(call, ["prompt", "name", "arguments", "outputMarker", "responseText"])
+  const callKeys = ["prompt", "name", "arguments", "outputMarker", "responseText"];
+  if (Object.hasOwn(call ?? {}, "outputMaxBytes")) callKeys.push("outputMaxBytes");
+  if (!exactKeys(call, callKeys)
     || !/^[a-z][a-z0-9_]{1,63}$/.test(call.name ?? "")
     || call.arguments === null || typeof call.arguments !== "object" || Array.isArray(call.arguments)
-    || Buffer.byteLength(JSON.stringify(call.arguments), "utf8") > 32768) {
+    || Buffer.byteLength(JSON.stringify(call.arguments), "utf8") > 32768
+    || (Object.hasOwn(call, "outputMaxBytes") && (!Number.isSafeInteger(call.outputMaxBytes)
+      || call.outputMaxBytes < 1 || call.outputMaxBytes > 2048))) {
     throw new TypeError("Chat continuation call requires one bounded tool and exact arguments");
   }
   return Object.freeze({ kind: value.kind, call: Object.freeze({
     prompt: nonEmptyString(call.prompt, "call.prompt"), name: call.name,
     arguments: structuredClone(call.arguments), outputMarker: nonEmptyString(call.outputMarker, "call.outputMarker"),
     responseText: nonEmptyString(call.responseText, "call.responseText"),
+    ...(Object.hasOwn(call, "outputMaxBytes") ? { outputMaxBytes: call.outputMaxBytes } : {}),
   }) });
 }
 
@@ -1288,7 +1293,7 @@ function chatToolContinuationRole(body, script) {
   const expectedName = script.call?.name ?? "current_time";
   const expectedArguments = JSON.stringify(script.call?.arguments ?? {});
   const outputMatches = value => script.call
-    ? typeof value === "string" && Buffer.byteLength(value, "utf8") <= CHAT_TOOL_OUTPUT_MAX_BYTES && value.includes(script.call.outputMarker)
+    ? typeof value === "string" && Buffer.byteLength(value, "utf8") <= (script.call.outputMaxBytes ?? CHAT_TOOL_OUTPUT_MAX_BYTES) && value.includes(script.call.outputMarker)
     : currentTimeToolOutputShape(value);
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const systemText = exactChatTextMessage(messages[0], "system");

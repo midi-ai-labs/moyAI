@@ -64,6 +64,13 @@ test("one registry binds every reusable scenario to the common runner contract",
     "mcp.receiver-approve",
     "mcp.receiver-deny",
     "mcp.receiver-abort",
+    "manual.case1",
+    "manual.case2",
+    "manual.case3",
+    "manual.case4",
+    "manual.case5",
+    "manual.case6",
+    "manual.case7",
     "manual.case5_2",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
@@ -95,6 +102,7 @@ test("one registry binds every reusable scenario to the common runner contract",
     "permission.guardian-handoff-abort",
     "permission.temp-escalation",
     "provider.chat-tool-continuation",
+    "history.tool-operation-failure",
     "provider.responses-compaction-retry",
     "provider.responses-progress",
     "provider.restart",
@@ -120,8 +128,18 @@ test("one registry binds every reusable scenario to the common runner contract",
     "side-chat.session",
   ]);
   for (const id of scenarioIds) {
-    const options = id === "manual.case5_2"
-      ? case52Options
+    const options = id === "manual.case2"
+      ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", image_source: "C:/fixture/reference.jpg" }
+      : id === "manual.case5"
+        ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/repository" }
+      : id === "manual.case7"
+        ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/documents", docling_base_url: "http://docling.invalid:8123" }
+      : id === "manual.case3"
+      ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/case1" }
+      : ["manual.case1", "manual.case4", "manual.case6"].includes(id)
+      ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe" }
+      : id === "manual.case5_2"
+        ? case52Options
       : id === "manual.provider-openai-compatible"
         ? liveProviderOptions
         : id === "manual.provider-lm-studio-thinking"

@@ -68,13 +68,10 @@ impl OpenSessionView {
         self.read.active_turn_id
     }
 
-    pub fn active_turn_progress(
-        &self,
-    ) -> Option<&crate::session::model::CanonicalActiveTurnProgress> {
-        self.read
-            .active_turn_progress
-            .as_ref()
-            .filter(|progress| Some(progress.turn_id) == self.read.active_turn_id)
+    pub fn turn_progress(&self) -> Option<&crate::session::model::CanonicalTurnProgress> {
+        self.read.turn_progress.as_ref().filter(|progress| {
+            Some(progress.turn_id) == self.read.active_turn_id.or(self.read.latest_turn_id)
+        })
     }
 
     pub fn latest_turn_id(&self) -> Option<crate::protocol::TurnId> {
@@ -181,7 +178,7 @@ impl OpenSessionView {
         self.read.latest_turn_id = incoming.latest_turn_id;
         self.read.active_turn_id = incoming.active_turn_id;
         self.read.active_turn_sequence_no = incoming.active_turn_sequence_no;
-        self.read.active_turn_progress = incoming.active_turn_progress.clone();
+        self.read.turn_progress = incoming.turn_progress.clone();
         self.read.admission_revision = incoming.admission_revision;
         self.read.turn_elapsed_ms.extend(
             incoming
@@ -741,7 +738,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
-            active_turn_progress: None,
+            turn_progress: None,
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -864,6 +861,10 @@ mod tests {
             terminal_turn_count: 1,
             measured_turn_count: 1,
             reasoning_measured_turn_count: 1,
+            model_request_count: 1,
+            reported_request_count: 1,
+            reasoning_reported_request_count: 1,
+            unrecorded_turn_count: 0,
             prompt_tokens: 80,
             completion_tokens: 20,
             total_tokens: 100,
@@ -875,6 +876,10 @@ mod tests {
             terminal_turn_count: 2,
             measured_turn_count: 2,
             reasoning_measured_turn_count: 2,
+            model_request_count: 2,
+            reported_request_count: 2,
+            reasoning_reported_request_count: 2,
+            unrecorded_turn_count: 0,
             prompt_tokens: 200,
             completion_tokens: 50,
             total_tokens: 250,
@@ -1088,7 +1093,7 @@ mod tests {
         running_read.active_turn_id = Some(turn_id);
         let mut view = OpenSessionView::from_loaded(&running_read);
         let mut live = AppState::default();
-        live.load_turn_items_with_active_turn(&running_session, &items, Some(turn_id));
+        live.load_turn_items_with_active_turn(&running_session, &items, Some(turn_id), None);
 
         let running_identity = view
             .live_detail(&live, None)
@@ -1127,7 +1132,7 @@ mod tests {
             items.clone(),
         );
         assert!(view.merge_contiguous(&completed_read));
-        live.load_turn_items_with_active_turn(&completed_session, &items, None);
+        live.load_turn_items_with_active_turn(&completed_session, &items, None, None);
         live.apply_run_summary(crate::session::RunSummary::from_terminal(
             completed_session.id,
             turn_id,

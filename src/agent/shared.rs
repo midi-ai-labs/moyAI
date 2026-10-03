@@ -79,6 +79,8 @@ pub(crate) struct SharedProgress {
     pub tool_calls_by_name: BTreeMap<String, usize>,
     pub failed_tool_calls_by_name: BTreeMap<String, usize>,
     pub latest_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_token_usage: Option<crate::session::CumulativeTokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,5 +179,53 @@ impl SharedRunContext {
                 Ok(receipt)
             })
             .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::CumulativeTokenUsage;
+
+    #[test]
+    fn shared_progress_resumes_cumulative_usage_without_recounting_latest_response() {
+        let latest = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            reasoning_tokens: None,
+        };
+        let mut cumulative = CumulativeTokenUsage::default();
+        cumulative.record_response(Some(&latest));
+        let progress = SharedProgress {
+            model_request_count: 1,
+            latest_usage: Some(latest.clone()),
+            cumulative_token_usage: Some(cumulative),
+            ..Default::default()
+        };
+        let restored: SharedProgress = serde_json::from_value(
+            serde_json::to_value(&progress).expect("checkpoint progress JSON"),
+        )
+        .expect("restored checkpoint progress");
+        let mut resumed = restored.cumulative_token_usage.unwrap_or_default();
+        let request_count = restored.model_request_count + 1;
+        resumed.record_response(Some(&latest));
+        assert_eq!(request_count, 2);
+        assert_eq!(resumed.reported_request_count, 2);
+        assert_eq!(resumed.total_tokens, 30);
+
+        let mut legacy_json = serde_json::to_value(progress).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("cumulative_token_usage");
+        let legacy: SharedProgress = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.latest_usage.as_ref().unwrap().total_tokens, 15);
+        assert!(legacy.cumulative_token_usage.is_none());
+        let mut resumed_legacy = legacy.cumulative_token_usage.unwrap_or_default();
+        resumed_legacy.record_response(Some(&latest));
+        assert_eq!(legacy.model_request_count + 1, 2);
+        assert_eq!(resumed_legacy.reported_request_count, 1);
+        assert_eq!(resumed_legacy.total_tokens, 15);
     }
 }

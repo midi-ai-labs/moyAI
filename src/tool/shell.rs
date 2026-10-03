@@ -1193,7 +1193,14 @@ fn shell_references_network_path(workdir: &Utf8Path, command: &str) -> bool {
 }
 
 fn is_windows_unc_path(path: &Utf8Path) -> bool {
-    path.as_str().replace('/', "\\").starts_with("\\\\")
+    let normalized = path.as_str().replace('/', "\\");
+    // Extended DOS paths name the same local drive paths as ordinary DOS paths.
+    // Keep UNC and unknown device namespaces subject to network-path review.
+    let extended_dos_path = normalized.strip_prefix(r"\\?\").is_some_and(|suffix| {
+        let bytes = suffix.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    });
+    normalized.starts_with(r"\\") && !extended_dos_path
 }
 
 fn shell_has_delete_risk(command: &str) -> bool {
@@ -2527,6 +2534,109 @@ mod tests {
             let risks = super::shell_permission_risks(&workspace, command);
             assert!(risks.contains(&crate::tool::PermissionRisk::Network));
             assert!(risks.contains(&crate::tool::PermissionRisk::ExternalConnection));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_permission_intent_accepts_local_workdir_namespaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(root.join("nested")).expect("workspace directories");
+        let extended_root = Utf8PathBuf::from(format!(r"\\?\{root}"));
+        let config = ResolvedConfig::default();
+
+        for workspace_root in [&root, &extended_root] {
+            let workspace = WorkspaceDiscovery::discover_fixed_root(workspace_root, &config)
+                .expect("workspace");
+            for workdir in [
+                None,
+                Some(Utf8PathBuf::from(".")),
+                Some(Utf8PathBuf::from("nested")),
+                Some(root.clone()),
+                Some(extended_root.clone()),
+            ] {
+                let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                    "command": "python --version",
+                    "workdir": workdir,
+                }))
+                .expect("shell input");
+                let intent = super::shell_permission_intent(&workspace, &config, &input)
+                    .expect("permission intent");
+
+                assert!(!intent.outside_workspace, "{workspace_root}: {workdir:?}");
+                assert!(
+                    intent.risks.is_empty(),
+                    "{workspace_root}: {workdir:?}: {:?}",
+                    intent.risks
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_permission_intent_preserves_literal_path_boundaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let nested = root.join("nested");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("sibling")).expect("utf8 sibling");
+        std::fs::create_dir_all(&nested).expect("workspace directories");
+        std::fs::create_dir_all(&external).expect("external directory");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        for (path, outside_workspace) in [(&root, false), (&nested, false), (&external, true)] {
+            for literal in [path.clone(), Utf8PathBuf::from(format!(r"\\?\{path}"))] {
+                for literal in [
+                    literal.clone(),
+                    Utf8PathBuf::from(literal.as_str().replace('\\', "/")),
+                ] {
+                    let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                        "command": format!("Get-ChildItem -LiteralPath '{literal}'"),
+                    }))
+                    .expect("shell input");
+                    let intent = super::shell_permission_intent(&workspace, &config, &input)
+                        .expect("permission intent");
+
+                    assert_eq!(intent.outside_workspace, outside_workspace, "{literal}");
+                    assert!(intent.risks.is_empty(), "{literal}: {:?}", intent.risks);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_network_paths_keep_unc_and_device_review() {
+        for literal in [
+            r"\\server\shared folder\target.txt",
+            r"\\?\UNC\server\shared folder\target.txt",
+            r"\\?\uNc\server\shared folder\target.txt",
+            r"//server/shared folder/target.txt",
+            r"//?/UNC/server/shared folder/target.txt",
+            r"\\.\C:\device-target",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\target",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\target",
+            r"\\?\C:drive-relative",
+            r"\\?\1:\target",
+            r"\\?\C:",
+        ] {
+            assert!(
+                super::shell_references_network_path(
+                    camino::Utf8Path::new(literal),
+                    "python --version"
+                ),
+                "workdir: {literal}"
+            );
+            assert!(
+                super::shell_references_network_path(
+                    camino::Utf8Path::new(r"C:\workspace"),
+                    &format!("Get-ChildItem -LiteralPath '{literal}'")
+                ),
+                "command path: {literal}"
+            );
         }
     }
 

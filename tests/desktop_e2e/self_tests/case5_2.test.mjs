@@ -32,6 +32,8 @@ import {
   case52ExtraBodyEvidence,
   case52ForbiddenWorkspacePaths,
   case52FixtureConfig,
+  case52ProviderHeaders,
+  case52ExternalEnvironment,
   case52MainProviderSelectionKeys,
   case52NewRequestComposerSurfaceReady,
   case52NewTurnAcquisitionAccepted,
@@ -194,6 +196,37 @@ test("manual.case5_2 preserves legacy execution-owned LM Studio and accepts an e
     () => normalizeCase52Options({ ...case52OptionsForFailure(), provider_lifecycle: "host-owned" }),
     /provider_lifecycle/,
   );
+});
+
+test("manual.case5_2 api key option carries only a variable name through Main and leaves Side credentials isolated", () => {
+  const legacy = normalizeCase52Options(case52OptionsForFailure());
+  assert.equal(Object.hasOwn(legacy, "apiKeyEnv"), false);
+  assert.doesNotMatch(case52FixtureConfig(legacy), /api_key_env/);
+  const options = normalizeCase52Options({ ...case52OptionsForFailure(), api_key_env: "MANUAL_TEST_KEY" });
+  assert.equal(options.apiKeyEnv, "MANUAL_TEST_KEY");
+  assert.match(case52FixtureConfig(options), /api_key_env = "MANUAL_TEST_KEY"/);
+  assert.match(case52FixtureConfig(options), /access_mode = "auto_review"/);
+  const gui = normalizeCase52Options({ ...case52OptionsForFailure(), configure_main_via_gui: true, api_key_env: "MANUAL_TEST_KEY" });
+  assert.doesNotMatch(case52FixtureConfig(gui), /api_key_env/);
+  const surface = { projection: { config_target: { configGeneration: "1" }, config_fields: [
+    { key: "model.api_key_env", value: "" }, { key: "side_chat.base_url", value: "old" },
+    { key: "side_chat.model", value: "old" }, { key: "side_chat.provider_profile", value: "lm_studio" },
+  ] } };
+  assert.deepEqual(case52ExpectedMainGlobalSave(surface, gui).args.values.find(row => row.key === "model.api_key_env"), { key: "model.api_key_env", text: "MANUAL_TEST_KEY" });
+  assert.deepEqual(case52ExpectedSideGlobalSave(surface, options).args.values.find(row => row.key === "model.api_key_env"), { key: "model.api_key_env", text: "" });
+  assert.equal(case52ExpectedSideGlobalSave(surface, options).args.values.some(row => row.key === "side_chat.api_key_env"), false);
+  assert.equal(normalizeCase52Options({ ...case52OptionsForFailure(), api_key_env: "123KEY" }).apiKeyEnv, "123KEY");
+  for (const api_key_env of ["Bearer secret", "KEY\nOTHER", 12, null]) assert.throws(() => normalizeCase52Options({ ...case52OptionsForFailure(), api_key_env }), /api_key_env/);
+});
+
+test("manual.case5_2 api key header resolves only at request time and external tests do not receive it", () => {
+  const environment = { MANUAL_TEST_KEY: "fake-token", Path: "keep" };
+  assert.deepEqual(case52ProviderHeaders("", environment), {});
+  assert.deepEqual(case52ProviderHeaders("MANUAL_TEST_KEY", environment), { authorization: "Bearer fake-token" });
+  assert.throws(() => case52ProviderHeaders("MISSING", environment), error => error.owner === "environment" && !String(error).includes("fake-token"));
+  assert.deepEqual(case52ExternalEnvironment("manual_test_key", environment), { Path: "keep" });
+  assert.deepEqual(case52ExternalEnvironment("", environment), environment);
+  assert.equal(environment.MANUAL_TEST_KEY, "fake-token");
 });
 
 test("manual.case5_2 accepts an external-unmanaged OpenAI-compatible /v1 provider without LM Studio fields", () => {

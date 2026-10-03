@@ -178,6 +178,32 @@ test("selected GUI tool fixture rejects malformed or unbounded calls", () => {
   }
 });
 
+test("custom tool output limit counts UTF-8 bytes and preserves the default 512-byte bound", async (context) => {
+  const boundary = `MARKER${"あ".repeat(680)}xx`;
+  assert.equal(Buffer.byteLength(boundary), 2048);
+  for (const [outputMaxBytes, output, expectedStatus] of [[undefined, "MARKER" + "x".repeat(507), 422],
+    [2048, boundary, 200], [2048, boundary + "x", 422]]) {
+    const call = { prompt: "Check bounded tool output", name: "read", arguments: { path: "fixture.txt" },
+      outputMarker: "MARKER", responseText: "BOUNDED_OUTPUT_DONE", ...(outputMaxBytes === undefined ? {} : { outputMaxBytes }) };
+    const provider = await startScriptedProvider({ responseBehavior: "hold_until_release", script: createChatToolContinuationProviderScript({ call }) });
+    context.after(() => provider.close());
+    const initial = [{ role: "system", content: SYSTEM }, { role: "user", content: call.prompt }];
+    const first = await post(provider, chatRequest(initial));
+    assert.equal(first.status, 200);
+    const emitted = parseSse(await first.text())[1].choices[0].delta.tool_calls[0];
+    const continuation = [...initial, { role: "assistant", tool_calls: [{ id: emitted.id, type: emitted.type, function: emitted.function }] },
+      { role: "tool", tool_call_id: emitted.id, content: output }];
+    const final = post(provider, chatRequest(continuation));
+    if (expectedStatus === 200) {
+      await waitFor(() => provider.requestLedger.at(-1)?.response_phase === "held");
+      provider.releaseScriptRole("chat_continuation");
+    }
+    const response = await final;
+    assert.equal(response.status, expectedStatus);
+    await response.text();
+  }
+});
+
 test("Chat continuation HTTP responses terminate with DONE after the split tool call and released final", async (context) => {
   const provider = await startChatProvider();
   context.after(() => provider.close());
