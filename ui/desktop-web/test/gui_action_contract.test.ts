@@ -130,6 +130,8 @@ function state(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
     },
     provider_apply_enabled: false,
     provider_model_ids: [],
+    provider_effective_base_url: "http://127.0.0.1:1234",
+    provider_effective_profile: "lm_studio",
     docling_readiness: {
       status: "idle",
       endpoint: "",
@@ -1115,6 +1117,8 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     ],
   });
   const actionContext = context(wizard, []);
+  const errors: unknown[] = [];
+  actionContext.reportError = error => { errors.push(error); };
   const nativeCalls: MutationCall[] = [];
   let release!: (result: unknown) => void;
   const blockedResult = new Promise((resolve) => { release = resolve; });
@@ -1154,6 +1158,7 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     });
     await first;
 
+    assert.deepEqual(errors, []);
     assert.equal(actionContext.uiState.configDirty, true);
     assert.deepEqual(Array.from(actionContext.uiState.configDraftValues), [
       ["model.model", "model-b"],

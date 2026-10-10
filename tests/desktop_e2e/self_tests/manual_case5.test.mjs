@@ -30,6 +30,14 @@ test("case5 docs-only gate requires three physical nonempty documents and preser
   assert.deepEqual(manualCase5ScopeFailures(before, after.map(row => row.path === "README.md" ? { path: row.path, symbolic_link: true } : row)), ["missing-or-empty-document:README.md"]);
 });
 
+test("case5 observation override validates a bounded turn horizon", () => {
+  assert.equal(normalizeManualCase5Options(RAW).observationTimeoutMs, 3_600_000);
+  assert.equal(normalizeManualCase5Options({ ...RAW, observation_timeout_ms: 7_200_000 }).observationTimeoutMs, 7_200_000);
+  for (const value of [0, -1, 7_200_001, 1.5, "7200000", null, true, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => normalizeManualCase5Options({ ...RAW, observation_timeout_ms: value }), /observation_timeout_ms/);
+  }
+});
+
 test("case5 reuses physical clean-seed copy while excluding secrets/cache and preserving config examples", async context => {
   const parent = fileURLToPath(new URL("../../../../project_sandbox/manual-st-harness-self-tests/", import.meta.url));
   await mkdir(parent, { recursive: true });
@@ -54,7 +62,8 @@ test("case5 reuses physical clean-seed copy while excluding secrets/cache and pr
   assert.equal(legacy.copy_rule.id, "case5_2-clean-seed.v1");
   assert.equal(legacy.files.some(row => row.path === "backend/.env.production"), true);
   await mkdir(path.join(source, "frontend"), { recursive: true });
-  for (const [name, expected] of [["case5", 30 * 60 * 1000], ["case6", 15 * 60 * 1000]]) {
+  let defaultCase5Config = null;
+  for (const [name, expected] of [["case5", 60 * 60 * 1000], ["case5-custom", 120 * 60 * 1000], ["case6", 30 * 60 * 1000]]) {
     const fixture = path.join(root, name);
     await mkdir(fixture);
     const paths = Object.fromEntries(["workspace", "config", "data", "prefs", "webview", "logs"].map(key => [key, path.join(fixture, key)]));
@@ -62,9 +71,14 @@ test("case5 reuses physical clean-seed copy while excluding secrets/cache and pr
     paths.config_file = path.join(paths.config, "config.toml"); paths.prefs_file = path.join(paths.prefs, "desktop.toml");
     const records = [];
     const sink = { record: async (...args) => records.push(args), writeJson: async file => ({ path: file }) };
-    const scenario = name === "case5" ? createManualCase5Scenario({ ...RAW, fixture_source: source }) : createManualCase6Scenario(Object.fromEntries(Object.entries(RAW).filter(([key]) => key !== "fixture_source")));
+    const isCase5 = name.startsWith("case5");
+    const scenario = isCase5 ? createManualCase5Scenario({ ...RAW, fixture_source: source,
+      ...(name === "case5-custom" ? { observation_timeout_ms: expected } : {}) }) : createManualCase6Scenario(Object.fromEntries(Object.entries(RAW).filter(([key]) => key !== "fixture_source")));
     await scenario.prepare({ context: { root: fixture, paths }, sink, phase: "prepared" });
-    assert.equal(records.find(row => row[0] === `${name}-input`)[1].observation_timeout_ms, expected);
-    assert.doesNotMatch(await readFile(paths.config_file, "utf8"), /request_timeout|stream_idle|temperature|reasoning_effort/);
+    assert.equal(records.find(row => row[0] === `${isCase5 ? "case5" : name}-input`)[1].observation_timeout_ms, expected);
+    const configuration = await readFile(paths.config_file, "utf8");
+    assert.doesNotMatch(configuration, /request_timeout|stream_idle|temperature|reasoning_effort|observation_timeout/);
+    if (name === "case5") defaultCase5Config = configuration;
+    if (name === "case5-custom") assert.equal(configuration, defaultCase5Config);
   }
 });

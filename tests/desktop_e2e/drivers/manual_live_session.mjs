@@ -2,13 +2,13 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { waitForObservation } from "../core/deadline.mjs";
-import { canonicalU64, canonicalUlid } from "../core/canonical_identity.mjs";
+import { canonicalU64, canonicalUlid, canonicalWorkspace } from "../core/canonical_identity.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { WebviewInput, assertTrustedProbeSequence, assertTrustedTextInsertion } from "./webview_input.mjs";
 import { DesktopCommandProbe } from "./desktop_command_probe.mjs";
 import { runWindowsExternalProcess } from "./windows_external_process.mjs";
 import { operatorRequestFingerprint, waitForOperatorReview } from "./operator_review.mjs";
-import { observeProviderTurnSurface } from "../scenarios/provider_restart.mjs";
+import { observeProviderTurnSurface, providerRenderedTerminalFailures } from "../scenarios/provider_restart.mjs";
 import { observeRunNextTurnSurface, settledComposer } from "../scenarios/run_next_turn.mjs";
 import { captureScenarioScreenshot } from "../scenarios/observations.mjs";
 
@@ -38,7 +38,8 @@ export function manualLivePrompt(spec) { return manualLiveSection(spec, "Canonic
 
 export function normalizeManualLiveOptions(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new TypeError("manual scenario requires explicit options");
-  const allowed = new Set(["provider_base_url", "model", "api_key_env", "python_executable", "approval_mode"]);
+  const allowed = new Set(["provider_base_url", "model", "api_key_env", "python_executable", "approval_mode",
+    "side_model", "side_api_key_env", "approve_model", "approve_api_key_env", "access_mode"]);
   if (Object.keys(raw).some(key => !allowed.has(key))) throw new TypeError("unknown manual scenario option");
   const url = new URL(raw.provider_base_url);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash
@@ -47,19 +48,54 @@ export function normalizeManualLiveOptions(raw) {
     || /[\u0000-\u001f\u007f]/u.test(raw.model) || Buffer.byteLength(raw.model) > 1024) throw new TypeError("manual scenario requires an exact bounded model ID");
   const apiKeyEnv = raw.api_key_env ?? "";
   if (typeof apiKeyEnv !== "string" || (apiKeyEnv !== "" && !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(apiKeyEnv))) throw new TypeError("api_key_env must be an environment variable name");
+  const roles = {};
+  for (const role of ["side", "approve"]) {
+    const model = raw[`${role}_model`];
+    const key = raw[`${role}_api_key_env`];
+    if (model !== undefined && (typeof model !== "string" || !model || model !== model.trim()
+      || /[\u0000-\u001f\u007f]/u.test(model) || Buffer.byteLength(model) > 1024)) throw new TypeError(`${role}_model must be an exact bounded model ID`);
+    if (key !== undefined && (typeof key !== "string" || (key !== "" && !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)))) throw new TypeError(`${role}_api_key_env must be an environment variable name`);
+    if (model !== undefined || key !== undefined) {
+      roles[`${role}Model`] = model ?? raw.model;
+      roles[`${role}ApiKeyEnv`] = key ?? "";
+    }
+  }
   if (typeof raw.python_executable !== "string" || !path.isAbsolute(raw.python_executable)
     || raw.python_executable.includes("\0")) throw new TypeError("manual scenario requires an absolute python_executable");
   const approvalMode = raw.approval_mode ?? "stop";
   if (!["stop", "operator"].includes(approvalMode)) throw new TypeError("approval_mode must be stop or operator");
+  const accessMode = raw.access_mode === undefined ? "default" : raw.access_mode;
+  if (!["default", "auto_review", "full_access"].includes(accessMode)) throw new TypeError("access_mode must be default, auto_review, or full_access");
   return Object.freeze({ providerBaseUrl: url.href.replace(/\/$/, ""), model: raw.model, apiKeyEnv,
-    pythonExecutable: raw.python_executable, approvalMode });
+    pythonExecutable: raw.python_executable, approvalMode, accessMode, ...roles });
 }
 
 export function manualLiveFixtureConfig(options) {
-  return `[model]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.model)}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options.apiKeyEnv)}\ncontext_window = 131072\n\n[permissions]\naccess_mode = "default"\n\n[multi_agent]\nenabled = false\n\n[docling]\nenabled = false\n\n[mcp]\nenabled = false\n`;
+  const roles = ["side", "approve"].filter(role => options[`${role}Model`] !== undefined).map(role =>
+    `[${role === "side" ? "side_chat" : role}]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options[`${role}Model`])}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options[`${role}ApiKeyEnv`])}\n\n`).join("");
+  return `[model]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.model)}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options.apiKeyEnv)}\ncontext_window = 131072\n\n${roles}[permissions]\naccess_mode = ${JSON.stringify(options.accessMode ?? "default")}\n\n[multi_agent]\nenabled = false\n\n[docling]\nenabled = false\n\n[mcp]\nenabled = false\n`;
 }
 
-export function manualLiveTerminalDecision(surface) {
+function manualLiveConfiguredFields(options) {
+  const fields = [["permissions.access_mode", options.accessMode ?? "default"]];
+  for (const [role, model, key] of [["model", options.model, options.apiKeyEnv],
+    ["side_chat", options.sideModel, options.sideApiKeyEnv], ["approve", options.approveModel, options.approveApiKeyEnv]]) {
+    if (model === undefined) continue;
+    fields.push([`${role}.base_url`, options.providerBaseUrl], [`${role}.model`, model],
+      [`${role}.provider_profile`, "openai_compatible"], [`${role}.api_key_env`, key ?? ""]);
+  }
+  return fields;
+}
+
+export function manualLiveConfigurationFailures(projection, options) {
+  return manualLiveConfiguredFields(options).flatMap(([key, expected]) => {
+    const rows = (projection?.config_fields ?? []).filter(field => field.key === key);
+    const actual = rows.length === 1 ? rows[0].value : null;
+    return actual === expected ? [] : [{ key, expected, actual }];
+  });
+}
+
+function manualLiveProjectionTerminalDecision(surface) {
   const p = surface?.projection;
   if (p?.confirmation_visible === true) return "approval";
   if (surface?.visible_fatal_count > 0 || surface?.visible_recoverable_error_count > 0) return "failed";
@@ -73,12 +109,39 @@ export function manualLiveTerminalDecision(surface) {
     && p.composer_submit_mode === "new_request" && p.can_submit === true ? "completed" : "pending";
 }
 
+export function manualLiveTerminalDecision(surface) {
+  const decision = manualLiveProjectionTerminalDecision(surface);
+  return decision === "completed" && providerRenderedTerminalFailures(surface).length > 0 ? "pending" : decision;
+}
+
 export function manualLiveTurnObservationReady(surface, { previousConfirmationId = null, previousTurnId = null } = {}) {
   const decision = manualLiveTerminalDecision(surface);
   return decision !== "pending"
     && !(surface.projection?.confirmation_visible && surface.projection.confirmation_id === previousConfirmationId)
     && !(decision === "completed" && previousTurnId !== null
       && surface.projection.run_target.expectedState.latestTurnId === previousTurnId);
+}
+
+function manualLiveStopOwnerReady(surface, request) {
+  const projection = surface?.projection;
+  const stopped = request?.stop_target;
+  const target = projection?.run_target;
+  return stopped?.kind === "turn" && canonicalWorkspace(stopped.workspacePath)
+    && canonicalUlid(stopped.sessionId) && canonicalUlid(stopped.turnId)
+    && canonicalU64(stopped.admissionRevision)
+    && projection?.busy === false && projection.confirmation_visible === false
+    && projection.post_run_refresh_pending === false && projection.background_mutation_pending === false
+    && projection.async_polling_required === false && Array.isArray(projection.pending_async_operations)
+    && projection.pending_async_operations.length === 0 && projection.task_activity_state === "idle"
+    && target?.workspacePath === stopped.workspacePath && target?.sessionId === stopped.sessionId
+    && target.expectedState?.kind === "idle" && target.expectedState.latestTurnId === stopped.turnId
+    && target.expectedState.admissionRevision === stopped.admissionRevision
+    // A fresh Rust terminal can precede the frontend's removal of the Stop dialog.
+    && surface.visible_dialog_count === 0 && surface.visible_modal_backdrop_count === 0;
+}
+
+export function manualLiveStopObservationReady(surface, request) {
+  return manualLiveStopOwnerReady(surface, request) && providerRenderedTerminalFailures(surface).length === 0;
 }
 
 export function manualLiveUnittestResult(processResult, stdout, stderr) {
@@ -166,8 +229,9 @@ export async function manualLiveGeneratedFiles(context, sink, evidenceStem = "ca
 export async function manualLiveExternalProcess({ context, sink, options, label, args, owner = "scenario:manual.case1", stem = "case1", phase = "executing" }) {
   const stdoutPath = path.join(context.paths.logs, `${label}.stdout.log`);
   const stderrPath = path.join(context.paths.logs, `${label}.stderr.log`);
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-    !["temp", "tmp", "tmpdir", options.apiKeyEnv.toLowerCase()].includes(key.toLowerCase())));
+  const excluded = ["temp", "tmp", "tmpdir", options.apiKeyEnv, options.sideApiKeyEnv, options.approveApiKeyEnv]
+    .filter(value => typeof value === "string").map(value => value.toLowerCase());
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !excluded.includes(key.toLowerCase())));
   Object.assign(env, { PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1", TEMP: context.paths.logs, TMP: context.paths.logs, TMPDIR: context.paths.logs });
   const result = await runWindowsExternalProcess({ executionRoot: context.root, executable: options.pythonExecutable, args,
     cwd: context.paths.workspace, env, stdoutPath, stderrPath, timeoutMs: 120_000, maxOutputBytes: MAX_OUTPUT_BYTES, label });
@@ -212,6 +276,12 @@ export class ManualLiveSession {
     Object.assign(this, { context, driver, sink, options, owner, stem, capturePaths, input: null, commands: null, lastTerminal: null });
   }
   async open() {
+    const initial = await observeProviderTurnSurface(this.driver);
+    const failures = manualLiveConfigurationFailures(initial.projection, this.options);
+    if (failures.length) throw failure(`${this.stem}-role-config`, "manual case role connections or access mode differ from explicit inputs", { failures });
+    await this.sink.record(`${this.stem}-role-config`, { fields: manualLiveConfiguredFields(this.options).map(([key, expected]) => ({ key, value: expected })),
+      config_target: structuredClone(initial.projection.config_target),
+      observation: "public_config_projection", provider_traffic: "not_observed_by_this_check" }, { phase: "executing", owner: this.owner });
     this.input = new WebviewInput(this.driver, { probeId: `manual-${this.stem}-input` });
     await this.input.installProbe();
     this.commands = new DesktopCommandProbe(this.driver, { probeId: `manual-${this.stem}-permission`, commands: ["answer_permission", "cancel_run"] });
@@ -233,15 +303,43 @@ export class ManualLiveSession {
         const before = await state.input.snapshotProbe();
         await state.input.insertText(PROMPT, state.prompt);
         const typing = assertTrustedTextInsertion(await state.input.snapshotProbe(before.sequence), { afterSequence: before.sequence, identity: PROMPT.identity, text: state.prompt });
-        await waitForObservation({ label: "Case1 prompt ready", timeoutMs: 10_000, retrySampleErrors: false, sample: () => observeProviderTurnSurface(cdp), accept: value => value.prompt?.value === state.prompt && value.send?.enabled === true });
+        await waitForObservation({ label: `${prefix} prompt ready`, timeoutMs: 10_000, retrySampleErrors: false, sample: () => observeProviderTurnSurface(cdp), accept: value => value.prompt?.value === state.prompt && value.send?.enabled === true });
         const send = await click(state.input, SEND, sink, "send-canonical-prompt");
         await captureScenarioScreenshot({ cdp, sink, name: `${prefix}-request-sent`, owner: OWNER });
         await sink.record(`${prefix}-prompt-sent`, { typing, send, prompt: state.prompt }, { phase: "executing", owner: OWNER });
         const turnDeadline = Date.now() + timeoutMs;
-        const waitTerminal = previousId => waitForObservation({ label: "Case1 completion or review request",
-          timeoutMs: Math.max(1, turnDeadline - Date.now()), pollMs: 500, retrySampleErrors: false,
-          sample: () => observeProviderTurnSurface(cdp), accept: value => manualLiveTurnObservationReady(value,
-            { previousConfirmationId: previousId, previousTurnId }) });
+        let firstRenderDiscrepancyAt = null;
+        const renderEvidence = surface => ({
+          projection: { run_target: surface.projection.run_target,
+            session_usage_label: surface.projection.session_usage_label,
+            session_usage_title: surface.projection.session_usage_title,
+            session_usage_state: surface.projection.session_usage_state },
+          composer: surface.composer, session_usage: surface.session_usage,
+          failures: providerRenderedTerminalFailures(surface),
+        });
+        const sampleTerminal = async ownerReady => {
+          const surface = await observeProviderTurnSurface(cdp);
+          if (firstRenderDiscrepancyAt === null && ownerReady(surface)
+            && providerRenderedTerminalFailures(surface).length > 0) {
+            firstRenderDiscrepancyAt = new Date().toISOString();
+            await sink.record(`${prefix}-terminal-render`, { status: "discrepancy", ...renderEvidence(surface) },
+              { phase: "executing", owner: OWNER, at: firstRenderDiscrepancyAt });
+          }
+          return surface;
+        };
+        const recordRenderedSettlement = surface => sink.record(`${prefix}-terminal-render`, {
+          status: "settled", first_discrepancy_at: firstRenderDiscrepancyAt, ...renderEvidence(surface),
+        }, { phase: "executing", owner: OWNER });
+        const waitTerminal = async previousId => {
+          const observed = await waitForObservation({ label: `${prefix} completion or review request`,
+            timeoutMs: Math.max(1, turnDeadline - Date.now()), pollMs: 500, retrySampleErrors: false,
+            sample: () => sampleTerminal(value => manualLiveProjectionTerminalDecision(value) === "completed"
+              && value.projection.run_target.expectedState.latestTurnId !== previousTurnId),
+            accept: value => manualLiveTurnObservationReady(value,
+              { previousConfirmationId: previousId, previousTurnId }) });
+          if (manualLiveTerminalDecision(observed.value) === "completed") await recordRenderedSettlement(observed.value);
+          return observed;
+        };
         let observed = await waitTerminal(null);
         let approval = false;
         let reviewStopReason = null;
@@ -287,7 +385,10 @@ export class ManualLiveSession {
           if (decision === "approve") { observed = await waitTerminal(request.confirmation_id); continue; }
           approval = true;
           reviewStopReason = reviewed.status === "decided" ? `operator-${decision}` : reviewed.reason;
-          observed = await waitForObservation({ label: "Case1 operator Stop terminal", timeoutMs: 30_000, pollMs: 100, retrySampleErrors: false, sample: () => observeProviderTurnSurface(cdp), accept: value => value.projection?.busy === false && value.projection?.confirmation_visible === false && value.projection?.post_run_refresh_pending === false && value.projection?.run_target?.expectedState?.kind === "idle" });
+          observed = await waitForObservation({ label: `${prefix} operator Stop terminal`, timeoutMs: 30_000, pollMs: 100,
+            retrySampleErrors: false, sample: () => sampleTerminal(value => manualLiveStopOwnerReady(value, request)),
+            accept: value => manualLiveStopObservationReady(value, request) });
+          await recordRenderedSettlement(observed.value);
           break;
         }
         const terminal = observed.value;

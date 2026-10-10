@@ -1,4 +1,5 @@
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import {
   DesktopCommandProbe,
@@ -29,6 +30,7 @@ import {
   quiesceProviderResource,
 } from "./provider_restart.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
+import { trustedFocus } from "./hub_browser_enrollment.mjs";
 
 const OWNER = "scenario:side-chat.quote";
 const SIDE_PROVIDER_PROFILE = "openai_responses";
@@ -386,8 +388,63 @@ export async function trustedInsert(input, locator, text) {
   return { focus, insertion, probe };
 }
 
-async function trustedReplace(input, locator, text) {
-  const focus = await trustedClick(input, locator);
+const SETTINGS_SCROLL_BODY = '[role="dialog"][aria-labelledby="config-dialog-title"] .settings-content';
+
+export async function trustedSideSettingsClick(input, cdp, locator, { sink, evidenceOwner = OWNER } = {}) {
+  await trustedFocus(input, cdp, locator);
+  const initial = await input.observeExactTarget(locator);
+  let focusScroll = null;
+  if (initial.observation.center_in_viewport === false || initial.observation.center_in_scroll_clip === false) {
+    let previous = null, stableSamples = 0;
+    const samples = [];
+    const settled = await waitForObservation({
+      label: "Side settings keyboard focus scroll settlement",
+      timeoutMs: 1_500,
+      pollMs: 75,
+      retrySampleErrors: false,
+      sample: () => input.observeScrollContainer(locator, SETTINGS_SCROLL_BODY),
+      accept: value => {
+        const observation = value.observation;
+        const geometry = { scroll_top: observation.scroll_top, scroll_left: observation.scroll_left,
+          center: observation.target.center, rect: observation.target.rect, scroll_clip: observation.target.scroll_clip };
+        stableSamples = previous !== null && sameValue(previous, geometry) ? stableSamples + 1 : 1;
+        previous = geometry;
+        samples.push(geometry);
+        return stableSamples >= 3;
+      },
+    });
+    focusScroll = { ...settled, samples, stable_samples: stableSamples };
+    if (sink) await sink.record("side-chat-settings-focus-scroll-settled", { initial, focus_scroll: focusScroll }, { phase: "executing", owner: evidenceOwner });
+  }
+  const geometry = focusScroll?.value.observation.target ?? initial.observation;
+  let wheel = null;
+  if (geometry.center_in_viewport === false || geometry.center_in_scroll_clip === false) {
+    const clip = geometry.scroll_clip;
+    const bounded = value => Math.sign(value) * Math.min(Math.ceil(Math.abs(value)), 1_000);
+    const start = (await input.snapshotProbe()).sequence;
+    const dispatch = await input.scrollContainer(locator, {
+      containerSelector: SETTINGS_SCROLL_BODY,
+      deltaX: geometry.center.x < clip.left || geometry.center.x >= clip.right
+        ? bounded(geometry.center.x - (clip.left + clip.right) / 2) : 0,
+      deltaY: geometry.center.y < clip.top || geometry.center.y >= clip.bottom
+        ? bounded(geometry.center.y - (clip.top + clip.bottom) / 2) : 0,
+    });
+    wheel = { initial, focus_scroll: focusScroll, dispatch };
+    if (sink) await sink.record("side-chat-settings-wheel-acquisition", wheel, { phase: "executing", owner: evidenceOwner });
+    wheel.probe = await input.waitForTrustedProbeSequence({
+      afterSequence: start,
+      expected: [{ type: "wheel", identity: dispatch.before.observation.container.identity,
+        deltaX: dispatch.parameters.deltaX, deltaY: dispatch.parameters.deltaY, deltaMode: 0 }],
+    });
+    await input.resolveExactTarget(locator, { stableHitSamples: 3 });
+    wheel.settled = await input.observeScrollContainer(locator, SETTINGS_SCROLL_BODY);
+    if (sink) await sink.record("side-chat-settings-wheel-settled", { probe: wheel.probe, geometry: wheel.settled }, { phase: "executing", owner: evidenceOwner });
+  }
+  return { ...await trustedClick(input, locator), wheel_acquisition: wheel };
+}
+
+async function trustedReplace(input, cdp, locator, text, evidence) {
+  const focus = await trustedSideSettingsClick(input, cdp, locator, evidence);
   const clearStart = (await input.snapshotProbe()).sequence;
   await input.keyDown("Control");
   try {
@@ -438,14 +495,6 @@ async function trustedSelectSideProviderProfile(input) {
       expected: [{ type: "change", identity: SIDE_PROVIDER_PROFILE_CONTROL.identity }],
     }),
   };
-}
-
-function globalConfigValues(projection, overrides) {
-  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
-  return fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
 }
 
 function configFieldValue(projection, key) {
@@ -608,6 +657,8 @@ export async function saveGlobalSideChatAndOpen({
   providerBaseUrl,
   ownerSessionId,
   systemPrompt = "",
+  sink,
+  evidenceOwner = OWNER,
 }) {
   const open = await trustedClick(input, SHOW_SETTINGS);
   await waitForProductStage({
@@ -653,9 +704,10 @@ export async function saveGlobalSideChatAndOpen({
   const profile = ready.value.settings.profile_value === SIDE_PROVIDER_PROFILE
     ? null
     : await trustedSelectSideProviderProfile(input);
-  const baseUrl = await trustedReplace(input, SIDE_BASE_URL, providerBaseUrl);
-  const model = await trustedReplace(input, SIDE_MANUAL_MODEL, SCRIPTED_PROVIDER_MODEL_ID);
-  const systemPromptTyping = await trustedReplace(input, SIDE_SYSTEM_PROMPT, systemPrompt);
+  const evidence = { sink, evidenceOwner };
+  const baseUrl = await trustedReplace(input, cdp, SIDE_BASE_URL, providerBaseUrl, evidence);
+  const model = await trustedReplace(input, cdp, SIDE_MANUAL_MODEL, SCRIPTED_PROVIDER_MODEL_ID, evidence);
+  const systemPromptTyping = await trustedReplace(input, cdp, SIDE_SYSTEM_PROMPT, systemPrompt, evidence);
   const committable = await waitForProductStage({
     label: "global Side Chat settings save admission",
     timeoutMs: 10_000,
@@ -674,7 +726,7 @@ export async function saveGlobalSideChatAndOpen({
   const expectedSave = {
     command: "save_global_config",
     args: {
-      values: globalConfigValues(ready.value.projection, {
+      values: expectedConfigCommandValues(ready.value.projection, {
         "side_chat.base_url": providerBaseUrl,
         "side_chat.model": SCRIPTED_PROVIDER_MODEL_ID,
         "side_chat.system_prompt": systemPrompt.trim(),
@@ -816,7 +868,7 @@ export async function inspectGlobalSideChatSettings({
     code: "side-chat-settings-values-not-restored",
     message: "Side Chat Settings did not restore the exact persisted global values",
   });
-  const prompt = await trustedClick(input, SIDE_SYSTEM_PROMPT);
+  const prompt = await trustedSideSettingsClick(input, cdp, SIDE_SYSTEM_PROMPT, { sink, evidenceOwner });
   const screenshot = await captureScenarioScreenshot({
     cdp,
     sink,
@@ -960,6 +1012,7 @@ export function createSideChatQuoteScenario() {
         const configuration = await saveGlobalSideChatAndOpen({
           cdp,
           input,
+          sink,
           providerBaseUrl: provider.baseUrl,
           ownerSessionId: owner.session_id,
         });

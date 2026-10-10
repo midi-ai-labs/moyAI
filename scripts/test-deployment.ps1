@@ -7,11 +7,13 @@ $EvidenceRoot = [IO.Path]::GetFullPath($EvidenceRoot)
 New-Item -ItemType Directory -Path $EvidenceRoot -Force | Out-Null
 $package = Join-Path $EvidenceRoot 'package'
 $destination = Join-Path $EvidenceRoot 'installed'
+$shortcutFolder = Join-Path $EvidenceRoot 'isolated Start menu'
 New-Item -ItemType Directory -Path (Join-Path $package 'scripts'), (Join-Path $package 'app/bin'), (Join-Path $package 'hub/bin') -Force | Out-Null
 foreach ($name in @('common.ps1', 'runtime-access.ps1', 'Setup-moyAI.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deployment/$name") -Destination (Join-Path $package "scripts/$name") }
 # Subprocess fixtures never open actual logon/association registry keys, even read-only.
 $fixtureCommon = Join-Path $package 'scripts/common.ps1'
 [IO.File]::WriteAllText($fixtureCommon, ((Get-Content -LiteralPath $fixtureCommon -Raw -Encoding UTF8) + "`nfunction Open-MoyaiRunKey([bool]`$Writable) { return `$null }`nfunction Open-MoyaiClassesKey([bool]`$Writable) { return `$null }`nfunction Get-MoyaiJoinFileDefaultOverrides { throw 'Fixture attempted to read actual registry defaults.' }`n"), [Text.UTF8Encoding]::new($true))
+[IO.File]::AppendAllText($fixtureCommon, ("function Get-MoyaiShortcutFolder { return '" + $shortcutFolder.Replace("'", "''") + "' }`n"), [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Start-moyAI.cmd') -Destination (Join-Path $package 'Start-moyAI.cmd')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Setup-moyAI.cmd') -Destination (Join-Path $package 'Setup-moyAI.cmd')
 Write-MoyaiUtf8 (Join-Path $package 'app/bin/moyai-runner.exe') 'inert deployment fixture; never execute'
@@ -131,18 +133,25 @@ Assert-That ($integration.Contains('](../hub/docs/firewall.md)') -and $integrati
 Write-MoyaiUtf8 (Join-Path $standaloneGuides 'docs/hub-integration.md') '[Gateway](../../moyAI-Hub/docs/gateway.md)'
 Update-MoyaiReleaseGuideLinks $standaloneGuides $hubSourceCommit ''
 Assert-That ((Get-Content -LiteralPath (Join-Path $standaloneGuides 'docs/hub-integration.md') -Raw -Encoding UTF8).Contains('](https://github.com/midi-ai-labs/moyAI-Hub)')) 'Desktop-only secondary Hub guide links also need no sibling checkout'
-function Write-FixtureManifest([string]$Version) {
+function Write-FixtureManifest([string]$Version, [switch]$DesktopOnly) {
   $files = @(Get-ChildItem -LiteralPath $package -Recurse -File | Where-Object { $_.Name -ne 'deployment.json' } | ForEach-Object {
     [ordered]@{path=$_.FullName.Substring($package.Length + 1).Replace('\', '/'); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
   })
   $manifest = [ordered]@{schema=1; product='moyai-windows-user'; target='windows-x86_64'; version=$Version;
-    hub=@{sha256=(Get-FileHash -LiteralPath (Join-Path $package 'hub/bin/moyai-hub.exe') -Algorithm SHA256).Hash.ToLowerInvariant()};
+    hub=$(if ($DesktopOnly) { $null } else { @{sha256=(Get-FileHash -LiteralPath (Join-Path $package 'hub/bin/moyai-hub.exe') -Algorithm SHA256).Hash.ToLowerInvariant()} });
     runtime=@{webview2='system-installed'; visual_cpp='system-installed'}; files=$files}
   Write-MoyaiUtf8 (Join-Path $package 'deployment.json') ($manifest | ConvertTo-Json -Depth 8)
 }
-function Invoke-FixtureSetup([string[]]$Extra = @()) {
-  $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'scripts/Setup-moyAI.ps1') -InstallRoot $destination -NoShortcuts @Extra 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "Setup failed: $output" }
+function Invoke-FixtureSetup([string[]]$Extra = @(), [switch]$Shortcuts) {
+  [string[]]$shortcutOptions = @()
+  if (-not $Shortcuts) { $shortcutOptions = @('-NoShortcuts') }
+  $previousErrorPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'scripts/Setup-moyAI.ps1') -InstallRoot $destination @shortcutOptions @Extra 2>&1 | ForEach-Object { $_.ToString() } | Out-String
+    $setupExitCode = $LASTEXITCODE
+  } finally { $ErrorActionPreference = $previousErrorPreference }
+  if ($setupExitCode -ne 0) { throw "Setup failed: $output" }
   $script:lastSetupOutput = $output
 }
 Write-FixtureManifest '1.0-fixture'
@@ -402,6 +411,37 @@ Assert-That ((Get-Content -LiteralPath (Join-Path $destination 'release.txt') -R
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $destination 'app/bin/moyai-desktop.exe'))) 'uninstall removes only unchanged application payload'
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $destination 'installation.json'))) 'uninstall resumes when a previous attempt already removed a file'
 Assert-That ((Get-Content -LiteralPath $profile -Raw) -eq 'existing credential and history fixture') 'install, update, and uninstall retain data outside the installation'
+# Actual WScript shortcuts and setup/uninstall paths stay inside the isolated Start-menu fixture.
+$hubInstallation = Join-Path $EvidenceRoot 'Hub installation'
+$desktopInstallation = Join-Path $EvidenceRoot 'Desktop installation'
+$destination = $hubInstallation
+Write-FixtureManifest '3.0-fixture'
+Invoke-FixtureSetup -Shortcuts
+$mainLink = Join-Path $shortcutFolder 'moyAI.lnk'
+$teamLink = Join-Path $shortcutFolder 'moyAI Team Management.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$teamBytes = [IO.File]::ReadAllBytes($teamLink)
+$destination = $desktopInstallation
+Write-FixtureManifest '3.0-desktop-fixture' -DesktopOnly
+Invoke-FixtureSetup -Shortcuts
+Assert-That (($shell.CreateShortcut($mainLink).WorkingDirectory -ieq $desktopInstallation) -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($teamLink)) -ceq [Convert]::ToBase64String($teamBytes)) 'Desktop-only installation preserves the other installation Team Management shortcut'
+$destination = $hubInstallation
+Invoke-FixtureSetup -Extra @('-Uninstall', '-CheckOnly') -Shortcuts
+Assert-That ((Test-Path -LiteralPath $mainLink) -and (Test-Path -LiteralPath $teamLink) -and $lastSetupOutput.Contains($teamLink) -and -not $lastSetupOutput.Contains($mainLink)) 'uninstall preview selects only shortcuts pointing at the selected installation and deletes none'
+Invoke-FixtureSetup -Extra @('-Uninstall') -Shortcuts
+Assert-That ((Test-Path -LiteralPath $mainLink) -and -not (Test-Path -LiteralPath $teamLink) -and $shell.CreateShortcut($mainLink).WorkingDirectory -ieq $desktopInstallation) 'uninstall removes its own Team Management shortcut and preserves another installation main shortcut'
+$editedLink = $shell.CreateShortcut($mainLink)
+$editedLink.Arguments += ' -CustomArgument'
+$editedLink.Save()
+$editedBytes = [IO.File]::ReadAllBytes($mainLink)
+$destination = $desktopInstallation
+Invoke-FixtureSetup -Extra @('-Uninstall') -Shortcuts
+Assert-That ((Test-Path -LiteralPath $mainLink) -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($mainLink)) -ceq [Convert]::ToBase64String($editedBytes)) 'uninstall preserves a user-modified shortcut to the same installation'
+$editedLink = $shell.CreateShortcut($mainLink)
+$editedLink.Arguments = (Get-MoyaiShortcutRegistration $desktopInstallation 'moyAI').Arguments
+$editedLink.Save()
+[void](Remove-MoyaiShortcuts $desktopInstallation $shortcutFolder)
+Assert-That (-not (Test-Path -LiteralPath $mainLink)) 'exact owned main shortcut can be removed after an interrupted payload uninstall'
 # Exercise the actual cmd pause and exit status with an inert script, never an installer.
 $wrapperRoot = Join-Path $EvidenceRoot 'interactive wrapper'
 New-Item -ItemType Directory -Path (Join-Path $wrapperRoot 'scripts') | Out-Null
@@ -434,6 +474,6 @@ foreach ($expectedExit in @(0, 7)) {
     $wrapperProcess.Dispose()
   }
 }
-Write-MoyaiUtf8 (Join-Path $EvidenceRoot 'RESULTS.md') ("# Deployment focused tests`n`n" + ($checks -join "`n") + "`n`nOnly a generated argument-recording fixture and inert cmd wrapper were launched; no product executable was launched. Autostart and dedicated connection-file association tests used isolated fake registry owners; subprocess packages override registry openers and never open the real user's Run, Classes, or UserChoice keys. Existing system runtimes were used for prerequisite checking. Fresh-PC, bundled-runtime execution, Explorer/ShellExecute association resolution, and real shortcut GUI behavior remain separate validation.`n")
+Write-MoyaiUtf8 (Join-Path $EvidenceRoot 'RESULTS.md') ("# Deployment focused tests`n`n" + ($checks -join "`n") + "`n`nOnly a generated argument-recording fixture and inert cmd wrapper were launched; no product executable was launched. Autostart and dedicated connection-file association tests used isolated fake registry owners; subprocess packages override registry openers and never open the real user's Run, Classes, or UserChoice keys. Setup created and removed actual WScript shortcuts only in an isolated fixture folder. Existing system runtimes were used for prerequisite checking. Fresh-PC, bundled-runtime execution, Explorer/ShellExecute association resolution, and Start-menu GUI launch remain separate validation.`n")
 $checks | Write-Output
 Write-Output "evidence=$EvidenceRoot"

@@ -19,20 +19,25 @@ async function hubRequest(
   const local = context.uiState.hub;
   if (local.pending || !hubSettingsOpen(context)) return;
   const serial = ++local.requestSerial;
+  const readStartedFrom = local.projection;
   const before = local.projection && structuredClone(local.projection);
   local.pending = pending;
   clearHubError(local);
   context.rerender();
+  const channel = pending === "main" || pending === "side_chat" || pending === "approve" ? pending
+    : pending === "main_mode" ? "main" : pending === "side_chat_mode" ? "side_chat"
+      : pending === "approve_mode" ? "approve" : null;
   try {
     const result = await command<HubProjection>(name, args);
     if (serial !== local.requestSerial) return;
     acceptHubProjection(local, result, {
       refreshTargets: pending === "refresh",
-      savedContext: pending === "main" || pending === "side_chat" ? pending : undefined,
+      savedContext: channel && !pending.endsWith("_mode") ? channel : undefined,
       connected: pending === "connect" && result.status === "connected",
-      localSave: before && (pending === "main" || pending === "side_chat" || pending === "main_mode" || pending === "side_chat_mode")
-        ? { before, context: pending === "main" || pending === "main_mode" ? "main" : "side_chat", kind: pending.endsWith("_mode") ? "mode" : "review" }
+      localSave: before && channel
+        ? { before, context: channel, kind: pending.endsWith("_mode") ? "mode" : "review" }
         : undefined,
+      readStartedFrom: readStartedFrom && (pending === "load" || pending === "refresh") ? readStartedFrom : undefined,
     });
     if (pending === "connect" && result.status === "connected") {
       const token = document.querySelector<HTMLInputElement>("#hub-token");
@@ -46,10 +51,11 @@ async function hubRequest(
       try {
         // Rejected connection attempts may already have advanced the Rust owner. Keep the
         // request locked until it is reacquired so an immediate retry uses that fresh owner.
+        const readStartedFrom = local.projection;
         const projection = await command<HubProjection>("hub_projection");
         if (serial === local.requestSerial && hubSettingsOpen(context)) {
           // Failure settlement is not the user's explicit review/rebase action.
-          acceptHubProjection(local, projection);
+          acceptHubProjection(local, projection, { readStartedFrom: readStartedFrom ?? undefined });
         }
       } catch {
         // A failed local read must not replace the actionable original error or recurse.
@@ -58,8 +64,7 @@ async function hubRequest(
     if (serial === local.requestSerial && hubSettingsOpen(context)) {
       local.error = message;
       local.errorCode = typeof error === "string" ? error : null;
-      local.errorContext = pending === "main" || pending === "main_mode" ? "main"
-        : pending === "side_chat" || pending === "side_chat_mode" ? "side_chat" : "connection";
+      local.errorContext = channel ?? "connection";
     }
   } finally {
     if (serial === local.requestSerial) { local.pending = null; context.rerender(); }
@@ -115,7 +120,7 @@ export async function saveHubReview(context: ActionContext, channel: HubContext)
 export async function setHubRouteMode(context: ActionContext, channel: HubContext, mode: HubRouteMode): Promise<void> {
   const local = context.uiState.hub;
   if (!hubCanSetRouteMode(local, channel, mode) || !local.projection) return;
-  await hubRequest(context, channel === "main" ? "main_mode" : "side_chat_mode", "hub_set_route_mode", {
+  await hubRequest(context, `${channel}_mode`, "hub_set_route_mode", {
     context: channel, mode,
     expectedSettingsRevision: local.projection.settings_revision,
     expectedConnectionGeneration: local.projection.connection_generation,

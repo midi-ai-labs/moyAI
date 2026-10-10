@@ -12,6 +12,7 @@ import {
 } from "./actions.ts";
 import {
   configDraftAppliesTo,
+  configCommandValues,
   configMutationValues,
   reconcileConfigDraftTarget,
   type ConfigValueInput,
@@ -494,7 +495,12 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     if (
       normalizeProviderBaseUrl(next)
       !== normalizeProviderBaseUrl(context.uiState.drafts.provider.baseUrl)
-    ) context.uiState.drafts.providerCatalogIdentityRevision += 1;
+    ) {
+      context.uiState.drafts.providerCatalogIdentityRevision += 1;
+      context.uiState.drafts.provider.apiKeyEnv = "";
+      const credential = document.querySelector<HTMLInputElement>("#provider-api-key-env");
+      if (credential) credential.value = "";
+    }
     context.uiState.drafts.provider.baseUrl = next;
     context.uiState.drafts.providerRevision += 1;
     updateProviderActionButtons(context);
@@ -504,6 +510,9 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     if (!isProviderProfile(next)) return;
     if (context.uiState.drafts.provider.providerProfile !== next) {
       context.uiState.drafts.providerCatalogIdentityRevision += 1;
+      context.uiState.drafts.provider.apiKeyEnv = "";
+      const credential = document.querySelector<HTMLInputElement>("#provider-api-key-env");
+      if (credential) credential.value = "";
     }
     context.uiState.drafts.provider.providerProfile = next;
     context.uiState.drafts.providerRevision += 1;
@@ -1172,7 +1181,7 @@ export function prepareConfigMutation(
   if (!currentState) return null;
   const values = prepareConfigSnapshot(context, target);
   if (!values || !validateConfigValues(values, currentState.config_fields, true)) return null;
-  return values;
+  return configCommandValues(context.uiState, target, values);
 }
 
 export function prepareConfigSnapshot(

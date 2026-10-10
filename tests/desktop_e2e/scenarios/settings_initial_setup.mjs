@@ -3,6 +3,7 @@ import path from "node:path";
 import { readFile, stat, writeFile } from "node:fs/promises";
 
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import {
   DesktopCommandProbe,
@@ -97,7 +98,7 @@ function errorObservation(error) {
   };
 }
 
-function configValues(projection, overrides = {}) {
+function configValues(projection, overrides = {}, imported = false) {
   if (!Array.isArray(projection?.config_fields)) {
     throw new TypeError("Initial Setup command expectation requires projected config fields");
   }
@@ -106,10 +107,9 @@ function configValues(projection, overrides = {}) {
   if (unknownKeys.length > 0) {
     throw new TypeError(`Initial Setup import overrides contain unknown fields: ${unknownKeys.join(", ")}`);
   }
-  return projection.config_fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
+  return expectedConfigCommandValues(projection, overrides, { editedKeys: imported ? [...projectedKeys].filter(key => [
+    "model.api_key_env", "model.extra_headers_json", "model.extra_body_json", "side_chat.api_key_env",
+  ].includes(key)) : [] });
 }
 
 export function initialSetupImportConfig(baseUrl, secret = INITIAL_SETUP_SECRET_SENTINEL) {
@@ -162,6 +162,16 @@ export function initialSetupImportedPublicOverrides(baseUrl) {
     "model.supports_images": "false",
     "model.parallel_tool_calls": "false",
     "model.max_parallel_predictions": "1",
+    // An absent Approve role is displayed using the imported Main snapshot.
+    // Only differences from the saved public baseline enter the Finish command.
+    "approve.base_url": baseUrl,
+    "approve.model": SCRIPTED_PROVIDER_MODEL_ID,
+    "approve.provider_profile": INITIAL_SETUP_PROVIDER_PROFILE,
+    "approve.api_key_env": INITIAL_SETUP_PROVIDER_API_KEY_ENV,
+    "approve.context_window": "65536",
+    "approve.request_timeout_ms": "120000",
+    "approve.connect_timeout_ms": "10000",
+    "approve.max_retries": "0",
     "permissions.access_mode": "default",
     "multi_agent.enabled": "false",
     "multi_agent.mode": "explicit_request_only",
@@ -174,6 +184,12 @@ export function initialSetupImportedPublicOverrides(baseUrl) {
   });
 }
 
+export function initialSetupImportedApproveAbsent(projection, persistedText) {
+  return projection?.approve_model_configured === false
+    && typeof persistedText === "string"
+    && !/^[ \t]*\[[ \t]*approve(?:[ \t]*\]|[ \t]*\.)/mu.test(persistedText);
+}
+
 export function expectedInitialSetupFinishCommand(surface, importGeneration = null, valueOverrides = {}) {
   const projection = surface?.projection;
   const expectedConfigTarget = projection?.config_target;
@@ -184,7 +200,7 @@ export function expectedInitialSetupFinishCommand(surface, importGeneration = nu
   return {
     command: "finish_initial_setup",
     args: {
-      values: configValues(projection, valueOverrides),
+      values: configValues(projection, valueOverrides, importGeneration !== null),
       expectedConfigTarget: structuredClone(expectedConfigTarget),
       expectedSetupTarget: structuredClone(expectedSetupTarget),
       importGeneration,
@@ -858,6 +874,14 @@ export function createSettingsInitialSetupScenario() {
         const configBytes = await readFile(context.paths.config_file);
         const configStat = await stat(context.paths.config_file);
         const persistedText = configBytes.toString("utf8");
+        const finishedSurface = await observeInitialSetupSurface(firstCdp);
+        if (!initialSetupImportedApproveAbsent(finishedSurface.projection, persistedText)) {
+          throw productFailure(
+            "initial-setup-imported-approve-materialized",
+            "Main-only import and Finish created an explicit Approve role",
+            { approve_model_configured: finishedSurface.projection.approve_model_configured },
+          );
+        }
         const persistedSecretCount = persistedText.split(INITIAL_SETUP_SECRET_SENTINEL).length - 1;
         if (persistedSecretCount !== 1) {
           throw productFailure(
@@ -895,6 +919,7 @@ export function createSettingsInitialSetupScenario() {
             size_bytes: configStat.size,
             sha256: crypto.createHash("sha256").update(configBytes).digest("hex"),
             imported_secret_preserved_once: persistedSecretCount === 1,
+            imported_approve_absent: true,
           },
           provider_docling_ledger: provider.requestLedger,
           screenshots: {
@@ -931,6 +956,14 @@ export function createSettingsInitialSetupScenario() {
         const restoredSensitive = restored.value.surface.projection.config_fields.filter(
           (field) => field?.key === "model.extra_headers_json",
         );
+        const reopenedConfigText = await readFile(context.paths.config_file, "utf8");
+        if (!initialSetupImportedApproveAbsent(restored.value.surface.projection, reopenedConfigText)) {
+          throw productFailure(
+            "initial-setup-restarted-approve-materialized",
+            "restart materialized the absent Approve role from the Main-only import",
+            { approve_model_configured: restored.value.surface.projection.approve_model_configured },
+          );
+        }
         if (restoredSensitive.length !== 1
           || restoredSensitive[0].sensitive !== true
           || restoredSensitive[0].configured !== true
@@ -946,6 +979,7 @@ export function createSettingsInitialSetupScenario() {
           restart: restarted.restart,
           surface: restored.value.surface,
           stable_for_ms: INITIAL_SETUP_RESTART_STABILITY_MS,
+          imported_approve_absent: true,
           accepted_provider_docling_ledger: state.acceptedLedger,
           screenshot: restartScreenshot,
         }, { phase: "executing", owner: OWNER });

@@ -625,7 +625,7 @@ fn seek_sequence(
 
     let last_start = lines.len() - pattern.len();
     let search_start = if is_end_of_file {
-        last_start
+        last_start.max(start_index)
     } else {
         start_index.min(last_start.saturating_add(1))
     };
@@ -1293,6 +1293,35 @@ mod tests {
             PatchParser::apply_to_text("value\nmiddle\n value ", hunks)
                 .expect("EOF constraint evaluates only the tail candidate"),
             "value\nmiddle\ntail-won"
+        );
+    }
+
+    #[test]
+    fn eof_hunk_cannot_revisit_a_previous_hunk_range() {
+        for patch in [
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-b\n+c\n@@\n-b\n+d\n*** End of File\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n-b\n+c\n@@\n-b\n*** End of File\n*** End Patch",
+        ] {
+            let operations = PatchParser::parse(patch).expect("parse overlapping hunks");
+            let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+                panic!("expected update operation");
+            };
+            assert!(PatchParser::apply_to_text("a\nb\n", hunks).is_err());
+        }
+    }
+
+    #[test]
+    fn eof_hunk_after_a_disjoint_change_preserves_both_changes() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+x\n@@\n-c\n+y\n*** End of File\n*** End Patch",
+        )
+        .expect("parse forward hunks");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+        assert_eq!(
+            PatchParser::apply_to_text("a\nb\nc\n", hunks).expect("apply disjoint hunks"),
+            "x\nb\ny\n"
         );
     }
 

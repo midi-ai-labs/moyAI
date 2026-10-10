@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use ulid::Ulid;
 
+const MAX_SETTINGS_BYTES: usize = 512 * 1024;
+
 #[cfg(test)]
 mod tests;
 
@@ -218,10 +220,10 @@ impl OperationsStore {
         let installed = match std::fs::File::open(&path) {
             Ok(file) => {
                 let mut bytes = Vec::new();
-                file.take(512 * 1024 + 1)
+                file.take(MAX_SETTINGS_BYTES as u64 + 1)
                     .read_to_end(&mut bytes)
                     .map_err(error)?;
-                if bytes.len() > 512 * 1024 {
+                if bytes.len() > MAX_SETTINGS_BYTES {
                     return Err(RunnerError::new("Runner settings exceed 512 KiB"));
                 }
                 let value: Installed = serde_json::from_slice(&bytes).map_err(error)?;
@@ -237,13 +239,16 @@ impl OperationsStore {
     }
 
     pub(crate) fn update(&mut self, installed: Installed) -> Result<(), RunnerError> {
+        let bytes = serde_json::to_vec_pretty(&installed).map_err(error)?;
+        if bytes.len() > MAX_SETTINGS_BYTES {
+            return Err(RunnerError::new("Runner settings exceed 512 KiB"));
+        }
         let parent = self
             .path
             .parent()
             .ok_or_else(|| RunnerError::new("Invalid Runner settings path"))?;
         std::fs::create_dir_all(parent).map_err(error)?;
         let mut file = tempfile::NamedTempFile::new_in(parent).map_err(error)?;
-        let bytes = serde_json::to_vec_pretty(&installed).map_err(error)?;
         file.write_all(&bytes).map_err(error)?;
         file.as_file().sync_all().map_err(error)?;
         file.persist(&self.path).map_err(error)?;

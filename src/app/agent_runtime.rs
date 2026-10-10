@@ -3497,6 +3497,8 @@ fn durable_child_result_from_projection(
         .map(str::to_string);
     if status == SessionStatus::Failed {
         error.or(assistant)
+    } else if status == SessionStatus::Completed {
+        assistant
     } else {
         assistant.or(error)
     }

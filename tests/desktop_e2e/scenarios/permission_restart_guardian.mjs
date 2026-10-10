@@ -17,6 +17,7 @@ import { prepareDesktopFixture } from "./fixture.mjs";
 import {
   classifyAcquiredObservationFailure,
   observeProviderTurnSurface,
+  providerRenderedTerminalFailures,
   quiesceProviderResource,
 } from "./provider_restart.mjs";
 import { captureScenarioScreenshot } from "./observations.mjs";
@@ -336,6 +337,52 @@ function seedTerminalFailures(surface) {
   return failures;
 }
 
+export function permissionRestartGuardianRenderedTerminalFailures(surface) {
+  const failures = providerRenderedTerminalFailures(surface);
+  const conversation = primaryConversation(surface?.projection);
+  const compare = (field, expected, actual) => {
+    if (!isDeepStrictEqual(expected, actual)) failures.push({ field, expected, actual: actual ?? null });
+  };
+  compare("thread_count", 1, surface?.thread_count);
+  compare("prompt.count", 1, surface?.prompt?.count);
+  compare("prompt.value", "", surface?.prompt?.value);
+  compare("assistants.text", conversation.assistants,
+    Array.isArray(surface?.assistants) ? surface.assistants.map((row) => row?.text) : null);
+  compare("assistants.visible", conversation.assistants.map(() => true),
+    Array.isArray(surface?.assistants) ? surface.assistants.map((row) => row?.visible) : null);
+  return failures;
+}
+
+export function permissionRestartGuardianSeedTerminalDecision(
+  { surface, ledger },
+  apiMode = RESPONSES_API_MODE,
+) {
+  if (providerOrSurfaceFailed(surface, ledger, 1, apiMode)) return "fail";
+  if (!exactPermissionRestartGuardianLedger(ledger, ["guardian_seed"], { apiMode })) return "pending";
+  if (seedTerminalFailures(surface).length !== 0) return settledSurface(surface) ? "fail" : "pending";
+  return permissionRestartGuardianRenderedTerminalFailures(surface).length === 0 ? "pass" : "pending";
+}
+
+export function permissionRestartGuardianTerminalDecision(
+  { surface, ledger },
+  seedOwner = null,
+  apiMode = RESPONSES_API_MODE,
+) {
+  if (providerOrSurfaceFailed(
+    surface,
+    ledger,
+    SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES,
+    apiMode,
+  )) return "fail";
+  if (!exactPermissionRestartGuardianLedger(ledger, PERMISSION_RESTART_GUARDIAN_ROLES, { apiMode })) {
+    return "pending";
+  }
+  if (permissionRestartGuardianTerminalFailures(surface, seedOwner, apiMode).length !== 0) {
+    return settledSurface(surface) ? "fail" : "pending";
+  }
+  return permissionRestartGuardianRenderedTerminalFailures(surface).length === 0 ? "pass" : "pending";
+}
+
 export function createPermissionRestartGuardianStableRestartDecision(
   seedOwner,
   minimumStableMs = RESTART_STABILITY_MS,
@@ -360,6 +407,10 @@ export function createPermissionRestartGuardianStableRestartDecision(
     if (owner === null || !isDeepStrictEqual(owner, seedOwner)) {
       acceptedSince = null;
       return "fail";
+    }
+    if (permissionRestartGuardianRenderedTerminalFailures(surface).length !== 0) {
+      acceptedSince = null;
+      return "pending";
     }
     const observedAt = now();
     acceptedSince ??= observedAt;
@@ -733,16 +784,7 @@ function createPermissionRestartGuardianScenarioForApiMode(apiMode) {
             surface: await observeProviderTurnSurface(firstCdp),
             ledger: provider.requestLedger,
           }),
-          decide: ({ surface, ledger }) => {
-            if (providerOrSurfaceFailed(surface, ledger, 1, apiMode)) return "fail";
-            if (!exactPermissionRestartGuardianLedger(
-              ledger,
-              ["guardian_seed"],
-              { apiMode },
-            )) return "pending";
-            const failures = seedTerminalFailures(surface);
-            return failures.length === 0 ? "pass" : settledSurface(surface) ? "fail" : "pending";
-          },
+          decide: (sample) => permissionRestartGuardianSeedTerminalDecision(sample, apiMode),
           code: "permission-guardian-seed-terminal",
           message: "the GUI seed turn did not reach one exact canonical terminal",
         });
@@ -763,6 +805,7 @@ function createPermissionRestartGuardianScenarioForApiMode(apiMode) {
           submit,
           command_lifetime: seedCommandLifetime,
           owner: seedOwner,
+          surface: seedTerminal.surface,
           ledger: provider.requestLedger,
           screenshot,
         }, { phase: "executing", owner });
@@ -879,25 +922,7 @@ function createPermissionRestartGuardianScenarioForApiMode(apiMode) {
               surface: await observeProviderTurnSurface(restarted.driver),
               ledger: provider.requestLedger,
             }),
-            decide: ({ surface, ledger }) => {
-              if (providerOrSurfaceFailed(
-                surface,
-                ledger,
-                SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES,
-                apiMode,
-              )) return "fail";
-              if (!exactPermissionRestartGuardianLedger(
-                ledger,
-                PERMISSION_RESTART_GUARDIAN_ROLES,
-                { apiMode },
-              )) return "pending";
-              const failures = permissionRestartGuardianTerminalFailures(
-                surface,
-                seedOwner,
-                apiMode,
-              );
-              return failures.length === 0 ? "pass" : settledSurface(surface) ? "fail" : "pending";
-            },
+            decide: (sample) => permissionRestartGuardianTerminalDecision(sample, seedOwner, apiMode),
             code: "permission-guardian-terminal",
             message: "the restarted AutoReview turn did not complete under bounded Desktop storage pressure",
           });
@@ -920,6 +945,7 @@ function createPermissionRestartGuardianScenarioForApiMode(apiMode) {
             pressure: state.pressureOutcome,
             provider_release: release,
             terminal_owner: idleOwner(terminal.surface.projection),
+            surface: terminal.surface,
             provider_ledger: state.acceptedLedger,
             screenshot,
           }, { phase: "executing", owner });

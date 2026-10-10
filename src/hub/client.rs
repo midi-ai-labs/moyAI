@@ -118,7 +118,7 @@ impl HubCatalogClient {
     pub(super) async fn device_session(
         endpoint: &str,
         http: crate::device_network::ManagedHubHttp,
-    ) -> Result<(RegisteredHubClient, Option<super::HubSelection>), HubError> {
+    ) -> Result<(RegisteredHubClient, super::HubDefaultSelections), HubError> {
         #[derive(Deserialize)]
         struct Receipt {
             id: String,
@@ -132,6 +132,8 @@ impl HubCatalogClient {
             supports_delegated_execution: bool,
             identity_scope: String,
             default_selection: Option<super::HubSelection>,
+            #[serde(default)]
+            default_selections: Option<super::HubDefaultSelections>,
         }
         let mut url = validated_endpoint(endpoint)?;
         url.set_path("/v1/network/model-session");
@@ -170,10 +172,18 @@ impl HubCatalogClient {
         let mut connection = Self::new(endpoint, &receipt.client_token, 10000)?;
         connection.http = http.snapshot();
         connection.managed_http = Some(http);
-        let selection = receipt.default_selection;
-        if let Some(selection) = &selection {
-            selection.validate_shape()?;
-        }
+        let selections = receipt.default_selections.unwrap_or_else(|| {
+            let side_chat = receipt.default_selection.clone().map(|mut selection| {
+                selection.required_capabilities.clear();
+                selection
+            });
+            super::HubDefaultSelections {
+                main: receipt.default_selection,
+                side_chat,
+                approve: None,
+            }
+        });
+        selections.validate_shape()?;
         Ok((
             RegisteredHubClient {
                 connection,
@@ -185,7 +195,7 @@ impl HubCatalogClient {
                 supports_delegated_execution: receipt.supports_delegated_execution
                     && receipt.supports_turn_heartbeat,
             },
-            selection,
+            selections,
         ))
     }
     pub fn new(endpoint: &str, token: &str, deadline_ms: u64) -> Result<Self, HubError> {

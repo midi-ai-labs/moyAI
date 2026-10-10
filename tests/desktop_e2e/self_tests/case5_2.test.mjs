@@ -28,6 +28,7 @@ import {
   case52EvidenceOptions,
   case52ExpectedMainGlobalSave,
   case52ExpectedSideGlobalSave,
+  case52ConfiguredApproveFailures,
   case52ExternalLmStudioObservation,
   case52ExtraBodyEvidence,
   case52ForbiddenWorkspacePaths,
@@ -48,6 +49,7 @@ import {
   case52SideProviderSummary,
   case52LegacySideSummaryV1,
   case52SideScreenshotSurfaceReady,
+  case52Stage5Options,
   case52ProviderControlTokenLeakFailure,
   classifyCase52MainSaveCommandError,
   classifyCase52MainPreferencesObservationError,
@@ -209,13 +211,20 @@ test("manual.case5_2 api key option carries only a variable name through Main an
   const gui = normalizeCase52Options({ ...case52OptionsForFailure(), configure_main_via_gui: true, api_key_env: "MANUAL_TEST_KEY" });
   assert.doesNotMatch(case52FixtureConfig(gui), /api_key_env/);
   const surface = { projection: { config_target: { configGeneration: "1" }, config_fields: [
+    { key: "model.base_url", value: "old" }, { key: "model.model", value: "old" },
+    { key: "model.provider_profile", value: "lm_studio" },
     { key: "model.api_key_env", value: "" }, { key: "side_chat.base_url", value: "old" },
     { key: "side_chat.model", value: "old" }, { key: "side_chat.provider_profile", value: "lm_studio" },
+    { key: "side_chat.api_key_env", value: "" },
   ] } };
   assert.deepEqual(case52ExpectedMainGlobalSave(surface, gui).args.values.find(row => row.key === "model.api_key_env"), { key: "model.api_key_env", text: "MANUAL_TEST_KEY" });
-  assert.deepEqual(case52ExpectedSideGlobalSave(surface, options).args.values.find(row => row.key === "model.api_key_env"), { key: "model.api_key_env", text: "" });
-  assert.equal(case52ExpectedSideGlobalSave(surface, options).args.values.some(row => row.key === "side_chat.api_key_env"), false);
+  assert.equal(case52ExpectedSideGlobalSave(surface, options).args.values.find(row => row.key === "model.api_key_env"), undefined);
+  assert.equal(case52ExpectedSideGlobalSave(surface, options).args.values.find(row => row.key === "side_chat.api_key_env"), undefined);
+  const shared = normalizeCase52Options({ ...case52OptionsForFailure(), api_key_env: "MANUAL_TEST_KEY", side_api_key_env: "MANUAL_TEST_KEY" });
+  assert.deepEqual(case52ExpectedSideGlobalSave(surface, shared).args.values.find(row => row.key === "side_chat.api_key_env"), { key: "side_chat.api_key_env", text: "MANUAL_TEST_KEY" });
+  for (const side_api_key_env of ["Bearer secret", "KEY\nOTHER", 12, null]) assert.throws(() => normalizeCase52Options({ ...case52OptionsForFailure(), side_api_key_env }), /side_api_key_env/);
   assert.equal(normalizeCase52Options({ ...case52OptionsForFailure(), api_key_env: "123KEY" }).apiKeyEnv, "123KEY");
+  assert.equal(normalizeCase52Options({ ...case52OptionsForFailure(), side_api_key_env: "123KEY" }).sideApiKeyEnv, "123KEY");
   for (const api_key_env of ["Bearer secret", "KEY\nOTHER", 12, null]) assert.throws(() => normalizeCase52Options({ ...case52OptionsForFailure(), api_key_env }), /api_key_env/);
 });
 
@@ -227,6 +236,60 @@ test("manual.case5_2 api key header resolves only at request time and external t
   assert.deepEqual(case52ExternalEnvironment("manual_test_key", environment), { Path: "keep" });
   assert.deepEqual(case52ExternalEnvironment("", environment), environment);
   assert.equal(environment.MANUAL_TEST_KEY, "fake-token");
+  assert.deepEqual(case52ExternalEnvironment(["manual_test_key", "SIDE_TEST_KEY"], { ...environment, SIDE_TEST_KEY: "fake-side-token" }), { Path: "keep" });
+});
+
+test("manual.case5_2 explicitly configures Approve without changing the legacy Main fallback", () => {
+  const raw = { fixture_source: "C:\\fixture", provider_profile: "openai_compatible",
+    provider_base_url: "http://provider.test/v1", main_model: "main", side_model: "chat",
+    api_key_env: "SHARED_TEST_KEY", side_api_key_env: "SHARED_TEST_KEY" };
+  const legacy = normalizeCase52Options(raw);
+  assert.equal(Object.hasOwn(legacy, "approveModel"), false);
+  assert.doesNotMatch(case52FixtureConfig(legacy), /\[approve\]/);
+  const options = normalizeCase52Options({ ...raw, approve_model: "review", approve_api_key_env: "SHARED_TEST_KEY" });
+  assert.equal(options.approveModel, "review");
+  assert.equal(options.approveApiKeyEnv, options.apiKeyEnv);
+  const config = case52FixtureConfig(options);
+  const section = config.split("[approve]\n")[1].split(/^\[/m)[0];
+  assert.match(section, /base_url = "http:\/\/provider.test\/v1"/);
+  assert.match(section, /model = "review"/);
+  assert.match(section, /provider_profile = "openai_compatible"/);
+  assert.match(section, /api_key_env = "SHARED_TEST_KEY"/);
+  assert.doesNotMatch(section, /context_window|request_timeout|temperature|extra_body/);
+  assert.match(config, /access_mode = "auto_review"/);
+  assert.equal(normalizeCase52Options({ ...raw, approve_model: "review" }).approveApiKeyEnv, "");
+  for (const approve_model of [null, "", "bad\nmodel"]) assert.throws(() => normalizeCase52Options({ ...raw, approve_model }), TypeError);
+  for (const approve_api_key_env of [null, 1, "Bearer secret", "KEY\nOTHER"]) assert.throws(() => normalizeCase52Options({ ...raw, approve_api_key_env }), TypeError);
+  const fields = [{ key: "approve.base_url", value: options.providerBaseUrl }, { key: "approve.model", value: options.approveModel },
+    { key: "approve.provider_profile", value: options.providerProfile }, { key: "approve.api_key_env", value: options.approveApiKeyEnv }];
+  assert.deepEqual(case52ConfiguredApproveFailures({ config_fields: fields }, options), []);
+  for (const row of fields) {
+    const drifted = fields.map(field => field.key === row.key ? { ...field, value: "drift" } : field);
+    assert.deepEqual(case52ConfiguredApproveFailures({ config_fields: drifted }, options), [{ key: row.key, expected: row.value, actual: "drift" }]);
+  }
+  assert.deepEqual(case52ConfiguredApproveFailures({ config_fields: [...fields, fields[1]] }, options), [{ key: "approve.model", expected: "review", actual: null }]);
+  assert.deepEqual(case52ConfiguredApproveFailures({}, legacy), []);
+});
+
+test("manual.case5_2 Main and Sub saves preserve ordinary fields and omit untouched Approve and private snapshots", () => {
+  const options = normalizeCase52Options(case52OptionsForFailure());
+  const target = { configGeneration: "7", workspacePath: "C:\\workspace", sessionId: null };
+  const surface = { projection: { config_target: target, config_fields: [
+    { key: "model.base_url", value: "old" }, { key: "model.provider_profile", value: "lm_studio" },
+    { key: "model.api_key_env", value: "" },
+    { key: "side_chat.base_url", value: "old" }, { key: "side_chat.provider_profile", value: "lm_studio" },
+    { key: "side_chat.api_key_env", value: "" },
+    { key: "model.model", value: "main-before" }, { key: "side_chat.model", value: "chat-before" },
+    { key: "approve.model", value: "review" }, { key: "approve.api_key_env", value: "REVIEW_KEY" },
+    { key: "docling.enabled", value: "false" },
+  ] } };
+  for (const save of [case52ExpectedMainGlobalSave(surface, options), case52ExpectedSideGlobalSave(surface, options)]) {
+    assert.deepEqual(save.args.values.map(row => row.key), ["model.base_url", "model.provider_profile",
+      "side_chat.base_url", "side_chat.provider_profile", "model.model", "side_chat.model", "docling.enabled"]);
+    assert.deepEqual(save.args.expectedTarget, target);
+    assert.equal(save.args.values.at(-1).text, "false");
+  }
+  assert.equal(surface.projection.config_fields.find(row => row.key === "approve.model").value, "review");
 });
 
 test("manual.case5_2 accepts an external-unmanaged OpenAI-compatible /v1 provider without LM Studio fields", () => {
@@ -349,7 +412,6 @@ test("manual.case5_2 can seed a neutral connection for same-execution trusted Ma
         { key: "model.base_url", text: "http://192.0.2.1:1234" },
         { key: "model.model", text: "main" },
         { key: "model.provider_profile", text: "lm_studio" },
-        { key: "model.api_key_env", text: "" },
         { key: "model.context_window", text: "131072" },
       ],
       expectedTarget: { workspacePath: "C:\\workspace", sessionId: null, configGeneration: "7" },
@@ -361,6 +423,7 @@ test("manual.case5_2 can seed a neutral connection for same-execution trusted Ma
     { key: "side_chat.base_url", value: "http://127.0.0.1:1234" },
     { key: "side_chat.model", value: "side-before-save" },
     { key: "side_chat.provider_profile", value: "lm_studio" },
+    { key: "side_chat.api_key_env", value: "" },
     { key: "side_chat.system_prompt", value: "preserve-side-prompt" },
   );
   assert.deepEqual(case52ExpectedSideGlobalSave(sideSurface, normalized), {
@@ -370,7 +433,6 @@ test("manual.case5_2 can seed a neutral connection for same-execution trusted Ma
         { key: "model.base_url", text: "http://127.0.0.1:9" },
         { key: "model.model", text: "moyai-case5-2-before-gui-save" },
         { key: "model.provider_profile", text: "lm_studio" },
-        { key: "model.api_key_env", text: "" },
         { key: "model.context_window", text: "131072" },
         { key: "side_chat.base_url", text: "http://192.0.2.1:1234" },
         { key: "side_chat.model", text: "side" },
@@ -584,6 +646,7 @@ test("manual.case5_2 Side screenshot readiness requires global values and the ma
     details: { ...visible, open: true },
     profile: { ...visible, value: options.providerProfile },
     base: { ...visible, value: options.providerBaseUrl },
+    api_key: { ...visible, value: "" },
     manual: { ...visible, value: options.sideModel },
   };
   assert.equal(case52SideScreenshotSurfaceReady(surface, options, SESSION_ID), true);
@@ -594,6 +657,7 @@ test("manual.case5_2 Side screenshot readiness requires global values and the ma
     { profile: { ...surface.profile, value: "openai_compatible" } },
     { base: { ...surface.base, viewport_visible: false } },
     { manual: { ...surface.manual, viewport_visible: false } },
+    { api_key: { ...surface.api_key, value: "UNEXPECTED_KEY" } },
   ]) {
     assert.equal(case52SideScreenshotSurfaceReady({ ...surface, ...changed }, options, SESSION_ID), false);
   }
@@ -795,6 +859,7 @@ test("manual.case5_2 reads exact OpenAI-compatible model identity and optional c
     main: { id: "Qwen3.8-27B-4bit", owned_by: "omlx", max_model_len: 131_072 },
     side: { id: "Qwen3.8-27B-4bit", owned_by: "omlx", max_model_len: 131_072 },
     main_match_count: 1,
+    side_match_count: 1,
     context_capacity: {
       reported: true,
       candidates: [{ field: "max_model_len", value: 131_072 }],
@@ -802,6 +867,29 @@ test("manual.case5_2 reads exact OpenAI-compatible model identity and optional c
       conflict: false,
     },
   });
+});
+
+test("OpenAI-compatible Side model and credential reference stay independent through Stage5", () => {
+  const options = normalizeCase52Options({
+    fixture_source: "C:\\fixture", provider_profile: "openai_compatible",
+    provider_base_url: "http://192.0.2.10:8119/v1", main_model: "Qwen", side_model: "Gemma",
+    api_key_env: "MAIN_TEST_KEY", side_api_key_env: "MAIN_TEST_KEY",
+  });
+  assert.equal(options.sideModel, "Gemma");
+  assert.equal(options.sideApiKeyEnv, "MAIN_TEST_KEY");
+  assert.equal(case52Stage5Options(options), options);
+  const models = case52ProviderModelState({ models: { value: { data: [
+    { id: "Qwen", max_model_len: 131_072 }, { id: "Gemma", max_model_len: 131_072 },
+  ] } } }, options);
+  assert.equal(models.main.id, "Qwen");
+  assert.equal(models.side.id, "Gemma");
+  assert.equal(models.side_match_count, 1);
+  const missing = case52ProviderModelState({ models: { value: { data: [{ id: "Qwen" }] } } }, options);
+  assert.equal(missing.side, null);
+  assert.equal(missing.side_match_count, 0);
+  const legacy = normalizeCase52Options(case52OptionsForFailure());
+  assert.equal(case52Stage5Options(legacy).sideModel, legacy.mainModel);
+  assert.equal(legacy.sideModel, "side");
 });
 
 test("manual.case5_2 normalizes checkout line endings before exact trusted GUI insertion", () => {
@@ -1318,6 +1406,7 @@ test("manual.case5_2 external provider cleanup verifies availability without loa
           main: { id: "Qwen3.8-27B-4bit" },
           side: { id: "Qwen3.8-27B-4bit" },
           main_match_count: 1,
+          side_match_count: 1,
           context_capacity: {
             reported: true,
             candidates: [{ field: "max_model_len", value: 131_072 }],

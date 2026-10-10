@@ -8,10 +8,7 @@ import { createHubOfflineResetScenario } from "./scenarios/hub_offline_reset.mjs
 import { createHubBrowserEnrollmentScenario } from "./scenarios/hub_browser_enrollment.mjs";
 import { createHubJoinRetryControlsScenario } from "./scenarios/hub_join_retry_controls.mjs";
 import { createOutputHistoryNavigationScenario } from "./scenarios/output_history_navigation.mjs";
-import { createMcpReceiverLiveScenario, createMcpReceiverStopScenario, createMcpReceiverPermissionScenario, createMcpHistoryPaginationScenario } from "./scenarios/mcp_receiver_live.mjs";
 import { createReviewControlsScenario } from "./scenarios/review_controls.mjs";
-import { createHubReceiverSettingsScenario } from "./scenarios/hub_receiver_settings.mjs";
-import { createOutgoingControlsScenario } from "./scenarios/hub_outgoing_controls.mjs";
 import { createNativeDialogCancelScenario } from "./scenarios/native_dialog_cancel.mjs";
 import { createSessionManagementScenario } from "./scenarios/session_management.mjs";
 import { createWorkspaceControlsScenario } from "./scenarios/workspace_controls.mjs";
@@ -36,6 +33,7 @@ import {
 } from "./scenarios/permission_temp_escalation.mjs";
 import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
 import { createToolOperationFailureScenario } from "./scenarios/tool_operation_failure.mjs";
+import { createShellProjectionAccuracyScenario } from "./scenarios/shell_projection_accuracy.mjs";
 import { createProviderResponsesCompactionRetryScenario } from "./scenarios/provider_responses_compaction_retry.mjs";
 import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
@@ -90,19 +88,11 @@ const factories = new Map([
   ["onboarding.win-a-to-win-b", createOnboardingWinAbScenario],
   ["project.four-device-acceptance", createFourDeviceAcceptanceScenario],
   ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
-  ["hub.receiver-settings-controls", createHubReceiverSettingsScenario],
-  ["hub.outgoing-controls", createOutgoingControlsScenario],
   ["agent.interrupt", createAgentInterruptScenario],
   ["history.restart-prepend", createHistoryRestartPrependScenario],
   ["history.terminal-reconcile", createHistoryTerminalReconcileScenario],
   ["input.pointer-keyboard", createPointerKeyboardScenario],
   ["input.command-palette-insertion", createCommandPaletteInsertionScenario],
-  ["mcp.receiver-live", createMcpReceiverLiveScenario],
-  ["mcp.receiver-stop", createMcpReceiverStopScenario],
-  ["mcp.history-pagination", createMcpHistoryPaginationScenario],
-  ["mcp.receiver-approve", options => createMcpReceiverPermissionScenario({ ...options, decision: "approved" })],
-  ["mcp.receiver-deny", options => createMcpReceiverPermissionScenario({ ...options, decision: "denied" })],
-  ["mcp.receiver-abort", options => createMcpReceiverPermissionScenario({ ...options, decision: "abort" })],
   ["manual.case1", createManualCase1Scenario],
   ["manual.case2", createManualCase2Scenario],
   ["manual.case3", createManualCase3Scenario],
@@ -142,6 +132,8 @@ const factories = new Map([
   ["permission.temp-escalation", createPermissionTempEscalationScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
   ["history.tool-operation-failure", createToolOperationFailureScenario],
+  ["permission.shell-projection-success", () => createShellProjectionAccuracyScenario("success")],
+  ["permission.shell-projection-failure", () => createShellProjectionAccuracyScenario("failure")],
   ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],
   ["provider.responses-progress", createProviderResponsesProgressScenario],
   ["provider.restart", createProviderRestartScenario],
@@ -185,14 +177,6 @@ const configurableScenarios = new Set([
   "hub.browser-enrollment",
   "hub.offline-reset",
   "hub.join-retry-controls",
-  "hub.receiver-settings-controls",
-  "hub.outgoing-controls",
-  "mcp.receiver-live",
-  "mcp.receiver-stop",
-  "mcp.history-pagination",
-  "mcp.receiver-approve",
-  "mcp.receiver-deny",
-  "mcp.receiver-abort",
   "manual.case1",
   "manual.case2",
   "manual.case3",

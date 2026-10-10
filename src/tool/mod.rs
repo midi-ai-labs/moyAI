@@ -1,4 +1,5 @@
 pub mod apply_patch;
+pub mod compact_context;
 pub mod context;
 pub mod contract;
 pub mod current_time;

@@ -30,6 +30,11 @@ export function sharedApprovalParked(value, expected) {
     && Number.isFinite(approval.expires_at_ms) && value.observed_at_ms >= approval.expires_at_ms
     && value.status?.environments?.some(row => row.id === expected.environmentId && row.occupied === 1);
 }
+export function sharedRenameEditorRetained(value, expected) {
+  return value?.connected === true && value.same_node === true && value.focused === true
+    && value.value === expected.value && value.selection_start === expected.selection_start
+    && value.selection_end === expected.selection_end && value.selection_direction === expected.selection_direction;
+}
 export function createSharedWorkEntryScenario(options = {}) {
   const settings = normalizeHubBrowserOptions(options);
   const state = { resource: null, input: null, commands: null, nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false, failures: [], close: null, notificationLog: null };
@@ -114,6 +119,7 @@ export function createSharedWorkEntryScenario(options = {}) {
         }
         async function click(name, value) {
           const target = sharedActionTarget(name, value);
+          await trustedFocus(input, cdp, target);
           await waitForSharedComposer(input, target);
           await trustedClick(input, cdp, target, sink);
         }
@@ -141,6 +147,62 @@ export function createSharedWorkEntryScenario(options = {}) {
         const job = submitted.status.jobs.find(j => j.title === prompt);
         await openSharedJob(input, cdp, sink, job.id);
         await wait("Job detail displays the submitted prompt", () => invokeDesktopCommand(cdp, "shared_work_projection"), p => p.detail?.id === job.id && p.detail.input?.prompt === "共有環境で解析してください。");
+        const conversationId = submitted.selected_conversation_id ?? job.conversation_id;
+        if (!conversationId) throw failure("Submitted work has no shared conversation identity", { job });
+        await trustedClick(input, cdp, { selector: `.sidebar button[data-action="shared-start-rename-conversation"][data-value=${JSON.stringify(conversationId)}]`,
+          identity: { tag: "BUTTON", action: "shared-start-rename-conversation" } }, sink);
+        await wait("Rename starts with keyboard focus on its editor", () => cdp.evaluate("document.activeElement?.id"), value => value === "shared-rename-title");
+        const editorReference = await cdp.call("Runtime.evaluate", { expression: "document.getElementById('shared-rename-title')", returnByValue: false });
+        const editorObjectId = editorReference.result?.objectId;
+        if (!editorObjectId) throw failure("Rename editor is unavailable after the public start action", editorReference);
+        const renamedTitle = "名前変更の入力保持を確認";
+        try {
+          const editor = async () => {
+            const result = await cdp.call("Runtime.callFunctionOn", { objectId: editorObjectId, returnByValue: true,
+              functionDeclaration: "function () { return { connected: this.isConnected, same_node: document.getElementById('shared-rename-title') === this, focused: document.activeElement === this, value: this.value, selection_start: this.selectionStart, selection_end: this.selectionEnd, selection_direction: this.selectionDirection }; }" });
+            return result.result?.value;
+          };
+          async function retainThroughPolling(label, expected) {
+            const afterSequence = (await state.commands.snapshot()).sequence;
+            // Refresh is serial: seeing the third call establishes that two
+            // preceding refreshes have returned and rendered the actual UI.
+            return wait(label, async () => {
+              const commands = await state.commands.snapshot(afterSequence), observed = await editor();
+              if (commands.dropped_through > afterSequence || !sharedRenameEditorRetained(observed, expected))
+                throw failure("Shared polling changed the active rename editor or its selection", { expected, observed, commands });
+              return { editor: observed, refresh_calls: commands.calls.filter(call => call.args?.request?.kind === "refresh") };
+            }, value => value.refresh_calls.length >= 3, 30_000);
+          }
+          await input.keyDown("Control"); try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
+          await input.insertText(byId("shared-rename-title", "INPUT"), renamedTitle);
+          await input.keyDown("Control"); try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
+          const keyboardSelection = await editor();
+          if (!sharedRenameEditorRetained(keyboardSelection, { ...keyboardSelection, value: renamedTitle, selection_start: 0, selection_end: renamedTitle.length }))
+            throw failure("Keyboard editing did not retain the selected rename draft", keyboardSelection);
+          const keyboardProof = await retainThroughPolling("Shared polling keeps the selected rename draft focused", keyboardSelection);
+          await input.click(byId("shared-rename-title", "INPUT"), { stableHitSamples: 3 });
+          const pointerSelection = await editor();
+          if (!(pointerSelection?.connected && pointerSelection.same_node && pointerSelection.focused && pointerSelection.value === renamedTitle
+            && Number.isInteger(pointerSelection.selection_start) && pointerSelection.selection_start >= 0 && pointerSelection.selection_end <= renamedTitle.length))
+            throw failure("Pointer editing lost the rename draft", pointerSelection);
+          if (pointerSelection.selection_start !== pointerSelection.selection_end)
+            throw failure("Clicking the rename editor did not place the text cursor", pointerSelection);
+          const pointerProof = await retainThroughPolling("Shared polling keeps the clicked text cursor focused", pointerSelection);
+          await sink.record("shared-rename-editor-retention", { conversation_id: conversationId, keyboard: keyboardProof, pointer: pointerProof }, { phase: "executing", owner: OWNER });
+          await captureScenarioScreenshot({ cdp, sink, name: "shared-rename-input-retained", owner: OWNER });
+          const beforeRename = (await state.commands.snapshot()).sequence;
+          const renameGeneration = (await invokeDesktopCommand(cdp, "shared_work_projection")).generation;
+          await click("save-rename-conversation");
+          await wait("Saving the shared name updates the conversation and visible heading", async () => ({ projection: await invokeDesktopCommand(cdp, "shared_work_projection"),
+            heading: await cdp.evaluate("document.getElementById('shared-heading')?.textContent"), editor: await cdp.evaluate("document.getElementById('shared-rename-title') !== null") }),
+          value => value.projection.conversations?.some(row => row.id === conversationId && row.title === renamedTitle) && value.heading === renamedTitle && !value.editor);
+          const renameCommands = await state.commands.snapshot(beforeRename);
+          const renameProof = assertExactDesktopCommandSequence({ ...renameCommands, calls: renameCommands.calls.filter(call => call.args?.request?.kind !== "refresh") }, {
+            afterSequence: beforeRename, expected: [{ command: "shared_work_command", args: { expectedGeneration: renameGeneration,
+              request: { kind: "rename_conversation", project_id: "project-a", conversation_id: conversationId, title: renamedTitle } } }],
+          });
+          await sink.record("shared-rename-saved", { conversation_id: conversationId, title: renamedTitle, command: renameProof }, { phase: "executing", owner: OWNER });
+        } finally { await cdp.call("Runtime.releaseObject", { objectId: editorObjectId }); }
         await captureScenarioScreenshot({ cdp, sink, name: "shared-submitted-job", owner: OWNER });
         const beforeRestart = { user_id: alice.user_id, project_id: "project-a", job_id: job.id };
         const restartProof = await restart();

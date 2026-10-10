@@ -11,6 +11,7 @@ export type FocusIntentSource =
   | "new-session"
   | "command-palette"
   | "settings-action"
+  | "shared-editor"
   | "titlebar-menu"
   | "modal-return"
   | "focus-snapshot"

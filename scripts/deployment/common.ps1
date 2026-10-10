@@ -130,6 +130,37 @@ function Write-MoyaiUtf8([string]$Path, [string]$Content) {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Get-MoyaiShortcutFolder {
+  return Join-Path ([Environment]::GetFolderPath('Programs')) 'moyAI'
+}
+
+function Get-MoyaiShortcutRegistration([string]$Root, [string]$Name) {
+  $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+  $extra = if ($Name -ceq 'moyAI Team Management') { ' -TeamManagement' } elseif ($Name -ceq 'moyAI') { '' } else { throw 'Unknown moyAI shortcut.' }
+  return [pscustomobject]@{
+    TargetPath = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell/v1.0/powershell.exe'
+    Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Resolve-MoyaiChild $rootPath 'scripts/Start-moyAI.ps1') + '"' + $extra
+    WorkingDirectory = $rootPath
+    IconLocation = (Resolve-MoyaiChild $rootPath 'app/bin/moyai-desktop.exe') + ',0'
+  }
+}
+
+function Remove-MoyaiShortcuts([string]$Root, [string]$ShortcutFolder, [string[]]$Names = @('moyAI', 'moyAI Team Management'), [switch]$Preview) {
+  if (-not (Test-Path -LiteralPath $ShortcutFolder -PathType Container)) { return }
+  $shell = New-Object -ComObject WScript.Shell
+  foreach ($name in $Names) {
+    $path = Resolve-MoyaiChild $ShortcutFolder ($name + '.lnk')
+    Assert-MoyaiRegularPath $ShortcutFolder $path
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+    $expected = Get-MoyaiShortcutRegistration $Root $name
+    $actual = $shell.CreateShortcut($path)
+    # Shared Start-menu names can point to another installation or a user-edited command.
+    if ($actual.TargetPath -ine $expected.TargetPath -or $actual.Arguments -cne $expected.Arguments -or $actual.WorkingDirectory -ine $expected.WorkingDirectory -or $actual.IconLocation -ine $expected.IconLocation) { continue }
+    if (-not $Preview) { Remove-Item -LiteralPath $path -Force }
+    $path
+  }
+}
+
 # Report only processes in the installation being replaced; never stop them here.
 function Get-MoyaiRunningAppNotice([string]$Root, [object[]]$Processes) {
   $boundary = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + '\'

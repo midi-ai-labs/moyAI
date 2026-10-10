@@ -20,10 +20,11 @@ function projection(overrides: Partial<HubProjection> = {}): HubProjection {
         { id: "model-b", label: "Model B", capabilities: ["vision"] },
       ],
     },
-    main_review: null, side_chat_review: null,
-    main_confirmation: "unconfirmed", side_chat_confirmation: "unconfirmed", error: null,
-    main_mode: "direct", side_chat_mode: "direct", active_main: null, active_side_chat: null,
-    can_enable_main_hub: true, can_enable_side_chat_hub: true, can_change_main_mode: true, can_change_side_chat_mode: true,
+    main_review: null, side_chat_review: null, approve_review: null,
+    main_confirmation: "unconfirmed", side_chat_confirmation: "unconfirmed", approve_confirmation: "unconfirmed", error: null,
+    main_mode: "direct", side_chat_mode: "direct", approve_mode: "direct", active_main: null, active_side_chat: null, active_approve: null,
+    can_enable_main_hub: true, can_enable_side_chat_hub: true, can_enable_approve_hub: true,
+    can_change_main_mode: true, can_change_side_chat_mode: true, can_change_approve_mode: true,
     ...overrides,
   };
 }
@@ -209,6 +210,7 @@ test("a newer catalog poll cannot be rolled back by a delayed local save receipt
   editHubField(state, "main:model:model-a", "", true);
   editHubField(state, "side_chat:model:model-b", "", true);
   editHubField(state, "side_chat:affinity", "9", false);
+  editHubField(state, "approve:choice", "model-b", false);
   const drafts = structuredClone(state.drafts);
   const receipt = { ...before, settings_revision: "2", main_confirmation: "confirmed" as const,
     main_review: { hub_id: "hub-a", reviewed_revision: "7", selection: structuredClone(state.drafts.main.selection) } };
@@ -230,12 +232,13 @@ test("a newer catalog poll cannot be rolled back by a delayed local save receipt
 });
 
 test("a delayed local save receipt cannot replace newer same-revision lifecycle or runtime state", () => {
-  for (const update of ["stale", "unauthorized", "main_running", "side_running", "other_confirmation"] as const) {
+  for (const update of ["stale", "unauthorized", "main_running", "side_running", "approve_running", "other_confirmation"] as const) {
     const state = createHubUiState();
     const before = projection({ connection_generation: "2" });
     acceptHubProjection(state, before);
     editHubField(state, "main:model:model-a", "", true);
     editHubField(state, "side_chat:model:model-b", "", true);
+    editHubField(state, "approve:choice", "model-b", false);
     const drafts = structuredClone(state.drafts);
     const receipt = { ...before, settings_revision: "2", main_confirmation: "confirmed" as const,
       main_review: { hub_id: "hub-a", reviewed_revision: "7", selection: structuredClone(state.drafts.main.selection) } };
@@ -244,6 +247,7 @@ test("a delayed local save receipt cannot replace newer same-revision lifecycle 
     if (update === "unauthorized") { newer.status = "error"; newer.error = "unauthorized"; }
     if (update === "main_running") newer.active_main = { turn_id: "main-turn", phase: "running", logical_model_id: "model-a" };
     if (update === "side_running") newer.active_side_chat = { turn_id: "side-turn", phase: "running", logical_model_id: "model-b" };
+    if (update === "approve_running") newer.active_approve = { turn_id: "approve-turn", phase: "running", logical_model_id: "model-b" };
     if (update === "other_confirmation") newer.side_chat_confirmation = "confirmed";
     acceptHubProjection(state, newer);
     assert.equal(acceptHubProjection(state, receipt, {
@@ -253,6 +257,58 @@ test("a delayed local save receipt cannot replace newer same-revision lifecycle 
     assert.deepEqual(state.drafts, drafts, update);
     assert.equal(hubCanSave(state, "side_chat"), false, update);
   }
+});
+
+test("role-specific defaults keep Main, Sub and Approve independent and never configure Approve implicitly", () => {
+  const local = createHubUiState();
+  const selection = (id: string, capabilities: string[] = []) => ({ allowed_model_ids: [id], preferred_model_id: id,
+    required_capabilities: capabilities, wait_policy: "wait_for_preferred" as const, affinity_turns: 1 });
+  acceptHubProjection(local, projection({ recommended_main_selection: selection("model-a", ["tools"]),
+    recommended_side_chat_selection: selection("model-b"), recommended_approve_selection: selection("model-b") }));
+  assert.equal(local.projection!.approve_review, null);
+  assert.equal(hubModelChoice(local, "approve"), "");
+  assert.match(renderManagedAiConnection(local, "approve"), /未設定（Mainのモデルを使用）/);
+  for (const context of ["main", "side_chat", "approve"] as const) editHubField(local, `${context}:choice`, ":hub-default", false);
+  assert.equal(local.drafts.main.selection.preferred_model_id, "model-a");
+  assert.equal(local.drafts.side_chat.selection.preferred_model_id, "model-b");
+  assert.equal(local.drafts.approve.selection.preferred_model_id, "model-b");
+  assert.deepEqual(local.drafts.approve.selection.required_capabilities, []);
+  assert.equal(hubCanSave(local, "approve"), true);
+  assert.match(renderManagedAiConnection(local, "approve"), /data-action="hub-save-approve"/);
+  assert.doesNotMatch(renderManagedAiConnection(local, "approve"), /Approveは未設定/);
+  acceptHubProjection(local, { ...local.projection!, recommended_approve_selection: selection("model-a") });
+  assert.equal(local.drafts.approve.selection.preferred_model_id, "model-b", "a passive recommendation does not replace the edited choice");
+});
+
+test("Approve review failure and a removed saved model retain the explicit selection instead of Main inheritance", () => {
+  const local = createHubUiState();
+  const review = { hub_id: "hub-a", reviewed_revision: "7", selection: { allowed_model_ids: ["removed"], preferred_model_id: "removed",
+    required_capabilities: [], wait_policy: "wait_for_preferred" as const, affinity_turns: 1 } };
+  acceptHubProjection(local, projection({ approve_review: review, approve_confirmation: "review_required", approve_mode: "hub" }));
+  const html = renderManagedAiConnection(local, "approve");
+  assert.match(html, /選択済みモデルが削除されています/);
+  assert.doesNotMatch(html, /未設定（Main|Approveは未設定/);
+  assert.equal(hubCanSave(local, "approve"), false);
+  assert.match(hubExecutionRoute(local.projection, "approve")!.blockedReason!, /再確認・保存/);
+});
+
+test("an Approve acknowledgement advances both edited chat baselines while preserving their models and catalog targets", () => {
+  const local = createHubUiState();
+  const before = projection();
+  acceptHubProjection(local, before);
+  editHubField(local, "main:choice", "model-a", false);
+  editHubField(local, "side_chat:choice", "model-b", false);
+  editHubField(local, "approve:choice", "model-b", false);
+  const main = structuredClone(local.drafts.main), side = structuredClone(local.drafts.side_chat);
+  const after = projection({ settings_revision: "2", approve_confirmation: "confirmed",
+    approve_review: { hub_id: "hub-a", reviewed_revision: "7", selection: structuredClone(local.drafts.approve.selection) } });
+  acceptHubProjection(local, after, { savedContext: "approve", localSave: { before, context: "approve", kind: "review" } });
+  assert.equal(local.drafts.approve.dirty, false);
+  assert.deepEqual(local.drafts.main, { ...main, target: { ...main.target!, expectedSettingsRevision: "2" } });
+  assert.deepEqual(local.drafts.side_chat, { ...side, target: { ...side.target!, expectedSettingsRevision: "2" } });
+  assert.equal(hubCanSave(local, "main"), true);
+  assert.equal(hubCanSave(local, "side_chat"), true);
+  assert.equal(hubCanSave(local, "approve"), false);
 });
 
 test("a local review acknowledgement may confirm only its own pre-acknowledgement poll", () => {
@@ -457,6 +513,7 @@ test("Main and Side dropdowns preserve independent explicit/default choices acro
   acceptHubProjection(state, projection({ main_mode: "hub", side_chat_mode: "hub", recommended_main_selection: recommendation }));
   editHubField(state, "main:choice", ":hub-default", false);
   editHubField(state, "side_chat:choice", "model-b", false);
+  editHubField(state, "approve:choice", "model-a", false);
   assert.equal(hubModelChoice(state, "main"), ":hub-default");
   assert.equal(hubModelChoice(state, "side_chat"), "model-b");
   assert.deepEqual(state.drafts.main.selection, recommendation);
@@ -477,12 +534,12 @@ test("Main and Side dropdowns preserve independent explicit/default choices acro
 test("refreshing a changed Hub default keeps the reviewed edit fenced against external settings changes", () => {
   const state = createHubUiState();
   const selection = { allowed_model_ids:["model-a"],preferred_model_id:"model-a",required_capabilities:[],wait_policy:"wait_for_preferred" as const,affinity_turns:3 };
-  const first = projection({ main_uses_default:true,side_chat_uses_default:true,recommended_main_selection:selection,
+  const first = projection({ main_uses_default:true,side_chat_uses_default:true,recommended_main_selection:selection,recommended_side_chat_selection:selection,
     main_review:{hub_id:"hub-a",reviewed_revision:"7",selection:structuredClone(selection)},
     side_chat_review:{hub_id:"hub-a",reviewed_revision:"7",selection:structuredClone(selection)},
     main_confirmation:"confirmed",side_chat_confirmation:"confirmed" });
   acceptHubProjection(state,first);
-  const changed = {...first,recommended_main_selection:{...selection,allowed_model_ids:["model-b"],preferred_model_id:"model-b"}};
+  const changed = {...first,recommended_side_chat_selection:{...selection,allowed_model_ids:["model-b"],preferred_model_id:"model-b"}};
   acceptHubProjection(state,changed,{refreshTargets:true});
   assert.equal(state.drafts.side_chat.dirty,true);
   assert.equal(hubCanSave(state,"side_chat"),true);

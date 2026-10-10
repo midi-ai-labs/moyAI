@@ -247,6 +247,9 @@ test("scenario options distinguish live provider credentials from scripted quali
   assert.throws(() => normalizeFourDeviceOptions({ unknown: true }));
   const value = normalizeFourDeviceOptions({ liveProvider: { provider_base_url: "http://127.0.0.1:8119", model: "example" }, upstreamCredentialFile: path.resolve("credential.json") });
   assert.equal(value.live.model, "example");
+  for (const patch of [{ api_key_env: "MAIN_TEST_KEY" }, { side_model: "Gemma" }, { side_api_key_env: "SIDE_TEST_KEY" }]) {
+    assert.throws(() => normalizeFourDeviceOptions({ liveProvider: { provider_base_url: "http://127.0.0.1:8119", model: "example", ...patch } }), TypeError);
+  }
 });
 test("comparison options retain ordinary defaults and bound only the test observation budget", () => {
   const defaults = normalizeFourDeviceOptions();

@@ -75,6 +75,32 @@ test("validation accepts an inherited local context budget, Rust integer bounds,
   }).invalidField, "accessMode");
 });
 
+test("changing a session connection clears the old reference until the user re-enters it", () => {
+  for (const [field, value] of [
+    ["baseUrl", "https://new.example.test/v1"],
+    ["providerProfile", "lm_studio"],
+  ] as const) {
+    const state = createSessionSettingsState();
+    reconcileSessionSettings(state, TARGET, { ...VALUES, apiKeyEnv: "OLD_KEY" });
+    updateSessionSettingsDraft(state, TARGET, field, value);
+    assert.equal(state.draft?.apiKeyEnv, "");
+    const request = beginSessionSettingsMutation(state, TARGET);
+    assert.equal(request?.draft.apiKeyEnv, "");
+    assert.ok(request);
+    finishSessionSettingsMutation(state, request, { succeeded: false, target: TARGET, values: VALUES });
+    updateSessionSettingsDraft(state, TARGET, "apiKeyEnv", "OLD_KEY");
+    assert.equal(beginSessionSettingsMutation(state, TARGET)?.draft.apiKeyEnv, "OLD_KEY");
+  }
+});
+
+test("same session target URL spelling and model edits retain its credential reference", () => {
+  const state = createSessionSettingsState();
+  reconcileSessionSettings(state, TARGET, { ...VALUES, apiKeyEnv: "OLD_KEY" });
+  updateSessionSettingsDraft(state, TARGET, "baseUrl", `${VALUES.baseUrl}/`);
+  updateSessionSettingsDraft(state, TARGET, "model", "another-model");
+  assert.equal(state.draft?.apiKeyEnv, "OLD_KEY");
+});
+
 test("clearing a numeric override remains a valid dirty payload for Rust to restore inheritance", () => {
   const state = createSessionSettingsState();
   reconcileSessionSettings(state, TARGET, VALUES);

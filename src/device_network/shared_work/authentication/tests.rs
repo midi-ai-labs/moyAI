@@ -709,6 +709,113 @@ async fn ordinary_chat_retries_only_its_durable_uncertain_submission_after_resta
             .origin_has_pending_submission("local-session-a")
             .unwrap()
     );
+    let prepared = restored
+        .prepare_agent_retry_submission("local-session-a")
+        .await
+        .expect("prepare the saved submission before review");
+    let saved = {
+        let runtime = restored.inner.shared_work.0.lock().unwrap();
+        let user_id = &runtime.view.principal.as_ref().unwrap().user_id;
+        let saved = runtime
+            .receipts
+            .pending(prepared.hub_binding(), user_id)
+            .unwrap()
+            .clone();
+        let evidence =
+            crate::tool::permission_guardian::PermissionGuardianEvidence::HubSubmission {
+                endpoint: prepared.endpoint(),
+                hub_binding: prepared.hub_binding().into(),
+                payload: prepared.payload().clone(),
+            };
+        let public = serde_json::to_value(evidence).unwrap();
+        assert_eq!(public["kind"], "hub_submission");
+        assert_eq!(public["payload"], saved.payload);
+        assert_eq!(public["payload"]["request_id"], "original-call");
+        assert_eq!(public["payload"]["environment_id"], "env-b");
+        assert_eq!(public["payload"]["input"]["prompt"], "Build a TODO app");
+        assert_eq!(public.as_object().unwrap().len(), 4);
+        assert!(
+            !public
+                .to_string()
+                .contains(runtime.token.as_ref().unwrap().as_str())
+        );
+        saved
+    };
+    assert_eq!(
+        server.script.lock().unwrap().submit_requests.len(),
+        1,
+        "preparation performs no submission"
+    );
+    let mut changed = saved.clone();
+    changed.payload["input"]["prompt"] = json!("another saved action");
+    {
+        let mut runtime = restored.inner.shared_work.0.lock().unwrap();
+        runtime.receipts.remove_confirmed(&saved).unwrap();
+        runtime.receipts.insert(changed.clone()).unwrap();
+    }
+    let stale = restored
+        .execute_prepared_agent_retry_submission(prepared, || {
+            Ok(control.begin_tool_effect_commit().unwrap())
+        })
+        .await;
+    assert!(
+        stale
+            .unwrap_err()
+            .contains("pending Hub submission changed")
+    );
+    assert_eq!(
+        server.script.lock().unwrap().submit_requests.len(),
+        1,
+        "a changed receipt cannot replace the reviewed effect"
+    );
+    {
+        let mut runtime = restored.inner.shared_work.0.lock().unwrap();
+        assert!(runtime.receipts.pending(&changed.hub, &changed.user_id) == Some(&changed));
+        runtime.receipts.remove_confirmed(&changed).unwrap();
+        runtime.receipts.insert(saved).unwrap();
+    }
+    let prepared = restored
+        .prepare_agent_retry_submission("local-session-a")
+        .await
+        .expect("prepare against the original binding");
+    let hub_id = {
+        let mut state = restored.inner.state.lock().unwrap();
+        state.settings.hub_id.replace("different-hub".into())
+    };
+    let stale_binding = restored
+        .execute_prepared_agent_retry_submission(prepared, || {
+            panic!("a changed device binding must stop before effect admission")
+        })
+        .await;
+    assert!(
+        stale_binding
+            .unwrap_err()
+            .contains("device or connection changed")
+    );
+    restored.inner.state.lock().unwrap().settings.hub_id = hub_id;
+    assert_eq!(server.script.lock().unwrap().submit_requests.len(), 1);
+    let prepared = restored
+        .prepare_agent_retry_submission("local-session-a")
+        .await
+        .expect("prepare while receipt storage is available");
+    let invalid_receipts = root.join("invalid-receipts.json");
+    std::fs::write(&invalid_receipts, "not a receipt document").unwrap();
+    let original_store = {
+        let mut runtime = restored.inner.shared_work.0.lock().unwrap();
+        std::mem::replace(&mut runtime.receipts, ReceiptStore::new(invalid_receipts))
+    };
+    let blocked = restored
+        .execute_prepared_agent_retry_submission(prepared, || {
+            Ok(control.begin_tool_effect_commit().unwrap())
+        })
+        .await;
+    restored.inner.shared_work.0.lock().unwrap().receipts = original_store;
+    assert!(blocked.unwrap_err().contains("受付記録"));
+    assert_eq!(
+        server.script.lock().unwrap().submit_requests.len(),
+        1,
+        "receipt storage failure after preparation performs no submission"
+    );
     let wrong_chat = restored
         .agent_retry_submission("another-session", || {
             Ok(control.begin_tool_effect_commit().unwrap())

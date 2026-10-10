@@ -122,6 +122,7 @@ function binding(side) {
     draft_revision: side?.draft_revision ?? null,
     context_as_of_append_position: side?.context_as_of_append_position ?? null,
     provider_profile: side?.provider_profile ?? null,
+    api_key_env: side?.api_key_env ?? "",
     base_url: side?.base_url ?? null,
     model: side?.model ?? null,
     messages: (side?.messages ?? []).map(({ id, role, content }) => ({ id, role, content })),
@@ -139,6 +140,7 @@ export function case52Stage5Ready(surface, expected) {
     && side.provider_profile === expected.provider_profile
     && side.base_url === expected.provider_base_url
     && side.model === expected.model
+    && (side.api_key_env ?? "") === (expected.api_key_env ?? "")
     && side.context_scope === "owner_session"
     && typeof side.context_as_of_append_position === "string"
     && /^(0|[1-9][0-9]*)$/.test(side.context_as_of_append_position)
@@ -204,6 +206,7 @@ function case52Stage5CanonicalTerminalMatches(surface, expected) {
     && side.provider_profile === expected.provider_profile
     && side.base_url === expected.provider_base_url
     && side.model === expected.model
+    && (side.api_key_env ?? "") === (expected.api_key_env ?? "")
     && side.status === "completed"
     && side.last_error === ""
     && side.can_send === true
@@ -560,6 +563,10 @@ function validateArguments(options) {
   for (const key of ["sessionId", "providerProfile", "providerBaseUrl", "model"]) {
     if (typeof options[key] !== "string" || options[key].trim().length === 0) throw new TypeError(`case5_2 Stage5 ${key} is required`);
   }
+  if (options.apiKeyEnv !== undefined && (typeof options.apiKeyEnv !== "string"
+    || (options.apiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(options.apiKeyEnv)))) {
+    throw new TypeError("case5_2 Stage5 apiKeyEnv must be an environment variable name or empty string");
+  }
   if (typeof options.promptInput?.text !== "string" || options.promptInput.text.trim().length === 0) {
     throw new TypeError("case5_2 Stage5 promptInput.text is required");
   }
@@ -598,6 +605,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
   const {
     cdp, input, sink, sessionId, providerProfile, providerBaseUrl, model, promptInput,
     commandProbe: suppliedCommandProbe = null,
+    apiKeyEnv = "",
   } = options;
   const submittedQuestion = promptInput.text.trim();
   const dependencies = { ...defaultDependencies(cdp), ...injected };
@@ -628,6 +636,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
       provider_profile: providerProfile,
       provider_base_url: providerBaseUrl,
       model,
+      api_key_env: apiKeyEnv,
     };
     if (!case52Stage5Ready(initial, expectedReady)) {
       throw productFailure(
@@ -690,6 +699,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
       provider_profile: providerProfile,
       provider_base_url: providerBaseUrl,
       model,
+      api_key_env: apiKeyEnv,
       question: submittedQuestion,
       generation: beforeSend.generation,
       context_as_of_append_position: beforeSend.context_as_of_append_position,

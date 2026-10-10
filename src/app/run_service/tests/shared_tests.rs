@@ -481,6 +481,242 @@ async fn child_and_redelegated_context_keep_origin_but_identify_their_own_execut
 }
 
 #[tokio::test]
+async fn shared_archive_clm_checkpoint_restores_native_projection_and_raw_history() {
+    use crate::agent::context_manager::ContextManager;
+    use crate::protocol::{ClmCheckpoint, CompactionLayout, HistoryItemPayload};
+    use crate::storage::session_repo::{ModelResponseWrite, PendingToolCallWrite};
+
+    fn active_context(store: &StoreBundle, session_id: SessionId) -> ContextManager {
+        let mut builder = ContextManager::active_history_builder();
+        let snapshot = store
+            .protocol_event_store()
+            .visit_active_history_pages_for_session(
+                session_id,
+                crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+                &mut |page| {
+                    builder.ingest_page(page.items);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        builder.finish(snapshot.append_fence, snapshot.canonical_count)
+    }
+
+    let (_, source_store, _, _source_runtime, _, _, first_yield) = pause().await;
+    // Settle the real first child through its owner before taking a complete-pair
+    // CLM snapshot. A paused receipt must never be edited behind its history digest.
+    let admission = source_store
+        .session_repo()
+        .resume_shared_run(&resume(&first_yield))
+        .unwrap();
+    let session_id = first_yield.session_id;
+    let turn_id = first_yield.turn_id;
+    let original = source_store
+        .protocol_event_store()
+        .list_history_items_for_session(session_id)
+        .unwrap();
+    let source_context = active_context(&source_store, session_id);
+    let mut messages = source_context.model_messages(false);
+    let protected = messages[0].clone();
+    assert!(matches!(protected, ModelMessage::User { .. }));
+    let retained = "CLM_ARCHIVE_RETAINED_RESULT\r\nselected child evidence";
+    let original_tool = messages
+        .iter_mut()
+        .find_map(|message| match message {
+            ModelMessage::Tool {
+                result, metadata, ..
+            } => {
+                assert!(!metadata.is_null());
+                let original = result.clone();
+                *result = retained.into();
+                Some(original)
+            }
+            _ => None,
+        })
+        .expect("the first child settled a real native pair");
+    let checkpoint = ClmCheckpoint::from_messages(&messages, 1).unwrap();
+    let checkpoint_json = serde_json::to_value(&checkpoint).unwrap();
+    let replacement_item_ids = source_context.active_item_ids();
+    let summary = "Context edited with CLM; original results remain in history.";
+    source_store
+        .session_repo()
+        .commit_admitted_compaction_with_protocol_bundle(
+            session_id,
+            admission.admission_id,
+            &crate::session::RunEvent::CompactionCompleted {
+                summarized_messages: replacement_item_ids.len(),
+                layout: CompactionLayout::ClmCheckpoint,
+                clm_checkpoint: Some(checkpoint),
+                preserved_user_messages: Vec::new(),
+                summary: summary.into(),
+                replacement_item_ids,
+            },
+            turn_id,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let pending_call_id = crate::session::ToolCallId::new();
+    let child_args =
+        json!({"environment_id":"solver","title":"Solve again","prompt":"Verify 2 + 2"});
+    source_store
+        .session_repo()
+        .record_model_response_with_protocol_bundle(
+            session_id,
+            admission.admission_id,
+            turn_id,
+            ModelResponseWrite {
+                response_id: crate::protocol::ModelResponseId::new(),
+                assistant_text: None,
+                assistant_protocol_sequence_no: None,
+                tool_calls: vec![PendingToolCallWrite {
+                    id: pending_call_id,
+                    model_call_id: "clm-archive-next-child".into(),
+                    tool_name: "shared_delegate".into(),
+                    arguments_json: child_args.to_string(),
+                    protocol_sequence_no: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let mut progress: crate::agent::shared::SharedProgress =
+        serde_json::from_value(first_yield.checkpoint["progress"].clone()).unwrap();
+    progress.model_request_count += 1;
+    progress.tool_call_count += 1;
+    *progress
+        .tool_calls_by_name
+        .entry("shared_delegate".into())
+        .or_default() += 1;
+    let yielded = source_store
+        .session_repo()
+        .checkpoint_shared_run(
+            &context(),
+            session_id,
+            turn_id,
+            admission.admission_id,
+            crate::agent::shared::SharedYieldProposal {
+                tool_call_id: pending_call_id,
+                child: crate::tool::shared_delegate::parse_child(
+                    child_args,
+                    &context().allowed_child_environments,
+                )
+                .unwrap(),
+                progress,
+                retained_service: None,
+            },
+        )
+        .unwrap();
+    let archive = source_store
+        .session_repo()
+        .export_shared_archive("parent-job", source_store.paths())
+        .unwrap()
+        .unwrap();
+    let source_history = source_store
+        .protocol_event_store()
+        .list_history_items_for_session(session_id)
+        .unwrap();
+    let (target, target_store, workspace, _target_runtime, target_llm, config, _) =
+        pause_named("unrelated-clm-job").await;
+    target_store
+        .session_repo()
+        .restore_shared_archive(
+            &resume(&yielded),
+            &archive,
+            &workspace,
+            &config,
+            target_store.paths(),
+        )
+        .unwrap();
+    let restored = target_store
+        .protocol_event_store()
+        .list_history_items_for_session(session_id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap(),
+        serde_json::to_value(&source_history).unwrap()
+    );
+    for item in &original {
+        let copied = restored.iter().find(|copied| copied.id == item.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(copied).unwrap(),
+            serde_json::to_value(item).unwrap()
+        );
+    }
+    assert!(restored.iter().any(|item| matches!(&item.payload,
+        HistoryItemPayload::ToolOutput { output_text, .. } if output_text == &original_tool)));
+    let restored_checkpoint = restored
+        .iter()
+        .find_map(|item| match &item.payload {
+            HistoryItemPayload::Compaction {
+                clm_checkpoint: Some(checkpoint),
+                summary: actual,
+                ..
+            } => {
+                assert_eq!(actual, summary);
+                Some(checkpoint)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(restored_checkpoint).unwrap(),
+        checkpoint_json
+    );
+    let active = active_context(&target_store, session_id);
+    assert_eq!(restored_checkpoint.protected_prefix_len(), 1);
+    // Re-encoding through the typed owner compares Tool metadata as well as the
+    // message bodies, which ModelMessage's provider serialization omits.
+    assert_eq!(
+        serde_json::to_value(
+            ClmCheckpoint::from_messages(&active.model_messages(false), 1).unwrap()
+        )
+        .unwrap(),
+        checkpoint_json
+    );
+    let public = serde_json::to_string(
+        &target_store
+            .protocol_event_store()
+            .list_turn_items_for_session(session_id)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(public.contains(summary));
+    assert!(!public.contains("CLM_ARCHIVE_RETAINED_RESULT"));
+
+    let outcome = target
+        .execute_shared(
+            request(config, &workspace),
+            resume(&yielded),
+            &mut crate::cli::HumanRenderer::new(),
+            &mut NoPrompt,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SharedRunOutcome::Completed(_)));
+    let requests = target_llm.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "unrelated pause, then one resumed sample"
+    );
+    let resumed_messages = &requests.last().unwrap().messages;
+    assert_eq!(
+        serde_json::to_value(&resumed_messages[..messages.len()]).unwrap(),
+        serde_json::to_value(&messages).unwrap()
+    );
+    assert_eq!(
+        resumed_messages
+            .iter()
+            .filter(|message| matches!(message,
+        ModelMessage::Tool { call_id, .. } if call_id == "clm-archive-next-child"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn shared_archive_restores_into_another_store_without_replaying_completed_effects() {
     let (_source, source_store, _source_workspace, _source_runtime, source_llm, _, yielded) =
         pause().await;
@@ -713,10 +949,48 @@ async fn shared_archive_rejects_foreign_rows_and_changed_history_atomically() {
 async fn shared_archive_v68_forward_migration_preserves_v67_paused_execution() {
     let (_, store, _, _runtime, _, _, yielded) = pause().await;
     let db = rusqlite::Connection::open(&store.paths().database_path).unwrap();
+    let insert_sql = include_str!("../../../../migrations/V60__provider_connection_profiles.sql");
+    let insert_start = insert_sql
+        .find("CREATE TRIGGER validate_side_chat_binding_before_insert")
+        .unwrap();
+    let insert_end = insert_sql[insert_start..]
+        .find("CREATE TRIGGER validate_side_chat_binding_before_update")
+        .unwrap()
+        + insert_start;
+    let update_sql = include_str!("../../../../migrations/V61__side_chat_system_prompt.sql");
+    let update_start = update_sql
+        .find("CREATE TRIGGER validate_side_chat_binding_before_update")
+        .unwrap();
+    let update_end = update_sql
+        .find("INSERT INTO moyai_schema_migrations")
+        .unwrap();
+    db.execute_batch("DROP TRIGGER validate_side_chat_binding_before_insert; DROP TRIGGER validate_side_chat_binding_before_update;").unwrap();
+    db.execute_batch(&insert_sql[insert_start..insert_end])
+        .unwrap();
+    db.execute_batch(&update_sql[update_start..update_end])
+        .unwrap();
     db.execute_batch(
-        "DROP TABLE shared_history_files; DELETE FROM moyai_schema_migrations WHERE version=68;",
+        "DROP TABLE shared_history_files; DELETE FROM moyai_schema_migrations WHERE version IN (68,69,70);",
     )
     .unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT MAX(version) FROM moyai_schema_migrations",
+            [],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        67
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shared_history_files'",
+            [],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        0
+    );
     drop(db);
     let reopened = SqliteStore::open(store.paths()).unwrap();
     reopened.migrate().unwrap();
@@ -727,7 +1001,26 @@ async fn shared_archive_v68_forward_migration_preserves_v67_paused_execution() {
         .export_shared_archive("parent-job", reopened.paths())
         .unwrap()
         .unwrap();
-    assert_eq!(saved["schema_version"], 68);
+    assert_eq!(saved["schema_version"], 70);
+    let db = rusqlite::Connection::open(&reopened.paths().database_path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT name FROM moyai_schema_migrations WHERE version=68",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "shared_history_files"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shared_history_files'",
+            [],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1
+    );
     assert!(saved["sidecars"].as_array().unwrap().is_empty());
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(

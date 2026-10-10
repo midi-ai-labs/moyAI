@@ -10,7 +10,7 @@
   <a href="README.ja.md">日本語</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">Published v2.1.1</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="LICENSE">MIT License</a>
+  <a href="#license">License</a>
 </p>
 
 <p align="center"><img src="logo/moyai-screenshot-sample.png" alt="moyAI Desktop screenshot" width="920"></p>
@@ -65,13 +65,19 @@ The published v2.1.1 ZIP uses `bin/moyai-desktop.exe`; it does not use the new S
 
 The user-wide Windows configuration is `%APPDATA%\midi-ai-labs\moyai\config\config.toml`. Existing user settings take precedence over defaults.
 
-Use **設定 → AIの接続** for Main and Side Chat. Without Hub configuration, enter the endpoint and connection type: LM Studio Responses or OpenAI-compatible Chat Completions, such as oMLX. Load the model list or enter a model ID. API credentials, when required, are referenced by environment-variable name rather than saved as secret text.
+Use **設定 → AIの接続** for Main, Sub (Side Chat), and Approve (permission review). Without Hub configuration, enter the endpoint and connection type: LM Studio Responses or OpenAI-compatible Chat Completions, such as oMLX. Load the model list or enter a model ID. API credentials, when required, are referenced by environment-variable name rather than saved as secret text.
 
-When Hub is configured, this screen shows the Hub connection and lets you choose the standard or another registered model. Main and Side selections are independent. Shared Runner jobs use the executing PC's Main selection. Hub outages do not automatically switch to manual settings.
+When Hub is configured, this screen shows the Hub connection and lets you choose the standard or another registered model independently for Main, Sub, and Approve. Hub administrators can save a standard model for each role. Shared Runner jobs capture the executing PC's Main and Approve selections when work starts. Hub outages do not automatically switch to manual settings.
 
 **接続設定をリセット** works without a Hub response. It preserves local conversations, files and manual AI settings, and lets you join a replacement Hub.
 
-Global settings apply to future work; session settings can override the selected local Main conversation. Side Chat has its own global connection. `context_window` controls moyAI's local accounting and compaction; model loading, sampling and generation output limits belong to the LLM host. See [config.example.toml](config.example.toml) and [Hub model integration](docs/hub-integration.md).
+Global settings apply to future work; session settings can override the selected local Main conversation. Side Chat has its own global connection and optional API-key environment-variable reference. To share Main's key, enter the same variable name explicitly in Side Chat settings. Existing Side conversations retain their captured connection and reference until closed. `context_window` controls moyAI's local accounting and compaction; model loading, sampling and generation output limits belong to the LLM host. See [config.example.toml](config.example.toml) and [Hub model integration](docs/hub-integration.md).
+
+The optional global `model.compaction_budget_tokens` setting (`MOYAI_COMPACTION_BUDGET_TOKENS`) sets when automatic compaction starts. When omitted, moyAI uses its normal working context limit. An explicit value must be positive and no greater than the effective input limit derived from `context_window`; automatic compaction starts at the smaller of that value and the normal working limit. With `context_window = 131072`, setting `98304` starts automatic compaction at 98,304 estimated input tokens. This setting also applies to Main through Hub and shared execution; generation output limits belong to the LLM host.
+
+The model can also call `compact_context` with its own concise working summary. moyAI keeps the latest user input and recent completed work, validates that the summary reduces the active context, and saves it through the existing conversation history. Original messages and tool results remain available. This design takes conceptual inspiration from [Context Language Models](https://github.com/facebookresearch/context-language-models) and is implemented within moyAI's own history and tool system.
+
+Approve supplies the separate, tool-free Guardian request in **Approve for me** mode. Its connection, model, API-key reference and timeouts can be configured independently. Leaving Approve unconfigured preserves the current Main connection for reviews. An explicit Approve selection stays independent of later Main changes; connection failures do not switch the reviewer to Main. Its response timeout bounds the entire review, including the latest user-turn generation lookup. Guardian receives the exact action and execution facts without conversation history. It reports a risk level: low or medium allows that action, high or unknown asks you to confirm, and critical refuses and stops the turn. This risk review does not independently enforce restrictions written in conversation text. Ask for approval and Full access do not contact the Approve model.
 
 ## CLI and TUI
 
@@ -124,4 +130,4 @@ Release packaging uses `scripts/package-release.ps1` from a clean release commit
 
 ## License
 
-[MIT](LICENSE). Copyright (c) 2026 Hideyoshi Takahashi. `midi-ai-labs` is this personal project's GitHub namespace.
+Original moyAI code is licensed under [MIT](LICENSE). Copyright (c) 2026 Hideyoshi Takahashi. `midi-ai-labs` is this personal project's GitHub namespace.

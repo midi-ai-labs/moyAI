@@ -3,7 +3,9 @@ import path from "node:path";
 import { lstat, readFile } from "node:fs/promises";
 
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
+import { case52RestartContinuityFailures } from "../case5_2_predicates.mjs";
 import {
   DesktopCommandProbe,
   assertExactDesktopCommandSequence,
@@ -22,7 +24,7 @@ import {
   case52Stage5MainSnapshot,
   executeCase52SideChatStage,
 } from "./case5_2_side_chat.mjs";
-import { observeSideChatQuoteSurface } from "./side_chat_quote.mjs";
+import { observeSideChatQuoteSurface, surfaceHasNoErrors } from "./side_chat_quote.mjs";
 
 const OWNER = "scenario:manual.provider-openai-compatible";
 const PROFILE = "openai_compatible";
@@ -85,6 +87,14 @@ const MODEL_MANUAL = Object.freeze({
 const API_KEY_ENV = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.api_key_env"]',
   identity: { tag: "INPUT", configKey: "model.api_key_env" },
+});
+const SIDE_SETTINGS_NAV = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]',
+  identity: { tag: "A", href: "#settings-side-chat" },
+});
+const LOAD_SIDE_MODELS = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] section#settings-side-chat button[data-action="load-side-chat-models"]',
+  identity: { tag: "BUTTON", action: "load-side-chat-models" },
 });
 const SAVE_GLOBAL_CONFIG = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]',
@@ -150,11 +160,26 @@ function canonicalModel(value) {
   return normalized;
 }
 
-export function normalizeProviderConnectionLiveOptions(options) {
+function canonicalApiKeyEnv(value, field) {
+  if (value === undefined) return EMPTY_API_KEY_ENV;
+  if (typeof value !== "string") {
+    throw new TypeError(`manual.provider-openai-compatible ${field} must be an environment variable name or empty string`);
+  }
+  const normalized = value.trim();
+  if (normalized !== "" && !/^[A-Za-z0-9_]+$/u.test(normalized)) {
+    throw new TypeError(`manual.provider-openai-compatible ${field} must be an environment variable name or empty string`);
+  }
+  return normalized;
+}
+
+export function normalizeProviderConnectionLiveOptions(options, { extendedConnection = true } = {}) {
   if (options === null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("manual.provider-openai-compatible requires one scenario config object");
   }
-  const allowed = new Set(["provider_base_url", "model", "side_chat_after_completion"]);
+  const allowed = new Set([
+    "provider_base_url", "model", "side_chat_after_completion",
+    ...(extendedConnection ? ["api_key_env", "side_model", "side_api_key_env"] : []),
+  ]);
   const unknown = Object.keys(options).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
     throw new TypeError(`unknown manual.provider-openai-compatible option: ${unknown.join(",")}`);
@@ -163,10 +188,15 @@ export function normalizeProviderConnectionLiveOptions(options) {
   if (typeof sideChatAfterCompletion !== "boolean") {
     throw new TypeError("manual.provider-openai-compatible side_chat_after_completion must be a boolean");
   }
+  const apiKeyEnv = canonicalApiKeyEnv(options.api_key_env, "api_key_env");
+  const sideApiKeyEnv = canonicalApiKeyEnv(options.side_api_key_env, "side_api_key_env");
   return Object.freeze({
     providerBaseUrl: canonicalProviderBaseUrl(options.provider_base_url),
     model: canonicalModel(options.model),
     sideChatAfterCompletion,
+    ...(apiKeyEnv === "" ? {} : { apiKeyEnv }),
+    ...(options.side_model === undefined ? {} : { sideModel: canonicalModel(options.side_model) }),
+    ...(sideApiKeyEnv === "" ? {} : { sideApiKeyEnv }),
   });
 }
 
@@ -206,22 +236,89 @@ function desiredConnection(options) {
     baseUrl: options.providerBaseUrl,
     model: options.model,
     providerProfile: PROFILE,
-    apiKeyEnv: EMPTY_API_KEY_ENV,
+    apiKeyEnv: options.apiKeyEnv ?? EMPTY_API_KEY_ENV,
   };
+}
+
+export function providerConnectionLiveSideOptions(options) {
+  return {
+    providerProfile: PROFILE,
+    providerBaseUrl: options.providerBaseUrl,
+    sideModel: options.sideModel ?? options.model,
+    sideApiKeyEnv: options.sideApiKeyEnv ?? EMPTY_API_KEY_ENV,
+  };
+}
+
+export function providerConnectionLiveSideCatalogRequired(options) {
+  return options.sideChatAfterCompletion === true
+    && (options.sideModel !== undefined || options.sideApiKeyEnv !== undefined);
+}
+
+export function expectedProviderConnectionSideCatalogLoad(surface, options) {
+  const target = surface?.projection?.config_target;
+  if (typeof target?.configGeneration !== "string" || target.configGeneration.length === 0) {
+    throw new TypeError("provider Side catalog load requires one config generation");
+  }
+  const side = providerConnectionLiveSideOptions(options);
+  const catalogUrl = new URL(side.providerBaseUrl);
+  const pathname = catalogUrl.pathname.replace(/\/+$/, "");
+  catalogUrl.pathname = pathname.endsWith("/v1") ? pathname.slice(0, -3) || "/" : pathname || "/";
+  return {
+    command: "load_side_chat_models",
+    args: {
+      baseUrl: catalogUrl.toString().replace(/\/+$/, ""),
+      providerProfile: side.providerProfile,
+      apiKeyEnv: side.sideApiKeyEnv,
+      expectedConfigGeneration: target.configGeneration,
+    },
+  };
+}
+
+export function providerConnectionLiveSideBinding(side) {
+  return {
+    owner_session_id: side?.owner_session_id ?? null,
+    chat_id: side?.chat_id ?? null,
+    provider_profile: side?.provider_profile ?? null,
+    base_url: side?.base_url ?? null,
+    model: side?.model ?? null,
+    api_key_env: side?.api_key_env ?? "",
+    context_scope: side?.context_scope ?? null,
+    generation: side?.generation ?? null,
+    draft_revision: side?.draft_revision ?? null,
+    context_as_of_append_position: side?.context_as_of_append_position ?? null,
+  };
+}
+
+export function providerConnectionLiveSideReopenReady(surface, options, { main, binding }) {
+  const projection = surface?.projection;
+  const currentMain = case52Stage5MainSnapshot(surface);
+  const side = projection?.side_chat;
+  const desired = providerConnectionLiveSideOptions(options);
+  const mainKeys = ["session_id", "selected_session_id", "main_draft", "active_turn_id", "admission_revision", "latest_turn_id", "turn_page_total", "turn_page_limit"];
+  return case52Stage5MainMatches(surface, currentMain)
+    && surfaceHasNoErrors(surface)
+    && mainKeys.every((key) => currentMain[key] === main[key])
+    && finalAssistant(projection) === (main.primary_rows?.filter((row) => row.kind === "assistant").at(-1)?.body.trim() ?? "")
+    && case52RestartContinuityFailures({
+      beforeSessionId: main.session_id, afterSessionId: currentMain.session_id,
+      beforeHistory: main.canonical_rows, afterHistory: currentMain.canonical_rows,
+    }).length === 0
+    && typeof binding?.chat_id === "string" && binding.chat_id.length > 0
+    && sameValue(providerConnectionLiveSideBinding(side), binding)
+    && side.configured === true && side.deleting === false
+    && side.owner_session_id === main.session_id
+    && side.provider_profile === desired.providerProfile && side.base_url === desired.providerBaseUrl
+    && side.model === desired.sideModel && (side.api_key_env ?? "") === desired.sideApiKeyEnv
+    && side.context_scope === "owner_session"
+    && side.status === "idle" && side.last_error === "" && side.can_send === true && side.can_cancel === false
+    && side.draft_text === "" && side.draft_quote === null
+    && Array.isArray(side.messages) && side.messages.length === 0;
 }
 
 function fieldValue(projection, key) {
   const rows = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
   const matches = rows.filter((row) => row?.key === key);
   return matches.length === 1 ? matches[0].value : null;
-}
-
-function configValues(projection, overrides = {}) {
-  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
-  return fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
 }
 
 export function expectedProviderConnectionGlobalSave(surface, options) {
@@ -231,12 +328,12 @@ export function expectedProviderConnectionGlobalSave(surface, options) {
   return {
     command: "save_global_config",
     args: {
-      values: configValues(projection, {
+      values: expectedConfigCommandValues(projection, {
         "model.base_url": desired.baseUrl,
         "model.model": desired.model,
         "model.provider_profile": desired.providerProfile,
         "model.api_key_env": desired.apiKeyEnv,
-      }),
+      }, { editedKeys: desired.apiKeyEnv ? ["model.api_key_env"] : [] }),
       expectedTarget: structuredClone(projection.config_target),
     },
   };
@@ -325,6 +422,24 @@ export async function observeProviderConnectionLiveSurface(cdp) {
         save: button(${JSON.stringify(SAVE_GLOBAL_CONFIG.selector)}),
         close: button(${JSON.stringify(CLOSE_SETTINGS.selector)}),
       },
+      side_catalog: {
+        section: (() => {
+          const found = one('[role="dialog"][aria-labelledby="config-dialog-title"] section#settings-side-chat');
+          return { count: found.count, visible: found.visible, busy: found.node?.getAttribute('aria-busy') ?? null };
+        })(),
+        base_url: control('input#side-chat-base-url[data-config-key="side_chat.base_url"]'),
+        profile: control('select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]'),
+        api_key_env: control('input#side-chat-api-key-env[data-config-key="side_chat.api_key_env"]'),
+        model: control('select#side-chat-model[data-config-key="side_chat.model"]'),
+        model_options: matches('select#side-chat-model[data-config-key="side_chat.model"] option').map((option) => ({
+          id: option.value, label: (option.textContent ?? '').trim(), disabled: option.disabled,
+        })),
+        load: button(${JSON.stringify(LOAD_SIDE_MODELS.selector)}),
+        status: (() => {
+          const found = one('#side-chat-model-catalog-status');
+          return { count: found.count, visible: found.visible, text: found.node?.textContent?.trim() ?? null, error: found.node?.classList.contains('error') ?? false };
+        })(),
+      },
       prompt: control(${JSON.stringify(PROMPT.selector)}),
       send: button(${JSON.stringify(SEND.selector)}),
       assistants,
@@ -349,6 +464,40 @@ function surfaceErrorFree(surface) {
     && surface?.visible_recoverable_error_count === 0
     && surface?.visible_validation_error_count === 0
     && surface?.visible_transcript_error_count === 0;
+}
+
+function exactSideCatalogControls(surface, options) {
+  const side = providerConnectionLiveSideOptions(options);
+  const catalog = surface?.side_catalog;
+  return surface?.projection?.overlay === "config"
+    && surfaceErrorFree(surface)
+    && surface.settings?.dialog?.visible === true
+    && surface.settings.dirty === false
+    && catalog?.section?.count === 1 && catalog.section.visible === true
+    && catalog.base_url?.value === side.providerBaseUrl
+    && catalog.profile?.value === side.providerProfile
+    && catalog.api_key_env?.value === side.sideApiKeyEnv
+    && catalog.model?.value === side.sideModel
+    && fieldValue(surface.projection, "side_chat.base_url") === side.providerBaseUrl
+    && fieldValue(surface.projection, "side_chat.provider_profile") === side.providerProfile
+    && fieldValue(surface.projection, "side_chat.model") === side.sideModel
+    && fieldValue(surface.projection, "side_chat.api_key_env") === side.sideApiKeyEnv;
+}
+
+export function providerConnectionLiveSideCatalogReady(surface, options, configTarget) {
+  if (!exactSideCatalogControls(surface, options)
+    || !sameValue(surface.projection.config_target, configTarget)) return false;
+  const catalog = surface.side_catalog;
+  const side = providerConnectionLiveSideOptions(options);
+  const matches = Array.isArray(catalog.model_options)
+    ? catalog.model_options.filter((option) => option?.id === side.sideModel)
+    : [];
+  return catalog.section.busy === "false"
+    && catalog.load?.count === 1 && catalog.load.visible === true && catalog.load.enabled === true
+    && catalog.status?.count === 1 && catalog.status.visible === true && catalog.status.error === false
+    && /^[1-9][0-9]*件のモデルから選択できます。$/u.test(catalog.status.text ?? "")
+    && matches.length === 1 && matches[0].disabled === false
+    && typeof matches[0].label === "string" && !matches[0].label.endsWith("（現在の設定）");
 }
 
 function exactSettingsControls(surface, expected, { dirty, detailsOpen = true }) {
@@ -495,6 +644,7 @@ function liveCurrentTimeProjectionAccepted(surface, options) {
     || providerConnectionLiveControlTokenLeaks(projection).length > 0) return false;
   const assistant = finalAssistant(projection);
   return projection?.run_status_key === "completed"
+    && (options?.providerBaseUrl === undefined || persistedConnectionReady(surface, desiredConnection(options)))
     && projection?.task_activity_state === "idle"
     && projection?.busy === false
     && projection?.agent_tree_active === false
@@ -772,6 +922,77 @@ async function waitForCommands(probe, afterSequence, expected) {
   return assertExactDesktopCommandSequence(observed.value, { afterSequence, expected });
 }
 
+async function reloadProviderSideCatalog({ cdp, input, sink, options, state, generation }) {
+  const commandProbe = new DesktopCommandProbe(cdp, {
+    probeId: "provider-live-side-catalog",
+    commands: ["load_side_chat_models"],
+  });
+  let primaryError = null;
+  try {
+    await commandProbe.install();
+    const open = await trustedClick(input, SHOW_SETTINGS);
+    await waitForProductStage({
+      label: "Side catalog Settings opened",
+      sample: () => observeProviderConnectionLiveSurface(cdp),
+      decide: (surface) => !surfaceErrorFree(surface) ? "fail"
+        : surface.projection?.overlay === "config" ? "pass" : "pending",
+      code: "provider-live-side-catalog-settings-open",
+      message: "saved Side Settings did not open for the catalog reload",
+    });
+    const navigate = await trustedClick(input, SIDE_SETTINGS_NAV);
+    const before = await waitForProductStage({
+      label: "saved Side catalog controls ready",
+      sample: () => observeProviderConnectionLiveSurface(cdp),
+      decide: (surface) => !surfaceErrorFree(surface) ? "fail"
+        : exactSideCatalogControls(surface, options)
+          && surface.side_catalog.load?.enabled === true ? "pass" : "pending",
+      code: "provider-live-side-catalog-config-mismatch",
+      message: "Side catalog reload did not target the explicitly saved Side model and credential reference",
+    });
+    const configTarget = structuredClone(before.value.projection.config_target);
+    const expected = expectedProviderConnectionSideCatalogLoad(before.value, options);
+    const start = (await commandProbe.snapshot()).sequence;
+    const load = await trustedClick(input, LOAD_SIDE_MODELS);
+    const command = await waitForCommands(commandProbe, start, [expected]);
+    const loaded = await waitForProductStage({
+      label: "Side authenticated catalog settled with the selected model",
+      timeoutMs: 60_000,
+      sample: () => observeProviderConnectionLiveSurface(cdp),
+      decide: (surface) => !surfaceErrorFree(surface) || surface.side_catalog?.status?.error === true ? "fail"
+        : providerConnectionLiveSideCatalogReady(surface, options, configTarget) ? "pass" : "pending",
+      code: "provider-live-side-catalog-mismatch",
+      message: "Side catalog did not accept the exact credential target and expose the selected model",
+    });
+    const screenshot = await captureScenarioScreenshot({
+      cdp, sink, name: "provider-openai-compatible-side-catalog-ready", owner: OWNER,
+    });
+    const evidence = {
+      input_kind: "browser_trusted", open, navigate, load, command,
+      identity_evidence: "exact-command-and-typed-settlement-dom",
+      raw_catalog_response_captured: false,
+      side_catalog: loaded.value.side_catalog,
+      config_target: configTarget,
+      screenshot,
+    };
+    await sink.record("provider-live-side-catalog-loaded", evidence, { phase: "executing", owner: OWNER });
+    await trustedClick(input, CLOSE_SETTINGS);
+    await waitForProductStage({
+      label: "Side catalog Settings clean close",
+      sample: () => observeProviderConnectionLiveSurface(cdp),
+      decide: (surface) => !surfaceErrorFree(surface) ? "fail"
+        : surface.projection?.overlay === "none" ? "pass" : "pending",
+      code: "provider-live-side-catalog-settings-close",
+      message: "Side catalog Settings did not close before the Side request",
+    });
+    return evidence;
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    await settleGenerationResources(state, { commandProbe, generation, primaryError });
+  }
+}
+
 async function settleGenerationResources(state, { input = null, commandProbe = null, generation, primaryError = null }) {
   const outcome = { generation, input: null, command_probe: null, failures: [] };
   if (input !== null) {
@@ -835,9 +1056,13 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
         provider_base_url: options.providerBaseUrl,
         model: options.model,
         provider_profile: PROFILE,
-        api_key_env: EMPTY_API_KEY_ENV,
+        api_key_env: options.apiKeyEnv ?? EMPTY_API_KEY_ENV,
         prompt: PROVIDER_OPENAI_COMPATIBLE_PROMPT,
         side_chat_after_completion: options.sideChatAfterCompletion,
+        ...(options.sideChatAfterCompletion ? {
+          side_model: options.sideModel ?? options.model,
+          side_api_key_env: options.sideApiKeyEnv ?? EMPTY_API_KEY_ENV,
+        } : {}),
         workspace_sentinel: state.sentinelBaseline,
         external_provider_owned_by_scenario: false,
       }, { phase, owner: OWNER });
@@ -846,8 +1071,10 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
       let firstInput = null;
       let firstCommands = null;
       let secondInput = null;
+      let thirdInput = null;
       let firstSettled = false;
       let secondSettled = false;
+      let thirdSettled = false;
       let primaryError = null;
       try {
         await acquireInteractiveShell({ context, driver: firstCdp, sink }, {
@@ -896,7 +1123,7 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
           base_url: await trustedReplaceText({ cdp: firstCdp, input: firstInput, locator: BASE_URL, text: options.providerBaseUrl }),
           profile: await trustedSelectOpenAiCompatible({ cdp: firstCdp, input: firstInput }),
           model: await trustedReplaceText({ cdp: firstCdp, input: firstInput, locator: MODEL_MANUAL, text: options.model }),
-          api_key_env: await trustedReplaceText({ cdp: firstCdp, input: firstInput, locator: API_KEY_ENV, text: EMPTY_API_KEY_ENV }),
+          api_key_env: await trustedReplaceText({ cdp: firstCdp, input: firstInput, locator: API_KEY_ENV, text: options.apiKeyEnv ?? EMPTY_API_KEY_ENV }),
         };
         const desired = desiredConnection(options);
         const dirty = await waitForProductStage({
@@ -1043,7 +1270,7 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
           label: "OpenAI-compatible current_time terminal",
           timeoutMs: LIVE_TURN_TIMEOUT_MS,
           sample: () => observeProviderConnectionLiveSurface(restarted.driver),
-          decide: liveCurrentTimeTerminalDecision,
+          decide: (surface) => liveCurrentTimeTerminalDecision(surface, options),
           code: "provider-live-current-time-mismatch",
           message: "the OpenAI-compatible provider did not complete exactly one current_time tool round with a visible Japanese answer",
         });
@@ -1078,11 +1305,7 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
               { draft_target: terminal.value.projection?.draft_target ?? null },
             );
           }
-          const sideOptions = {
-            providerProfile: PROFILE,
-            providerBaseUrl: options.providerBaseUrl,
-            sideModel: options.model,
-          };
+          const sideOptions = providerConnectionLiveSideOptions(options);
           const mainBeforeSideSurface = await observeSideChatQuoteSurface(restarted.driver);
           const mainBeforeSideChat = case52Stage5MainSnapshot(mainBeforeSideSurface);
           if (!case52Stage5MainMatches(mainBeforeSideSurface, mainBeforeSideChat)) {
@@ -1111,30 +1334,79 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
               },
             );
           }
+          let sideCdp = restarted.driver;
+          let sideInput = secondInput;
+          let sideMainBaseline = mainBeforeSideChat;
+          let sideReopen = null;
+          if (providerConnectionLiveSideCatalogRequired(options)) {
+            const expectedBinding = providerConnectionLiveSideBinding(mainAfterConfigureSurface.projection.side_chat);
+            secondSettled = true;
+            await settleGenerationResources(state, { input: secondInput, generation: 2 });
+            const reopened = await host.restart({ context, scenario: this, sink, driver: sideCdp, phase: "executing" });
+            sideCdp = reopened.driver;
+            await acquireInteractiveShell({ context, driver: sideCdp, sink }, {
+              evidenceOwner: OWNER, screenshotStem: "provider-live-side-reopened-shell-ready",
+            });
+            const restoredSide = await waitForProductStage({
+              label: "cold reopened Side binding and Main owner",
+              sample: () => observeSideChatQuoteSurface(sideCdp),
+              decide: (surface) => !surfaceHasNoErrors(surface) ? "fail"
+                : providerConnectionLiveSideReopenReady(surface, options, {
+                  main: mainBeforeSideChat, binding: expectedBinding,
+                }) ? "pass" : "pending",
+              code: "provider-live-side-reopen-binding",
+              message: "cold restart did not restore the same Side binding, credential reference, model, and completed Main owner",
+            });
+            sideMainBaseline = case52Stage5MainSnapshot(restoredSide.value);
+            thirdInput = new WebviewInput(sideCdp, { probeId: "provider-live-g3" });
+            await thirdInput.installProbe();
+            sideInput = thirdInput;
+            sideReopen = {
+              restart: reopened.restart,
+              binding_before: expectedBinding,
+              binding_after: providerConnectionLiveSideBinding(restoredSide.value.projection.side_chat),
+              main_before: mainBeforeSideChat,
+              main_after: sideMainBaseline,
+              history_comparison: "restart-primary-row-continuity",
+            };
+            await sink.record("provider-live-side-cold-reopened", sideReopen, { phase: "executing", owner: OWNER });
+          }
+          const sideCatalog = providerConnectionLiveSideCatalogRequired(options)
+            ? await reloadProviderSideCatalog({ cdp: sideCdp, input: sideInput, sink, options, state, generation: 3 })
+            : null;
+          const mainBeforeRequestSurface = await observeSideChatQuoteSurface(sideCdp);
+          if (!case52Stage5MainMatches(mainBeforeRequestSurface, sideMainBaseline)) {
+            throw productFailure(
+              "provider-live-side-catalog-main-drift",
+              "Side catalog reload changed the completed Main session",
+              { expected: sideMainBaseline, observed: case52Stage5MainSnapshot(mainBeforeRequestSurface) },
+            );
+          }
           const question = providerConnectionLiveSideChatQuestion(time);
           const sideChat = await executeCase52SideChatStage({
-            cdp: restarted.driver,
-            input: secondInput,
+            cdp: sideCdp,
+            input: sideInput,
             sink,
             sessionId,
             providerProfile: PROFILE,
             providerBaseUrl: options.providerBaseUrl,
-            model: options.model,
+            model: sideOptions.sideModel,
+            apiKeyEnv: sideOptions.sideApiKeyEnv,
             promptInput: { text: question },
             timeoutMs: LIVE_TURN_TIMEOUT_MS,
             evidenceName: "provider-openai-compatible-side-chat",
           });
           if (!providerConnectionLiveSideChatMainPreserved(
-            mainBeforeSideChat,
-            mainAfterConfigureSurface,
+            sideMainBaseline,
+            mainBeforeRequestSurface,
             sideChat,
           )) {
             throw productFailure(
               "provider-live-side-chat-main-drift",
               "Side Chat did not preserve the exact completed current_time Main session",
               {
-                expected: mainBeforeSideChat,
-                after_configure: case52Stage5MainSnapshot(mainAfterConfigureSurface),
+                expected: sideMainBaseline,
+                before_request: case52Stage5MainSnapshot(mainBeforeRequestSurface),
                 stage_baseline: sideChat.mainBaseline,
                 completed: case52Stage5MainSnapshot(sideChat.completedSurface),
               },
@@ -1157,22 +1429,30 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
             owner_session_id: sessionId,
             provider_profile: PROFILE,
             provider_base_url: options.providerBaseUrl,
-            model: options.model,
+            model: sideOptions.sideModel,
+            api_key_env: sideOptions.sideApiKeyEnv,
             question,
             answer: sideChat.answer,
             current_time: time,
-            main_before_side_chat: mainBeforeSideChat,
+            main_before_side_chat: sideMainBaseline,
             main_after_configure: case52Stage5MainSnapshot(mainAfterConfigureSurface),
             main_after_side_chat: case52Stage5MainSnapshot(sideChat.completedSurface),
             global_side_setup: sideSetup,
+            ...(sideReopen === null ? {} : { side_cold_reopen: sideReopen }),
+            ...(sideCatalog === null ? {} : { side_catalog: sideCatalog }),
             binding: sideChat.binding,
             command_evidence: sideChat.commandEvidence,
             screenshot: sideChat.terminal_screenshot,
           }, { phase: "executing", owner: OWNER });
         }
 
-        secondSettled = true;
-        await settleGenerationResources(state, { input: secondInput, generation: 2 });
+        if (thirdInput !== null) {
+          thirdSettled = true;
+          await settleGenerationResources(state, { input: thirdInput, generation: 3 });
+        } else {
+          secondSettled = true;
+          await settleGenerationResources(state, { input: secondInput, generation: 2 });
+        }
         return { acquisition: "pass", oracle: "pass", manual: "not_required" };
       } catch (error) {
         primaryError = error;
@@ -1199,6 +1479,14 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
               generation: 2,
               primaryError,
             });
+          } catch (error) {
+            if (primaryError === null) throw error;
+          }
+        }
+        if (!thirdSettled && thirdInput !== null) {
+          thirdSettled = true;
+          try {
+            await settleGenerationResources(state, { input: thirdInput, generation: 3, primaryError });
           } catch (error) {
             if (primaryError === null) throw error;
           }

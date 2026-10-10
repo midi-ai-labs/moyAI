@@ -13,9 +13,12 @@ use crate::session::{
 };
 use crate::tool::ToolName;
 
+mod clm_checkpoint;
 mod projection;
 mod recording;
 mod store;
+
+pub use clm_checkpoint::ClmCheckpoint;
 
 pub(crate) use projection::{completed_tool_display_status, user_turn_text};
 
@@ -585,11 +588,37 @@ pub enum CompactionLayout {
     /// Current checkpoints carry bounded real-user inputs and append the
     /// latest summary after those inputs.
     UserAnchoredCheckpoint,
+    /// An edited model projection inserted where its replaced history began.
+    /// The snapshot remains separate from the user-visible summary.
+    ClmCheckpoint,
 }
 
 impl CompactionLayout {
+    pub const fn completed_event_default() -> Self {
+        Self::UserAnchoredCheckpoint
+    }
+
     pub const fn appends_checkpoint(self) -> bool {
         matches!(self, Self::UserAnchoredCheckpoint)
+    }
+
+    pub(crate) fn validate_checkpoint(
+        self,
+        checkpoint: Option<&ClmCheckpoint>,
+        preserved_user_messages: &[String],
+    ) -> Result<(), String> {
+        match (self, checkpoint) {
+            (Self::ClmCheckpoint, Some(checkpoint)) => {
+                checkpoint.validate()?;
+                if !preserved_user_messages.is_empty() {
+                    return Err("CLM checkpoint must not include separate user anchors".into());
+                }
+                Ok(())
+            }
+            (Self::ClmCheckpoint, None) => Err("CLM compaction requires a checkpoint".into()),
+            (_, Some(_)) => Err("CLM checkpoint requires the CLM layout".into()),
+            (_, None) => Ok(()),
+        }
     }
 }
 
@@ -676,6 +705,8 @@ pub enum HistoryItemPayload {
         layout: CompactionLayout,
         #[serde(default)]
         preserved_user_messages: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clm_checkpoint: Option<ClmCheckpoint>,
         summary: String,
         replacement_item_ids: Vec<HistoryItemId>,
     },
@@ -686,6 +717,21 @@ pub enum HistoryItemPayload {
         changes: Vec<FileChangeEvidence>,
         summary: String,
     },
+}
+
+impl HistoryItemPayload {
+    pub(crate) fn validate_compaction_checkpoint(&self) -> Result<(), String> {
+        if let Self::Compaction {
+            layout,
+            clm_checkpoint,
+            preserved_user_messages,
+            ..
+        } = self
+        {
+            layout.validate_checkpoint(clm_checkpoint.as_ref(), preserved_user_messages)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

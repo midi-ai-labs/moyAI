@@ -20,24 +20,42 @@ export function enrollmentAccepted(network, snapshot) {
   return network?.enrollment === "active" && typeof network.device_id === "string"
     && snapshot?.devices?.filter(device => device.device_id === network.device_id).length === 1;
 }
-export function independentSelectionsAccepted(hub, mainId, sideId) {
-  return mainId !== sideId && hub?.status === "connected" && [
-    ["main", mainId], ["side_chat", sideId],
+export function independentSelectionsAccepted(hub, mainId, sideId, approveId) {
+  return [mainId, sideId, approveId].every(value => typeof value === "string" && value.length > 0)
+    && new Set([mainId, sideId, approveId]).size === 3 && hub?.status === "connected" && [
+    ["main", mainId], ["side_chat", sideId], ["approve", approveId],
   ].every(([context, model]) => hub[`${context}_confirmation`] === "confirmed"
     && hub[`${context}_mode`] === "hub"
     && hub[`${context}_review`]?.selection?.preferred_model_id === model
     && JSON.stringify(hub[`${context}_review`]?.selection?.allowed_model_ids) === JSON.stringify([model]));
 }
-export function connectedShellAccepted(value, mainId, sideId) {
+export function connectedShellAccepted(value, mainId, sideId, approveId) {
   const state = value?.state;
   // An enrolled device keeps polling for Hub heartbeats even while its shell is idle.
-  return independentSelectionsAccepted(state?.hub, mainId, sideId)
+  return independentSelectionsAccepted(state?.hub, mainId, sideId, approveId)
     && state?.device_network?.enrollment === "active" && state?.overlay === "none"
     && state?.run_status_key === "idle" && state?.busy === false && state?.provider_loading === false
     && state?.confirmation_visible === false && state?.background_mutation_pending === false
     && state?.pending_async_operations?.length === 0 && state?.navigation_loading === false
     && state?.navigation_admission_open === true && state?.can_submit === true
     && value?.prompt_enabled === true && value?.prompt_center_hit === true && value?.blocking_dialogs === 0;
+}
+
+async function observeConnectedShell(cdp) {
+  return cdp.evaluate(`(async () => {
+    const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
+    const prompts = document.querySelectorAll('textarea#prompt');
+    const prompt = prompts.length === 1 ? prompts[0] : null;
+    const rect = prompt?.getBoundingClientRect();
+    return { state,
+      prompt_enabled: prompt !== null && !prompt.disabled && !prompt.readOnly && prompt.closest('[hidden], [inert], [aria-hidden="true"]') === null,
+      prompt_center_hit: Boolean(rect?.width && rect?.height && document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === prompt),
+      blocking_dialogs: [...document.querySelectorAll('[data-modal], [role="dialog"], [role="alertdialog"]')].filter(node => {
+        const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+      }).length,
+    };
+  })()`);
 }
 
 export async function wait(label, sample, accept, timeoutMs = 30_000) {
@@ -146,29 +164,34 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       await prepareShellBaseline(args);
       state.resource = await startHubBrowserResource({ ...args, options: settings });
     },
-    async execute({ context, runtime, driver: cdp, sink }) {
+    async execute({ context, runtime, driver: initialCdp, sink, host }) {
+      let cdp = initialCdp;
       const resource = state.resource, { page, hub, provider } = resource;
       await acquireInteractiveShell({ context, driver: cdp, sink }, { evidenceOwner: OWNER, screenshotStem: "hub-browser-desktop-shell" });
-      const input = state.input = new WebviewInput(cdp, { probeId: "hub-browser-enrollment" });
+      let input = state.input = new WebviewInput(cdp, { probeId: "hub-browser-enrollment" });
       try {
       await input.installProbe();
       await page.goto(hub.url);
       await page.locator("#management-status").filter({ hasText: "Hub本体に接続中" }).waitFor();
       await page.locator('nav a[href="#models"]').click();
       await page.locator("#endpoint").fill(provider.url);
+      provider.setModels(["fixture-alpha", "fixture-beta", "fixture-gamma"]);
       await page.locator("#profile").selectOption("openai_compatible_chat");
       await page.locator("#discover").click();
       await page.locator('#model option[value="fixture-alpha"]').waitFor({ state: "attached" });
-      for (const [model, label] of [["fixture-alpha", "Enrollment Main"], ["fixture-beta", "Enrollment Side"]]) {
+      for (const [model, label, tools] of [["fixture-alpha", "Enrollment Main", true], ["fixture-beta", "Enrollment Side", true], ["fixture-gamma", "Enrollment Approve", false]]) {
         await page.locator("#model").selectOption(model);
         await page.locator("#label").fill(label);
-        await page.locator("#allow-tools").check();
+        await page.locator("#allow-tools").setChecked(tools);
         await page.locator("#register").click();
         await page.locator("#model-rows tr").filter({ hasText: label }).waitFor();
       }
       const registered = await hub.command("hub_snapshot");
       const models = registered.store.catalog.models;
-      if (models.length !== 2 || new Set(models.map(model => model.label)).size !== 2) throw fail("Hub must contain the two browser-registered models", { models });
+      if (models.length !== 3 || new Set(models.map(model => model.label)).size !== 3
+        || models.find(model => model.label === "Enrollment Approve")?.capabilities.includes("tools") !== false) {
+        throw fail("Hub must contain three browser-registered models including a text-only Approve model", { models });
+      }
       await resource.screenshot("hub-browser-registered-models");
       await page.locator('nav a[href="#device-network"]').click();
       await page.locator("#network-ip").fill("127.0.0.1");
@@ -179,22 +202,23 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
       await enrollDesktopFromHubBrowser({ resource, context, runtime, cdp, input, sink, nativeState: state });
       await installModelCommandObservation(cdp);
       await trustedClick(input, cdp, action("show-config", '[data-surface="hub"]'), sink);
-      const connected = await wait("Enrollment automatically connects the model catalog", () => invokeDesktopCommand(cdp, "hub_projection"), value => value.status === "connected" && value.catalog?.models.length === 2);
+      const connected = await wait("Enrollment automatically connects the model catalog", () => invokeDesktopCommand(cdp, "hub_projection"), value => value.status === "connected" && value.catalog?.models.length === 3);
       await wait("Desktop displays the unified readonly connection and model dropdowns", () => cdp.evaluate(`(() => {
         const selects = [...document.querySelectorAll('select[data-hub-field$=":choice"]')];
         const endpoints = [...document.querySelectorAll('.ai-connection input[readonly]')];
-        return selects.length === 2 && selects.every(row => !row.disabled) && endpoints.length === 4
+        return selects.length === 3 && selects.every(row => !row.disabled) && endpoints.length === 6
           && !document.querySelector('#hub-token');
       })()`), Boolean);
       await trustedClick(input, cdp, action("hub-refresh", '[data-ai-connection="main"]'), sink);
       await wait("Model refresh finishes in the same form", () => cdp.evaluate(`!document.querySelector('[data-ai-connection="main"] button[data-action="hub-refresh"]')?.disabled`), Boolean);
       await captureScenarioScreenshot({ cdp, sink, name: "hub-models-visible-refresh", owner: OWNER });
-      const selected = Object.fromEntries([["main", "Enrollment Main"], ["side_chat", "Enrollment Side"]].map(([name, label]) => {
+      await wait("Unconfigured Approve visibly inherits Main", () => cdp.evaluate(`document.querySelector('[data-ai-connection="approve"] [data-settings-passive="ai-approve-inheritance"]')?.textContent`), text => text?.includes("Approveは未設定"));
+      const selected = Object.fromEntries([["main", "Enrollment Main"], ["side_chat", "Enrollment Side"], ["approve", "Enrollment Approve"]].map(([name, label]) => {
         const matches = connected.catalog.models.filter(model => model.label === label);
         if (matches.length !== 1) throw fail("Desktop catalog does not match browser registration", { label });
         return [name, matches[0].id];
       }));
-      for (const name of ["main", "side_chat"]) {
+      for (const name of ["main", "side_chat", "approve"]) {
         const target = byId(`ai-${name}-model`, "SELECT");
         const values = await cdp.evaluate(`Array.from(document.querySelector(${JSON.stringify(target.selector)}).options).filter(o => !o.disabled).map(o => o.value)`);
         const index = values.indexOf(selected[name]);
@@ -203,7 +227,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         for (let i = 0; i < index; i++) await input.pressKey("ArrowDown");
         await input.pressKey("Enter");
         await wait("Model dropdown retains the chosen model", () => cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.value`), value => value === selected[name]);
-        const route = name === "main" ? "main" : "side";
+        const route = name === "side_chat" ? "side" : name;
         await sink.record("hub-model-before-save", { context: name, hub: await invokeDesktopCommand(cdp, "hub_projection"),
           form: await cdp.evaluate(`(() => { const form = document.querySelector('[data-ai-connection="${name}"]'); return { text: form?.innerText, buttons: [...(form?.querySelectorAll('button') ?? [])].map(button => ({action:button.dataset.action,disabled:button.disabled})), value: form?.querySelector('select')?.value }; })()`),
         }, { phase: "executing", owner: OWNER });
@@ -212,32 +236,52 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         await wait(`Desktop ${name} saves an independent explicit model`, () => invokeDesktopCommand(cdp, "hub_projection"), value => value[`${name}_confirmation`] === "confirmed"
           && value[`${name}_uses_default`] === false && value[`${name}_review`]?.selection.preferred_model_id === selected[name]);
       }
-      const accepted = await wait("Desktop Main and Side independently use Hub selections", () => invokeDesktopCommand(cdp, "hub_projection"), value => independentSelectionsAccepted(value, selected.main, selected.side_chat));
+      const accepted = await wait("Desktop Main, Sub and Approve independently use Hub selections", () => invokeDesktopCommand(cdp, "hub_projection"), value => independentSelectionsAccepted(value, selected.main, selected.side_chat, selected.approve)
+        && value.approve_review.selection.required_capabilities.length === 0);
       await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-desktop-model-selection", owner: OWNER });
       await resource.screenshot("hub-browser-approved-device");
       await sink.record("hub-browser-independent-model-selection", { hub_id: accepted.hub_id, revision: accepted.catalog.revision,
-        main: accepted.main_review, side_chat: accepted.side_chat_review }, { phase: "executing", owner: OWNER });
+        main: accepted.main_review, side_chat: accepted.side_chat_review, approve: accepted.approve_review }, { phase: "executing", owner: OWNER });
       if (resource.pageErrors().length) throw fail("Hub browser reported page errors", resource.pageErrors());
       await trustedClick(input, cdp, action("close-overlay", ".settings-modal"), sink);
-      const shell = await wait("The enrolled Desktop returns to an interactive shell", () => cdp.evaluate(`(async () => {
-        const state = await window.__TAURI_INTERNALS__.invoke('desktop_state');
-        const prompts = document.querySelectorAll('textarea#prompt');
-        const prompt = prompts.length === 1 ? prompts[0] : null;
-        const rect = prompt?.getBoundingClientRect();
-        return { state,
-          prompt_enabled: prompt !== null && !prompt.disabled && !prompt.readOnly && prompt.closest('[hidden], [inert], [aria-hidden="true"]') === null,
-          prompt_center_hit: Boolean(rect?.width && rect?.height && document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === prompt),
-          blocking_dialogs: [...document.querySelectorAll('[data-modal], [role="dialog"], [role="alertdialog"]')].filter(node => {
-            const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-          }).length,
-        };
-      })()`), value => connectedShellAccepted(value, selected.main, selected.side_chat));
+      const shell = await wait("The enrolled Desktop returns to an interactive shell", () => observeConnectedShell(cdp),
+        value => connectedShellAccepted(value, selected.main, selected.side_chat, selected.approve));
       await sink.record("hub-browser-enrolled-shell", { device_id: shell.state.device_network.device_id,
         async_polling_required: shell.state.async_polling_required, pending_async_operations: shell.state.pending_async_operations,
         prompt_enabled: shell.prompt_enabled, prompt_center_hit: shell.prompt_center_hit, blocking_dialogs: shell.blocking_dialogs,
       }, { phase: "executing", owner: OWNER });
       await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-desktop-finished", owner: OWNER });
+      await finishModelCommandObservation(cdp, sink);
+      await input.cleanup(); state.input = null;
+      const restarted = await host.restart({ context, scenario: this, sink, driver: cdp, phase: "executing" });
+      cdp = restarted.driver;
+      const coldShell = await wait("Cold enrolled Desktop returns to its interactive shell", () => observeConnectedShell(cdp),
+        value => connectedShellAccepted(value, selected.main, selected.side_chat, selected.approve));
+      await sink.record("hub-browser-cold-shell", { async_polling_required: coldShell.state.async_polling_required,
+        pending_async_operations: coldShell.state.pending_async_operations, prompt_enabled: coldShell.prompt_enabled,
+        prompt_center_hit: coldShell.prompt_center_hit, blocking_dialogs: coldShell.blocking_dialogs,
+      }, { phase: "executing", owner: OWNER });
+      await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-cold-shell", owner: OWNER });
+      input = state.input = new WebviewInput(cdp, { probeId: "hub-browser-enrollment-g2" });
+      await input.installProbe();
+      await installModelCommandObservation(cdp);
+      const restored = await wait("Cold Desktop reconfirms the three saved model selections", () => invokeDesktopCommand(cdp, "hub_projection"),
+        value => independentSelectionsAccepted(value, selected.main, selected.side_chat, selected.approve));
+      for (const name of ["main", "side_chat", "approve"]) {
+        if (restored.hub_id !== accepted.hub_id || JSON.stringify(restored[`${name}_review`]) !== JSON.stringify(accepted[`${name}_review`])
+          || restored[`${name}_uses_default`] !== false) throw fail("Cold Desktop changed the saved role selection", { name, before: accepted, restored });
+      }
+      await trustedClick(input, cdp, action("show-config", "aside.sidebar"), sink);
+      const restoredForm = await wait("Cold Settings visibly restores each independent model", () => cdp.evaluate(`(() => {
+        const selected = ${JSON.stringify(selected)}, choices = Object.fromEntries(Object.keys(selected).map(name => [name, document.querySelector('#ai-' + name + '-model')?.value]));
+        return { choices, inherited: Boolean(document.querySelector('[data-settings-passive="ai-approve-inheritance"]')),
+          ready: Object.keys(selected).every(name => choices[name] === selected[name]) };
+      })()`), value => value.ready && !value.inherited);
+      await sink.record("hub-browser-cold-model-selection", { restart: restarted.restart, hub_id: restored.hub_id,
+        main: restored.main_review, side_chat: restored.side_chat_review, approve: restored.approve_review,
+        text_only_approve: true, form: restoredForm }, { phase: "executing", owner: OWNER });
+      await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-cold-model-selection", owner: OWNER });
+      await trustedClick(input, cdp, action("close-overlay", ".settings-modal"), sink);
       await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
       await trustedClick(input, cdp, byId("hub-tab-devices"), sink);
       const sharedShortcut = await wait("Connected device panel has rendered its shared-work shortcut", async () =>

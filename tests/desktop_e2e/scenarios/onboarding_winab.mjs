@@ -56,7 +56,7 @@ export function completedRequestorIdentityAccepted(shared, expected) {
 }
 export function createOnboardingWinAbScenario(options = {}) {
   const { runnerBinary, runnerTestBinary, liveProvider, expectProviderFailure = false, ...hubOptions } = options;
-  const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider);
+  const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider, { extendedConnection: false });
   if (typeof expectProviderFailure !== "boolean" || (expectProviderFailure && !live)) throw new TypeError("expectProviderFailure requires explicit live provider options");
   const settings = normalizeHubBrowserOptions(hubOptions);
   const a = { name: "a", label: "WinA (操作PC)", input: null }, b = { name: "b", label: "WinB (実行PC)", input: null };

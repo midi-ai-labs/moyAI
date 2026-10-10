@@ -155,6 +155,32 @@ test("Initial Setup projects imported sensitive configured metadata without expo
   assert.equal(projectViewState(drifted, ui).config_fields[0]?.configured, false);
 });
 
+test("config catalog requests exclude old connection credentials unless explicitly re-entered", () => {
+  for (const change of [null, ["model.base_url", "https://new.example.test/v1"],
+    ["model.provider_profile", "lm_studio"]] as const) {
+    for (const reenter of [false, true]) {
+      const fields: ConfigFieldProjection[] = [
+        { key: "model.base_url", value: "https://old.example.test/v1" },
+        { key: "model.provider_profile", value: "openai_compatible" },
+        { key: "model.api_key_env", value: "OLD_KEY" },
+      ].map(field => ({ ...field, env_override: null, value_type: "string", required: false,
+        min_value: null, max_value: null, options: [] }));
+      const state = projection({ overlay: "config", config_fields: fields,
+        provider_base_url: fields[0].value, provider_effective_base_url: fields[0].value,
+        provider_profile: "openai_compatible", provider_effective_profile: "openai_compatible",
+        provider_api_key_env: "OLD_KEY" });
+      const ui = createUiLocalState();
+      reconcileUiDrafts(ui, null, state);
+      const baseline = fields.map(field => ({ key: field.key, text: field.value }));
+      if (change) updateConfigDraftValue(ui, state.config_target, baseline, change[0], change[1]);
+      if (reenter) updateConfigDraftValue(ui, state.config_target, baseline, "model.api_key_env", "OLD_KEY");
+      synchronizeInitialSetupProviderDraft(state, ui);
+      const request = beginProviderCatalogRequest(ui, state);
+      assert.equal(request?.apiKeyEnv, change && !reenter ? null : "OLD_KEY");
+    }
+  }
+});
+
 for (const overlay of ["initial_setup", "config"] as const) {
 test(`${overlay} catalog evidence is invalidated by A to B to A config-draft edits`, () => {
   const providerFields: ConfigFieldProjection[] = [
@@ -3291,7 +3317,7 @@ test("run admission polls for the Rust owner before the start command responds",
 });
 
 test("a Hub command starts ordinary polling before the Desktop snapshot advertises its connection", () => {
-  const idle = { status: "disconnected" as const, active_main: null, active_side_chat: null };
+  const idle = { status: "disconnected" as const, active_main: null, active_side_chat: null, active_approve: null };
   assert.equal(runtimePollingRequired(false, false, idle), false);
   assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connecting" }), true);
   assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connected" }), true);
@@ -3299,6 +3325,9 @@ test("a Hub command starts ordinary polling before the Desktop snapshot advertis
   assert.equal(runtimePollingRequired(false, false, { ...idle, status: "error" }), false);
   assert.equal(runtimePollingRequired(false, false, {
     ...idle, active_side_chat: { turn_id: "side-turn", phase: "running", logical_model_id: "model" },
+  }), true);
+  assert.equal(runtimePollingRequired(false, false, {
+    ...idle, active_approve: { turn_id: "approval-turn", phase: "waiting", logical_model_id: null },
   }), true);
 });
 
@@ -4815,6 +4844,39 @@ test("initial setup makes durable save primary and explains its blocking alterna
     renderOverlay(blocked, local),
     /class="setup-primary-action" data-action="save-global-config" disabled aria-disabled="true">設定を保存して開始</,
   );
+});
+
+test("Settings renders independent Approve connection fields and shows Main inheritance from the Rust owner", () => {
+  const entries: [string, string, ConfigFieldProjection["value_type"], boolean][] = [
+    ["approve.base_url", "http://approve.test/v1", "string", true],
+    ["approve.model", "fast-reviewer", "string", true],
+    ["approve.provider_profile", "openai_compatible", "enum", true],
+    ["approve.api_key_env", "APPROVE_API_KEY", "string", false],
+    ["approve.context_window", "32768", "integer", true],
+    ["approve.request_timeout_ms", "30000", "integer", true],
+    ["approve.connect_timeout_ms", "5000", "integer", true],
+    ["approve.max_retries", "2", "integer", true],
+  ];
+  const fields = entries.map(([key, value, value_type, required]) => ({ key, value, value_type, required,
+    env_override: null, min_value: value_type === "integer" ? key.endsWith("max_retries") ? 0 : 1 : null,
+    max_value: null, options: value_type === "enum" ? ["openai_compatible", "openai_responses"] : [] }));
+  const inherited = renderOverlay(projection({ overlay: "config", config_fields: fields, approve_model_configured: false }), renderLocal());
+  assert.match(inherited, /href="#settings-approve"/);
+  assert.match(inherited, /<h3 id="settings-approve-title">Approve（承認）<\/h3>/);
+  assert.match(inherited, /Approveは未設定のため、実行時のMainのモデルを使います/);
+  assert.match(inherited, /id="approve-model"[^>]*value="fast-reviewer"/);
+  assert.match(inherited, /id="approve-api-key-env"[^>]*value="APPROVE_API_KEY"/);
+  assert.match(inherited, /id="approve-provider-profile"/);
+  assert.match(inherited, /href="#settings-provider">Main（メイン）/);
+  assert.match(inherited, /href="#settings-side-chat">Sub（サイドチャット）/);
+  for (let index = 0; index < fields.length; index++) {
+    assert.equal((inherited.match(new RegExp(`data-config-index="${index}"`, "g")) ?? []).length, 1,
+      "the dedicated section owns each Approve field once");
+  }
+  const independent = renderOverlay(projection({ overlay: "config", config_fields: fields, approve_model_configured: true }), renderLocal());
+  assert.match(independent, /Mainのモデル変更はApproveに反映されません/);
+  assert.doesNotMatch(independent, /Approveは未設定/);
+  assert.doesNotMatch(independent, /approve\.system_prompt/);
 });
 
 test("initial setup replaces an old import failure with current mutation progress", () => {

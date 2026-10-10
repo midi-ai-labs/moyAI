@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sharedEntryReady, sharedSettingsClosed, sharedApprovalParked } from "../scenarios/shared_work_entry.mjs";
+import { sharedEntryReady, sharedSettingsClosed, sharedApprovalParked, sharedRenameEditorRetained } from "../scenarios/shared_work_entry.mjs";
 import { rememberedRestartAccepted, sharedActionTarget, sharedWorkSurfaceMatches, waitForSharedComposer } from "../scenarios/shared_work_navigation.mjs";
 import { action, hubSettingsCloseTarget } from "../scenarios/hub_browser_enrollment.mjs";
 
@@ -23,6 +23,17 @@ const parkedTarget = { jobId: "job-approval", approvalId: "permission-old", atte
 const parkedProjection = () => ({ observed_at_ms: 60_100, detail: { id: "job-approval", state: "running" },
   approval: { id: "permission-old", attempt_id: "attempt-1", context: { job_id: "job-approval" }, status: "expired", decision: null,
     expires_at_ms: 60_000, can_decide: false, can_reconfirm: true }, status: { environments: [{ id: "env-b", occupied: 1 }] } });
+
+test("rename retention requires the original connected editor, focus, draft and exact selection", () => {
+  const selected = { connected: true, same_node: true, focused: true, value: "名前変更の入力保持を確認", selection_start: 0, selection_end: 12, selection_direction: "forward" };
+  assert.equal(sharedRenameEditorRetained(selected, selected), true);
+  const pointer = { ...selected, selection_start: 5, selection_end: 5, selection_direction: "none" };
+  assert.equal(sharedRenameEditorRetained(pointer, pointer), true);
+  for (const patch of [{ connected: false }, { same_node: false }, { focused: false }, { value: "元の名前" },
+    { selection_start: 1 }, { selection_end: 11 }, { selection_direction: "backward" }])
+    assert.equal(sharedRenameEditorRetained({ ...selected, ...patch }, selected), false, JSON.stringify(patch));
+  assert.equal(sharedRenameEditorRetained(null, selected), false);
+});
 
 test("permission expiry oracle requires the exact operation to stay running and occupy its environment", () => {
   assert.equal(sharedApprovalParked(parkedProjection(), parkedTarget), true);

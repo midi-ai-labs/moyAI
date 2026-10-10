@@ -2120,6 +2120,7 @@ async fn capture_side_chat_direct_provider(
 struct SideChatCatalogRequestTarget {
     base_url: String,
     provider_profile: ProviderProfile,
+    api_key_env: Option<String>,
     config_generation: u64,
 }
 
@@ -2136,6 +2137,7 @@ struct SideChatCatalogModelProjection {
 struct SideChatCatalogProjection {
     base_url: String,
     provider_profile: String,
+    api_key_env: String,
     config_generation: String,
     models: Vec<SideChatCatalogModelProjection>,
 }
@@ -2145,6 +2147,7 @@ async fn load_side_chat_models(
     controller: State<'_, SharedController>,
     base_url: String,
     provider_profile: String,
+    api_key_env: String,
     expected_config_generation: String,
 ) -> Result<SideChatCatalogProjection, DesktopCommandError> {
     let (target, probe_config) = {
@@ -2162,11 +2165,13 @@ async fn load_side_chat_models(
             controller.state.provider_config.effective_config.clone(),
             &base_url,
             provider_profile,
+            &api_key_env,
         )
         .map_err(read_only_command_conflict_error)?;
         let target = SideChatCatalogRequestTarget {
             base_url: canonical_base_url,
             provider_profile,
+            api_key_env: probe_config.model.api_key_env.clone(),
             config_generation: controller.state.provider_config.config_generation,
         };
         (target, probe_config)
@@ -2194,6 +2199,7 @@ async fn load_side_chat_models(
     Ok(SideChatCatalogProjection {
         base_url: target.base_url,
         provider_profile: target.provider_profile.as_str().to_string(),
+        api_key_env: target.api_key_env.unwrap_or_default(),
         config_generation: target.config_generation.to_string(),
         models,
     })
@@ -2253,6 +2259,7 @@ fn side_chat_catalog_probe_config(
     mut config: ResolvedConfig,
     base_url: &str,
     provider_profile: ProviderProfile,
+    api_key_env: &str,
 ) -> Result<(ResolvedConfig, String), DesktopCommandConflict> {
     let canonical_base_url = ProviderEndpoint::parse(base_url)
         .map_err(|error| DesktopCommandConflict::new(error.to_string()))?
@@ -2265,14 +2272,14 @@ fn side_chat_catalog_probe_config(
     config.model.connect_timeout_ms = config.side_chat.connect_timeout_ms;
     config.model.max_retries = config.side_chat.max_retries;
     config.model.context_window = config.side_chat.context_window;
+    config.model.compaction_budget_tokens = None;
     config.model.system_prompt.clear();
     config.model.supports_tools = false;
     config.model.supports_images = false;
     config.model.parallel_tool_calls = false;
 
-    // Side Chat has no credential surface and must never inherit the main
-    // provider's authentication material or generation-body customization.
-    config.model.api_key_env = None;
+    // A catalog request owns its explicit Side reference, never Main's secret.
+    config.model.api_key_env = canonical_provider_api_key_env_input(api_key_env)?;
     config.model.extra_headers.clear();
     config.model.chat_completions_reasoning_parameters = None;
     config.model.reasoning_effort = None;
@@ -5393,7 +5400,8 @@ async fn insert_command(
 struct DesktopProviderActionInput {
     base_url: String,
     provider_profile: String,
-    api_key_env: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
     context_window: String,
     selected_model_id: String,
 }
@@ -5447,11 +5455,22 @@ fn accept_provider_action_input(
                 .set_status_message("the provider connection type is invalid");
             rejected_action(controller, &error.message)
         })?;
-    let api_key_env =
-        canonical_provider_api_key_env_input(&input.api_key_env).map_err(|error| {
-            controller.state.set_status_message(error.message.clone());
-            error
-        })?;
+    let connection_changed = crate::llm::normalize_provider_base_url(&input.base_url)
+        != crate::llm::normalize_provider_base_url(
+            &controller.state.provider_config.provider_base_url_input,
+        )
+        || provider_profile != controller.state.provider_config.provider_profile_input;
+    let api_key_env = match input.api_key_env.as_deref() {
+        Some(value) => canonical_provider_api_key_env_input(value),
+        None if connection_changed => Ok(None),
+        None => canonical_provider_api_key_env_input(
+            &controller.state.provider_config.provider_api_key_env_input,
+        ),
+    }
+    .map_err(|error| {
+        controller.state.set_status_message(error.message.clone());
+        error
+    })?;
     controller.accept_provider_action_input(
         input.base_url,
         provider_profile,
@@ -5697,7 +5716,35 @@ fn validate_complete_config_draft(
     controller: &DesktopController,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    let dirty = complete_config_draft_is_dirty(controller.state.global_config(), values)?;
+    validate_config_draft(controller, values, ConfigDraftShape::Snapshot)
+}
+
+fn validate_config_commit_draft(
+    controller: &DesktopController,
+    values: &[DesktopConfigValueInput],
+) -> Result<bool, DesktopCommandConflict> {
+    validate_config_draft(controller, values, ConfigDraftShape::Commit)
+}
+
+#[derive(Clone, Copy)]
+enum ConfigDraftShape {
+    Snapshot,
+    Commit,
+}
+
+fn validate_config_draft(
+    controller: &DesktopController,
+    values: &[DesktopConfigValueInput],
+    shape: ConfigDraftShape,
+) -> Result<bool, DesktopCommandConflict> {
+    let dirty = match shape {
+        ConfigDraftShape::Snapshot => {
+            complete_config_draft_is_dirty(controller.state.global_config(), values)?
+        }
+        ConfigDraftShape::Commit => {
+            config_draft_is_dirty(controller.state.global_config(), values, shape)?
+        }
+    };
     validate_managed_ai_draft(
         controller.state.global_config(),
         values,
@@ -5754,6 +5801,11 @@ fn validate_managed_ai_draft(
                     | ConfigField::SideChatBaseUrl
                     | ConfigField::SideChatModel
                     | ConfigField::SideChatProviderProfile
+                    | ConfigField::SideChatApiKeyEnv
+                    | ConfigField::ApproveBaseUrl
+                    | ConfigField::ApproveModel
+                    | ConfigField::ApproveProviderProfile
+                    | ConfigField::ApproveApiKeyEnv
             )
     }) {
         return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
@@ -5765,19 +5817,41 @@ fn complete_config_draft_is_dirty(
     effective_config: &crate::config::ResolvedConfig,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    let expected_field_count = crate::config::ConfigField::ALL
+    config_draft_is_dirty(effective_config, values, ConfigDraftShape::Snapshot)
+}
+
+fn config_draft_is_dirty(
+    effective_config: &crate::config::ResolvedConfig,
+    values: &[DesktopConfigValueInput],
+    shape: ConfigDraftShape,
+) -> Result<bool, DesktopCommandConflict> {
+    let mut seen = std::collections::BTreeSet::new();
+    let current_fields = crate::config::ConfigField::ALL
         .into_iter()
         .filter(|field| !field.is_host_owned_generation())
-        .count();
+        .collect::<Vec<_>>();
     let contains_only_current_gui_fields = values.iter().all(|value| {
-        crate::config::ConfigField::ALL
-            .into_iter()
-            .any(|field| !field.is_host_owned_generation() && field.label() == value.key.as_str())
+        seen.insert(value.key.as_str())
+            && current_fields
+                .iter()
+                .any(|field| field.label() == value.key.as_str())
     });
-    if values.len() != expected_field_count || !contains_only_current_gui_fields {
-        return Err(DesktopCommandConflict::new(
-            "the complete settings draft must accompany the configuration owner target",
-        ));
+    // Commits distinguish untouched credentials from an explicit grant to a
+    // changed connection. Snapshots still contain the complete browser draft.
+    let includes_required_fields = current_fields.iter().all(|field| {
+        (matches!(shape, ConfigDraftShape::Commit)
+            && (field.is_approve() || field.is_connection_private_value()))
+            || seen.contains(field.label())
+    });
+    if !contains_only_current_gui_fields || !includes_required_fields {
+        return Err(DesktopCommandConflict::new(match shape {
+            ConfigDraftShape::Snapshot => {
+                "the complete settings draft must accompany the configuration owner target"
+            }
+            ConfigDraftShape::Commit => {
+                "the settings commit must include every ordinary GUI field and only current GUI fields"
+            }
+        }));
     }
     let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
         effective_config,
@@ -5787,6 +5861,20 @@ fn complete_config_draft_is_dirty(
             .collect(),
     )
     .map_err(DesktopCommandConflict::new)?;
+    if matches!(shape, ConfigDraftShape::Commit) {
+        let approve_values = editor
+            .fields
+            .iter()
+            .filter(|field| field.key.is_approve() && seen.contains(field.key.label()))
+            .map(|field| (field.key, field.value.as_str()))
+            .collect::<Vec<_>>();
+        // Initial-setup imports hydrate private fields in the commit owner.
+        // Validate the optional role patch without resolving that public snapshot early.
+        crate::config::field::validate_complete_config_field_values(&approve_values)
+            .map_err(DesktopCommandConflict::new)?;
+        crate::config::field::parse_config_field_patch(&approve_values)
+            .map_err(DesktopCommandConflict::new)?;
+    }
     Ok(editor.fields.iter().any(|field| field.dirty))
 }
 
@@ -6316,7 +6404,7 @@ async fn apply_session_config(
     if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+    if let Err(conflict) = validate_config_commit_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let applied = controller.apply_session_config(
@@ -6351,7 +6439,7 @@ async fn save_global_config(
     if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+    if let Err(conflict) = validate_config_commit_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let saved = controller.save_global_config(
@@ -6435,7 +6523,7 @@ async fn finish_initial_setup(
     if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+    if let Err(conflict) = validate_config_commit_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let import_generation =
@@ -9023,6 +9111,294 @@ mod tests {
         assert!(complete_config_draft_is_dirty(&config, &values).is_err());
     }
 
+    fn config_commit_fixture_values(config: &ResolvedConfig) -> Vec<DesktopConfigValueInput> {
+        crate::tui::config_editor::ConfigEditorState::from_config(config)
+            .fields
+            .into_iter()
+            .filter(|field| !field.key.is_host_owned_generation() && !field.key.is_approve())
+            .map(|field| DesktopConfigValueInput {
+                key: field.key.label().into(),
+                text: field.value,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn config_commit_accepts_sparse_approve_without_weakening_complete_snapshots() {
+        let config = ResolvedConfig::default();
+        let values = config_commit_fixture_values(&config);
+        assert!(complete_config_draft_is_dirty(&config, &values).is_err());
+        assert!(!config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+        let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+            &config,
+            values
+                .iter()
+                .map(|value| (value.key.clone(), value.text.clone()))
+                .collect(),
+        )
+        .unwrap();
+        assert!(
+            editor
+                .build_resolved_config(&config)
+                .unwrap()
+                .approve
+                .is_none()
+        );
+
+        for field in crate::config::ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_approve())
+        {
+            let mut values = values.clone();
+            values.push(DesktopConfigValueInput {
+                key: field.label().into(),
+                text: field.editor_value(&config),
+            });
+            assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).is_ok());
+            assert!(complete_config_draft_is_dirty(&config, &values).is_err());
+        }
+        let mut values = values;
+        values.push(DesktopConfigValueInput {
+            key: "approve.model".into(),
+            text: "independent-judge".into(),
+        });
+        assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+        let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+            &config,
+            values
+                .into_iter()
+                .map(|value| (value.key, value.text))
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            editor
+                .build_resolved_config(&config)
+                .unwrap()
+                .approve
+                .unwrap()
+                .model,
+            "independent-judge"
+        );
+    }
+
+    #[test]
+    fn config_commit_rejects_incomplete_duplicate_unknown_and_invalid_fields() {
+        let config = ResolvedConfig::default();
+        let values = config_commit_fixture_values(&config);
+        let mut missing = values.clone();
+        missing.retain(|value| value.key != "model.model");
+        assert!(config_draft_is_dirty(&config, &missing, ConfigDraftShape::Commit).is_err());
+        let mut duplicate = values.clone();
+        duplicate.push(values[0].clone());
+        assert!(config_draft_is_dirty(&config, &duplicate, ConfigDraftShape::Commit).is_err());
+        for (key, text) in [
+            ("approve.extra_headers_json", "{}"),
+            ("model.temperature", "0.7"),
+            ("approve.request_timeout_ms", "not-an-integer"),
+            ("approve.model", ""),
+        ] {
+            let mut invalid = values.clone();
+            invalid.push(DesktopConfigValueInput {
+                key: key.into(),
+                text: text.into(),
+            });
+            assert!(
+                config_draft_is_dirty(&config, &invalid, ConfigDraftShape::Commit).is_err(),
+                "accepted {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_commit_public_import_draft_leaves_private_hydration_to_the_commit_owner() {
+        use crate::config::ConfigField;
+        let config = ResolvedConfig::default();
+        let mut imported = config.clone();
+        imported.model.model = "imported-main".into();
+        imported
+            .model
+            .extra_headers
+            .insert("X-Import".into(), "private-main-header".into());
+        imported.mcp.enabled = true;
+        imported.mcp.servers[0].enabled = true;
+        imported.mcp.servers[0]
+            .headers
+            .insert("X-Import".into(), "private-mcp-header".into());
+        let mut approve = crate::config::ApproveConfig::from_model(&imported.model);
+        approve.model = "imported-review".into();
+        approve
+            .extra_headers
+            .insert("X-Review".into(), "private-review-header".into());
+        imported.approve = Some(approve.clone());
+        let mut values = ConfigField::ALL
+            .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
+            .map(|field| DesktopConfigValueInput {
+                key: field.label().into(),
+                text: field.public_value(&imported).value,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            values
+                .iter()
+                .find(|value| value.key == "mcp.servers_json")
+                .unwrap()
+                .text
+                .is_empty()
+        );
+        let public = serde_json::to_string(&values).unwrap();
+        for marker in [
+            "private-main-header",
+            "private-mcp-header",
+            "private-review-header",
+        ] {
+            assert!(!public.contains(marker));
+        }
+        assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+
+        for value in &mut values {
+            let field = ConfigField::ALL
+                .into_iter()
+                .find(|field| field.label() == value.key)
+                .unwrap();
+            if field.is_sensitive() && value.text.is_empty() {
+                value.text = field.editor_value(&imported);
+            }
+        }
+        let editor = crate::tui::config_editor::ConfigEditorState::from_complete_config_values(
+            &config,
+            values
+                .into_iter()
+                .map(|value| (value.key, value.text))
+                .collect(),
+        )
+        .unwrap()
+        .with_imported_approve(approve.clone());
+        let hydrated = editor.build_resolved_config(&config).unwrap();
+        assert_eq!(hydrated.model.extra_headers, imported.model.extra_headers);
+        assert_eq!(hydrated.mcp, imported.mcp);
+        assert_eq!(hydrated.approve, Some(approve));
+    }
+
+    #[test]
+    fn config_commit_sparse_approve_saves_and_reloads_an_independent_connection() {
+        const CHILD_MARKER: &str = "MOYAI_CONFIG_COMMIT_TEST_CHILD";
+        const TEST_NAME: &str = "desktop::tauri_app::tests::config_commit_sparse_approve_saves_and_reloads_an_independent_connection";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let path = camino::Utf8PathBuf::from(std::env::var("MOYAI_CONFIG_PATH").unwrap());
+            let config =
+                crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+                    &path,
+                    &std::fs::read_to_string(&path).unwrap(),
+                )
+                .unwrap();
+            let mut values = config_commit_fixture_values(&config);
+            values
+                .iter_mut()
+                .find(|value| value.key == "model.model")
+                .unwrap()
+                .text = "new-main".into();
+            assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+            let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+                &config,
+                values
+                    .into_iter()
+                    .map(|value| (value.key, value.text))
+                    .collect(),
+            )
+            .unwrap();
+            let saved = editor
+                .save_global(
+                    &path.parent().unwrap(),
+                    crate::tui::config_editor::GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+                )
+                .unwrap();
+            assert!(saved.resolved_config.approve.is_none());
+            let saved_text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                toml::from_str::<toml::Value>(&saved_text)
+                    .unwrap()
+                    .get("approve")
+                    .is_none()
+            );
+            let config =
+                crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+                    &path,
+                    &saved_text,
+                )
+                .unwrap();
+            assert_eq!(config.model.model, "new-main");
+
+            let mut values = config_commit_fixture_values(&config);
+            values.push(DesktopConfigValueInput {
+                key: "approve.model".into(),
+                text: "independent-judge".into(),
+            });
+            assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+            let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+                &config,
+                values
+                    .into_iter()
+                    .map(|value| (value.key, value.text))
+                    .collect(),
+            )
+            .unwrap();
+            editor
+                .save_global(
+                    &path.parent().unwrap(),
+                    crate::tui::config_editor::GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+                )
+                .unwrap();
+            let saved_text = std::fs::read_to_string(&path).unwrap();
+            let loaded =
+                crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+                    &path,
+                    &saved_text,
+                )
+                .unwrap();
+            assert_eq!(loaded.model.model, "new-main");
+            assert_eq!(loaded.approve.as_ref().unwrap().model, "independent-judge");
+            assert_eq!(
+                loaded.approve.as_ref().unwrap().base_url,
+                config.model.base_url
+            );
+            assert_eq!(
+                toml::from_str::<toml::Value>(&saved_text).unwrap()["approve"]
+                    .as_table()
+                    .unwrap()
+                    .len(),
+                9
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[model]\nmodel='old-main'\nbase_url='https://main.example/v1'\n",
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        for (name, _) in
+            std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("MOYAI_"))
+        {
+            child.env_remove(name);
+        }
+        let result = child
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env("MOYAI_CONFIG_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "isolated settings save failed: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
     #[test]
     fn hub_managed_ai_preserves_manual_connections_while_other_settings_remain_editable() {
         use crate::config::ConfigField;
@@ -9036,6 +9412,11 @@ mod tests {
             ConfigField::SideChatBaseUrl,
             ConfigField::SideChatModel,
             ConfigField::SideChatProviderProfile,
+            ConfigField::SideChatApiKeyEnv,
+            ConfigField::ApproveBaseUrl,
+            ConfigField::ApproveModel,
+            ConfigField::ApproveProviderProfile,
+            ConfigField::ApproveApiKeyEnv,
         ] {
             let values = vec![DesktopConfigValueInput {
                 key: field.label().to_string(),
@@ -9059,6 +9440,18 @@ mod tests {
             text: "日本語で回答してください".into(),
         }];
         assert!(validate_managed_ai_draft(&config, &prompts, true).is_ok());
+        for field in [
+            ConfigField::ApproveContextWindow,
+            ConfigField::ApproveRequestTimeoutMs,
+            ConfigField::ApproveConnectTimeoutMs,
+            ConfigField::ApproveMaxRetries,
+        ] {
+            let values = vec![DesktopConfigValueInput {
+                key: field.label().into(),
+                text: "17".into(),
+            }];
+            assert!(validate_managed_ai_draft(&config, &values, true).is_ok());
+        }
     }
 
     #[test]
@@ -9257,6 +9650,7 @@ mod tests {
         let target = SideChatCatalogRequestTarget {
             base_url: "http://127.0.0.1:1234".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible,
+            api_key_env: None,
             config_generation: 7,
         };
         assert!(validate_side_chat_catalog_target(&target, 7).is_ok());
@@ -9264,7 +9658,7 @@ mod tests {
     }
 
     #[test]
-    fn side_chat_catalog_probe_is_canonical_and_credential_free() {
+    fn side_chat_catalog_probe_is_canonical_and_does_not_inherit_main_credentials() {
         let mut config = ResolvedConfig::default();
         let profile = ProviderProfile::OpenAiCompatible;
         config.side_chat.connect_timeout_ms = 3_210;
@@ -9293,7 +9687,7 @@ mod tests {
         }));
 
         let (probe, canonical) =
-            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ", profile)
+            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ", profile, "")
                 .expect("valid side chat provider endpoint");
         assert_eq!(canonical, "http://127.0.0.1:1234");
         assert_eq!(probe.model.base_url, canonical);
@@ -9321,6 +9715,46 @@ mod tests {
                 ResolvedConfig::default(),
                 "http://user:password@127.0.0.1:1234",
                 ProviderProfile::OpenAiCompatible,
+                "",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn side_chat_catalog_probe_accepts_only_its_explicit_api_key_reference() {
+        let mut config = ResolvedConfig::default();
+        config.model.api_key_env = Some("MAIN_KEY".to_string());
+        config.side_chat.api_key_env = Some("SAVED_SIDE_KEY".to_string());
+        config
+            .model
+            .extra_headers
+            .insert("X-Main-Secret".to_string(), "main-only".to_string());
+        for reference in [" MAIN_KEY ", "SIDE_KEY"] {
+            let (probe, _) = side_chat_catalog_probe_config(
+                config.clone(),
+                "https://side.example/v1",
+                ProviderProfile::OpenAiCompatible,
+                reference,
+            )
+            .expect("explicit Side catalog reference");
+            assert_eq!(probe.model.api_key_env.as_deref(), Some(reference.trim()));
+            assert!(probe.model.extra_headers.is_empty());
+        }
+        let (anonymous, _) = side_chat_catalog_probe_config(
+            config.clone(),
+            "https://side.example/v1",
+            ProviderProfile::OpenAiCompatible,
+            "",
+        )
+        .unwrap();
+        assert_eq!(anonymous.model.api_key_env, None);
+        assert!(
+            side_chat_catalog_probe_config(
+                config,
+                "https://side.example/v1",
+                ProviderProfile::OpenAiCompatible,
+                "INVALID-NAME",
             )
             .is_err()
         );
@@ -9351,6 +9785,7 @@ mod tests {
         let projection = SideChatCatalogProjection {
             base_url: "http://127.0.0.1:1234".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible.as_str().to_string(),
+            api_key_env: String::new(),
             config_generation: "7".to_string(),
             models: vec![model],
         };
@@ -9358,6 +9793,7 @@ mod tests {
         assert!(json.get("ownerSessionId").is_none());
         assert_eq!(json["baseUrl"], "http://127.0.0.1:1234");
         assert_eq!(json["providerProfile"], "openai_compatible");
+        assert_eq!(json["apiKeyEnv"], "");
         assert_eq!(json["configGeneration"], "7");
         assert_eq!(json["models"][0]["loadState"], "loaded");
     }

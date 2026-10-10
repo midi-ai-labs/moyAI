@@ -43,8 +43,8 @@ impl Tool for ReadTool {
                 "required": ["path"],
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer" },
-                    "limit": { "type": "integer" }
+                    "offset": { "type": "integer", "description": "One-based starting source line; defaults to 1." },
+                    "limit": { "type": "integer", "description": "Maximum number of requested source lines; defaults to 2000. The configured output line and byte limits may return fewer lines." }
                 }
             }),
         }
@@ -258,6 +258,7 @@ impl Tool for ReadTool {
                 "size_bytes": size_bytes,
                 "start_line": offset,
                 "end_line": page.end_line,
+                "requested_end_line": page.requested_end_line,
                 "total_lines": lines.len(),
                 "encoding": source_encoding.label(),
                 "truncated": page.has_more,
@@ -388,6 +389,7 @@ struct BoundedLinePage {
     output_text: String,
     visible_line_count: usize,
     end_line: usize,
+    requested_end_line: usize,
     has_more: bool,
 }
 
@@ -400,6 +402,9 @@ fn bounded_line_page(
 ) -> Result<BoundedLinePage, ToolError> {
     let offset = offset.max(1);
     let start_index = offset.saturating_sub(1).min(lines.len());
+    let requested_end_line = start_index
+        .saturating_add(requested_limit.max(1))
+        .min(lines.len());
     let line_limit = requested_limit.max(1).min(max_lines.max(1));
     let byte_limit = max_bytes.max(1);
     let mut output_text = String::new();
@@ -437,6 +442,7 @@ fn bounded_line_page(
         output_text,
         visible_line_count,
         end_line,
+        requested_end_line,
         has_more: end_line < lines.len(),
     })
 }
@@ -1014,6 +1020,7 @@ mod tests {
         assert_eq!(page.output_text, "1: aaaa\n2: bbbb");
         assert_eq!(page.visible_line_count, 2);
         assert_eq!(page.end_line, 2);
+        assert_eq!(page.requested_end_line, 3);
         assert!(page.has_more);
         assert!(page.output_text.len() <= 15);
     }
@@ -1024,6 +1031,7 @@ mod tests {
             bounded_line_page(&["one", "two", "three"], 2, 1, 10, 1_024).expect("limited page");
         assert_eq!(limited.output_text, "2: two");
         assert_eq!(limited.end_line, 2);
+        assert_eq!(limited.requested_end_line, 2);
         assert!(limited.has_more);
 
         let max_lines =
@@ -1031,6 +1039,7 @@ mod tests {
         assert_eq!(max_lines.output_text, "1: one\n2: two");
         assert_eq!(max_lines.visible_line_count, 2);
         assert_eq!(max_lines.end_line, 2);
+        assert_eq!(max_lines.requested_end_line, 3);
         assert!(max_lines.has_more);
     }
 
@@ -1050,7 +1059,37 @@ mod tests {
 
         assert_eq!(page.output_text, "1: one\n2: two");
         assert_eq!(page.end_line, 2);
+        assert_eq!(page.requested_end_line, 2);
         assert!(!page.has_more);
+    }
+
+    #[test]
+    fn bounded_line_page_distinguishes_requested_completion_from_file_tail() {
+        let lines = ["one", "two", "three"];
+        let complete = bounded_line_page(&lines, 2, 1, 1, 1_024).expect("requested range");
+        let incomplete = bounded_line_page(&lines, 2, 2, 1, 1_024).expect("limited output");
+
+        assert_eq!(complete.output_text, incomplete.output_text);
+        assert_eq!(complete.end_line, incomplete.end_line);
+        assert!(complete.has_more && incomplete.has_more);
+        assert_eq!(complete.end_line, complete.requested_end_line);
+        assert!(incomplete.end_line < incomplete.requested_end_line);
+    }
+
+    #[test]
+    fn requested_line_range_is_clamped_at_eof_without_overflow() {
+        for (lines, offset, limit, expected_end) in [
+            (vec!["one", "two"], 2, 20, 2),
+            (vec!["one", "two"], 20, 20, 2),
+            (vec![], 1, 20, 0),
+            (vec!["one", "two"], 2, usize::MAX, 2),
+            (vec!["one", "two"], usize::MAX, usize::MAX, 2),
+        ] {
+            let page = bounded_line_page(&lines, offset, limit, 10, 1_024).expect("eof page");
+            assert_eq!(page.requested_end_line, expected_end);
+            assert_eq!(page.end_line, page.requested_end_line);
+            assert!(!page.has_more);
+        }
     }
 
     fn stamp_for(path: &camino::Utf8Path) -> (FileReadStamp, crate::edit::FileContentIdentity) {
@@ -1075,7 +1114,10 @@ mod tests {
         let safety = EditSafety::default();
         let session_id = SessionId::new();
         let (stamp, identity) = stamp_for(&path);
-        let decision = edit_baseline_decision(2, 1, 3, false, true);
+        let page = bounded_line_page(&["one", "two", "three"], 2, 1, 10, 1_024)
+            .expect("complete requested range");
+        assert_eq!(page.end_line, page.requested_end_line);
+        let decision = edit_baseline_decision(2, page.visible_line_count, 3, page.has_more, true);
 
         record_edit_baseline_if_eligible(&safety, session_id, stamp, decision)
             .expect("apply baseline decision");

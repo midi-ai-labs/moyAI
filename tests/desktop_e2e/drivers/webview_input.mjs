@@ -1,3 +1,5 @@
+import { waitForObservation } from "../core/deadline.mjs";
+
 const SEMANTIC_IDENTITY_FIELDS = Object.freeze([
   "tag",
   "id",
@@ -152,8 +154,7 @@ function targetFailure(code, message, observation, locator) {
   throw new WebviewInputError(code, message, { locator, observation });
 }
 
-export function assertExactSemanticTarget(observation, locatorValue) {
-  const locator = normalizeSemanticLocator(locatorValue);
+function assertSemanticTargetPresence(observation, locator) {
   if (observation === null || typeof observation !== "object" || Array.isArray(observation)) {
     targetFailure("semantic-target-observation-invalid", "semantic target observation is invalid", observation, locator);
   }
@@ -172,6 +173,11 @@ export function assertExactSemanticTarget(observation, locatorValue) {
   if (!identityMatches(observation.identity, locator.identity)) {
     targetFailure("semantic-target-identity", "semantic target identity does not match the locator", observation, locator);
   }
+}
+
+export function assertExactSemanticTarget(observation, locatorValue) {
+  const locator = normalizeSemanticLocator(locatorValue);
+  assertSemanticTargetPresence(observation, locator);
   if (
     observation.center_hit !== true
     || !finiteNumber(observation?.center?.x)
@@ -295,6 +301,40 @@ function normalizeProbeId(probeId) {
   return probeId;
 }
 
+function scrollContainerExpression(locator, containerSelector) {
+  return `(() => {
+    ${PAGE_IDENTITY_SOURCE}
+    const target = ${exactTargetExpression(locator)};
+    const container = ${exactTargetExpression({ selector: containerSelector })};
+    const nodes = document.querySelectorAll(${JSON.stringify(locator.selector)});
+    const containers = document.querySelectorAll(${JSON.stringify(containerSelector)});
+    if (nodes.length !== 1 || containers.length !== 1) return { target, container };
+    const body = containers[0], style = getComputedStyle(body), rect = body.getBoundingClientRect();
+    const clip = {
+      left: Math.max(rect.left + body.clientLeft, container.scroll_clip.left),
+      top: Math.max(rect.top + body.clientTop, container.scroll_clip.top),
+      right: Math.min(rect.left + body.clientLeft + body.clientWidth, container.scroll_clip.right),
+      bottom: Math.min(rect.top + body.clientTop + body.clientHeight, container.scroll_clip.bottom),
+    };
+    // Use container padding, so a textarea's own wheel handling cannot consume the scroll.
+    const point = {
+      x: clip.left + Math.min(Math.max(1, parseFloat(style.paddingLeft) / 2 || 1), (clip.right - clip.left) / 2),
+      y: (clip.top + clip.bottom) / 2,
+    };
+    return {
+      target, container,
+      target_contained: body.contains(nodes[0]),
+      scrollable: ['auto', 'scroll'].includes(style.overflowY) && body.scrollHeight > body.clientHeight,
+      scroll_top: body.scrollTop, scroll_left: body.scrollLeft,
+      client_height: body.clientHeight, scroll_height: body.scrollHeight,
+      wheel_point: point,
+      wheel_point_hit: clip.right > clip.left && clip.bottom > clip.top
+        && document.elementFromPoint(point.x, point.y) === body,
+      active_identity: semanticIdentity(document.activeElement),
+    };
+  })()`;
+}
+
 function installProbeExpression(probeId, maxEvents) {
   return `(() => {
     ${PAGE_IDENTITY_SOURCE}
@@ -330,6 +370,9 @@ function installProbeExpression(probeId, maxEvents) {
         button: event instanceof MouseEvent ? event.button : null,
         buttons: event instanceof MouseEvent ? event.buttons : null,
         detail: event instanceof MouseEvent ? event.detail : null,
+        deltaX: event instanceof WheelEvent ? event.deltaX : null,
+        deltaY: event instanceof WheelEvent ? event.deltaY : null,
+        deltaMode: event instanceof WheelEvent ? event.deltaMode : null,
         inputType: event instanceof InputEvent ? event.inputType : null,
         data: event instanceof InputEvent ? event.data : null,
       });
@@ -338,7 +381,7 @@ function installProbeExpression(probeId, maxEvents) {
         state.droppedThrough = removed.at(-1)?.sequence ?? state.droppedThrough;
       }
     };
-    for (const type of ['pointermove', 'pointerdown', 'pointerup', 'click', 'keydown', 'keyup', 'input', 'change', 'focusin']) {
+    for (const type of ['pointermove', 'pointerdown', 'pointerup', 'click', 'wheel', 'keydown', 'keyup', 'input', 'change', 'focusin']) {
       document.addEventListener(type, record, { capture: true, signal: controller.signal });
     }
     registry.set(probeId, state);
@@ -389,9 +432,8 @@ function probeFailure(code, message, evidence) {
   throw new WebviewInputError(code, message, evidence);
 }
 
-export function assertTrustedProbeSequence(snapshot, { afterSequence, expected }) {
+function assertProbeSnapshot(snapshot, afterSequence) {
   invariant(Number.isInteger(afterSequence) && afterSequence >= 0, "probe afterSequence must be a non-negative integer");
-  invariant(Array.isArray(expected) && expected.length > 0, "expected probe sequence must be non-empty");
   if (snapshot?.found !== true || !Number.isInteger(snapshot.sequence) || !Array.isArray(snapshot.events)) {
     probeFailure("event-probe-snapshot-invalid", "WebView event probe snapshot is invalid", snapshot);
   }
@@ -405,6 +447,11 @@ export function assertTrustedProbeSequence(snapshot, { afterSequence, expected }
     }
     previousSequence = event.sequence;
   }
+}
+
+export function assertTrustedProbeSequence(snapshot, { afterSequence, expected }) {
+  invariant(Array.isArray(expected) && expected.length > 0, "expected probe sequence must be non-empty");
+  assertProbeSnapshot(snapshot, afterSequence);
   const expectedTypes = new Set(expected.map((event) => event?.type));
   invariant(!expectedTypes.has(undefined), "every expected probe event requires a type");
   const observed = snapshot.events.filter((event) => expectedTypes.has(event.type));
@@ -423,7 +470,7 @@ export function assertTrustedProbeSequence(snapshot, { afterSequence, expected }
     if (wanted.identity && !identityMatches(actual, wanted.identity)) {
       probeFailure("event-probe-target", "WebView input event target identity drifted", { index, wanted, actual });
     }
-    for (const field of ["key", "code", "button", "buttons", "pointerId", "inputType", "data"]) {
+    for (const field of ["key", "code", "button", "buttons", "pointerId", "inputType", "data", "deltaX", "deltaY", "deltaMode"]) {
       if (Object.hasOwn(wanted, field) && actual[field] !== wanted[field]) {
         probeFailure("event-probe-detail", `WebView input event ${field} did not match`, { index, field, wanted, actual });
       }
@@ -572,6 +619,35 @@ export class WebviewInput {
       locator,
       observation: clone(await this.#cdp.evaluate(exactTargetExpression(locator))),
     };
+  }
+
+  async observeScrollContainer(locatorValue, containerSelector) {
+    const locator = normalizeSemanticLocator(locatorValue);
+    invariant(typeof containerSelector === "string" && containerSelector.length > 0
+      && containerSelector.length <= 512 && !containerSelector.includes("\0"), "scroll container selector is invalid");
+    return { locator, container_selector: containerSelector,
+      observation: clone(await this.#cdp.evaluate(scrollContainerExpression(locator, containerSelector))) };
+  }
+
+  async scrollContainer(locatorValue, { containerSelector, deltaX = 0, deltaY } = {}) {
+    invariant([deltaX, deltaY].every(value => finiteNumber(value) && Math.abs(value) <= 1_000)
+      && (deltaX !== 0 || deltaY !== 0), "wheel deltas must be nonzero finite values bounded to 1000 pixels");
+    if (this.#pressedPointer !== null || this.#pressedKeys.size > 0) {
+      throw new WebviewInputError("wheel-input-held", "wheel acquisition requires all pointer and keyboard input to be released");
+    }
+    const before = await this.observeScrollContainer(locatorValue, containerSelector);
+    const value = before.observation;
+    assertSemanticTargetPresence(value.target, before.locator);
+    if (value.container?.count !== 1 || value.container.connected !== true || value.container.visible !== true
+      || value.container.enabled !== true || value.target_contained !== true || value.scrollable !== true
+      || value.wheel_point_hit !== true || ![value.wheel_point?.x, value.wheel_point?.y].every(finiteNumber)) {
+      throw new WebviewInputError("wheel-scroll-container-unavailable", "wheel target requires one visible hit-tested owning scroll container", before);
+    }
+    const parameters = { type: "mouseWheel", x: value.wheel_point.x, y: value.wheel_point.y,
+      button: "none", buttons: 0, modifiers: 0, deltaX, deltaY };
+    // Wheel is one-shot input. Ambiguous dispatch must not be retried.
+    await this.#cdp.call("Input.dispatchMouseEvent", parameters);
+    return { before, parameters, after: await this.observeScrollContainer(locatorValue, containerSelector) };
   }
 
   #currentModifiers(extra = 0) {
@@ -898,6 +974,31 @@ export class WebviewInput {
       throw new WebviewInputError("event-probe-snapshot", "WebView event probe disappeared before observation", result);
     }
     return clone(result);
+  }
+
+  async waitForTrustedProbeSequence({ afterSequence, expected }) {
+    invariant(Array.isArray(expected) && expected.length > 0, "expected probe sequence must be non-empty");
+    const types = new Set(expected.map(event => event?.type));
+    invariant(!types.has(undefined), "every expected probe event requires a type");
+    let probe;
+    const observed = await waitForObservation({
+      label: "trusted WebView input event settlement",
+      timeoutMs: this.targetAcquisitionTimeoutMs,
+      pollMs: Math.max(1, this.targetAcquisitionPollMs),
+      now: this.now,
+      sleep: this.wait,
+      retrySampleErrors: false,
+      sample: () => this.snapshotProbe(afterSequence),
+      accept: snapshot => {
+        assertProbeSnapshot(snapshot, afterSequence);
+        // Absence can settle asynchronously. Any observed relevant event must
+        // already satisfy the complete sequence; malformed/extra input fails now.
+        if (!snapshot.events.some(event => types.has(event.type))) return false;
+        probe = assertTrustedProbeSequence(snapshot, { afterSequence, expected });
+        return true;
+      },
+    });
+    return { ...probe, attempts: observed.attempts, elapsed_ms: observed.elapsed_ms };
   }
 
   async removeProbe() {

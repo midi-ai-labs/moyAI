@@ -8,7 +8,7 @@ const pretty = (value: unknown): string => typeof value === "string" ? value : J
 const record = (value: unknown): Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown): string => typeof value === "string" ? value : "";
 function toolLabel(name: string): string {
-  return ({ read: "ファイルの読取り", write: "ファイルの保存", apply_patch: "ファイルの編集", shell: "コマンドの実行", shell_start: "継続するコマンドの起動", shell_status: "コマンドの状態確認", shell_stop: "コマンドの停止", shared_publish_artifact: "成果ファイルの共有", shared_delegate: "別の実行先への依頼", inspect_directory: "フォルダーの確認", list: "フォルダーの確認", glob: "ファイルの検索", grep: "内容の検索", current_time: "現在時刻の確認", update_plan: "作業手順の更新" } as Record<string, string>)[name] ?? "操作";
+  return ({ read: "ファイルの読取り", write: "ファイルの保存", apply_patch: "ファイルの編集", shell: "コマンドの実行", shell_start: "継続するコマンドの起動", shell_status: "コマンドの状態確認", shell_stop: "コマンドの停止", shared_publish_artifact: "成果ファイルの共有", shared_delegate: "別の実行先への依頼", inspect_directory: "フォルダーの確認", list: "フォルダーの確認", glob: "ファイルの検索", grep: "内容の検索", current_time: "現在時刻の確認", update_plan: "作業手順の更新", compact_context: "会話文脈の圧縮" } as Record<string, string>)[name] ?? "操作";
 }
 function renderTranscriptItem(item: { position: number; kind: string; payload: unknown }, owner: string): string {
   const payload = record(item.payload);

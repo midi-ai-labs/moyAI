@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { assertExactDesktopCommandSequence } from "../drivers/desktop_command_probe.mjs";
 
 import {
   PROVIDER_CONTEXT_AFTER,
+  PROVIDER_CONTEXT_AFTER_APPROVE,
+  APPROVE_MODEL_AFTER,
+  APPROVE_KEYS,
+  approveFields,
+  approvePreferencesReady,
   PROVIDER_CONTEXT_BEFORE,
   PROVIDER_PROFILE_OPTIONS,
   MAIN_SYSTEM_PROMPT_MARKER,
@@ -17,8 +23,10 @@ import {
   expectedProviderGlobalSave,
   expectedResetThenClose,
   preferencesReady,
+  privateConnectionRegressionStages,
   providerEditorReady,
   savedPreferencesReady,
+  savedPrivateConnectionReady,
   settingsTriggerRestoredShellReady,
   settingsPreferencesFixtureConfig,
   shellReadyForSettingsDrag,
@@ -28,6 +36,7 @@ import {
   tabToSettingsControl,
   trustedClickProbeEvents,
   trustedReplaceFocusedSettingsDigits,
+  trustedReplaceFocusedSettingsText,
   trustedToggleFocusedSettingsCheckbox,
   trustedTypeFocusedSettingsText,
 } from "../scenarios/settings_preferences.mjs";
@@ -208,6 +217,7 @@ const target = Object.freeze({
 function projection(overrides = {}) {
   return {
     overlay: "config",
+    approve_model_configured: false,
     config_target: { ...target },
     config_fields: [
       { key: "model.base_url", value: "http://127.0.0.1:43111" },
@@ -217,6 +227,17 @@ function projection(overrides = {}) {
       { key: "model.context_window", value: PROVIDER_CONTEXT_AFTER },
       { key: "model.system_prompt", value: MAIN_SYSTEM_PROMPT_MARKER },
       { key: "model.max_output_tokens", value: "32768" },
+      { key: "model.request_timeout_ms", value: "30000" },
+      { key: "model.connect_timeout_ms", value: "1000" },
+      { key: "model.max_retries", value: "0" },
+      { key: "approve.base_url", value: "http://127.0.0.1:43111" },
+      { key: "approve.model", value: "moyai-e2e-scripted" },
+      { key: "approve.provider_profile", value: SETTINGS_PROVIDER_PROFILE },
+      { key: "approve.api_key_env", value: SETTINGS_PROVIDER_API_KEY_ENV },
+      { key: "approve.context_window", value: PROVIDER_CONTEXT_AFTER },
+      { key: "approve.request_timeout_ms", value: "30000" },
+      { key: "approve.connect_timeout_ms", value: "1000" },
+      { key: "approve.max_retries", value: "0" },
       { key: "docling.enabled", value: "false" },
       { key: "docling.base_url", value: "http://127.0.0.1:43111" },
     ],
@@ -260,14 +281,21 @@ function cleanSurface(overrides = {}) {
       save: { count: 1, visible: true, enabled: false },
       discard: { count: 0, visible: false, enabled: false },
       close: { count: 1, visible: true, enabled: true },
+      approve: {
+        fields: APPROVE_KEYS.map(key => ({ key,
+          value: projection().config_fields.find(row => row.key === key).value,
+          enabled: true, tag: key === "approve.provider_profile" ? "SELECT" : "INPUT" })),
+        inheritance: { count: 1, text: "Approveは未設定のため、実行時のMainのモデルを使います。" },
+      },
       navigation: {
         groups: {
           count: 3,
           visible_count: 3,
           texts: ["共通設定", "チャットごとの設定", "画面設定"],
         },
-        provider: { count: 1, visible: true, text: "AIの接続・メイン" },
-        side_chat: { count: 1, visible: true, text: "サイドチャット" },
+        provider: { count: 1, visible: true, text: "Main（メイン）" },
+        side_chat: { count: 1, visible: true, text: "Sub（サイドチャット）" },
+        approve: { count: 1, visible: true, text: "Approve（承認）" },
         tools: { count: 1, visible: true, text: "ツール" },
         session_overrides: { count: 1, visible: true, text: "現在のチャット" },
         window: { count: 1, visible: true, text: "ウィンドウ" },
@@ -374,6 +402,7 @@ test("shell, provider, and clean Preferences predicates reject network and visib
   for (const [name, mutate] of [
     ["legacy Main label", (value) => { value.settings.navigation.provider.text = "メインLLM"; }],
     ["legacy Side label", (value) => { value.settings.navigation.side_chat.text = "サイドチャットLLM"; }],
+    ["missing Approve nav", (value) => { value.settings.navigation.approve.count = 0; }],
     ["missing hierarchy group", (value) => { value.settings.navigation.groups.count = 2; }],
     ["reordered hierarchy groups", (value) => { value.settings.navigation.groups.texts.reverse(); }],
     ["missing Session Overrides", (value) => { value.settings.navigation.session_overrides.count = 0; }],
@@ -498,6 +527,152 @@ test("saved and restored predicates require a generation advance, clean state, a
   assert.equal(failing({ surface: saved, ledger: [{ pathname: "/v1/models" }] }), "fail");
 });
 
+test("Approve controls and ownership distinguish inherited and independent settings after Main changes", () => {
+  const inherited = cleanSurface();
+  assert.equal(approvePreferencesReady(inherited), true);
+  for (const mutate of [
+    value => { value.projection.approve_model_configured = true; },
+    value => { value.settings.approve.fields.pop(); },
+    value => { value.settings.approve.fields.push(value.settings.approve.fields[0]); },
+    value => { value.settings.approve.fields[0].enabled = false; },
+    value => { value.settings.approve.fields[0].value = "another-endpoint"; },
+    value => { value.settings.approve.inheritance.count = 0; },
+  ]) {
+    const drifted = structuredClone(inherited);
+    mutate(drifted);
+    assert.equal(approvePreferencesReady(drifted), false);
+  }
+  const explicit = structuredClone(inherited);
+  explicit.projection.approve_model_configured = true;
+  explicit.projection.config_fields.find(row => row.key === "approve.model").value = APPROVE_MODEL_AFTER;
+  explicit.settings.approve.fields.find(row => row.key === "approve.model").value = APPROVE_MODEL_AFTER;
+  explicit.settings.approve.inheritance.text = "Approve専用の接続設定を使います。Mainのモデル変更はApproveに反映されません。";
+  const snapshot = approveFields(explicit.projection);
+  assert.equal(approvePreferencesReady(explicit, { configured: true, model: APPROVE_MODEL_AFTER, snapshot }), true);
+  explicit.projection.config_fields.find(row => row.key === "model.context_window").value = PROVIDER_CONTEXT_AFTER_APPROVE;
+  explicit.settings.context.value = PROVIDER_CONTEXT_AFTER_APPROVE;
+  explicit.projection.config_fields.find(row => row.key === "docling.enabled").value = "true";
+  explicit.settings.docling.checked = true;
+  const decide = createStablePreferencesDecision({ expectedContext: PROVIDER_CONTEXT_AFTER_APPROVE,
+    expectedApproveConfigured: true, expectedApproveModel: APPROVE_MODEL_AFTER, expectedApproveSnapshot: snapshot,
+    now: (() => { let time = 0; return () => time += 500; })() });
+  assert.equal(decide({ surface: explicit, ledger: [] }), "pending");
+  assert.equal(decide({ surface: explicit, ledger: [] }), "pass");
+  explicit.projection.config_fields.find(row => row.key === "approve.context_window").value = PROVIDER_CONTEXT_AFTER_APPROVE;
+  explicit.settings.approve.fields.find(row => row.key === "approve.context_window").value = PROVIDER_CONTEXT_AFTER_APPROVE;
+  assert.equal(approvePreferencesReady(explicit, { configured: true, snapshot }), false);
+});
+
+test("global save expectations omit unedited Approve and include only its actual model edit", () => {
+  const surface = cleanSurface();
+  assert.equal(expectedGlobalSave(surface).args.values.some(row => row.key.startsWith("approve.")), false);
+  const edited = expectedGlobalSave(surface, { "approve.model": APPROVE_MODEL_AFTER });
+  assert.deepEqual(edited.args.values.filter(row => row.key.startsWith("approve.")), [
+    { key: "approve.model", text: APPROVE_MODEL_AFTER },
+  ]);
+  assert.equal(expectedGlobalSave(surface, { "approve.model": "moyai-e2e-scripted" }).args.values
+    .some(row => row.key.startsWith("approve.")), false);
+});
+
+test("connection save oracle distinguishes implicit credentials from explicit same-value re-entry", () => {
+  const surface = cleanSurface();
+  surface.projection.config_fields.find(row => row.key === "model.api_key_env").value = "MOYAI_E2E_UNUSED_API_KEY";
+  const overrides = { "model.base_url": "http://127.0.0.1:43111/changed", "model.api_key_env": "MOYAI_E2E_UNUSED_API_KEY" };
+  assert.equal(expectedGlobalSave(surface, overrides).args.values.some(row => row.key === "model.api_key_env"), false);
+  assert.deepEqual(expectedGlobalSave(surface, overrides, { editedKeys: ["model.api_key_env"] }).args.values
+    .filter(row => row.key === "model.api_key_env"), [{ key: "model.api_key_env", text: "MOYAI_E2E_UNUSED_API_KEY" }]);
+});
+
+test("the actual connection regression restores an empty API by omission and a nonempty API after its URL edit", () => {
+  for (const role of ["model", "side_chat"]) {
+    const baseKey = `${role}.base_url`, apiKey = `${role}.api_key_env`;
+    const baseline = { projection: {
+      config_target: target,
+      config_fields: [
+        { key: baseKey, value: "http://127.0.0.1:43111/credential-clear" },
+        { key: apiKey, value: "" },
+      ],
+    } };
+    for (const originalApi of ["", "MOYAI_E2E_UNUSED_API_KEY"]) {
+      const stages = privateConnectionRegressionStages({ baseUrl: "http://127.0.0.1:43111", role,
+        originalUrl: "http://127.0.0.1:43111/original", originalApi, apiReference: "MOYAI_E2E_UNUSED_API_KEY" });
+      assert.equal(stages[1].editApi, true, "same-value reuse still requires API input after the new URL");
+      assert.equal(stages[2].editApi, false, "URL-only clearing must omit an API input");
+      const restore = stages.at(-1);
+      const edits = [[baseKey, restore.url], ...(restore.editApi ? [[apiKey, restore.api]] : [])];
+      assert.deepEqual(edits, originalApi === "" ? [[baseKey, restore.url]] : [[baseKey, restore.url], [apiKey, originalApi]],
+        "a later URL edit would clear an earlier explicit API intent");
+      const expected = expectedGlobalSave(baseline, Object.fromEntries(edits), {
+        editedKeys: edits.map(([key]) => key),
+      });
+      assert.deepEqual(expected.args.values.filter(row => row.key === apiKey),
+        originalApi === "" ? [] : [{ key: apiKey, text: originalApi }]);
+      const actual = { command: "save_global_config", args: {
+        values: [{ key: baseKey, text: restore.url }, ...(originalApi === "" ? [] : [{ key: apiKey, text: originalApi }])],
+        expectedTarget: target,
+      } };
+      const snapshot = { found: true, sequence: 1, dropped_through: 0, calls: [{ sequence: 1, ...actual }] };
+      assertExactDesktopCommandSequence(snapshot, { expected: [expected] });
+      if (originalApi === "") {
+        const obsolete = structuredClone(expected);
+        obsolete.args.values.push({ key: apiKey, text: "" });
+        assert.throws(() => assertExactDesktopCommandSequence(snapshot, { expected: [obsolete] }),
+          { code: "desktop-command-probe-call-mismatch" });
+      }
+    }
+  }
+});
+
+test("private connection save requires both persisted and visible values, a new generation and zero requests", () => {
+  for (const role of ["model", "side_chat"]) {
+    const expected = { role, baseUrl: "http://127.0.0.1:43111/changed", apiKeyEnv: "", baselineTarget: target };
+    const fields = [{ key: `${role}.base_url`, value: expected.baseUrl }, { key: `${role}.api_key_env`, value: "" }];
+    const saved = cleanSurface();
+    saved.projection.config_target.configGeneration = "42";
+    saved.projection.config_fields = fields;
+    saved.settings.connection_fields = fields.map(field => ({ ...field, count: 1 }));
+    assert.equal(savedPrivateConnectionReady(saved, [], expected), true);
+    assert.equal(savedPrivateConnectionReady(saved, [{ pathname: "/v1/models" }], expected), false);
+    for (const mutate of [
+      value => { value.projection.config_target.configGeneration = "41"; },
+      value => { value.projection.config_target.sessionId = "another-session"; },
+      value => { value.projection.config_fields[1].value = "old-credential"; },
+      value => { value.settings.connection_fields[1].value = "old-credential"; },
+      value => { value.settings.connection_fields[0].count = 2; },
+      value => { value.settings.dirty_badge_visible = true; },
+      value => { value.settings.save.enabled = true; },
+      value => { value.visible_validation_error_count = 1; },
+    ]) {
+      const invalid = structuredClone(saved); mutate(invalid);
+      assert.equal(savedPrivateConnectionReady(invalid, [], expected), false);
+    }
+  }
+});
+
+test("Approve model replacement selects the exact focused control then delivers trusted text once", async () => {
+  const identity = { tag: "INPUT", configKey: "approve.model" };
+  const events = [], calls = [];
+  const emit = (type, key, code) => events.push({ sequence: events.length + 1, isTrusted: true, ...identity, type, key, code });
+  const input = {
+    snapshotProbe: async (after = 0) => ({ found: true, sequence: events.length, dropped_through: 0,
+      active: identity, events: events.filter(row => row.sequence > after) }),
+    keyDown: async key => { calls.push(["down", key]); emit("keydown", key, "ControlLeft"); },
+    pressKey: async key => { calls.push(["press", key]); emit("keydown", key, "KeyA"); emit("keyup", key, "KeyA"); },
+    keyUp: async key => { calls.push(["up", key]); emit("keyup", key, "ControlLeft"); },
+    typeText: async text => {
+      calls.push(["text", text]);
+      for (const key of text) {
+        emit("keydown", key);
+        events.push({ sequence: events.length + 1, isTrusted: true, ...identity,
+          type: "input", inputType: "insertText", data: key });
+        emit("keyup", key);
+      }
+    },
+  };
+  await trustedReplaceFocusedSettingsText(input, { identity }, APPROVE_MODEL_AFTER);
+  assert.deepEqual(calls, [["down", "Control"], ["press", "a"], ["up", "Control"], ["text", APPROVE_MODEL_AFTER]]);
+});
+
 test("scenario factory returns fresh common-runner contracts", () => {
   const first = createSettingsPreferencesScenario();
   const second = createSettingsPreferencesScenario();
@@ -516,6 +691,7 @@ test("config-only scenario declares excluded native drag and retains isolated se
   assert.equal(config.id, "settings.preferences-config");
   assert.equal(config.databaseRequired, true);
   assert.equal(config.coverage.settings_save_and_restart, "required");
+  assert.equal(config.coverage.private_connection_target_changes, "required");
   assert.equal(config.coverage.native_titlebar_drag, "not_tested");
   assert.match(config.coverage.native_drag_note, /native drag未確認/);
   for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {

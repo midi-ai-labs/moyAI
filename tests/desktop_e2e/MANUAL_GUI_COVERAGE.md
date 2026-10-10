@@ -9,7 +9,7 @@
 1. `project_sandbox/<task>/` に検証専用の workspace / config / data / 成果物保存先を用意する。current binary と frontend の版、実行日時、Windows / WebView2、画面サイズ、DPI、zoom、IME、実行者を結果へ記録する。削除・rollback・保存の対象には使い捨てデータを使う。
 2. プロジェクト P1 / P2、P1 のセッション S1 / S2、プロジェクトなしのチャット C1 を GUI から作る。日本語・空白・長い名称を一つずつ含める。fixture に保存データを直接 seed した場合は別記し、その作成操作が GUI 合格になったとは数えない。
 3. 短い通常応答、tool 実行中に応答を保持できる scripted provider、失敗・空カタログ・遅延応答、長い履歴、画像、artifact、Sub Agent を各 case に必要な分だけ用意する。モデル依存の長時間試験へ全ケースを束ねない。
-4. Hub / MCP のケースは接続方式を明記する。模擬 HTTP カタログ、同一PCの実 Hub＋実 Desktop 2役、物理 WinA / WinB、WinA / WinB / WinC は別の受入単位である。端末は表示名に加えて ID と公開 project / temp を記録する。
+4. Hub / MCP のケースは接続方式を明記する。模擬 HTTP カタログ、同一PCの実 Hub＋実 Desktop 2役、物理 WinA / WinB、WinA / WinB / WinC は別の受入単位である。端末は表示名に加えて ID と共有プロジェクト・実行環境を記録する。
 5. OS のピッカーや IME を操作できる実対話デスクトップを確保する。使えない場合は当該ケースを environment blocked とし、DOM 書換えや IPC 直呼びで GUI 操作を代用しない。実 OS 入力、実 Tauri 上の trusted pointer / keyboard 操作は操作証拠になる。製品状態の注入は fixture setup として分離する。
 6. GUI を専有する実行は共通ハーネスの admission / lifecycle に従う。独自 launch / kill / SQLite cleanup を増やさず、終了時は自分の fixture と helper だけを片付ける。保存データ確認は既存 cleanup の閉じた DB 証跡を使い、seal 後の DB を開き直さない。
 
@@ -220,7 +220,7 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 
 ### N: Hub参加、実行PC設定、旧仕事の保守
 
-自動補助は current device-network / diagnostics / artifacts unit tests と、registryにある実Hub browser enrollment scenarioの実際のassertion。旧Hub Tauri結合scenarioの過去PASSは転用しない。以下は実Hubブラウザーとの操作を併用し、実WinA / WinBは別receiptを残す。N05–N09の旧個別受付・新規利用先選択は通常導線から退役済みであり、新規操作の合格を要求しない。保存済み仕事のN10–N12は互換保守として確認する。
+自動補助は current device-network / diagnostics / artifacts unit tests と、registryにある実Hub browser enrollment scenarioの実際のassertion。以下は実Hubブラウザーとの操作を併用し、実WinA / WinBは別receiptを残す。保存済み仕事のN10–N12は互換保守として確認する。
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
@@ -228,11 +228,6 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | N02 | `device-network-refresh` | pending / active / stopped / disconnected | Hubブラウザーで承認・停止・再許可後、最新情報 / 再接続 | 正しい端末状態を反映し入力・detailsを維持。単なる接続中表示を受付ONと混同しない |
 | N03 | `device-network-join` | 申請未完 / 不通復旧 / pending | 到達可能へ戻して再試行、重ねて押す | 同じ申請を追跡し不要な重複登録をしない。失効/管理者停止の理由と可能な対処を区別 |
 | N04 | `device-network-diagnose-hub` | 接続成功 / 不通 / 未設定 | Hub接続を診断しdetails展開のままpoll | 保存済Hubの到達・認証結果を表示。detailsの反復開閉なし、FWを自動変更しない |
-| N05 | `device-network-diagnose-receiver` | 保存受付あり、draft変更あり / 停止 | 保存済受付の診断を押す | 診断したIP/port/受付状態が保存値と一致。未保存draftを検査済と表示しない |
-| N06 | `device-network-diagnose-peer` | WinB / WinC、到達可 / 不可 / 許可なし | 各peerの接続診断を押す | そのpeerの結果と理由を同じcardへ表示。別peerに結果が混ざらず未確認と成功を区別 |
-| N07 | `device-network-receiver-on` | active参加、temp / project、確認未 / 済、bind不正 | 場所・権限・model・起動/非表示方針を選び確認→受付ON/保存 | 自動IP・証明書で開始しendpointとON/受付中を表示。未確認/不正は保存不可の理由。dirty変更は保存まで適用されない |
-| N08 | `device-network-receiver-off` | 受付ON / 実行あり / 停止中 | 受付OFFを押し進行中jobを別に確認 | 新規受付OFFと既存taskの停止完了を区別。OFFだけで完了したように見せない |
-| N09 | `device-network-select` | 許可peerのOFF / ON / unavailable、保存失敗 | WinBのswitchをpointer、Space、Enterで切替。WinCも選ぶ | 現在値ON/OFFとswitch位置が一致。保存中/結果を示し、失敗時は最後の保存値。利用可否は選択と別表示 |
 | N10 | `device-network-stop-job` | incoming / outgoing active、到達不可 / terminal | 対象jobの停止、別jobの状態も確認 | 対象だけ停止要求→確認。到達不能は未確認を残し、Mainや別peerを誤停止しない |
 | N11 | `device-network-artifacts` | terminal job、記録あり / 0件 / peer不通 | 成果物details→確認。別jobへ切替 | job/version/記録されたfile変更が一致。任意shellファイル全体を同期済と見せず、0件/取得不能を説明 |
 | N12 | `device-network-export-artifacts` | 確認済版あり / なし / 版変化 | 保存先OS picker取消→新folderへ保存→同じ場所で再試行 | 取消は確認内容保持。確認版の新folderとreceiptを表示。既存同名folderを上書きせず、元projectへ自動適用しない |
@@ -257,13 +252,13 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | M08 | `mcp-history-export` | 選択あり / なし、長い本文 | Markdown保存を取消→保存し内容を読む | 取消と保存先を表示。選択した方向/ID/相手の履歴を書き出す。選択なしは無効、本文省略の案内が明確 |
 | M09 | `mcp-history-stop` | can_stop / terminal、相手到達可 / 不可 | 詳細の停止要求を押し、双方の記録を確認 | 対象の要求受付と停止確認を分け、未確認を完了としない。別方向/別Mainは停止しない |
 
-### L: 退役した手動端末登録
+### 一般HTTP MCP設定
 
-旧L01〜L04の `mcp-peer-refresh/add/remove/check` フォームは通常設定画面から退役した。互換consumerとfixtureの検査は保持するが、旧GUIを通常suiteで実行したり復活させたりしない。一般HTTP MCP設定はFの設定操作、moyAI端末の新規参加はDNと共有プロジェクト、保存済み旧利用先の削除は `hub.offline-reset`、過去の仕事はMの履歴操作で確認する。
+一般HTTP MCPは共通設定の操作で確認する。moyAI端末の参加はNと共有プロジェクト、保存済み旧利用先の削除は `hub.offline-reset`、過去の仕事はMの履歴操作で確認する。
 
 ## 4. action ID 以外のGUI機能と横断ケース
 
-140件のID表だけでは次の入力・OS操作・表示を覆わない。固定ID全件を実行しても、本節と対象状態が未完了なら「全GUI合格」としない。
+上のID表だけでは次の入力・OS操作・表示を覆わない。表の全件を実行しても、本節と対象状態が未完了なら「全GUI合格」としない。
 
 | Case | 対象 / 状態 | 具体的な操作 | 合格条件 |
 |---|---|---|---|
@@ -273,8 +268,6 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | X04 | 全設定field・分類リンク | GlobalのMain、入力上限/モデル機能、Side、権限、エージェント、ツール、ファイル、詳細、現在のチャット、ウィンドウを順に移動。表示された全fieldをキー単位で記録し、種類ごとに下記matrixを適用 | 到達不能fieldなし。label/help/継承/dirty/エラーを表示し、変更を指定scopeへ保存。画面の項目一覧をtask evidenceへ保存し、分類を開いただけで全項目PASSにしない |
 | X05 | Directモデル一覧 | profileとURLをA→B→A。0件、削除済保存ID、読込失敗、古い応答を作り、Main / Side / 初回 / Sessionを比較 | 接続先と候補が一致。保存済だが候補外のIDは状態として説明し、存在する候補へ偽装しない。外部ホストのload/unloadを勝手に変更しない |
 | X06 | Hubモデルfield・差分 | Main/Side別に標準モデル・明示モデルのDDDWを変更。Hub側で追加/削除/機能改訂し再取得 | 各contextのbefore/after・未保存・再確認が明確。old response、poll、tab移動でdraft/focus/detailsが戻らない |
-| X07 | 端末受付field | temp/project、3権限、Hub/Direct model、bind空/有効IPv4/非local/IPv6、port空/有効/不正/競合、2つの起動・非表示checkbox、公開確認checkboxを操作 | 自動値と指定値、保存前後を区別。固定port競合は別portへ無断fallbackせず理由。公開対象変更後の確認を古い承認で代用しない |
-| X08 | 端末検索 / details / use switch | 名称・公開対象・IDで検索、0件、clear、日本語IME。複数peerの識別/診断detailsを展開しswitch focusでpoll | 検索と表示が一致。ON/OFFは現在値、availabilityと別。detailsの1秒周期開閉やfocus消失なし |
 | X09 | MCP活動表示 | 受入待機→実行→承認→停止→終端、複数受入、状態取得不能。Main同時実行中にchat切替 | 赤系共通indicatorと文言/件数が一致。全終了で消え、取得不能は「何も実行なし」と見せない。Mainの青表示と同時に識別可能 |
 | X10 | MCP履歴の大量/長文/エラー | page超の行、空方向、長いID/path、Markdown code/table/長文、本文省略、peer不通を表示。本文途中でpoll・方向切替 | 一覧はbounded、本文・page・選択の対応が正しい。読書位置/details保持、拡張子等の文字が欠けず、停止要求/確認/最終観測を区別 |
 | X11 | Main履歴rail / details / scroll | streaming中は末尾と途中を交互に読む。User/Assistant/tool/work/error/usage等のdetails、rail hover/移動、以前のページを操作 | 読んでいる位置を強制的に末尾へ戻さず、末尾追従は意図どおり。canonical化後の重複・欠落・順序逆転なし |
@@ -354,6 +347,6 @@ agentが画像を読んだ場合は読んだ画像と観点を記す。人が直
 
 ## 6. 合格範囲と保守
 
-リリース前には、対象buildについて固定140行の実施状態、X01〜X16、field matrix、native consumer、物理端末の残範囲を集計する。表の行数、unit test件数、起動成功、スクリーンショット枚数から「すべてのGUIチェック済み」と判断しない。long-history/多数peer/同時Main・Side・MCP、異常状態、視覚/IME、実物理peerの未確認を明示する。
+リリース前には、対象buildについて現行action表と横断ケース、field matrix、native consumer、物理端末の残範囲を集計する。表の行数、unit test件数、起動成功、スクリーンショット枚数から「すべてのGUIチェック済み」と判断しない。long-history/多数peer/同時Main・Side・MCP、異常状態、視覚/IME、実物理peerの未確認を明示する。
 
 action IDの追加・廃止時は [actions.ts](../../ui/desktop-web/src/actions.ts) の定義と本表を集合比較し、missing / duplicate / obsolete を0にする。この比較は文書棚卸しであり製品sourceを固定する新testではない。動的menu・field・details・入力イベントは別に §4 へ対応させる。新しいscenarioは共通 [registry](scenario_registry.mjs) / driver / lifecycleを使い、ケースごとの独自起動や合否frameworkを追加しない。

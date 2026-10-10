@@ -84,8 +84,12 @@ impl Tool for WriteTool {
             .map(ToolFormatterPlan::permission_detail)
             .into_iter()
             .collect();
+        let guardian_evidence =
+            crate::tool::permission_guardian::PermissionGuardianEvidenceState::file_edit_with_formatters(
+                formatter_plan.iter().map(ToolFormatterPlan::guardian_evidence),
+            );
         let effect_admission = ctx
-            .confirm_if_needed_with_details(
+            .confirm_if_needed_with_details_and_guardian_evidence(
                 permission_access,
                 format!("Write full contents to {}", guarded.absolute),
                 permission_details,
@@ -95,6 +99,7 @@ impl Tool for WriteTool {
                         .as_ref()
                         .is_some_and(ToolFormatterPlan::outside_workspace),
                 risks,
+                guardian_evidence,
             )
             .await?;
         ctx.run_mutation_fence.assert_owned().await?;
@@ -574,6 +579,31 @@ mod tests {
             "Set-Content -LiteralPath 'formatter-started.marker' -Value 'started'; [Console]::Out.Write([Console]::In.ReadToEnd())"
                 .to_string(),
         ]
+    }
+
+    #[test]
+    fn write_formatter_guardian_evidence_uses_the_resolved_execution_plan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("output.txt");
+        let (_, plan) = marker_formatter_and_plan(&root, &target);
+        let evidence =
+            crate::tool::permission_guardian::PermissionGuardianEvidenceState::file_edit_with_formatters(
+                Some(&plan).into_iter().map(ToolFormatterPlan::guardian_evidence),
+            );
+        let crate::tool::permission_guardian::PermissionGuardianEvidenceState::Complete(
+            crate::tool::permission_guardian::PermissionGuardianEvidence::FileEditWithFormatters {
+                formatters,
+            },
+        ) = evidence
+        else {
+            panic!("the accompanying process must be part of the reviewed file edit");
+        };
+        assert_eq!(formatters.len(), 1);
+        assert_eq!(formatters[0].target, target);
+        assert_eq!(formatters[0].cwd, root);
+        assert_eq!(formatters[0].argv, plan.command());
+        assert_eq!(formatters[0].executable.as_str(), plan.command()[0]);
     }
 
     #[test]

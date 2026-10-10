@@ -5,13 +5,13 @@ import { renderHubCatalogComparison } from "./hub_catalog_render.ts";
 import type { DeviceNetworkPresentation } from "./device_network_state.ts";
 import type { SharedWorkPresentation } from "./shared_work_state.ts";
 import {
-  createHubUiState, hubActiveRoute, hubCanSave, hubErrorText, hubModelChoice,
+  createHubUiState, hubActiveRoute, hubCanSave, hubErrorText, hubModelChoice, hubRecommendedSelection,
   hubSaveFeedback, type HubContext, type HubPresentation,
 } from "./hub_state.ts";
 
 export function aiConnectionManaged(hub?: HubPresentation, network?: DeviceNetworkPresentation): boolean {
   return Boolean(network?.projection?.hub_url || (hub?.projection?.endpoint
-    && (hub.projection.main_mode === "hub" || hub.projection.side_chat_mode === "hub")));
+    && (hub.projection.main_mode === "hub" || hub.projection.side_chat_mode === "hub" || hub.projection.approve_mode === "hub")));
 }
 
 /** One AI connection form: only the public Hub endpoint and catalog reach this surface. */
@@ -22,6 +22,8 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
   const catalog = projection?.catalog;
   const draft = state.drafts[context];
   const choice = hubModelChoice(state, context);
+  const recommendation = projection && hubRecommendedSelection(projection, context);
+  const inheritsMain = context === "approve" && projection?.approve_review == null && !draft.dirty;
   const route = hubActiveRoute(state, context);
   const enabled = projection?.status === "connected" && !state.pending && !route;
   const enrollment = network?.projection?.enrollment;
@@ -39,8 +41,8 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
       <label class="hub-field" for="ai-${context}-mode">接続方式<input id="ai-${context}-mode" class="settings-control" value="Hubから取得" readonly aria-readonly="true" aria-describedby="ai-${context}-status" /></label>
       <label class="hub-field" for="ai-${context}-model">モデル<div data-settings-passive="ai-${context}-models" data-settings-preserve-focused-region>
         <select id="ai-${context}-model" class="settings-control" data-hub-field="${context}:choice" aria-describedby="ai-${context}-status ai-${context}-feedback" ${enabled ? "" : "disabled"}>
-          <option value="" ${choice === "" ? "selected" : ""} disabled>モデルを選択してください</option>
-          ${projection?.recommended_main_selection || choice === ":hub-default" ? `<option value=":hub-default" ${choice === ":hub-default" ? "selected" : ""}>Hubの標準モデル</option>` : ""}
+          <option value="" ${choice === "" ? "selected" : ""} disabled>${inheritsMain ? "未設定（Mainのモデルを使用）" : "モデルを選択してください"}</option>
+          ${recommendation || choice === ":hub-default" ? `<option value=":hub-default" ${choice === ":hub-default" ? "selected" : ""}>Hubの標準モデル</option>` : ""}
           ${choice === ":saved" ? `<option value=":saved" selected>保存済みの選択: ${escapeHtml(savedLabel)}</option>` : ""}
           ${(catalog?.models ?? []).map((model) => `<option value="${escapeHtml(model.id)}" ${choice === model.id ? "selected" : ""}>${escapeHtml(model.label)}</option>`).join("")}
         </select></div></label>
@@ -49,8 +51,9 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
     <div data-settings-passive="ai-${context}-comparison">${renderHubCatalogComparison(projection?.[`${context}_catalog_comparison`], context)}</div>
     <div data-settings-passive="ai-${context}-model-prompts">${(catalog?.models ?? []).filter(model => draft.selection.allowed_model_ids.includes(model.id) && model.system_prompt).map(model => `<details class="hub-model-prompt" data-details-key="hub-${context}-prompt-${escapeHtml(model.id)}"><summary>${escapeHtml(model.label)}のシステムプロンプト</summary><pre>${escapeHtml(model.system_prompt ?? "")}</pre></details>`).join("")}</div>
     <p id="ai-${context}-feedback" class="hub-help" data-settings-passive="ai-${context}-feedback" role="status">${escapeHtml(feedback || hubErrorText(projection?.error))}</p>
-    <div class="hub-connection-actions"><button data-action="hub-save-${context === "main" ? "main" : "side"}" ${hubCanSave(state, context) ? "" : "disabled"}>${state.pending === context ? "保存しています…" : "モデル選択を保存"}</button><button data-action="hub-refresh" ${state.pending ? "disabled" : ""}>最新情報を取得</button></div>
-    <p class="hub-help">メインとサイドは別々に保存します。共有仕事には、実行するPCのメインのモデル選択を使います。</p>
+    <div class="hub-connection-actions"><button data-action="hub-save-${context === "side_chat" ? "side" : context}" ${hubCanSave(state, context) ? "" : "disabled"}>${state.pending === context ? "保存しています…" : "モデル選択を保存"}</button><button data-action="hub-refresh" ${state.pending ? "disabled" : ""}>最新情報を取得</button></div>
+    ${inheritsMain ? '<p class="hub-help" data-settings-passive="ai-approve-inheritance">Approveは未設定のため、Mainのモデルを使います。Approve用のモデルを選択・保存すると、Mainと別に承認を審査します。</p>' : ""}
+    <p class="hub-help">Main・Sub・Approveは別々に保存します。共有仕事には、実行するPCのMainのモデル選択を使います。</p>
   </div>`;
 }
 

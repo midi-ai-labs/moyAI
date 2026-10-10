@@ -48,6 +48,9 @@ test("live onboarding requires an explicit credential-free endpoint and model be
   for (const patch of [{ provider_base_url: "http://secret:password@localhost:8119" }, { model: "" }, { model: "bad\nmodel" }, { unexpected: true }]) {
     assert.throws(() => createOnboardingWinAbScenario({ liveProvider: { ...liveProvider, ...patch } }), TypeError);
   }
+  for (const patch of [{ api_key_env: "MAIN_TEST_KEY" }, { side_model: "Gemma" }, { side_api_key_env: "SIDE_TEST_KEY" }]) {
+    assert.throws(() => createOnboardingWinAbScenario({ liveProvider: { ...liveProvider, ...patch } }), TypeError);
+  }
 });
 test("implementation plan executes its created script and reads actual output before answering", () => {
   const messages = [{ role: "user", content: `.moyai-shared-inputs-example/${INPUT_NAME}` }];

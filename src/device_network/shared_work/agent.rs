@@ -51,6 +51,27 @@ struct AgentOriginTurnStop {
     request_id: String,
 }
 
+pub(crate) struct PreparedAgentSubmissionRetry {
+    connection: Connection,
+    session: LoginSession,
+    receipt: Receipt,
+    origin_session_ref: String,
+}
+
+impl PreparedAgentSubmissionRetry {
+    pub(crate) fn endpoint(&self) -> String {
+        self.connection.client.endpoint()
+    }
+
+    pub(crate) fn hub_binding(&self) -> &str {
+        &self.connection.hub_binding
+    }
+
+    pub(crate) fn payload(&self) -> &Value {
+        &self.receipt.payload
+    }
+}
+
 impl DeviceNetworkService {
     fn configured_origin_hub_binding(&self) -> Option<String> {
         let state = self.inner.state.lock().unwrap();
@@ -958,11 +979,10 @@ impl DeviceNetworkService {
     /// The normal chat has no Hub-specific Retry button. Replaying its one
     /// uncertain submission must use the durable request body, not a new tool
     /// call ID or a model reconstruction of the original prompt and inputs.
-    pub(crate) async fn agent_retry_submission(
+    pub(crate) async fn prepare_agent_retry_submission(
         &self,
         origin_session_ref: &str,
-        admit: impl FnOnce() -> Result<crate::runtime::ToolEffectCommitReservation, String>,
-    ) -> Result<Value, String> {
+    ) -> Result<PreparedAgentSubmissionRetry, String> {
         if !super::super::stable_id(origin_session_ref) {
             return Err("Invalid local conversation identity".into());
         }
@@ -983,18 +1003,40 @@ impl DeviceNetworkService {
             }
             pending.clone()
         };
-        let effect_commit = admit()?;
+        Ok(PreparedAgentSubmissionRetry {
+            connection,
+            session,
+            receipt,
+            origin_session_ref: origin_session_ref.to_string(),
+        })
+    }
+
+    pub(crate) async fn execute_prepared_agent_retry_submission(
+        &self,
+        prepared: PreparedAgentSubmissionRetry,
+        admit: impl FnOnce() -> Result<crate::runtime::ToolEffectCommitReservation, String>,
+    ) -> Result<Value, String> {
+        let PreparedAgentSubmissionRetry {
+            connection,
+            session,
+            receipt,
+            origin_session_ref,
+        } = prepared;
         if self
-            .inner
-            .shared_work
-            .0
-            .lock()
-            .unwrap()
-            .receipts
-            .pending(&receipt.hub, &receipt.user_id)
-            != Some(&receipt)
+            .shared_connection()
+            .is_none_or(|current| current.binding != connection.binding)
         {
-            return Err("The pending Hub submission changed; refresh before retrying".into());
+            return Err("The Hub device or connection changed; prepare the submission again before retrying".into());
+        }
+        let effect_commit = admit()?;
+        {
+            let runtime = self.inner.shared_work.0.lock().unwrap();
+            if let Some(error) = runtime.receipts.error() {
+                return Err(error.into());
+            }
+            if runtime.receipts.pending(&receipt.hub, &receipt.user_id) != Some(&receipt) {
+                return Err("The pending Hub submission changed; refresh before retrying".into());
+            }
         }
         let result: Result<WorkDetail, RequestError> = request(
             &connection.client,
@@ -1008,7 +1050,7 @@ impl DeviceNetworkService {
         if let Ok(job) = &result {
             if receipt.payload["project_id"].as_str() != Some(job.project_id.as_str())
                 || receipt.payload["environment_id"].as_str() != Some(job.environment_id.as_str())
-                || job.origin_session_ref.as_deref() != Some(origin_session_ref)
+                || job.origin_session_ref.as_deref() != Some(origin_session_ref.as_str())
                 || job.origin_turn_ref.as_deref() != receipt.payload["origin_turn_ref"].as_str()
                 || job.origin_turn_epoch != receipt.payload["origin_turn_epoch"].as_u64()
                 || receipt.payload["title"].as_str() != Some(job.title.as_str())
@@ -1041,6 +1083,19 @@ impl DeviceNetworkService {
         Ok(json!({"job_id":job.id,"project_id":job.project_id,
             "environment_id":job.environment_id,"state":job.state,
             "conversation_id":job.conversation_id,"recovered":true}))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn agent_retry_submission(
+        &self,
+        origin_session_ref: &str,
+        admit: impl FnOnce() -> Result<crate::runtime::ToolEffectCommitReservation, String>,
+    ) -> Result<Value, String> {
+        let prepared = self
+            .prepare_agent_retry_submission(origin_session_ref)
+            .await?;
+        self.execute_prepared_agent_retry_submission(prepared, admit)
+            .await
     }
 
     async fn agent_job_artifacts_with_session(

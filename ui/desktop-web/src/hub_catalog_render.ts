@@ -1,4 +1,4 @@
-import type { HubCatalogComparison, HubContext, HubModel } from "./hub_state.ts";
+import { hubContextLabel, type HubCatalogComparison, type HubContext, type HubModel } from "./hub_state.ts";
 import { escapeHtml } from "./utils.ts";
 
 function field(label: string, before: string | null, after: string | null): string {
@@ -33,7 +33,7 @@ export function renderHubCatalogComparison(comparison: HubCatalogComparison | un
   }
   return `<p class="hub-help">${escapeHtml(heading)}<br>モデル: 追加 ${added} / 削除 ${removed} / 変更 ${changed}${softwareChanged ? " · Hubバージョン変更あり" : ""}</p>
     <details class="hub-catalog-diff" data-details-key="hub-${context}-catalog-diff" id="hub-${context}-catalog-diff" open>
-      <summary>確認時からの変更内容</summary><div class="hub-catalog-diff-list" tabindex="0" role="region" aria-label="${context === "main" ? "メインチャット" : "サイドチャット"}のモデル設定の変更内容">
+      <summary>確認時からの変更内容</summary><div class="hub-catalog-diff-list" tabindex="0" role="region" aria-label="${hubContextLabel(context)}のモデル設定の変更内容">
       ${softwareChanged ? `<article><h4>Hubバージョン</h4>${table(field("バージョン", comparison.software_before, comparison.software_after))}</article>` : ""}
       ${comparison.models.map((row) => `<article><h4>${!row.before ? "追加" : !row.after ? "削除" : "変更"} · <code>${escapeHtml(row.id)}</code></h4>${table(field("表示名", row.before?.label ?? null, row.after?.label ?? null) + field("機能", capabilities(row.before), capabilities(row.after)) + field("システムプロンプト", modelPrompt(row.before), modelPrompt(row.after)))}</article>`).join("")}
       </div></details>`;

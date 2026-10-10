@@ -658,14 +658,18 @@ impl Tool for ShellStartTool {
             Some(timeout) => format!("実行時間の上限: 起動から{}秒。上限で自動停止します。", timeout as f64 / 1_000.0),
             None => "このアプリは終了・明示停止・実行権限の失効・Runner終了まで管理します。LLMの応答待ち時間では停止しません。".into(),
         });
+        let guardian_evidence = intent
+            .execution
+            .guardian_evidence(&intent.guarded.absolute, &input.command);
         let admission = ctx
-            .confirm_if_needed_with_details(
+            .confirm_if_needed_with_details_and_guardian_evidence(
                 AccessKind::Shell,
                 intent.description.clone(),
                 intent.details,
                 intent.targets,
                 intent.outside_workspace,
                 intent.risks,
+                guardian_evidence,
             )
             .await?;
         let fence = ctx.run_mutation_fence.clone();

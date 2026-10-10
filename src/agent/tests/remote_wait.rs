@@ -275,7 +275,19 @@ async fn agent_remote_wait_keeps_model_idle_until_the_saved_job_result_arrives()
         })
         .collect::<Vec<_>>();
     assert_eq!(output.len(), 1);
-    let result: Value = serde_json::from_str(output[0]).unwrap();
+    let canonical_outputs = store
+        .protocol_event_store()
+        .list_history_items_for_session(session_id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|item| match item.payload {
+            HistoryItemPayload::ToolOutput { output_text, .. } => Some(output_text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(canonical_outputs.len(), 1);
+    assert_eq!(output[0], canonical_outputs[0].as_str());
+    let result: Value = serde_json::from_str(&canonical_outputs[0]).unwrap();
     assert_eq!(result["timed_out"], false);
     assert_eq!(result["jobs"][0]["job_id"], job_id);
     assert_eq!(result["jobs"][0]["state"], "completed");

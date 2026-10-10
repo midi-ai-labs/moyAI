@@ -15,9 +15,10 @@ export const MANUAL_CASE5_COPY_RULE = Object.freeze({ ...CASE5_2_CLEAN_SEED_COPY
 });
 
 export function normalizeManualCase5Options(raw) {
-  const { fixture_source, ...connection } = raw;
+  const { fixture_source, observation_timeout_ms = 60 * 60 * 1000, ...connection } = raw;
   if (typeof fixture_source !== "string" || !path.isAbsolute(fixture_source) || fixture_source.includes("\0")) throw new TypeError("case5 fixture_source must be an absolute repository fixture path");
-  return Object.freeze({ ...normalizeManualLiveOptions(connection), fixtureSource: path.resolve(fixture_source) });
+  if (!Number.isSafeInteger(observation_timeout_ms) || observation_timeout_ms <= 0 || observation_timeout_ms > 120 * 60 * 1000) throw new TypeError("case5 observation_timeout_ms must be a positive integer of at most 7200000ms");
+  return Object.freeze({ ...normalizeManualLiveOptions(connection), fixtureSource: path.resolve(fixture_source), observationTimeoutMs: observation_timeout_ms });
 }
 export function manualCase5Input(spec) { return { prompt: manualLiveSection(spec, "Canonical user request"), task: manualLiveSection(spec, "Canonical task.md", "markdown") }; }
 export function manualCase5ScopeFailures(before, after) {
@@ -30,7 +31,7 @@ export function createManualCase5Scenario(raw = {}) {
   const options = normalizeManualCase5Options(raw);
   let seed = null;
   return createManualTextCase({ id: "manual.case5", options, specPath: SPEC, outputs: OUTPUTS,
-    observationTimeoutMs: 30 * 60 * 1000,
+    observationTimeoutMs: options.observationTimeoutMs,
     stages: spec => [{ name: "stage1", prompt: manualCase5Input(spec).prompt }],
     async prepareWorkspace({ context, sink, options, spec, phase, owner }) {
       for (const name of ["backend", "frontend", "examples", "data"]) {

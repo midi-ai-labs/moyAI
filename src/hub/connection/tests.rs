@@ -157,10 +157,22 @@ async fn register_device(State(state): State<Arc<ServerState>>) -> (StatusCode, 
         "authorization",
         format!("Bearer {BOOTSTRAP}").parse().unwrap(),
     );
-    let (status, Json(mut body)) =
-        register(State(state), headers, Json(json!({"label":"worker"}))).await;
+    let (status, Json(mut body)) = register(
+        State(state.clone()),
+        headers,
+        Json(json!({"label":"worker"})),
+    )
+    .await;
     body["identity_scope"] = json!("device_session");
     body["default_selection"] = serde_json::to_value(selection("fast")).unwrap();
+    if let Some(defaults) = state
+        .catalog_override
+        .lock()
+        .unwrap()
+        .get("default_selections")
+    {
+        body["default_selections"] = defaults.clone();
+    }
     (status, Json(body))
 }
 async fn heartbeat(
@@ -558,7 +570,7 @@ async fn managed_default_sources_are_independent_durable_and_reset_without_hub_c
     assert!(explicit.main_uses_default);
     assert!(!explicit.side_chat_uses_default);
     let loaded = persisted.load().unwrap();
-    assert_eq!(loaded.schema_version, 4);
+    assert_eq!(loaded.schema_version, 5);
     assert!(loaded.main_uses_default);
     assert!(!loaded.side_chat_uses_default);
     assert_eq!(
@@ -1106,7 +1118,7 @@ fn schema_one_reads_as_direct_and_schema_two_rejects_duplicate_or_missing_modes(
     let legacy = r#"{"schema_version":1,"revision":"4","endpoint":"","label":"Desktop","hub_id":null,"main_review":null,"side_chat_review":null}"#;
     std::fs::write(&path, legacy).unwrap();
     let loaded = store.load().unwrap();
-    assert_eq!(loaded.schema_version, 4);
+    assert_eq!(loaded.schema_version, 5);
     assert_eq!(loaded.main_mode, HubRouteMode::Direct);
     assert_eq!(loaded.side_chat_mode, HubRouteMode::Direct);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
@@ -1142,6 +1154,445 @@ async fn enable(
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn role_defaults_are_independent_and_approve_requires_explicit_selection() {
+    let server = Server::start(60_000).await;
+    let mut side = selection("fast");
+    side.required_capabilities.clear();
+    let defaults = super::super::HubDefaultSelections {
+        main: Some(selection("deep")),
+        side_chat: Some(side.clone()),
+        approve: Some(side),
+    };
+    *server.state.catalog_override.lock().unwrap() = json!({
+        "team_default_model_id": "deep", "team_default_side_model_id": "fast", "team_default_approve_model_id": "fast",
+        "default_selections": defaults,
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let manual = connect_service(&service, &server).await;
+    assert_eq!(
+        manual
+            .recommended_main_selection
+            .unwrap()
+            .preferred_model_id,
+        "deep"
+    );
+    assert_eq!(
+        manual
+            .recommended_side_chat_selection
+            .unwrap()
+            .preferred_model_id,
+        "fast"
+    );
+    assert_eq!(
+        manual
+            .recommended_approve_selection
+            .unwrap()
+            .preferred_model_id,
+        "fast"
+    );
+    assert!(manual.approve_review.is_none());
+    let http = crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    let connected = service
+        .connect_device(&server.endpoint, http, true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        connected
+            .main_review
+            .as_ref()
+            .unwrap()
+            .selection
+            .preferred_model_id,
+        "deep"
+    );
+    assert_eq!(
+        connected
+            .side_chat_review
+            .as_ref()
+            .unwrap()
+            .selection
+            .preferred_model_id,
+        "fast"
+    );
+    assert!(connected.approve_review.is_none());
+    assert!(!connected.approve_uses_default);
+    let approved = service
+        .save_review_with_source(
+            HubReviewContext::Approve,
+            selection("deep"),
+            connected.hub_id.unwrap(),
+            connected.catalog.as_ref().unwrap().revision,
+            connected.settings_revision,
+            connected.connection_generation,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        approved
+            .approve_review
+            .as_ref()
+            .unwrap()
+            .selection
+            .preferred_model_id,
+        "fast"
+    );
+    assert!(
+        approved
+            .approve_review
+            .as_ref()
+            .unwrap()
+            .selection
+            .required_capabilities
+            .is_empty()
+    );
+    assert!(approved.approve_uses_default);
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approve_routes_use_the_captured_model_and_own_child_heartbeat_cleanup() {
+    let server = Server::start(100).await;
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    let main = save(&service, &connected, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    let approved = save(&service, &main, HubReviewContext::Approve, "fast")
+        .await
+        .unwrap();
+    let enabled = enable(&service, approved, HubReviewContext::Main).await;
+    enable(&service, enabled, HubReviewContext::Approve).await;
+    let parent_cancel = CancellationToken::new();
+    let parent = service
+        .begin_turn(HubReviewContext::Main, parent_cancel.clone())
+        .unwrap()
+        .unwrap();
+    assert!(parent.approve_configured());
+    let child = parent.fork_delegated(CancellationToken::new()).unwrap();
+    let child_guard = child.execution_guard();
+    let review_cancel = CancellationToken::new();
+    let review = parent
+        .begin_approve_review(review_cancel.clone())
+        .unwrap()
+        .unwrap();
+    let review_guard = review.execution_guard();
+    let child_review = child
+        .begin_approve_review(CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let child_review_guard = child_review.execution_guard();
+    assert_eq!(review.logical_model(), "fast");
+    assert_eq!(child_review.logical_model(), "fast");
+    assert!(
+        !review
+            .runtime_config(&crate::config::ResolvedConfig::default())
+            .model
+            .supports_tools
+    );
+    assert!(service.projection_now().active_approve.is_some());
+    *server.state.prepare_response.lock().unwrap() = grant(&server, "fast");
+    for route in [&review, &child_review] {
+        let mut output = Output::default();
+        route
+            .client()
+            .stream_chat(route_request(), CancellationToken::new(), &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output.text, "Hub response");
+        assert_eq!(output.prepared[0].provider_target().model(), "fast");
+        assert!(output.prepared[0].tools.is_empty());
+    }
+    let prepares = server.state.prepares.lock().unwrap().clone();
+    assert_eq!(prepares.len(), 2);
+    assert_ne!(prepares[0]["turn_id"], prepares[1]["turn_id"]);
+    for prepared in prepares {
+        assert_eq!(prepared["context"], "approve");
+        assert_eq!(prepared["purpose"], "delegated");
+        assert_eq!(
+            prepared["delegated_selection"]["preferred_model_id"],
+            "fast"
+        );
+    }
+    until(|| {
+        server
+            .state
+            .heartbeat_turns
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|turns| {
+                turns.as_array().is_some_and(|turns| {
+                    turns
+                        .iter()
+                        .filter(|turn| turn["context"] == "approve" && turn["delegated"] == true)
+                        .count()
+                        == 2
+                })
+            })
+    })
+    .await;
+    review_cancel.cancel();
+    review_guard.finish().await;
+    assert!(!parent_cancel.is_cancelled());
+    assert!(service.projection_now().active_main.is_some());
+    assert!(service.projection_now().active_approve.is_some());
+    child_review_guard.finish().await;
+    child_guard.finish().await;
+    parent.finish().await;
+    assert!(!service.has_active_turns());
+    assert!(service.projection_now().active_approve.is_none());
+    let closes = server.state.closes.lock().unwrap();
+    assert_eq!(
+        closes
+            .iter()
+            .filter(|close| close["context"] == "approve")
+            .count(),
+        2
+    );
+    assert!(
+        closes
+            .iter()
+            .filter(|close| close["context"] == "approve")
+            .all(|close| close["delegated"] == true)
+    );
+    drop(closes);
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approve_capacity_does_not_consume_the_existing_delegated_agent_capacity() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    let main = save(&service, &connected, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    let approved = save(&service, &main, HubReviewContext::Approve, "fast")
+        .await
+        .unwrap();
+    let enabled = enable(&service, approved, HubReviewContext::Main).await;
+    enable(&service, enabled, HubReviewContext::Approve).await;
+    let parent = service
+        .begin_turn(HubReviewContext::Main, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let mut routes = Vec::new();
+    for _ in 0..14 {
+        routes.push(parent.fork_delegated(CancellationToken::new()).unwrap());
+    }
+    for _ in 0..15 {
+        routes.push(
+            parent
+                .begin_approve_review(CancellationToken::new())
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        parent.fork_delegated(CancellationToken::new()).unwrap_err(),
+        HubError::RouteBusy
+    );
+    assert_eq!(
+        parent
+            .begin_approve_review(CancellationToken::new())
+            .unwrap_err(),
+        HubError::RouteBusy
+    );
+    for route in routes {
+        route.finish().await;
+    }
+    parent.finish().await;
+    assert!(!service.has_active_turns());
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approve_unconfigured_and_later_saved_choices_do_not_rewrite_a_main_snapshot() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    let main = save(&service, &connected, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    enable(&service, main, HubReviewContext::Main).await;
+    let inherited = service
+        .begin_turn(HubReviewContext::Main, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    assert!(!inherited.approve_configured());
+    assert!(
+        inherited
+            .begin_approve_review(CancellationToken::new())
+            .unwrap()
+            .is_none()
+    );
+    let approved = save(
+        &service,
+        &service.projection_now(),
+        HubReviewContext::Approve,
+        "fast",
+    )
+    .await
+    .unwrap();
+    enable(&service, approved, HubReviewContext::Approve).await;
+    assert!(!inherited.approve_configured());
+    assert!(
+        inherited
+            .begin_approve_review(CancellationToken::new())
+            .unwrap()
+            .is_none()
+    );
+    inherited.finish().await;
+    let captured = service
+        .begin_turn(HubReviewContext::Main, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    assert!(captured.approve_configured());
+    save(
+        &service,
+        &service.projection_now(),
+        HubReviewContext::Approve,
+        "deep",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        captured
+            .begin_approve_review(CancellationToken::new())
+            .unwrap_err(),
+        HubError::ReviewRequired
+    );
+    let child = captured.fork_delegated(CancellationToken::new()).unwrap();
+    assert_eq!(
+        child
+            .begin_approve_review(CancellationToken::new())
+            .unwrap_err(),
+        HubError::ReviewRequired
+    );
+    child.finish().await;
+    captured.finish().await;
+    assert!(server.state.prepares.lock().unwrap().is_empty());
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approve_review_rejection_keeps_default_main_admission_and_never_falls_back() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    let main = save(&service, &connected, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    let approved = save(&service, &main, HubReviewContext::Approve, "fast")
+        .await
+        .unwrap();
+    let enabled = enable(&service, approved, HubReviewContext::Main).await;
+    enable(&service, enabled, HubReviewContext::Approve).await;
+    server.state.reject_review.store(true, Ordering::SeqCst);
+    assert_eq!(
+        save(
+            &service,
+            &service.projection_now(),
+            HubReviewContext::Approve,
+            "fast"
+        )
+        .await
+        .unwrap_err(),
+        HubError::ReviewRequired
+    );
+    let current = service.projection_now();
+    assert_eq!(current.main_confirmation, HubReviewConfirmation::Confirmed);
+    assert_eq!(
+        current.approve_confirmation,
+        HubReviewConfirmation::Unconfirmed
+    );
+    let main = service
+        .begin_turn(HubReviewContext::Main, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    assert!(main.approve_configured());
+    assert_eq!(
+        main.begin_approve_review(CancellationToken::new())
+            .unwrap_err(),
+        HubError::ReviewRequired
+    );
+    assert!(server.state.prepares.lock().unwrap().is_empty());
+    main.finish().await;
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_captures_explicit_approve_and_legacy_settings_keep_main_guardian() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    let connected = connect_service(&service, &server).await;
+    let main = save(&service, &connected, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    let legacy = persisted.load().unwrap();
+    save(&service, &main, HubReviewContext::Approve, "fast")
+        .await
+        .unwrap();
+    let explicit = persisted.load().unwrap();
+    assert_eq!(explicit.schema_version, 5);
+    for (settings, independent) in [(legacy, false), (explicit.clone(), true)] {
+        let http = crate::device_network::ManagedHubHttp::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
+        let route = HubConnection::device_worker_route_with_settings(
+            &server.endpoint,
+            http,
+            Some(settings),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(route.approve_configured(), independent);
+        let review = route
+            .begin_approve_review(CancellationToken::new())
+            .unwrap();
+        assert_eq!(review.is_some(), independent);
+        if let Some(review) = review {
+            assert_eq!(review.logical_model(), "fast");
+            review.finish().await;
+        }
+        route.finish().await;
+    }
+    let mut pending = explicit;
+    pending.approve_catalog_baseline = None;
+    let http = crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    let route = HubConnection::device_worker_route_with_settings(
+        &server.endpoint,
+        http,
+        Some(pending),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(route.logical_model(), "deep");
+    assert_eq!(
+        route
+            .begin_approve_review(CancellationToken::new())
+            .unwrap_err(),
+        HubError::ReviewRequired
+    );
+    route.finish().await;
+    service.shutdown().await;
 }
 
 fn route_request() -> crate::llm::ChatRequest {

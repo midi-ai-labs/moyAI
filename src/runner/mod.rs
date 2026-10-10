@@ -50,6 +50,31 @@ pub struct LocalRunRequest {
     pub single_agent: bool,
 }
 
+impl LocalRunRequest {
+    fn validate(&self, shared: bool) -> Result<(), RunnerError> {
+        // SharedInput validates the user text before preparation adds bounded snapshot paths.
+        // Only the private, authenticated shared execution path can use the expanded input.
+        let title_limit = if shared {
+            shared::MAX_SHARED_LABEL_BYTES
+        } else {
+            256
+        };
+        if !self.directory.is_absolute()
+            || self.prompt.trim().is_empty()
+            || (!shared && self.prompt.len() > MAX_PROMPT_BYTES)
+            || self
+                .title
+                .as_ref()
+                .is_some_and(|value| value.len() > title_limit)
+        {
+            return Err(RunnerError::new(
+                "An absolute directory, a nonempty prompt within its input limit, and a valid title are required",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerIdentity {
     pub runner_id: Ulid,
@@ -475,18 +500,7 @@ impl RunnerHost {
         request: LocalRunRequest,
         shared: Option<SharedExecution>,
     ) -> Result<LocalRunSnapshot, RunnerError> {
-        if !request.directory.is_absolute()
-            || request.prompt.trim().is_empty()
-            || request.prompt.len() > MAX_PROMPT_BYTES
-            || request
-                .title
-                .as_ref()
-                .is_some_and(|value| value.len() > 256)
-        {
-            return Err(RunnerError::new(
-                "An absolute directory and a nonempty prompt of at most 32 KiB are required",
-            ));
-        }
+        request.validate(shared.is_some())?;
         {
             let mut state = self
                 .inner

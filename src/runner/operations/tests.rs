@@ -1,6 +1,63 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn oversized_template_settings_preserve_the_saved_and_effective_configuration() {
+    let base = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("project_sandbox/fix-whole-review-20261010/runner-settings");
+    std::fs::create_dir_all(&base).unwrap();
+    let temp = tempfile::tempdir_in(base).unwrap();
+    let root = Utf8Path::from_path(temp.path()).unwrap();
+    let mut store = OperationsStore::open(root).unwrap();
+    let mut saved = Installed::default();
+    saved.mode = ProvisionMode::Paused;
+    store.update(saved.clone()).unwrap();
+    let original = std::fs::read(root.join("runner-operations.json")).unwrap();
+    let mut expanded = saved;
+    expanded.templates = (0..128)
+        .map(|index| ProvisionTemplate {
+            id: format!("template-{index}"),
+            label: "Execution folder".into(),
+            base_root: root.into(),
+            access_mode: crate::config::AccessMode::Default,
+            allowed_child_environments: (0..128)
+                .map(|child| format!("environment-{child:020}"))
+                .collect(),
+        })
+        .collect();
+    super::super::provision::validate_templates(&mut expanded.templates).unwrap();
+    assert!(serde_json::to_vec_pretty(&expanded).unwrap().len() > MAX_SETTINGS_BYTES);
+    assert!(store.update(expanded).is_err());
+    assert_eq!(
+        std::fs::read(root.join("runner-operations.json")).unwrap(),
+        original
+    );
+    assert_eq!(store.installed.mode, ProvisionMode::Paused);
+    assert!(store.installed.templates.is_empty());
+    let reopened = OperationsStore::open(root).unwrap();
+    assert_eq!(reopened.installed.mode, ProvisionMode::Paused);
+    assert!(reopened.installed.templates.is_empty());
+    let mut within_limit = reopened.installed;
+    within_limit.templates = vec![ProvisionTemplate {
+        id: "one".into(),
+        label: "Execution folder".into(),
+        base_root: root.into(),
+        access_mode: crate::config::AccessMode::Default,
+        allowed_child_environments: vec!["child".into()],
+    }];
+    store.update(within_limit).unwrap();
+    assert_eq!(
+        OperationsStore::open(root)
+            .unwrap()
+            .installed
+            .templates
+            .len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn folder_change_status_covers_active_unknown_retained_and_local_processes() {
     use crate::runner::shared::{

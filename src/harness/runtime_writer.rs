@@ -196,6 +196,34 @@ impl NativeHarnessRecorder {
         }
     }
 
+    fn record_compaction_diagnostic_best_effort(
+        &mut self,
+        diagnostic: &crate::runtime::CompactionDiagnostic,
+    ) {
+        if self.recording_status.disabled {
+            self.recording_status.dropped_event_count =
+                self.recording_status.dropped_event_count.saturating_add(1);
+            return;
+        }
+        let result = self.flush_pending_delta().and_then(|_| {
+            if self.next_sequence_no >= MAX_RECORDED_EVENTS_PER_RUN.saturating_sub(1) {
+                self.recording_status.dropped_event_count =
+                    self.recording_status.dropped_event_count.saturating_add(1);
+                return Ok(());
+            }
+            self.append(
+                HarnessEventKind::StateTransitionRecorded,
+                HarnessEventPayload::generic(serde_json::json!({
+                    "kind": "compaction_diagnostic",
+                    "diagnostic": diagnostic,
+                })),
+            )
+        });
+        if let Err(error) = result {
+            self.disable(error);
+        }
+    }
+
     pub fn flush(&mut self) -> Result<(), RuntimeError> {
         self.flush_pending_delta()
     }
@@ -497,6 +525,11 @@ impl<'a, S: RunEventSink + ?Sized> HarnessRecordingSink<'a, S> {
 }
 
 impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
+    fn record_compaction_diagnostic(&mut self, diagnostic: &crate::runtime::CompactionDiagnostic) {
+        self.recorder
+            .record_compaction_diagnostic_best_effort(diagnostic);
+    }
+
     fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
         self.inner.reserve_protocol_sequence_no()
     }
@@ -1093,6 +1126,106 @@ mod tests {
         assert_eq!(sink.recording_status().failure_count, 1);
         drop(sink);
         assert_eq!(inner.events.len(), 1);
+    }
+
+    #[test]
+    fn compaction_diagnostics_are_private_best_effort_harness_evidence() {
+        #[derive(Default)]
+        struct CollectingSink {
+            events: Vec<RunEvent>,
+            diagnostics: usize,
+        }
+        impl RunEventSink for CollectingSink {
+            fn emit(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+                self.events.push(event);
+                Ok(())
+            }
+            fn record_compaction_diagnostic(
+                &mut self,
+                _diagnostic: &crate::runtime::CompactionDiagnostic,
+            ) {
+                self.diagnostics += 1;
+            }
+        }
+        let diagnostic = crate::runtime::CompactionDiagnostic {
+            response_id: ModelResponseId::new(),
+            provider_request_id: Some(crate::llm::ProviderRequestId::new()),
+            outcome: crate::runtime::CompactionDiagnosticOutcome::EmptySummary,
+            finish_reason: Some(crate::session::FinishReason::Stop),
+            local_request_tokens: 100,
+            usage: None,
+            provider_failure_kind: None,
+            checkpoint_budget: None,
+        };
+        for recording_fails in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 path");
+            let paths = StoragePaths {
+                database_path: data_dir.join("moyai.sqlite3"),
+                truncation_dir: data_dir.join("truncation"),
+                data_dir: data_dir.clone(),
+            };
+            let store = SqliteStore::open(&paths).expect("open store");
+            store.migrate().expect("migrate store");
+            let bundle = StoreBundle::new(store);
+            let mut recorder = NativeHarnessRecorder::start_harness_only(
+                &bundle,
+                None,
+                Utf8PathBuf::from("C:/workspace"),
+            )
+            .expect("recorder");
+            let run_id = recorder.run_id();
+            if recording_fails {
+                let blocked = data_dir.join("blocked-artifact-root");
+                std::fs::write(blocked.as_std_path(), b"not a directory").expect("block recording");
+                recorder.artifact_root = blocked;
+            }
+            let mut inner = CollectingSink::default();
+            let mut harness_sink = HarnessRecordingSink::new(recorder, &mut inner);
+            let turn_id = TurnId::new();
+            let mut protocol_sink = crate::protocol::ProtocolRecordingSink::new(
+                bundle.protocol_event_store(),
+                None,
+                turn_id,
+                &mut harness_sink,
+            );
+            protocol_sink.record_compaction_diagnostic(&diagnostic);
+            assert_eq!(
+                protocol_sink.reserve_protocol_sequence_no(),
+                Some(0),
+                "private evidence does not allocate canonical sequence numbers"
+            );
+            drop(protocol_sink);
+            assert_eq!(harness_sink.recording_status().disabled, recording_fails);
+            drop(harness_sink);
+            assert!(
+                inner.events.is_empty(),
+                "diagnostics never enter the renderer event channel"
+            );
+            assert_eq!(
+                inner.diagnostics, 0,
+                "private evidence stops at its recorder"
+            );
+            let events = bundle
+                .harness_event_store()
+                .list_events(run_id)
+                .expect("harness events");
+            if recording_fails {
+                assert!(events.is_empty());
+            } else {
+                let [event] = events.as_slice() else {
+                    panic!("one private diagnostic")
+                };
+                let HarnessEventPayload::Generic(payload) = &event.payload else {
+                    panic!("generic diagnostic payload")
+                };
+                assert_eq!(payload["kind"], "compaction_diagnostic");
+                assert_eq!(
+                    payload["diagnostic"],
+                    serde_json::to_value(&diagnostic).expect("serialized diagnostic")
+                );
+            }
+        }
     }
 
     #[test]

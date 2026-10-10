@@ -4,6 +4,9 @@ use serde_json::json;
 
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::permission_guardian::{
+    PermissionGuardianEvidence, PermissionGuardianEvidenceState,
+};
 use crate::tool::registry::Tool;
 use crate::tool::{ToolEffectClass, ToolEffectPolicy, ToolName, ToolResult, ToolSpec};
 use crate::workspace::AccessKind;
@@ -79,11 +82,13 @@ struct Input {
     service_id: String,
 }
 
-fn stop_permission_details(
+fn stop_permission_material(
     service_id: &str,
     services: &serde_json::Value,
     candidates: &[crate::runner::shared::SharedCandidate],
-) -> Result<Vec<String>, ToolError> {
+    attempt_id: &str,
+    generation: u64,
+) -> Result<(Vec<String>, PermissionGuardianEvidenceState), ToolError> {
     let environment_id = services
         .as_array()
         .and_then(|services| {
@@ -115,12 +120,20 @@ fn stop_permission_details(
         Some(pc) => format!("{pc} の起動中アプリ（ID: {service_id}）"),
         None => format!("実行環境 {environment_id} の起動中アプリ（ID: {service_id}）"),
     };
-    Ok(vec![
+    let details = vec![
         "操作: 起動中アプリの停止".into(),
         format!("対象: {target}"),
         format!("実行環境: {environment}"),
         "このアプリに停止を依頼します。作成したファイルは削除しません。停止完了は実行PCからの応答で確認します。".into(),
-    ])
+    ];
+    let evidence =
+        PermissionGuardianEvidenceState::Complete(PermissionGuardianEvidence::SharedServiceStop {
+            service_id: service_id.to_owned(),
+            environment_id: environment_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            generation,
+        });
+    Ok((details, evidence))
 }
 
 #[async_trait(?Send)]
@@ -163,15 +176,22 @@ impl Tool for SharedStopServiceTool {
             .shared_conversation_services(&self.attempt_id, self.generation)
             .await
             .map_err(ToolError::Message)?;
-        let details = stop_permission_details(&input.service_id, &services, &self.candidates)?;
+        let (details, guardian_evidence) = stop_permission_material(
+            &input.service_id,
+            &services,
+            &self.candidates,
+            &self.attempt_id,
+            self.generation,
+        )?;
         let admission = ctx
-            .confirm_if_needed_with_details(
+            .confirm_if_needed_with_details_and_guardian_evidence(
                 AccessKind::Edit,
                 "この会話で起動したアプリを停止します。".into(),
                 details,
                 Vec::new(),
                 false,
                 ToolEffectClass::Mutation.permission_risks(),
+                guardian_evidence,
             )
             .await?;
         admission.admit()?;
@@ -209,7 +229,8 @@ mod tests {
             environment_label: "TODOアプリの作成".into(),
             capabilities: Vec::new(),
         }];
-        let details = stop_permission_details("todo-app", &services, &candidates).unwrap();
+        let (details, evidence) =
+            stop_permission_material("todo-app", &services, &candidates, "attempt-b", 7).unwrap();
         assert!(
             details
                 .iter()
@@ -221,26 +242,54 @@ mod tests {
                 .any(|detail| detail.contains("TODOアプリの作成"))
         );
         assert!(!details.iter().any(|detail| detail.contains("other-app")));
+        let PermissionGuardianEvidenceState::Complete(evidence) = evidence else {
+            panic!("exact retained target evidence");
+        };
+        assert_eq!(
+            evidence,
+            PermissionGuardianEvidence::SharedServiceStop {
+                service_id: "todo-app".into(),
+                environment_id: "win-b".into(),
+                attempt_id: "attempt-b".into(),
+                generation: 7,
+            }
+        );
+        let payload = serde_json::to_string(&evidence).expect("typed action evidence");
+        assert!(!payload.contains("TODOアプリの作成"));
+        assert!(!payload.contains("WinB"));
     }
 
     #[test]
     fn stop_permission_keeps_exact_target_when_pc_label_is_unavailable() {
         let services = json!([{"service_id":"todo-app","environment_id":"win-b"}]);
-        let details = stop_permission_details("todo-app", &services, &[]).unwrap();
+        let (details, evidence) =
+            stop_permission_material("todo-app", &services, &[], "attempt-b", 7).unwrap();
         assert!(
             details
                 .iter()
                 .any(|detail| detail.contains("win-b") && detail.contains("todo-app"))
+        );
+        assert!(
+            matches!(evidence, PermissionGuardianEvidenceState::Complete(
+            PermissionGuardianEvidence::SharedServiceStop { environment_id, .. }
+        ) if environment_id == "win-b")
         );
     }
 
     #[test]
     fn stop_permission_rejects_a_service_missing_from_the_conversation() {
         let services = json!([{"service_id":"other-app","environment_id":"win-b"}]);
-        assert!(stop_permission_details("todo-app", &services, &[]).is_err());
-        assert!(stop_permission_details("todo-app", &json!([]), &[]).is_err());
+        assert!(stop_permission_material("todo-app", &services, &[], "attempt-b", 7).is_err());
+        assert!(stop_permission_material("todo-app", &json!([]), &[], "attempt-b", 7).is_err());
         assert!(
-            stop_permission_details("todo-app", &json!([{"service_id":"todo-app"}]), &[]).is_err()
+            stop_permission_material(
+                "todo-app",
+                &json!([{"service_id":"todo-app"}]),
+                &[],
+                "attempt-b",
+                7
+            )
+            .is_err()
         );
     }
 }

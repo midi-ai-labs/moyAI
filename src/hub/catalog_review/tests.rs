@@ -8,6 +8,10 @@ fn catalog(revision: u64) -> HubCatalog {
         revision: CatalogRevision::new(revision).unwrap(),
         software_version: "0.1.0".into(),
         changes: Vec::new(),
+        team_default_model_id: None,
+        team_default_side_model_id: None,
+        team_default_approve_model_id: None,
+        default_selections: Default::default(),
         models: ["keep", "remove", "rename"]
             .into_iter()
             .map(|id| HubModel {
@@ -148,12 +152,22 @@ fn legacy_settings_gain_no_invented_baseline_and_upgrade_only_on_explicit_save()
     let temp = tempfile::tempdir().unwrap();
     let store = store(&temp);
     let path = temp.path().join("hub.json");
-    for schema in [1, 2, 3] {
+    for schema in [1, 2, 3, 4] {
         let mut legacy = serde_json::to_value(settings(&catalog(1))).unwrap();
         legacy["schema_version"] = json!(schema);
         let object = legacy.as_object_mut().unwrap();
-        object.remove("main_uses_default");
-        object.remove("side_chat_uses_default");
+        for field in [
+            "approve_review",
+            "approve_catalog_baseline",
+            "approve_mode",
+            "approve_uses_default",
+        ] {
+            object.remove(field);
+        }
+        if schema < 4 {
+            object.remove("main_uses_default");
+            object.remove("side_chat_uses_default");
+        }
         if schema < 3 {
             object.remove("main_catalog_baseline");
             object.remove("side_chat_catalog_baseline");
@@ -165,17 +179,20 @@ fn legacy_settings_gain_no_invented_baseline_and_upgrade_only_on_explicit_save()
         let bytes = serde_json::to_vec(&legacy).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         let loaded = store.load().unwrap();
-        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.schema_version, 5);
+        assert!(loaded.approve_review.is_none());
+        assert!(loaded.approve_catalog_baseline.is_none());
+        assert_eq!(loaded.approve_mode, HubRouteMode::Direct);
         assert_eq!(loaded.main_mode, HubRouteMode::Direct);
         assert!(loaded.main_review.is_some());
         assert_eq!(loaded.main_catalog_baseline.is_none(), schema < 3);
         assert!(!loaded.main_uses_default && !loaded.side_chat_uses_default);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let saved = store.save(&loaded).unwrap();
-        assert_eq!(saved.schema_version, 4);
+        assert_eq!(saved.schema_version, 5);
         assert_eq!(saved.main_catalog_baseline.is_none(), schema < 3);
         assert_eq!(store.load().unwrap(), saved);
-        if schema == 3 {
+        if schema >= 3 {
             legacy["main_uses_default"] = json!("invalid");
         } else {
             legacy["main_catalog_baseline"] = json!(null);
@@ -233,7 +250,7 @@ fn baseline_store_rejects_mismatched_identity_revision_and_missing_fields_withou
 }
 
 #[test]
-fn settings_store_fits_two_maximum_public_catalogs_and_rejects_over_limit_input() {
+fn settings_store_fits_three_maximum_public_catalogs_and_rejects_over_limit_input() {
     let temp = tempfile::tempdir().unwrap();
     let store = store(&temp);
     let path = temp.path().join("hub.json");
@@ -253,6 +270,8 @@ fn settings_store_fits_two_maximum_public_catalogs_and_rejects_over_limit_input(
     let mut proposed = settings(&large);
     proposed.side_chat_review = proposed.main_review.clone();
     proposed.side_chat_catalog_baseline = proposed.main_catalog_baseline.clone();
+    proposed.approve_review = proposed.main_review.clone();
+    proposed.approve_catalog_baseline = proposed.main_catalog_baseline.clone();
     let saved = store.save(&proposed).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.len() > 128 * 1024);

@@ -1412,6 +1412,12 @@ pub enum RunEvent {
     },
     CompactionCompleted {
         summarized_messages: usize,
+        #[serde(default = "crate::protocol::CompactionLayout::completed_event_default")]
+        layout: crate::protocol::CompactionLayout,
+        /// Kept only by the canonical projection; event and display exports
+        /// carry the short summary below, never replay contents.
+        #[serde(skip)]
+        clm_checkpoint: Option<crate::protocol::ClmCheckpoint>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         preserved_user_messages: Vec<String>,
         summary: String,

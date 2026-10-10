@@ -3,8 +3,8 @@ use crate::tool::shell::{ShellStartTool, ShellStatusTool, ShellStopTool};
 use std::time::Duration;
 
 use crate::tool::permission_guardian::{
-    PermissionGuardian, PermissionGuardianDecision, PermissionGuardianError,
-    PermissionGuardianEvidence, permission_retry_effect_keys,
+    PermissionGuardian, PermissionGuardianAssessment, PermissionGuardianError,
+    PermissionGuardianEvidence, PermissionRiskLevel, permission_retry_effect_keys,
 };
 
 struct DurableManagedGuardian {
@@ -14,6 +14,7 @@ struct DurableManagedGuardian {
     workspace: Utf8PathBuf,
     call: crate::llm::ModelToolCall,
     lease: Option<crate::storage::PermissionReviewLease>,
+    retained_leases: Option<Vec<crate::storage::PermissionReviewLease>>,
     key: Option<crate::storage::PermissionRetryFenceKey>,
     reviewed: usize,
     deny: bool,
@@ -25,7 +26,7 @@ impl PermissionGuardian for DurableManagedGuardian {
         &mut self,
         request: &crate::tool::PermissionRequest,
         evidence: &PermissionGuardianEvidence,
-    ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+    ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
         let keys = permission_retry_effect_keys(request, evidence, &self.call, &self.workspace)?;
         let key = crate::storage::PermissionRetryFenceKey::new(
             self.session_id,
@@ -56,8 +57,9 @@ impl PermissionGuardian for DurableManagedGuardian {
                     .unwrap(),
                 crate::storage::PermissionReviewTransition::Applied
             );
-            Ok(PermissionGuardianDecision::Deny {
-                rationale: "this independent operation is not authorized".into(),
+            Ok(PermissionGuardianAssessment {
+                risk_level: PermissionRiskLevel::Critical,
+                rationale: "this independent operation has critical risk".into(),
             })
         } else {
             assert_eq!(
@@ -65,14 +67,21 @@ impl PermissionGuardian for DurableManagedGuardian {
                 crate::storage::PermissionReviewTransition::Applied
             );
             self.lease = Some(lease);
-            Ok(PermissionGuardianDecision::Allow {
-                rationale: "this exact operation is authorized".into(),
+            Ok(PermissionGuardianAssessment {
+                risk_level: PermissionRiskLevel::Low,
+                rationale: "this exact operation has low risk".into(),
             })
         }
     }
 
     fn take_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
-        self.lease.take()
+        let lease = self.lease.take();
+        if let Some(retained) = &mut self.retained_leases
+            && let Some(lease) = &lease
+        {
+            retained.push(lease.clone());
+        }
+        lease
     }
 }
 
@@ -123,6 +132,7 @@ async fn managed_guardian(fixture: &mut ShellToolFixture) -> DurableManagedGuard
             arguments_json: String::new(),
         },
         lease: None,
+        retained_leases: None,
         key: None,
         reviewed: 0,
         deny: false,
@@ -161,6 +171,115 @@ async fn guardian_managed_call<T: Tool>(
         },
     )
     .await
+}
+
+#[tokio::test]
+async fn ordinary_shell_settles_success_and_nonzero_exit_before_an_independent_review() {
+    let mut fixture = shell_tool_fixture().await;
+    let mut guardian = managed_guardian(&mut fixture).await;
+    // Keep another owner alive so destructor cleanup cannot hide missing explicit settlement.
+    guardian.retained_leases = Some(Vec::new());
+    let (control, fence) = admit_test_run(&fixture).await;
+    for (command, exit_code) in [
+        (successful_read_only_command(), 0),
+        ("exit 7".to_string(), 7),
+        (successful_read_only_command(), 0),
+    ] {
+        let result = guardian_managed_call(
+            &fixture,
+            &crate::tool::shell::ShellTool,
+            serde_json::json!({
+                "command":command,
+                "sandbox_permissions":"require_escalated",
+                "justification":"inspect with a separately reviewed command"
+            }),
+            &control,
+            &fence,
+            &mut guardian,
+        )
+        .await
+        .expect("a completed attempt must settle before the next independent action");
+        assert_eq!(result.metadata["exit_code"], exit_code);
+        assert_eq!(result.metadata["success"], exit_code == 0);
+        assert_eq!(result.metadata["effect_started"], true);
+        assert_eq!(result.metadata["change_evidence"]["effects_unknown"], true);
+        assert_eq!(result.metadata["sandbox"], "unrestricted");
+        assert!(
+            fixture
+                .services
+                .store
+                .permission_retry_fence_store()
+                .record(guardian.key.as_ref().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!control.is_cancelled());
+    }
+    assert_eq!(guardian.reviewed, 3);
+    assert_eq!(guardian.retained_leases.as_ref().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn ordinary_shell_settlement_failure_does_not_report_success_or_repeat_the_effect() {
+    let mut fixture = shell_tool_fixture().await;
+    let mut guardian = managed_guardian(&mut fixture).await;
+    let (control, fence) = admit_test_run(&fixture).await;
+    let database = rusqlite::Connection::open(&fixture.services.storage_paths.database_path)
+        .expect("open isolated fixture database");
+    database
+        .execute_batch(
+            "CREATE TRIGGER fixture_block_fence_release
+             BEFORE DELETE ON permission_retry_fences
+             BEGIN SELECT RAISE(ABORT, 'fixture settlement failure'); END;",
+        )
+        .expect("inject settlement failure");
+    let command = if cfg!(windows) {
+        "[System.IO.File]::AppendAllText((Join-Path (Get-Location) 'attempts.txt'), 'once')"
+    } else {
+        "printf once >> attempts.txt"
+    };
+    let result = guardian_managed_call(
+        &fixture,
+        &crate::tool::shell::ShellTool,
+        serde_json::json!({
+            "command":command,
+            "sandbox_permissions":"require_escalated",
+            "justification":"record one reviewed test effect"
+        }),
+        &control,
+        &fence,
+        &mut guardian,
+    )
+    .await;
+    assert!(matches!(result, Err(crate::error::ToolError::Message(_))));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("fixture settlement failure")
+    );
+    assert!(control.is_cancelled());
+    assert_eq!(guardian.reviewed, 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.session.workspace.root.join("attempts.txt"))
+            .expect("the effect ran exactly once"),
+        "once"
+    );
+    let recorded = fixture
+        .services
+        .store
+        .permission_retry_fence_store()
+        .record(guardian.key.as_ref().unwrap())
+        .unwrap()
+        .expect("failed settlement must remain fenced");
+    assert_eq!(
+        recorded.state,
+        crate::storage::PermissionRetryFenceState::Admitted
+    );
+    assert_eq!(recorded.outcome, None);
+    database
+        .execute_batch("DROP TRIGGER fixture_block_fence_release;")
+        .expect("remove fixture fault");
 }
 
 #[tokio::test]

@@ -132,6 +132,9 @@ const V64_REMOTE_NETWORK_RECEIPTS: &str =
 const V65_REMOTE_ARTIFACTS: &str = include_str!("../../migrations/V65__remote_artifacts.sql");
 const V66_SIDE_CHAT_ROUTE_KIND: &str =
     include_str!("../../migrations/V66__side_chat_route_kind.sql");
+const V69_SIDE_CHAT_API_KEY_REFERENCES: &str =
+    include_str!("../../migrations/V69__side_chat_api_key_references.sql");
+const V70_CLM_CHECKPOINT: &str = include_str!("../../migrations/V70__clm_checkpoint.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -162,6 +165,8 @@ const EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION: i64 = 58;
 const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION: i64 = 59;
 const PROVIDER_CONNECTION_PROFILES_VERSION: i64 = 60;
 const SIDE_CHAT_SYSTEM_PROMPT_VERSION: i64 = 61;
+const SIDE_CHAT_API_KEY_REFERENCES_VERSION: i64 = 69;
+const CLM_CHECKPOINT_VERSION: i64 = 70;
 const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
 const RECURSIVE_SESSION_SPAWN_EDGES_NAME: &str = "recursive_session_spawn_edges";
 const AGENT_OWNER_RESUME_REQUESTS_NAME: &str = "agent_owner_resume_requests";
@@ -179,6 +184,7 @@ const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME: &str =
     "session_settings_revision_and_context_window";
 const PROVIDER_CONNECTION_PROFILES_NAME: &str = "provider_connection_profiles";
 const SIDE_CHAT_SYSTEM_PROMPT_NAME: &str = "side_chat_system_prompt";
+const SIDE_CHAT_API_KEY_REFERENCES_NAME: &str = "side_chat_api_key_references";
 const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
@@ -614,12 +620,63 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
             run_remote_artifacts(connection)?;
             run_side_chat_route_kind(connection)?;
             run_shared_run_checkpoints(connection)?;
-            return run_shared_history_files(connection);
+            run_shared_history_files(connection)?;
+            run_side_chat_api_key_references(connection)?;
+            return run_clm_checkpoint(connection);
         }
     }
     Err(StorageError::Message(format!(
-        "storage migration did not reach current endpoint V{SIDE_CHAT_SYSTEM_PROMPT_VERSION}"
+        "storage migration did not reach current endpoint V{CLM_CHECKPOINT_VERSION}"
     )))
+}
+
+fn run_clm_checkpoint(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, CLM_CHECKPOINT_VERSION)? {
+            connection.execute_batch(V70_CLM_CHECKPOINT)?;
+        }
+        if !schema_migration_has_exact_name(connection, CLM_CHECKPOINT_VERSION, "clm_checkpoint")? {
+            return Err(StorageError::Message(
+                "invalid CLM checkpoint migration marker".into(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn run_side_chat_api_key_references(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_side_chat_system_prompt_schema(connection)?;
+        validate_side_chat_system_prompt_data(connection)?;
+        if !schema_migration_applied(connection, SIDE_CHAT_API_KEY_REFERENCES_VERSION)? {
+            connection.execute_batch(V69_SIDE_CHAT_API_KEY_REFERENCES)?;
+        }
+        validate_side_chat_system_prompt_schema(connection)?;
+        validate_side_chat_system_prompt_data(connection)?;
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn run_shared_history_files(connection: &Connection) -> Result<(), StorageError> {
@@ -2745,6 +2802,20 @@ fn validate_side_chat_system_prompt_schema(connection: &Connection) -> Result<()
         }
         expected_connection.execute_batch(V66_SIDE_CHAT_ROUTE_KIND)?;
     }
+    if schema_migration_applied(connection, SIDE_CHAT_API_KEY_REFERENCES_VERSION)? {
+        if !schema_migration_has_exact_name(connection, 66, "side_chat_route_kind")?
+            || !schema_migration_has_exact_name(
+                connection,
+                SIDE_CHAT_API_KEY_REFERENCES_VERSION,
+                SIDE_CHAT_API_KEY_REFERENCES_NAME,
+            )?
+        {
+            return Err(StorageError::Message(
+                "invalid side chat API-key reference migration marker or predecessor".into(),
+            ));
+        }
+        expected_connection.execute_batch(V69_SIDE_CHAT_API_KEY_REFERENCES)?;
+    }
     let expected_side_chats =
         normalized_schema_objects_for_table(&expected_connection, "side_chat_bindings")?;
     let observed_side_chats =
@@ -2884,7 +2955,8 @@ fn validate_provider_connection_profiles_data(connection: &Connection) -> Result
             OR conversation.base_url <> binding.base_url
             OR json_extract(conversation.provider_connection_json, '$.profile')
                  IS NOT binding.provider_profile
-            OR json_type(conversation.provider_connection_json, '$.api_key_env') <> 'null'
+            OR (?1 = 0
+                AND json_type(conversation.provider_connection_json, '$.api_key_env') <> 'null')
             OR json_type(conversation.provider_connection_json, '$.extra_headers') <> 'object'
             OR EXISTS (
                 SELECT 1
@@ -2918,7 +2990,10 @@ fn validate_provider_connection_profiles_data(connection: &Connection) -> Result
             OR binding.delete_requested_at_ms < 0
             OR binding.created_at_ms < 0
             OR binding.updated_at_ms < binding.created_at_ms",
-        [],
+        [schema_migration_applied(
+            connection,
+            SIDE_CHAT_API_KEY_REFERENCES_VERSION,
+        )?],
         |row| row.get::<_, i64>(0),
     )?;
     if invalid_side_chats != 0 {
@@ -3552,6 +3627,7 @@ fn decode_current_compaction_payload(
         "mode",
         "layout",
         "preserved_user_messages",
+        "clm_checkpoint",
         "summary",
         "replacement_item_ids",
     ];
@@ -3567,7 +3643,7 @@ fn decode_current_compaction_payload(
         )));
     }
     for field in ALLOWED_FIELDS {
-        if !object.contains_key(*field) {
+        if *field != "clm_checkpoint" && !object.contains_key(*field) {
             return Err(StorageError::Message(format!(
                 "V46 compaction history item {id} has no `{field}` field"
             )));
@@ -3592,6 +3668,9 @@ fn decode_current_compaction_payload(
             "V46 compaction history item {id} decoded as another payload kind"
         )));
     };
+    current
+        .validate_compaction_checkpoint()
+        .map_err(StorageError::Message)?;
     if matches!(layout, crate::protocol::CompactionLayout::LegacyPrefix)
         && !preserved_user_messages.is_empty()
     {
@@ -18278,6 +18357,343 @@ mod tests {
                 "unexpected V61 data audit error: {error}"
             );
         }
+    }
+
+    fn v69_predecessor_fixture(endpoint: i64) -> (Connection, String, String, String) {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        run_through_exact_v59_endpoint(&connection);
+        let (owner, conversation, binding) =
+            insert_v59_side_chat(&connection, "openai_compatible_only", "chat_completions");
+        run_provider_connection_profiles(&connection).unwrap();
+        if endpoint >= 61 {
+            run_side_chat_system_prompt(&connection).unwrap();
+        }
+        if endpoint >= 65 {
+            run_remote_agent_jobs(&connection).unwrap();
+            run_device_outgoing_references(&connection).unwrap();
+            run_remote_network_receipts(&connection).unwrap();
+            run_remote_artifacts(&connection).unwrap();
+        }
+        if endpoint >= 66 {
+            run_side_chat_route_kind(&connection).unwrap();
+        }
+        if endpoint >= 67 {
+            run_shared_run_checkpoints(&connection).unwrap();
+        }
+        if endpoint >= 68 {
+            run_shared_history_files(&connection).unwrap();
+        }
+        connection.execute(
+            "UPDATE side_chat_bindings SET persisted_draft='retained draft',draft_revision=1,updated_at_ms=3 WHERE id=?1",
+            [&binding],
+        ).unwrap();
+        (connection, owner, conversation, binding)
+    }
+
+    fn v69_side_snapshot(connection: &Connection, binding: &str) -> String {
+        connection.query_row(
+            "SELECT json_object('id',b.id,'owner',b.owner_session_id,'conversation',b.conversation_session_id,
+                'url',b.base_url,'model',b.model,'profile',b.provider_profile,
+                'draft',b.persisted_draft,'draft_revision',b.draft_revision,'generation',b.request_generation,
+                'connection',s.provider_connection_json)
+             FROM side_chat_bindings b JOIN sessions s ON s.id=b.conversation_session_id WHERE b.id=?1",
+            [binding], |row| row.get(0),
+        ).unwrap()
+    }
+
+    #[test]
+    fn v69_upgrades_released_side_snapshots_without_rebinding() {
+        for endpoint in [60, 61, 65, 66, 67, 68] {
+            let (connection, owner, conversation, binding) = v69_predecessor_fixture(endpoint);
+            let before = v69_side_snapshot(&connection, &binding);
+            run_to_current(&connection).expect("released storage reaches V69");
+            run_to_current(&connection).expect("V69 cold audit is idempotent");
+            assert!(
+                schema_migration_has_exact_name(
+                    &connection,
+                    SIDE_CHAT_API_KEY_REFERENCES_VERSION,
+                    SIDE_CHAT_API_KEY_REFERENCES_NAME,
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                v69_side_snapshot(&connection, &binding),
+                before,
+                "V{endpoint}"
+            );
+            let reference: Option<String> = connection.query_row(
+                "SELECT json_extract(provider_connection_json,'$.api_key_env') FROM sessions WHERE id=?1",
+                [&conversation], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(reference, None);
+            let unbound: bool = connection
+                .query_row(
+                    "SELECT provider_connection_json IS NULL FROM sessions WHERE id=?1",
+                    [&owner],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(unbound, "legacy Main root stays explicitly unbound");
+            assert!(foreign_key_violations(&connection).is_empty());
+
+            connection.execute(
+                "UPDATE sessions SET provider_connection_json=json_set(provider_connection_json,'$.api_key_env','SIDE_KEY') WHERE id=?1",
+                [&conversation],
+            ).unwrap();
+            connection.execute(
+                "UPDATE side_chat_bindings SET persisted_draft='authenticated draft',draft_revision=2,updated_at_ms=4 WHERE id=?1",
+                [&binding],
+            ).expect("explicit reference permits canonical draft transition");
+            run_to_current(&connection).expect("explicit reference reopens after upgrade");
+        }
+    }
+
+    #[test]
+    fn v69_fresh_schema_rejects_marker_and_ownership_trigger_tampering() {
+        for corruption in ["marker", "insert", "update"] {
+            let connection = Connection::open_in_memory().unwrap();
+            run_to_current(&connection).expect("fresh V69 schema");
+            assert!(
+                schema_migration_has_exact_name(
+                    &connection,
+                    SIDE_CHAT_API_KEY_REFERENCES_VERSION,
+                    SIDE_CHAT_API_KEY_REFERENCES_NAME,
+                )
+                .unwrap()
+            );
+            match corruption {
+                "marker" => {
+                    connection
+                        .execute(
+                            "UPDATE moyai_schema_migrations SET name='incorrect' WHERE version=69",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "insert" => {
+                    connection
+                        .execute_batch("DROP TRIGGER validate_side_chat_binding_before_insert")
+                        .unwrap();
+                }
+                "update" => {
+                    connection
+                        .execute_batch("DROP TRIGGER validate_side_chat_binding_before_update")
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = run_to_current(&connection)
+                .expect_err("altered V69 ownership contract must fail closed");
+            assert!(
+                error.to_string().contains("migration marker")
+                    || error.to_string().contains("canonical system-prompt schema"),
+                "{corruption}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v70_checkpoint_marker_is_forward_only_and_idempotent() {
+        let connection = Connection::open_in_memory().unwrap();
+        run_to_current(&connection).unwrap();
+        connection
+            .execute("DELETE FROM moyai_schema_migrations WHERE version=70", [])
+            .unwrap();
+        insert_v46_compaction_parent(&connection);
+        let replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replacement_id, 0);
+        let legacy = serde_json::json!({"kind":"compaction", "mode":"automatic",
+            "layout":"legacy_prefix", "preserved_user_messages":[],
+            "summary":"old summary", "replacement_item_ids":[replacement_id]})
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "v70-old-checkpoint",
+            1,
+            &legacy,
+            &sha256_text(&legacy),
+        );
+        let schema_before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(type,name,sql)) FROM (SELECT type,name,sql FROM sqlite_master ORDER BY type,name)",
+        );
+        let payload_before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id,payload_json,payload_sha256)) FROM (SELECT * FROM protocol_history_items ORDER BY id)",
+        );
+        run_to_current(&connection).unwrap();
+        run_to_current(&connection).unwrap();
+        assert!(schema_migration_has_exact_name(&connection, 70, "clm_checkpoint").unwrap());
+        assert_eq!(
+            schema_before,
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(type,name,sql)) FROM (SELECT type,name,sql FROM sqlite_master ORDER BY type,name)"
+            )
+        );
+        assert_eq!(
+            payload_before,
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id,payload_json,payload_sha256)) FROM (SELECT * FROM protocol_history_items ORDER BY id)"
+            )
+        );
+        connection
+            .execute(
+                "UPDATE moyai_schema_migrations SET name='wrong' WHERE version=70",
+                [],
+            )
+            .unwrap();
+        assert!(
+            run_to_current(&connection)
+                .unwrap_err()
+                .to_string()
+                .contains("CLM checkpoint migration marker")
+        );
+    }
+
+    #[test]
+    fn v70_checkpoint_failed_marker_write_is_retryable_without_rewriting_data() {
+        let connection = Connection::open_in_memory().unwrap();
+        run_to_current(&connection).unwrap();
+        connection
+            .execute("DELETE FROM moyai_schema_migrations WHERE version=70", [])
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_v70_marker BEFORE INSERT ON moyai_schema_migrations
+            WHEN NEW.version=70 BEGIN SELECT RAISE(ABORT,'fixture V70 marker failure'); END;",
+            )
+            .unwrap();
+        let before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(version,name)) FROM (SELECT * FROM moyai_schema_migrations ORDER BY version)",
+        );
+        assert!(
+            run_clm_checkpoint(&connection)
+                .unwrap_err()
+                .to_string()
+                .contains("fixture V70 marker failure")
+        );
+        assert_eq!(
+            before,
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(version,name)) FROM (SELECT * FROM moyai_schema_migrations ORDER BY version)"
+            )
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_v70_marker")
+            .unwrap();
+        run_to_current(&connection).unwrap();
+        assert!(schema_migration_has_exact_name(&connection, 70, "clm_checkpoint").unwrap());
+    }
+
+    #[test]
+    fn v70_checkpoint_decoder_keeps_old_shapes_and_rejects_invalid_clm_payloads() {
+        for layout in ["legacy_prefix", "user_anchored_checkpoint"] {
+            let value = serde_json::json!({"kind":"compaction", "mode":"automatic", "layout":layout,
+                "preserved_user_messages":[], "summary":"old summary", "replacement_item_ids":[]});
+            let decoded =
+                decode_current_compaction_payload("old", value.as_object().unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        }
+        let checkpoint = crate::protocol::ClmCheckpoint::from_messages(
+            &[crate::llm::ModelMessage::User {
+                content: "task".into(),
+            }],
+            1,
+        )
+        .unwrap();
+        let value = serde_json::json!({"kind":"compaction", "mode":"automatic", "layout":"clm_checkpoint",
+            "clm_checkpoint":checkpoint, "preserved_user_messages":[], "summary":"Context updated", "replacement_item_ids":[]});
+        assert!(decode_current_compaction_payload("valid", value.as_object().unwrap()).is_ok());
+        for corruption in ["missing", "version", "authority", "layout", "anchors"] {
+            let mut modified = value.clone();
+            match corruption {
+                "missing" => {
+                    modified.as_object_mut().unwrap().remove("clm_checkpoint");
+                }
+                "version" => modified["clm_checkpoint"]["version"] = serde_json::json!(9),
+                "authority" => {
+                    modified["clm_checkpoint"]["messages"][0]["role"] = serde_json::json!("system")
+                }
+                "layout" => modified["layout"] = serde_json::json!("legacy_prefix"),
+                "anchors" => modified["preserved_user_messages"] = serde_json::json!(["duplicate"]),
+                _ => unreachable!(),
+            }
+            assert!(
+                decode_current_compaction_payload("invalid", modified.as_object().unwrap())
+                    .is_err(),
+                "{corruption}"
+            );
+        }
+    }
+
+    #[test]
+    fn v69_upgrade_rejects_corrupt_legacy_snapshots_without_changing_schema() {
+        for corruption in [
+            None,
+            Some(r#"{"profile":"openai_compatible","api_key_env":"SIDE_KEY","extra_headers":{}}"#),
+            Some(
+                r#"{"profile":"openai_compatible","api_key_env":null,"extra_headers":{"X-Test":"value"}}"#,
+            ),
+        ] {
+            let (connection, _, conversation, binding) = v69_predecessor_fixture(68);
+            connection
+                .execute(
+                    "UPDATE sessions SET provider_connection_json=?2 WHERE id=?1",
+                    params![conversation, corruption],
+                )
+                .unwrap();
+            let before = v69_side_snapshot(&connection, &binding);
+            let schema =
+                normalized_schema_objects_for_table(&connection, "side_chat_bindings").unwrap();
+            run_to_current(&connection)
+                .expect_err("invalid released Side snapshot must not be repaired by V69");
+            assert_eq!(v69_side_snapshot(&connection, &binding), before);
+            assert_eq!(
+                normalized_schema_objects_for_table(&connection, "side_chat_bindings").unwrap(),
+                schema
+            );
+            assert!(
+                !schema_migration_applied(&connection, SIDE_CHAT_API_KEY_REFERENCES_VERSION)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn v69_failed_marker_write_rolls_back_both_replaced_triggers_and_data() {
+        let (connection, _, _, binding) = v69_predecessor_fixture(68);
+        let before = v69_side_snapshot(&connection, &binding);
+        let schema =
+            normalized_schema_objects_for_table(&connection, "side_chat_bindings").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_v69_marker BEFORE INSERT ON moyai_schema_migrations
+             WHEN NEW.version=69 BEGIN SELECT RAISE(ABORT,'fixture marker write failure'); END;",
+            )
+            .unwrap();
+        let error = run_side_chat_api_key_references(&connection)
+            .expect_err("late marker failure must roll back V69 DDL");
+        assert!(error.to_string().contains("fixture marker write failure"));
+        assert_eq!(
+            normalized_schema_objects_for_table(&connection, "side_chat_bindings").unwrap(),
+            schema
+        );
+        assert_eq!(v69_side_snapshot(&connection, &binding), before);
+        assert!(
+            !schema_migration_applied(&connection, SIDE_CHAT_API_KEY_REFERENCES_VERSION).unwrap()
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_v69_marker")
+            .unwrap();
+        run_to_current(&connection)
+            .expect("V69 succeeds after external storage failure is removed");
     }
 
     #[test]

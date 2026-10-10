@@ -8,10 +8,11 @@ function projection(overrides: Partial<HubProjection> = {}): HubProjection {
   return {
     settings_revision: "0", connection_generation: "0", status: "disconnected",
     endpoint: "http://127.0.0.1:9470", label: "moyAI Desktop", hub_id: null,
-    catalog: null, main_review: null, side_chat_review: null,
-    main_confirmation: "unconfirmed", side_chat_confirmation: "unconfirmed", error: null,
-    main_mode: "direct", side_chat_mode: "direct", active_main: null, active_side_chat: null,
-    can_enable_main_hub: false, can_enable_side_chat_hub: false, can_change_main_mode: true, can_change_side_chat_mode: true,
+    catalog: null, main_review: null, side_chat_review: null, approve_review: null,
+    main_confirmation: "unconfirmed", side_chat_confirmation: "unconfirmed", approve_confirmation: "unconfirmed", error: null,
+    main_mode: "direct", side_chat_mode: "direct", approve_mode: "direct", active_main: null, active_side_chat: null, active_approve: null,
+    can_enable_main_hub: false, can_enable_side_chat_hub: false, can_enable_approve_hub: false,
+    can_change_main_mode: true, can_change_side_chat_mode: true, can_change_approve_mode: true,
     ...overrides,
   };
 }
@@ -73,6 +74,56 @@ test("route mode save sends the exact channel and revision without optimistic fa
     await request;
     assert.equal(local.projection!.main_mode, "direct");
     assert.deepEqual(local.drafts.side_chat, sideDraft);
+  });
+});
+
+test("delayed catalog refresh keeps newer runtime start and stop projections for every role", async () => {
+  for (const channel of ["main", "side_chat", "approve"] as const) {
+    for (const started of [true, false]) {
+      const refresh = deferred<HubProjection>();
+      await withContext(async () => refresh.promise, async ({ context, local }) => {
+        const active = { turn_id: "live-turn", phase: "running" as const, logical_model_id: "model-a" };
+        const before = projection({ status: "connected", hub_id: "hub-a", connection_generation: "2",
+          catalog: { hub_id: "hub-a", software_version: "1", revision: "3", changes: [], models: [] },
+          [`active_${channel}`]: started ? null : active, [`can_change_${channel}_mode`]: started });
+        acceptHubProjection(local, before);
+        const request = refreshHub(context);
+        acceptHubProjection(local, { ...before, [`active_${channel}`]: started ? active : null,
+          [`can_change_${channel}_mode`]: !started });
+        refresh.resolve({ ...before, catalog: { ...before.catalog!, revision: "4" } });
+        await request;
+        assert.deepEqual(local.projection![`active_${channel}`], started ? active : null);
+        assert.equal(local.projection![`can_change_${channel}_mode`], !started);
+        assert.equal(local.projection!.catalog?.revision, "4");
+      });
+    }
+  }
+});
+
+test("an in-flight refresh cannot restore a run after start and stop return to the initial state", async () => {
+  for (const channel of ["main", "side_chat", "approve"] as const) {
+    const refresh = deferred<HubProjection>();
+    await withContext(async () => refresh.promise, async ({ context, local }) => {
+      const before = projection({ status: "connected", hub_id: "hub-a", connection_generation: "2" });
+      const running = { ...before, [`active_${channel}`]: {
+        turn_id: "ended-turn", phase: "running" as const, logical_model_id: "model-a",
+      }, [`can_change_${channel}_mode`]: false };
+      acceptHubProjection(local, before);
+      const request = refreshHub(context);
+      acceptHubProjection(local, running);
+      acceptHubProjection(local, structuredClone(before));
+      refresh.resolve(running);
+      await request;
+      assert.equal(local.projection![`active_${channel}`], null);
+      assert.equal(local.projection![`can_change_${channel}_mode`], true);
+    });
+  }
+  await withContext(async () => projection({ status: "connected", hub_id: "hub-a", connection_generation: "2",
+    active_main: { turn_id: "new-turn", phase: "running", logical_model_id: "model-a" }, can_change_main_mode: false }),
+  async ({ context, local }) => {
+    acceptHubProjection(local, projection({ status: "connected", hub_id: "hub-a", connection_generation: "2" }));
+    await refreshHub(context);
+    assert.equal(local.projection!.active_main?.turn_id, "new-turn", "a read without an intervening projection still adopts its runtime");
   });
 });
 
@@ -178,6 +229,7 @@ test("failed review save retains both drafts and does not treat recovery as a lo
     acceptHubProjection(local, before);
     editHubField(local, "main:model:model-a", "", true);
     editHubField(local, "side_chat:model:model-a", "", true);
+    editHubField(local, "approve:model:model-a", "", true);
     const drafts = structuredClone(local.drafts);
     await saveHubReview(context, "main");
     assert.deepEqual(local.drafts, drafts);
@@ -193,6 +245,61 @@ test("route activation is not sent before review or while the backend closes its
     acceptHubProjection(local, projection({ status: "connected", main_confirmation: "confirmed", can_enable_main_hub: true, can_change_main_mode: false }));
     await setHubRouteMode(context, "main", "hub");
     assert.deepEqual(calls, []);
+  });
+});
+
+test("Main, Sub and Approve selections save in every order with exact independent command targets", async () => {
+  const orders = [["main", "side_chat", "approve"], ["main", "approve", "side_chat"],
+    ["side_chat", "main", "approve"], ["side_chat", "approve", "main"],
+    ["approve", "main", "side_chat"], ["approve", "side_chat", "main"]] as const;
+  const ids = { main: "main-model", side_chat: "sub-model", approve: "approve-model" };
+  for (const order of orders) {
+    let remote = projection({ status: "connected", settings_revision: "1", connection_generation: "2", hub_id: "hub-a",
+      catalog: { hub_id: "hub-a", software_version: "0.1.0", revision: "7", changes: [],
+        models: Object.values(ids).map(id => ({ id, label: id, capabilities: [] })) } });
+    const calls: string[] = [];
+    await withContext(async (name, args) => {
+      assert.equal(name, "hub_save_review");
+      const channel = args.context as typeof order[number];
+      calls.push(channel);
+      assert.equal(args.expectedSettingsRevision, remote.settings_revision);
+      assert.equal(args.expectedConnectionGeneration, "2");
+      assert.equal(args.expectedHubId, "hub-a");
+      assert.equal(args.expectedCatalogRevision, "7");
+      assert.equal((args.selection as HubSelection).preferred_model_id, ids[channel]);
+      remote = { ...remote, settings_revision: String(Number(remote.settings_revision) + 1),
+        [`${channel}_review`]: { hub_id: "hub-a", reviewed_revision: "7", selection: structuredClone(args.selection) },
+        [`${channel}_confirmation`]: "confirmed" };
+      return remote;
+    }, async ({ context, local }) => {
+      acceptHubProjection(local, remote);
+      for (const channel of order) editHubField(local, `${channel}:choice`, ids[channel], false);
+      for (const channel of order) { assert.equal(hubCanSave(local, channel), true); await saveHubReview(context, channel); }
+      assert.deepEqual(calls, order);
+      for (const channel of order) {
+        assert.equal(local.projection![`${channel}_review`]!.selection.preferred_model_id, ids[channel]);
+        assert.equal(local.drafts[channel].dirty, false);
+      }
+    });
+  }
+});
+
+test("Approve route mode sends its own target and an active review blocks its selection", async () => {
+  const calls: { name: string; args: Record<string, unknown> }[] = [];
+  await withContext(async (name, args) => { calls.push({ name, args }); return projection({ settings_revision: "6", connection_generation: "7" }); }, async ({ context, local }) => {
+    acceptHubProjection(local, projection({ approve_mode: "hub", settings_revision: "5", connection_generation: "7" }));
+    await setHubRouteMode(context, "approve", "direct");
+    assert.deepEqual(calls, [{ name: "hub_set_route_mode", args: {
+      context: "approve", mode: "direct", expectedSettingsRevision: "5", expectedConnectionGeneration: "7",
+    } }]);
+    const current = projection({ status: "connected", hub_id: "hub-a",
+      catalog: { hub_id: "hub-a", software_version: "0.1.0", revision: "7", changes: [], models: [{ id: "approve-model", label: "Approve", capabilities: [] }] } });
+    acceptHubProjection(local, { ...current, settings_revision: "6", connection_generation: "7" });
+    editHubField(local, "approve:choice", "approve-model", false);
+    acceptHubProjection(local, { ...local.projection!, active_approve: { turn_id: "review-turn", phase: "running", logical_model_id: "approve-model" } });
+    await saveHubReview(context, "approve");
+    assert.equal(calls.length, 1);
+    assert.equal(local.drafts.approve.dirty, true);
   });
 });
 

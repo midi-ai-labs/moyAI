@@ -12,6 +12,7 @@ import {
   exactChatToolContinuationLedger,
   providerChatToolContinuationFixtureConfig,
 } from "../scenarios/provider_chat_tool_continuation.mjs";
+import { providerRenderedTerminalFailures } from "../scenarios/provider_restart.mjs";
 
 const SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const TURN_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
@@ -315,6 +316,21 @@ test("terminal continuation keeps one canonical tool result and one exact final 
     "1787715296001",
   );
   assert.match(chatToolContinuationTerminalFailures(toolDrift, TIME).join(","), /time-evidence/u);
+});
+
+test("the passing Chat continuation oracle still needs the same rendered owner and usage before its terminal screenshot", () => {
+  const sample = { surface: terminalSurface(), ledger: ledger(["completed", "completed"]) };
+  assert.deepEqual(chatToolContinuationTerminalFailures(sample, TIME), []);
+  const surface = sample.surface;
+  Object.assign(surface.projection, { session_usage_label: "累計 34 tokens", session_usage_title: "2 requests", session_usage_state: "complete" });
+  surface.composer = { count: 1, visible: true, run_target: structuredClone(surface.projection.run_target) };
+  surface.session_usage = { count: 1, visible: true, text: "未計測", title: "まだ記録されていません", state: "missing" };
+  assert.deepEqual(chatToolContinuationTerminalFailures(sample, TIME), []);
+  assert.deepEqual(providerRenderedTerminalFailures(surface).map(failure => failure.field), ["session_usage.text", "session_usage.title", "session_usage.state"]);
+  Object.assign(surface.session_usage, { text: surface.projection.session_usage_label, title: surface.projection.session_usage_title, state: surface.projection.session_usage_state });
+  assert.deepEqual(providerRenderedTerminalFailures(surface), []);
+  surface.composer.run_target.expectedState.admissionRevision = "2";
+  assert.deepEqual(providerRenderedTerminalFailures(surface).map(failure => failure.field), ["composer.run_target"]);
 });
 
 test("held and completed tool evidence requires one completed current_time, with durable Assistant identity", () => {

@@ -14,6 +14,7 @@ import {
 import {
   SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES,
   createPermissionTempEscalationProviderScript,
+  permissionGuardianShellPayloadContract,
   startScriptedProvider,
 } from "../drivers/scripted_provider.mjs";
 import {
@@ -929,62 +930,12 @@ function liveGuardianPayloadPass(body, elevatedCall) {
   const input = Array.isArray(body?.input) ? body.input : [];
   const inputText = input.length === 1 ? responsesInputText(input[0]) : null;
   let payload = null;
-  let context = null;
   try {
     payload = JSON.parse(inputText);
-    context = JSON.parse(payload.task_context);
   } catch {
     return false;
   }
-  const authority = context?.canonical_user_authority;
-  const recent = payload?.recent_committed_response;
-  const request = recent?.tool_request;
-  const permission = payload?.permission_request;
-  return exactObjectKeys(payload, [
-    "action_evidence",
-    "permission_request",
-    "recent_committed_response",
-    "task_context",
-    "trusted_world_state",
-  ])
-    && exactObjectKeys(context, ["authority_session_id", "canonical_user_authority"])
-    && typeof context.authority_session_id === "string"
-    && context.authority_session_id.length > 0
-    && Array.isArray(authority)
-    && authority.length === 1
-    && exactObjectKeys(authority[0], ["history_item_id", "kind", "text"])
-    && authority[0].kind === "user_turn"
-    && authority[0].text === PERMISSION_TEMP_ESCALATION_LIVE_PROMPT
-    && exactObjectKeys(recent, [
-      "assistant_text",
-      "prior_committed_tool_results",
-      "response_id",
-      "tool_request",
-    ])
-    && Array.isArray(recent.prior_committed_tool_results)
-    && recent.prior_committed_tool_results.length === 0
-    && exactObjectKeys(request, ["arguments_json", "call_id", "tool_name"])
-    && request.call_id === elevatedCall.callId
-    && request.tool_name === "shell"
-    && request.arguments_json === elevatedCall.argumentsJson
-    && exactObjectKeys(permission, [
-      "access",
-      "details",
-      "outside_workspace",
-      "risks",
-      "summary",
-      "targets",
-    ])
-    && permission.access === "shell"
-    && Array.isArray(permission.details)
-    && permission.details.includes(
-      `Requested sandbox elevation: ${PERMISSION_TEMP_ESCALATION_JUSTIFICATION}`,
-    )
-    && permission.outside_workspace === true
-    && Array.isArray(permission.risks)
-    && permission.risks.length === 0
-    && exactObjectKeys(payload.action_evidence, ["kind"])
-    && payload.action_evidence.kind === "permission_request";
+  return permissionGuardianShellPayloadContract(payload, elevatedCall.argumentsJson).pass;
 }
 
 export function permissionTempEscalationLiveCaptureContract(captures, options) {

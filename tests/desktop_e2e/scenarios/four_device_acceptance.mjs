@@ -46,7 +46,7 @@ export function normalizeFourDeviceOptions(options = {}) {
   const { runnerBinary, runnerTestBinary, liveProvider, upstreamCredentialFile, contextComparison = null,
     roleMapping = DEFAULT_ROLE_MAPPING, generationObservationMs = 3600000, ...hubOptions } = options;
   for (const value of [runnerBinary, runnerTestBinary, upstreamCredentialFile]) if (value !== undefined && (typeof value !== "string" || !path.isAbsolute(value))) throw new TypeError("Four-device binary and credential paths must be absolute");
-  const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider);
+  const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider, { extendedConnection: false });
   if (upstreamCredentialFile && !live) throw new TypeError("An upstream credential requires an explicit live provider");
   if (contextComparison !== null && (!["remove", "preserve"].includes(contextComparison) || !live || !upstreamCredentialFile))
     throw new TypeError("Context comparison requires remove/preserve, a live model and its exact credential file");

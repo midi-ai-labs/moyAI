@@ -99,6 +99,7 @@ const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "model.supports_images",
   "model.parallel_tool_calls",
   "side_chat.base_url",
+  "side_chat.api_key_env",
   "side_chat.model",
   "side_chat.provider_profile",
   "side_chat.system_prompt",
@@ -106,6 +107,14 @@ const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "side_chat.request_timeout_ms",
   "side_chat.connect_timeout_ms",
   "side_chat.max_retries",
+  "approve.base_url",
+  "approve.model",
+  "approve.provider_profile",
+  "approve.api_key_env",
+  "approve.context_window",
+  "approve.request_timeout_ms",
+  "approve.connect_timeout_ms",
+  "approve.max_retries",
   "permissions.access_mode",
   "multi_agent.enabled",
   "multi_agent.mode",
@@ -2104,7 +2113,7 @@ function renderSideChatSettings(
     <section id="settings-side-chat" class="settings-section" aria-labelledby="settings-side-chat-title" aria-describedby="side-chat-settings-help" aria-busy="${catalogLoading ? "true" : "false"}">
       <div class="settings-section-head">
         <div>
-          <h3 id="settings-side-chat-title">サイドチャット</h3>
+          <h3 id="settings-side-chat-title">Sub（サイドチャット）</h3>
           <p id="side-chat-settings-help">新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません。既存の会話の設定は変わりません。</p>
         </div>
         ${managed ? "" : `<button data-action="load-side-chat-models" aria-controls="side-chat-model side-chat-model-catalog-status" aria-disabled="${local.sideChat.catalogLoadEnabled ? "false" : "true"}" ${local.sideChat.catalogLoadEnabled ? "" : "disabled"}>${catalogLoading ? "読込中…" : "モデル読込"}</button>`}
@@ -2117,7 +2126,8 @@ function renderSideChatSettings(
       <div class="settings-grid-two">
         ${managed ? "" : `
         ${renderConfigEnumField(state, "side_chat.provider_profile", "接続方式", PROVIDER_PROFILE_LABELS, { controlId: "side-chat-provider-profile" })}
-        ${renderConfigTextField(state, "side_chat.base_url", "接続先URL", "url", "メインチャットとは別の接続先です。", { controlId: "side-chat-base-url" })}
+        ${renderConfigTextField(state, "side_chat.base_url", "接続先URL", "url", "メインチャットと独立して設定できます。", { controlId: "side-chat-base-url" })}
+        ${renderConfigTextField(state, "side_chat.api_key_env", "APIキーの環境変数名（任意）", "text", "同じキーを使う場合は、メインチャットと同じ環境変数名を入力してください。空欄は認証なしです。", { controlId: "side-chat-api-key-env" })}
         ${renderSideChatModelField(state, local.sideChat.catalog)}
         `}
         ${renderConfigMultilineField(
@@ -2150,6 +2160,33 @@ export function sideChatCatalogStatusText(catalog: SideChatCatalogView): string 
     case "idle":
       return "「モデル読込」で候補を取得できます。一覧にないモデルIDは直接入力できます。";
   }
+}
+
+function renderApproveSettings(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const managed = aiConnectionManaged(local.hub, local.deviceNetwork);
+  return `<section id="settings-approve" class="settings-section" aria-labelledby="settings-approve-title" aria-describedby="approve-settings-help">
+    <div class="settings-section-head"><div>
+      <h3 id="settings-approve-title">Approve（承認）</h3>
+      <p id="approve-settings-help">「代理で承認」でツール操作を審査するモデルです。承認方法は下の「権限」で変更できます。</p>
+    </div></div>
+    ${managed ? renderManagedAiConnection(local.hub, "approve", local.deviceNetwork) : `
+      <p class="hub-help" data-settings-passive="approve-config-inheritance">${state.approve_model_configured
+        ? "Approve専用の接続設定を使います。Mainのモデル変更はApproveに反映されません。"
+        : "Approveは未設定のため、実行時のMainのモデルを使います。以下はMainの設定です。Approveの項目を変更・保存すると、専用の接続設定になります。"}</p>
+      <div class="settings-grid-two">
+        ${renderConfigTextField(state, "approve.base_url", "接続先URL", "url", "Mainと独立して設定できます。", { controlId: "approve-base-url" })}
+        ${renderConfigTextField(state, "approve.model", "モデルID", "text", "接続先で利用できるモデルIDを入力してください。", { controlId: "approve-model" })}
+        ${renderConfigEnumField(state, "approve.provider_profile", "接続方式", PROVIDER_PROFILE_LABELS, { controlId: "approve-provider-profile" })}
+        ${renderConfigTextField(state, "approve.api_key_env", "APIキーの環境変数名（任意）", "text", "Mainと同じキーを使う場合は、同じ環境変数名を入力してください。空欄は認証なしです。", { controlId: "approve-api-key-env" })}
+        ${renderConfigTextField(state, "approve.context_window", "入力の整理上限（トークン）", "number")}
+        ${renderConfigTextField(state, "approve.request_timeout_ms", "承認判定を待つ時間（ms）", "number", "権限情報の読込みから最終判定までの制限時間です。")}
+        ${renderConfigTextField(state, "approve.connect_timeout_ms", "接続を待つ時間（ms）", "number")}
+        ${renderConfigTextField(state, "approve.max_retries", "再試行の上限回数", "number")}
+      </div>`}
+  </section>`;
 }
 
 function renderConfigOverlay(
@@ -2203,9 +2240,10 @@ function renderConfigOverlay(
         <div class="settings-layout">
           <nav class="settings-nav" aria-label="設定カテゴリ">
             <span class="settings-nav-group" role="heading" aria-level="3">共通設定</span>
-            <a href="#settings-provider">AIの接続・メイン</a>
+            <a href="#settings-provider">Main（メイン）</a>
             <a class="settings-nav-subitem" href="#settings-model">入力の上限・モデル機能</a>
-            <a href="#settings-side-chat">サイドチャット</a>
+            <a href="#settings-side-chat">Sub（サイドチャット）</a>
+            <a href="#settings-approve">Approve（承認）</a>
             <a href="#settings-permissions">権限</a>
             <a href="#settings-agents">エージェント</a>
             <a href="#settings-tools">ツール</a>
@@ -2222,7 +2260,7 @@ function renderConfigOverlay(
             <section id="settings-provider" class="settings-section" aria-labelledby="settings-provider-title" aria-describedby="main-provider-settings-help" aria-busy="${state.provider_loading ? "true" : "false"}">
               <div class="settings-section-head">
                 <div>
-                  <h3 id="settings-provider-title">AIの接続・メインチャット</h3>
+                  <h3 id="settings-provider-title">Main（メイン）</h3>
                   <p id="main-provider-settings-help">メインチャットの共通の既定値です。いまの会話だけを変更する場合は「現在のチャット」を開いてください。</p>
                 </div>
                 ${managed ? "" : `<button data-action="load-provider-models" aria-controls="main-provider-model main-provider-model-catalog-status" title="入力中の接続先からモデル一覧を取得" ${state.config_draft.edit_enabled && !state.provider_loading ? "" : "disabled"}>モデル読込</button>`}
@@ -2279,6 +2317,7 @@ function renderConfigOverlay(
               </div>
             </section>
             ${renderSideChatSettings(state, local)}
+            ${renderApproveSettings(state, local)}
             <section id="settings-permissions" class="settings-section" aria-labelledby="settings-permissions-title" aria-describedby="settings-permissions-help">
               <div>
                 <h3 id="settings-permissions-title">権限</h3>
@@ -2444,6 +2483,7 @@ function configFieldSectionHelpId(key: string): string {
   }
   if (key.startsWith("model.")) return "settings-model-help";
   if (key.startsWith("side_chat.")) return "side-chat-settings-help";
+  if (key.startsWith("approve.")) return "approve-settings-help";
   if (key.startsWith("permissions.")) return "settings-permissions-help";
   if (key.startsWith("multi_agent.")) return "settings-agents-help";
   if (key.startsWith("shell.") || key.startsWith("docling.") || key.startsWith("mcp.")) {

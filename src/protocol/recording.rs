@@ -248,6 +248,10 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
 }
 
 impl<S: RunEventSink + ?Sized> RunEventSink for ProtocolRecordingSink<'_, S> {
+    fn record_compaction_diagnostic(&mut self, diagnostic: &crate::runtime::CompactionDiagnostic) {
+        self.inner.record_compaction_diagnostic(diagnostic);
+    }
+
     fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
         Some(self.reserve_sequence_no())
     }

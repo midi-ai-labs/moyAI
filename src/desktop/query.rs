@@ -1,4 +1,7 @@
+use std::borrow::Cow;
+
 use crate::app::App;
+use crate::cli::terminal::tool_output_display_text;
 use crate::desktop::args::{DesktopArgs, quick_chat_workspace_directory};
 use crate::desktop::models::{
     DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow, DesktopSessionDetail,
@@ -526,18 +529,19 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots
                 status,
                 summary,
             } => {
+                let display_summary = tool_output_display_text(summary);
                 if *status == crate::protocol::ToolLifecycleStatus::Failed {
                     current.system_rows.push(desktop_transcript_row(
                         DesktopTranscriptRowKind::Error,
                         String::new(),
                         format!("エラー - Tool {tool}"),
-                        summary.clone(),
+                        display_summary.as_ref().to_string(),
                         Vec::new(),
                     ));
                 }
                 current.tool_rows.push((
                     *call_id,
-                    format_tool_history_row(*status, title.trim(), summary.trim()),
+                    format_tool_history_row(*status, title.trim(), display_summary.trim()),
                 ));
             }
             crate::protocol::TurnItemPayload::FileChange { .. } => {
@@ -1102,7 +1106,8 @@ fn format_transcript_text(state: &AppState) -> String {
         .enumerate()
         .map(|(index, entry)| {
             let heading = entry_heading(entry.kind, &entry.title);
-            let body = entry.body.trim();
+            let display_body = transcript_entry_display_body(entry);
+            let body = display_body.trim();
             let step = index + 1;
             if body.is_empty() {
                 format!("[{step:02}] {heading}")
@@ -1112,6 +1117,19 @@ fn format_transcript_text(state: &AppState) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn transcript_entry_display_body(entry: &crate::tui::state::TranscriptEntry) -> Cow<'_, str> {
+    if entry.tool_call_id.is_some()
+        && matches!(
+            entry.kind,
+            TranscriptKind::Tool | TranscriptKind::Editing | TranscriptKind::Error
+        )
+    {
+        tool_output_display_text(&entry.body)
+    } else {
+        Cow::Borrowed(&entry.body)
+    }
 }
 
 #[cfg(test)]
@@ -1147,7 +1165,7 @@ fn transcript_rows_with_context(
                     row_kind,
                     format!("{:02}", index + 1),
                     entry_heading(entry.kind, &entry.title),
-                    entry.body.trim().to_string(),
+                    transcript_entry_display_body(entry).trim().to_string(),
                     Vec::new(),
                 ))
             })
@@ -1418,9 +1436,14 @@ fn current_run_summary_text(state: &AppState, file_changes: &[DesktopFileChangeR
     }
     if let Some(last_tool) = state.tool_statuses.last()
         && let Some(summary) = last_tool.summary.as_ref().or(last_tool.error.as_ref())
-        && !summary.trim().is_empty()
     {
-        lines.push(format!("- 直近出力: {}", single_line_preview(summary, 180)));
+        let summary = tool_output_display_text(summary);
+        if !summary.trim().is_empty() {
+            lines.push(format!(
+                "- 直近出力: {}",
+                single_line_preview(&summary, 180)
+            ));
+        }
     }
     if lines.len() == 1 {
         lines.push("- 詳細は作業履歴に記録されています。".to_string());
@@ -1434,10 +1457,11 @@ fn format_compact_tool_rows(tools: &[crate::tui::state::ToolStatusView]) -> Stri
         .take(8)
         .map(|tool| {
             let mut line = format!("- [{}] {}", tool_call_status_label(tool.status), tool.title);
-            if let Some(summary) = tool.summary.as_ref().or(tool.error.as_ref())
-                && !summary.trim().is_empty()
-            {
-                line.push_str(&format!("\n  出力: {}", single_line_preview(summary, 220)));
+            if let Some(summary) = tool.summary.as_ref().or(tool.error.as_ref()) {
+                let summary = tool_output_display_text(summary);
+                if !summary.trim().is_empty() {
+                    line.push_str(&format!("\n  出力: {}", single_line_preview(&summary, 220)));
+                }
             }
             line
         })
@@ -1584,7 +1608,12 @@ fn format_bounded_tool_activity_row(tool: &crate::tui::state::ToolStatusView) ->
         .error
         .as_deref()
         .or(tool.summary.as_deref())
-        .map(|value| single_line_preview(value, DESKTOP_TOOL_ACTIVITY_LINE_CHAR_LIMIT))
+        .map(|value| {
+            single_line_preview(
+                &tool_output_display_text(value),
+                DESKTOP_TOOL_ACTIVITY_LINE_CHAR_LIMIT,
+            )
+        })
         .filter(|value| !value.is_empty());
     match detail {
         Some(detail) => format!("- [{status}] {title}: {detail}"),
@@ -1901,6 +1930,211 @@ mod tests {
             active_turn_id: None,
             active_turn_sequence_no: None,
             admission_revision: u64::from(latest_turn_id.is_some()),
+        }
+    }
+
+    #[test]
+    fn tool_output_display_canonical_rows_keep_raw_evidence_and_non_tool_text() {
+        use crate::protocol::{HistoryItemPayload, ToolLifecycleStatus, TurnTerminalOutcome};
+        use crate::session::{RunEvent, ToolCallId};
+        use crate::tool::ToolName;
+
+        let session = test_session_record("tool-display");
+        let turn_id = crate::protocol::TurnId::new();
+        let user = "\x1b[31m説明用の user 本文\x1b[0m";
+        let assistant = "\x1b[32m説明用の assistant 本文\x1b[0m";
+        let raw_error = format!(
+            "Command: inspect\n\nExit code: 1\n\nStderr:\n{}",
+            "\x1b[31;1mError: \x1b[31;1m日本語の失敗\x1b[0m\r\n"
+                .repeat(5)
+                .trim_end()
+        );
+        let expected_error = format!(
+            "Command: inspect\n\nExit code: 1\n\nStderr:\n{}",
+            "Error: 日本語の失敗\r\n".repeat(5).trim_end()
+        );
+        let item = |sequence_no, payload| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id: session.id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload,
+        };
+        let mut items = vec![item(
+            1,
+            TurnItemPayload::UserMessage {
+                text: user.to_string(),
+            },
+        )];
+        let mut history = Vec::new();
+        for (sequence_no, summary, success) in [
+            (2, raw_error.clone(), false),
+            (3, "Stdout:\n\x1b[32mOK 日本語\x1b[0m".to_string(), true),
+        ] {
+            let event = RunEvent::ToolCallCompleted {
+                tool_call_id: ToolCallId::new(),
+                tool: ToolName::Shell,
+                title: "inspect".to_string(),
+                summary,
+                metadata: serde_json::json!({"success": success}),
+            };
+            let projection = crate::protocol::project_protocol_run_event(
+                &event,
+                Some(session.id),
+                turn_id,
+                sequence_no,
+            )
+            .expect("durable tool projection");
+            items.push(projection.turn_item.expect("ToolStatus"));
+            history.push(projection.history_item.expect("ToolOutput"));
+        }
+        items.push(item(
+            4,
+            TurnItemPayload::AgentMessage {
+                text: assistant.to_string(),
+            },
+        ));
+        items.push(item(
+            5,
+            TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Completed,
+            },
+        ));
+        let mut read = canonical_read_with_elapsed(&session, items, Default::default());
+        read.history.total = history.len();
+        read.history.items = history;
+        let raw_history = serde_json::to_string(&read.history.items).unwrap();
+        let raw_turns = serde_json::to_string(&read.turns.items).unwrap();
+
+        for _ in 0..2 {
+            let detail = build_session_detail(&read, None);
+            let error = detail
+                .transcript_rows
+                .iter()
+                .find(|row| row.row_kind == DesktopTranscriptRowKind::Error)
+                .unwrap();
+            assert_eq!(error.body, expected_error);
+            let work = detail
+                .transcript_rows
+                .iter()
+                .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+                .unwrap();
+            assert!(!work.body.contains('\x1b'));
+            assert!(work.body.contains("OK 日本語"));
+            assert!(work.body.contains("[失敗]"));
+            assert!(work.body.contains("[完了]"));
+            assert!(detail.transcript_rows.iter().any(|row| row.body == user));
+            assert!(
+                detail
+                    .transcript_rows
+                    .iter()
+                    .any(|row| row.body == assistant)
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&read.history.items).unwrap(),
+            raw_history
+        );
+        assert_eq!(serde_json::to_string(&read.turns.items).unwrap(), raw_turns);
+        assert!(matches!(
+            &read.history.items[0].payload,
+            HistoryItemPayload::ToolOutput { status: ToolLifecycleStatus::Completed, success: Some(false), output_text, .. }
+                if output_text == &raw_error
+        ));
+        assert!(
+            crate::session::markdown::canonical_session_read_to_markdown(&read)
+                .contains(&raw_error)
+        );
+    }
+
+    #[test]
+    fn tool_output_display_removes_sgr_before_tool_preview_limits() {
+        let raw = format!("{}終端", "\x1b[31m字\x1b[0m".repeat(168));
+        let plain = format!("{}終端", "字".repeat(168));
+        let mut state = AppState::default();
+        state.tool_statuses.push(crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "inspect".to_string(),
+            status: ToolCallStatus::Failed,
+            summary: None,
+            error: Some(raw.clone()),
+        });
+        for display in [
+            format_tool_status_text(&state),
+            current_run_summary_text(&state, &[]),
+            format_compact_tool_rows(&state.tool_statuses),
+        ] {
+            assert!(display.contains(&plain));
+            assert!(!display.contains('\x1b'));
+            assert!(!display.contains('…'));
+        }
+        assert_eq!(state.tool_statuses[0].error.as_deref(), Some(raw.as_str()));
+        assert_eq!(state.tool_statuses[0].status, ToolCallStatus::Failed);
+    }
+
+    #[test]
+    fn tool_output_display_fallback_requires_a_tool_call_and_tool_kind() {
+        let raw = "\x1b[31m本文\x1b[0m";
+        for (kind, tool_call_id, stripped) in [
+            (
+                TranscriptKind::Error,
+                Some(crate::session::ToolCallId::new()),
+                true,
+            ),
+            (
+                TranscriptKind::Tool,
+                Some(crate::session::ToolCallId::new()),
+                true,
+            ),
+            (
+                TranscriptKind::Editing,
+                Some(crate::session::ToolCallId::new()),
+                true,
+            ),
+            (TranscriptKind::Error, None, false),
+            (TranscriptKind::Tool, None, false),
+            (
+                TranscriptKind::User,
+                Some(crate::session::ToolCallId::new()),
+                false,
+            ),
+            (
+                TranscriptKind::Assistant,
+                Some(crate::session::ToolCallId::new()),
+                false,
+            ),
+            (
+                TranscriptKind::Diff,
+                Some(crate::session::ToolCallId::new()),
+                false,
+            ),
+        ] {
+            let mut state = AppState::default();
+            state
+                .transcript_entries
+                .push(crate::tui::state::TranscriptEntry {
+                    kind,
+                    title: "Tool shell".to_string(),
+                    body: raw.to_string(),
+                    response_id: None,
+                    tool_call_id,
+                });
+            let detail = build_session_detail_from_app_state(&state);
+            assert_eq!(detail.transcript_text.contains('\x1b'), !stripped);
+            if matches!(
+                kind,
+                TranscriptKind::Error | TranscriptKind::User | TranscriptKind::Assistant
+            ) {
+                assert!(
+                    detail
+                        .transcript_rows
+                        .iter()
+                        .any(|row| row.body == if stripped { "本文" } else { raw })
+                );
+            }
+            assert_eq!(state.transcript_entries[0].body, raw);
         }
     }
 

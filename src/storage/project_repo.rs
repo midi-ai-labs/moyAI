@@ -323,6 +323,12 @@ impl SqliteProjectRepository {
             params![id.to_string()],
         )?;
         tx.execute(
+            "DELETE FROM agent_mailbox_messages
+             WHERE root_session_id IN (SELECT id FROM sessions WHERE project_id = ?1)
+                OR recipient_session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
             "DELETE FROM protocol_turn_items
              WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
             params![id.to_string()],
@@ -587,6 +593,111 @@ mod tests {
             )
             .await
             .expect("reviewer edge");
+
+        let root_turn = TurnId::new();
+        let root_admission = repository
+            .admit_session_turn(sessions[0].id, root_turn)
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        let child_turn = TurnId::new();
+        let child_admission = repository
+            .admit_session_turn(sessions[1].id, child_turn)
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+        for payload in ["delivered message", "discarded message"] {
+            repository
+                .append_inter_agent_communication_for_caller_turn_with_protocol_bundle_and_capacity(
+                    sessions[1].id,
+                    child_admission.admission_id,
+                    child_turn,
+                    sessions[0].id,
+                    crate::protocol::InterAgentCommunication {
+                        author: "/root/worker".into(),
+                        recipient: "/root".into(),
+                        content: crate::protocol::render_inter_agent_message(
+                            crate::protocol::InterAgentMessageType::Message,
+                            "/root",
+                            "/root/worker",
+                            payload,
+                        ),
+                        trigger_turn: false,
+                    },
+                    true,
+                    true,
+                )
+                .expect("enqueue child message");
+        }
+        repository
+            .deliver_pending_agent_mail_for_admitted_turn_with_selector(
+                sessions[0].id,
+                root_admission.admission_id,
+                root_turn,
+                crate::storage::session_repo::AgentMailboxDeliverySelector::AllPending,
+                1,
+            )
+            .expect("deliver first message");
+        repository
+            .record_agent_tree_stop_fence(
+                sessions[0].id,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            )
+            .await
+            .expect("discard remaining message at Stop");
+        for (session_id, admission_id, turn_id, cause) in [
+            (
+                sessions[0].id,
+                root_admission.admission_id,
+                root_turn,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            ),
+            (
+                sessions[1].id,
+                child_admission.admission_id,
+                child_turn,
+                crate::protocol::TurnInterruptionCause::TreeStopped,
+            ),
+        ] {
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &crate::session::RunEvent::TurnTerminal {
+                        session_id,
+                        terminal: Box::new(crate::session::DurableTurnTerminal {
+                            outcome: crate::protocol::TurnTerminalOutcome::Interrupted { cause },
+                            final_response_id: None,
+                            tool_call_count: 0,
+                            failed_tool_count: 0,
+                            change_count: 0,
+                            metrics: Default::default(),
+                        }),
+                    },
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("settle stopped owner");
+        }
+        let states = {
+            let project_repository = store.project_repo();
+            let connection = project_repository.connection.lock().expect("sqlite mutex");
+            let mut statement = connection
+                .prepare("SELECT state FROM agent_mailbox_messages ORDER BY state")
+                .expect("mailbox query");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("mailbox states")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("mailbox rows")
+        };
+        assert_eq!(states, ["delivered", "discarded"]);
+        SqliteStore::open(store.paths())
+            .expect("reopen valid mailbox database")
+            .migrate()
+            .expect("mailbox identities are valid before deletion");
 
         store
             .project_repo()

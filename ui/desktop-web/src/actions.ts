@@ -16,6 +16,7 @@ import { snapshotAgentInterruptTarget } from "./agent_interrupt_contract.ts";
 import { snapshotPromptReviewMutationTarget } from "./composer_target_contract.ts";
 import {
   beginConfigMutation,
+  configCommandValues,
   configMutationPending,
   finishConfigMutation,
   replaceCompleteConfigDraft,
@@ -155,6 +156,7 @@ export interface ActionContext {
   loadSideChatModels: (args: {
     baseUrl: string;
     providerProfile: ProviderProfile;
+    apiKeyEnv: string;
     expectedConfigGeneration: string;
   }) => Promise<SideChatCatalogResult>;
   jumpToHistoryAnchor: (anchorId: string) => void;
@@ -633,7 +635,7 @@ async function finishInitialSetupFlow(
     const [nextState, succeeded] = await command<[DesktopWebState, boolean]>(
       "finish_initial_setup",
       {
-        values,
+        values: configCommandValues(context.uiState, state.config_target, values),
         expectedConfigTarget: finishRequest.configTarget,
         expectedSetupTarget: finishRequest.setupTarget,
         importGeneration: imported?.importGeneration ?? null,
@@ -1084,6 +1086,7 @@ async function loadSideChatModels(state: DesktopWebState, context: ActionContext
     const result = await context.loadSideChatModels({
       baseUrl: request.baseUrl,
       providerProfile: request.providerProfile,
+      apiKeyEnv: request.apiKeyEnv,
       expectedConfigGeneration: request.configGeneration,
     });
     const settlement = finishSideChatCatalogLoad(
@@ -1631,6 +1634,7 @@ const ACTION_DEFINITIONS = [
   { id: "hub-refresh", label: "Hubの最新情報を取得", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && !model.local.hub.pending, run: (_state, context) => refreshHub(context) },
   { id: "hub-save-main", label: "メインチャットのHubモデルを保存", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && hubCanSave(model.local.hub, "main"), run: (_state, context) => saveHubReview(context, "main") },
   { id: "hub-save-side", label: "サイドチャットのHubモデルを保存", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && hubCanSave(model.local.hub, "side_chat"), run: (_state, context) => saveHubReview(context, "side_chat") },
+  { id: "hub-save-approve", label: "ApproveのHubモデルを保存", enabled: (state, _payload, model) => ["hub", "config"].includes(state.overlay) && hubCanSave(model.local.hub, "approve"), run: (_state, context) => saveHubReview(context, "approve") },
   {
     id: "show-session-settings",
     label: "このチャットの設定",

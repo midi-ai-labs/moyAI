@@ -3027,9 +3027,19 @@ mod command_projection_owner_tests {
             .model
             .extra_headers
             .insert("X-Import-Secret".to_string(), second_secret.to_string());
+        second.approve = Some(crate::config::ApproveConfig::from_model(&second.model));
         let (second_generation, _) = controller
             .stage_initial_setup_config_import(second)
             .expect("stage replacement import");
+        assert!(
+            controller
+                .pending_initial_setup_config_import
+                .as_ref()
+                .unwrap()
+                .config
+                .approve
+                .is_some()
+        );
         let redacted_values = ConfigField::ALL
             .into_iter()
             .filter(|field| !field.is_host_owned_generation())
@@ -3049,6 +3059,67 @@ mod command_projection_owner_tests {
                 .is_err(),
             "a second import must invalidate the first raw owner"
         );
+        let sparse_commit_values = redacted_values
+            .iter()
+            .filter(|(key, _)| {
+                !ConfigField::ALL.into_iter().any(|field| {
+                    field.label() == key
+                        && (field.is_connection_private_value()
+                            || field.label().starts_with("approve."))
+                })
+            })
+            .cloned()
+            .collect();
+        let sparse_hydrated = controller
+            .hydrate_initial_setup_import_sensitive_values(
+                sparse_commit_values,
+                Some(second_generation),
+            )
+            .expect("current imported snapshot with unchanged private fields omitted");
+        assert!(
+            sparse_hydrated.iter().any(|(key, value)| {
+                key == ConfigField::ExtraHeadersJson.label() && value.contains(second_secret)
+            }),
+            "same-target Finish must retain the imported header when the Web commit omits its redacted field"
+        );
+        for (field, value) in [
+            (ConfigField::BaseUrl, "http://changed-import-target.test"),
+            (ConfigField::ProviderProfile, "openai"),
+        ] {
+            for omit_private in [false, true] {
+                let changed_target_values = redacted_values
+                    .iter()
+                    .filter(|(key, _)| {
+                        !omit_private
+                            || !ConfigField::ALL.into_iter().any(|field| {
+                                field.label() == key && field.is_connection_private_value()
+                            })
+                    })
+                    .map(|(key, text)| {
+                        (
+                            key.clone(),
+                            if key == field.label() {
+                                value.to_string()
+                            } else {
+                                text.clone()
+                            },
+                        )
+                    })
+                    .collect();
+                let hydrated = controller
+                    .hydrate_initial_setup_import_sensitive_values(
+                        changed_target_values,
+                        Some(second_generation),
+                    )
+                    .expect("changed imported connection target");
+                assert!(
+                    !hydrated.iter().any(|(key, text)| {
+                        key == ConfigField::ExtraHeadersJson.label() && text.contains(second_secret)
+                    }),
+                    "an omitted or redacted header must not authorize the changed imported target"
+                );
+            }
+        }
         let hydrated = controller
             .hydrate_initial_setup_import_sensitive_values(
                 redacted_values.clone(),
@@ -3093,6 +3164,12 @@ mod command_projection_owner_tests {
         assert!(
             controller.pending_initial_setup_config_import.is_none(),
             "raw imported secrets must be dropped as soon as their exact config owner drifts"
+        );
+        assert!(
+            controller
+                .hydrate_initial_setup_import_sensitive_values(Vec::new(), Some(second_generation),)
+                .is_err(),
+            "another settings owner cannot reuse the imported approval snapshot"
         );
     }
 
@@ -4444,6 +4521,7 @@ mod command_projection_owner_tests {
             defaults.model = "first-side-model".to_string();
             defaults.system_prompt = "FIRST_SIDE_PROMPT".to_string();
             defaults.provider_profile = ProviderProfile::OpenAiCompatible;
+            defaults.api_key_env = Some("FIRST_SIDE_KEY".to_string());
             defaults.context_window = 65_536;
         }
 
@@ -4460,6 +4538,7 @@ mod command_projection_owner_tests {
         assert_eq!(first.model, "first-side-model");
         assert_eq!(first.system_prompt, "FIRST_SIDE_PROMPT");
         assert_eq!(first.context_window, 65_536);
+        assert_eq!(first.api_key_env.as_deref(), Some("FIRST_SIDE_KEY"));
 
         controller
             .state
@@ -4474,6 +4553,12 @@ mod command_projection_owner_tests {
             .side_chat
             .system_prompt = "SECOND_SIDE_PROMPT".to_string();
         controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .api_key_env = Some("SECOND_SIDE_KEY".to_string());
+        controller
             .ensure_side_chat(owner_session_id)
             .expect("existing Side Chat remains stable");
         let unchanged = controller
@@ -4486,6 +4571,15 @@ mod command_projection_owner_tests {
         assert_eq!(unchanged.id, first.id);
         assert_eq!(unchanged.model, "first-side-model");
         assert_eq!(unchanged.system_prompt, "FIRST_SIDE_PROMPT");
+        assert_eq!(unchanged.api_key_env, first.api_key_env);
+        assert_eq!(
+            controller.side_chat_projection().api_key_env,
+            "FIRST_SIDE_KEY"
+        );
+        let request = side_chat_request_profile(&unchanged);
+        assert_eq!(request.api_key_env, first.api_key_env);
+        assert_eq!(request.base_url, first.base_url);
+        assert!(request.extra_headers.is_empty());
 
         controller
             .delete_side_chat(owner_session_id, first.id, first.request_generation)
@@ -4512,6 +4606,71 @@ mod command_projection_owner_tests {
         assert_ne!(replacement.id, first.id);
         assert_eq!(replacement.model, "second-side-model");
         assert_eq!(replacement.system_prompt, "SECOND_SIDE_PROMPT");
+        assert_eq!(replacement.api_key_env.as_deref(), Some("SECOND_SIDE_KEY"));
+        assert_eq!(
+            controller.side_chat_projection().api_key_env,
+            "SECOND_SIDE_KEY"
+        );
+    }
+
+    #[tokio::test]
+    async fn side_chat_authentication_requires_an_explicit_independent_reference() {
+        let (_temp, _root, mut controller, owner) = side_chat_test_controller().await;
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .api_key_env = Some("SHARED_PROVIDER_KEY".to_string());
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .extra_headers
+            .insert("X-Main-Secret".to_string(), "main-only-header".to_string());
+        controller
+            .ensure_side_chat(owner)
+            .expect("anonymous Side default");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.api_key_env, None);
+        assert_eq!(side_chat_request_profile(&binding).api_key_env, None);
+        assert!(side_chat_request_profile(&binding).extra_headers.is_empty());
+        controller
+            .delete_side_chat(owner, binding.id, binding.request_generation)
+            .unwrap();
+
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .api_key_env = Some("SHARED_PROVIDER_KEY".to_string());
+        controller
+            .ensure_side_chat(owner)
+            .expect("explicit same reference");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            side_chat_request_profile(&binding).api_key_env.as_deref(),
+            Some("SHARED_PROVIDER_KEY")
+        );
+        assert!(side_chat_request_profile(&binding).extra_headers.is_empty());
+        assert_eq!(
+            controller.side_chat_projection().api_key_env,
+            "SHARED_PROVIDER_KEY"
+        );
     }
 
     #[tokio::test]
@@ -11076,10 +11235,8 @@ fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfil
         max_retries: binding.max_retries,
         context_window: binding.context_window,
         system_prompt: side_chat_system_prompt(&binding.system_prompt),
-        // Side-chat provider credentials are deliberately isolated from the main task target.
-        // A future credential surface must persist its own reference rather than inheriting the
-        // main provider's environment variable or request headers.
-        api_key_env: None,
+        // Use the Side binding's explicit reference; Main is a separate authority.
+        api_key_env: binding.api_key_env.clone(),
         extra_headers: Default::default(),
     }
 }
@@ -11566,6 +11723,7 @@ impl DesktopController {
             current_owner_append_position.map(|position| position.to_string());
         let context_truncated = false;
         let side_chat_defaults = &self.state.provider_config.effective_config.side_chat;
+        let default_api_key_env = side_chat_defaults.api_key_env.clone().unwrap_or_default();
         let default_base_url = side_chat_defaults.base_url.clone();
         let default_model = side_chat_defaults.model.clone();
         let default_system_prompt = side_chat_defaults.system_prompt.clone();
@@ -11584,6 +11742,7 @@ impl DesktopController {
                     system_prompt: default_system_prompt,
                     base_url: default_base_url,
                     provider_profile: default_profile,
+                    api_key_env: default_api_key_env,
                     status: "failed".to_string(),
                     phase: "storage read failed".to_string(),
                     last_error: error.to_string(),
@@ -11600,6 +11759,7 @@ impl DesktopController {
                 system_prompt: default_system_prompt,
                 base_url: default_base_url,
                 provider_profile: default_profile,
+                api_key_env: default_api_key_env,
                 status: "idle".to_string(),
                 last_error: self
                     .side_chat_errors
@@ -11695,6 +11855,7 @@ impl DesktopController {
             system_prompt: binding.system_prompt,
             base_url: binding.base_url,
             provider_profile: binding.provider_profile.as_str().to_string(),
+            api_key_env: binding.api_key_env.unwrap_or_default(),
             status: active
                 .map(|_| "running".to_string())
                 .unwrap_or_else(|| durable.status.key().to_string()),
@@ -11811,6 +11972,7 @@ impl DesktopController {
             defaults.base_url = hub.endpoint;
             defaults.model = review.selection.preferred_model_id;
             defaults.provider_profile = ProviderProfile::OpenAiCompatible;
+            defaults.api_key_env = None;
         }
         let mut target =
             SideChatProviderTarget::try_from(&defaults).map_err(|error| error.to_string())?;
@@ -12200,6 +12362,9 @@ impl DesktopController {
                     || self.state.prompt_enhance_pending()
             }
             crate::hub::HubReviewContext::SideChat => !self.side_chat_runs.is_empty(),
+            crate::hub::HubReviewContext::Approve => {
+                self.run_lifecycle.root_is_active() || self.current_agent_tree_active()
+            }
         }
     }
 
@@ -14893,6 +15058,15 @@ impl DesktopController {
                 return false;
             }
         };
+        let candidate = match expected_import_generation.and_then(|generation| {
+            self.pending_initial_setup_config_import
+                .as_ref()
+                .filter(|import| import.generation == generation)
+                .and_then(|import| import.config.approve.clone())
+        }) {
+            Some(approve) => candidate.with_imported_approve(approve),
+            None => candidate,
+        };
         let save_result = candidate.save_global(
             &self.app.workspace.root,
             GlobalConfigAdoptionPolicy::StrictCurrentSchema,
@@ -15091,6 +15265,25 @@ impl DesktopController {
             .ok_or_else(|| {
                 "the imported configuration owner changed; import the TOML again".to_string()
             })?;
+        let connection_values = values
+            .iter()
+            .filter_map(|(key, text)| {
+                [ConfigField::BaseUrl, ConfigField::ProviderProfile]
+                    .into_iter()
+                    .find(|field| field.label() == key)
+                    .map(|field| (field, text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let final_config = apply_config_patch(
+            self.state.global_config().clone(),
+            crate::config::field::parse_config_field_patch(&connection_values)?,
+        );
+        let same_imported_connection =
+            crate::config::ProviderEndpoint::parse(&final_config.model.base_url)
+                .map_err(|error| error.to_string())?
+                == crate::config::ProviderEndpoint::parse(&candidate.config.model.base_url)
+                    .map_err(|error| error.to_string())?
+                && final_config.model.provider_profile == candidate.config.model.provider_profile;
         for (key, text) in &mut values {
             let Some(field) = ConfigField::ALL
                 .into_iter()
@@ -15098,9 +15291,22 @@ impl DesktopController {
             else {
                 continue;
             };
-            if field.is_sensitive() && text.trim().is_empty() {
+            if field.is_sensitive()
+                && text.trim().is_empty()
+                && (field != ConfigField::ExtraHeadersJson || same_imported_connection)
+            {
                 *text = field.editor_value(&candidate.config);
             }
+        }
+        if same_imported_connection
+            && !values
+                .iter()
+                .any(|(key, _)| key == ConfigField::ExtraHeadersJson.label())
+        {
+            values.push((
+                ConfigField::ExtraHeadersJson.label().to_string(),
+                ConfigField::ExtraHeadersJson.editor_value(&candidate.config),
+            ));
         }
         Ok(values)
     }

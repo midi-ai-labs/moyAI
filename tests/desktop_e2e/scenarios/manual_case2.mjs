@@ -90,7 +90,9 @@ async function preparePrivateCapture({ context, sink, options, captureDirectory 
   if (powershell === null) throw new DesktopE2eError("environment", "case2-powershell-unavailable", "existing PowerShell 7 executable is unavailable on PATH", {});
   const stdoutPath = path.join(context.paths.logs, "case2-capture-acl.stdout.log");
   const stderrPath = path.join(context.paths.logs, "case2-capture-acl.stderr.log");
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ![options.apiKeyEnv.toLowerCase(), "temp", "tmp", "tmpdir"].includes(key.toLowerCase())));
+  const excluded = [options.apiKeyEnv, options.sideApiKeyEnv, options.approveApiKeyEnv, "temp", "tmp", "tmpdir"]
+    .filter(value => typeof value === "string").map(value => value.toLowerCase());
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !excluded.includes(key.toLowerCase())));
   Object.assign(env, { TEMP: context.paths.logs, TMP: context.paths.logs, TMPDIR: context.paths.logs });
   const result = await runWindowsExternalProcess({ executionRoot: context.root, executable: powershell,
     args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", ACL_SCRIPT, "-ExecutionRoot", context.root, "-CaptureDirectory", captureDirectory],

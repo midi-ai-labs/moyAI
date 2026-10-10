@@ -2,6 +2,7 @@
 use super::*;
 use crate::config::{AccessMode, ProviderProfile};
 use crate::mcp_publish::PublishAuthentication;
+use crate::protocol::ProtocolEventStore;
 use crate::session::ProjectRepository;
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -866,7 +867,24 @@ async fn completed_remote_server_survives_workspace_rebuild_and_profile_stop_dra
         .and_then(|message| message["content"].as_str())
         .map(str::to_owned)
         .expect("the receiver reports the real shell_start result to its provider");
-    let start_result: Value = serde_json::from_str(&start_result).unwrap();
+    let stored_jobs = app.store.remote_job_store().recent_all(64).unwrap();
+    assert_eq!(stored_jobs.len(), 1);
+    let canonical_outputs = app
+        .store
+        .protocol_event_store()
+        .list_history_items_for_session(stored_jobs[0].session_id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|item| match item.payload {
+            crate::protocol::HistoryItemPayload::ToolOutput { output_text, .. } => {
+                Some(output_text)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(canonical_outputs.len(), 1);
+    assert_eq!(start_result, canonical_outputs[0]);
+    let start_result: Value = serde_json::from_str(&canonical_outputs[0]).unwrap();
     assert_eq!(start_result["state"], "running", "{start_result}");
     assert!(start_result["pid"].as_u64().is_some_and(|pid| pid > 0));
     assert!(

@@ -23,38 +23,46 @@ test("enrollment acceptance requires the same actual device at both endpoints", 
 });
 
 test("independent model acceptance rejects route mismatch, stale review and leaked other-context selection", () => {
-  const hub = { status: "connected", main_confirmation: "confirmed", side_chat_confirmation: "confirmed", main_mode: "hub", side_chat_mode: "hub",
+  const hub = { status: "connected", main_confirmation: "confirmed", side_chat_confirmation: "confirmed", approve_confirmation: "confirmed",
+    main_mode: "hub", side_chat_mode: "hub", approve_mode: "hub",
     main_review: { selection: { preferred_model_id: "main", allowed_model_ids: ["main"] } },
-    side_chat_review: { selection: { preferred_model_id: "side", allowed_model_ids: ["side"] } } };
-  assert.equal(independentSelectionsAccepted(hub, "main", "side"), true);
-  assert.equal(independentSelectionsAccepted({ ...hub, side_chat_mode: "direct" }, "main", "side"), false);
-  assert.equal(independentSelectionsAccepted({ ...hub, main_confirmation: "review_required" }, "main", "side"), false);
-  assert.equal(independentSelectionsAccepted({ ...hub, side_chat_review: hub.main_review }, "main", "side"), false);
+    side_chat_review: { selection: { preferred_model_id: "side", allowed_model_ids: ["side"] } },
+    approve_review: { selection: { preferred_model_id: "approve", allowed_model_ids: ["approve"] } } };
+  assert.equal(independentSelectionsAccepted(hub, "main", "side", "approve"), true);
+  assert.equal(independentSelectionsAccepted({ ...hub, side_chat_mode: "direct" }, "main", "side", "approve"), false);
+  assert.equal(independentSelectionsAccepted({ ...hub, main_confirmation: "review_required" }, "main", "side", "approve"), false);
+  assert.equal(independentSelectionsAccepted({ ...hub, side_chat_review: hub.main_review }, "main", "side", "approve"), false);
+  assert.equal(independentSelectionsAccepted({ ...hub, approve_review: hub.main_review }, "main", "side", "approve"), false);
+  assert.equal(independentSelectionsAccepted({ ...hub, approve_review: null }, "main", "side", "approve"), false);
+  assert.equal(independentSelectionsAccepted({ ...hub, approve_confirmation: "review_required" }, "main", "side", "approve"), false);
   const additional = structuredClone(hub); additional.main_review.selection.allowed_model_ids.push("side");
-  assert.equal(independentSelectionsAccepted(additional, "main", "side"), false);
+  assert.equal(independentSelectionsAccepted(additional, "main", "side", "approve"), false);
 });
 
 test("enrolled idle shell permits heartbeat polling while rejecting jobs, dialogs and stale routes", () => {
   const value = { prompt_enabled: true, prompt_center_hit: true, blocking_dialogs: 0,
     state: { async_polling_required: true, device_network: { enrollment: "active" },
-      hub: { status: "connected", main_confirmation: "confirmed", side_chat_confirmation: "confirmed", main_mode: "hub", side_chat_mode: "hub",
+      hub: { status: "connected", main_confirmation: "confirmed", side_chat_confirmation: "confirmed", approve_confirmation: "confirmed",
+        main_mode: "hub", side_chat_mode: "hub", approve_mode: "hub",
         main_review: { selection: { preferred_model_id: "main", allowed_model_ids: ["main"] } },
-        side_chat_review: { selection: { preferred_model_id: "side", allowed_model_ids: ["side"] } } },
+        side_chat_review: { selection: { preferred_model_id: "side", allowed_model_ids: ["side"] } },
+        approve_review: { selection: { preferred_model_id: "approve", allowed_model_ids: ["approve"] } } },
       overlay: "none", run_status_key: "idle", busy: false, provider_loading: false,
       confirmation_visible: false, background_mutation_pending: false, pending_async_operations: [],
       navigation_loading: false, navigation_admission_open: true, can_submit: true,
     } };
-  assert.equal(connectedShellAccepted(value, "main", "side"), true);
+  assert.equal(connectedShellAccepted(value, "main", "side", "approve"), true);
   for (const mutate of [
     next => { next.state.pending_async_operations = ["remote_job"]; },
     next => { next.state.device_network.enrollment = "pending"; },
     next => { next.state.run_status_key = "running"; },
     next => { next.state.busy = true; },
     next => { next.state.hub.main_mode = "direct"; },
+    next => { next.state.hub.approve_mode = "direct"; },
     next => { next.blocking_dialogs = 1; },
     next => { next.prompt_center_hit = false; },
   ]) {
     const next = structuredClone(value); mutate(next);
-    assert.equal(connectedShellAccepted(next, "main", "side"), false);
+    assert.equal(connectedShellAccepted(next, "main", "side", "approve"), false);
   }
 });

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::HubRouteMode;
 use super::{HubCatalogBaseline, HubError, ReviewedHubSelection, bounded_text, valid_id};
 
-// Two bounded public catalog snapshots (128 models / 32 capabilities each), plus preferences.
-pub(super) const MAX_SETTINGS_BYTES: usize = 32 * 1024 * 1024;
+// Three bounded public catalog snapshots (128 models / 32 capabilities each), plus preferences.
+pub(super) const MAX_SETTINGS_BYTES: usize = 48 * 1024 * 1024;
 
 /// Application-owned preferences only. Runtime credentials and provider allocations cannot
 /// be represented by this strict, versioned document. Revision zero means never saved.
@@ -23,35 +23,47 @@ pub struct HubSettings {
     pub main_review: Option<ReviewedHubSelection>,
     pub side_chat_review: Option<ReviewedHubSelection>,
     #[serde(default)]
+    pub approve_review: Option<ReviewedHubSelection>,
+    #[serde(default)]
     pub main_catalog_baseline: Option<HubCatalogBaseline>,
     #[serde(default)]
     pub side_chat_catalog_baseline: Option<HubCatalogBaseline>,
+    #[serde(default)]
+    pub approve_catalog_baseline: Option<HubCatalogBaseline>,
     #[serde(default)]
     pub main_mode: HubRouteMode,
     #[serde(default)]
     pub side_chat_mode: HubRouteMode,
     #[serde(default)]
+    pub approve_mode: HubRouteMode,
+    #[serde(default)]
     pub main_uses_default: bool,
     #[serde(default)]
     pub side_chat_uses_default: bool,
+    #[serde(default)]
+    pub approve_uses_default: bool,
 }
 
 impl Default for HubSettings {
     fn default() -> Self {
         Self {
-            schema_version: 4,
+            schema_version: 5,
             revision: "0".into(),
             endpoint: String::new(),
             label: "moyAI Desktop".into(),
             hub_id: None,
             main_review: None,
             side_chat_review: None,
+            approve_review: None,
             main_catalog_baseline: None,
             side_chat_catalog_baseline: None,
+            approve_catalog_baseline: None,
             main_mode: HubRouteMode::Direct,
             side_chat_mode: HubRouteMode::Direct,
+            approve_mode: HubRouteMode::Direct,
             main_uses_default: false,
             side_chat_uses_default: false,
+            approve_uses_default: false,
         }
     }
 }
@@ -65,7 +77,7 @@ pub(super) fn decimal(value: &str) -> Option<u64> {
 
 impl HubSettings {
     fn validate(&self) -> Result<(), HubError> {
-        if self.schema_version != 4
+        if self.schema_version != 5
             || decimal(&self.revision).is_none()
             || !bounded_text(&self.label, 256)
         {
@@ -75,6 +87,7 @@ impl HubSettings {
             if self.hub_id.is_some()
                 || self.main_review.is_some()
                 || self.side_chat_review.is_some()
+                || self.approve_review.is_some()
             {
                 return Err(HubError::SettingsInvalid);
             }
@@ -87,9 +100,13 @@ impl HubSettings {
                 return Err(HubError::SettingsInvalid);
             }
         }
-        for review in [&self.main_review, &self.side_chat_review]
-            .into_iter()
-            .flatten()
+        for review in [
+            &self.main_review,
+            &self.side_chat_review,
+            &self.approve_review,
+        ]
+        .into_iter()
+        .flatten()
         {
             if Some(&review.hub_id) != self.hub_id.as_ref() {
                 return Err(HubError::SettingsInvalid);
@@ -102,6 +119,7 @@ impl HubSettings {
         for (review, baseline) in [
             (&self.main_review, &self.main_catalog_baseline),
             (&self.side_chat_review, &self.side_chat_catalog_baseline),
+            (&self.approve_review, &self.approve_catalog_baseline),
         ] {
             if let Some(baseline) = baseline {
                 baseline
@@ -111,6 +129,7 @@ impl HubSettings {
         }
         if (self.main_mode == HubRouteMode::Hub && self.main_review.is_none())
             || (self.side_chat_mode == HubRouteMode::Hub && self.side_chat_review.is_none())
+            || (self.approve_mode == HubRouteMode::Hub && self.approve_review.is_none())
         {
             return Err(HubError::SettingsInvalid);
         }
@@ -148,6 +167,14 @@ impl HubSettingsStore {
             serde_json::from_slice(&bytes).map_err(|_| HubError::SettingsInvalid)?;
         let has_baselines = value.get("main_catalog_baseline").is_some()
             || value.get("side_chat_catalog_baseline").is_some();
+        let has_approve_fields = [
+            "approve_review",
+            "approve_catalog_baseline",
+            "approve_mode",
+            "approve_uses_default",
+        ]
+        .into_iter()
+        .any(|field| value.get(field).is_some());
         match value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -155,29 +182,44 @@ impl HubSettingsStore {
             Some(1)
                 if value.get("main_mode").is_none()
                     && value.get("side_chat_mode").is_none()
-                    && !has_baselines => {}
+                    && !has_baselines
+                    && !has_approve_fields => {}
             Some(2)
                 if value.get("main_mode").is_some()
                     && value.get("side_chat_mode").is_some()
-                    && !has_baselines => {}
+                    && !has_baselines
+                    && !has_approve_fields => {}
             Some(3)
                 if value.get("main_mode").is_some()
                     && value.get("side_chat_mode").is_some()
                     && value.get("main_catalog_baseline").is_some()
-                    && value.get("side_chat_catalog_baseline").is_some() => {}
+                    && value.get("side_chat_catalog_baseline").is_some()
+                    && !has_approve_fields => {}
             Some(4)
                 if value.get("main_mode").is_some()
                     && value.get("side_chat_mode").is_some()
                     && value.get("main_catalog_baseline").is_some()
                     && value.get("side_chat_catalog_baseline").is_some()
                     && value.get("main_uses_default").is_some()
-                    && value.get("side_chat_uses_default").is_some() => {}
+                    && value.get("side_chat_uses_default").is_some()
+                    && !has_approve_fields => {}
+            Some(5)
+                if value.get("main_mode").is_some()
+                    && value.get("side_chat_mode").is_some()
+                    && value.get("approve_mode").is_some()
+                    && value.get("main_catalog_baseline").is_some()
+                    && value.get("side_chat_catalog_baseline").is_some()
+                    && value.get("approve_catalog_baseline").is_some()
+                    && value.get("main_uses_default").is_some()
+                    && value.get("side_chat_uses_default").is_some()
+                    && value.get("approve_uses_default").is_some()
+                    && value.get("approve_review").is_some() => {}
             _ => return Err(HubError::SettingsInvalid),
         }
         // Deserialize the original bytes so duplicate object fields remain errors.
         let mut settings: HubSettings =
             serde_json::from_slice(&bytes).map_err(|_| HubError::SettingsInvalid)?;
-        settings.schema_version = 4;
+        settings.schema_version = 5;
         settings.validate()?;
         Ok(settings)
     }

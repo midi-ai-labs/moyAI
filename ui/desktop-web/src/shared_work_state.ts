@@ -1,3 +1,5 @@
+import type { FocusTargetElement, PostRenderFocusIntent } from "./focus_arbiter.ts";
+
 export interface WorkPerson { user_id: string; display_name: string }
 export interface WorkApprovalContext {
   job_id: string; project_id: string; root_id: string; conversation_id: string;
@@ -96,6 +98,36 @@ export function sharedWorkPresentation(local: SharedWorkUiState): SharedWorkPres
     prompt: local.prompt, pending: local.pending, error: local.error, conceal: local.conceal,
     confirmation: local.confirmation, editingConversationId: local.editingConversationId, renameDraft: local.renameDraft,
     editingJobId: local.editingJobId, editingJobRevision: local.editingJobRevision, revisionDraft: local.revisionDraft, draft: local.draft };
+}
+
+export function sharedEditorFocusIntent(
+  previous: SharedWorkPresentation | null,
+  current: SharedWorkPresentation,
+  latest: () => SharedWorkPresentation | null,
+  resolve: (selector: string) => FocusTargetElement | null,
+): PostRenderFocusIntent | null {
+  const rename = current.editingConversationId !== null
+    && previous?.editingConversationId !== current.editingConversationId;
+  const revise = current.editingJobId !== null
+    && previous?.editingJobId !== current.editingJobId;
+  const projection = current.projection;
+  if ((!rename && !revise) || !projection?.selected_project_id) return null;
+  const projectId = projection.selected_project_id;
+  const participation = sharedProjectParticipation(projection, projectId);
+  return {
+    source: "shared-editor", priority: "explicit-transfer", claim: { kind: "force" },
+    candidates: [{ resolve: () => resolve(rename ? "#shared-rename-title" : "#shared-revise-prompt") }],
+    isCurrent: () => {
+      const local = latest();
+      const owner = local?.projection;
+      return !!local && !!owner && owner.generation === projection.generation
+        && owner.selected_project_id === projectId
+        && owner.selected_conversation_id === projection.selected_conversation_id
+        && sharedProjectParticipation(owner, projectId) === participation
+        && (rename ? local.editingConversationId === current.editingConversationId
+          : local.editingJobId === current.editingJobId && local.editingJobRevision === current.editingJobRevision);
+    },
+  };
 }
 export function acceptSharedWork(local: SharedWorkUiState, projection: SharedWorkProjection): boolean {
   const previous = local.projection;

@@ -139,12 +139,8 @@ impl OpenSessionView {
         read.turns = turns;
         read.turns.session = read.session.clone();
         read.turn_elapsed_ms = turn_elapsed_ms;
-        read.session_token_usage = incoming.session_token_usage.clone();
-        // The queue projection and canonical transcript are read from one
-        // repository snapshot. Never merge pending input by visible text or
-        // retain it from an older page: the incoming snapshot is authoritative
-        // for the pending -> delivered transition.
-        read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
+        // Queue and usage belong to the selected metadata snapshot. An older
+        // history page may extend the transcript without restoring discarded input.
         self.stored_detail = build_session_detail_with_roots(
             &read,
             None,
@@ -663,7 +659,7 @@ fn canonical_metadata_is_newer(
     if incoming.session.updated_at_ms != existing.session.updated_at_ms {
         return incoming.session.updated_at_ms > existing.session.updated_at_ms;
     }
-    session_status_rank(incoming.session.status) > session_status_rank(existing.session.status)
+    session_status_rank(incoming.session.status) >= session_status_rank(existing.session.status)
 }
 
 const fn session_status_rank(status: crate::session::SessionStatus) -> u8 {
@@ -3064,17 +3060,43 @@ mod tests {
         )];
         let mut current = canonical_read(&completed, 0, 1, 1, items.clone());
         current.latest_turn_id = Some(turn_id);
+        current.session_token_usage.total_tokens = 42;
+        current.session_token_usage.terminal_turn_count = 1;
         let mut stale_running_session = completed.clone();
         stale_running_session.status = SessionStatus::Running;
         stale_running_session.updated_at_ms = completed.updated_at_ms.saturating_sub(1);
         stale_running_session.completed_at_ms = None;
         let mut stale = canonical_read(&stale_running_session, 0, 1, 1, items);
         stale.active_turn_id = Some(turn_id);
+        stale.pending_turn_inputs = vec![pending_input(HistoryItemId::new(), turn_id, "discarded")];
+        stale.session_token_usage.total_tokens = 12;
         let mut view = OpenSessionView::from_loaded(&current);
 
         assert!(view.merge_contiguous(&stale));
         assert_eq!(view.read.session.status, SessionStatus::Completed);
         assert_eq!(view.read.active_turn_id, None);
         assert_eq!(view.read.turns.session.status, SessionStatus::Completed);
+        assert!(view.pending_turn_inputs().is_empty());
+        assert_eq!(view.read.session_token_usage, current.session_token_usage);
+    }
+
+    #[test]
+    fn equal_metadata_page_keeps_fresh_queue_delivery_and_usage() {
+        let mut session = session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let turn_id = TurnId::new();
+        let mut current = canonical_read(&session, 0, 1, 0, Vec::new());
+        current.active_turn_id = Some(turn_id);
+        current.active_turn_sequence_no = Some(2);
+        current.pending_turn_inputs = vec![pending_input(HistoryItemId::new(), turn_id, "queued")];
+        let mut fresh = current.clone();
+        fresh.pending_turn_inputs.clear();
+        fresh.session_token_usage.total_tokens = 42;
+        let mut view = OpenSessionView::from_loaded(&current);
+
+        assert!(view.merge_contiguous(&fresh));
+        assert!(view.pending_turn_inputs().is_empty());
+        assert_eq!(view.read.session_token_usage, fresh.session_token_usage);
     }
 }

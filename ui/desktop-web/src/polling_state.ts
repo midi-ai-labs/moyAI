@@ -69,13 +69,13 @@ export function installRuntimePolling(
 export function runtimePollingRequired(
   projectionRequiresPolling: boolean,
   runStartMutationPending: boolean,
-  hub: Pick<HubProjection, "status" | "active_main" | "active_side_chat"> | null = null,
+  hub: Pick<HubProjection, "status" | "active_main" | "active_side_chat" | "active_approve"> | null = null,
   publish: Pick<PublishProjection, "profiles"> | null = null,
 ): boolean {
   // A Hub command can return its owner before the next ordinary Desktop snapshot.
   // Keep the existing poll alive across that handoff; both views come from Rust.
   return projectionRequiresPolling || runStartMutationPending
     || hub?.status === "connecting" || hub?.status === "connected"
-    || Boolean(hub?.active_main || hub?.active_side_chat)
+    || Boolean(hub?.active_main || hub?.active_side_chat || hub?.active_approve)
     || Boolean(publish?.profiles.some((row) => ["starting", "running", "stopping"].includes(row.status)));
 }

@@ -2,6 +2,7 @@ pub mod active_run;
 pub mod agent_control;
 pub mod cancel;
 pub mod clock;
+mod compaction_diagnostics;
 pub mod event_bus;
 mod local_task_executor;
 pub(crate) mod resource_admission;
@@ -33,6 +34,9 @@ pub use cancel::{
     ToolSettlementReservation,
 };
 pub use clock::{Clock, SystemClock};
+pub use compaction_diagnostics::{
+    CompactionCheckpointBudget, CompactionDiagnostic, CompactionDiagnosticOutcome,
+};
 pub use event_bus::{
     RunEventBus, RunEventPublisher, RunEventSink, RunEventSubscriber, SessionRuntimeEventHub,
     SessionRuntimeEventPublisher, SessionRuntimeEventSubscription,

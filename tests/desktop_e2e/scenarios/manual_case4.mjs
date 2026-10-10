@@ -10,7 +10,7 @@ const OUTPUTS = ["calculator.py", "design.md", "scientific_calculator.py", "test
 export function manualCase4Input(spec) { return { prompt: manualLivePrompt(spec), task: manualLiveSection(spec, "Canonical task.md", "markdown") }; }
 export function createManualCase4Scenario(raw = {}) {
   const options = normalizeManualLiveOptions(raw);
-  return createManualTextCase({ id: "manual.case4", options, specPath: SPEC,
+  return createManualTextCase({ id: "manual.case4", options, specPath: SPEC, observationTimeoutMs: 60 * 60 * 1000,
     stages: spec => [{ name: "stage1", prompt: manualCase4Input(spec).prompt }], outputs: OUTPUTS,
     async prepareWorkspace({ context, spec }) { await writeFile(path.join(context.paths.workspace, "task.md"), manualCase4Input(spec).task, { flag: "wx" }); },
     async checkStage({ context, sink, options, owner, stem, row, generated }) {

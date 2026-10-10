@@ -76,42 +76,26 @@ function taskRequest(messages) {
 }
 
 function guardianPayload(call) {
+  const executableArguments = JSON.parse(call.function.arguments);
+  delete executableArguments.description;
+  delete executableArguments.justification;
   return {
-    trusted_world_state: { schema_version: "fixture-world-state.v1" },
-    task_context: JSON.stringify({
-      authority_session_id: "01M00000000000000000000000",
-      canonical_user_authority: [
-        {
-          kind: "user_turn",
-          history_item_id: "01M00000000000000000000001",
-          text: SEED_PROMPT,
-        },
-        {
-          kind: "user_turn",
-          history_item_id: "01M00000000000000000000002",
-          text: TASK_PROMPT,
-        },
-      ],
-    }),
-    recent_committed_response: {
-      response_id: "01M00000000000000000000003",
-      assistant_text: "",
-      tool_request: {
-        call_id: call.id,
-        tool_name: call.function.name,
-        arguments_json: call.function.arguments,
-      },
-      prior_committed_tool_results: [],
-    },
-    permission_request: {
+    tool_request: { tool_name: "shell", arguments: executableArguments },
+    execution_facts: {
+      workspace_root: "C:/fixture/workspace",
       access: "shell",
-      summary: "Run the bounded fixture command",
-      details: [`Requested sandbox elevation: ${JUSTIFICATION}`],
-      targets: ["C:/fixture/workspace"],
       outside_workspace: true,
+      targets: ["C:/fixture/workspace"],
       risks: [],
+      process_sandbox_after_approval: "unrestricted",
     },
-    action_evidence: { kind: "permission_request" },
+    action_evidence: {
+      kind: "shell_execution",
+      shell_family: "power_shell",
+      cwd: "C:/fixture/workspace",
+      executable_candidates: ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"],
+      arguments: ["-NoProfile", "-Command", executableArguments.command],
+    },
   };
 }
 
@@ -242,7 +226,7 @@ test("OpenAI-compatible Chat Guardian script completes the exact four-role tool-
   assert.equal(guardian.status, 200);
   const guardianEvents = parseSse(await guardian.text());
   assert.equal(guardianEvents[0].choices[0].delta.content, JSON.stringify({
-    decision: "allow",
+    risk_level: "low",
     rationale: "bounded deterministic fixture command",
   }));
   assert.equal(guardianEvents[0].choices[0].finish_reason, "stop");

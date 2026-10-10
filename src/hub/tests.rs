@@ -13,6 +13,10 @@ fn catalog(revision: u64) -> HubCatalog {
             capabilities: BTreeSet::from(["tools".into(), "text".into()]),
         }],
         changes: vec![],
+        team_default_model_id: None,
+        team_default_side_model_id: None,
+        team_default_approve_model_id: None,
+        default_selections: Default::default(),
     }
 }
 

@@ -1,4 +1,5 @@
-export type HubContext = "main" | "side_chat";
+export type HubContext = "main" | "side_chat" | "approve";
+export const HUB_CONTEXTS = ["main", "side_chat", "approve"] as const;
 export type HubRouteMode = "direct" | "hub";
 export interface HubActiveRoute {
   turn_id: string;
@@ -39,21 +40,31 @@ export interface HubProjection {
   catalog: HubCatalog | null;
   main_review: HubReview | null;
   recommended_main_selection?: HubSelection | null;
+  recommended_side_chat_selection?: HubSelection | null;
+  recommended_approve_selection?: HubSelection | null;
   side_chat_review: HubReview | null;
+  approve_review: HubReview | null;
   main_uses_default?: boolean;
   side_chat_uses_default?: boolean;
+  approve_uses_default?: boolean;
   main_catalog_comparison?: HubCatalogComparison;
   side_chat_catalog_comparison?: HubCatalogComparison;
+  approve_catalog_comparison?: HubCatalogComparison;
   main_confirmation: "unconfirmed" | "confirmed" | "review_required";
   side_chat_confirmation: "unconfirmed" | "confirmed" | "review_required";
+  approve_confirmation: "unconfirmed" | "confirmed" | "review_required";
   main_mode: HubRouteMode;
   side_chat_mode: HubRouteMode;
+  approve_mode: HubRouteMode;
   active_main: HubActiveRoute | null;
   active_side_chat: HubActiveRoute | null;
+  active_approve: HubActiveRoute | null;
   can_enable_main_hub: boolean;
   can_enable_side_chat_hub: boolean;
+  can_enable_approve_hub: boolean;
   can_change_main_mode: boolean;
   can_change_side_chat_mode: boolean;
+  can_change_approve_mode: boolean;
   error: string | null;
 }
 export interface HubReviewTarget {
@@ -77,7 +88,7 @@ export interface HubUiState {
   label: string;
   connectionTouched: boolean;
   drafts: Record<HubContext, HubDraft>;
-  pending: "load" | "connect" | "refresh" | "main" | "side_chat" | "main_mode" | "side_chat_mode" | "disconnect" | null;
+  pending: "load" | "connect" | "refresh" | HubContext | `${HubContext}_mode` | "disconnect" | null;
   error: string;
   errorCode: string | null;
   errorContext: HubContext | "connection" | null;
@@ -95,13 +106,19 @@ export function createHubUiState(): HubUiState {
   return {
     tab: "devices",
     projection: null, endpoint: "http://127.0.0.1:9470", label: "moyAI Desktop",
-    connectionTouched: false, drafts: { main: emptyDraft(), side_chat: emptyDraft() },
+    connectionTouched: false, drafts: { main: emptyDraft(), side_chat: emptyDraft(), approve: emptyDraft() },
     pending: null, error: "", errorCode: null, errorContext: null, requestSerial: 0,
   };
 }
 export function hubPresentation(state: HubUiState): HubPresentation {
   const { requestSerial: _serial, ...presentation } = state;
   return presentation;
+}
+export function hubContextLabel(context: HubContext): string {
+  return { main: "Main（メイン）", side_chat: "Sub（サイドチャット）", approve: "Approve（承認）" }[context];
+}
+export function hubRecommendedSelection(projection: HubProjection, context: HubContext): HubSelection | null {
+  return projection[`recommended_${context}_selection`] ?? null;
 }
 export function hubReviewTarget(projection: HubProjection): HubReviewTarget | null {
   if (!projection.catalog || !projection.hub_id) return null;
@@ -118,6 +135,7 @@ export function acceptHubProjection(
   options: {
     refreshTargets?: boolean; savedContext?: HubContext; connected?: boolean;
     localSave?: { before: HubProjection; context: HubContext; kind: "review" | "mode" };
+    readStartedFrom?: HubProjection;
   } = {},
 ): boolean {
   const previous = state.projection;
@@ -132,6 +150,21 @@ export function acceptHubProjection(
     && projection.connection_generation === previous.connection_generation
     && projection.settings_revision === previous.settings_revision
     && !localSaveReceiptMatchesCurrent(previous, projection, options.localSave)) return false;
+  const readBaseline = options.readStartedFrom;
+  if (previous && readBaseline && previous !== readBaseline
+    && previous.connection_generation === readBaseline.connection_generation
+    && projection.connection_generation === previous.connection_generation
+    && previous.hub_id === readBaseline.hub_id && projection.hub_id === previous.hub_id) {
+    // Catalog reads do not own runtime admission. A poll may have observed a
+    // start or stop while this request was in flight.
+    projection = { ...projection };
+    for (const context of HUB_CONTEXTS) {
+      const active = `active_${context}` as const;
+      const canChange = `can_change_${context}_mode` as const;
+      projection[active] = previous[active];
+      projection[canChange] = previous[canChange];
+    }
+  }
   if (previous && state.error && !state.pending && projection.status === "connected" && projection.error === null) {
     const reconnected = previous.status !== "connected"
       || previous.connection_generation !== projection.connection_generation;
@@ -154,9 +187,9 @@ export function acceptHubProjection(
     state.connectionTouched = false;
   }
   const changedHub = previous?.hub_id && projection.hub_id && previous.hub_id !== projection.hub_id;
-  for (const context of ["main", "side_chat"] as const) {
+  for (const context of HUB_CONTEXTS) {
     let draft = state.drafts[context];
-    const review = context === "main" ? projection.main_review : projection.side_chat_review;
+    const review = projection[`${context}_review`];
     if (changedHub) draft = state.drafts[context] = emptyDraft();
     if (!draft.dirty || options.savedContext === context) {
       draft.selection = structuredClone(review?.selection ?? emptyDraft().selection);
@@ -174,8 +207,9 @@ export function acceptHubProjection(
       // Passive polling must not silently rebase an edit's mutation target.
       draft.target = hubReviewTarget(projection);
     }
-    if (options.refreshTargets && draft.usesDefault && projection.recommended_main_selection) {
-      draft.selection = structuredClone(projection.recommended_main_selection);
+    const recommendation = hubRecommendedSelection(projection, context);
+    if (options.refreshTargets && draft.usesDefault && recommendation) {
+      draft.selection = structuredClone(recommendation);
       draft.affinityText = String(draft.selection.affinity_turns);
       draft.capabilitiesText = draft.selection.required_capabilities.join(", ");
       // A refresh that repeats the saved default is not a local edit. Keeping
@@ -238,7 +272,7 @@ function canAdvanceDraftAfterLocalSave(
     || BigInt(after.settings_revision) !== BigInt(before.settings_revision) + 1n
     || JSON.stringify(before.catalog) !== JSON.stringify(after.catalog)
     || JSON.stringify(target) !== JSON.stringify(beforeTarget)) return false;
-  for (const channel of ["main", "side_chat"] as const) {
+  for (const channel of HUB_CONTEXTS) {
     if (save.kind !== "review" || channel !== save.context) {
       if (JSON.stringify(before[`${channel}_review`]) !== JSON.stringify(after[`${channel}_review`])) return false;
       if (before[`${channel}_uses_default`] !== after[`${channel}_uses_default`]) return false;
@@ -309,22 +343,22 @@ export function hubSaveFeedback(state: HubPresentation, context: HubContext): st
 }
 export function hubRouteMode(state: HubPresentation, context: HubContext): HubRouteMode | null {
   if (!state.projection) return null;
-  return context === "main" ? state.projection.main_mode : state.projection.side_chat_mode;
+  return state.projection[`${context}_mode`];
 }
 export function hubActiveRoute(state: HubPresentation, context: HubContext): HubActiveRoute | null {
   if (!state.projection) return null;
-  return context === "main" ? state.projection.active_main : state.projection.active_side_chat;
+  return state.projection[`active_${context}`];
 }
 export function hubRouteModeBlocker(state: HubPresentation, context: HubContext, mode: HubRouteMode): string | null {
   if (!state.projection) return "送信先の設定を読み込んでいます。";
   if (state.pending) return "現在の操作が完了するまでお待ちください。";
-  if (!(context === "main" ? state.projection.can_change_main_mode : state.projection.can_change_side_chat_mode)) return "このチャットの待機・実行が終了してから切り替えられます。";
+  if (!state.projection[`can_change_${context}_mode`]) return "待機・実行が終了してから切り替えられます。";
   if (mode === "direct") return null;
   if (state.projection.status !== "connected") return "Hubに接続してから切り替えてください。";
-  const confirmation = context === "main" ? state.projection.main_confirmation : state.projection.side_chat_confirmation;
+  const confirmation = state.projection[`${context}_confirmation`];
   if (confirmation !== "confirmed") return "利用モデルの選択を確認・保存してからHubに切り替えてください。";
   if (hubDraftHasChanges(state, context)) return "編集中のモデル選択を保存してからHubに切り替えてください。";
-  if (!(context === "main" ? state.projection.can_enable_main_hub : state.projection.can_enable_side_chat_hub)) return "現在はHubを利用できません。接続状態とモデルの対応状況を確認してください。";
+  if (!state.projection[`can_enable_${context}_hub`]) return "現在はHubを利用できません。接続状態とモデルの対応状況を確認してください。";
   return null;
 }
 export function hubCanSetRouteMode(state: HubPresentation, context: HubContext, mode: HubRouteMode): boolean {
@@ -337,13 +371,13 @@ export function hubExecutionRoute(projection: HubProjection | null | undefined, 
   blockedReason: string | null;
 } | null {
   if (!projection) return null;
-  const active = context === "main" ? projection.active_main : projection.active_side_chat;
-  const mode = context === "main" ? projection.main_mode : projection.side_chat_mode;
+  const active = projection[`active_${context}`];
+  const mode = projection[`${context}_mode`];
   if (mode !== "hub" && !active) return null;
-  const review = context === "main" ? projection.main_review : projection.side_chat_review;
+  const review = projection[`${context}_review`];
   const modelId = active?.logical_model_id ?? review?.selection.preferred_model_id ?? "";
   const modelLabel = projection.catalog?.models.find((model) => model.id === modelId)?.label || modelId || "モデル未確認";
-  const confirmation = context === "main" ? projection.main_confirmation : projection.side_chat_confirmation;
+  const confirmation = projection[`${context}_confirmation`];
   return {
     modelLabel: `${active?.logical_model_id ? "使用中" : "優先モデル"}: ${modelLabel}`,
     endpointLabel: "Hubで割当",
@@ -351,7 +385,7 @@ export function hubExecutionRoute(projection: HubProjection | null | undefined, 
     blockedReason: active ? null : projection.status !== "connected"
       ? "Hubに接続してください。送信先はHubのままです。"
       : confirmation !== "confirmed" ? "Hubのモデル選択を再確認・保存してください。"
-        : !(context === "main" ? projection.can_enable_main_hub : projection.can_enable_side_chat_hub)
+        : !projection[`can_enable_${context}_hub`]
           ? "現在はHubで実行できません。接続とモデルの対応状況を確認してください。" : null,
   };
 }
@@ -389,11 +423,11 @@ export function editHubField(state: HubUiState, field: string, value: string, ch
   }
   if (field === "token") { state.connectionTouched = true; return; }
   const [context, key, ...idParts] = field.split(":");
-  if (context !== "main" && context !== "side_chat") return;
+  if (context !== "main" && context !== "side_chat" && context !== "approve") return;
   const draft = state.drafts[context];
   if (key === "choice") {
     if (state.projection?.status !== "connected" || hubActiveRoute(state, context)) return;
-    const recommended = state.projection.recommended_main_selection;
+    const recommended = hubRecommendedSelection(state.projection, context);
     if (value === ":hub-default" && recommended) {
       draft.selection = structuredClone(recommended);
       draft.usesDefault = true;

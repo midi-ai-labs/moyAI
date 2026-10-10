@@ -427,6 +427,19 @@ fn fixture_task_text(request: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn fixture_is_guardian_request(request: &Value) -> bool {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("independent permission guardian"))
+        })
+}
+
 impl Provider {
     async fn start() -> Self {
         let parent_calls = Arc::new(AtomicUsize::new(0));
@@ -447,12 +460,12 @@ impl Provider {
                     captured.lock().unwrap().push(request.clone());
                     let task_text = fixture_task_text(&request);
                     let approval_case = task_text.contains("approval-fixture") || task_text.contains("cancel-fixture");
-                    let (delta,finish) = if task_text.contains("guardian-handoff-fixture") {
-                        let is_guardian = request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "system" && message["content"].as_str().is_some_and(|content| content.contains("independent permission guardian")));
+                    let is_guardian = fixture_is_guardian_request(&request);
+                    let (delta,finish) = if is_guardian || task_text.contains("guardian-handoff-fixture") {
                         if is_guardian {
                             assert!(request["tools"].is_null() || request["tools"].as_array().is_some_and(Vec::is_empty));
                             assert!(request["tool_choice"].is_null());
-                            (json!({"role":"assistant","content":json!({"decision":"ask_user","rationale":"WinB側の作業フォルダに確認用ファイルを作成してよいか確認してください。"}).to_string()}),"stop")
+                            (json!({"role":"assistant","content":json!({"risk_level":"high","rationale":"WinB側の作業フォルダに確認用ファイルを作成してよいか確認してください。"}).to_string()}),"stop")
                         } else if request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool" && message["tool_call_id"] == "guardian-handoff-effect") {
                             (json!({"role":"assistant","content":"Human-approved shared effect completed once"}),"stop")
                         } else {
@@ -599,6 +612,36 @@ async fn scripted_provider_routes_child_assignment_separately_from_root_context(
             );
         }
     }
+    let request_start = provider.requests.lock().unwrap().len();
+    let response = http
+        .post(format!("{}/chat/completions", provider.endpoint))
+        .json(&json!({
+            "model": "fixture-child",
+            "messages": [
+                {"role": "system", "content": include_str!("../../../assets/prompts/permission_guardian.md")},
+                {"role": "user", "content": "Review the controlled shell effect creating guardian-handoff.txt."},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let stream = response.text().await.unwrap();
+    let first: Value = serde_json::from_str(
+        stream
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    let assessment: Value =
+        serde_json::from_str(first["choices"][0]["delta"]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(assessment["risk_level"], "high");
+    let requests = provider.requests.lock().unwrap();
+    let review_requests = &requests[request_start..];
+    assert_eq!(review_requests.len(), 1);
+    assert!(fixture_is_guardian_request(&review_requests[0]));
+    assert!(!fixture_task_text(&review_requests[0]).contains("guardian-handoff-fixture"));
 }
 
 async fn shared_post(
@@ -1448,6 +1491,7 @@ async fn real_hub_scenario() {
         // The running host captured its mapping at startup. Keep no temporary mode on disk.
         std::fs::write(&restore.path, &restore.original).unwrap();
     }
+    let handoff_request_start = provider.requests.lock().unwrap().len();
     let handoff = shared_post(http,&url,token,"jobs",json!({"request_id":"guardian-handoff-request","project_id":"project","environment_id":"solver","title":"Guardian human confirmation","input":{"version":1,"prompt":"guardian-handoff-fixture: create the controlled file after confirmation"},"descendant_budget":0})).await;
     let handoff_id = handoff["id"].as_str().unwrap();
     let handoff_approval = wait_approval(http, &url, token, handoff_id).await;
@@ -1494,10 +1538,13 @@ async fn real_hub_scenario() {
     );
     {
         let requests = provider.requests.lock().unwrap();
-        let handoff_requests = requests
-            .iter()
-            .filter(|request| fixture_task_text(request).contains("guardian-handoff-fixture"))
-            .collect::<Vec<_>>();
+        // Guardian input owns the proposed effect, rather than repeating the task assignment.
+        let handoff_requests = &requests[handoff_request_start..];
+        std::fs::write(
+            root.join("guardian-handoff-provider-requests.json"),
+            serde_json::to_vec_pretty(handoff_requests).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             handoff_requests.len(),
             3,
@@ -1506,16 +1553,17 @@ async fn real_hub_scenario() {
         assert_eq!(
             handoff_requests
                 .iter()
-                .filter(|request| request["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|message| message["role"] == "system"
-                        && message["content"].as_str().is_some_and(
-                            |content| content.contains("independent permission guardian")
-                        )))
+                .filter(|request| fixture_is_guardian_request(request))
                 .count(),
             1
+        );
+        assert_eq!(
+            handoff_requests
+                .iter()
+                .filter(|request| fixture_task_text(request).contains("guardian-handoff-fixture"))
+                .count(),
+            2,
+            "The assignment reaches the task and continuation, while Guardian reviews only the effect"
         );
     }
     workers[1].stop().await;

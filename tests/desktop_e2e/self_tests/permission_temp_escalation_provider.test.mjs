@@ -97,35 +97,26 @@ function taskRequest(input) {
 }
 
 function guardianPayload(call) {
+  const executableArguments = JSON.parse(call.arguments);
+  delete executableArguments.description;
+  delete executableArguments.justification;
   return {
-    trusted_world_state: { schema_version: "fixture-world-state.v1" },
-    task_context: JSON.stringify({
-      authority_session_id: "01M00000000000000000000000",
-      canonical_user_authority: [{
-        kind: "user_turn",
-        history_item_id: "01M00000000000000000000001",
-        text: TASK_PROMPT,
-      }],
-    }),
-    recent_committed_response: {
-      response_id: "01M00000000000000000000002",
-      assistant_text: "",
-      tool_request: {
-        call_id: call.call_id,
-        tool_name: call.name,
-        arguments_json: call.arguments,
-      },
-      prior_committed_tool_results: [],
-    },
-    permission_request: {
+    tool_request: { tool_name: "shell", arguments: executableArguments },
+    execution_facts: {
+      workspace_root: "C:/fixture/workspace",
       access: "shell",
-      summary: "Retry the exact trusted pytest command",
-      details: [`Requested sandbox elevation: ${JUSTIFICATION}`],
-      targets: ["C:/fixture/workspace"],
       outside_workspace: true,
+      targets: ["C:/fixture/workspace"],
       risks: [],
+      process_sandbox_after_approval: "unrestricted",
     },
-    action_evidence: { kind: "permission_request" },
+    action_evidence: {
+      kind: "shell_execution",
+      shell_family: "power_shell",
+      cwd: "C:/fixture/workspace",
+      executable_candidates: ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"],
+      arguments: ["-NoProfile", "-Command", executableArguments.command],
+    },
   };
 }
 
@@ -246,7 +237,7 @@ test("permission TEMP escalation script enforces restricted failure, exact eleva
   const guardian = await post(provider, guardianRequest(secondCall));
   assert.equal(guardian.status, 200);
   assert.equal(parseSse(await guardian.text())[0].delta, JSON.stringify({
-    decision: "allow",
+    risk_level: "low",
     rationale: "bounded deterministic fixture command",
   }));
 
@@ -291,8 +282,7 @@ test("permission TEMP escalation script enforces restricted failure, exact eleva
     ["temp_continuation", true, "completed", 200],
   ]);
   assert.equal(rows[1].contract.role_evidence.restricted_output.output_sha256, sha256(RESTRICTED_OUTPUT));
-  assert.equal(rows[2].contract.role_evidence.payload.authority_count, 1);
-  assert.equal(rows[2].contract.role_evidence.payload.authority_matches, true);
+  assert.equal(rows[2].contract.role_evidence.payload.history_absent, true);
   assert.equal(rows[2].contract.reasoning_absent, true);
   assert.deepEqual(rows[2].response_delay, {
     schema_version: "desktop-e2e.scripted-provider-guardian-delay.v1",

@@ -370,6 +370,7 @@ pub(crate) struct DurableChildResultProjection {
 struct RetainedChildTerminalProjection {
     failure_error: Option<String>,
     interruption_cause: Option<TurnInterruptionCause>,
+    final_response_id: Option<ModelResponseId>,
 }
 
 fn parse_pending_deferred_completion(
@@ -587,6 +588,21 @@ fn retained_descendant_page_in_transaction(
             terminal_payload,
         ) = row?;
         let terminal = optional_child_terminal_projection(terminal_payload)?;
+        let assistant_content = if session_status == "completed" {
+            terminal
+                .final_response_id
+                .map(|response_id| {
+                    assistant_content_for_response_in_connection(
+                        transaction,
+                        parse_session_id(&child, "retained child session")?,
+                        response_id,
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            optional_assistant_content(assistant_payload)?
+        };
         let latest_error = match terminal.failure_error {
             Some(error) => Some(error),
             None => optional_error_message(error_payload)?,
@@ -654,7 +670,7 @@ fn retained_descendant_page_in_transaction(
                 })
                 .transpose()?,
             latest_task_content: optional_input_content(task_payload)?,
-            latest_assistant_content: optional_assistant_content(assistant_payload)?,
+            latest_assistant_content: assistant_content,
             latest_error,
             interruption_cause: terminal.interruption_cause,
         });
@@ -683,6 +699,36 @@ impl SqliteProtocolEventStore {
     where
         F: FnMut() -> bool + Send + 'static,
     {
+        self.read_user_authority_with_interrupt(on_query_ready, should_interrupt, |connection| {
+            canonical_user_authority_items_from_connection(connection, session_id)
+        })
+    }
+
+    pub(crate) fn latest_user_authority_id_for_session_with_interrupt<G, F>(
+        &self,
+        session_id: SessionId,
+        on_query_ready: impl FnOnce(rusqlite::InterruptHandle) -> Result<G, StorageError>,
+        should_interrupt: F,
+    ) -> Result<Option<HistoryItemId>, StorageError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        self.read_user_authority_with_interrupt(on_query_ready, should_interrupt, |connection| {
+            crate::storage::permission_retry_fence::latest_authority_history_item_id(
+                connection, session_id,
+            )
+        })
+    }
+
+    fn read_user_authority_with_interrupt<G, F, T>(
+        &self,
+        on_query_ready: impl FnOnce(rusqlite::InterruptHandle) -> Result<G, StorageError>,
+        should_interrupt: F,
+        query: impl FnOnce(&Connection) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
         let mut connection = match self.connection.try_lock() {
             Ok(connection) => connection,
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -700,7 +746,7 @@ impl SqliteProtocolEventStore {
         connection.progress_handler(1, Some(should_interrupt));
         let result = (|| {
             let transaction = connection.transaction()?;
-            let items = canonical_user_authority_items_from_connection(&transaction, session_id)?;
+            let items = query(&transaction)?;
             transaction.commit()?;
             Ok(items)
         })();
@@ -812,24 +858,7 @@ impl SqliteProtocolEventStore {
         response_id: ModelResponseId,
     ) -> Result<Option<Vec<ContentPart>>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let payload = connection
-            .query_row(
-                "SELECT history.payload_json
-                 FROM protocol_history_items AS history
-                 INNER JOIN protocol_item_append_order AS append_order
-                   ON append_order.session_id = history.session_id
-                  AND append_order.source_kind = 'history_item'
-                  AND append_order.source_id = history.id
-                 WHERE history.session_id = ?1
-                   AND json_extract(history.payload_json, '$.kind') = 'assistant_message'
-                   AND json_extract(history.payload_json, '$.response_id') = ?2
-                 ORDER BY append_order.append_position DESC
-                 LIMIT 1",
-                params![session_id.to_string(), response_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        optional_assistant_content(payload)
+        assistant_content_for_response_in_connection(&connection, session_id, response_id)
     }
 
     #[cfg(test)]
@@ -1386,7 +1415,7 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
                 scope: HistoryScope::Turn { turn_id },
                 sequence_no,
                 created_at_ms,
-                payload: serde_json::from_str::<HistoryItemPayload>(&payload_json)?,
+                payload: decode_history_payload(&payload_json)?,
             });
         }
         Ok(items)
@@ -2430,6 +2459,7 @@ fn fork_agent_context_payload(
         HistoryItemPayload::Compaction {
             mode,
             layout,
+            clm_checkpoint,
             preserved_user_messages,
             summary,
             ..
@@ -2440,6 +2470,7 @@ fn fork_agent_context_payload(
             Some(HistoryItemPayload::Compaction {
                 mode,
                 layout,
+                clm_checkpoint,
                 preserved_user_messages,
                 summary,
                 replacement_item_ids: Vec::new(),
@@ -2668,7 +2699,7 @@ fn latest_collaboration_mode_from_connection(
     let Some(payload_json) = payload_json else {
         return Ok(ModeKind::default());
     };
-    match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
+    match decode_history_payload(&payload_json)? {
         HistoryItemPayload::CollaborationModeInstruction { mode } => Ok(mode),
         _ => Err(StorageError::Message(format!(
             "indexed collaboration-mode lookup returned a non-mode item for session {session_id}"
@@ -2953,9 +2984,7 @@ fn protocol_source_count_bounded(
         .into_iter()
         .any(|count| count > sqlite_page_value(limit))
     {
-        return Err(StorageError::Message(format!(
-            "canonical protocol {source_kind} source exceeds the bounded scan limit of {limit} items"
-        )));
+        return Err(StorageError::CanonicalSourceLimitExceeded { source_kind, limit });
     }
     if table_count != append_count || table_count != joined_count {
         return Err(StorageError::Message(format!(
@@ -3638,7 +3667,7 @@ fn optional_input_content(
     let Some(payload_json) = payload_json else {
         return Ok(None);
     };
-    match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
+    match decode_history_payload(&payload_json)? {
         HistoryItemPayload::UserTurn { content, .. }
         | HistoryItemPayload::SteerTurn { content, .. } => Ok(Some(content)),
         payload => Err(StorageError::Message(format!(
@@ -3648,13 +3677,38 @@ fn optional_input_content(
     }
 }
 
+fn assistant_content_for_response_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    response_id: ModelResponseId,
+) -> Result<Option<Vec<ContentPart>>, StorageError> {
+    let payload = connection
+        .query_row(
+            "SELECT history.payload_json
+             FROM protocol_history_items AS history
+             INNER JOIN protocol_item_append_order AS append_order
+               ON append_order.session_id = history.session_id
+              AND append_order.source_kind = 'history_item'
+              AND append_order.source_id = history.id
+             WHERE history.session_id = ?1
+               AND json_extract(history.payload_json, '$.kind') = 'assistant_message'
+               AND json_extract(history.payload_json, '$.response_id') = ?2
+             ORDER BY append_order.append_position DESC
+             LIMIT 1",
+            params![session_id.to_string(), response_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    optional_assistant_content(payload)
+}
+
 fn optional_assistant_content(
     payload_json: Option<String>,
 ) -> Result<Option<Vec<ContentPart>>, StorageError> {
     let Some(payload_json) = payload_json else {
         return Ok(None);
     };
-    match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
+    match decode_history_payload(&payload_json)? {
         HistoryItemPayload::AssistantMessage { content, .. } => Ok(Some(content)),
         payload => Err(StorageError::Message(format!(
             "assistant response projection decoded unexpected history kind `{}`",
@@ -3667,7 +3721,7 @@ fn optional_error_message(payload_json: Option<String>) -> Result<Option<String>
     let Some(payload_json) = payload_json else {
         return Ok(None);
     };
-    match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
+    match decode_history_payload(&payload_json)? {
         HistoryItemPayload::Error { message } => Ok(Some(message)),
         payload => Err(StorageError::Message(format!(
             "child error projection decoded unexpected history kind `{}`",
@@ -3684,10 +3738,14 @@ fn optional_child_terminal_projection(
     };
     match serde_json::from_str::<RuntimeEventMsg>(&payload_json)? {
         RuntimeEventMsg::TurnTerminal { terminal } => match terminal.outcome {
-            TurnTerminalOutcome::Completed => Ok(RetainedChildTerminalProjection::default()),
+            TurnTerminalOutcome::Completed => Ok(RetainedChildTerminalProjection {
+                final_response_id: terminal.final_response_id,
+                ..RetainedChildTerminalProjection::default()
+            }),
             TurnTerminalOutcome::Interrupted { cause } => Ok(RetainedChildTerminalProjection {
                 failure_error: None,
                 interruption_cause: Some(cause),
+                final_response_id: None,
             }),
             TurnTerminalOutcome::Failed { error } => {
                 if error.trim().is_empty() {
@@ -3698,6 +3756,7 @@ fn optional_child_terminal_projection(
                 Ok(RetainedChildTerminalProjection {
                     failure_error: Some(error),
                     interruption_cause: None,
+                    final_response_id: None,
                 })
             }
         },
@@ -3795,7 +3854,7 @@ fn turn_item_page_from_connection(
                 status: crate::protocol::ToolLifecycleStatus::Completed,
                 success: Some(false),
                 ..
-            } = serde_json::from_str::<HistoryItemPayload>(&source_json)?
+            } = decode_history_payload(&source_json)?
             && *call_id == source_call_id
         {
             *status = crate::protocol::ToolLifecycleStatus::Failed;
@@ -4023,6 +4082,7 @@ fn fork_history_payload_for_session(
         HistoryItemPayload::Compaction {
             mode,
             layout,
+            clm_checkpoint,
             preserved_user_messages,
             summary,
             replacement_item_ids,
@@ -4041,6 +4101,7 @@ fn fork_history_payload_for_session(
             Ok(HistoryItemPayload::Compaction {
                 mode,
                 layout,
+                clm_checkpoint,
                 preserved_user_messages,
                 summary,
                 replacement_item_ids,
@@ -4535,6 +4596,9 @@ fn insert_history_item(
     connection: &impl ProtocolSqlExecutor,
     item: &HistoryItem,
 ) -> Result<(), StorageError> {
+    item.payload
+        .validate_compaction_checkpoint()
+        .map_err(StorageError::Message)?;
     let payload_json = serde_json::to_string(&item.payload)?;
     let scope_kind = item.scope.as_str();
     let turn_id = item.turn_id().map(|turn_id| turn_id.to_string());
@@ -4679,6 +4743,14 @@ fn hash_text(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn decode_history_payload(payload_json: &str) -> Result<HistoryItemPayload, StorageError> {
+    let payload: HistoryItemPayload = serde_json::from_str(payload_json)?;
+    payload
+        .validate_compaction_checkpoint()
+        .map_err(StorageError::Message)?;
+    Ok(payload)
+}
+
 fn parse_protocol_id<T>(value: &str, label: &str) -> Result<T, StorageError>
 where
     T: std::str::FromStr,
@@ -4716,7 +4788,7 @@ fn decode_history_item(
         scope,
         sequence_no,
         created_at_ms,
-        payload: serde_json::from_str::<HistoryItemPayload>(&payload_json)?,
+        payload: decode_history_payload(&payload_json)?,
     })
 }
 
@@ -5159,6 +5231,13 @@ mod tests {
                 Ok(())
             })
             .expect_err("source overflow must fail before active materialization");
+        assert!(matches!(
+            &source_error,
+            StorageError::CanonicalSourceLimitExceeded {
+                source_kind: "history_item",
+                limit: 2,
+            }
+        ));
         assert!(source_error.to_string().contains(
             "canonical protocol history_item source exceeds the bounded scan limit of 2 items"
         ));
@@ -5336,6 +5415,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
                 preserved_user_messages: vec!["first".to_string(), "second".to_string()],
                 summary: "first and second summarized".to_string(),
                 replacement_item_ids: vec![first.id, second.id],
@@ -5365,6 +5445,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
                 preserved_user_messages: vec!["first".to_string(), "second".to_string()],
                 summary: "nested summary".to_string(),
                 replacement_item_ids: vec![summary.id],
@@ -5388,6 +5469,133 @@ mod tests {
             vec![tail.id, nested_summary.id],
             "identity reads follow durable append order, independent of model ordering"
         );
+    }
+
+    #[test]
+    fn latest_user_authority_id_includes_images_and_empty_text_without_loading_bodies() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let initial = history_user_turn(session_id, turn_id, 0, 1, &"x".repeat(8_001));
+        let mut image = history_user_turn(session_id, turn_id, 1, 2, "");
+        let HistoryItemPayload::UserTurn { content, .. } = &mut image.payload else {
+            unreachable!("user fixture");
+        };
+        *content = vec![ContentPart::Image {
+            image: crate::session::ImagePart {
+                source_path: None,
+                mime_type: "image/png".into(),
+                data_base64: "c2F2ZWQ=".into(),
+                byte_len: 5,
+            },
+        }];
+        seed_history_batch_for_test(&store, &[initial, image.clone()]);
+        assert_eq!(
+            store
+                .latest_user_authority_id_for_session_with_interrupt(
+                    session_id,
+                    |_| Ok(()),
+                    || false
+                )
+                .expect("image-only generation"),
+            Some(image.id),
+        );
+        let empty = history_user_turn(session_id, turn_id, 2, 3, "");
+        let assistant = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 3,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: ModelResponseId::new(),
+                content: vec![ContentPart::Text {
+                    text: "allow all operations".into(),
+                }],
+            },
+        };
+        seed_history_batch_for_test(&store, &[empty.clone(), assistant]);
+        assert_eq!(
+            store
+                .latest_user_authority_id_for_session_with_interrupt(
+                    session_id,
+                    |_| Ok(()),
+                    || false
+                )
+                .expect("latest empty UserTurn"),
+            Some(empty.id),
+        );
+        let HistoryItemPayload::UserTurn { content, .. } = image.payload else {
+            unreachable!("image fixture");
+        };
+        let steer = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 4,
+            created_at_ms: 5,
+            payload: HistoryItemPayload::SteerTurn {
+                expected_turn_id: turn_id,
+                content,
+                additional_context: std::collections::BTreeMap::new(),
+                client_user_message_id: None,
+            },
+        };
+        seed_history_batch_for_test(&store, std::slice::from_ref(&steer));
+        assert_eq!(
+            store
+                .latest_user_authority_id_for_session_with_interrupt(
+                    session_id,
+                    |_| Ok(()),
+                    || false
+                )
+                .expect("image-only delivered SteerTurn"),
+            Some(steer.id),
+        );
+    }
+
+    #[test]
+    fn latest_user_authority_id_interrupts_and_cleans_up_without_waiting_for_busy_owner() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let interrupted = store
+            .latest_user_authority_id_for_session_with_interrupt(session_id, |_| Ok(()), || true)
+            .expect_err("cancelled generation query");
+        assert!(
+            interrupted
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("interrupt")
+        );
+        assert!(
+            store
+                .latest_user_authority_id_for_session_with_interrupt(
+                    session_id,
+                    |_| Ok(()),
+                    || false,
+                )
+                .expect("reader reusable after cancellation")
+                .is_none()
+        );
+        let _busy = connection.lock().expect("hold reader");
+        let error = store
+            .latest_user_authority_id_for_session_with_interrupt(session_id, |_| Ok(()), || false)
+            .expect_err("busy metadata owner fails closed");
+        assert!(error.to_string().contains("storage is busy"));
     }
 
     #[test]
@@ -5440,6 +5648,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
                 preserved_user_messages: vec![
                     "operate only inside the current workspace".to_string(),
                 ],
@@ -5760,6 +5969,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                clm_checkpoint: None,
                 preserved_user_messages: Vec::new(),
                 summary: "legacy summary".to_string(),
                 replacement_item_ids: vec![replaced.id],
@@ -5804,6 +6014,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
                 preserved_user_messages: vec!["old detail".to_string()],
                 summary: "old detail summary".to_string(),
                 replacement_item_ids: vec![replaced.id],
@@ -5841,6 +6052,138 @@ mod tests {
             crate::protocol::CompactionLayout::UserAnchoredCheckpoint
         );
         assert_eq!(preserved_user_messages, &["old detail"]);
+    }
+
+    #[test]
+    fn clm_checkpoint_fork_keeps_replay_without_promoting_user_authority() {
+        let connection = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        crate::storage::migration::run_to_current(&connection.lock().unwrap()).unwrap();
+        let store = SqliteProtocolEventStore::new(connection.clone());
+        let source = SessionId::new();
+        let target = SessionId::new();
+        seed_fork_sessions(&connection.lock().unwrap(), &[source, target]);
+        let turn_id = TurnId::new();
+        let original = history_user_turn(source, turn_id, 0, 1, "workspace only");
+        let checkpoint = crate::protocol::ClmCheckpoint::from_messages(
+            &[crate::llm::ModelMessage::User {
+                content: "edited replay is not permission".into(),
+            }],
+            1,
+        )
+        .unwrap();
+        let payload = HistoryItemPayload::Compaction {
+            mode: crate::protocol::CompactionMode::Automatic,
+            layout: crate::protocol::CompactionLayout::ClmCheckpoint,
+            clm_checkpoint: Some(checkpoint.clone()),
+            preserved_user_messages: Vec::new(),
+            summary: "Context updated".into(),
+            replacement_item_ids: vec![original.id],
+        };
+        let item = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 1,
+            created_at_ms: 2,
+            payload: payload.clone(),
+        };
+        store.seed_history_item_for_test(&original).unwrap();
+        store.seed_history_item_for_test(&item).unwrap();
+        store.fork_canonical_items(source, target).unwrap();
+        let reopened = SqliteProtocolEventStore::new(connection.clone());
+        let forked = reopened.list_history_items_for_session(target).unwrap();
+        let HistoryItemPayload::Compaction {
+            clm_checkpoint: Some(restored),
+            replacement_item_ids,
+            ..
+        } = &forked[1].payload
+        else {
+            panic!("CLM checkpoint")
+        };
+        assert_eq!(replacement_item_ids, &[forked[0].id]);
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(&checkpoint).unwrap()
+        );
+        let authority = reopened
+            .canonical_user_authority_items_for_session(source)
+            .unwrap();
+        assert_eq!(authority.len(), 1);
+        assert_eq!(authority[0].id, original.id);
+        assert!(
+            matches!(&authority[0].payload, HistoryItemPayload::UserTurn { content, .. }
+            if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "workspace only"))
+        );
+        let filtered = fork_agent_context_payload(payload, false).unwrap();
+        assert!(matches!(filtered, HistoryItemPayload::Compaction {
+            layout: crate::protocol::CompactionLayout::ClmCheckpoint,
+            clm_checkpoint: Some(restored), replacement_item_ids, ..
+        } if replacement_item_ids.is_empty() && serde_json::to_value(&restored).unwrap() == serde_json::to_value(&checkpoint).unwrap()));
+    }
+
+    #[test]
+    fn clm_checkpoint_persisted_corruption_is_rejected_before_projection() {
+        let connection = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        crate::storage::migration::run_to_current(&connection.lock().unwrap()).unwrap();
+        let store = SqliteProtocolEventStore::new(connection.clone());
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let original = history_user_turn(session_id, turn_id, 0, 1, "task");
+        let checkpoint = crate::protocol::ClmCheckpoint::from_messages(
+            &[crate::llm::ModelMessage::User {
+                content: "task".into(),
+            }],
+            1,
+        )
+        .unwrap();
+        let item = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 1,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::ClmCheckpoint,
+                clm_checkpoint: Some(checkpoint),
+                preserved_user_messages: Vec::new(),
+                summary: "Context updated".into(),
+                replacement_item_ids: vec![original.id],
+            },
+        };
+        store.seed_history_item_for_test(&original).unwrap();
+        store.seed_history_item_for_test(&item).unwrap();
+        let valid = serde_json::to_value(&item.payload).unwrap();
+        for corruption in ["version", "metadata", "missing", "wrong_layout"] {
+            let mut value = valid.clone();
+            match corruption {
+                "version" => value["clm_checkpoint"]["version"] = serde_json::json!(2),
+                "metadata" => {
+                    value["clm_checkpoint"]["tool_metadata"] = serde_json::json!({"0":{}})
+                }
+                "missing" => {
+                    value.as_object_mut().unwrap().remove("clm_checkpoint");
+                }
+                "wrong_layout" => value["layout"] = serde_json::json!("legacy_prefix"),
+                _ => unreachable!(),
+            }
+            let encoded = serde_json::to_string(&value).unwrap();
+            connection.lock().unwrap().execute(
+                "UPDATE protocol_history_items SET payload_json=?1,payload_sha256=?2 WHERE id=?3",
+                params![encoded, hash_text(&encoded), item.id.to_string()],
+            ).unwrap();
+            assert!(
+                store.list_history_items(session_id, turn_id).is_err(),
+                "{corruption}"
+            );
+            assert!(
+                store.list_history_items_for_session(session_id).is_err(),
+                "{corruption}"
+            );
+            // Existing migration markers deliberately avoid a database-wide
+            // re-audit on reopen. Payload validation belongs to the read above.
+            crate::storage::migration::run_to_current(&connection.lock().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -5895,6 +6238,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                clm_checkpoint: None,
                 preserved_user_messages: Vec::new(),
                 summary: "cross-page history summary".to_string(),
                 replacement_item_ids: replacement_item_ids.clone(),
@@ -6405,6 +6749,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
                 preserved_user_messages: vec!["original task".to_string()],
                 summary: "completed research; implementation is next".to_string(),
                 replacement_item_ids: vec![replaced_user.id],
@@ -6684,6 +7029,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                clm_checkpoint: None,
                 preserved_user_messages: Vec::new(),
                 summary: "the earlier exchange established the compacted contract".to_string(),
                 replacement_item_ids: vec![old_user.id, old_assistant.id],
@@ -6748,6 +7094,7 @@ mod tests {
         let payload = HistoryItemPayload::Compaction {
             mode: crate::protocol::CompactionMode::Automatic,
             layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+            clm_checkpoint: None,
             preserved_user_messages: vec![
                 "original task".to_string(),
                 "latest instruction".to_string(),
@@ -6851,6 +7198,7 @@ mod tests {
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                clm_checkpoint: None,
                 preserved_user_messages: Vec::new(),
                 summary: "the obsolete prefix is summarized once".to_string(),
                 replacement_item_ids,

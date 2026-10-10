@@ -3,6 +3,135 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn maximum_shared_prompt_with_snapshots_passes_host_validation() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha256};
+
+    let (_temp, settings, path) = super::tests::fixture();
+    let root = path.parent().unwrap();
+    let mut assignment = super::tests::assignment();
+    let input = SharedInput {
+        version: 2,
+        prompt: "x".repeat(crate::agent::shared::MAX_SHARED_PROMPT_BYTES),
+        input_refs: vec!["input".into()],
+    };
+    input.validate().unwrap();
+    assignment.job.input = serde_json::to_value(&input).unwrap();
+    let content = b"original input";
+    let download = json!({"asset":{"id":"input","project_id":"project","job_id":null,
+        "kind":"input","name":"input.txt","sha256":format!("{:x}",Sha256::digest(content)),
+        "byte_length":content.len()},"content_base64":STANDARD.encode(content)});
+    let (client, _, server) = tls_script(
+        root,
+        vec![Some((200, download)), Some((200, serde_json::Value::Null))],
+    )
+    .await;
+    let mut journal = Journal::open(&path, &settings).unwrap();
+    let entry = journal
+        .intent(assignment, settings.environments[0].clone())
+        .unwrap();
+    let prepared = super::data::prepare(&client, &entry, &input).await.unwrap();
+    server.await.unwrap();
+    assert!(prepared.prompt.len() > crate::agent::shared::MAX_SHARED_PROMPT_BYTES);
+    assert!(prepared.prompt.starts_with(&input.prompt));
+    assert!(
+        prepared
+            .prompt
+            .contains(".moyai-shared-inputs-job/input.txt")
+    );
+    assert_eq!(
+        std::fs::read(root.join(".moyai-shared-inputs-job/input.txt")).unwrap(),
+        content
+    );
+    let request = LocalRunRequest {
+        directory: root.into(),
+        prompt: prepared.prompt,
+        session_id: None,
+        title: Some("Task".into()),
+        single_agent: true,
+    };
+    request.validate(true).unwrap();
+    assert!(
+        request.validate(false).is_err(),
+        "local IPC keeps its user-text limit"
+    );
+    let mut oversized = input;
+    oversized.prompt.push('x');
+    assert!(oversized.validate().is_err());
+}
+
+#[tokio::test]
+async fn assignment_labels_match_the_hub_utf8_byte_limit() {
+    let (_temp, settings, path) = super::tests::fixture();
+    let root = path.parent().unwrap();
+    let paths = crate::storage::StoragePaths {
+        data_dir: root.join("data"),
+        database_path: root.join("data/db.sqlite3"),
+        truncation_dir: root.join("data/output"),
+    };
+    let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+    sqlite.migrate().unwrap();
+    let process =
+        crate::app::AppBootstrap::create_process_runtime(crate::storage::StoreBundle::new(sqlite))
+            .await
+            .unwrap();
+    let host = RunnerHost::from_process(process).unwrap();
+    let (client, _, server) = tls_script(root, vec![]).await;
+    server.await.unwrap();
+    let controller = Controller {
+        host: host.clone(),
+        settings: settings.clone(),
+        client,
+        journal: Journal::open(&path, &settings).unwrap(),
+        checkpoint_cursor: String::new(),
+        commands: None,
+        external: None,
+        local_project_id: None,
+    };
+    let mut assignment = super::tests::assignment();
+    let label = format!("{}x", "界".repeat(341));
+    assert_eq!(label.len(), 1024);
+    assignment.job.title = label.clone();
+    assignment.allowed_child_environments = vec!["child".into()];
+    assignment.allowed_child_candidates = vec![SharedCandidate {
+        environment_id: "child".into(),
+        device_id: "child-device".into(),
+        device_label: label.clone(),
+        environment_label: label,
+        capabilities: vec![],
+    }];
+    controller.validate_assignment(&assignment).unwrap();
+    let mut request = LocalRunRequest {
+        directory: root.into(),
+        prompt: "Task".into(),
+        session_id: None,
+        title: Some(assignment.job.title.clone()),
+        single_agent: true,
+    };
+    request.validate(true).unwrap();
+    assert!(request.validate(false).is_err());
+    request.title.as_mut().unwrap().push('x');
+    assert!(request.validate(true).is_err());
+    for field in ["title", "device", "environment"] {
+        let mut oversized = assignment.clone();
+        match field {
+            "title" => oversized.job.title.push('x'),
+            "device" => oversized.allowed_child_candidates[0].device_label.push('x'),
+            "environment" => oversized.allowed_child_candidates[0]
+                .environment_label
+                .push('x'),
+            _ => unreachable!(),
+        }
+        assert!(
+            controller.validate_assignment(&oversized).is_err(),
+            "{field}"
+        );
+    }
+    host.begin_shutdown().unwrap();
+    host.wait_shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn invalid_project_context_is_rejected_before_runner_admission_or_preparation() {
     for invalid in ["other-project", "oversized-overview", "invalid-origin"] {
         let (_temp, settings, path) = super::tests::fixture();

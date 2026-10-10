@@ -2858,6 +2858,9 @@ impl SqliteSessionRepository {
     ) -> Result<(), StorageError> {
         let RunEvent::CompactionCompleted {
             summarized_messages,
+            layout,
+            clm_checkpoint,
+            preserved_user_messages,
             summary,
             replacement_item_ids,
             ..
@@ -2867,6 +2870,9 @@ impl SqliteSessionRepository {
                 "compaction writer requires a CompactionCompleted event".to_string(),
             ));
         };
+        layout
+            .validate_checkpoint(clm_checkpoint.as_ref(), preserved_user_messages)
+            .map_err(StorageError::Message)?;
         if replacement_item_ids.is_empty() {
             return Err(StorageError::Message(
                 "compaction must replace at least one canonical history item".to_string(),
@@ -12562,6 +12568,15 @@ fn recover_expired_run_admission_in_transaction(
         .unwrap_or_else(|| TurnTerminalOutcome::Failed {
             error: EXPIRED_RUN_RECOVERY_REASON.to_string(),
         });
+    if was_active && !matches!(recovery_outcome, TurnTerminalOutcome::Interrupted { .. }) {
+        deliver_all_pending_turn_steers_in_transaction(
+            transaction,
+            session_id,
+            recovery_admission.admission_id,
+            recovery_turn_id,
+            now_ms,
+        )?;
+    }
     if was_active {
         transaction.execute(
             "UPDATE sessions
@@ -12632,6 +12647,14 @@ fn recover_expired_run_admission_in_transaction(
         if recovery_turn_is_tree_stop_fenced {
             let resolver_terminal_event_id =
                 exact_terminal_event_id_in_transaction(transaction, session_id, turn_id)?;
+            discard_all_pending_turn_steers_in_transaction(
+                transaction,
+                session_id,
+                recovery_admission.admission_id,
+                turn_id,
+                resolver_terminal_event_id,
+                now_ms,
+            )?;
             discard_pending_deferred_completions_for_fenced_terminal_in_transaction(
                 transaction,
                 session_id,
@@ -13001,6 +13024,152 @@ mod tests {
             .await
             .expect("session");
         (store, session.id)
+    }
+
+    #[tokio::test]
+    async fn clm_checkpoint_commit_reopens_and_stale_admission_cannot_replace_it() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let original = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .unwrap();
+        let checkpoint = crate::protocol::ClmCheckpoint::from_messages(
+            &[
+                crate::llm::ModelMessage::User {
+                    content: "canonical request".into(),
+                },
+                crate::llm::ModelMessage::Assistant {
+                    content: "retained CLM note".into(),
+                },
+            ],
+            1,
+        )
+        .unwrap();
+        let event = RunEvent::CompactionCompleted {
+            summarized_messages: 1,
+            layout: crate::protocol::CompactionLayout::ClmCheckpoint,
+            clm_checkpoint: Some(checkpoint.clone()),
+            preserved_user_messages: Vec::new(),
+            summary: "Context updated".into(),
+            replacement_item_ids: vec![original[0].id],
+        };
+        let repository = store.session_repo();
+        for (layout, payload, anchors) in [
+            (
+                crate::protocol::CompactionLayout::ClmCheckpoint,
+                None,
+                Vec::new(),
+            ),
+            (
+                crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                Some(checkpoint.clone()),
+                Vec::new(),
+            ),
+            (
+                crate::protocol::CompactionLayout::ClmCheckpoint,
+                Some(checkpoint.clone()),
+                vec!["duplicate anchor".into()],
+            ),
+        ] {
+            let invalid = RunEvent::CompactionCompleted {
+                summarized_messages: 1,
+                layout,
+                clm_checkpoint: payload,
+                preserved_user_messages: anchors,
+                summary: "Context updated".into(),
+                replacement_item_ids: vec![original[0].id],
+            };
+            repository
+                .commit_admitted_compaction_with_protocol_bundle(
+                    session_id,
+                    admission_id,
+                    &invalid,
+                    turn_id,
+                    None,
+                )
+                .await
+                .expect_err("invalid snapshot/layout must not commit");
+        }
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_history_items(session_id, turn_id)
+                .unwrap()
+                .len(),
+            original.len()
+        );
+        repository
+            .commit_admitted_compaction_with_protocol_bundle(
+                session_id,
+                admission_id,
+                &event,
+                turn_id,
+                None,
+            )
+            .await
+            .unwrap();
+        let before = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .unwrap();
+        let reopened_sqlite = SqliteStore::open(store.paths()).unwrap();
+        reopened_sqlite
+            .migrate()
+            .expect("typed snapshot is accepted on reopen");
+        let reopened = StoreBundle::new(reopened_sqlite);
+        let after = reopened
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&after[0]).unwrap(),
+            serde_json::to_value(&original[0]).unwrap()
+        );
+        let HistoryItemPayload::Compaction {
+            clm_checkpoint: Some(restored),
+            summary,
+            ..
+        } = &after[1].payload
+        else {
+            panic!("CLM checkpoint")
+        };
+        assert_eq!(summary, "Context updated");
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(checkpoint).unwrap()
+        );
+        repository
+            .record_agent_tree_stop_fence(
+                session_id,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            )
+            .await
+            .unwrap();
+        repository
+            .commit_admitted_compaction_with_protocol_bundle(
+                session_id,
+                admission_id,
+                &event,
+                turn_id,
+                None,
+            )
+            .await
+            .expect_err("stopped admission cannot append a snapshot");
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .protocol_event_store()
+                    .list_history_items(session_id, turn_id)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -14081,6 +14250,8 @@ mod tests {
                 old_admission_id,
                 &RunEvent::CompactionCompleted {
                     summarized_messages: 1,
+                    layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                    clm_checkpoint: None,
                     preserved_user_messages: vec!["canonical request".to_string()],
                     summary: "late compaction must not commit".to_string(),
                     replacement_item_ids: vec![replacement_item_id],
@@ -24087,6 +24258,98 @@ mod tests {
                 .map(|terminal| terminal.session_status()),
             Some(SessionStatus::Failed)
         );
+    }
+
+    #[tokio::test]
+    async fn expired_owner_replacement_settles_queued_steer_and_remains_migratable() {
+        for stopped in [false, true] {
+            let (store, session_id) = test_repo().await;
+            let repository = store.session_repo();
+            let admitted_at_ms = SystemClock::now_ms();
+            let expired_turn_id = TurnId::new();
+            repository
+                .admit_session_turn_at(
+                    session_id,
+                    expired_turn_id,
+                    admitted_at_ms,
+                    RUN_ADMISSION_LEASE_DURATION_MS,
+                )
+                .await
+                .expect("old admission")
+                .expect("old owner admitted");
+            let input_id = repository
+                .accept_active_turn_steer(
+                    session_id,
+                    1,
+                    &SteerTurn {
+                        expected_turn_id: expired_turn_id,
+                        items: vec![UserInputItem::Text {
+                            text: "preserve the accepted input".to_string(),
+                        }],
+                        additional_context: Default::default(),
+                        client_user_message_id: Some("queued-before-expiry".to_string()),
+                    },
+                )
+                .await
+                .expect("queue steer");
+            if stopped {
+                repository
+                    .record_agent_tree_stop_fence(
+                        session_id,
+                        crate::protocol::TurnInterruptionCause::UserStop,
+                    )
+                    .await
+                    .expect("Stop boundary")
+                    .expect("Stop fence recorded");
+            }
+            repository
+                .admit_session_turn_at(
+                    session_id,
+                    TurnId::new(),
+                    admitted_at_ms + RUN_ADMISSION_LEASE_DURATION_MS + 1,
+                    RUN_ADMISSION_LEASE_DURATION_MS,
+                )
+                .await
+                .expect("replace expired owner")
+                .expect("replacement admitted");
+
+            crate::storage::SqliteStore::open(store.paths())
+                .expect("reopen database")
+                .migrate()
+                .expect("recovered queue must remain valid at startup");
+            let history = store
+                .protocol_event_store()
+                .list_history_items(session_id, expired_turn_id)
+                .expect("expired turn history");
+            assert_eq!(
+                history.iter().filter(|item| item.id == input_id).count(),
+                usize::from(!stopped)
+            );
+            let state = repository
+                .connection
+                .lock()
+                .expect("sqlite mutex")
+                .query_row(
+                    "SELECT state FROM turn_steer_inputs WHERE id = ?1",
+                    [input_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("queue state");
+            assert_eq!(state, if stopped { "discarded" } else { "delivered" });
+            assert_eq!(
+                repository
+                    .durable_terminal_for_turn(session_id, expired_turn_id)
+                    .await
+                    .expect("recovered terminal")
+                    .expect("terminal")
+                    .session_status(),
+                if stopped {
+                    SessionStatus::Cancelled
+                } else {
+                    SessionStatus::Failed
+                },
+            );
+        }
     }
 
     #[tokio::test]

@@ -12,11 +12,12 @@ use crate::config::merge::{
     apply_patch, normalize_provider_profile_alias, normalize_request_timeout_alias,
 };
 use crate::config::model::{
-    AccessMode, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
-    PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
-    PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialSessionConfig, PartialShellConfig, PartialSideChatConfig, PartialToolOutputConfig,
-    PartialWorkspaceConfig, ProviderApiMode, ProviderProfile, ResolvedConfig,
+    AccessMode, PartialApproveConfig, PartialDoclingConfig, PartialFileGuardConfig,
+    PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
+    PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig,
+    PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PartialSideChatConfig,
+    PartialToolOutputConfig, PartialWorkspaceConfig, ProviderApiMode, ProviderProfile,
+    ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -111,6 +112,14 @@ impl ConfigLoader {
             resolved_config,
             preserved_unknown_top_level_sections,
         })
+    }
+
+    pub(crate) fn resolve_forward_compatible_global_config_text_without_environment(
+        config_source: &Utf8Path,
+        text: &str,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        let (global, _) = parse_forward_compatible_global_config_text(config_source, text)?;
+        Self::resolve_config(config_source, Some(global), None, None)
     }
 
     fn resolve_global_config(
@@ -348,6 +357,7 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             connect_timeout_ms: Some(config.model.connect_timeout_ms),
             max_retries: Some(config.model.max_retries),
             context_window: Some(config.model.context_window),
+            compaction_budget_tokens: config.model.compaction_budget_tokens,
             max_output_tokens: None,
             temperature: None,
             top_p: None,
@@ -366,12 +376,24 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
         side_chat: Some(PartialSideChatConfig {
             base_url: Some(config.side_chat.base_url.clone()),
             model: Some(config.side_chat.model.clone()),
+            api_key_env: config.side_chat.api_key_env.clone().map(Some),
             system_prompt: Some(config.side_chat.system_prompt.clone()),
             provider_profile: Some(config.side_chat.provider_profile),
             context_window: Some(config.side_chat.context_window),
             request_timeout_ms: Some(config.side_chat.request_timeout_ms),
             connect_timeout_ms: Some(config.side_chat.connect_timeout_ms),
             max_retries: Some(config.side_chat.max_retries),
+        }),
+        approve: config.approve.as_ref().map(|approve| PartialApproveConfig {
+            base_url: Some(approve.base_url.clone()),
+            model: Some(approve.model.clone()),
+            provider_profile: Some(approve.provider_profile),
+            api_key_env: Some(Some(approve.api_key_env.clone().unwrap_or_default())),
+            extra_headers: Some(approve.extra_headers.clone()),
+            context_window: Some(approve.context_window),
+            request_timeout_ms: Some(approve.request_timeout_ms),
+            connect_timeout_ms: Some(approve.connect_timeout_ms),
+            max_retries: Some(approve.max_retries),
         }),
         session: Some(PartialSessionConfig {
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
@@ -479,7 +501,11 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
         validate_parsed_env::<u64>(name)?;
     }
     validate_parsed_env::<u8>("MOYAI_MAX_RETRIES")?;
-    for name in ["MOYAI_CONTEXT_WINDOW", "MOYAI_MAX_PARALLEL_PREDICTIONS"] {
+    for name in [
+        "MOYAI_CONTEXT_WINDOW",
+        "MOYAI_COMPACTION_BUDGET_TOKENS",
+        "MOYAI_MAX_PARALLEL_PREDICTIONS",
+    ] {
         validate_parsed_env::<u32>(name)?;
     }
 
@@ -653,6 +679,13 @@ fn env_patch() -> Result<PartialResolvedConfig, ConfigError> {
             patch.model.get_or_insert_default().context_window = Some(parsed);
         }
     }
+    if let Ok(value) = env::var("MOYAI_COMPACTION_BUDGET_TOKENS") {
+        let parsed = value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| invalid_env("MOYAI_COMPACTION_BUDGET_TOKENS"))?;
+        patch.model.get_or_insert_default().compaction_budget_tokens = Some(parsed);
+    }
     if let Ok(value) = env::var("MOYAI_SUPPORTS_TOOLS") {
         if let Ok(parsed) = value.parse() {
             patch.model.get_or_insert_default().supports_tools = Some(parsed);
@@ -809,6 +842,80 @@ fn apply_request_timeout_env_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_budget_toml_round_trip_and_legacy_omission() {
+        let source = Utf8Path::new("compaction-budget.toml");
+        let legacy = ConfigLoader::resolve_global_config_text_without_environment(
+            source,
+            "[model]\ncontext_window = 131072\nmax_output_tokens = 1\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.model.compaction_budget_tokens, None);
+        assert!(
+            !toml::to_string(&default_config_patch(&legacy))
+                .unwrap()
+                .contains("compaction_budget_tokens")
+        );
+
+        let configured = ConfigLoader::resolve_global_config_text_without_environment(
+            source,
+            "[model]\ncontext_window = 131072\ncompaction_budget_tokens = 98304\n",
+        )
+        .unwrap();
+        let text = toml::to_string(&default_config_patch(&configured)).unwrap();
+        let restored =
+            ConfigLoader::resolve_global_config_text_without_environment(source, &text).unwrap();
+        assert_eq!(restored.model.compaction_budget_tokens, Some(98_304));
+        for value in ["0", "124519", "\"98304\""] {
+            let text = format!("[model]\ncompaction_budget_tokens = {value}\n");
+            assert!(
+                ConfigLoader::resolve_global_config_text_without_environment(source, &text)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_budget_environment_overrides_file_and_rejects_invalid_values() {
+        const CHILD_MARKER: &str = "MOYAI_COMPACTION_BUDGET_ENV_TEST_CHILD";
+        if let Ok(value) = std::env::var(CHILD_MARKER) {
+            let result = ConfigLoader::resolve_global_config_text_with_environment(
+                Utf8Path::new("compaction-budget-env.toml"),
+                "[model]\ncontext_window = 131072\ncompaction_budget_tokens = 98304\n",
+            );
+            if value == "65536" {
+                assert_eq!(result.unwrap().model.compaction_budget_tokens, Some(65_536));
+            } else {
+                let error = result.expect_err("invalid explicit budget must fail closed");
+                assert!(
+                    error.to_string().contains("compaction_budget_tokens")
+                        || error.to_string().contains("MOYAI_COMPACTION_BUDGET_TOKENS")
+                );
+            }
+            return;
+        }
+        for value in ["65536", "0", "124519", "invalid", ""] {
+            let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .args([
+                    "--exact",
+                    "config::loader::tests::compaction_budget_environment_overrides_file_and_rejects_invalid_values",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, value)
+                .env("MOYAI_COMPACTION_BUDGET_TOKENS", value)
+                .env("MOYAI_CONTEXT_WINDOW", "131072")
+                .env("MOYAI_OVERFLOW_MARGIN_TOKENS", "1024")
+                .output()
+                .expect("isolated budget environment test");
+            assert!(
+                output.status.success(),
+                "budget {value:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn draft_import_resolution_does_not_materialize_environment_overrides() {
@@ -1086,10 +1193,12 @@ mod tests {
             r#"
 [model]
 model = "main-model"
+api_key_env = "MAIN_KEY"
 
 [side_chat]
 base_url = " https://side.example.test/v1/ "
 model = "  side-model  "
+api_key_env = "  SIDE_KEY  "
 system_prompt = "  first\n  second  "
 provider_profile = "openai_compatible"
 context_window = 65536
@@ -1101,8 +1210,10 @@ max_retries = 4
         .expect("valid global Side Chat config");
 
         assert_eq!(config.model.model, "main-model");
+        assert_eq!(config.model.api_key_env.as_deref(), Some("MAIN_KEY"));
         assert_eq!(config.side_chat.base_url, "https://side.example.test/v1");
         assert_eq!(config.side_chat.model, "side-model");
+        assert_eq!(config.side_chat.api_key_env.as_deref(), Some("SIDE_KEY"));
         assert_eq!(config.side_chat.system_prompt, "first\n  second");
         assert_eq!(
             config.side_chat.provider_profile,
@@ -1122,6 +1233,67 @@ max_retries = 4
         .expect("re-import normalized global config");
         assert_eq!(imported.side_chat, config.side_chat);
         assert_eq!(imported.model.model, "main-model");
+        assert_eq!(imported.model.api_key_env.as_deref(), Some("MAIN_KEY"));
+    }
+
+    #[test]
+    fn approval_config_round_trips_anonymous_and_explicit_connections() {
+        let source = Utf8Path::new("approval.toml");
+        let legacy = ConfigLoader::resolve_global_config_text_without_environment(
+            source,
+            "[model]\nmodel=\"main\"\napi_key_env=\"MAIN_KEY\"\n",
+        )
+        .unwrap();
+        assert!(legacy.approve.is_none());
+        assert!(
+            !toml::to_string_pretty(&default_config_patch(&legacy))
+                .unwrap()
+                .contains("[approve]")
+        );
+        for key in ["", "APPROVE_KEY"] {
+            let text = format!(
+                "[model]\nmodel=\"main\"\napi_key_env=\"MAIN_KEY\"\n[approve]\nbase_url=\"https://approve.example.test/v1\"\nmodel=\"fast-review\"\nprovider_profile=\"openai_compatible\"\napi_key_env=\"{key}\"\ncontext_window=32768\nrequest_timeout_ms=30000\nconnect_timeout_ms=5000\nmax_retries=1\n"
+            );
+            let config =
+                ConfigLoader::resolve_global_config_text_without_environment(source, &text)
+                    .unwrap();
+            let exported = toml::to_string_pretty(&default_config_patch(&config)).unwrap();
+            let reopened =
+                ConfigLoader::resolve_global_config_text_without_environment(source, &exported)
+                    .unwrap();
+            assert_eq!(reopened.approve, config.approve);
+            assert_eq!(reopened.model.api_key_env.as_deref(), Some("MAIN_KEY"));
+            assert_eq!(
+                reopened.approve.as_ref().unwrap().api_key_env.as_deref(),
+                (!key.is_empty()).then_some(key)
+            );
+        }
+    }
+
+    #[test]
+    fn blank_side_chat_api_key_reference_imports_as_anonymous_without_borrowing_main() {
+        for blank in ["", "   "] {
+            let text = format!(
+                "[model]\napi_key_env = \"MAIN_KEY\"\n[side_chat]\napi_key_env = \"{blank}\"\n"
+            );
+            let config = ConfigLoader::resolve_global_config_text_without_environment(
+                Utf8Path::new("anonymous-side.toml"),
+                &text,
+            )
+            .expect("blank Side reference is an explicit anonymous connection");
+            assert_eq!(config.side_chat.api_key_env, None);
+            assert_eq!(config.model.api_key_env.as_deref(), Some("MAIN_KEY"));
+
+            let exported = toml::to_string_pretty(&default_config_patch(&config))
+                .expect("export anonymous Side config");
+            let imported = ConfigLoader::resolve_global_config_text_without_environment(
+                Utf8Path::new("anonymous-side-round-trip.toml"),
+                &exported,
+            )
+            .expect("anonymous Side configuration remains anonymous after export");
+            assert_eq!(imported.side_chat.api_key_env, None);
+            assert_eq!(imported.model.api_key_env.as_deref(), Some("MAIN_KEY"));
+        }
     }
 
     #[test]

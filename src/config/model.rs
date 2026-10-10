@@ -347,6 +347,9 @@ pub struct ModelConfig {
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
     pub context_window: u32,
+    /// Optional automatic compaction threshold; generation limits remain host-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_budget_tokens: Option<u32>,
     pub max_output_tokens: u32,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -407,6 +410,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
             .field("context_window", &self.context_window)
+            .field("compaction_budget_tokens", &self.compaction_budget_tokens)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("temperature", &self.temperature)
             .field("top_p", &self.top_p)
@@ -428,12 +432,14 @@ impl std::fmt::Debug for ModelConfig {
 /// Global defaults for Side Chat provider requests.
 ///
 /// This is deliberately independent from `ModelConfig`: changing Main's
-/// provider settings does not implicitly change Side Chat, and Side Chat does
-/// not carry credentials, headers, tool, image, or generation-policy fields.
+/// provider settings does not implicitly change Side Chat. Side Chat does not
+/// inherit Main credentials, headers, tool, image, or generation-policy fields.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SideChatConfig {
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     #[serde(default)]
     pub system_prompt: String,
     pub provider_profile: ProviderProfile,
@@ -448,6 +454,7 @@ impl Default for SideChatConfig {
         Self {
             base_url: DEFAULT_MODEL_BASE_URL.to_string(),
             model: DEFAULT_MODEL_NAME.to_string(),
+            api_key_env: None,
             system_prompt: String::new(),
             provider_profile: ProviderProfile::LmStudio,
             context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
@@ -464,6 +471,7 @@ impl std::fmt::Debug for SideChatConfig {
             .debug_struct("SideChatConfig")
             .field("base_url", &"<redacted provider endpoint>")
             .field("model", &self.model)
+            .field("api_key_env", &self.api_key_env)
             .field("system_prompt_chars", &self.system_prompt.chars().count())
             .field("provider_profile", &self.provider_profile)
             .field("context_window", &self.context_window)
@@ -471,6 +479,82 @@ impl std::fmt::Debug for SideChatConfig {
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
             .finish()
+    }
+}
+
+/// An explicit approval-provider connection. Absence preserves the admitted Main connection.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApproveConfig {
+    pub base_url: String,
+    pub model: String,
+    pub provider_profile: ProviderProfile,
+    pub api_key_env: Option<String>,
+    pub extra_headers: BTreeMap<String, String>,
+    pub context_window: u32,
+    pub request_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    pub max_retries: u8,
+}
+
+impl ApproveConfig {
+    pub(crate) fn from_model(model: &ModelConfig) -> Self {
+        Self {
+            base_url: model.base_url.clone(),
+            model: model.model.clone(),
+            provider_profile: model.provider_profile,
+            api_key_env: model.api_key_env.clone(),
+            extra_headers: model.extra_headers.clone(),
+            context_window: model.context_window,
+            request_timeout_ms: model.request_timeout_ms,
+            connect_timeout_ms: model.connect_timeout_ms,
+            max_retries: model.max_retries,
+        }
+    }
+}
+
+impl std::fmt::Debug for ApproveConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApproveConfig")
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("model", &self.model)
+            .field("provider_profile", &self.provider_profile)
+            .field("api_key_env", &self.api_key_env)
+            .field("extra_header_count", &self.extra_headers.len())
+            .field("context_window", &self.context_window)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialApproveConfig {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub provider_profile: Option<ProviderProfile>,
+    pub api_key_env: Option<Option<String>>,
+    pub extra_headers: Option<BTreeMap<String, String>>,
+    pub context_window: Option<u32>,
+    pub request_timeout_ms: Option<u64>,
+    pub connect_timeout_ms: Option<u64>,
+    pub max_retries: Option<u8>,
+}
+
+impl std::fmt::Debug for PartialApproveConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PartialApproveConfig")
+            .field("model", &self.model)
+            .field("provider_profile", &self.provider_profile)
+            .field("api_key_env", &self.api_key_env)
+            .field(
+                "extra_header_count",
+                &self.extra_headers.as_ref().map(BTreeMap::len),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -638,6 +722,8 @@ pub struct ResolvedConfig {
     pub model: ModelConfig,
     #[serde(default)]
     pub side_chat: SideChatConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve: Option<ApproveConfig>,
     pub session: SessionConfig,
     pub multi_agent: MultiAgentConfig,
     pub permissions: PermissionsConfig,
@@ -656,6 +742,35 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
+    pub fn approve_model(&self) -> ModelConfig {
+        let mut model = self.model.clone();
+        if let Some(approve) = &self.approve {
+            model.base_url = approve.base_url.clone();
+            model.model = approve.model.clone();
+            model.provider_profile = approve.provider_profile;
+            model.api_key_env = approve.api_key_env.clone();
+            model.extra_headers = approve.extra_headers.clone();
+            model.context_window = approve.context_window;
+            model.request_timeout_ms = approve.request_timeout_ms;
+            model.connect_timeout_ms = approve.connect_timeout_ms;
+            model.max_retries = approve.max_retries;
+        }
+        model.clear_legacy_generation_settings();
+        // Approval requests are tool-free and do not inherit Main's compaction threshold.
+        model.compaction_budget_tokens = None;
+        model.system_prompt.clear();
+        model.supports_tools = false;
+        model.supports_images = false;
+        model.parallel_tool_calls = false;
+        model
+    }
+
+    pub(crate) fn approve_runtime_config(&self) -> Self {
+        let mut config = self.clone();
+        config.model = self.approve_model();
+        config
+    }
+
     pub(crate) fn normalize_and_validate_provider_runtime(&mut self) -> Result<(), String> {
         self.model.clear_legacy_generation_settings();
         let model = self.model.model.trim();
@@ -683,6 +798,18 @@ impl ResolvedConfig {
                 "config field `model.context_window` must be greater than zero".to_string(),
             );
         }
+        if let Some(budget) = self.model.compaction_budget_tokens {
+            let full_limit = crate::llm::model_policy::ContextWindowLimits::resolve(
+                self.model.context_window,
+                self.session.overflow_margin_tokens,
+            )
+            .effective_full;
+            if budget == 0 || budget > full_limit {
+                return Err(format!(
+                    "config field `model.compaction_budget_tokens` must be between 1 and the effective input limit ({full_limit}) inclusive"
+                ));
+            }
+        }
 
         self.side_chat.base_url =
             crate::config::turn::ProviderEndpoint::parse(&self.side_chat.base_url)
@@ -695,6 +822,14 @@ impl ResolvedConfig {
             return Err("config field `side_chat.model` must not be empty".to_string());
         }
         self.side_chat.model = side_chat_model.to_string();
+        self.side_chat.api_key_env = canonical_api_key_env_name(
+            self.side_chat
+                .api_key_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        )
+        .map_err(|error| format!("config field `side_chat.api_key_env` {error}"))?;
 
         self.side_chat.system_prompt =
             crate::system_prompt::normalize_user_configured_system_prompt(Some(
@@ -720,6 +855,39 @@ impl ResolvedConfig {
                 "config field `side_chat.connect_timeout_ms` must fit a positive SQLite integer"
                     .to_string(),
             );
+        }
+        if let Some(approve) = &mut self.approve {
+            approve.base_url = crate::config::turn::ProviderEndpoint::parse(&approve.base_url)
+                .map_err(|error| format!("config field `approve.base_url` {error}"))?
+                .as_str()
+                .to_string();
+            approve.model = approve.model.trim().to_string();
+            if approve.model.is_empty() {
+                return Err("config field `approve.model` must not be empty".into());
+            }
+            approve.api_key_env = canonical_api_key_env_name(
+                approve
+                    .api_key_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty()),
+            )
+            .map_err(|error| format!("config field `approve.api_key_env` {error}"))?;
+            if !(1..=MAX_MODEL_REQUEST_TIMEOUT_MS).contains(&approve.request_timeout_ms) {
+                return Err(format!(
+                    "config field `approve.request_timeout_ms` must be between 1 and {MAX_MODEL_REQUEST_TIMEOUT_MS} milliseconds inclusive"
+                ));
+            }
+            if approve.context_window == 0 {
+                return Err(
+                    "config field `approve.context_window` must be greater than zero".into(),
+                );
+            }
+            if approve.connect_timeout_ms == 0 {
+                return Err(
+                    "config field `approve.connect_timeout_ms` must be greater than zero".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -988,6 +1156,7 @@ impl Default for ResolvedConfig {
                 connect_timeout_ms: 10_000,
                 max_retries: 2,
                 context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
+                compaction_budget_tokens: None,
                 max_output_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
                 temperature: None,
                 top_p: None,
@@ -1004,6 +1173,7 @@ impl Default for ResolvedConfig {
                 extra_body_json: None,
             },
             side_chat: SideChatConfig::default(),
+            approve: None,
             session: SessionConfig {
                 overflow_margin_tokens: 1_024,
             },
@@ -1111,6 +1281,7 @@ impl Default for ResolvedConfig {
 pub struct PartialResolvedConfig {
     pub model: Option<PartialModelConfig>,
     pub side_chat: Option<PartialSideChatConfig>,
+    pub approve: Option<PartialApproveConfig>,
     pub session: Option<PartialSessionConfig>,
     pub multi_agent: Option<PartialMultiAgentConfig>,
     pub permissions: Option<PartialPermissionsConfig>,
@@ -1128,9 +1299,10 @@ pub struct PartialResolvedConfig {
 }
 
 impl PartialResolvedConfig {
-    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 16] = [
+    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 17] = [
         "model",
         "side_chat",
+        "approve",
         "session",
         "multi_agent",
         "permissions",
@@ -1179,6 +1351,7 @@ pub struct PartialModelConfig {
     pub connect_timeout_ms: Option<u64>,
     pub max_retries: Option<u8>,
     pub context_window: Option<u32>,
+    pub compaction_budget_tokens: Option<u32>,
     /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
     #[serde(skip_serializing)]
     pub max_output_tokens: Option<u32>,
@@ -1259,6 +1432,7 @@ impl std::fmt::Debug for PartialModelConfig {
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
             .field("context_window", &self.context_window)
+            .field("compaction_budget_tokens", &self.compaction_budget_tokens)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("temperature", &self.temperature)
             .field("top_p", &self.top_p)
@@ -1285,6 +1459,7 @@ impl std::fmt::Debug for PartialModelConfig {
 pub struct PartialSideChatConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub api_key_env: Option<Option<String>>,
     pub system_prompt: Option<String>,
     pub provider_profile: Option<ProviderProfile>,
     pub context_window: Option<u32>,
@@ -1305,6 +1480,7 @@ impl std::fmt::Debug for PartialSideChatConfig {
                     .map(|_| "<redacted provider endpoint>"),
             )
             .field("model", &self.model)
+            .field("api_key_env", &self.api_key_env)
             .field(
                 "system_prompt_chars",
                 &self
@@ -1454,10 +1630,53 @@ mod config_contract_tests {
     use crate::tool::ToolEffectClass;
 
     #[test]
+    fn compaction_budget_validates_against_the_current_effective_input_limit() {
+        for (context_window, budget, valid) in [
+            (131_072, None, true),
+            (131_072, Some(98_304), true),
+            (131_072, Some(124_518), true),
+            (131_072, Some(124_519), false),
+            (131_072, Some(0), false),
+            (8_192, Some(7_782), true),
+            (8_192, Some(7_783), false),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.model.context_window = context_window;
+            config.model.compaction_budget_tokens = budget;
+            let result = config.normalize_and_validate_provider_runtime();
+            assert_eq!(result.is_ok(), valid, "{context_window}, {budget:?}");
+            if let Err(error) = result {
+                assert!(error.contains("model.compaction_budget_tokens"));
+            }
+        }
+
+        let legacy = serde_json::to_value(ResolvedConfig::default().model).unwrap();
+        assert!(legacy.get("compaction_budget_tokens").is_none());
+        let decoded: super::ModelConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.compaction_budget_tokens, None);
+    }
+
+    #[test]
+    fn approval_runtime_does_not_inherit_the_main_compaction_budget() {
+        let mut config = ResolvedConfig::default();
+        config.model.compaction_budget_tokens = Some(98_304);
+        assert_eq!(config.approve_model().compaction_budget_tokens, None);
+        let mut approve = super::ApproveConfig::from_model(&config.model);
+        approve.context_window = 32_768;
+        config.approve = Some(approve);
+        let mut runtime = config.approve_runtime_config();
+        runtime.normalize_and_validate_provider_runtime().unwrap();
+        assert_eq!(runtime.model.context_window, 32_768);
+        assert_eq!(runtime.model.compaction_budget_tokens, None);
+        assert_eq!(config.model.compaction_budget_tokens, Some(98_304));
+    }
+
+    #[test]
     fn forward_compatible_top_level_section_inventory_matches_the_current_schema() {
         let complete_section_inventory = PartialResolvedConfig {
             model: Some(Default::default()),
             side_chat: Some(Default::default()),
+            approve: Some(Default::default()),
             session: Some(Default::default()),
             multi_agent: Some(Default::default()),
             permissions: Some(Default::default()),
@@ -1486,6 +1705,91 @@ mod config_contract_tests {
         expected.sort_unstable();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn approval_connection_is_legacy_main_until_explicit_then_independent() {
+        let mut original = ResolvedConfig::default();
+        original.model.model = "main-one".into();
+        original.model.base_url = "https://main.example.test/v1".into();
+        original.model.provider_profile = crate::config::ProviderProfile::OpenAiResponses;
+        original.model.api_key_env = Some("MAIN_KEY".into());
+        assert!(original.approve.is_none());
+        assert_eq!(original.approve_model().model, "main-one");
+        let selected = crate::config::merge::apply_patch(
+            original.clone(),
+            PartialResolvedConfig {
+                approve: Some(super::PartialApproveConfig {
+                    model: Some("fast-review".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let captured = selected.approve.as_ref().unwrap().clone();
+        assert_eq!(captured.base_url, original.model.base_url);
+        assert_eq!(captured.api_key_env, original.model.api_key_env);
+        let changed = crate::config::merge::apply_patch(
+            selected,
+            PartialResolvedConfig {
+                model: Some(super::PartialModelConfig {
+                    base_url: Some("https://new-main.example.test/v1".into()),
+                    model: Some("main-two".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(changed.approve.as_ref(), Some(&captured));
+        assert_eq!(changed.approve_model().model, "fast-review");
+        assert!(!changed.approve_model().supports_tools);
+        assert!(!changed.approve_model().supports_images);
+    }
+
+    #[test]
+    fn approval_validation_and_debug_use_the_provider_secret_boundary() {
+        let mut config = ResolvedConfig::default();
+        let mut approve = super::ApproveConfig::from_model(&config.model);
+        approve.model = "  fast-review  ".into();
+        approve.base_url = " https://approve.example.test/v1/ ".into();
+        approve.api_key_env = Some("  APPROVE_KEY  ".into());
+        approve
+            .extra_headers
+            .insert("authorization".into(), "private-test-header".into());
+        config.approve = Some(approve);
+        config.normalize_and_validate_provider_runtime().unwrap();
+        assert_eq!(
+            config.approve.as_ref().unwrap().base_url,
+            "https://approve.example.test/v1"
+        );
+        assert_eq!(config.approve.as_ref().unwrap().model, "fast-review");
+        assert_eq!(
+            config.approve.as_ref().unwrap().api_key_env.as_deref(),
+            Some("APPROVE_KEY")
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("private-test-header"));
+        assert!(!debug.contains("approve.example.test"));
+        for field in ["model", "context", "timeout", "connect", "key", "endpoint"] {
+            let mut invalid = config.clone();
+            let approval = invalid.approve.as_mut().unwrap();
+            match field {
+                "model" => approval.model = " ".into(),
+                "context" => approval.context_window = 0,
+                "timeout" => approval.request_timeout_ms = 0,
+                "connect" => approval.connect_timeout_ms = 0,
+                "key" => approval.api_key_env = Some("INVALID-KEY".into()),
+                _ => {
+                    approval.base_url =
+                        "https://user:private-test-password@approve.example.test/v1".into()
+                }
+            }
+            let error = invalid
+                .normalize_and_validate_provider_runtime()
+                .unwrap_err();
+            assert!(error.contains("approve."));
+            assert!(!error.contains("private-test-password"));
+        }
     }
 
     #[test]
@@ -1615,6 +1919,7 @@ mod config_contract_tests {
     #[test]
     fn side_chat_defaults_are_independent_and_provider_inputs_are_normalized() {
         let defaults = ResolvedConfig::default();
+        assert_eq!(defaults.side_chat.api_key_env, None);
         assert_eq!(defaults.side_chat.base_url, defaults.model.base_url);
         assert_eq!(defaults.side_chat.model, defaults.model.model);
         assert_eq!(
@@ -1641,6 +1946,7 @@ mod config_contract_tests {
 
         let mut config = defaults;
         config.model.model = "main-only-change".to_string();
+        config.model.api_key_env = Some("MAIN_KEY".to_string());
         config.side_chat.base_url = " https://side.example.test/v1/ ".to_string();
         config.side_chat.model = "  side-model  ".to_string();
         config.side_chat.system_prompt = "  first\n  second  ".to_string();
@@ -1652,6 +1958,34 @@ mod config_contract_tests {
         assert_eq!(config.side_chat.model, "side-model");
         assert_eq!(config.side_chat.system_prompt, "first\n  second");
         assert_ne!(config.side_chat.model, config.model.model);
+        assert_eq!(config.side_chat.api_key_env, None);
+    }
+
+    #[test]
+    fn side_chat_api_key_reference_is_explicit_and_uses_shared_name_validation() {
+        let mut config = ResolvedConfig::default();
+        config.model.api_key_env = Some("PROVIDER_KEY".to_string());
+        config.side_chat.api_key_env = Some("  PROVIDER_KEY  ".to_string());
+        config
+            .normalize_and_validate_provider_runtime()
+            .expect("explicit sharing of the same environment reference");
+        assert_eq!(
+            config.side_chat.api_key_env.as_deref(),
+            Some("PROVIDER_KEY")
+        );
+
+        config.side_chat.api_key_env = Some(" \t ".to_string());
+        config
+            .normalize_and_validate_provider_runtime()
+            .expect("blank Side reference clears it");
+        assert_eq!(config.side_chat.api_key_env, None);
+        assert_eq!(config.model.api_key_env.as_deref(), Some("PROVIDER_KEY"));
+
+        config.side_chat.api_key_env = Some("INVALID-NAME".to_string());
+        let error = config
+            .normalize_and_validate_provider_runtime()
+            .expect_err("invalid Side environment name");
+        assert!(error.contains("side_chat.api_key_env"), "{error}");
     }
 
     #[test]
@@ -1746,7 +2080,6 @@ mod config_contract_tests {
         for (input, field) in [
             ("[agent]\nretired = true\n", "agent"),
             ("[model]\nprompt_profile = \"auto\"\n", "prompt_profile"),
-            ("[side_chat]\napi_key_env = \"KEY\"\n", "api_key_env"),
             ("[side_chat]\nextra_headers = {}\n", "extra_headers"),
             ("[side_chat]\nsupports_tools = true\n", "supports_tools"),
             ("[side_chat]\nsupports_images = true\n", "supports_images"),

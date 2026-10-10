@@ -458,17 +458,36 @@ impl Tool for TeamRetrySubmissionTool {
             ));
         }
         ctx.run_mutation_fence.assert_owned().await?;
+        let network = network(&ctx)?;
+        let prepared = network
+            .prepare_agent_retry_submission(&ctx.session.session.id.to_string())
+            .await
+            .map_err(ToolError::Message)?;
+        let endpoint = prepared.endpoint();
+        let hub_binding = prepared.hub_binding().to_string();
+        let payload = prepared.payload().clone();
         let admission = ctx
-            .confirm_if_needed(
+            .confirm_if_needed_with_details_and_guardian_evidence(
                 AccessKind::Edit,
                 "未確認のPCへの依頼を同じ受付番号で再確認".into(),
+                vec![
+                    format!("Hub endpoint: {endpoint}"),
+                    format!("Saved submission: {}", serde_json::to_string(&payload)?),
+                ],
                 Vec::new(),
                 false,
                 ToolEffectClass::Mutation.permission_risks(),
+                crate::tool::permission_guardian::PermissionGuardianEvidenceState::Complete(
+                    crate::tool::permission_guardian::PermissionGuardianEvidence::HubSubmission {
+                        endpoint,
+                        hub_binding,
+                        payload,
+                    },
+                ),
             )
             .await?;
-        let value = network(&ctx)?
-            .agent_retry_submission(&ctx.session.session.id.to_string(), || {
+        let value = network
+            .execute_prepared_agent_retry_submission(prepared, || {
                 admission.admit().map_err(|error| error.to_string())?;
                 ctx.run_mutation_fence
                     .begin_effect_commit()

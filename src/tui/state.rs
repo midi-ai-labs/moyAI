@@ -1394,6 +1394,7 @@ pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
         ToolName::DoclingConvert => "文書の変換",
         ToolName::McpCall => "外部ツール",
         ToolName::UpdatePlan => "計画の更新",
+        ToolName::CompactContext => "会話文脈の圧縮",
         ToolName::GetGoal | ToolName::CreateGoal | ToolName::UpdateGoal => "目標の更新",
         ToolName::SpawnAgent => "Sub Agentの開始",
         ToolName::SendMessage | ToolName::FollowupTask => "Sub Agentへの連絡",

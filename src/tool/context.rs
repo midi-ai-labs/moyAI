@@ -108,6 +108,18 @@ impl ToolFormatterPlan {
         self.invocation.command()
     }
 
+    pub(crate) fn guardian_evidence(
+        &self,
+    ) -> crate::tool::permission_guardian::FormatterExecutionEvidence {
+        crate::tool::permission_guardian::FormatterExecutionEvidence {
+            target: self.invocation.target().to_path_buf(),
+            cwd: self.invocation.working_directory().to_path_buf(),
+            // resolve_invocation replaces argv[0] with the pinned executable's canonical path.
+            executable: Utf8PathBuf::from(&self.invocation.command()[0]),
+            argv: self.invocation.command().to_vec(),
+        }
+    }
+
     pub fn permission_risks(&self) -> &[crate::tool::PermissionRisk] {
         &self.permission_risks
     }
@@ -173,9 +185,9 @@ impl ToolEffectAdmission {
         &self.sandbox_plan
     }
 
-    /// Settle the approval for a managed process after its actual startup is observed.
-    /// The process keeps its sandbox and cancellation owner, but must not use this
-    /// ticket to start another effect. Unlike Drop, handoff must confirm settlement.
+    /// Settle the approval after a synchronous process attempt returns, or before
+    /// handing off an observed managed-process startup. No further effect may use
+    /// this ticket. Unlike Drop, a tool response must confirm settlement.
     pub(crate) fn finish_started_effect(self) -> Result<(), ToolError> {
         let Some(lease) = &self.permission_retry_lease else {
             return Ok(());
@@ -183,9 +195,8 @@ impl ToolEffectAdmission {
         match lease.release() {
             Ok(crate::storage::PermissionReviewTransition::Applied) => Ok(()),
             other => {
-                let message = format!(
-                    "起動した操作の承認記録を確定できないため、処理を停止しました: {other:?}"
-                );
+                let message =
+                    format!("操作の承認記録を確定できないため、処理を停止しました: {other:?}");
                 self.control.fail(message.clone());
                 Err(ToolError::Message(message))
             }
@@ -514,8 +525,15 @@ impl<'a> ToolContext<'a> {
                 }
                 return Err(ToolError::RunInterrupted);
             }
+            let decision = decision.map(|assessment| {
+                (
+                    assessment.decision(),
+                    assessment.risk_level,
+                    assessment.rationale,
+                )
+            });
             let (reason, fence_outcome) = match decision {
-                Ok(PermissionGuardianDecision::Allow { .. }) => {
+                Ok((PermissionGuardianDecision::Allow, _, _)) => {
                     let Some(retry_lease) = self
                         .permission_guardian
                         .as_deref_mut()
@@ -531,13 +549,20 @@ impl<'a> ToolContext<'a> {
                         Some(retry_lease),
                     );
                 }
-                Ok(PermissionGuardianDecision::AskUser { rationale }) => (
-                    rationale,
+                Ok((PermissionGuardianDecision::AskUser, risk_level, rationale)) => (
+                    format!(
+                        "{}。{rationale}",
+                        match risk_level {
+                            crate::tool::permission_guardian::PermissionRiskLevel::High =>
+                                "この操作は危険度が高いため、確認が必要です",
+                            _ => "この操作の危険度を判断できないため、確認が必要です",
+                        }
+                    ),
                     crate::storage::PermissionRetryFenceOutcome::GuardianDenied,
                 ),
-                Ok(PermissionGuardianDecision::Deny { rationale }) => {
+                Ok((PermissionGuardianDecision::Deny, _, rationale)) => {
                     return self.stop_permission_work(format!(
-                        "この操作は依頼の制限または禁止事項に反するため、実行せず停止しました。代理承認の判断: {rationale}。依頼内容を確認して、次の指示を入力してください。"
+                        "この操作は重大な危険があると判定されたため、実行せず停止しました。代理承認の判断: {rationale}。内容を確認して、次の指示を入力してください。"
                     ));
                 }
                 Err(
@@ -562,7 +587,7 @@ impl<'a> ToolContext<'a> {
                 Err(
                     crate::tool::permission_guardian::PermissionGuardianError::InvalidDecision(_),
                 ) => (
-                    "代理承認に使うAIの回答から、許可の判断を確認できませんでした。".to_string(),
+                    "代理承認に使うAIの回答から、操作の危険度を確認できませんでした。".to_string(),
                     crate::storage::PermissionRetryFenceOutcome::InvalidDecision,
                 ),
                 Err(crate::tool::permission_guardian::PermissionGuardianError::TotalDeadline {
@@ -779,7 +804,9 @@ mod tests {
     use crate::protocol::ReviewDecision;
     use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
     use crate::storage::{SqliteStore, StoragePaths};
-    use crate::tool::permission_guardian::{PermissionGuardianDecision, PermissionGuardianError};
+    use crate::tool::permission_guardian::{
+        PermissionGuardianAssessment, PermissionGuardianError, PermissionRiskLevel,
+    };
     use crate::workspace::{AccessKind, WorkspaceDiscovery};
 
     #[derive(Default)]
@@ -821,17 +848,20 @@ mod tests {
             &mut self,
             _request: &crate::tool::PermissionRequest,
             _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
-        ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+        ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
             self.requests += 1;
             match self.outcome {
-                FixedGuardianOutcome::Allow => Ok(PermissionGuardianDecision::Allow {
+                FixedGuardianOutcome::Allow => Ok(PermissionGuardianAssessment {
+                    risk_level: PermissionRiskLevel::Low,
                     rationale: "scoped action".to_string(),
                 }),
-                FixedGuardianOutcome::AskUser => Ok(PermissionGuardianDecision::AskUser {
+                FixedGuardianOutcome::AskUser => Ok(PermissionGuardianAssessment {
+                    risk_level: PermissionRiskLevel::High,
                     rationale: "confirm the destination".to_string(),
                 }),
-                FixedGuardianOutcome::Deny => Ok(PermissionGuardianDecision::Deny {
-                    rationale: "not authorized".to_string(),
+                FixedGuardianOutcome::Deny => Ok(PermissionGuardianAssessment {
+                    risk_level: PermissionRiskLevel::Critical,
+                    rationale: "critical danger".to_string(),
                 }),
                 FixedGuardianOutcome::Fail => Err(PermissionGuardianError::Request(
                     "fixture transport failure".to_string(),
@@ -846,9 +876,10 @@ mod tests {
             &mut self,
             request: &crate::tool::PermissionRequest,
             _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
-        ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+        ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
             self.requests.push(request.clone());
-            Ok(PermissionGuardianDecision::Allow {
+            Ok(PermissionGuardianAssessment {
+                risk_level: PermissionRiskLevel::Low,
                 rationale: "scoped elevation".to_string(),
             })
         }
@@ -1405,6 +1436,7 @@ mod tests {
         struct HandoffGuardian {
             lease: Option<crate::storage::PermissionReviewLease>,
             timeout: bool,
+            risk_level: PermissionRiskLevel,
         }
         #[async_trait::async_trait(?Send)]
         impl PermissionGuardian for HandoffGuardian {
@@ -1412,13 +1444,14 @@ mod tests {
                 &mut self,
                 _request: &crate::tool::PermissionRequest,
                 _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
-            ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+            ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
                 if self.timeout {
                     Err(PermissionGuardianError::TotalDeadline {
                         milliseconds: 60_000,
                     })
                 } else {
-                    Ok(PermissionGuardianDecision::AskUser {
+                    Ok(PermissionGuardianAssessment {
+                        risk_level: self.risk_level,
                         rationale: "接続先の確認が必要です".into(),
                     })
                 }
@@ -1516,6 +1549,7 @@ mod tests {
             "authority_changed",
             "lost_claim",
             "timeout",
+            "unknown",
         ] {
             let (config, session, services) = permission_fixture(AccessMode::AutoReview).await;
             let authority_id = crate::protocol::HistoryItemId::new();
@@ -1562,6 +1596,11 @@ mod tests {
             let mut guardian = HandoffGuardian {
                 lease: Some(lease.clone()),
                 timeout: action == "timeout",
+                risk_level: if action == "unknown" {
+                    PermissionRiskLevel::Unknown
+                } else {
+                    PermissionRiskLevel::High
+                },
             };
             let mut prompt = HandoffPrompt {
                 store: services.store.clone(),
@@ -1601,7 +1640,7 @@ mod tests {
             drop(context);
             assert_eq!(prompt.requests, 1, "{action}");
             match action {
-                "approved" | "timeout" => {
+                "approved" | "timeout" | "unknown" => {
                     let admission = result.as_ref().unwrap();
                     assert!(matches!(
                         admission.sandbox_plan(),
@@ -1968,6 +2007,67 @@ mod tests {
             .finish_started_effect()
             .expect("startup with no automatic review needs no fence settlement");
         assert!(!control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn started_effect_finish_waits_for_transient_sqlite_contention() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let (key, _authority_id, lease) =
+            started_effect_review_lease(&services, session.session.id);
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record allow"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .with_permission_retry_lease(Some(lease));
+        admission.admit().expect("admit one effect");
+        let database = rusqlite::Connection::open(&services.storage_paths.database_path)
+            .expect("open isolated fixture writer");
+        database
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold an external writer during settlement");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal settlement start");
+            finished_tx
+                .send(admission.finish_started_effect())
+                .expect("return checked settlement");
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("settlement worker started");
+        let early_result = finished_rx.recv_timeout(std::time::Duration::from_millis(50));
+        database
+            .execute_batch("ROLLBACK")
+            .expect("release writer before checking assertions");
+        let waited_for_writer = matches!(
+            &early_result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let result = match early_result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("settlement completed after writer released"),
+            Err(error) => panic!("settlement worker disconnected: {error}"),
+        };
+        worker.join().expect("join settlement worker");
+        assert!(
+            waited_for_writer,
+            "a response must wait for checked settlement"
+        );
+        result.expect("transient contention must not leave a blocking approved fence");
+        assert!(!control.is_cancelled());
+        assert!(
+            services
+                .store
+                .permission_retry_fence_store()
+                .record(&key)
+                .expect("read settled approval")
+                .is_none()
+        );
     }
 
     #[tokio::test]

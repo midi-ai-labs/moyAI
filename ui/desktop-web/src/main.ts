@@ -8,7 +8,7 @@ import { refreshSharedWork } from "./shared_work_actions.ts";
 import { refreshReceiverActivity } from "./receiver_activity.ts";
 import { refreshOriginWork } from "./origin_work.ts";
 import { refreshDeviceExecution } from "./device_execution.ts";
-import { sharedWorkPresentation } from "./shared_work_state.ts";
+import { sharedEditorFocusIntent, sharedWorkPresentation } from "./shared_work_state.ts";
 import { applyLocalMessageEditHandoff } from "./local_revision_source.ts";
 import { retainSharedWorkSurface } from "./shared_work_render.ts";
 import { shouldRetainSharedWorkMain } from "./shared_work_retention.ts";
@@ -1088,6 +1088,7 @@ function renderCommitted(
   );
   const mcpActivityDelay = taskActivityAnimationDelay(uiState.mcpActivityAnimationEpoch, renderNowMs);
   const previous = lastRenderedState;
+  const previousSharedWork = lastRenderedModel?.local.sharedWork ?? null;
   const runFocusDecision = reconcileMainRunFocusContinuation(
     uiState.mainRunFocusContinuation,
     previous,
@@ -1249,6 +1250,9 @@ function renderCommitted(
   const previousPrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   const previousThreadScrollTop = previousThread?.scrollTop ?? 0;
   const previousThreadWasNearEnd = previousThread ? isThreadNearEnd(previousThread) : true;
+  const previousThreadEndGap = previousThread
+    ? Math.max(0, previousThread.scrollHeight - previousThread.clientHeight - previousThreadScrollTop)
+    : 0;
   const previousSessionInteractionOwner = previous ? composerSessionOwner(previous) : null;
   const nextSessionInteractionOwner = composerSessionOwner(state);
   const restorePromptFocusAfterRefresh = refreshPromptFocusContinuationAccepted(
@@ -1447,6 +1451,7 @@ function renderCommitted(
   }
   const thread = document.querySelector<HTMLElement>("#thread");
   let sessionThreadInteractionAfterLayout: SessionInteractionSnapshot | null = null;
+  let threadScrollTopAfterLayout: number | null = null;
   let pinnedToEnd = false;
   if (thread && prependViewportAnchor && restoreViewportAnchor(thread, prependViewportAnchor)) {
     // Preserve the visible message while an older bounded history chunk is prepended.
@@ -1459,7 +1464,7 @@ function renderCommitted(
     revealThreadEnd(revealGeneration);
     pinnedToEnd = true;
   } else if (thread && previousThread) {
-    restoreThreadPosition(thread, previousThreadScrollTop);
+    threadScrollTopAfterLayout = previousThreadScrollTop;
   }
   previousSessionKey = nextSessionKey;
   lastRenderedLocalModalIdentity = renderedLocalModalIdentity;
@@ -1609,6 +1614,16 @@ function renderCommitted(
   }
   if (thread && sessionThreadInteractionAfterLayout) {
     restoreSessionThreadInteraction(sessionThreadInteractionAfterLayout, thread);
+  } else if (thread && threadScrollTopAfterLayout !== null) {
+    // Restore after composer layout, before another projection can capture the replacement's
+    // temporary zero offset. A queued frame can otherwise restore an already detached thread.
+    // A pane width change can reflow the same conversation. Keep its near-tail distance so
+    // layout alone does not turn the viewport into an older-history position.
+    const scrollTop = previousThreadWasNearEnd
+      && previousSessionInteractionOwner === nextSessionInteractionOwner
+      ? Math.max(0, thread.scrollHeight - thread.clientHeight - previousThreadEndGap)
+      : threadScrollTopAfterLayout;
+    restoreScrollPosition(thread, thread.scrollLeft, scrollTop);
   }
   if (promptSessionInteraction) {
     const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
@@ -1779,6 +1794,13 @@ function renderCommitted(
     pendingNewSessionPromptFocus,
   );
   if (requestedPromptFocus) postRenderFocusIntents.push(requestedPromptFocus);
+  const sharedEditorFocus = state.hub_project_open && state.overlay === "none"
+    ? sharedEditorFocusIntent(previousSharedWork, model.local.sharedWork,
+      () => lastRenderedModel === model && currentState?.hub_project_open && currentState.overlay === "none"
+        ? sharedWorkPresentation(uiState.sharedWork) : null,
+      selector => document.querySelector<HTMLElement>(selector))
+    : null;
+  if (sharedEditorFocus) postRenderFocusIntents.push(sharedEditorFocus);
   if (
     selectedAgentNeedsRefresh
     && uiState.selectedAgentPath
@@ -2630,13 +2652,6 @@ function wireThreadTailFollowEvents(thread: HTMLElement): void {
       observeUserViewport();
     }
   });
-}
-
-function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {
-  const scroll = () => {
-    thread.scrollTop = Math.min(scrollTop, Math.max(0, thread.scrollHeight - thread.clientHeight));
-  };
-  requestAnimationFrame(scroll);
 }
 
 function shouldAutoRefresh(state: DesktopWebState): boolean {

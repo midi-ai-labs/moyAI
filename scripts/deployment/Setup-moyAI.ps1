@@ -23,13 +23,16 @@ try {
   if ($sourceRoot.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase) -and -not $Uninstall) { throw '新しいZIPが導入済みフォルダーの内側にあります。導入先の外へ展開し直し、そちらのSetup-moyAI.cmdを開いてください。' }
   $runningNotice = Get-MoyaiRunningAppNotice $InstallRoot @(Get-Process -ErrorAction SilentlyContinue)
   if ($runningNotice) { throw $runningNotice }
-  $shortcutFolder = Join-Path ([Environment]::GetFolderPath('Programs')) 'moyAI'
+  $shortcutFolder = Get-MoyaiShortcutFolder
   if ($Uninstall) {
     $installed = Read-MoyaiDeployment $InstallRoot -AllowMissingFiles
     $autostart = @(Remove-MoyaiAutostart $InstallRoot $receipt $installed -Preview:$CheckOnly)
     foreach ($registration in $autostart) { Write-Output "サインイン時の自動起動$(if ($CheckOnly) { 'の解除予定' } else { 'を解除しました' }): $($registration.name)" }
     $association = @(Remove-MoyaiJoinFileAssociation $InstallRoot $receipt $installed -Preview:$CheckOnly)
     foreach ($path in $association) { Write-Output "接続ファイルの関連付け$(if ($CheckOnly) { 'の解除予定' } else { 'を解除しました' }): $path" }
+    if (-not $NoShortcuts) {
+      foreach ($path in @(Remove-MoyaiShortcuts $InstallRoot $shortcutFolder -Preview:$CheckOnly)) { Write-Output "ショートカット$(if ($CheckOnly) { 'の削除予定' } else { 'を削除しました' }): $path" }
+    }
     if ($CheckOnly) { Write-Output "確認のみ完了しました。アプリの削除予定先: $InstallRoot`n設定・履歴と、導入後に追加・変更したファイルは残します。まだ削除していません。"; exit 0 }
     foreach ($file in $installed.files) {
       $path = Resolve-MoyaiChild $InstallRoot $file.path
@@ -47,12 +50,6 @@ try {
       if ((Test-Path -LiteralPath $directory) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { Remove-Item -LiteralPath $directory -Force }
     }
     if (@(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -eq 0) { Remove-Item -LiteralPath $InstallRoot -Force }
-    if (-not $NoShortcuts) {
-      foreach ($name in @('moyAI.lnk', 'moyAI Team Management.lnk')) {
-        $path = Join-Path $shortcutFolder $name
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-      }
-    }
     Write-Output "アンインストールが完了しました。`nアプリ本体と、この配置に一致するRunner・Hubの自動起動を取り除きました。`n設定・ログイン情報・履歴・作業フォルダー、追加・変更したファイル、別の導入先の登録は残しています。`nこの画面を閉じてください。"
     exit 0
   }
@@ -94,19 +91,19 @@ try {
   if (-not $NoShortcuts) {
     New-Item -ItemType Directory -Path $shortcutFolder -Force | Out-Null
     $shell = New-Object -ComObject WScript.Shell
-    $entries = @(@{Name='moyAI'; Arguments=''})
-    if ($manifest.hub) { $entries += @{Name='moyAI Team Management'; Arguments=' -TeamManagement'} }
-    foreach ($entry in $entries) {
-      $shortcut = $shell.CreateShortcut((Join-Path $shortcutFolder ($entry.Name + '.lnk')))
-      $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
-      $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $InstallRoot 'scripts/Start-moyAI.ps1') + '"' + $entry.Arguments
-      $shortcut.WorkingDirectory = $InstallRoot
-      $shortcut.IconLocation = (Join-Path $InstallRoot 'app/bin/moyai-desktop.exe') + ',0'
+    $entries = @('moyAI')
+    if ($manifest.hub) { $entries += 'moyAI Team Management' }
+    foreach ($name in $entries) {
+      $entry = Get-MoyaiShortcutRegistration $InstallRoot $name
+      $shortcut = $shell.CreateShortcut((Join-Path $shortcutFolder ($name + '.lnk')))
+      $shortcut.TargetPath = $entry.TargetPath
+      $shortcut.Arguments = $entry.Arguments
+      $shortcut.WorkingDirectory = $entry.WorkingDirectory
+      $shortcut.IconLocation = $entry.IconLocation
       $shortcut.Save()
     }
     if (-not $manifest.hub) {
-      $oldShortcut = Join-Path $shortcutFolder 'moyAI Team Management.lnk'
-      if (Test-Path -LiteralPath $oldShortcut) { Remove-Item -LiteralPath $oldShortcut -Force }
+      [void](Remove-MoyaiShortcuts $InstallRoot $shortcutFolder @('moyAI Team Management'))
     }
   }
   Write-Output "`n導入が完了しました。moyAI $($manifest.version)`n導入先: $InstallRoot"

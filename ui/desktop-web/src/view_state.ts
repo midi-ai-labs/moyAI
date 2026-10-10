@@ -1,5 +1,6 @@
 import {
   configDraftAppliesTo,
+  configCommandValues,
   configMutationPending,
   reconcileConfigDraftTarget,
   type ConfigValueInput,
@@ -407,7 +408,7 @@ export function synchronizeInitialSetupProviderDraft(
 ): boolean {
   if (state.overlay !== "config"
     && (!state.startup.initial_setup_required || state.overlay !== "initial_setup")) return false;
-  const next = providerDraftFromConfigFields(state.config_fields, uiState.drafts.provider);
+  const next = providerDraftForCurrentSurface(state, uiState);
   if (sameProviderDraft(next, uiState.drafts.provider)) return false;
   const catalogIdentityChanged = !sameProviderCatalogIdentity(next, uiState.drafts.provider);
   uiState.drafts.provider = next;
@@ -799,7 +800,15 @@ function providerDraftForCurrentSurface(
     && (!state.startup.initial_setup_required || state.overlay !== "initial_setup")) {
     return uiState.drafts.provider;
   }
-  return providerDraftFromConfigFields(activeConfigFields(state, uiState), uiState.drafts.provider);
+  const fields = activeConfigFields(state, uiState);
+  const draft = providerDraftFromConfigFields(fields, uiState.drafts.provider);
+  const baselineUrl = uiState.configDraftBaselineValues.get("model.base_url") ?? state.provider_effective_base_url;
+  const baselineProfile = uiState.configDraftBaselineValues.get("model.provider_profile") ?? state.provider_effective_profile;
+  const connectionChanged = normalizeProviderBaseUrl(draft.baseUrl) !== normalizeProviderBaseUrl(baselineUrl)
+    || draft.providerProfile !== baselineProfile;
+  const values = configCommandValues(uiState, state.config_target, fields.map(field => ({ key: field.key, text: field.value })));
+  if (connectionChanged && !values.some(value => value.key === "model.api_key_env")) draft.apiKeyEnv = "";
+  return draft;
 }
 
 function providerDraftFromConfigFields(

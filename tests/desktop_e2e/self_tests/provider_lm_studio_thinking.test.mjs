@@ -44,6 +44,12 @@ const CONFIG_FIELDS = Object.freeze([
   { key: "model.model", value: OPTIONS.model },
   { key: "model.provider_profile", value: "lm_studio" },
   { key: "model.api_key_env", value: "" },
+  { key: "model.extra_headers_json", value: "" },
+  { key: "side_chat.api_key_env", value: "UNCHANGED_SIDE_KEY" },
+  { key: "approve.base_url", value: "http://127.0.0.1:10" },
+  { key: "approve.provider_profile", value: "openai_responses" },
+  { key: "approve.model", value: "guardian" },
+  { key: "approve.api_key_env", value: "UNCHANGED_APPROVE_KEY" },
   { key: "model.supports_tools", value: "true" },
   { key: "permissions.access_mode", value: "default" },
 ]);
@@ -285,7 +291,7 @@ test("fixture leaves LM Studio sampling and thinking at host defaults", () => {
   assert.doesNotMatch(config, /qwen\/qwen3\.8-27b|127\.0\.0\.1:1234/);
 });
 
-test("global Save preserves every non-generation fixture field and exact target", () => {
+test("global Save preserves ordinary fields and omits unchanged Approve and private settings", () => {
   const surface = settingsSurface({
     projection: {
       config_fields: CONFIG_FIELDS.map((field) => {
@@ -298,7 +304,9 @@ test("global Save preserves every non-generation fixture field and exact target"
   assert.deepEqual(expectedLmStudioThinkingGlobalSave(surface, OPTIONS), {
     command: "save_global_config",
     args: {
-      values: CONFIG_FIELDS.map((field) => ({ key: field.key, text: field.value })),
+      values: CONFIG_FIELDS.filter(field => !field.key.startsWith("approve.")
+        && !["model.api_key_env", "model.extra_headers_json", "side_chat.api_key_env"].includes(field.key))
+        .map((field) => ({ key: field.key, text: field.value })),
       expectedTarget: CONFIG_TARGET,
     },
   });

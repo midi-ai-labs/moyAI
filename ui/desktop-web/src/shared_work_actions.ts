@@ -168,7 +168,6 @@ export function startSharedRename(context: ActionContext, conversationId: string
   local.editingConversationId = conversationId;
   local.renameDraft = row.title;
   context.rerender();
-  document.querySelector<HTMLInputElement>("#shared-rename-title")?.focus();
 }
 
 export function cancelSharedRename(context: ActionContext): void {
@@ -194,7 +193,6 @@ export function startSharedRevision(context: ActionContext, jobId: string): void
   local.editingJobRevision = p.detail!.revision;
   local.revisionDraft = prompt.prompt;
   context.rerender();
-  document.querySelector<HTMLTextAreaElement>("#shared-revise-prompt")?.focus();
 }
 
 export function cancelSharedRevision(context: ActionContext): void {

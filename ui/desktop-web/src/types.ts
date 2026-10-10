@@ -375,11 +375,13 @@ export interface SideChatCatalogModel {
 export interface SideChatCatalogResult {
   baseUrl: string;
   providerProfile: ProviderProfile;
+  apiKeyEnv: string;
   configGeneration: string;
   models: SideChatCatalogModel[];
 }
 
 export interface SideChatProjection {
+  api_key_env?: string;
   direct_provider_capture?: { base_url: string; model: string; provider_profile: string; enabled: boolean; reason: string } | null;
   configured: boolean;
   deleting: boolean;
@@ -516,6 +518,7 @@ export interface DesktopWebState {
   provider_apply_enabled: boolean;
   docling_readiness: DoclingReadinessProjection;
   config_fields: ConfigFieldProjection[];
+  approve_model_configured: boolean;
   config_target: ConfigMutationTarget;
   workspace_input: string;
   review_target: PromptReviewMutationTarget | null;

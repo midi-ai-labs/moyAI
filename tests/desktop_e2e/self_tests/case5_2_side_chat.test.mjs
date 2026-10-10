@@ -39,6 +39,7 @@ function surface({
   contextScope = "owner_session",
   appendPosition = "194",
   canonicalExtraRows = [],
+  apiKeyEnv = "",
 } = {}) {
   const sideMessages = messages.map((message) => ({ ...message }));
   const domMessages = (renderedMessages ?? messages).map((message) => ({ ...message }));
@@ -74,6 +75,7 @@ function surface({
         draft_revision: draftRevision,
         context_as_of_append_position: appendPosition,
         provider_profile: PROFILE,
+        api_key_env: apiKeyEnv,
         base_url: BASE_URL,
         model: MODEL,
         status,
@@ -217,6 +219,21 @@ test("Stage5 readiness fixes the exact selected Main owner and one empty configu
   const main = case52Stage5MainSnapshot(current);
   assert.equal(case52Stage5MainMatches(current, main), true);
   assert.equal(case52Stage5Ready(current, readyExpected(main)), true);
+});
+
+test("Stage5 readiness and terminal retain the explicitly selected credential reference", () => {
+  const initial = surface({ apiKeyEnv: "SIDE_TEST_KEY" });
+  const main = case52Stage5MainSnapshot(initial);
+  const expected = { ...readyExpected(main), api_key_env: "SIDE_TEST_KEY" };
+  assert.equal(case52Stage5Ready(initial, expected), true);
+  assert.equal(case52Stage5Ready(initial, { ...expected, api_key_env: "OTHER_KEY" }), false);
+  const completed = surface({ apiKeyEnv: "SIDE_TEST_KEY", status: "completed", generation: "1", messages: [
+    { id: "side-user", role: "user", content: QUESTION },
+    { id: "side-assistant", role: "assistant", content: ANSWER },
+  ] });
+  const terminalExpected = { ...expected, chat_id: CHAT, generation: "0", question: QUESTION, context_as_of_append_position: "194" };
+  assert.equal(case52Stage5TerminalMatches(completed, terminalExpected), true);
+  assert.equal(case52Stage5TerminalMatches(completed, { ...terminalExpected, api_key_env: "OTHER_KEY" }), false);
 });
 
 test("Stage5 readiness rejects non-empty or cross-session Side state and any Main drift", async (t) => {

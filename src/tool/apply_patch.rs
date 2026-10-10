@@ -1274,7 +1274,11 @@ async fn confirm_patch_permission_admission(
     ctx: &mut ToolContext<'_>,
     admission: &PatchPermissionAdmission,
 ) -> Result<ToolEffectAdmission, ToolError> {
-    ctx.confirm_if_needed_with_details(
+    let guardian_evidence =
+        crate::tool::permission_guardian::PermissionGuardianEvidenceState::file_edit_with_formatters(
+            admission.formatter_plans.iter().flatten().map(ToolFormatterPlan::guardian_evidence),
+        );
+    ctx.confirm_if_needed_with_details_and_guardian_evidence(
         admission.access,
         format!(
             "Apply patch as one tool invocation to {} target(s)",
@@ -1284,6 +1288,7 @@ async fn confirm_patch_permission_admission(
         admission.targets.clone(),
         admission.outside_workspace,
         admission.risks.clone(),
+        guardian_evidence,
     )
     .await
 }
@@ -1936,7 +1941,7 @@ mod tests {
                     config: &config,
                     tool_call_id,
                     cancel: control.token(),
-                    run_control: control,
+                    run_control: control.clone(),
                     run_mutation_fence: mutation_fence,
                     prompt: &mut prompt,
                     services: &services,
@@ -1961,6 +1966,65 @@ mod tests {
                 "{name}"
             );
         }
+        let preserved = std::fs::read(root.join("moved.txt")).unwrap();
+        for hunks in [
+            "@@\n-last\n+first\n@@\n-last\n+second\n*** End of File",
+            "@@\n-one\n-two\n-last\n+first\n@@\n-last\n*** End of File",
+        ] {
+            let patch =
+                format!("*** Begin Patch\n*** Update File: moved.txt\n{hunks}\n*** End Patch");
+            let tool_call_id = ToolCallId::new();
+            store
+                .session_repo()
+                .record_model_response_with_protocol_bundle(
+                    session.session.id,
+                    admission_id,
+                    turn_id,
+                    ModelResponseWrite {
+                        response_id: ModelResponseId::new(),
+                        assistant_text: None,
+                        assistant_protocol_sequence_no: None,
+                        tool_calls: vec![PendingToolCallWrite {
+                            id: tool_call_id,
+                            model_call_id: format!("overlap-{tool_call_id}"),
+                            tool_name: "apply_patch".into(),
+                            arguments_json: serde_json::json!({"patch_text": patch}).to_string(),
+                            protocol_sequence_no: None,
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            let result = ApplyPatchTool
+                .execute(
+                    serde_json::json!({"patch_text": patch}),
+                    ToolContext {
+                        session: &session,
+                        workspace: &session.workspace,
+                        config: &config,
+                        tool_call_id,
+                        cancel: control.token(),
+                        run_control: control.clone(),
+                        run_mutation_fence: RunMutationFence::new(
+                            store.session_repo(),
+                            session.session.id,
+                            admission_id,
+                            turn_id,
+                            control.clone(),
+                        ),
+                        prompt: &mut prompt,
+                        services: &services,
+                        agent: None,
+                        permission_guardian: None,
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "overlapping EOF hunks must be rejected before mutation"
+            );
+            assert_eq!(std::fs::read(root.join("moved.txt")).unwrap(), preserved);
+        }
     }
 
     #[cfg(windows)]
@@ -1973,6 +2037,53 @@ mod tests {
             "Set-Content -LiteralPath 'formatter-started.marker' -Value 'started'; [Console]::In.ReadToEnd()"
                 .to_string(),
         ]
+    }
+
+    #[test]
+    fn patch_guardian_evidence_keeps_each_resolved_formatter_in_operation_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.format = marker_format_config();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let operations = vec![
+            PatchOperation::Add {
+                path: Utf8PathBuf::from("first.txt"),
+                contents: "first".into(),
+            },
+            PatchOperation::Delete {
+                path: Utf8PathBuf::from("removed.txt"),
+            },
+            PatchOperation::Add {
+                path: Utf8PathBuf::from("second.txt"),
+                contents: "second".into(),
+            },
+        ];
+        let admission = build_patch_permission_admission(&config, &workspace, &operations)
+            .expect("combined patch admission");
+        let evidence =
+            crate::tool::permission_guardian::PermissionGuardianEvidenceState::file_edit_with_formatters(
+                admission.formatter_plans.iter().flatten().map(ToolFormatterPlan::guardian_evidence),
+            );
+        let crate::tool::permission_guardian::PermissionGuardianEvidenceState::Complete(
+            crate::tool::permission_guardian::PermissionGuardianEvidence::FileEditWithFormatters {
+                formatters,
+            },
+        ) = evidence
+        else {
+            panic!("the accompanying processes must be part of the reviewed patch");
+        };
+        assert_eq!(formatters.len(), 2);
+        assert_eq!(formatters[0].target, root.join("first.txt"));
+        assert_eq!(formatters[1].target, root.join("second.txt"));
+        for (actual, plan) in formatters
+            .iter()
+            .zip(admission.formatter_plans.iter().flatten())
+        {
+            assert_eq!(actual.cwd, root);
+            assert_eq!(actual.argv, plan.command());
+            assert_eq!(actual.executable.as_str(), plan.command()[0]);
+        }
     }
 
     #[test]

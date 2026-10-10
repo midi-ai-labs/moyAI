@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use super::merge::apply_patch as apply_config_patch;
 use super::model::{
     AccessMode, MAX_MODEL_REQUEST_TIMEOUT_MS, McpServerConfig, MultiAgentMode,
-    PartialDoclingConfig, PartialFileGuardConfig, PartialInspectionConfig, PartialMcpConfig,
-    PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialShellConfig, PartialSideChatConfig, ProviderProfile, ResolvedConfig,
-    validate_optional_provider_float,
+    PartialApproveConfig, PartialDoclingConfig, PartialFileGuardConfig, PartialInspectionConfig,
+    PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig,
+    PartialResolvedConfig, PartialShellConfig, PartialSideChatConfig, ProviderProfile,
+    ResolvedConfig, validate_optional_provider_float,
 };
 use super::turn::ProviderEndpoint;
 
@@ -18,6 +18,7 @@ pub enum ConfigField {
     SystemPrompt,
     ProviderProfile,
     ApiKeyEnv,
+    SideChatApiKeyEnv,
     SideChatBaseUrl,
     SideChatModel,
     SideChatSystemPrompt,
@@ -26,6 +27,14 @@ pub enum ConfigField {
     SideChatRequestTimeoutMs,
     SideChatConnectTimeoutMs,
     SideChatMaxRetries,
+    ApproveBaseUrl,
+    ApproveModel,
+    ApproveProviderProfile,
+    ApproveApiKeyEnv,
+    ApproveContextWindow,
+    ApproveRequestTimeoutMs,
+    ApproveConnectTimeoutMs,
+    ApproveMaxRetries,
     AccessMode,
     MultiAgentEnabled,
     MultiAgentMode,
@@ -39,6 +48,7 @@ pub enum ConfigField {
     Seed,
     StopSequences,
     ContextWindow,
+    CompactionBudgetTokens,
     MaxOutputTokens,
     RequestTimeoutMs,
     ConnectTimeoutMs,
@@ -153,12 +163,13 @@ impl ConfigFieldDescriptor {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 53] = [
+    pub const ALL: [ConfigField; 63] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
         ConfigField::SystemPrompt,
         ConfigField::ProviderProfile,
         ConfigField::ApiKeyEnv,
+        ConfigField::SideChatApiKeyEnv,
         ConfigField::SideChatBaseUrl,
         ConfigField::SideChatModel,
         ConfigField::SideChatSystemPrompt,
@@ -167,6 +178,14 @@ impl ConfigField {
         ConfigField::SideChatRequestTimeoutMs,
         ConfigField::SideChatConnectTimeoutMs,
         ConfigField::SideChatMaxRetries,
+        ConfigField::ApproveBaseUrl,
+        ConfigField::ApproveModel,
+        ConfigField::ApproveProviderProfile,
+        ConfigField::ApproveApiKeyEnv,
+        ConfigField::ApproveContextWindow,
+        ConfigField::ApproveRequestTimeoutMs,
+        ConfigField::ApproveConnectTimeoutMs,
+        ConfigField::ApproveMaxRetries,
         ConfigField::AccessMode,
         ConfigField::MultiAgentEnabled,
         ConfigField::MultiAgentMode,
@@ -180,6 +199,7 @@ impl ConfigField {
         ConfigField::Seed,
         ConfigField::StopSequences,
         ConfigField::ContextWindow,
+        ConfigField::CompactionBudgetTokens,
         ConfigField::MaxOutputTokens,
         ConfigField::RequestTimeoutMs,
         ConfigField::ConnectTimeoutMs,
@@ -241,6 +261,17 @@ impl ConfigField {
         )
     }
 
+    pub(crate) const fn is_connection_private_value(self) -> bool {
+        matches!(
+            self,
+            Self::ApiKeyEnv
+                | Self::SideChatApiKeyEnv
+                | Self::ApproveApiKeyEnv
+                | Self::ExtraHeadersJson
+                | Self::ExtraBodyJson
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             ConfigField::BaseUrl => "model.base_url",
@@ -248,6 +279,7 @@ impl ConfigField {
             ConfigField::SystemPrompt => "model.system_prompt",
             ConfigField::ProviderProfile => "model.provider_profile",
             ConfigField::ApiKeyEnv => "model.api_key_env",
+            ConfigField::SideChatApiKeyEnv => "side_chat.api_key_env",
             ConfigField::SideChatBaseUrl => "side_chat.base_url",
             ConfigField::SideChatModel => "side_chat.model",
             ConfigField::SideChatSystemPrompt => "side_chat.system_prompt",
@@ -256,6 +288,14 @@ impl ConfigField {
             ConfigField::SideChatRequestTimeoutMs => "side_chat.request_timeout_ms",
             ConfigField::SideChatConnectTimeoutMs => "side_chat.connect_timeout_ms",
             ConfigField::SideChatMaxRetries => "side_chat.max_retries",
+            ConfigField::ApproveBaseUrl => "approve.base_url",
+            ConfigField::ApproveModel => "approve.model",
+            ConfigField::ApproveProviderProfile => "approve.provider_profile",
+            ConfigField::ApproveApiKeyEnv => "approve.api_key_env",
+            ConfigField::ApproveContextWindow => "approve.context_window",
+            ConfigField::ApproveRequestTimeoutMs => "approve.request_timeout_ms",
+            ConfigField::ApproveConnectTimeoutMs => "approve.connect_timeout_ms",
+            ConfigField::ApproveMaxRetries => "approve.max_retries",
             ConfigField::AccessMode => "permissions.access_mode",
             ConfigField::MultiAgentEnabled => "multi_agent.enabled",
             ConfigField::MultiAgentMode => "multi_agent.mode",
@@ -269,6 +309,7 @@ impl ConfigField {
             ConfigField::Seed => "model.seed",
             ConfigField::StopSequences => "model.stop_sequences",
             ConfigField::ContextWindow => "model.context_window",
+            ConfigField::CompactionBudgetTokens => "model.compaction_budget_tokens",
             ConfigField::MaxOutputTokens => "model.max_output_tokens",
             ConfigField::RequestTimeoutMs => "model.request_timeout_ms",
             ConfigField::ConnectTimeoutMs => "model.connect_timeout_ms",
@@ -311,13 +352,22 @@ impl ConfigField {
             ConfigField::ProviderProfile => Some("MOYAI_PROVIDER_PROFILE"),
             ConfigField::ApiKeyEnv => Some("MOYAI_API_KEY_ENV"),
             ConfigField::SideChatBaseUrl
+            | ConfigField::SideChatApiKeyEnv
             | ConfigField::SideChatModel
             | ConfigField::SideChatSystemPrompt
             | ConfigField::SideChatProviderProfile
             | ConfigField::SideChatContextWindow
             | ConfigField::SideChatRequestTimeoutMs
             | ConfigField::SideChatConnectTimeoutMs
-            | ConfigField::SideChatMaxRetries => None,
+            | ConfigField::SideChatMaxRetries
+            | ConfigField::ApproveBaseUrl
+            | ConfigField::ApproveModel
+            | ConfigField::ApproveProviderProfile
+            | ConfigField::ApproveApiKeyEnv
+            | ConfigField::ApproveContextWindow
+            | ConfigField::ApproveRequestTimeoutMs
+            | ConfigField::ApproveConnectTimeoutMs
+            | ConfigField::ApproveMaxRetries => None,
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
             ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
             ConfigField::MultiAgentMode => Some("MOYAI_MULTI_AGENT_MODE"),
@@ -331,6 +381,7 @@ impl ConfigField {
             ConfigField::Seed => Some("MOYAI_SEED"),
             ConfigField::StopSequences => Some("MOYAI_STOP_SEQUENCES"),
             ConfigField::ContextWindow => Some("MOYAI_CONTEXT_WINDOW"),
+            ConfigField::CompactionBudgetTokens => Some("MOYAI_COMPACTION_BUDGET_TOKENS"),
             ConfigField::MaxOutputTokens => Some("MOYAI_MAX_OUTPUT_TOKENS"),
             ConfigField::RequestTimeoutMs => Some("MOYAI_REQUEST_TIMEOUT_MS"),
             ConfigField::ConnectTimeoutMs => Some("MOYAI_CONNECT_TIMEOUT_MS"),
@@ -369,12 +420,28 @@ impl ConfigField {
         }
     }
 
+    pub(crate) fn is_approve(self) -> bool {
+        matches!(
+            self,
+            ConfigField::ApproveBaseUrl
+                | ConfigField::ApproveModel
+                | ConfigField::ApproveProviderProfile
+                | ConfigField::ApproveApiKeyEnv
+                | ConfigField::ApproveContextWindow
+                | ConfigField::ApproveRequestTimeoutMs
+                | ConfigField::ApproveConnectTimeoutMs
+                | ConfigField::ApproveMaxRetries
+        )
+    }
+
     pub fn display_label(self) -> &'static str {
         match self {
             ConfigField::SystemPrompt => "Main system prompt (optional)",
             ConfigField::ProviderProfile => "Connection type",
             ConfigField::ApiKeyEnv => "API key environment variable (optional)",
+            ConfigField::SideChatApiKeyEnv => "Side Chat API key environment variable (optional)",
             ConfigField::RequestTimeoutMs => "LLM response inactivity timeout",
+            ConfigField::CompactionBudgetTokens => "Automatic compaction threshold (optional)",
             ConfigField::SideChatBaseUrl => "Side Chat Base URL",
             ConfigField::SideChatModel => "Side Chat model",
             ConfigField::SideChatSystemPrompt => "Side Chat system prompt (optional)",
@@ -383,12 +450,23 @@ impl ConfigField {
             ConfigField::SideChatRequestTimeoutMs => "Side Chat response inactivity timeout",
             ConfigField::SideChatConnectTimeoutMs => "Side Chat connection timeout",
             ConfigField::SideChatMaxRetries => "Side Chat maximum retries",
+            ConfigField::ApproveBaseUrl => "Approve Base URL",
+            ConfigField::ApproveModel => "Approve model",
+            ConfigField::ApproveProviderProfile => "Approve connection type",
+            ConfigField::ApproveApiKeyEnv => "Approve API key environment variable (optional)",
+            ConfigField::ApproveContextWindow => "Approve context budget",
+            ConfigField::ApproveRequestTimeoutMs => "Approve total review timeout",
+            ConfigField::ApproveConnectTimeoutMs => "Approve connection timeout",
+            ConfigField::ApproveMaxRetries => "Approve maximum retries",
             _ => self.label(),
         }
     }
 
     pub fn help(self) -> &'static str {
         match self {
+            ConfigField::CompactionBudgetTokens => {
+                "自動圧縮を始める入力トークン数です。空欄では通常の作業用上限を使います。1以上かつcontext_windowから求めた実効入力上限以下で指定し、指定値と通常の作業用上限の小さい方で圧縮を始めます。出力上限はhost側で設定します。"
+            }
             ConfigField::SystemPrompt => {
                 "moyAI の組み込み system prompt の後へ追記します。空欄では追記せず、最大 16,384 文字です。"
             }
@@ -398,6 +476,9 @@ impl ConfigField {
             ConfigField::ApiKeyEnv => {
                 "API keyそのものではなく、起動環境に設定した環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄にします。"
             }
+            ConfigField::SideChatApiKeyEnv => {
+                "Side Chat用のAPI key環境変数名です。Mainと同じキーを使う場合も同じ環境変数名を明示してください。認証不要なら空欄です。"
+            }
             ConfigField::RequestTimeoutMs => {
                 "応答headerまでの待機と、応答中のSSE event間の最大無進捗時間（ms）です。進捗中の総所要時間は制限せず、hostへも送信しません。"
             }
@@ -406,6 +487,12 @@ impl ConfigField {
             }
             ConfigField::SideChatRequestTimeoutMs => {
                 "Side Chat の応答headerまでの待機と、応答中のSSE event間の最大無進捗時間（ms）です。"
+            }
+            ConfigField::ApproveApiKeyEnv => {
+                "Approve用のAPI key環境変数名です。認証不要なら空欄にします。接続先を変更すると、明示的に再指定していない認証設定は解除されます。"
+            }
+            ConfigField::ApproveRequestTimeoutMs => {
+                "代理で承認するときの、権限情報の読込みから最終判定までの制限時間（ms）です。hostへは送信しません。"
             }
             _ => "",
         }
@@ -435,7 +522,9 @@ impl ConfigField {
         const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
 
         let (value_type, integer_min, integer_max, options) = match self {
-            ConfigField::ProviderProfile | ConfigField::SideChatProviderProfile => {
+            ConfigField::ProviderProfile
+            | ConfigField::SideChatProviderProfile
+            | ConfigField::ApproveProviderProfile => {
                 (ConfigFieldValueType::Enum, None, None, PROVIDER_PROFILES)
             }
             ConfigField::AccessMode => (ConfigFieldValueType::Enum, None, None, ACCESS_MODES),
@@ -463,7 +552,9 @@ impl ConfigField {
                 (ConfigFieldValueType::Integer, Some(1), None, NONE)
             }
             ConfigField::ContextWindow
+            | ConfigField::CompactionBudgetTokens
             | ConfigField::SideChatContextWindow
+            | ConfigField::ApproveContextWindow
             | ConfigField::MaxParallelPredictions => (
                 ConfigFieldValueType::Integer,
                 Some(1),
@@ -476,7 +567,9 @@ impl ConfigField {
                 Some(u32::MAX as u64),
                 NONE,
             ),
-            ConfigField::MaxRetries | ConfigField::SideChatMaxRetries => (
+            ConfigField::MaxRetries
+            | ConfigField::SideChatMaxRetries
+            | ConfigField::ApproveMaxRetries => (
                 ConfigFieldValueType::Integer,
                 Some(0),
                 Some(u8::MAX as u64),
@@ -487,13 +580,15 @@ impl ConfigField {
             | ConfigField::InspectionMaxExtensionsReported => {
                 (ConfigFieldValueType::Integer, Some(0), None, NONE)
             }
-            ConfigField::RequestTimeoutMs | ConfigField::SideChatRequestTimeoutMs => (
+            ConfigField::RequestTimeoutMs
+            | ConfigField::SideChatRequestTimeoutMs
+            | ConfigField::ApproveRequestTimeoutMs => (
                 ConfigFieldValueType::Integer,
                 Some(1),
                 Some(MAX_MODEL_REQUEST_TIMEOUT_MS),
                 NONE,
             ),
-            ConfigField::SideChatConnectTimeoutMs => (
+            ConfigField::SideChatConnectTimeoutMs | ConfigField::ApproveConnectTimeoutMs => (
                 ConfigFieldValueType::Integer,
                 Some(1),
                 Some(i64::MAX as u64),
@@ -508,9 +603,13 @@ impl ConfigField {
             | ConfigField::Model
             | ConfigField::SystemPrompt
             | ConfigField::SideChatBaseUrl
+            | ConfigField::ApproveBaseUrl
+            | ConfigField::ApproveModel
+            | ConfigField::ApproveApiKeyEnv
             | ConfigField::SideChatModel
             | ConfigField::SideChatSystemPrompt
             | ConfigField::ApiKeyEnv
+            | ConfigField::SideChatApiKeyEnv
             | ConfigField::StopSequences
             | ConfigField::FileGuardBlockedReadExtensions
             | ConfigField::FileGuardStructuredDocumentExtensions
@@ -530,12 +629,15 @@ impl ConfigField {
         matches!(
             self,
             ConfigField::Temperature
+                | ConfigField::CompactionBudgetTokens
                 | ConfigField::TopP
                 | ConfigField::TopK
                 | ConfigField::PresencePenalty
                 | ConfigField::FrequencyPenalty
                 | ConfigField::Seed
                 | ConfigField::ApiKeyEnv
+                | ConfigField::SideChatApiKeyEnv
+                | ConfigField::ApproveApiKeyEnv
                 | ConfigField::SystemPrompt
                 | ConfigField::SideChatSystemPrompt
                 | ConfigField::StopSequences
@@ -556,6 +658,9 @@ impl ConfigField {
             ConfigField::SystemPrompt => config.model.system_prompt.clone(),
             ConfigField::ProviderProfile => config.model.provider_profile.as_str().to_string(),
             ConfigField::ApiKeyEnv => config.model.api_key_env.clone().unwrap_or_default(),
+            ConfigField::SideChatApiKeyEnv => {
+                config.side_chat.api_key_env.clone().unwrap_or_default()
+            }
             ConfigField::SideChatBaseUrl => config.side_chat.base_url.clone(),
             ConfigField::SideChatModel => config.side_chat.model.clone(),
             ConfigField::SideChatSystemPrompt => config.side_chat.system_prompt.clone(),
@@ -570,6 +675,20 @@ impl ConfigField {
                 config.side_chat.connect_timeout_ms.to_string()
             }
             ConfigField::SideChatMaxRetries => config.side_chat.max_retries.to_string(),
+            ConfigField::ApproveBaseUrl => config.approve_model().base_url,
+            ConfigField::ApproveModel => config.approve_model().model,
+            ConfigField::ApproveProviderProfile => {
+                config.approve_model().provider_profile.as_str().to_string()
+            }
+            ConfigField::ApproveApiKeyEnv => config.approve_model().api_key_env.unwrap_or_default(),
+            ConfigField::ApproveContextWindow => config.approve_model().context_window.to_string(),
+            ConfigField::ApproveRequestTimeoutMs => {
+                config.approve_model().request_timeout_ms.to_string()
+            }
+            ConfigField::ApproveConnectTimeoutMs => {
+                config.approve_model().connect_timeout_ms.to_string()
+            }
+            ConfigField::ApproveMaxRetries => config.approve_model().max_retries.to_string(),
             ConfigField::AccessMode => config.permissions.access_mode.as_str().to_string(),
             ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
             ConfigField::MultiAgentMode => config.multi_agent.mode.as_str().to_string(),
@@ -587,6 +706,9 @@ impl ConfigField {
             ConfigField::Seed => option_value(config.model.seed),
             ConfigField::StopSequences => config.model.stop_sequences.join(", "),
             ConfigField::ContextWindow => config.model.context_window.to_string(),
+            ConfigField::CompactionBudgetTokens => {
+                option_value(config.model.compaction_budget_tokens)
+            }
             ConfigField::MaxOutputTokens => config.model.max_output_tokens.to_string(),
             ConfigField::RequestTimeoutMs => config.model.request_timeout_ms.to_string(),
             ConfigField::ConnectTimeoutMs => config.model.connect_timeout_ms.to_string(),
@@ -679,13 +801,22 @@ pub(crate) fn build_resolved_config_from_field_values(
     fields: &[(ConfigField, &str)],
 ) -> Result<ResolvedConfig, String> {
     validate_complete_config_field_values(fields)?;
-    let mut config = apply_config_patch(base.clone(), parse_config_field_patch(fields)?);
+    let approve_changed = fields
+        .iter()
+        .any(|(field, value)| field.is_approve() && value.trim() != field.editor_value(base));
+    let fields = fields
+        .iter()
+        .copied()
+        .filter(|(field, _)| base.approve.is_some() || approve_changed || !field.is_approve())
+        .collect::<Vec<_>>();
+    let mut config = apply_config_patch(base.clone(), parse_config_field_patch(&fields)?);
 
-    for (field, value) in fields {
+    for (field, value) in &fields {
         if !value.trim().is_empty() {
             continue;
         }
         match field {
+            ConfigField::CompactionBudgetTokens => config.model.compaction_budget_tokens = None,
             ConfigField::Temperature => config.model.temperature = None,
             ConfigField::TopP => config.model.top_p = None,
             ConfigField::TopK => config.model.top_k = None,
@@ -693,6 +824,14 @@ pub(crate) fn build_resolved_config_from_field_values(
             ConfigField::FrequencyPenalty => config.model.frequency_penalty = None,
             ConfigField::Seed => config.model.seed = None,
             ConfigField::ApiKeyEnv => config.model.api_key_env = None,
+            ConfigField::SideChatApiKeyEnv => config.side_chat.api_key_env = None,
+            ConfigField::ApproveApiKeyEnv => {
+                config
+                    .approve
+                    .as_mut()
+                    .expect("explicit approval patch")
+                    .api_key_env = None
+            }
             ConfigField::SystemPrompt => config.model.system_prompt.clear(),
             ConfigField::SideChatSystemPrompt => config.side_chat.system_prompt.clear(),
             ConfigField::ExtraHeadersJson => config.model.extra_headers.clear(),
@@ -715,11 +854,14 @@ pub(crate) fn build_resolved_config_from_key_values(
     base: &ResolvedConfig,
     values: Vec<(String, String)>,
 ) -> Result<ResolvedConfig, String> {
+    let approve_requested = values.iter().any(|(key, _)| key.starts_with("approve."));
     let mut fields = ConfigField::ALL
         .into_iter()
+        .filter(|field| base.approve.is_some() || approve_requested || !field.is_approve())
         .map(|field| (field, field.editor_value(base)))
         .collect::<Vec<_>>();
     let mut seen = HashSet::new();
+    let mut explicit = HashSet::new();
     for (key, value) in values {
         if !seen.insert(key.clone()) {
             return Err(format!("duplicate config field key: {key}"));
@@ -734,8 +876,11 @@ pub(crate) fn build_resolved_config_from_key_values(
         {
             continue;
         }
+        explicit.insert(field.0);
         field.1 = value;
     }
+    // A baseline value is not an explicit credential grant to a new endpoint.
+    fields.retain(|(field, _)| !field.is_connection_private_value() || explicit.contains(field));
     let borrowed = fields
         .iter()
         .map(|(field, value)| (*field, value.as_str()))
@@ -749,6 +894,7 @@ pub(crate) fn parse_config_field_patch(
     let mut patch = PartialResolvedConfig::default();
     let mut model = PartialModelConfig::default();
     let mut side_chat = PartialSideChatConfig::default();
+    let mut approve = PartialApproveConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
     let mut multi_agent = PartialMultiAgentConfig::default();
     let mut shell = PartialShellConfig::default();
@@ -780,6 +926,7 @@ pub(crate) fn parse_config_field_patch(
                 }
             }
             ConfigField::ApiKeyEnv => model.api_key_env = Some(parse_string(text)),
+            ConfigField::SideChatApiKeyEnv => side_chat.api_key_env = Some(parse_string(text)),
             ConfigField::SideChatBaseUrl => {
                 side_chat.base_url = match parse_string(text) {
                     Some(value) => Some(
@@ -810,6 +957,36 @@ pub(crate) fn parse_config_field_patch(
             }
             ConfigField::SideChatMaxRetries => {
                 side_chat.max_retries = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::ApproveBaseUrl => {
+                approve.base_url = match parse_string(text) {
+                    Some(value) => Some(
+                        ProviderEndpoint::parse(&value)
+                            .map_err(|error| format!("{}: {error}", field.label()))?
+                            .as_str()
+                            .to_string(),
+                    ),
+                    None => None,
+                };
+            }
+            ConfigField::ApproveModel => approve.model = parse_string(text),
+            ConfigField::ApproveApiKeyEnv => approve.api_key_env = Some(parse_string(text)),
+            ConfigField::ApproveProviderProfile => {
+                approve.provider_profile = parse_string(text)
+                    .map(|value| parse_provider_profile(&value))
+                    .transpose()?;
+            }
+            ConfigField::ApproveContextWindow => {
+                approve.context_window = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::ApproveRequestTimeoutMs => {
+                approve.request_timeout_ms = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::ApproveConnectTimeoutMs => {
+                approve.connect_timeout_ms = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::ApproveMaxRetries => {
+                approve.max_retries = parse_integer(text, field.descriptor())?
             }
             ConfigField::AccessMode => {
                 permissions.access_mode = match parse_string(text) {
@@ -843,6 +1020,9 @@ pub(crate) fn parse_config_field_patch(
             ConfigField::StopSequences => model.stop_sequences = Some(parse_csv(text)),
             ConfigField::ContextWindow => {
                 model.context_window = parse_integer(text, field.descriptor())?
+            }
+            ConfigField::CompactionBudgetTokens => {
+                model.compaction_budget_tokens = parse_integer(text, field.descriptor())?
             }
             ConfigField::MaxOutputTokens => {
                 model.max_output_tokens = parse_integer(text, field.descriptor())?
@@ -934,6 +1114,9 @@ pub(crate) fn parse_config_field_patch(
 
     patch.model = Some(model);
     patch.side_chat = Some(side_chat);
+    if fields.iter().any(|(field, _)| field.is_approve()) {
+        patch.approve = Some(approve);
+    }
     patch.permissions = Some(permissions);
     patch.multi_agent = Some(multi_agent);
     patch.shell = Some(shell);
@@ -944,7 +1127,9 @@ pub(crate) fn parse_config_field_patch(
     Ok(patch)
 }
 
-fn validate_complete_config_field_values(fields: &[(ConfigField, &str)]) -> Result<(), String> {
+pub(crate) fn validate_complete_config_field_values(
+    fields: &[(ConfigField, &str)],
+) -> Result<(), String> {
     for (field, value) in fields {
         if !value.trim().is_empty() || !field.descriptor().required() {
             continue;
@@ -1072,7 +1257,7 @@ mod tests {
 
     #[test]
     fn descriptor_inventory_has_one_stable_entry_per_field() {
-        assert_eq!(ConfigField::ALL.len(), 53);
+        assert_eq!(ConfigField::ALL.len(), 63);
         let mut keys = HashSet::new();
         for field in ConfigField::ALL {
             let descriptor = field.descriptor();
@@ -1080,6 +1265,176 @@ mod tests {
             assert!(keys.insert(descriptor.key()));
             assert_eq!(descriptor.required(), !field.allows_empty_complete_value());
         }
+    }
+
+    #[test]
+    fn approval_fields_preserve_unconfigured_state_when_other_settings_change() {
+        let mut base = ResolvedConfig::default();
+        base.model.model = "main-one".into();
+        let mut complete = ConfigField::ALL
+            .into_iter()
+            .map(|field| (field.label().to_string(), field.editor_value(&base)))
+            .collect::<Vec<_>>();
+        complete
+            .iter_mut()
+            .find(|(key, _)| key == "model.model")
+            .unwrap()
+            .1 = "main-two".into();
+        let changed = build_resolved_config_from_key_values(&base, complete).unwrap();
+        assert!(changed.approve.is_none());
+        assert_eq!(changed.approve_model().model, "main-two");
+        let independent = build_resolved_config_from_key_values(
+            &changed,
+            vec![("approve.model".into(), "fast-review".into())],
+        )
+        .unwrap();
+        assert_eq!(independent.approve.as_ref().unwrap().model, "fast-review");
+        let later = build_resolved_config_from_key_values(
+            &independent,
+            vec![("model.model".into(), "main-three".into())],
+        )
+        .unwrap();
+        assert_eq!(later.approve, independent.approve);
+        assert_eq!(later.model.model, "main-three");
+    }
+
+    #[test]
+    fn compaction_budget_field_sets_clears_and_validates_the_global_value() {
+        let field = ConfigField::CompactionBudgetTokens;
+        assert!(!field.descriptor().required());
+        assert!(!field.is_host_owned_generation());
+        assert_eq!(field.descriptor().integer_min(), Some(1));
+        assert_eq!(field.env_override(), Some("MOYAI_COMPACTION_BUDGET_TOKENS"));
+        let base = ResolvedConfig::default();
+        let configured = build_resolved_config_from_key_values(
+            &base,
+            vec![(field.label().into(), "98304".into())],
+        )
+        .unwrap();
+        assert_eq!(configured.model.compaction_budget_tokens, Some(98_304));
+        assert_eq!(field.editor_value(&configured), "98304");
+        let cleared = build_resolved_config_from_key_values(
+            &configured,
+            vec![(field.label().into(), String::new())],
+        )
+        .unwrap();
+        assert_eq!(cleared.model.compaction_budget_tokens, None);
+        assert!(field.editor_value(&cleared).is_empty());
+        for value in ["0", "124519", "not-a-number"] {
+            assert!(
+                build_resolved_config_from_key_values(
+                    &base,
+                    vec![(field.label().into(), value.into())],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn approval_target_edits_drop_unconfirmed_credentials_and_keep_explicit_references() {
+        let mut base = ResolvedConfig::default();
+        base.model.api_key_env = Some("MAIN_KEY".into());
+        base.model
+            .extra_headers
+            .insert("x-private".into(), "private-value".into());
+        let changed = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    "approve.base_url".into(),
+                    "https://review.example.test/v1".into(),
+                ),
+                ("approve.model".into(), "fast-review".into()),
+            ],
+        )
+        .unwrap();
+        let approve = changed.approve.as_ref().unwrap();
+        assert!(approve.api_key_env.is_none());
+        assert!(approve.extra_headers.is_empty());
+        let explicit = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    "approve.base_url".into(),
+                    "https://review.example.test/v1".into(),
+                ),
+                ("approve.api_key_env".into(), "MAIN_KEY".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.approve.as_ref().unwrap().api_key_env.as_deref(),
+            Some("MAIN_KEY")
+        );
+        assert!(explicit.approve.as_ref().unwrap().extra_headers.is_empty());
+    }
+
+    #[test]
+    fn main_and_sub_target_edits_require_explicit_private_values() {
+        let mut base = ResolvedConfig::default();
+        base.model.base_url = "https://main.example.test/v1".into();
+        base.model.api_key_env = Some("MAIN_KEY".into());
+        base.model
+            .extra_headers
+            .insert("Authorization".into(), "private".into());
+        base.model.extra_body_json = Some(serde_json::json!({"token": "private"}));
+        base.side_chat.base_url = "https://sub.example.test/v1".into();
+        base.side_chat.api_key_env = Some("SUB_KEY".into());
+        for (url_key, key_key, reference, is_main) in [
+            ("model.base_url", "model.api_key_env", "MAIN_KEY", true),
+            (
+                "side_chat.base_url",
+                "side_chat.api_key_env",
+                "SUB_KEY",
+                false,
+            ),
+        ] {
+            let target: (String, String) = (url_key.into(), "https://new.example.test/v1".into());
+            let changed =
+                build_resolved_config_from_key_values(&base, vec![target.clone()]).unwrap();
+            if is_main {
+                assert!(changed.model.api_key_env.is_none());
+                assert!(changed.model.extra_headers.is_empty());
+                assert!(changed.model.extra_body_json.is_none());
+                assert_eq!(changed.side_chat.api_key_env, base.side_chat.api_key_env);
+            } else {
+                assert!(changed.side_chat.api_key_env.is_none());
+                assert_eq!(changed.model.api_key_env, base.model.api_key_env);
+                assert_eq!(changed.model.extra_headers, base.model.extra_headers);
+                assert!(changed.model.extra_body_json.is_none());
+            }
+            let confirmed = build_resolved_config_from_key_values(
+                &base,
+                vec![target, (key_key.into(), reference.into())],
+            )
+            .unwrap();
+            let actual = if is_main {
+                &confirmed.model.api_key_env
+            } else {
+                &confirmed.side_chat.api_key_env
+            };
+            assert_eq!(actual.as_deref(), Some(reference));
+        }
+        let same_target = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    "model.base_url".into(),
+                    "https://main.example.test/v1/".into(),
+                ),
+                ("model.model".into(), "new-model".into()),
+                ("side_chat.model".into(), "new-sub-model".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(same_target.model.api_key_env, base.model.api_key_env);
+        assert_eq!(
+            same_target.side_chat.api_key_env,
+            base.side_chat.api_key_env
+        );
+        assert_eq!(same_target.model.extra_headers, base.model.extra_headers);
+        assert!(same_target.model.extra_body_json.is_none());
     }
 
     #[test]
@@ -1127,6 +1482,7 @@ mod tests {
         let fields = [
             (ConfigField::SideChatBaseUrl, "side_chat.base_url"),
             (ConfigField::SideChatModel, "side_chat.model"),
+            (ConfigField::SideChatApiKeyEnv, "side_chat.api_key_env"),
             (ConfigField::SideChatSystemPrompt, "side_chat.system_prompt"),
             (
                 ConfigField::SideChatProviderProfile,
@@ -1168,6 +1524,10 @@ mod tests {
                     "side-model".to_string(),
                 ),
                 (
+                    ConfigField::SideChatApiKeyEnv.label().to_string(),
+                    " SIDE_KEY ".to_string(),
+                ),
+                (
                     ConfigField::SideChatSystemPrompt.label().to_string(),
                     "  side instructions  ".to_string(),
                 ),
@@ -1198,11 +1558,16 @@ mod tests {
         assert_eq!(configured.model.model, base.model.model);
         assert_eq!(configured.model.base_url, base.model.base_url);
         assert_eq!(configured.model.system_prompt, base.model.system_prompt);
+        assert_eq!(configured.model.api_key_env, base.model.api_key_env);
         assert_eq!(
             configured.side_chat.base_url,
             "https://side.example.test/v1"
         );
         assert_eq!(configured.side_chat.model, "side-model");
+        assert_eq!(
+            configured.side_chat.api_key_env.as_deref(),
+            Some("SIDE_KEY")
+        );
         assert_eq!(configured.side_chat.system_prompt, "side instructions");
         assert_eq!(
             configured.side_chat.provider_profile,
@@ -1234,6 +1599,16 @@ mod tests {
         )
         .expect("blank Side Chat prompt clears only the prompt");
         assert!(cleared.side_chat.system_prompt.is_empty());
+        let cleared_reference = build_resolved_config_from_key_values(
+            &configured,
+            vec![(
+                ConfigField::SideChatApiKeyEnv.label().to_string(),
+                String::new(),
+            )],
+        )
+        .expect("blank Side reference clears it");
+        assert_eq!(cleared_reference.side_chat.api_key_env, None);
+        assert_eq!(cleared_reference.model.api_key_env, base.model.api_key_env);
     }
 
     #[test]
@@ -1437,6 +1812,7 @@ mod tests {
         assert_eq!(side_connect_timeout.integer_min(), Some(1));
         assert_eq!(side_connect_timeout.integer_max(), Some(i64::MAX as u64));
         assert!(!ConfigField::ApiKeyEnv.descriptor().required());
+        assert!(!ConfigField::SideChatApiKeyEnv.descriptor().required());
     }
 
     #[test]
@@ -1472,9 +1848,20 @@ mod tests {
                 }
             }
             if let Some(maximum) = descriptor.integer_max() {
+                let valid_maximum = if field == ConfigField::CompactionBudgetTokens {
+                    u64::from(
+                        crate::llm::model_policy::ContextWindowLimits::resolve(
+                            base.model.context_window,
+                            base.session.overflow_margin_tokens,
+                        )
+                        .effective_full,
+                    )
+                } else {
+                    maximum
+                };
                 build_resolved_config_from_key_values(
                     &base,
-                    vec![(descriptor.key().to_string(), maximum.to_string())],
+                    vec![(descriptor.key().to_string(), valid_maximum.to_string())],
                 )
                 .unwrap_or_else(|error| {
                     panic!(
@@ -1482,6 +1869,17 @@ mod tests {
                         descriptor.key()
                     )
                 });
+                if valid_maximum < maximum {
+                    let error = build_resolved_config_from_key_values(
+                        &base,
+                        vec![(
+                            descriptor.key().to_string(),
+                            (valid_maximum + 1).to_string(),
+                        )],
+                    )
+                    .unwrap_err();
+                    assert!(error.contains(descriptor.key()), "{error}");
+                }
                 if let Some(above_maximum) = maximum.checked_add(1) {
                     let error = build_resolved_config_from_key_values(
                         &base,

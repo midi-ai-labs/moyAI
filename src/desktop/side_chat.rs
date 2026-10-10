@@ -41,6 +41,14 @@ pub(crate) fn side_chat_system_prompt(configured: &str) -> String {
 // serializers omit it, so side chat supplies a fixed inert value instead of a
 // legacy moyAI generation setting.
 const RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER: u32 = 1;
+
+fn owner_context_capture_error(error: crate::error::StorageError) -> String {
+    match error {
+        crate::error::StorageError::CanonicalSourceLimitExceeded { .. } =>
+            "元のチャットの保存履歴が上限に達しています。新しいチャットを開始してから、サイドチャットへ送信してください。".to_string(),
+        error => format!("failed to capture canonical owner context: {error}"),
+    }
+}
 const SIDE_CHAT_MIN_RESPONSE_RESERVE_TOKENS: usize = 512;
 const SIDE_CHAT_MAX_RESPONSE_RESERVE_TOKENS: usize = 4_096;
 const SIDE_CHAT_CONTEXT_ENVELOPE_RESERVE_TOKENS: usize = 256;
@@ -898,7 +906,7 @@ pub(crate) async fn prepare_side_chat_input(
                 Ok(())
             },
         )
-        .map_err(|error| format!("failed to capture canonical owner context: {error}"))?;
+        .map_err(owner_context_capture_error)?;
     if snapshot.append_fence != expected_owner_append_position {
         return Err(format!(
             "the Side Chat owner context changed before Side Send (expected {:?}, current {:?})",
@@ -2192,6 +2200,25 @@ mod tests {
         assert_eq!(units[0].source_ids, vec![call.id, output.id]);
         assert!(units[0].body.contains("Tool call: read"));
         assert!(units[0].body.contains("canonical output"));
+    }
+
+    #[test]
+    fn canonical_source_limit_guidance_requires_a_new_chat() {
+        for source_kind in ["history", "runtime"] {
+            let message = super::owner_context_capture_error(
+                crate::error::StorageError::CanonicalSourceLimitExceeded {
+                    source_kind,
+                    limit: SIDE_CHAT_MAX_SCANNED_OWNER_ITEMS,
+                },
+            );
+            assert!(message.contains("新しいチャットを開始"));
+            assert!(!message.contains("compact"));
+        }
+        let message = super::owner_context_capture_error(crate::error::StorageError::Message(
+            "database failed".into(),
+        ));
+        assert!(message.contains("database failed"));
+        assert!(!message.contains("新しいチャットを開始"));
     }
 
     #[test]

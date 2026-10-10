@@ -23,6 +23,8 @@ import {
 import { prepareDesktopFixture } from "./fixture.mjs";
 import {
   classifyAcquiredObservationFailure,
+  observeProviderTurnSurface,
+  providerRenderedTerminalFailures,
   quiesceProviderResource,
 } from "./provider_restart.mjs";
 import { captureScenarioScreenshot, selectedNavigationIdentity } from "./observations.mjs";
@@ -513,6 +515,11 @@ async function settleResources(state, input, commands, primaryError) {
   }
 }
 
+export function chatToolContinuationClosedStoreReady(cleanup) {
+  return cleanup?.desktop_exited === true && cleanup.profile_webviews_remaining === 0
+    && cleanup.scenario_quiesce?.input === "pass" && cleanup.sqlite?.pass === true;
+}
+
 export function createProviderChatToolContinuationScenario({ profile = null } = {}) {
   const OWNER = profile?.owner ?? DEFAULT_OWNER;
   const prompt = profile?.prompt ?? SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
@@ -566,7 +573,7 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
       const input = new WebviewInput(cdp, { probeId: "provider-chat-tool-continuation" });
       const commands = new DesktopCommandProbe(cdp, {
         probeId: "provider-chat-tool-continuation-commands",
-        commands: ["submit_prompt", "cancel_run"],
+        commands: profile?.commandNames ?? ["submit_prompt", "cancel_run"],
       });
       let primaryError = null;
       try {
@@ -603,6 +610,10 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
           afterSequence: commandStart,
           expected: [expectedCommand],
         });
+        const additionalCommands = profile?.beforeHeld
+          ? await profile.beforeHeld({ context, cdp, input, commands, sink, provider, expectedCommand, waitForProductStage })
+          : [];
+        const expectedCommands = [expectedCommand, ...additionalCommands];
 
         const held = await waitForProductStage({
           label: "held Chat Completions tool continuation",
@@ -623,7 +634,7 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
         });
         const heldCommand = assertExactDesktopCommandSequence(await commands.snapshot(commandStart), {
           afterSequence: commandStart,
-          expected: [expectedCommand],
+          expected: expectedCommands,
         });
         const heldTime = currentTimeFromToolStatus(held.value.surface.projection);
         if (profile?.observeHeld) await profile.observeHeld({ cdp, input, sink, held: held.value });
@@ -654,8 +665,32 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
         });
         const finalCommand = assertExactDesktopCommandSequence(await commands.snapshot(commandStart), {
           afterSequence: commandStart,
-          expected: [expectedCommand],
+          expected: expectedCommands,
         });
+        if (profile === null) {
+          const rendered = await waitForProductStage({
+            label: "rendered Chat tool-continuation terminal metadata",
+            sample: () => observeProviderTurnSurface(cdp),
+            decide: surface => {
+              if (blockingFailure(surface) || controlTokenLeaks(surface).length > 0) return "fail";
+              return terminalSettled(surface)
+                && isDeepStrictEqual(surface.projection.run_target, terminal.value.surface.projection.run_target)
+                && providerRenderedTerminalFailures(surface).length === 0 ? "pass" : "pending";
+            },
+            code: "provider-chat-tool-terminal-render-mismatch",
+            message: "the terminal run owner and session usage did not settle in the rendered composer",
+          });
+          const surface = rendered.value;
+          await sink.record("provider-chat-tool-terminal-render", { status: "settled",
+            observation_elapsed_ms: rendered.elapsed_ms, observation_attempts: rendered.attempts,
+            projection: { run_target: surface.projection.run_target,
+              session_usage_label: surface.projection.session_usage_label,
+              session_usage_title: surface.projection.session_usage_title,
+              session_usage_state: surface.projection.session_usage_state },
+            composer: surface.composer, session_usage: surface.session_usage,
+            failures: providerRenderedTerminalFailures(surface),
+          }, { phase: "executing", owner: OWNER });
+        }
         const terminalScreenshot = await captureScenarioScreenshot({
           cdp,
           sink,
@@ -668,6 +703,7 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
           typed,
           send,
           expected_command: expectedCommand,
+          expected_commands: profile?.beforeHeld ? expectedCommands : undefined,
           command: exactCommand,
           held_command: heldCommand,
           final_command: finalCommand,
@@ -715,11 +751,19 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
       });
       return structuredClone(state.quiesceOutcome);
     },
-    async cleanup() {
+    async cleanup({ context, sink, inputs, cleanup } = {}) {
       const quiesced = state.quiesceOutcome !== null;
       const pass = quiesced
         && state.quiesceOutcome.input === "pass"
         && state.resourceOutcome?.failures?.length === 0;
+      let closedStore;
+      if (profile?.afterClosedStore && pass) {
+        if (!chatToolContinuationClosedStoreReady(cleanup)) {
+          throw new DesktopE2eError("harness", "provider-chat-closed-store-not-safe",
+            "Closed-store verification requires exact Desktop/profile zero, resource quiescence and a passing SQLite audit", { cleanup });
+        }
+        closedStore = await profile.afterClosedStore({ context, sink, inputs, cleanup });
+      }
       return {
         input: pass ? "pass" : "fail",
         resources: [{
@@ -727,6 +771,7 @@ export function createProviderChatToolContinuationScenario({ profile = null } = 
           quiesced,
           quiesce_input: state.quiesceOutcome?.input ?? null,
           interaction_resources: state.resourceOutcome,
+          closed_store_verification: closedStore,
         }],
       };
     },

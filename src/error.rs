@@ -57,6 +57,13 @@ pub enum StorageError {
     #[error("storage json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error(
+        "canonical protocol {source_kind} source exceeds the bounded scan limit of {limit} items"
+    )]
+    CanonicalSourceLimitExceeded {
+        source_kind: &'static str,
+        limit: usize,
+    },
+    #[error(
         "canonical history fence changed for session {session_id}: expected append position {expected_append_position:?}, {expected_history_count} history items, and {expected_active_count} active items; observed append position {actual_append_position:?}, {actual_history_count} history items, and {actual_active_count} active items"
     )]
     CanonicalHistoryFenceChanged {

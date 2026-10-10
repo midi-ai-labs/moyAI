@@ -49,6 +49,8 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 `case1`〜`case7`（`case5_2`を除く）のcurrent execution ownerは共通runnerの `manual.case1` / `manual.case2` / `manual.case3` / `manual.case4` / `manual.case5` / `manual.case6` / `manual.case7` scenarioである。GUI送信、承認操作、terminal取得、transcript exportは共通 `drivers/manual_live_session.mjs` を使う。`provider_base_url`、`model`、absolute `python_executable`をscenario configで指定し、認証が必要なら既存keyをprocess環境へ設定して、その名前だけをoptional `api_key_env`へ渡す。scenarioはproviderのload / unloadやhost generation設定を変更しない。
 
+共通scenarioのoptional `access_mode`は`default` / `auto_review` / `full_access`を受理し、省略時は従来どおり`default`とする。optional `side_model` / `side_api_key_env`、`approve_model` / `approve_api_key_env`は、Mainと同じ接続先・`openai_compatible` profileの独立したSub / Approve設定としてfixtureへ渡す。両項目とも省略したroleは設定を追加しない。roleのmodelだけ指定した場合は認証なし、環境変数名だけ指定した場合はMainと同じmodel IDを設定する。同じキーを使う場合も、各roleへ同じ環境変数名を明示する。Approveを省略した場合は製品のMain継承を維持する。`auto_review`ではApproveが既存Guardianの判定を行い、operatorは判定後に残った人手確認を扱う。実キー本文はprocess環境のみとし、外部verification commandへ3roleのcredential環境変数を渡さない。
+
 各scenarioのfixture条件は次のとおり。config/data/WebView profileは全caseでfreshにする。
 
 | Scenario | 必須fixture / 追加config |
@@ -63,7 +65,11 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 machine gateの後も、各specの成果物、API / CLI、test内容、作業範囲、途中出力と最終回答をtask-local reviewで確認するまでは`manual_pending`である。Case1後にレビューする依頼では後続caseを自動実行しない。
 
-これらのscenarioは未レビューの承認要求を既定で操作停止する。`approval_mode: "operator"` を指定してstdinを保持すると、要求・生成source・画面を保存した後、stdoutへ `operator-review-request` が出る。operatorが内容を確認し、表示された `confirmation_id`、`request_sha256`、`decision`（`approve` / `stop` / `deny`）だけを持つJSONを1行でstdinへ返す。その一件のownerと内容を再確認して既存GUIボタンを操作し、許可した場合は同じ実行を続ける。恒久許可ルールは作らない。EOF、5分のreview timeout、操作停止は未完了として扱う。各turnの観測期限はCase2 / Case5 / Case7が30分、Case1 / Case3 / Case4 / Case6が15分で、承認reviewの待機も含む。共通text adapterとCase2 adapterは観測期限をinput evidenceへ記録する。この観測期限の指定でproductのrequest timeoutやhost設定は変更しない。
+これらのscenarioは未レビューの承認要求を既定で操作停止する。`approval_mode: "operator"` を指定してstdinを保持すると、要求・生成source・画面を保存した後、stdoutへ `operator-review-request` が出る。operatorが内容を確認し、表示された `confirmation_id`、`request_sha256`、`decision`（`approve` / `stop` / `deny`）だけを持つJSONを1行でstdinへ返す。その一件のownerと内容を再確認して既存GUIボタンを操作し、許可した場合は同じ実行を続ける。恒久許可ルールは作らない。EOF、5分のreview timeout、操作停止は未完了として扱う。各turnの観測期限はCase4 / Case5が60分、Case2 / Case6 / Case7が30分、Case1 / Case3が15分で、承認reviewの待機も含む。Case4は5段階の実装・文書・testを一つのturnで実行し、15分で作業途中のまま観測が終了した。Case5はrepository調査と3文書を一つのturnで実行し、30分の期限までに文書生成へ到達せず最後の承認待ちが残り52秒に制限された。Case6は15分内に7回の承認reviewが発生し、最後のreview待機が残り約67秒に制限された。各実測に基づき上限を広げた。共通text adapterとCase2 adapterは観測期限をinput evidenceへ記録する。この観測期限の指定でproductのrequest timeoutやhost設定は変更しない。
+
+Case5のoptional `observation_timeout_ms`は、1 turn全体の観測期限を正の整数msで指定する。省略時は60分、最大120分（`7200000`）とする。Mainの継続要求、Compaction、承認待ちで期限をリセットせず、moyAIの要求timeoutやprovider設定は変更しない。
+
+共通manual driverは通常完了時とStop後、Rust projectionの実行対象とcomposerの`data-run-target`が一致し、使用量の件数・表示文・title・state classが同じprojectionの値と揃うまで既存期限内で待つ。表示に差があれば最初の差分を、揃った時点では公開targetと使用量の観測を`*-terminal-render` evidenceへ記録する。認証情報は含めない。Stop後は同じworkspace / session / turn / admission revisionのidle状態と非同期処理の完了に加え、実画面のdialogとbackdropが閉じるまで待ってからterminalを撮影し、transcriptをexportする。Stopによる未完了の分類は維持し、exportの失敗を省略して合格扱いにはしない。
 
 ```powershell
 npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --artifact-parent <absolute-task-root> --desktop-isolation fixture --scenario manual.case1 --scenario-config <absolute-scenario-config.json>
@@ -71,13 +77,15 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 `case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。LM Studioはlifecycle未指定の後方互換`execution-owned` routeに加え、明示的な`provider_lifecycle: "external-unmanaged"`を受理する。external routeは既存のhost設定を変更せず、Main exact 1 loaded、Side unloaded、両variant、reported loaded context 131072以上、時刻・elapsedを除いたstable host fingerprintをpreflight／各checkpoint／final／quiesceでGET観測し、drift時にもload / unloadによる修復を行わない。`openai_compatible`はexternal-unmanagedのみで、credentialを埋め込まない`/v1` base URLのexact IDとmetadataがあればreported context capacityをpreflight、時点sample、cleanupで確認する。reported capacityがlocal budget 131072未満またはmetadata内で競合する場合はenvironment block、未報告または131072以上だが非exactの場合とexternal lifecycle / wire差分はcomparability deviationとして`RESULTS.md`へ明記する。
 
-Case5_2の`api_key_env`はMain認証だけを設定する。Side Chatは現行の独立したcredential policyを使い、同じendpoint/modelでもMainの環境変数やheadersを継承しない。認証が必要なSide接続の可用性は実行前に確認し、harnessからMain secretを注入して補正しない。access modeはspecどおり`auto_review`を維持し、既存Guardianの判断を試験対象とする。
+Case5_2の`api_key_env`はMain認証、optional `side_api_key_env`はSide認証の環境変数名を設定する。Sideの指定がなければ認証なしとなる。同じキーを使う場合は、両方に同じ環境変数名を明示する。MainのheadersはSideへ継承しない。実キーはprocess環境にだけ設定し、fixtureやevidenceへ保存しない。access modeはspecどおり`auto_review`を維持し、既存Guardianの判断を試験対象とする。
+
+Case5_2のoptional `approve_model` / `approve_api_key_env`もMainと同じ接続先・profileの独立したApprove設定へ渡す。省略時は従来のMain継承を維持し、modelだけ指定した場合は認証なしとする。環境変数名だけ指定した場合はMainと同じmodel IDを設定する。判定のprompt、出力形式、権限判断は既存Guardianを使用し、providerのgeneration設定を追加しない。SubのStage 5問い合わせmodelとApproveの判定modelはそれぞれ維持する。
 
 `manual.case5_2` はStage 1〜4のmachine predicateとcleanupが成立した時点でも`manual_pending`を返す。従来の100点rubricはStage 1〜4の比較条件として維持する。Stage 5のSide問い合わせは別の定性rubricで採点し、query経路、回答品質、context truncationの観測可否を分離する。transcript、成果物、公開・hidden evaluator evidence、Stage 5回答をtask-local rubricで人手採点し、その結果を`RESULTS.md`へ確定するまではfull PASSではない。
 
 Stage 1〜4はMain assistant transcript body、Stage 5はSide assistant bodyにexact `<|im_start|>` / `<|im_end|>` が現れた場合をprovider control-token leakとする。scenarioはconfig fieldを含まない最小evidence取得後、Main実行中はvisible Stopをexact 1回送る。Stage 5をrunning中に初めて観測した場合だけSide Cancelをexact 1回送ってterminalを取得し、既にcompletedならCancel 0のまま保存する。必要なprojection / screenshot / command evidenceと条件付きStop / Cancel terminalがsettleしない場合は`harness_ng`へ昇格し、いずれも`case5_2-provider-control-token-leak`の観測済みproduct failureを保持する。一般の`<|...|>`やtool rowは対象外である。
 
-Stage 1〜4はSide Chat Sendを操作経路に含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。Stage 4のevaluator成功後、Stage 5は同じownerのtool-less Side Chatへ問い合わせをexact 1回送る。LM Studioでは元のselected Side modelのunloaded sampleを維持し、Stage 5だけ設定modelがMainと異なる場合に既にload済みのMain modelへGUIから再設定する。OpenAI-compatibleは同じMain modelをそのまま使う。Stage 5の実使用modelは別fieldに記録し、元のSide modelをloadしない。command probeは`submit_side_chat` 1件とMain submit/cancel 0件を確認するが、remote providerにtraffic ledgerがなければprovider generation request総数まで証明したとは扱わない。
+Stage 1〜4はSide Chat Sendを操作経路に含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。Stage 4のevaluator成功後、Stage 5は同じownerのtool-less Side Chatへ問い合わせをexact 1回送る。LM Studioでは元のselected Side modelのunloaded sampleを維持し、Stage 5だけ設定modelがMainと異なる場合に既にload済みのMain modelへGUIから再設定する。OpenAI-compatibleはoptional `side_model`で指定したSide modelをStage 5でも維持し、省略時はMainと同じmodelを使う。Stage 5の実使用modelは別fieldに記録し、harnessはmodelをloadしない。command probeは`submit_side_chat` 1件とMain submit/cancel 0件を確認するが、remote providerにtraffic ledgerがなければprovider generation request総数まで証明したとは扱わない。
 
 Stage 5は送信前Side message 0件、正常完了後のUser / Assistant exact 2件、Main session / selected session / turn / admission / 現在のbounded canonical transcript rows / owner append fence / draftとworkspace manifestの不変を要求する。append fence不変はMainへの新規canonical append 0件を示すが、過去全pageのDB再hashとは扱わない。実行中に`context_truncated`を観測できれば保存し、観測できなければ不明とする。terminalのfalseを全履歴が収まった証拠にせず、Side Chatのbounded canonical evidenceとcompaction checkpointの範囲で回答を評価する。短いdeterministic helper qualificationはowner分離と操作回帰の証拠であり、この実long-history inquiry quality gateの代用ではない。
 

@@ -91,6 +91,14 @@ pub struct HubCatalog {
     pub revision: CatalogRevision,
     pub models: Vec<HubModel>,
     pub changes: Vec<CatalogChange>,
+    #[serde(default)]
+    pub team_default_model_id: Option<String>,
+    #[serde(default)]
+    pub team_default_side_model_id: Option<String>,
+    #[serde(default)]
+    pub team_default_approve_model_id: Option<String>,
+    #[serde(default)]
+    pub default_selections: HubDefaultSelections,
 }
 
 impl HubCatalog {
@@ -119,6 +127,19 @@ impl HubCatalog {
                 return Err(HubError::InvalidCatalog);
             }
         }
+        for id in [
+            &self.team_default_model_id,
+            &self.team_default_side_model_id,
+            &self.team_default_approve_model_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !ids.contains(id) {
+                return Err(HubError::InvalidCatalog);
+            }
+        }
+        self.default_selections.validate_shape()?;
         let mut previous = None;
         for change in &self.changes {
             if change.revision > self.revision
@@ -164,6 +185,27 @@ impl HubCatalog {
                 .map(|old| old.id.clone()),
         );
         Ok(diff)
+    }
+}
+
+/// Role recommendations are derived from the Hub catalog, never a second saved selection.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubDefaultSelections {
+    pub main: Option<HubSelection>,
+    pub side_chat: Option<HubSelection>,
+    pub approve: Option<HubSelection>,
+}
+
+impl HubDefaultSelections {
+    fn validate_shape(&self) -> Result<(), HubError> {
+        for selection in [&self.main, &self.side_chat, &self.approve]
+            .into_iter()
+            .flatten()
+        {
+            selection.validate_shape()?;
+        }
+        Ok(())
     }
 }
 
@@ -327,6 +369,7 @@ impl ModelRoute {
 pub struct DesktopHubRoutes {
     pub main: ModelRoute,
     pub side_chat: ModelRoute,
+    pub approve: ModelRoute,
 }
 
 /// Safe public errors intentionally omit URL, response body and credential material.

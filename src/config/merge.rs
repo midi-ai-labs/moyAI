@@ -1,9 +1,9 @@
 use super::model::{
-    PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig, PartialInspectionConfig,
-    PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig, PartialModelConfig,
-    PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
-    PartialShellConfig, PartialSideChatConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
-    ResolvedConfig,
+    PartialApproveConfig, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
+    PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
+    PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
+    PartialSessionConfig, PartialShellConfig, PartialSideChatConfig, PartialToolOutputConfig,
+    PartialWorkspaceConfig, ResolvedConfig,
 };
 use super::turn::ProviderEndpoint;
 
@@ -138,6 +138,9 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     if let Some(value) = patch.context_window {
         target.context_window = value;
     }
+    if let Some(value) = patch.compaction_budget_tokens {
+        target.compaction_budget_tokens = Some(value);
+    }
     if let Some(value) = patch.supports_tools {
         target.supports_tools = value;
     }
@@ -163,11 +166,24 @@ fn same_provider_endpoint(left: &str, right: &str) -> bool {
 }
 
 fn apply_side_chat(target: &mut crate::config::SideChatConfig, patch: PartialSideChatConfig) {
+    let connection_target_changed = patch
+        .base_url
+        .as_deref()
+        .is_some_and(|base_url| !same_provider_endpoint(&target.base_url, base_url))
+        || patch
+            .provider_profile
+            .is_some_and(|profile| profile != target.provider_profile);
+    if connection_target_changed && patch.api_key_env.is_none() {
+        target.api_key_env = None;
+    }
     if let Some(value) = patch.base_url {
         target.base_url = value;
     }
     if let Some(value) = patch.model {
         target.model = value;
+    }
+    if let Some(value) = patch.api_key_env {
+        target.api_key_env = value;
     }
     if let Some(value) = patch.system_prompt {
         target.system_prompt = value;
@@ -192,6 +208,51 @@ fn apply_side_chat(target: &mut crate::config::SideChatConfig, patch: PartialSid
 fn apply_session(target: &mut crate::config::SessionConfig, patch: PartialSessionConfig) {
     if let Some(value) = patch.overflow_margin_tokens {
         target.overflow_margin_tokens = value;
+    }
+}
+
+fn apply_approve(target: &mut crate::config::ApproveConfig, patch: PartialApproveConfig) {
+    let changed = patch
+        .base_url
+        .as_deref()
+        .is_some_and(|url| !same_provider_endpoint(&target.base_url, url))
+        || patch
+            .provider_profile
+            .is_some_and(|profile| profile != target.provider_profile);
+    if changed {
+        if patch.api_key_env.is_none() {
+            target.api_key_env = None;
+        }
+        if patch.extra_headers.is_none() {
+            target.extra_headers.clear();
+        }
+    }
+    if let Some(value) = patch.base_url {
+        target.base_url = value;
+    }
+    if let Some(value) = patch.model {
+        target.model = value;
+    }
+    if let Some(value) = patch.provider_profile {
+        target.provider_profile = value;
+    }
+    if let Some(value) = patch.api_key_env {
+        target.api_key_env = value;
+    }
+    if let Some(value) = patch.extra_headers {
+        target.extra_headers = value;
+    }
+    if let Some(value) = patch.context_window {
+        target.context_window = value;
+    }
+    if let Some(value) = patch.request_timeout_ms {
+        target.request_timeout_ms = value;
+    }
+    if let Some(value) = patch.connect_timeout_ms {
+        target.connect_timeout_ms = value;
+    }
+    if let Some(value) = patch.max_retries {
+        target.max_retries = value;
     }
 }
 
@@ -367,6 +428,10 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
     if let Some(value) = patch.side_chat {
         apply_side_chat(&mut target.side_chat, value);
     }
+    if let Some(value) = patch.approve {
+        let initial = crate::config::ApproveConfig::from_model(&target.model);
+        apply_approve(target.approve.get_or_insert(initial), value);
+    }
     if let Some(value) = patch.session {
         apply_session(&mut target.session, value);
     }
@@ -421,6 +486,30 @@ mod tests {
         PartialSideChatConfig, ProviderApiMode, ProviderMetadataMode, ProviderProfile,
         ReasoningEffort, ReasoningSummary, ResolvedConfig,
     };
+
+    #[test]
+    fn compaction_budget_sparse_patch_preserves_or_replaces_the_explicit_value() {
+        let mut base = ResolvedConfig::default();
+        base.model.compaction_budget_tokens = Some(98_304);
+        let unchanged = apply_patch(base.clone(), PartialResolvedConfig::default());
+        assert_eq!(unchanged.model.compaction_budget_tokens, Some(98_304));
+        let changed = apply_patch(
+            base,
+            PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    compaction_budget_tokens: Some(65_536),
+                    max_output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(changed.model.compaction_budget_tokens, Some(65_536));
+        assert_eq!(
+            changed.model.max_output_tokens,
+            ResolvedConfig::default().model.max_output_tokens
+        );
+    }
 
     #[test]
     fn legacy_generation_patch_is_accepted_but_runtime_inert() {
@@ -531,6 +620,7 @@ mod tests {
                 side_chat: Some(PartialSideChatConfig {
                     base_url: Some("https://side.example.test/v1".to_string()),
                     model: Some("side-model".to_string()),
+                    api_key_env: Some(Some("SIDE_KEY".to_string())),
                     system_prompt: Some("side instructions".to_string()),
                     provider_profile: Some(ProviderProfile::OpenAiCompatible),
                     context_window: Some(65_536),
@@ -545,6 +635,7 @@ mod tests {
         assert_eq!(resolved.model.model, main_before.model);
         assert_eq!(resolved.model.base_url, main_before.base_url);
         assert_eq!(resolved.side_chat.model, "side-model");
+        assert_eq!(resolved.side_chat.api_key_env.as_deref(), Some("SIDE_KEY"));
         assert_eq!(
             resolved.side_chat.provider_profile,
             ProviderProfile::OpenAiCompatible
@@ -553,6 +644,58 @@ mod tests {
         assert_eq!(resolved.side_chat.request_timeout_ms, 45_000);
         assert_eq!(resolved.side_chat.connect_timeout_ms, 5_000);
         assert_eq!(resolved.side_chat.max_retries, 4);
+    }
+
+    #[test]
+    fn side_chat_target_patch_retains_only_explicitly_owned_credential_references() {
+        let mut base = ResolvedConfig::default();
+        base.model.api_key_env = Some("MAIN_KEY".to_string());
+        base.side_chat.base_url = "https://provider-a.example/v1".to_string();
+        base.side_chat.api_key_env = Some("SIDE_A_KEY".to_string());
+        for patch in [
+            PartialSideChatConfig {
+                base_url: Some("https://provider-b.example/v1".to_string()),
+                ..PartialSideChatConfig::default()
+            },
+            PartialSideChatConfig {
+                provider_profile: Some(ProviderProfile::OpenAiCompatible),
+                ..PartialSideChatConfig::default()
+            },
+        ] {
+            let changed = apply_patch(
+                base.clone(),
+                PartialResolvedConfig {
+                    side_chat: Some(patch),
+                    ..PartialResolvedConfig::default()
+                },
+            );
+            assert_eq!(changed.side_chat.api_key_env, None);
+            assert_eq!(changed.model.api_key_env, base.model.api_key_env);
+        }
+        let equivalent = apply_patch(
+            base.clone(),
+            PartialResolvedConfig {
+                side_chat: Some(PartialSideChatConfig {
+                    base_url: Some(" https://provider-a.example/v1/ ".to_string()),
+                    model: Some("another-model".to_string()),
+                    ..PartialSideChatConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+        assert_eq!(equivalent.side_chat.api_key_env, base.side_chat.api_key_env);
+        let explicit = apply_patch(
+            base,
+            PartialResolvedConfig {
+                side_chat: Some(PartialSideChatConfig {
+                    base_url: Some("https://provider-b.example/v1".to_string()),
+                    api_key_env: Some(Some("MAIN_KEY".to_string())),
+                    ..PartialSideChatConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+        assert_eq!(explicit.side_chat.api_key_env.as_deref(), Some("MAIN_KEY"));
     }
 
     #[test]

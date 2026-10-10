@@ -7,6 +7,7 @@ import {
   createProviderConnectionLiveScenario,
   currentTimeFromCompletedProjection,
   expectedProviderConnectionGlobalSave,
+  expectedProviderConnectionSideCatalogLoad,
   liveCurrentTimeTerminalAccepted,
   liveCurrentTimeTerminalDecision,
   normalizeProviderConnectionLiveOptions,
@@ -14,11 +15,17 @@ import {
   providerConnectionLiveSideChatAnswerAccepted,
   providerConnectionLiveSideChatMainPreserved,
   providerConnectionLiveSideChatQuestion,
+  providerConnectionLiveSideCatalogReady,
+  providerConnectionLiveSideCatalogRequired,
+  providerConnectionLiveSideBinding,
+  providerConnectionLiveSideOptions,
+  providerConnectionLiveSideReopenReady,
   providerConnectionLiveFixtureConfig,
   providerConnectionLiveControlTokenLeaks,
   restoredProviderConnectionReady,
   savedProviderConnectionReady,
 } from "../scenarios/provider_connection_live.mjs";
+import { case52Stage5MainSnapshot } from "../scenarios/case5_2_side_chat.mjs";
 
 const RAW_OPTIONS = Object.freeze({
   provider_base_url: "http://192.0.2.10:8119/v1/",
@@ -171,6 +178,42 @@ test("live provider config accepts one credential-free endpoint, model, and opti
   }
 });
 
+test("live provider accepts explicit independent auth references and Side model without changing anonymous defaults", () => {
+  const options = normalizeProviderConnectionLiveOptions({
+    ...RAW_OPTIONS, api_key_env: " MAIN_TEST_KEY ", side_chat_after_completion: true,
+    side_model: " Gemma ", side_api_key_env: " SIDE_TEST_KEY ",
+  });
+  assert.deepEqual(options, {
+    ...OPTIONS, apiKeyEnv: "MAIN_TEST_KEY", sideChatAfterCompletion: true,
+    sideModel: "Gemma", sideApiKeyEnv: "SIDE_TEST_KEY",
+  });
+  assert.deepEqual(providerConnectionLiveSideOptions(options), {
+    providerProfile: "openai_compatible", providerBaseUrl: OPTIONS.providerBaseUrl,
+    sideModel: "Gemma", sideApiKeyEnv: "SIDE_TEST_KEY",
+  });
+  assert.deepEqual(providerConnectionLiveSideOptions(normalizeProviderConnectionLiveOptions({
+    ...RAW_OPTIONS, api_key_env: "MAIN_TEST_KEY", side_chat_after_completion: true,
+  })), {
+    providerProfile: "openai_compatible", providerBaseUrl: OPTIONS.providerBaseUrl,
+    sideModel: OPTIONS.model, sideApiKeyEnv: "",
+  });
+  assert.deepEqual(normalizeProviderConnectionLiveOptions({
+    ...RAW_OPTIONS, api_key_env: "  ", side_api_key_env: "",
+  }), OPTIONS);
+  assert.equal(providerConnectionLiveSideCatalogRequired(OPTIONS), false);
+  assert.equal(providerConnectionLiveSideCatalogRequired({ ...OPTIONS, sideChatAfterCompletion: true }), false);
+  assert.equal(providerConnectionLiveSideCatalogRequired(options), true);
+  assert.equal(providerConnectionLiveSideCatalogRequired({ ...options, sideChatAfterCompletion: false }), false);
+  assert.equal(normalizeProviderConnectionLiveOptions({ ...RAW_OPTIONS, api_key_env: "1_KEY" }).apiKeyEnv, "1_KEY");
+  for (const field of ["api_key_env", "side_api_key_env"]) {
+    for (const value of [null, 1, "BAD-NAME", "Bearer secret-value", "KEY\nBODY"]) {
+      assert.throws(() => normalizeProviderConnectionLiveOptions({ ...RAW_OPTIONS, [field]: value }), TypeError);
+    }
+  }
+  assert.throws(() => normalizeProviderConnectionLiveOptions({ ...RAW_OPTIONS, side_model: null }), TypeError);
+  assert.throws(() => normalizeProviderConnectionLiveOptions({ ...RAW_OPTIONS, side_model: "" }), TypeError);
+});
+
 test("post-task Side Chat asks from owner evidence and accepts only the exact tool and time answer", () => {
   const time = {
     local: "2026-08-24T12:34:56+09:00",
@@ -303,7 +346,7 @@ test("native provider select accepts the trusted committed change across its con
   );
 });
 
-test("global Save expectation carries every ordered config value and the exact target", () => {
+test("global Save expectation carries every ordered non-Approve config value and the exact target", () => {
   const surface = restoredSurface();
   surface.projection.config_fields = surface.projection.config_fields.map((field) => {
     if (field.key === "model.base_url") return { ...field, value: "http://127.0.0.1:9/v1" };
@@ -312,6 +355,7 @@ test("global Save expectation carries every ordered config value and the exact t
     if (field.key === "model.api_key_env") return { ...field, value: "OLD_KEY" };
     return field;
   });
+  surface.projection.config_fields.push({ key: "approve.model", value: "review" }, { key: "approve.api_key_env", value: "REVIEW_KEY" });
   assert.deepEqual(expectedProviderConnectionGlobalSave(surface, OPTIONS), {
     command: "save_global_config",
     args: {
@@ -319,6 +363,7 @@ test("global Save expectation carries every ordered config value and the exact t
       expectedTarget: CONFIG_TARGET,
     },
   });
+  assert.equal(surface.projection.config_fields.at(-1).value, "REVIEW_KEY");
 });
 
 test("restart persistence requires the exact saved and effective atomic connection", () => {
@@ -336,6 +381,122 @@ test("restart persistence requires the exact saved and effective atomic connecti
   assert.equal(restoredProviderConnectionReady(restoredSurface({
     settings: { dirty: true, save: { count: 1, visible: true, enabled: true } },
   }), OPTIONS), false);
+});
+
+test("authenticated global save and restart require the explicit Main credential reference", () => {
+  const options = normalizeProviderConnectionLiveOptions({ ...RAW_OPTIONS, api_key_env: "MAIN_TEST_KEY" });
+  const fields = CONFIG_FIELDS.map((field) => field.key === "model.api_key_env"
+    ? { ...field, value: options.apiKeyEnv } : field);
+  const surface = restoredSurface({
+    projection: { config_fields: fields, provider_effective_api_key_env: options.apiKeyEnv },
+    settings: { api_key_env: { count: 1, visible: true, enabled: true, value: options.apiKeyEnv } },
+  });
+  const beforeSave = { ...surface, projection: { ...surface.projection, config_fields: fields.map(field =>
+    field.key === "model.base_url" ? { ...field, value: "http://127.0.0.1:9" } : field) } };
+  assert.deepEqual(expectedProviderConnectionGlobalSave(beforeSave, options).args, {
+    values: fields.map((field) => ({ key: field.key, text: field.value })), expectedTarget: CONFIG_TARGET,
+  });
+  assert.equal(restoredProviderConnectionReady(surface, options), true);
+  assert.equal(restoredProviderConnectionReady({
+    ...surface, projection: { ...surface.projection, provider_effective_api_key_env: "OTHER_KEY" },
+  }, options), false);
+  assert.equal(restoredProviderConnectionReady({
+    ...surface, projection: { ...surface.projection, config_fields: CONFIG_FIELDS },
+  }, options), false);
+});
+
+test("Side catalog gate requires the saved independent ref, exact generation, and catalog-origin model", () => {
+  const options = normalizeProviderConnectionLiveOptions({
+    ...RAW_OPTIONS, api_key_env: "MAIN_TEST_KEY", side_chat_after_completion: true,
+    side_model: "Gemma", side_api_key_env: "SIDE_TEST_KEY",
+  });
+  const surface = restoredSurface({ projection: { config_fields: [
+    ...CONFIG_FIELDS,
+    { key: "side_chat.base_url", value: OPTIONS.providerBaseUrl },
+    { key: "side_chat.provider_profile", value: "openai_compatible" },
+    { key: "side_chat.model", value: "Gemma" },
+    { key: "side_chat.api_key_env", value: "SIDE_TEST_KEY" },
+  ] } });
+  surface.side_catalog = {
+    section: { count: 1, visible: true, busy: "false" },
+    base_url: { value: OPTIONS.providerBaseUrl }, profile: { value: "openai_compatible" },
+    api_key_env: { value: "SIDE_TEST_KEY" }, model: { value: "Gemma" },
+    model_options: [{ id: "Gemma", label: "Gemma", disabled: false }],
+    load: { count: 1, visible: true, enabled: true },
+    status: { count: 1, visible: true, text: "2件のモデルから選択できます。", error: false },
+  };
+  assert.deepEqual(expectedProviderConnectionSideCatalogLoad(surface, options), {
+    command: "load_side_chat_models", args: {
+      baseUrl: "http://192.0.2.10:8119", providerProfile: "openai_compatible",
+      apiKeyEnv: "SIDE_TEST_KEY", expectedConfigGeneration: "42",
+    },
+  });
+  assert.equal(providerConnectionLiveSideCatalogReady(surface, options, CONFIG_TARGET), true);
+  assert.equal(providerConnectionLiveSideCatalogReady(surface, options, { ...CONFIG_TARGET, configGeneration: "43" }), false);
+  for (const patch of [
+    { api_key_env: { value: "MAIN_TEST_KEY" } },
+    { section: { count: 1, visible: true, busy: "true" } },
+    { model_options: [{ id: "Gemma", label: "Gemma（現在の設定）", disabled: false }] },
+    { model_options: [{ id: "other", label: "other", disabled: false }] },
+    { model_options: [surface.side_catalog.model_options[0], surface.side_catalog.model_options[0]] },
+    { status: { count: 1, visible: true, text: "メインチャットで読み込み済みの2件から選択できます。", error: false } },
+    { status: { count: 1, visible: true, text: "応答対象が一致しませんでした。", error: true } },
+  ]) {
+    assert.equal(providerConnectionLiveSideCatalogReady({
+      ...surface, side_catalog: { ...surface.side_catalog, ...patch },
+    }, options, CONFIG_TARGET), false);
+  }
+});
+
+test("explicit Side cold reopen retains its durable binding and normalized Main history", () => {
+  const options = normalizeProviderConnectionLiveOptions({
+    ...RAW_OPTIONS, api_key_env: "MAIN_TEST_KEY", side_chat_after_completion: true,
+    side_model: "Gemma", side_api_key_env: "SIDE_TEST_KEY",
+  });
+  const surface = terminalSurface({ projection: {
+    draft_target: { sessionId: "session-main" }, navigation_loading: false,
+    selected_project_index: 0, selected_session_index: 0,
+    session_rows: [{ session_id: "session-main", active_turn_id: null, admission_revision: "1", latest_turn_id: "turn-main" }],
+    turn_page_total: 3, turn_page_limit: 256,
+    side_chat: {
+      configured: true, deleting: false, owner_session_id: "session-main", chat_id: "side-1",
+      provider_profile: "openai_compatible", base_url: OPTIONS.providerBaseUrl,
+      model: "Gemma", api_key_env: "SIDE_TEST_KEY", context_scope: "owner_session",
+      generation: "0", draft_revision: "0", context_as_of_append_position: "10",
+      status: "idle", last_error: "", can_send: true, can_cancel: false,
+      draft_text: "", draft_quote: null, messages: [],
+    },
+  } });
+  surface.main = {
+    prompt_value: "", primary_rows: surface.projection.transcript_rows
+      .filter((row) => ["user", "assistant", "error"].includes(row.row_kind))
+      .map((row) => ({ id: row.stable_history_identity ?? null, kind: row.row_kind, body: row.body })),
+  };
+  const expected = {
+    main: case52Stage5MainSnapshot(surface),
+    binding: providerConnectionLiveSideBinding(surface.projection.side_chat),
+  };
+  assert.equal(providerConnectionLiveSideReopenReady(surface, options, expected), true);
+  for (const side of [
+    { api_key_env: "MAIN_TEST_KEY" }, { api_key_env: "" }, { chat_id: "side-new" },
+    { owner_session_id: "other" }, { model: OPTIONS.model }, { context_as_of_append_position: "11" },
+    { configured: false }, { messages: [{ id: "message", role: "assistant", content: "unexpected" }] },
+  ]) {
+    assert.equal(providerConnectionLiveSideReopenReady({
+      ...surface, projection: { ...surface.projection, side_chat: { ...surface.projection.side_chat, ...side } },
+    }, options, expected), false);
+  }
+  assert.equal(providerConnectionLiveSideReopenReady({
+    ...surface, projection: { ...surface.projection, session_rows: [{ ...surface.projection.session_rows[0], latest_turn_id: "other" }] },
+  }, options, expected), false);
+  const changedAnswer = structuredClone(surface);
+  changedAnswer.projection.transcript_rows.at(-1).body = "changed durable answer";
+  assert.equal(providerConnectionLiveSideReopenReady(changedAnswer, options, expected), false);
+  changedAnswer.projection.transcript_rows.at(-1).body = `${ASSISTANT} extra text`;
+  assert.equal(providerConnectionLiveSideReopenReady(changedAnswer, options, expected), false);
+  const changedSummary = structuredClone(surface);
+  changedSummary.projection.transcript_rows[1].title = "restored summary title";
+  assert.equal(providerConnectionLiveSideReopenReady(changedSummary, options, expected), true);
 });
 
 test("global save accepts the product's collapsed model details after the exact atomic commit", () => {
@@ -561,6 +722,24 @@ test("live terminal helper classifies deterministic pass, pending, and product f
   assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
     projection: { run_status_key: "failed" },
   })), "fail");
+});
+
+test("live Main terminal binds the requested URL, model, and credential reference", () => {
+  const options = normalizeProviderConnectionLiveOptions({ ...RAW_OPTIONS, api_key_env: "MAIN_TEST_KEY" });
+  const projection = {
+    ...restoredSurface().projection, overlay: "none", provider_effective_api_key_env: options.apiKeyEnv,
+    config_fields: CONFIG_FIELDS.map((field) => field.key === "model.api_key_env"
+      ? { ...field, value: options.apiKeyEnv } : field),
+  };
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({ projection }), options), "pass");
+  for (const patch of [
+    { provider_effective_base_url: "http://other.invalid/v1" },
+    { provider_effective_model_id: "Gemma" },
+    { provider_effective_api_key_env: "" },
+    { config_fields: CONFIG_FIELDS },
+  ]) {
+    assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({ projection: { ...projection, ...patch } }), options), "fail");
+  }
 });
 
 test("scenario factory exposes the shared-runner live manual contract without contacting the provider", () => {

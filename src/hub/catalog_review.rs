@@ -1,4 +1,4 @@
-//! Public catalog facts captured with an explicit, durable Main/Side review.
+//! Public catalog facts captured with an explicit, durable Main/Sub/Approve review.
 //! The same baseline validates catalog continuity when a model session is recreated.
 //! It never allocates a model or independently records review confirmation.
 
@@ -32,6 +32,10 @@ impl HubCatalogBaseline {
             software_version: self.software_version.clone(),
             models: self.models.clone(),
             changes: Vec::new(),
+            team_default_model_id: None,
+            team_default_side_model_id: None,
+            team_default_approve_model_id: None,
+            default_selections: Default::default(),
         }
     }
 

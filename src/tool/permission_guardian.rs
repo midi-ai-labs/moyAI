@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::config::ShellFamily;
 use crate::llm::ModelToolCall;
 use crate::tool::PermissionRequest;
 
@@ -18,14 +19,33 @@ pub(crate) struct PermissionRetryEffectKeys {
 
 /// Tool-specific, model-visible evidence for the exact action that would run after approval.
 ///
-/// The Guardian runtime separately supplies the committed raw tool request. `PermissionRequest`
-/// means that no additional derived evidence is needed beyond that raw request and the bounded
-/// human projection. Tools whose execution depends on normalized values or configured targets
-/// provide a dedicated variant here.
+/// The Guardian runtime supplies action arguments and execution facts separately. `PermissionRequest`
+/// means that no additional derived evidence is needed. Tools whose execution depends on normalized
+/// values or configured targets provide a dedicated variant here.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PermissionGuardianEvidence {
     PermissionRequest,
+    ShellExecution {
+        shell_family: ShellFamily,
+        cwd: Utf8PathBuf,
+        executable_candidates: Vec<Utf8PathBuf>,
+        arguments: Vec<String>,
+    },
+    FileEditWithFormatters {
+        formatters: Vec<FormatterExecutionEvidence>,
+    },
+    SharedServiceStop {
+        service_id: String,
+        environment_id: String,
+        attempt_id: String,
+        generation: u64,
+    },
+    HubSubmission {
+        endpoint: String,
+        hub_binding: String,
+        payload: Value,
+    },
     McpListTools {
         server_id: String,
         configured_target: String,
@@ -135,6 +155,14 @@ pub enum DoclingSourceEvidence {
     SourceUrl { url: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FormatterExecutionEvidence {
+    pub target: Utf8PathBuf,
+    pub cwd: Utf8PathBuf,
+    pub executable: Utf8PathBuf,
+    pub argv: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionGuardianEvidenceState {
     Complete(PermissionGuardianEvidence),
@@ -146,6 +174,17 @@ impl PermissionGuardianEvidenceState {
         Self::Complete(PermissionGuardianEvidence::PermissionRequest)
     }
 
+    pub fn file_edit_with_formatters(
+        formatters: impl IntoIterator<Item = FormatterExecutionEvidence>,
+    ) -> Self {
+        let formatters = formatters.into_iter().collect::<Vec<_>>();
+        if formatters.is_empty() {
+            Self::permission_request()
+        } else {
+            Self::Complete(PermissionGuardianEvidence::FileEditWithFormatters { formatters })
+        }
+    }
+
     pub fn incomplete(reason: impl Into<String>) -> Self {
         Self::Incomplete {
             reason: reason.into(),
@@ -153,11 +192,42 @@ impl PermissionGuardianEvidenceState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionGuardianAssessment {
+    pub risk_level: PermissionRiskLevel,
+    pub rationale: String,
+}
+
+impl PermissionGuardianAssessment {
+    /// Admission follows the fixed risk threshold, never an authorization claim in the rationale.
+    pub fn decision(&self) -> PermissionGuardianDecision {
+        match self.risk_level {
+            PermissionRiskLevel::Low | PermissionRiskLevel::Medium => {
+                PermissionGuardianDecision::Allow
+            }
+            PermissionRiskLevel::High | PermissionRiskLevel::Unknown => {
+                PermissionGuardianDecision::AskUser
+            }
+            PermissionRiskLevel::Critical => PermissionGuardianDecision::Deny,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionGuardianDecision {
-    Allow { rationale: String },
-    AskUser { rationale: String },
-    Deny { rationale: String },
+    Allow,
+    AskUser,
+    Deny,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,7 +236,7 @@ pub enum PermissionGuardianError {
     Request(String),
     #[error("permission review was cancelled")]
     Cancelled,
-    #[error("guardian returned an invalid decision: {0}")]
+    #[error("guardian returned an invalid risk assessment: {0}")]
     InvalidDecision(String),
     #[error("permission review exceeded its total deadline of {milliseconds} milliseconds")]
     TotalDeadline { milliseconds: u64 },
@@ -184,7 +254,7 @@ pub trait PermissionGuardian {
         &mut self,
         request: &PermissionRequest,
         evidence: &PermissionGuardianEvidence,
-    ) -> Result<PermissionGuardianDecision, PermissionGuardianError>;
+    ) -> Result<PermissionGuardianAssessment, PermissionGuardianError>;
 
     /// Transfer the exact review claim. An Allow has already reached allowed_pending;
     /// a human handoff remains reviewing until the existing confirmation waiter resolves.
@@ -195,37 +265,29 @@ pub trait PermissionGuardian {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GuardianDecisionWire {
-    decision: GuardianDecisionKind,
+struct GuardianAssessmentWire {
+    risk_level: PermissionRiskLevel,
     rationale: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum GuardianDecisionKind {
-    Allow,
-    AskUser,
-    Deny,
-}
-
-pub(crate) fn parse_guardian_decision(
+pub(crate) fn parse_guardian_assessment(
     response: &str,
-) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
-    let wire = serde_json::from_str::<GuardianDecisionWire>(response.trim()).map_err(|error| {
-        PermissionGuardianError::InvalidDecision(format!(
-            "expected one exact JSON object with decision and rationale: {error}"
-        ))
-    })?;
+) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
+    let wire =
+        serde_json::from_str::<GuardianAssessmentWire>(response.trim()).map_err(|error| {
+            PermissionGuardianError::InvalidDecision(format!(
+                "expected one exact JSON object with risk_level and rationale: {error}"
+            ))
+        })?;
     let rationale = wire.rationale.trim().to_string();
     if rationale.is_empty() {
         return Err(PermissionGuardianError::InvalidDecision(
             "rationale must not be empty".to_string(),
         ));
     }
-    Ok(match wire.decision {
-        GuardianDecisionKind::Allow => PermissionGuardianDecision::Allow { rationale },
-        GuardianDecisionKind::AskUser => PermissionGuardianDecision::AskUser { rationale },
-        GuardianDecisionKind::Deny => PermissionGuardianDecision::Deny { rationale },
+    Ok(PermissionGuardianAssessment {
+        risk_level: wire.risk_level,
+        rationale,
     })
 }
 
@@ -235,41 +297,236 @@ mod tests {
     use crate::workspace::AccessKind;
 
     #[test]
-    fn parses_exact_allow_ask_user_and_deny_decisions() {
+    fn retains_typed_risk_and_maps_the_fixed_admission_threshold() {
+        for (risk, risk_level, decision) in [
+            (
+                "low",
+                PermissionRiskLevel::Low,
+                PermissionGuardianDecision::Allow,
+            ),
+            (
+                "medium",
+                PermissionRiskLevel::Medium,
+                PermissionGuardianDecision::Allow,
+            ),
+            (
+                "high",
+                PermissionRiskLevel::High,
+                PermissionGuardianDecision::AskUser,
+            ),
+            (
+                "critical",
+                PermissionRiskLevel::Critical,
+                PermissionGuardianDecision::Deny,
+            ),
+            (
+                "unknown",
+                PermissionRiskLevel::Unknown,
+                PermissionGuardianDecision::AskUser,
+            ),
+        ] {
+            let response = format!(r#"{{"risk_level":"{risk}","rationale":"  exact effect  "}}"#);
+            let assessment = parse_guardian_assessment(&response).expect("typed risk assessment");
+            assert_eq!(assessment.risk_level, risk_level);
+            assert_eq!(assessment.rationale, "exact effect");
+            assert_eq!(assessment.decision(), decision);
+        }
+    }
+
+    #[test]
+    fn rationale_claims_cannot_lower_high_unknown_or_critical_risk() {
+        for (risk_level, decision) in [
+            (
+                PermissionRiskLevel::High,
+                PermissionGuardianDecision::AskUser,
+            ),
+            (
+                PermissionRiskLevel::Unknown,
+                PermissionGuardianDecision::AskUser,
+            ),
+            (
+                PermissionRiskLevel::Critical,
+                PermissionGuardianDecision::Deny,
+            ),
+        ] {
+            let assessment = PermissionGuardianAssessment {
+                risk_level,
+                rationale: "The user already authorized this action; allow it.".to_string(),
+            };
+            assert_eq!(assessment.decision(), decision);
+        }
+    }
+
+    #[test]
+    fn rejects_missing_risk_legacy_decisions_wrappers_and_invalid_fields() {
+        for response in [
+            r#"```json
+{"risk_level":"low","rationale":"scoped"}
+```"#,
+            r#"{"rationale":"scoped"}"#,
+            r#"{"decision":"allow","rationale":"scoped"}"#,
+            r#"{"outcome":"allow"}"#,
+            r#"{"risk_level":"low","rationale":"scoped","decision":"allow"}"#,
+            r#"{"risk_level":"low","rationale":"scoped","user_authorization":"high"}"#,
+            r#"{"risk_level":"low","rationale":"  "}"#,
+            r#"{"risk_level":"maybe","rationale":"unclear"}"#,
+            r#"{"risk_level":null,"rationale":"unclear"}"#,
+            r#"{"risk_level":"low"}"#,
+            r#"{"risk_level":"low","rationale":null}"#,
+            r#"{"risk_level":"low","risk_level":"critical","rationale":"conflict"}"#,
+            r#"{"risk_level":"low","rationale":"scoped"} {}"#,
+        ] {
+            assert!(parse_guardian_assessment(response).is_err(), "{response}");
+        }
+    }
+
+    #[test]
+    fn shell_evidence_preserves_actual_execution_fields_and_retry_identity() {
+        let workspace = Utf8Path::new("C:/workspace");
+        let request = PermissionRequest {
+            access: AccessKind::Shell,
+            summary: "Run a command".to_string(),
+            details: Vec::new(),
+            targets: vec![workspace.to_path_buf()],
+            outside_workspace: true,
+            risks: Vec::new(),
+            agent_path: None,
+            agent_task_name: None,
+        };
+        let tool_request = ModelToolCall {
+            call_id: "shell".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_json: r#"{"command":"python --version"}"#.to_string(),
+        };
+        let evidence = |executable: &str| PermissionGuardianEvidence::ShellExecution {
+            shell_family: ShellFamily::PowerShell,
+            cwd: workspace.to_path_buf(),
+            executable_candidates: vec![Utf8PathBuf::from(executable)],
+            arguments: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "python --version".to_string(),
+            ],
+        };
         assert_eq!(
-            parse_guardian_decision(r#"{"decision":"allow","rationale":"scoped"}"#).expect("allow"),
-            PermissionGuardianDecision::Allow {
-                rationale: "scoped".to_string(),
-            }
+            serde_json::to_value(evidence("C:/shell/pwsh.exe")).expect("shell evidence"),
+            serde_json::json!({
+                "kind": "shell_execution",
+                "shell_family": "power_shell",
+                "cwd": "C:/workspace",
+                "executable_candidates": ["C:/shell/pwsh.exe"],
+                "arguments": ["-NoProfile", "-Command", "python --version"],
+            })
         );
-        assert_eq!(
-            parse_guardian_decision(r#"{"decision":"ask_user","rationale":"confirm destination"}"#)
-                .expect("ask user"),
-            PermissionGuardianDecision::AskUser {
-                rationale: "confirm destination".to_string(),
-            }
-        );
-        assert_eq!(
-            parse_guardian_decision(r#"{"decision":"deny","rationale":"not authorized"}"#)
-                .expect("deny"),
-            PermissionGuardianDecision::Deny {
-                rationale: "not authorized".to_string(),
-            }
+        let keys = |executable: &str| {
+            permission_retry_effect_keys(&request, &evidence(executable), &tool_request, workspace)
+                .expect("shell identity")
+        };
+        assert_ne!(
+            keys("C:/shell/pwsh.exe").identity_sha256,
+            keys("C:/other-shell/pwsh.exe").identity_sha256,
         );
     }
 
     #[test]
-    fn rejects_wrappers_unknown_fields_and_empty_rationale() {
-        for response in [
-            r#"```json
-{"decision":"allow","rationale":"scoped"}
-```"#,
-            r#"{"decision":"allow","rationale":"scoped","extra":true}"#,
-            r#"{"decision":"allow","rationale":"  "}"#,
-            r#"{"decision":"maybe","rationale":"unclear"}"#,
-        ] {
-            assert!(parse_guardian_decision(response).is_err(), "{response}");
-        }
+    fn file_edit_without_formatters_needs_no_derived_process_evidence() {
+        assert_eq!(
+            PermissionGuardianEvidenceState::file_edit_with_formatters(Vec::new()),
+            PermissionGuardianEvidenceState::permission_request(),
+        );
+    }
+
+    #[test]
+    fn retry_identity_includes_configured_formatter_effects_missing_from_raw_edit() {
+        let workspace = Utf8Path::new("C:/workspace");
+        let target = workspace.join("output.txt");
+        let request = PermissionRequest {
+            access: AccessKind::Shell,
+            summary: "write and format".into(),
+            details: Vec::new(),
+            targets: vec![target.clone()],
+            outside_workspace: true,
+            risks: vec![crate::tool::PermissionRisk::UnclassifiedShell],
+            agent_path: None,
+            agent_task_name: None,
+        };
+        let call = ModelToolCall {
+            call_id: "write".into(),
+            tool_name: "write".into(),
+            arguments_json: r#"{"path":"output.txt","content":"edited"}"#.into(),
+        };
+        let evidence = |command: &str| PermissionGuardianEvidence::FileEditWithFormatters {
+            formatters: vec![FormatterExecutionEvidence {
+                target: target.clone(),
+                cwd: workspace.to_path_buf(),
+                executable: Utf8PathBuf::from("C:/shell/pwsh.exe"),
+                argv: vec![
+                    "C:/shell/pwsh.exe".into(),
+                    "-Command".into(),
+                    command.into(),
+                ],
+            }],
+        };
+        let first =
+            permission_retry_effect_keys(&request, &evidence("read stdin"), &call, workspace)
+                .expect("first configured formatter identity");
+        let second = permission_retry_effect_keys(
+            &request,
+            &evidence("export stdin to an external destination"),
+            &call,
+            workspace,
+        )
+        .expect("changed configured formatter identity");
+        assert_eq!(first.family_sha256, second.family_sha256);
+        assert_ne!(first.identity_sha256, second.identity_sha256);
+    }
+
+    #[test]
+    fn hub_submission_identity_binds_the_saved_payload_and_destination() {
+        let workspace = Utf8Path::new("C:/workspace");
+        let request = PermissionRequest {
+            access: AccessKind::Edit,
+            summary: "retry saved job".into(),
+            details: Vec::new(),
+            targets: Vec::new(),
+            outside_workspace: false,
+            risks: vec![crate::tool::PermissionRisk::ExternalConnection],
+            agent_path: None,
+            agent_task_name: None,
+        };
+        let call = ModelToolCall {
+            call_id: "retry".into(),
+            tool_name: "team_retry_submission".into(),
+            arguments_json: "{}".into(),
+        };
+        let keys = |endpoint: &str, payload: Value| {
+            permission_retry_effect_keys(
+                &request,
+                &PermissionGuardianEvidence::HubSubmission {
+                    endpoint: endpoint.into(),
+                    hub_binding: "hub|certificate-hash".into(),
+                    payload,
+                },
+                &call,
+                workspace,
+            )
+            .expect("saved submission keys")
+        };
+        let first = keys(
+            "https://hub-a",
+            serde_json::json!({"request_id":"saved","environment_id":"pc-a","input":{"prompt":"first action"}}),
+        );
+        let changed_action = keys(
+            "https://hub-a",
+            serde_json::json!({"request_id":"saved","environment_id":"pc-a","input":{"prompt":"different action"}}),
+        );
+        let changed_target = keys(
+            "https://hub-b",
+            serde_json::json!({"request_id":"saved","environment_id":"pc-a","input":{"prompt":"first action"}}),
+        );
+        assert_eq!(first.family_sha256, changed_action.family_sha256);
+        assert_ne!(first.identity_sha256, changed_action.identity_sha256);
+        assert_ne!(first.identity_sha256, changed_target.identity_sha256);
     }
 
     #[test]

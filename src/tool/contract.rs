@@ -129,6 +129,7 @@ pub enum ToolName {
     SharedSaveArtifact,
     SharedPublishArtifact,
     UpdatePlan,
+    CompactContext,
     GetGoal,
     CreateGoal,
     UpdateGoal,
@@ -178,6 +179,7 @@ impl std::fmt::Display for ToolName {
             ToolName::SharedSaveArtifact => "shared_save_artifact",
             ToolName::SharedPublishArtifact => "shared_publish_artifact",
             ToolName::UpdatePlan => "update_plan",
+            ToolName::CompactContext => "compact_context",
             ToolName::GetGoal => "get_goal",
             ToolName::CreateGoal => "create_goal",
             ToolName::UpdateGoal => "update_goal",
@@ -230,6 +232,7 @@ impl ToolName {
             "shared_save_artifact" => Self::SharedSaveArtifact,
             "shared_publish_artifact" => Self::SharedPublishArtifact,
             "update_plan" => Self::UpdatePlan,
+            "compact_context" => Self::CompactContext,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
             "update_goal" => Self::UpdateGoal,
@@ -271,6 +274,20 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ToolName::UpdatePlan).expect("serialize"),
             "\"update_plan\""
+        );
+    }
+
+    #[test]
+    fn compact_context_has_one_canonical_tool_name() {
+        assert_eq!(ToolName::CompactContext.to_string(), "compact_context");
+        assert_eq!(ToolName::parse("compact_context"), ToolName::CompactContext);
+        assert_eq!(
+            serde_json::to_string(&ToolName::CompactContext).unwrap(),
+            "\"compact_context\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"compact_context\"").unwrap(),
+            ToolName::CompactContext
         );
     }
 

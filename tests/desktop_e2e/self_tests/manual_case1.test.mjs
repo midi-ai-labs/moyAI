@@ -10,6 +10,7 @@ import {
   normalizeManualCase1Options,
 } from "../scenarios/manual_case1.mjs";
 import * as case1 from "../scenarios/manual_case1.mjs";
+import { manualLiveConfigurationFailures } from "../drivers/manual_live_session.mjs";
 
 const SPEC = fileURLToPath(new URL("../../manual_ST/case1/spec.md", import.meta.url));
 const RAW = { provider_base_url: "http://provider.invalid:1234/v1", model: "exact-model", python_executable: process.execPath };
@@ -18,13 +19,18 @@ const TURN = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const TEST_OUTPUT = "......\n----------------------------------------------------------------------\nRan 6 tests in 0.001s\n\nOK\n";
 
 function terminal(overrides = {}) {
-  return { visible_fatal_count: 0, visible_recoverable_error_count: 0, projection: {
+  const projection = {
     confirmation_visible: false, busy: false, post_run_refresh_pending: false,
     background_mutation_pending: false, async_polling_required: false, pending_async_operations: [],
     run_status_key: "completed", task_activity_state: "idle", composer_submit_mode: "new_request", can_submit: true,
     run_target: { sessionId: ID, expectedState: { kind: "idle", latestTurnId: TURN } }, draft_target: { sessionId: ID },
+    session_usage_label: "このチャットの累計: 276k tokens", session_usage_title: "完了した依頼の累計", session_usage_state: "complete",
     ...overrides,
-  } };
+  };
+  return { visible_fatal_count: 0, visible_recoverable_error_count: 0, projection,
+    composer: { count: 1, visible: true, run_target: structuredClone(projection.run_target) },
+    session_usage: { count: 1, visible: true, text: projection.session_usage_label,
+      title: projection.session_usage_title, state: projection.session_usage_state } };
 }
 
 test("Case1 reads the sole canonical prompt from the current spec without extra instructions", async () => {
@@ -54,6 +60,57 @@ test("Case1 uses the current profile and local context budget with Default permi
   assert.match(config, /context_window = 131072/);
   assert.match(config, /access_mode = "default"/);
   assert.doesNotMatch(config, /temperature|top_p|top_k|max_tokens|thinking|reasoning|extra_body|request_timeout/);
+  assert.doesNotMatch(config, /\[side_chat\]|\[approve\]/);
+});
+
+test("manual live options bind independent Sub and Approve to explicit models and credential references", () => {
+  const options = normalizeManualCase1Options({ ...RAW, api_key_env: "SHARED_TEST_KEY",
+    side_model: "small-chat", side_api_key_env: "SHARED_TEST_KEY",
+    approve_model: "small-review", approve_api_key_env: "SHARED_TEST_KEY", access_mode: "auto_review" });
+  assert.equal(options.sideModel, "small-chat");
+  assert.equal(options.approveModel, "small-review");
+  assert.equal(options.sideApiKeyEnv, options.apiKeyEnv);
+  assert.equal(options.approveApiKeyEnv, options.apiKeyEnv);
+  const config = manualCase1FixtureConfig(options);
+  for (const [role, model] of [["side_chat", "small-chat"], ["approve", "small-review"]]) {
+    const section = config.split(`[${role}]\n`)[1].split(/^\[/m)[0];
+    assert.match(section, /base_url = "http:\/\/provider.invalid:1234\/v1"/);
+    assert.match(section, /provider_profile = "openai_compatible"/);
+    assert.match(section, /api_key_env = "SHARED_TEST_KEY"/);
+    assert.equal(JSON.parse(section.match(/^model = (.+)$/m)[1]), model);
+  }
+  assert.match(config, /access_mode = "auto_review"/);
+  assert.doesNotMatch(config, /temperature|top_p|top_k|max_tokens|thinking|reasoning|extra_body|request_timeout/);
+  const isolated = normalizeManualCase1Options({ ...RAW, api_key_env: "MAIN_ONLY_KEY", side_model: "small", approve_model: "small" });
+  assert.equal(isolated.sideApiKeyEnv, "");
+  assert.equal(isolated.approveApiKeyEnv, "");
+  assert.match(manualCase1FixtureConfig(isolated).split("[approve]\n")[1], /api_key_env = ""/);
+  for (const role of ["side", "approve"]) {
+    for (const model of [null, "", " padded ", "bad\nmodel", "x".repeat(1025)]) assert.throws(() => normalizeManualCase1Options({ ...RAW, [`${role}_model`]: model }), TypeError);
+    for (const key of [null, 7, "Bearer secret", "KEY\nOTHER", "1_INVALID"]) assert.throws(() => normalizeManualCase1Options({ ...RAW, [`${role}_api_key_env`]: key }), TypeError);
+  }
+  for (const access_mode of [null, "auto", true, "full-access"]) assert.throws(() => normalizeManualCase1Options({ ...RAW, access_mode }), TypeError);
+  for (const access_mode of ["default", "auto_review", "full_access"]) assert.equal(normalizeManualCase1Options({ ...RAW, access_mode }).accessMode, access_mode);
+});
+
+test("manual live preflight compares all configured roles and access mode without requiring legacy unused roles", () => {
+  const options = normalizeManualCase1Options({ ...RAW, api_key_env: "SHARED_TEST_KEY", side_model: "chat", side_api_key_env: "SHARED_TEST_KEY",
+    approve_model: "review", approve_api_key_env: "SHARED_TEST_KEY", access_mode: "auto_review" });
+  const fields = [{ key: "permissions.access_mode", value: "auto_review" }];
+  for (const [role, model] of [["model", "exact-model"], ["side_chat", "chat"], ["approve", "review"]]) {
+    fields.push({ key: `${role}.base_url`, value: RAW.provider_base_url }, { key: `${role}.model`, value: model },
+      { key: `${role}.provider_profile`, value: "openai_compatible" }, { key: `${role}.api_key_env`, value: "SHARED_TEST_KEY" });
+  }
+  assert.deepEqual(manualLiveConfigurationFailures({ config_fields: fields }, options), []);
+  for (const key of ["approve.model", "approve.api_key_env", "side_chat.model", "side_chat.api_key_env", "permissions.access_mode"]) {
+    const drifted = fields.map(field => field.key === key ? { ...field, value: "drift" } : field);
+    assert.deepEqual(manualLiveConfigurationFailures({ config_fields: drifted }, options), [{ key, expected: fields.find(field => field.key === key).value, actual: "drift" }]);
+  }
+  assert.deepEqual(manualLiveConfigurationFailures({ config_fields: [...fields, fields.find(field => field.key === "approve.model")] }, options), [{ key: "approve.model", expected: "review", actual: null }]);
+  const legacy = normalizeManualCase1Options(RAW);
+  const legacyFields = fields.filter(field => !field.key.startsWith("approve.") && !field.key.startsWith("side_chat."))
+    .map(field => field.key === "permissions.access_mode" ? { ...field, value: "default" } : field.key === "model.api_key_env" ? { ...field, value: "" } : field);
+  assert.deepEqual(manualLiveConfigurationFailures({ config_fields: legacyFields }, legacy), []);
 });
 
 test("Case1 terminal predicate waits for exact idle owner and does not classify approval as product failure", () => {
@@ -62,6 +119,12 @@ test("Case1 terminal predicate waits for exact idle owner and does not classify 
   for (const change of [{ busy: true }, { post_run_refresh_pending: true }, { pending_async_operations: ["refresh"] },
     { draft_target: { sessionId: TURN } }, { task_activity_state: "running" }]) assert.equal(manualCase1TerminalDecision(terminal(change)), "pending");
   assert.equal(manualCase1TerminalDecision(terminal({ run_status_key: "failed" })), "failed");
+  const stale = terminal();
+  stale.session_usage = { count: 1, visible: true, text: "このチャットの累計: 未計測", title: "まだ記録されていません。", state: "missing" };
+  assert.equal(manualCase1TerminalDecision(stale), "pending");
+  assert.equal(manualCase1TerminalDecision({ ...stale, visible_fatal_count: 1 }), "failed");
+  assert.equal(manualCase1TerminalDecision({ ...stale, projection: { ...stale.projection, run_status_key: "failed" } }), "failed");
+  assert.equal(manualCase1TerminalDecision({ ...stale, projection: { ...stale.projection, confirmation_visible: true } }), "approval");
 });
 
 test("Case1 external unittest must execute at least one test and complete with exit zero", () => {

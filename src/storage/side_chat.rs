@@ -104,6 +104,8 @@ pub struct SideChatProviderTarget {
     pub base_url: String,
     pub model: String,
     pub provider_profile: ProviderProfile,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     pub system_prompt: String,
     pub context_window: u32,
     pub request_timeout_ms: u64,
@@ -122,6 +124,7 @@ impl TryFrom<&SideChatConfig> for SideChatProviderTarget {
             base_url: config.base_url.clone(),
             model: config.model.clone(),
             provider_profile: config.provider_profile,
+            api_key_env: config.api_key_env.clone(),
             system_prompt: config.system_prompt.clone(),
             context_window: config.context_window,
             request_timeout_ms: config.request_timeout_ms,
@@ -149,6 +152,8 @@ impl SideChatProviderTarget {
             ));
         }
         self.system_prompt = normalize_side_chat_system_prompt(&self.system_prompt)?;
+        self.api_key_env = crate::config::canonical_api_key_env_name(self.api_key_env.as_deref())
+            .map_err(StorageError::Message)?;
         if self.context_window == 0 {
             return Err(StorageError::Message(
                 "side chat context limit must be positive".to_string(),
@@ -175,6 +180,7 @@ impl Debug for SideChatProviderTarget {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("provider_profile", &self.provider_profile)
+            .field("api_key_env", &self.api_key_env)
             .field("system_prompt_chars", &self.system_prompt.chars().count())
             .field("context_window", &self.context_window)
             .field("request_timeout_ms", &self.request_timeout_ms)
@@ -195,6 +201,8 @@ pub struct SideChatBinding {
     pub base_url: String,
     pub model: String,
     pub provider_profile: ProviderProfile,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     pub system_prompt: String,
     pub context_window: u32,
     /// Retired V55/V60 compatibility column. Runtime requests ignore it.
@@ -222,6 +230,7 @@ impl SideChatBinding {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             provider_profile: self.provider_profile,
+            api_key_env: self.api_key_env.clone(),
             system_prompt: self.system_prompt.clone(),
             context_window: self.context_window,
             request_timeout_ms: self.request_timeout_ms,
@@ -367,7 +376,7 @@ impl SqliteSideChatRepository {
         let target = target.validate()?;
         let provider_connection = SessionProviderConnection {
             profile: target.provider_profile,
-            api_key_env: None,
+            api_key_env: target.api_key_env.clone(),
             extra_headers: Default::default(),
         };
         // Provider connection snapshots are deliberately not generally serializable: their
@@ -546,7 +555,7 @@ impl SqliteSideChatRepository {
         ensure_conversation_not_running(&transaction, existing.conversation_session_id)?;
         let now_ms = SystemClock.now_ms();
         let provider_json = serde_json::to_string(&serde_json::json!({
-            "profile": direct.provider_profile, "api_key_env": null, "extra_headers": {},
+            "profile": direct.provider_profile, "api_key_env": direct.api_key_env, "extra_headers": {},
         }))?;
         transaction.execute(
             "UPDATE sessions SET model_name=?2, base_url=?3, provider_connection_json=?4,
@@ -1101,6 +1110,7 @@ type BindingColumns = (
     i64,
     i64,
     String,
+    Option<String>,
 );
 
 fn binding_columns(row: &Row<'_>) -> rusqlite::Result<BindingColumns> {
@@ -1128,6 +1138,7 @@ fn binding_columns(row: &Row<'_>) -> rusqlite::Result<BindingColumns> {
         row.get(20)?,
         row.get(21)?,
         row.get(22)?,
+        row.get(23)?,
     ))
 }
 
@@ -1138,7 +1149,9 @@ const BINDING_SELECT: &str = "SELECT id, owner_session_id, conversation_session_
             supports_images, supports_tools, supports_reasoning,
             persisted_draft, draft_revision, request_generation,
             delete_requested_at_ms, context_scope,
-            created_at_ms, updated_at_ms, provider_route_kind
+            created_at_ms, updated_at_ms, provider_route_kind,
+            (SELECT provider_connection_json FROM sessions
+             WHERE sessions.id = side_chat_bindings.conversation_session_id)
      FROM side_chat_bindings";
 
 fn binding_for_owner(
@@ -1164,6 +1177,15 @@ fn binding_for_conversation(
 }
 
 fn decode_binding(raw: BindingColumns) -> Result<SideChatBinding, StorageError> {
+    // The hidden conversation already owns the durable provider connection.
+    // Keep its credential reference with that endpoint rather than duplicating it.
+    let api_key_env = if let Some(json) = raw.23.as_deref() {
+        let provider: SessionProviderConnection = serde_json::from_str(json)?;
+        provider.validate().map_err(StorageError::Message)?;
+        provider.api_key_env
+    } else {
+        None
+    };
     Ok(SideChatBinding {
         route_kind: match raw.22.as_str() {
             "direct" => SideChatRouteKind::Direct,
@@ -1190,6 +1212,7 @@ fn decode_binding(raw: BindingColumns) -> Result<SideChatBinding, StorageError> 
                 raw.5
             ))
         })?,
+        api_key_env,
         system_prompt: decode_side_chat_system_prompt(raw.6)?,
         context_window: parse_positive_u32(raw.7, "context window")?,
         max_output_tokens: parse_positive_u32(raw.8, "max output tokens")?,
@@ -1505,6 +1528,7 @@ mod tests {
             base_url: "http://localhost:1234/v1/".to_string(),
             model: model.to_string(),
             provider_profile: ProviderProfile::LmStudioChatCompletions,
+            api_key_env: None,
             system_prompt: String::new(),
             context_window: 65_536,
             request_timeout_ms: 60_000,
@@ -1522,6 +1546,7 @@ mod tests {
             model: "  side-model  ".to_string(),
             system_prompt: "  SIDE_ONLY_MARKER  ".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible,
+            api_key_env: Some("SIDE_KEY".to_string()),
             context_window: 32_768,
             request_timeout_ms: 90_000,
             connect_timeout_ms: 7_500,
@@ -1535,6 +1560,7 @@ mod tests {
                 base_url: "http://localhost:8080/v1".to_string(),
                 model: "side-model".to_string(),
                 provider_profile: ProviderProfile::OpenAiCompatible,
+                api_key_env: Some("SIDE_KEY".to_string()),
                 system_prompt: "SIDE_ONLY_MARKER".to_string(),
                 context_window: 32_768,
                 request_timeout_ms: 90_000,
@@ -1544,6 +1570,273 @@ mod tests {
                 supports_tools: false,
             }
         );
+    }
+
+    #[test]
+    fn side_chat_credential_reference_reopens_with_its_provider_snapshot() {
+        let (store, repo, owner) = fixture();
+        let mut first_target = target("first-model");
+        first_target.api_key_env = Some(" SIDE_KEY ".to_string());
+        let first = repo
+            .ensure(owner, first_target)
+            .expect("explicit Side reference");
+        assert_eq!(first.api_key_env.as_deref(), Some("SIDE_KEY"));
+        let stored: String = repo
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT provider_connection_json FROM sessions WHERE id=?1",
+                [first.conversation_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: SessionProviderConnection = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored.api_key_env, first.api_key_env);
+        assert!(stored.extra_headers.is_empty());
+
+        let mut changed_defaults = target("second-model");
+        changed_defaults.base_url = "https://other-provider.test/v1".to_string();
+        changed_defaults.api_key_env = Some("OTHER_KEY".to_string());
+        assert_eq!(repo.ensure(owner, changed_defaults).unwrap(), first);
+        let reopened = SqliteStore::open(store.paths()).expect("reopen");
+        reopened.migrate().expect("current schema");
+        assert_eq!(
+            reopened.side_chat_repo().get_by_owner(owner).unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn side_chat_legacy_null_reference_reopens_with_anonymous_snapshot() {
+        let (store, repo, owner) = fixture();
+        let binding = repo.ensure(owner, target("legacy-model")).unwrap();
+        assert_eq!(binding.api_key_env, None);
+        let snapshot: String = repo
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT provider_connection_json FROM sessions WHERE id=?1",
+                [binding.conversation_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionProviderConnection>(&snapshot)
+                .unwrap()
+                .api_key_env,
+            None
+        );
+        let reopened = SqliteStore::open(store.paths()).expect("reopen");
+        reopened
+            .migrate()
+            .expect("legacy null reference remains valid");
+        assert_eq!(
+            reopened.side_chat_repo().get_by_owner(owner).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn side_chat_reopen_rejects_invalid_provider_or_owner_snapshots() {
+        for corruption in [
+            "invalid-ref",
+            "noncanonical-ref",
+            "headers",
+            "profile",
+            "missing",
+            "project",
+        ] {
+            let (store, repo, owner) = fixture();
+            let mut explicit = target("side-model");
+            explicit.api_key_env = Some("SIDE_KEY".into());
+            let binding = repo.ensure(owner, explicit).unwrap();
+            let connection = repo.connection.lock().unwrap();
+            let side_id = binding.conversation_session_id.to_string();
+            match corruption {
+                "project" => {
+                    let other_project = ProjectId::new().to_string();
+                    connection.execute(
+                        "INSERT INTO projects (id,root_path,display_name,vcs_kind,created_at_ms,updated_at_ms)
+                         VALUES (?1,?2,'other','none',1,1)",
+                        params![other_project, format!("C:/other/{other_project}")],
+                    ).unwrap();
+                    connection
+                        .execute(
+                            "UPDATE sessions SET project_id=?2 WHERE id=?1",
+                            params![side_id, other_project],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    let snapshot = match corruption {
+                        "invalid-ref" => Some(
+                            r#"{"profile":"lm_studio_chat_completions","api_key_env":"BAD-NAME","extra_headers":{}}"#,
+                        ),
+                        "noncanonical-ref" => Some(
+                            r#"{"profile":"lm_studio_chat_completions","api_key_env":" SIDE_KEY ","extra_headers":{}}"#,
+                        ),
+                        "headers" => Some(
+                            r#"{"profile":"lm_studio_chat_completions","api_key_env":"SIDE_KEY","extra_headers":{"X-Test":"value"}}"#,
+                        ),
+                        "profile" => Some(
+                            r#"{"profile":"openai_compatible","api_key_env":"SIDE_KEY","extra_headers":{}}"#,
+                        ),
+                        "missing" => None,
+                        _ => unreachable!(),
+                    };
+                    connection
+                        .execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE sessions SET provider_connection_json=?2 WHERE id=?1",
+                            params![side_id, snapshot],
+                        )
+                        .unwrap();
+                    connection
+                        .execute_batch("PRAGMA ignore_check_constraints=OFF")
+                        .unwrap();
+                }
+            }
+            drop(connection);
+            let reopened = SqliteStore::open(store.paths()).expect("reopen");
+            let error = reopened
+                .migrate()
+                .expect_err("corrupt Side snapshot must fail closed");
+            let message = error.to_string();
+            assert!(
+                message.contains("provider connection") || message.contains("canonical ownership"),
+                "{corruption}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn side_chat_rejects_invalid_credential_reference_before_creation() {
+        let (_store, repo, owner) = fixture();
+        let mut invalid = target("side-model");
+        invalid.api_key_env = Some("INVALID-NAME".to_string());
+        assert!(repo.ensure(owner, invalid).is_err());
+        assert!(repo.get_by_owner(owner).unwrap().is_none());
+    }
+
+    #[test]
+    fn side_chat_explicit_reference_keeps_owner_identity_immutable() {
+        let (_store, repo, owner) = fixture();
+        let mut explicit = target("side-model");
+        explicit.api_key_env = Some("SIDE_KEY".into());
+        let binding = repo.ensure(owner, explicit).unwrap();
+        let connection = repo.connection.lock().unwrap();
+        let another_owner = SessionId::new().to_string();
+        connection.execute(
+            "INSERT INTO sessions (id,project_id,title,status,cwd_path,model_name,base_url,created_at_ms,updated_at_ms)
+             SELECT ?2,project_id,'another owner','idle',cwd_path,model_name,base_url,created_at_ms,updated_at_ms
+             FROM sessions WHERE id=?1",
+            params![owner.to_string(), another_owner],
+        ).unwrap();
+        let error = connection
+            .execute(
+                "UPDATE side_chat_bindings SET owner_session_id=?2 WHERE id=?1",
+                params![binding.id.to_string(), another_owner],
+            )
+            .expect_err("reference support must not permit owner reassignment");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid side chat binding transition")
+        );
+        drop(connection);
+        assert_eq!(repo.get_by_owner(owner).unwrap(), Some(binding));
+    }
+
+    #[test]
+    fn side_chat_provider_snapshot_rolls_back_on_late_binding_write_failure() {
+        for capture in [false, true] {
+            let (store, repo, owner) = fixture();
+            let before = if capture {
+                let mut hub_target = target("hub-model");
+                hub_target.route_kind = SideChatRouteKind::Hub;
+                let binding = repo.ensure(owner, hub_target).unwrap();
+                repo.update_draft(owner, binding.id, 0, "retained draft")
+                    .unwrap();
+                repo.get_by_owner(owner).unwrap()
+            } else {
+                None
+            };
+            let before_snapshot = before.as_ref().map(|binding| {
+                repo.connection.lock().unwrap().query_row(
+                    "SELECT model_name,base_url,provider_connection_json,updated_at_ms FROM sessions WHERE id=?1",
+                    [binding.conversation_session_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, i64>(3)?)),
+                ).unwrap()
+            });
+            let failure_sql = if capture {
+                "CREATE TRIGGER fail_side_binding_write BEFORE UPDATE ON side_chat_bindings
+                 BEGIN SELECT RAISE(ABORT,'fixture binding write failure'); END;"
+            } else {
+                "CREATE TRIGGER fail_side_binding_write BEFORE INSERT ON side_chat_bindings
+                 BEGIN SELECT RAISE(ABORT,'fixture binding write failure'); END;"
+            };
+            repo.connection
+                .lock()
+                .unwrap()
+                .execute_batch(failure_sql)
+                .unwrap();
+            let direct = SideChatConfig {
+                base_url: "http://direct.test:1234/v1".into(),
+                model: "direct-model".into(),
+                api_key_env: Some("SIDE_KEY".into()),
+                ..SideChatConfig::default()
+            };
+            let result = if let Some(binding) = &before {
+                repo.capture_direct_provider(
+                    owner,
+                    binding.id,
+                    binding.request_generation,
+                    binding.draft_revision,
+                    &direct,
+                )
+            } else {
+                repo.ensure(owner, SideChatProviderTarget::try_from(&direct).unwrap())
+            };
+            let error = result.expect_err("binding write fails after the hidden session write");
+            assert!(error.to_string().contains("fixture binding write failure"));
+            repo.connection
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_side_binding_write")
+                .unwrap();
+            assert_eq!(repo.get_by_owner(owner).unwrap(), before);
+            if let Some(binding) = &before {
+                let after = repo.connection.lock().unwrap().query_row(
+                    "SELECT model_name,base_url,provider_connection_json,updated_at_ms FROM sessions WHERE id=?1",
+                    [binding.conversation_session_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, i64>(3)?)),
+                ).unwrap();
+                assert_eq!(Some(after), before_snapshot);
+            } else {
+                let sessions: i64 = repo
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    sessions, 1,
+                    "failed create leaves no hidden conversation orphan"
+                );
+            }
+            let reopened = SqliteStore::open(store.paths()).unwrap();
+            reopened
+                .migrate()
+                .expect("atomic rollback preserves current reopen contract");
+            assert_eq!(
+                reopened.side_chat_repo().get_by_owner(owner).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]
@@ -1557,12 +1850,34 @@ mod tests {
         let binding = repo.get_by_owner(owner).unwrap().unwrap();
         {
             let connection = repo.connection.lock().unwrap();
-            // Remove only the forward addition to reproduce the released V65 shape.
+            // Restore the released trigger contracts before removing the forward additions.
+            let insert_sql = include_str!("../../migrations/V60__provider_connection_profiles.sql");
+            let insert_start = insert_sql
+                .find("CREATE TRIGGER validate_side_chat_binding_before_insert")
+                .unwrap();
+            let insert_end = insert_sql[insert_start..]
+                .find("CREATE TRIGGER validate_side_chat_binding_before_update")
+                .unwrap()
+                + insert_start;
+            let update_sql = include_str!("../../migrations/V61__side_chat_system_prompt.sql");
+            let update_start = update_sql
+                .find("CREATE TRIGGER validate_side_chat_binding_before_update")
+                .unwrap();
+            let update_end = update_sql
+                .find("INSERT INTO moyai_schema_migrations")
+                .unwrap();
+            connection.execute_batch("DROP TRIGGER validate_side_chat_binding_before_insert; DROP TRIGGER validate_side_chat_binding_before_update;").unwrap();
+            connection
+                .execute_batch(&insert_sql[insert_start..insert_end])
+                .unwrap();
+            connection
+                .execute_batch(&update_sql[update_start..update_end])
+                .unwrap();
             connection
                 .execute_batch(
                     "DROP TRIGGER validate_side_chat_route_kind_before_update;
                 ALTER TABLE side_chat_bindings DROP COLUMN provider_route_kind;
-                DELETE FROM moyai_schema_migrations WHERE version=66;",
+                DELETE FROM moyai_schema_migrations WHERE version IN (66,69);",
                 )
                 .expect("V65 fixture");
         }
@@ -1599,6 +1914,7 @@ mod tests {
         let direct = SideChatConfig {
             base_url: "http://direct.test:1234/v1".into(),
             model: "direct-model".into(),
+            api_key_env: Some("EXPLICIT_DIRECT_KEY".into()),
             system_prompt: "must not overwrite policy".into(),
             ..SideChatConfig::default()
         };
@@ -1719,6 +2035,7 @@ mod tests {
         );
         assert_eq!(applied.model, "direct-model");
         assert_eq!(applied.base_url, "http://direct.test:1234/v1");
+        assert_eq!(applied.api_key_env.as_deref(), Some("EXPLICIT_DIRECT_KEY"));
         assert_eq!(applied.system_prompt, before.system_prompt);
         assert_eq!(applied.context_window, before.context_window);
         assert_eq!(applied.persisted_draft, before.persisted_draft);

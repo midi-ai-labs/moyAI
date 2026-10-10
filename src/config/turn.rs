@@ -388,6 +388,7 @@ impl fmt::Debug for ProviderTarget {
 pub struct ResolvedTurnConfig {
     effective: Arc<ResolvedConfig>,
     provider: ProviderTarget,
+    approve_provider: ProviderTarget,
 }
 
 impl ResolvedTurnConfig {
@@ -407,9 +408,12 @@ impl ResolvedTurnConfig {
         let provider = ProviderTarget::from_resolved_config(&effective)?;
         effective.model.base_url = provider.sanitized_endpoint().to_string();
         effective.model.model = provider.model().to_string();
+        let approve_provider =
+            ProviderTarget::from_resolved_config(&effective.approve_runtime_config())?;
         Ok(Self {
             effective: Arc::new(effective),
             provider,
+            approve_provider,
         })
     }
 
@@ -423,6 +427,10 @@ impl ResolvedTurnConfig {
 
     pub fn provider(&self) -> &ProviderTarget {
         &self.provider
+    }
+
+    pub(crate) fn approve_provider(&self) -> &ProviderTarget {
+        &self.approve_provider
     }
 
     pub fn with_model_override(&self, model: &str) -> Result<Self, ResolvedTurnConfigError> {
@@ -519,6 +527,52 @@ mod tests {
         assert_eq!(turn.runtime_config().model.temperature, None);
         assert_eq!(turn.runtime_config().model.seed, None);
         assert_eq!(turn.runtime_config().model.extra_body_json, None);
+    }
+
+    #[test]
+    fn approval_target_is_captured_and_main_overrides_do_not_replace_explicit_approval() {
+        let mut config = ResolvedConfig::default();
+        config.model.model = "main-one".into();
+        let legacy = ResolvedTurnConfig::capture(config.clone()).unwrap();
+        let signature = |target: &ProviderTarget| {
+            (
+                target.sanitized_endpoint().to_string(),
+                target.model().to_string(),
+                target.profile(),
+                target.deadlines(),
+            )
+        };
+        assert_eq!(
+            signature(legacy.approve_provider()),
+            signature(legacy.provider())
+        );
+        assert_eq!(
+            legacy
+                .with_model_override("main-two")
+                .unwrap()
+                .approve_provider()
+                .model(),
+            "main-two"
+        );
+        let mut approval = crate::config::ApproveConfig::from_model(&config.model);
+        approval.model = "fast-review".into();
+        approval.base_url = "https://approve.example.test/v1".into();
+        approval.provider_profile = ProviderProfile::OpenAiCompatible;
+        approval.request_timeout_ms = 30000;
+        config.approve = Some(approval);
+        let captured = ResolvedTurnConfig::capture(config.clone()).unwrap();
+        config.approve.as_mut().unwrap().model = "later-review".into();
+        assert_eq!(captured.approve_provider().model(), "fast-review");
+        let overridden = captured.with_model_override("main-two").unwrap();
+        assert_eq!(overridden.provider().model(), "main-two");
+        assert_eq!(
+            signature(overridden.approve_provider()),
+            signature(captured.approve_provider())
+        );
+        assert_eq!(
+            overridden.approve_provider().deadlines().request_timeout_ms,
+            30000
+        );
     }
 
     #[test]

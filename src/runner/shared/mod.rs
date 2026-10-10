@@ -24,6 +24,8 @@ use super::{ExecutionOutcome, LocalRunRequest, RunnerError, RunnerHost, SharedEx
 use journal::{Entry, Journal, Phase};
 use transport::{SharedClient, TransportError};
 
+pub(super) const MAX_SHARED_LABEL_BYTES: usize = 1024;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SharedProjection {
     pub connected: bool,
@@ -1038,16 +1040,16 @@ impl Controller {
                 !child_ids.contains(&candidate.environment_id)
                     || !crate::device_network::stable_id(&candidate.device_id)
                     || candidate.device_label.trim().is_empty()
-                    || candidate.device_label.len() > 256
+                    || candidate.device_label.len() > MAX_SHARED_LABEL_BYTES
                     || candidate.environment_label.trim().is_empty()
-                    || candidate.environment_label.len() > 256
+                    || candidate.environment_label.len() > MAX_SHARED_LABEL_BYTES
                     || candidate.capabilities.len() > 32
                     || candidate
                         .capabilities
                         .iter()
                         .any(|capability| capability.trim().is_empty() || capability.len() > 128)
             })
-            || assignment.job.title.len() > 256
+            || assignment.job.title.len() > MAX_SHARED_LABEL_BYTES
             || assignment.retained_services.len() > 16
             || assignment.retained_services.iter().any(|service| {
                 service.service_id.parse::<ulid::Ulid>().is_err()

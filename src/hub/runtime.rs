@@ -39,6 +39,9 @@ struct TurnRouteInner {
     connection_cancel: CancellationToken,
     finished: std::sync::atomic::AtomicBool,
     used_models: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    // Captured with the Main owner. None preserves older settings' Main Guardian;
+    // an explicit but unconfirmed choice remains an error until the next admission.
+    approve_review: Option<Result<super::ReviewedHubSelection, HubError>>,
 }
 
 #[derive(Clone)]
@@ -75,6 +78,7 @@ impl HubReviewContext {
         match self {
             Self::Main => settings.main_mode,
             Self::SideChat => settings.side_chat_mode,
+            Self::Approve => settings.approve_mode,
         }
     }
 }
@@ -108,7 +112,9 @@ impl HubConnection {
         let mut state = self.inner.state.lock().expect("Hub state lock poisoned");
         state.check_generation(&expected_connection_generation)?;
         state.check_settings(&expected_settings_revision)?;
-        if state.active[context.index()].is_some() {
+        if state.active[context.index()].is_some()
+            || (context == HubReviewContext::Approve && state.approve_active())
+        {
             return Err(HubError::RouteBusy);
         }
         if mode == HubRouteMode::Hub
@@ -120,6 +126,7 @@ impl HubConnection {
         match context {
             HubReviewContext::Main => proposed.main_mode = mode,
             HubReviewContext::SideChat => proposed.side_chat_mode = mode,
+            HubReviewContext::Approve => proposed.approve_mode = mode,
         }
         state.settings = self.persisted_store()?.save(&proposed)?;
         Ok(state.projection(managed.as_deref()))
@@ -169,6 +176,20 @@ impl HubConnection {
             .ok_or(HubError::ReviewRequired)?;
         let client = state.client.clone().ok_or(HubError::Unavailable)?;
         let catalog = state.catalog.clone().ok_or(HubError::Unavailable)?;
+        let approve_review = if context == HubReviewContext::Main
+            && (managed || state.settings.approve_mode == HubRouteMode::Hub)
+        {
+            state.settings.approve_review.as_ref().map(|review| {
+                if state.confirmation(HubReviewContext::Approve) == HubReviewConfirmation::Confirmed
+                {
+                    Ok(review.clone())
+                } else {
+                    Err(HubError::ReviewRequired)
+                }
+            })
+        } else {
+            None
+        };
         let turn_id = ulid::Ulid::new().to_string();
         state.active[context.index()] = Some(ActiveHubTurn {
             display: HubActiveTurnProjection {
@@ -193,6 +214,7 @@ impl HubConnection {
                 connection_cancel: state.cancellation.clone(),
                 finished: std::sync::atomic::AtomicBool::new(false),
                 used_models: std::sync::Mutex::new(Default::default()),
+                approve_review,
             }),
         }))
     }
@@ -221,7 +243,13 @@ impl HubTurnRoute {
         if state.confirmed[self.inner.context.index()].as_ref() != Some(&self.inner.review) {
             return Err(HubError::ReviewRequired);
         }
-        if state.delegated_active.len() >= 14 {
+        if state
+            .delegated_active
+            .values()
+            .filter(|(context, _)| *context != HubReviewContext::Approve)
+            .count()
+            >= 14
+        {
             return Err(HubError::RouteBusy);
         }
         let turn_id = ulid::Ulid::new().to_string();
@@ -254,8 +282,95 @@ impl HubTurnRoute {
                 connection_cancel: state.cancellation.clone(),
                 finished: std::sync::atomic::AtomicBool::new(false),
                 used_models: std::sync::Mutex::new(Default::default()),
+                approve_review: self.inner.approve_review.clone(),
             }),
         })
+    }
+
+    /// Create one short review owner from the immutable Main admission snapshot.
+    /// It shares the authenticated connection but owns its permit, heartbeat and cleanup.
+    pub(crate) fn begin_approve_review(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<Option<Self>, HubError> {
+        let Some(captured) = self.inner.approve_review.as_ref() else {
+            return Ok(None);
+        };
+        let review = captured.clone()?;
+        if !self.inner.client.supports_delegated_execution {
+            return Err(HubError::DelegatedExecutionUnsupported);
+        }
+        if self
+            .inner
+            .finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self.inner.cancel.is_cancelled()
+            || cancel.is_cancelled()
+        {
+            return Err(HubError::TurnClosed);
+        }
+        let mut state = self
+            .inner
+            .connection
+            .inner
+            .state
+            .lock()
+            .expect("Hub state lock poisoned");
+        if state.generation != self.inner.generation
+            || state.status != HubConnectionStatus::Connected
+        {
+            return Err(HubError::ConnectionChanged);
+        }
+        review.check_admission(state.catalog.as_ref().ok_or(HubError::Unavailable)?)?;
+        if state.confirmed[HubReviewContext::Approve.index()].as_ref() != Some(&review) {
+            return Err(HubError::ReviewRequired);
+        }
+        if state
+            .delegated_active
+            .values()
+            .filter(|(context, _)| *context == HubReviewContext::Approve)
+            .count()
+            >= 15
+        {
+            return Err(HubError::RouteBusy);
+        }
+        let turn_id = ulid::Ulid::new().to_string();
+        state.delegated_active.insert(
+            turn_id.clone(),
+            (
+                HubReviewContext::Approve,
+                ActiveHubTurn {
+                    display: HubActiveTurnProjection {
+                        turn_id: turn_id.clone(),
+                        phase: "waiting",
+                        logical_model_id: None,
+                    },
+                    cancel: cancel.clone(),
+                },
+            ),
+        );
+        Ok(Some(Self {
+            inner: Arc::new(TurnRouteInner {
+                connection: self.inner.connection.clone(),
+                client: self.inner.client.clone(),
+                generation: self.inner.generation,
+                context: HubReviewContext::Approve,
+                purpose: HubRequestPurpose::Delegated,
+                turn_id,
+                review,
+                catalog: self.inner.catalog.clone(),
+                endpoint: self.inner.endpoint.clone(),
+                cancel,
+                connection_cancel: state.cancellation.clone(),
+                finished: std::sync::atomic::AtomicBool::new(false),
+                used_models: std::sync::Mutex::new(Default::default()),
+                approve_review: None,
+            }),
+        }))
+    }
+
+    pub(crate) fn approve_configured(&self) -> bool {
+        self.inner.approve_review.is_some()
     }
 
     pub(crate) fn execution_guard(&self) -> HubExecutionGuard {
@@ -414,7 +529,11 @@ impl HubTurnRoute {
             .lock()
             .expect("Hub state lock poisoned");
         if state.generation == self.inner.generation {
-            state.record_review_rejection(self.inner.review.reviewed_revision, error);
+            state.record_review_rejection(
+                self.inner.context,
+                self.inner.review.reviewed_revision,
+                error,
+            );
         }
     }
 

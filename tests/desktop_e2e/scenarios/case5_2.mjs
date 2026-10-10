@@ -25,6 +25,7 @@ import {
 } from "../case5_2_predicates.mjs";
 import { inventoryCase52CleanSeed, copyCase52CleanSeed } from "../core/clean_seed.mjs";
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { waitForSemanticTargetSettlement } from "../core/semantic_target_settlement.mjs";
 import {
@@ -85,7 +86,7 @@ const EXPORT_TRANSCRIPT = Object.freeze({
   identity: { tag: "BUTTON", action: "export-transcript" },
 });
 const STOP = Object.freeze({
-  selector: 'section.run-strip button[data-action="cancel-run"][aria-label="実行停止"]',
+  selector: 'section.run-strip button[data-action="cancel-run"][aria-label="メインチャットを停止"]',
   identity: { tag: "BUTTON", action: "cancel-run" },
 });
 const SHOW_SETTINGS = Object.freeze({
@@ -135,6 +136,10 @@ const SIDE_SETTINGS_NAV = Object.freeze({
 const SIDE_BASE_URL = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-base-url[data-config-key="side_chat.base_url"]',
   identity: { tag: "INPUT", id: "side-chat-base-url", configKey: "side_chat.base_url" },
+});
+const SIDE_API_KEY = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-api-key-env[data-config-key="side_chat.api_key_env"]',
+  identity: { tag: "INPUT", id: "side-chat-api-key-env", configKey: "side_chat.api_key_env" },
 });
 const SIDE_PROVIDER_PROFILE = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]',
@@ -396,9 +401,12 @@ export function normalizeCase52Options(options) {
     "provider_profile",
     "provider_lifecycle",
     "api_key_env",
+    "side_api_key_env",
+    "approve_api_key_env",
     "configure_main_via_gui",
     "main_model",
     "side_model",
+    "approve_model",
     "expected_main_variant",
     "expected_side_variant",
   ]);
@@ -408,6 +416,18 @@ export function normalizeCase52Options(options) {
   if (typeof apiKeyEnv !== "string" || (apiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(apiKeyEnv))) {
     throw new TypeError("manual.case5_2 api_key_env must be an environment variable name or empty string");
   }
+  const sideApiKeyEnv = options.side_api_key_env === undefined ? "" : options.side_api_key_env;
+  if (typeof sideApiKeyEnv !== "string" || (sideApiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(sideApiKeyEnv))) {
+    throw new TypeError("manual.case5_2 side_api_key_env must be an environment variable name or empty string");
+  }
+  const approveApiKeyEnv = options.approve_api_key_env === undefined ? "" : options.approve_api_key_env;
+  if (typeof approveApiKeyEnv !== "string" || (approveApiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(approveApiKeyEnv))) {
+    throw new TypeError("manual.case5_2 approve_api_key_env must be an environment variable name or empty string");
+  }
+  const approve = options.approve_model === undefined && options.approve_api_key_env === undefined ? {} : {
+    approveModel: modelIdentity(options.approve_model === undefined ? options.main_model : options.approve_model, "approve_model"),
+    approveApiKeyEnv,
+  };
   if (typeof options.fixture_source !== "string" || !path.isAbsolute(options.fixture_source)) {
     throw new TypeError("manual.case5_2 fixture_source must be an absolute path");
   }
@@ -435,9 +455,11 @@ export function normalizeCase52Options(options) {
     mainModel: modelIdentity(options.main_model, "main_model"),
     configureMainViaGui: options.configure_main_via_gui ?? false,
     ...(apiKeyEnv === "" ? {} : { apiKeyEnv }),
+    ...(sideApiKeyEnv === "" ? {} : { sideApiKeyEnv }),
+    ...approve,
   };
   if (providerProfile === OPENAI_COMPATIBLE_PROFILE) {
-    const legacyFields = ["side_model", "expected_main_variant", "expected_side_variant"]
+    const legacyFields = ["expected_main_variant", "expected_side_variant"]
       .filter((key) => Object.hasOwn(options, key));
     if (legacyFields.length > 0) {
       throw new TypeError(`manual.case5_2 openai_compatible does not accept LM Studio fields: ${legacyFields.join(",")}`);
@@ -448,7 +470,7 @@ export function normalizeCase52Options(options) {
     }
     return Object.freeze({
       ...common,
-      sideModel: common.mainModel,
+      sideModel: options.side_model === undefined ? common.mainModel : modelIdentity(options.side_model, "side_model"),
       expectedMainVariant: null,
       expectedSideVariant: null,
       providerLifecycle: EXTERNAL_UNMANAGED_LIFECYCLE,
@@ -480,6 +502,7 @@ export function case52FixtureConfig(options) {
     ? `provider_profile = "openai_compatible"`
     : `provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"`;
+  const approveConnection = options.approveModel === undefined ? "" : `\n[approve]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.approveModel)}\nprovider_profile = ${JSON.stringify(options.providerProfile)}\napi_key_env = ${JSON.stringify(options.approveApiKeyEnv)}\n`;
   return `[model]
 base_url = ${JSON.stringify(initialBaseUrl)}
 model = ${JSON.stringify(initialModel)}
@@ -492,6 +515,7 @@ supports_tools = true
 supports_images = true
 parallel_tool_calls = false
 max_parallel_predictions = 1
+${approveConnection}
 [permissions]
 access_mode = "auto_review"
 
@@ -507,6 +531,12 @@ enabled = false
 [mcp]
 enabled = false
 `;
+}
+
+export function case52Stage5Options(options) {
+  return options.providerProfile === OPENAI_COMPATIBLE_PROFILE || options.sideModel === options.mainModel
+    ? options
+    : Object.freeze({ ...options, sideModel: options.mainModel });
 }
 
 async function fileIdentity(candidate, { includeBytes = false } = {}) {
@@ -622,7 +652,9 @@ export function case52ProviderHeaders(apiKeyEnv = "", environment = process.env)
 }
 
 export function case52ExternalEnvironment(apiKeyEnv = "", environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => apiKeyEnv === "" || key.toLowerCase() !== apiKeyEnv.toLowerCase()));
+  const references = new Set((Array.isArray(apiKeyEnv) ? apiKeyEnv : [apiKeyEnv])
+    .filter(name => name !== "").map(name => name.toLowerCase()));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !references.has(key.toLowerCase())));
 }
 
 async function providerJson(baseUrl, pathname, { method = "GET", body = undefined, timeoutMs = 300_000, apiKeyEnv = "" } = {}) {
@@ -696,10 +728,12 @@ export function case52ProviderModelState(snapshot, options) {
     if (!Array.isArray(rows)) throw new Error("OpenAI-compatible /v1/models catalog is invalid");
     const matches = rows.filter((row) => row?.id === options.mainModel);
     const main = matches.length === 1 ? matches[0] : null;
+    const sideMatches = rows.filter((row) => row?.id === (options.sideModel ?? options.mainModel));
     return {
       main,
-      side: main,
+      side: sideMatches.length === 1 ? sideMatches[0] : null,
       main_match_count: matches.length,
+      side_match_count: sideMatches.length,
       context_capacity: openAiContextCapacity(main),
     };
   }
@@ -834,6 +868,9 @@ function providerCatalogFailures(state, options, { mainLoaded, expectedLoadedCon
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
     if (state.main_match_count !== 1 || state.main?.id !== options.mainModel) {
       failures.push("main-model-exact-catalog-mismatch");
+    }
+    if (state.side_match_count !== 1 || state.side?.id !== (options.sideModel ?? options.mainModel)) {
+      failures.push("side-model-exact-catalog-mismatch");
     }
     if (state.context_capacity?.conflict === true) failures.push("main-context-capacity-conflict");
     if (Number.isInteger(state.context_capacity?.effective)
@@ -1477,7 +1514,7 @@ async function resolveExecutable(name, state, context) {
     executable: where,
     args: [name],
     cwd: context.root,
-    env: await ownedProcessEnvironment(context, `resolve-${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`, {}, state.apiKeyEnv),
+    env: await ownedProcessEnvironment(context, `resolve-${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`, {}, state.credentialEnvNames),
     timeoutMs: 10_000,
     state,
     label: `resolve-${name}`,
@@ -1735,7 +1772,7 @@ async function pythonSiteRoots(python, context, state) {
     env: await ownedProcessEnvironment(context, "python-site-roots", {
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONPYCACHEPREFIX: path.join(context.paths.logs, "python-site-probe-cache"),
-    }, state.apiKeyEnv),
+    }, state.credentialEnvNames),
     timeoutMs: 30_000,
     state,
     label: "python-site-roots",
@@ -2001,14 +2038,6 @@ function mainConnectionDesired(options) {
   };
 }
 
-function configValues(projection, overrides = {}) {
-  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
-  return fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
-}
-
 export function case52ExpectedMainGlobalSave(surface, options) {
   const target = surface?.projection?.config_target;
   if (target === null || typeof target !== "object") {
@@ -2018,12 +2047,12 @@ export function case52ExpectedMainGlobalSave(surface, options) {
   return {
     command: "save_global_config",
     args: {
-      values: configValues(surface.projection, {
+      values: expectedConfigCommandValues(surface.projection, {
         "model.base_url": desired.baseUrl,
         "model.model": desired.model,
         "model.provider_profile": desired.providerProfile,
         "model.api_key_env": desired.apiKeyEnv,
-      }),
+      }, { editedKeys: desired.apiKeyEnv ? ["model.api_key_env"] : [] }),
       expectedTarget: structuredClone(target),
     },
   };
@@ -2037,11 +2066,12 @@ export function case52ExpectedSideGlobalSave(surface, options) {
   return {
     command: "save_global_config",
     args: {
-      values: configValues(surface.projection, {
+      values: expectedConfigCommandValues(surface.projection, {
         "side_chat.base_url": options.providerBaseUrl,
         "side_chat.model": options.sideModel,
         "side_chat.provider_profile": options.providerProfile,
-      }),
+        "side_chat.api_key_env": options.sideApiKeyEnv ?? "",
+      }, { editedKeys: options.sideApiKeyEnv ? ["side_chat.api_key_env"] : [] }),
       expectedTarget: structuredClone(target),
     },
   };
@@ -2463,6 +2493,7 @@ async function observeSideSettings(cdp) {
     const section = one('[role="dialog"][aria-labelledby="config-dialog-title"] section#settings-side-chat');
     const profile = one('select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]');
     const base = one('input#side-chat-base-url[data-config-key="side_chat.base_url"]');
+    const apiKey = one('input#side-chat-api-key-env[data-config-key="side_chat.api_key_env"]');
     const manual = one('input#side-chat-model-manual[data-config-key="side_chat.model"]');
     const details = one('details[data-details-key="side-chat-manual-model"]');
     const save = one('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]');
@@ -2476,6 +2507,7 @@ async function observeSideSettings(cdp) {
       section: { count: section.count, visible: visible(section.node), viewport_visible: viewportVisible(section.node) },
       profile: { count: profile.count, visible: visible(profile.node), viewport_visible: viewportVisible(profile.node), value: profile.node instanceof HTMLSelectElement ? profile.node.value : null, enabled: profile.node instanceof HTMLSelectElement && !profile.node.disabled, options: profile.node instanceof HTMLSelectElement ? Array.from(profile.node.options).map((option) => option.value) : [] },
       base: { count: base.count, visible: visible(base.node), viewport_visible: viewportVisible(base.node), value: base.node instanceof HTMLInputElement ? base.node.value : null, enabled: base.node instanceof HTMLInputElement && !base.node.disabled && !base.node.readOnly },
+      api_key: { count: apiKey.count, visible: visible(apiKey.node), viewport_visible: viewportVisible(apiKey.node), value: apiKey.node instanceof HTMLInputElement ? apiKey.node.value : null, enabled: apiKey.node instanceof HTMLInputElement && !apiKey.node.disabled && !apiKey.node.readOnly },
       manual: { count: manual.count, visible: visible(manual.node), viewport_visible: viewportVisible(manual.node), value: manual.node instanceof HTMLInputElement ? manual.node.value : null, enabled: manual.node instanceof HTMLInputElement && !manual.node.disabled && !manual.node.readOnly },
       details: { count: details.count, visible: visible(details.node), viewport_visible: viewportVisible(details.node), open: details.node instanceof HTMLDetailsElement ? details.node.open : null },
       dirty: Array.from(document.querySelectorAll('[role="dialog"][aria-labelledby="config-dialog-title"] .dirty-badge.visible')).filter(visible).length === 1,
@@ -2501,6 +2533,7 @@ function exactSideChatProjection(projection, options, sessionId) {
     && side.base_url === options.providerBaseUrl
     && side.model === options.sideModel
     && side.provider_profile === options.providerProfile
+    && (side.api_key_env ?? "") === (options.sideApiKeyEnv ?? "")
     && side.status === "idle"
     && side.phase === ""
     && side.last_error === ""
@@ -2524,6 +2557,9 @@ export function case52SideScreenshotSurfaceReady(surface, options, sessionId) {
     && surface?.base?.visible === true
     && surface.base.viewport_visible === true
     && surface.base.value === options.providerBaseUrl
+    && surface?.api_key?.visible === true
+    && surface.api_key.viewport_visible === true
+    && surface.api_key.value === (options.sideApiKeyEnv ?? "")
     && surface?.manual?.visible === true
     && surface.manual.viewport_visible === true
     && surface.manual.value === options.sideModel;
@@ -2639,6 +2675,7 @@ export async function configureSideChat({
     const opened = await openSideSettings({ cdp, input, sink });
     const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
     await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
+    await replaceExactText({ cdp, input, locator: SIDE_API_KEY, text: options.sideApiKeyEnv ?? "", action: "side-chat-api-key-env", sink });
     let surface = await observeSideSettings(cdp);
     if (surface.details.open !== true) {
       await recordTrustedClick({
@@ -2664,6 +2701,7 @@ export async function configureSideChat({
       sample: () => observeSideSettings(cdp),
       accept: (value) => value.profile.value === options.providerProfile
         && value.base.value === options.providerBaseUrl
+        && value.api_key.value === (options.sideApiKeyEnv ?? "")
         && value.manual.value === options.sideModel
         && value.save.count === 1 && value.save.visible === true
         && (value.dirty === false || value.save.enabled === true),
@@ -2682,10 +2720,12 @@ export async function configureSideChat({
         accept: (value) => value.dirty === false
           && value.profile.value === options.providerProfile
           && value.base.value === options.providerBaseUrl
+          && value.api_key.value === (options.sideApiKeyEnv ?? "")
           && value.manual.value === options.sideModel
           && configField(value.projection, "side_chat.provider_profile") === options.providerProfile
           && configField(value.projection, "side_chat.base_url") === options.providerBaseUrl
           && configField(value.projection, "side_chat.model") === options.sideModel
+          && configField(value.projection, "side_chat.api_key_env") === (options.sideApiKeyEnv ?? "")
           && advancedConfigTarget(value.projection.config_target, baselineTarget)
           && value.fatal_count === 0
           && value.recoverable_error_count === 0
@@ -2795,6 +2835,7 @@ export async function configureSideChat({
       base_url: options.providerBaseUrl,
       model: options.sideModel,
       provider_profile: options.providerProfile,
+      api_key_env: options.sideApiKeyEnv ?? "",
       provider_profile_selection: providerProfile,
       prior_binding: prior,
       replaced_binding: replaceBinding,
@@ -2870,8 +2911,18 @@ function configField(projection, key) {
   return rows.length === 1 ? rows[0].value : null;
 }
 
+export function case52ConfiguredApproveFailures(projection, options) {
+  if (options.approveModel === undefined) return [];
+  return [["approve.base_url", options.providerBaseUrl], ["approve.model", options.approveModel],
+    ["approve.provider_profile", options.providerProfile], ["approve.api_key_env", options.approveApiKeyEnv ?? ""]]
+    .flatMap(([key, expected]) => {
+      const actual = configField(projection, key);
+      return actual === expected ? [] : [{ key, expected, actual }];
+    });
+}
+
 function mainConfigurationFailures(projection, options, { sessionRequired = false } = {}) {
-  const failures = [];
+  const failures = case52ConfiguredApproveFailures(projection, options);
   const expectedFields = new Map([
     ["model.base_url", options.providerBaseUrl],
     ["model.model", options.mainModel],
@@ -3456,7 +3507,7 @@ async function runPythonTest({ context, sink, state, python, name, cwd, args, ex
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONPYCACHEPREFIX: cacheRoot,
       ...extraEnv,
-    }, state.apiKeyEnv),
+    }, state.credentialEnvNames),
     timeoutMs: 30 * 60 * 1000,
     state,
     label: name,
@@ -4028,8 +4079,8 @@ export async function providerMustKeepSideUnloaded({ options, sink, state, name,
       captured_at: snapshot.captured_at,
       selected_side_model: options.sideModel,
       same_as_main_model: options.sideModel === options.mainModel,
-      exact_model_present: models.main_match_count === 1,
-      context_capacity: models.context_capacity,
+      exact_model_present: models.side_match_count === 1,
+      main_context_capacity: models.context_capacity,
       provider_load_state: "not-observable-external-unmanaged",
     });
     const failures = providerCatalogFailures(models, options, { mainLoaded: true });
@@ -4128,7 +4179,7 @@ async function cleanupWebviewInput(input, state, label) {
 export function createCase52Scenario(rawOptions = {}) {
   const options = normalizeCase52Options(rawOptions);
   const state = {
-    apiKeyEnv: options.apiKeyEnv ?? "",
+    credentialEnvNames: [options.apiKeyEnv ?? "", options.sideApiKeyEnv ?? "", options.approveApiKeyEnv ?? ""],
     baseline: null,
     seed: null,
     promptInputs: null,
@@ -4517,9 +4568,7 @@ export function createCase52Scenario(rawOptions = {}) {
         const evaluation = evaluated.report;
         const stage4FinalManifest = evaluated.finalManifest;
 
-        const stage5Options = options.sideModel === options.mainModel
-          ? options
-          : Object.freeze({ ...options, sideModel: options.mainModel });
+        const stage5Options = case52Stage5Options(options);
         if (stage5Options !== options) {
           await configureSideChat({
             cdp: activeCdp,
@@ -4539,6 +4588,7 @@ export function createCase52Scenario(rawOptions = {}) {
           providerProfile: stage5Options.providerProfile,
           providerBaseUrl: stage5Options.providerBaseUrl,
           model: stage5Options.sideModel,
+          apiKeyEnv: stage5Options.sideApiKeyEnv ?? "",
           promptInput: state.sidePromptInput,
           timeoutMs: QUALITY_REQUEST_TIMEOUT_MS,
         });

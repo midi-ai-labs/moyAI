@@ -6,7 +6,7 @@ const SPEC = fileURLToPath(new URL("../../manual_ST/case6/spec.md", import.meta.
 export function manualCase6ScopeFailures(before, after) { return manualLiveManifestDiff(before, after).map(name => `read-only-workspace-change:${name}`); }
 export function createManualCase6Scenario(raw = {}) {
   const options = normalizeManualLiveOptions(raw);
-  return createManualTextCase({ id: "manual.case6", options, specPath: SPEC,
+  return createManualTextCase({ id: "manual.case6", options, specPath: SPEC, observationTimeoutMs: 30 * 60 * 1000,
     stages: spec => [{ name: "stage1", prompt: manualLivePrompt(spec) }], outputs: [],
     checkStage: async ({ baseline, generated }) => manualCase6ScopeFailures(baseline, generated),
     manualReview: ["Read actual PowerShell commands/results for CPU/memory/process observations and short sampling or delta; cumulative CPU alone cannot establish the current cause.",

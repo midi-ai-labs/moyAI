@@ -12,6 +12,10 @@ connect_timeout_ms = 10000
 request_timeout_ms = 3600000
 max_retries = 2
 context_window = 131072
+# Optional automatic compaction threshold; omit to use the normal working context limit.
+# Must be positive and no greater than the effective input limit derived from context_window.
+# The earlier of this threshold and the normal working context limit starts compaction.
+# compaction_budget_tokens = 98304
 supports_tools = true
 supports_images = true
 # context_window is used only for moyAI's local input accounting and compaction.
@@ -21,6 +25,9 @@ supports_images = true
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
 provider_profile = "lm_studio"
+# Optional: Side Chat's own API-key environment-variable name.
+# To share Main's key, explicitly use the same name here.
+# api_key_env = "OPENAI_API_KEY"
 # Optional additional instructions for Side Chat. moyAI's built-in Side Chat system prompt remains active.
 # system_prompt = """
 # Answer concisely and call out assumptions.
@@ -29,7 +36,21 @@ connect_timeout_ms = 10000
 request_timeout_ms = 3600000
 max_retries = 2
 context_window = 131072
-# Side Chat intentionally has no API-key, header, tool, or image settings.
+# Side Chat does not inherit Main's API-key reference, headers, tools, or images.
+
+# Optional independent connection for the tool-free Guardian in auto_review mode.
+# Without [approve], reviews use the admitted Main connection.
+# The UI saves a complete snapshot when Approve is first changed.
+# [approve]
+# base_url = "http://127.0.0.1:1234"
+# model = "your-approval-model"
+# provider_profile = "lm_studio"
+# api_key_env = "" # Empty means no API-key reference; use a variable name when needed.
+# extra_headers = {}
+# context_window = 131072
+# request_timeout_ms = 60000 # Total review deadline, including authority retrieval.
+# connect_timeout_ms = 10000
+# max_retries = 2
 
 [permissions]
 # default = ask for approval, auto_review = let the AI guardian decide,

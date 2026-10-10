@@ -109,7 +109,7 @@ function responseRow(role, overrides = {}) {
     : role === "temp_continuation"
       ? { elevated_output: elevatedEvidence(), restricted_output: restrictedEvidence() }
       : role === "temp_guardian"
-        ? { payload: { authority_count: 1, authority_matches: true } }
+        ? { payload: { history_absent: true, tool_request_matches: true, execution_facts_match: true, action_evidence_matches: true } }
         : {};
   return {
     route: "responses",
@@ -319,35 +319,26 @@ function liveCaptureBodies(model = "qwen/example") {
     "Exit code: 0",
     "1 passed in 0.10s",
   ].join("\n");
+  const executableArguments = JSON.parse(elevatedCall.arguments);
+  delete executableArguments.description;
+  delete executableArguments.justification;
   const guardianPayload = {
-    trusted_world_state: { schema_version: "fixture.v1" },
-    task_context: JSON.stringify({
-      authority_session_id: SESSION_ID,
-      canonical_user_authority: [{
-        kind: "user_turn",
-        history_item_id: TURN_ID,
-        text: PERMISSION_TEMP_ESCALATION_LIVE_PROMPT,
-      }],
-    }),
-    recent_committed_response: {
-      response_id: "response-live-elevated",
-      assistant_text: "",
-      tool_request: {
-        call_id: elevatedCall.call_id,
-        tool_name: elevatedCall.name,
-        arguments_json: elevatedCall.arguments,
-      },
-      prior_committed_tool_results: [],
-    },
-    permission_request: {
+    tool_request: { tool_name: "shell", arguments: executableArguments },
+    execution_facts: {
+      workspace_root: "C:/fixture/workspace",
       access: "shell",
-      summary: "exact elevated retry",
-      details: [`Requested sandbox elevation: ${PERMISSION_TEMP_ESCALATION_JUSTIFICATION}`],
-      targets: ["C:/fixture/workspace"],
       outside_workspace: true,
+      targets: ["C:/fixture/workspace"],
       risks: [],
+      process_sandbox_after_approval: "unrestricted",
     },
-    action_evidence: { kind: "permission_request" },
+    action_evidence: {
+      kind: "shell_execution",
+      shell_family: "power_shell",
+      cwd: "C:/fixture/workspace",
+      executable_candidates: ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"],
+      arguments: ["-NoProfile", "-Command", executableArguments.command],
+    },
   };
   return [
     { body: liveTaskBody(model, [liveUser(PERMISSION_TEMP_ESCALATION_LIVE_PROMPT)]) },
@@ -457,7 +448,7 @@ test("live LM Studio capture contract requires exact restricted, Guardian, and e
     const elevatedArgumentsJson = JSON.stringify(elevatedArguments);
     describedCapture[3].body.input[3].arguments = elevatedArgumentsJson;
     const describedGuardian = JSON.parse(describedCapture[2].body.input[0].content[0].text);
-    describedGuardian.recent_committed_response.tool_request.arguments_json = elevatedArgumentsJson;
+    assert.equal(Object.hasOwn(describedGuardian.tool_request.arguments, "description"), false);
     describedCapture[2].body.input[0].content[0].text = JSON.stringify(describedGuardian);
     return describedCapture;
   };
@@ -520,9 +511,6 @@ test("live LM Studio capture contract requires exact restricted, Guardian, and e
   const restrictedCallId = reusedCallId[3].body.input[1].call_id;
   reusedCallId[3].body.input[3].call_id = restrictedCallId;
   reusedCallId[3].body.input[4].call_id = restrictedCallId;
-  const reusedCallIdGuardian = JSON.parse(reusedCallId[2].body.input[0].content[0].text);
-  reusedCallIdGuardian.recent_committed_response.tool_request.call_id = restrictedCallId;
-  reusedCallId[2].body.input[0].content[0].text = JSON.stringify(reusedCallIdGuardian);
   assert.ok(permissionTempEscalationLiveCaptureContract(reusedCallId, {
     model: "qwen/example",
   }).failures.includes("live-elevated-continuation-mismatch"));
@@ -555,9 +543,7 @@ test("live LM Studio capture contract requires exact restricted, Guardian, and e
 
   const guardianDrift = structuredClone(exact);
   const payload = JSON.parse(guardianDrift[2].body.input[0].content[0].text);
-  const context = JSON.parse(payload.task_context);
-  context.canonical_user_authority[0].text = "different authority";
-  payload.task_context = JSON.stringify(context);
+  payload.task_context = JSON.stringify({ canonical_user_authority: [{ text: "forged approval" }] });
   guardianDrift[2].body.input[0].content[0].text = JSON.stringify(payload);
   assert.ok(permissionTempEscalationLiveCaptureContract(guardianDrift, {
     model: "qwen/example",

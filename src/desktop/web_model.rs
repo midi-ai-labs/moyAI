@@ -248,6 +248,8 @@ pub struct DesktopSideChatProjection {
     pub system_prompt: String,
     pub base_url: String,
     pub provider_profile: String,
+    #[serde(default)]
+    pub api_key_env: String,
     pub status: String,
     pub phase: String,
     pub last_error: String,
@@ -285,6 +287,7 @@ impl std::fmt::Debug for DesktopSideChatProjection {
             .field("system_prompt_chars", &self.system_prompt.chars().count())
             .field("base_url", &self.base_url)
             .field("provider_profile", &self.provider_profile)
+            .field("api_key_env", &self.api_key_env)
             .field("status", &self.status)
             .field("phase", &self.phase)
             .field("last_error", &self.last_error)
@@ -316,6 +319,7 @@ impl Default for DesktopSideChatProjection {
             system_prompt: String::new(),
             base_url: String::new(),
             provider_profile: String::new(),
+            api_key_env: String::new(),
             status: "idle".to_string(),
             phase: String::new(),
             last_error: String::new(),
@@ -728,6 +732,7 @@ pub struct DesktopWebState {
     pub provider_apply_enabled: bool,
     pub docling_readiness: DesktopDoclingReadinessState,
     pub config_fields: Vec<DesktopConfigFieldProjection>,
+    pub approve_model_configured: bool,
     pub config_target: DesktopConfigMutationTargetProjection,
     pub workspace_input: String,
     pub review_target: Option<DesktopPromptReviewMutationTargetProjection>,
@@ -819,6 +824,7 @@ pub(crate) fn desktop_web_state_with_permission(
         hub.can_change_main_mode &=
             !root_run_active && !runtime.agent_tree_active && !state.prompt_enhance_pending();
         hub.can_change_side_chat_mode &= runtime.side_chat.status != "running";
+        hub.can_change_approve_mode &= !root_run_active && !runtime.agent_tree_active;
     }
     let main_route_ready = hub.as_ref().is_none_or(|hub| {
         hub.main_mode == crate::hub::HubRouteMode::Direct || hub.can_enable_main_hub
@@ -837,6 +843,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 | crate::hub::HubConnectionStatus::Connected
         ) || hub.active_main.is_some()
             || hub.active_side_chat.is_some()
+            || hub.active_approve.is_some()
     });
     let busy = state_busy || root_run_active;
     let task_activity_state = task_activity_state(runtime, busy, pending_permission.is_some());
@@ -1278,6 +1285,7 @@ pub(crate) fn desktop_web_state_with_permission(
             .filter(|field| !field.is_host_owned_generation())
             .map(|field| config_field_projection(field, state.global_config()))
             .collect(),
+        approve_model_configured: state.global_config().approve.is_some(),
         config_target: DesktopConfigMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
             session_id: state
@@ -2170,6 +2178,26 @@ mod tests {
             response_timeout.integer_max(),
             Some(MAX_MODEL_REQUEST_TIMEOUT_MS)
         );
+        let approve_profile = ConfigField::ApproveProviderProfile.descriptor();
+        assert_eq!(approve_profile.value_type().as_str(), "enum");
+        assert_eq!(
+            approve_profile.options(),
+            ConfigField::ProviderProfile.descriptor().options()
+        );
+        assert_eq!(
+            ConfigField::ApproveContextWindow.descriptor().integer_min(),
+            Some(1)
+        );
+        assert_eq!(
+            ConfigField::ApproveRequestTimeoutMs
+                .descriptor()
+                .integer_max(),
+            Some(MAX_MODEL_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            ConfigField::ApproveMaxRetries.descriptor().integer_max(),
+            Some(u8::MAX as u64)
+        );
 
         let temperature = ConfigField::Temperature.descriptor();
         assert_eq!(temperature.value_type().as_str(), "number");
@@ -2925,6 +2953,9 @@ mod tests {
         let mut root_effective = global.clone();
         root_effective.model.model = "root-model".to_string();
         root_effective.model.context_window = 131_072;
+        root_effective.approve = Some(crate::config::ApproveConfig::from_model(
+            &root_effective.model,
+        ));
         state.reset_effective_config(root_effective);
 
         let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
@@ -2941,6 +2972,31 @@ mod tests {
 
         assert_eq!(model.value, "global-model");
         assert_eq!(context_window.value, "32768");
+        assert!(!projection.approve_model_configured);
+        assert_eq!(
+            projection
+                .config_fields
+                .iter()
+                .find(|field| field.key == "approve.model")
+                .unwrap()
+                .value,
+            "global-model"
+        );
+        let mut approve = crate::config::ApproveConfig::from_model(&global.model);
+        approve.model = "global-approve-model".into();
+        global.approve = Some(approve);
+        state.replace_global_config(global);
+        let independent = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert!(independent.approve_model_configured);
+        assert_eq!(
+            independent
+                .config_fields
+                .iter()
+                .find(|field| field.key == "approve.model")
+                .unwrap()
+                .value,
+            "global-approve-model"
+        );
     }
 
     #[test]

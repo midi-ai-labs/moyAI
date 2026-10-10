@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { assertExactDesktopCommandSequence } from "../drivers/desktop_command_probe.mjs";
 
 import {
   INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS,
@@ -16,6 +17,7 @@ import {
   importedSecretStagedReady,
   initialSetupImportConfig,
   initialSetupImportedPublicOverrides,
+  initialSetupImportedApproveAbsent,
   initialSetupStepReady,
   initialSetupHostingUnavailableReady,
   initialSetupPurposeButtonsReady,
@@ -191,7 +193,7 @@ test("all three purpose labels fit the visible action without wrapping or clippi
   assert.equal(initialSetupPurposeButtonsReady(value), false);
 });
 
-test("Initial Setup Finish expectation carries all values and both exact targets", () => {
+test("Initial Setup Finish expectation carries ordinary values and both exact targets", () => {
   assert.deepEqual(expectedInitialSetupFinishCommand(surface("finish")), {
     command: "finish_initial_setup",
     args: {
@@ -199,7 +201,6 @@ test("Initial Setup Finish expectation carries all values and both exact targets
         { key: "model.base_url", text: "http://127.0.0.1:43111" },
         { key: "model.model", text: "e2e/scripted-responses" },
         { key: "model.provider_profile", text: INITIAL_SETUP_PROVIDER_PROFILE },
-        { key: "model.api_key_env", text: INITIAL_SETUP_PROVIDER_API_KEY_ENV },
       ],
       expectedConfigTarget: configTarget,
       expectedSetupTarget: setupTarget,
@@ -211,8 +212,11 @@ test("Initial Setup Finish expectation carries all values and both exact targets
     INITIAL_SETUP_IMPORT_GENERATION,
   );
   const importedPublic = initialSetupImportedPublicOverrides("http://127.0.0.1:43111");
+  const beforeImport = surface("finish");
+  beforeImport.projection.config_fields = beforeImport.projection.config_fields.map(field =>
+    field.key === "model.api_key_env" ? { ...field, value: "" } : field);
   const imported = expectedInitialSetupFinishCommand(
-    surface("finish"),
+    beforeImport,
     INITIAL_SETUP_IMPORT_GENERATION,
     {
       "model.base_url": importedPublic["model.base_url"],
@@ -267,6 +271,53 @@ test("Initial Setup import keeps a configured secret blank across public project
   assert.equal(importedSecretEditorReady(editor), true);
   const fixture = initialSetupImportConfig("http://127.0.0.1:43111");
   assert.equal((fixture.match(new RegExp(INITIAL_SETUP_SECRET_SENTINEL, "g")) ?? []).length, 1);
+});
+
+test("Main-only import sends inherited Approve differences while omitting unchanged Approve fields", () => {
+  const baseUrl = "http://127.0.0.1:43111";
+  const importedPublic = initialSetupImportedPublicOverrides(baseUrl);
+  const beforeImport = surface("finish");
+  const savedApprove = {
+    "approve.base_url": baseUrl,
+    "approve.model": "e2e/scripted-responses",
+    "approve.provider_profile": INITIAL_SETUP_PROVIDER_PROFILE,
+    "approve.api_key_env": "",
+    "approve.context_window": "65536",
+    "approve.request_timeout_ms": "3600000",
+    "approve.connect_timeout_ms": "10000",
+    "approve.max_retries": "2",
+  };
+  beforeImport.projection.config_fields = Object.entries(importedPublic).map(([key, text]) => ({
+    key,
+    value: Object.hasOwn(savedApprove, key) ? savedApprove[key] : text,
+  }));
+  const command = expectedInitialSetupFinishCommand(beforeImport, INITIAL_SETUP_IMPORT_GENERATION, importedPublic);
+  assert.deepEqual(command.args.values.filter(field => field.key.startsWith("approve.")), [
+    { key: "approve.api_key_env", text: INITIAL_SETUP_PROVIDER_API_KEY_ENV },
+    { key: "approve.request_timeout_ms", text: "120000" },
+    { key: "approve.max_retries", text: "0" },
+  ]);
+  for (const suffix of ["base_url", "model", "provider_profile", "api_key_env", "context_window", "request_timeout_ms", "connect_timeout_ms", "max_retries"]) {
+    assert.equal(importedPublic[`approve.${suffix}`], importedPublic[`model.${suffix}`]);
+  }
+  const snapshot = { found: true, sequence: 1, dropped_through: 0, calls: [{ sequence: 1, ...command }] };
+  assertExactDesktopCommandSequence(snapshot, { expected: [command] });
+  const obsolete = structuredClone(command);
+  obsolete.args.values = obsolete.args.values.filter(field => !field.key.startsWith("approve."));
+  assert.throws(() => assertExactDesktopCommandSequence(snapshot, { expected: [obsolete] }), { code: "desktop-command-probe-call-mismatch" });
+  const completeApprove = structuredClone(command);
+  completeApprove.args.values.push({ key: "approve.model", text: "e2e/scripted-responses" });
+  assert.throws(() => assertExactDesktopCommandSequence(snapshot, { expected: [completeApprove] }), { code: "desktop-command-probe-call-mismatch" });
+  assert.equal(JSON.stringify(command).includes(INITIAL_SETUP_SECRET_SENTINEL), false);
+});
+
+test("Main-only import requires the absent Approve role in both saved TOML and reopened public state", () => {
+  const persistedText = initialSetupImportConfig("http://127.0.0.1:43111");
+  assert.equal(initialSetupImportedApproveAbsent({ approve_model_configured: false }, persistedText), true);
+  assert.equal(initialSetupImportedApproveAbsent({ approve_model_configured: true }, persistedText), false);
+  assert.equal(initialSetupImportedApproveAbsent({}, persistedText), false);
+  assert.equal(initialSetupImportedApproveAbsent({ approve_model_configured: false }, `${persistedText}\n[approve]\nmodel = "guardian"\n`), false);
+  assert.equal(initialSetupImportedApproveAbsent({ approve_model_configured: false }, `${persistedText}\n[approve.extra_headers]\nAuthorization = "example"\n`), false);
 });
 
 test("Initial Setup restart predicate requires continuous closed wizard and zero network", () => {

@@ -29,7 +29,7 @@ test("catalog comparison displays additions, removals and label/capability/softw
   assert.match(html, /<td>chat<\/td><td>chat, vision<\/td>/);
   assert.doesNotMatch(html, /<name>/);
   assert.match(html, /data-details-key="hub-main-catalog-diff"/);
-  assert.match(html, /tabindex="0" role="region" aria-label="メインチャットのモデル設定の変更内容"/);
+  assert.match(html, /tabindex="0" role="region" aria-label="Main（メイン）のモデル設定の変更内容"/);
 });
 
 test("missing legacy, disconnected and invalid baselines never claim unchanged", () => {
@@ -58,10 +58,11 @@ test("Main and Side show their own reviewed revisions inside independent retaine
   const state = createHubUiState();
   state.projection = {
     settings_revision: "4", connection_generation: "1", status: "connected", endpoint: "http://127.0.0.1:9470/",
-    label: "Desktop", hub_id: "hub-a", catalog: null, main_review: null, side_chat_review: null,
-    main_confirmation: "review_required", side_chat_confirmation: "confirmed", error: null,
-    main_mode: "direct", side_chat_mode: "direct", active_main: null, active_side_chat: null,
-    can_enable_main_hub: false, can_enable_side_chat_hub: false, can_change_main_mode: true, can_change_side_chat_mode: true,
+    label: "Desktop", hub_id: "hub-a", catalog: null, main_review: null, side_chat_review: null, approve_review: null,
+    main_confirmation: "review_required", side_chat_confirmation: "confirmed", approve_confirmation: "unconfirmed", error: null,
+    main_mode: "direct", side_chat_mode: "direct", approve_mode: "direct", active_main: null, active_side_chat: null, active_approve: null,
+    can_enable_main_hub: false, can_enable_side_chat_hub: false, can_enable_approve_hub: false,
+    can_change_main_mode: true, can_change_side_chat_mode: true, can_change_approve_mode: true,
     main_catalog_comparison: comparison(),
     side_chat_catalog_comparison: comparison({ reviewed_revision: "8", models: [], software_before: "0.2.0" }),
   } satisfies HubProjection;

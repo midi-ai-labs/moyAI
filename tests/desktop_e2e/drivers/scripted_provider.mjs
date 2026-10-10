@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
+import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export const SCRIPTED_PROVIDER_MODEL_ID = "e2e/scripted-responses";
 export const SCRIPTED_PROVIDER_PROMPT = "return only MAIN_OK";
@@ -784,7 +786,7 @@ const PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID =
 const PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID =
   "fc_permission_temp_escalation_elevated";
 const PERMISSION_RESTART_GUARDIAN_ALLOW = Object.freeze({
-  decision: "allow",
+  risk_level: "low",
   rationale: "bounded deterministic fixture command",
 });
 const GUARDIAN_RESPONSES_KEYS = Object.freeze([
@@ -2378,111 +2380,97 @@ function permissionRestartGuardianMainRole(body, script) {
   };
 }
 
-function permissionGuardianPayloadContract(inputText, script) {
-  let payload = null;
-  let taskContext = null;
+export function permissionGuardianShellPayloadContract(payload, argumentsJson, expectedRisks = []) {
+  let expectedArguments = null;
   try {
-    payload = JSON.parse(inputText);
-    taskContext = typeof payload?.task_context === "string"
-      ? JSON.parse(payload.task_context)
-      : null;
+    expectedArguments = JSON.parse(argumentsJson);
+    delete expectedArguments.description;
+    delete expectedArguments.justification;
   } catch {
-    // Invalid or wrapped evidence fails the exact Guardian request contract below.
+    // Invalid committed arguments cannot establish an exact audited action.
   }
-  const payloadKeysMatch = exactKeys(payload, [
-    "action_evidence",
-    "permission_request",
-    "recent_committed_response",
-    "task_context",
-    "trusted_world_state",
-  ]);
-  const authority = Array.isArray(taskContext?.canonical_user_authority)
-    ? taskContext.canonical_user_authority
-    : [];
-  const authorityTexts = authority.map((item) => typeof item?.text === "string" ? item.text : null);
-  const authorityIds = authority.map((item) => typeof item?.history_item_id === "string"
-    ? item.history_item_id
-    : null);
-  const authorityMatches = exactKeys(taskContext, ["authority_session_id", "canonical_user_authority"])
-    && typeof taskContext.authority_session_id === "string"
-    && taskContext.authority_session_id.length > 0
-    && authority.length === 2
-    && authority.every((item) => exactKeys(item, ["history_item_id", "kind", "text"])
-      && item.kind === "user_turn"
-      && typeof item.history_item_id === "string"
-      && item.history_item_id.length > 0)
-    && authorityTexts[0] === script.seedPrompt
-    && authorityTexts[1] === script.taskPrompt
-    && new Set(authorityIds).size === authorityIds.length;
-  const recent = payload?.recent_committed_response;
-  const toolRequest = recent?.tool_request;
-  const expected = permissionRestartGuardianExpected(script);
-  const recentMatches = exactKeys(recent, [
-    "assistant_text",
-    "prior_committed_tool_results",
-    "response_id",
-    "tool_request",
-  ])
-    && typeof recent.response_id === "string"
-    && recent.response_id.length > 0
-    && typeof recent.assistant_text === "string"
-    && Array.isArray(recent.prior_committed_tool_results)
-    && recent.prior_committed_tool_results.length === 0
-    && exactKeys(toolRequest, ["arguments_json", "call_id", "tool_name"])
-    && toolRequest.call_id === PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID
-    && toolRequest.tool_name === "shell"
-    && toolRequest.arguments_json === expected.shellArguments;
-  const permission = payload?.permission_request;
-  const permissionMatches = exactKeys(permission, [
-    "access",
-    "details",
-    "outside_workspace",
-    "risks",
-    "summary",
-    "targets",
-  ])
-    && permission.access === "shell"
-    && typeof permission.summary === "string"
-    && permission.summary.trim().length > 0
-    && Array.isArray(permission.details)
-    && permission.details.some((detail) => detail === `Requested sandbox elevation: ${script.justification}`)
-    && Array.isArray(permission.targets)
-    && permission.targets.length > 0
-    && permission.targets.every((target) => typeof target === "string" && target.length > 0)
-    && permission.outside_workspace === true
-    && Array.isArray(permission.risks)
-    && JSON.stringify(permission.risks) === JSON.stringify(script.expectedPermissionRisks ?? []);
-  const evidenceMatches = exactKeys(payload?.action_evidence, ["kind"])
-    && payload.action_evidence.kind === "permission_request";
-  const worldStateMatches = payload?.trusted_world_state !== null
-    && typeof payload?.trusted_world_state === "object"
-    && !Array.isArray(payload.trusted_world_state)
-    && Object.keys(payload.trusted_world_state).length > 0;
+  const payloadKeysMatch = exactKeys(payload, ["action_evidence", "execution_facts", "tool_request"]);
+  const historyAbsent = ["task_context", "canonical_user_authority", "recent_committed_response",
+    "trusted_world_state", "descriptive_world_state", "permission_request"]
+    .every((key) => !Object.hasOwn(payload ?? {}, key));
+  const request = payload?.tool_request;
+  const actionMatches = expectedArguments !== null
+    && exactKeys(request, ["arguments", "tool_name"])
+    && request.tool_name === "shell"
+    && isDeepStrictEqual(request.arguments, expectedArguments);
+  const explanationsAbsent = request?.arguments !== null
+    && typeof request?.arguments === "object"
+    && !Object.hasOwn(request.arguments, "description")
+    && !Object.hasOwn(request.arguments, "justification");
+  const absolutePath = (value) => typeof value === "string"
+    && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/u.test(value);
+  const pathIdentity = (value) => {
+    if (!absolutePath(value)) return null;
+    if (/^(?:[A-Za-z]:[\\/]|\\\\)/u.test(value)) {
+      const withoutNamespace = value.replaceAll("/", "\\")
+        .replace(/^\\\\\?\\UNC\\/iu, "\\\\").replace(/^\\\\\?\\/u, "");
+      return path.win32.normalize(withoutNamespace).replace(/\\+$/u, "").toLowerCase();
+    }
+    return path.posix.normalize(value).replace(/\/+$/u, "") || "/";
+  };
+  const facts = payload?.execution_facts;
+  const factsMatch = exactKeys(facts, ["access", "outside_workspace", "process_sandbox_after_approval",
+    "risks", "targets", "workspace_root"])
+    && facts.access === "shell"
+    && facts.outside_workspace === true
+    && facts.process_sandbox_after_approval === "unrestricted"
+    && absolutePath(facts.workspace_root)
+    && Array.isArray(facts.targets)
+    && facts.targets.length > 0
+    && facts.targets.every(absolutePath)
+    && isDeepStrictEqual(facts.risks, expectedRisks);
+  const evidence = payload?.action_evidence;
+  const shellArguments = evidence?.shell_family === "power_shell"
+    ? ["-NoProfile", "-Command", expectedArguments?.command]
+    : evidence?.shell_family === "bash" ? ["-lc", expectedArguments?.command] : null;
+  const candidates = evidence?.executable_candidates;
+  const actionEvidenceChecks = {
+    keys_match: exactKeys(evidence, ["arguments", "cwd", "executable_candidates", "kind", "shell_family"]),
+    kind_matches: evidence?.kind === "shell_execution",
+    family_supported: shellArguments !== null,
+    cwd_absolute: absolutePath(evidence?.cwd),
+    // PathGuard normalizes the workdir before capturing the executable action.
+    cwd_matches: pathIdentity(evidence?.cwd) !== null
+      && pathIdentity(evidence?.cwd) === pathIdentity(expectedArguments?.workdir ?? facts?.workspace_root),
+    cwd_in_targets: facts?.targets?.includes(evidence?.cwd) === true,
+    candidates_non_empty: Array.isArray(candidates) && candidates.length > 0,
+    candidates_absolute: Array.isArray(candidates) && candidates.every(absolutePath),
+    candidates_unique: Array.isArray(candidates) && new Set(candidates).size === candidates.length,
+    arguments_match: shellArguments !== null && isDeepStrictEqual(evidence?.arguments, shellArguments),
+  };
+  const evidenceMatches = Object.values(actionEvidenceChecks).every((matches) => matches);
   return {
     json_valid: payload !== null,
     payload_keys_match: payloadKeysMatch,
-    authority_count: authority.length,
-    authority_kind_hashes: authority.map((item) => typeof item?.kind === "string"
-      ? sha256(Buffer.from(item.kind, "utf8"))
-      : null),
-    authority_text_hashes: authorityTexts.map((text) => text === null
-      ? null
-      : sha256(Buffer.from(text, "utf8"))),
-    authority_identity_hashes: authorityIds.map((id) => id === null
-      ? null
-      : sha256(Buffer.from(id, "utf8"))),
-    authority_matches: authorityMatches,
-    recent_committed_response_matches: recentMatches,
-    permission_request_matches: permissionMatches,
+    history_absent: historyAbsent,
+    explanations_absent: explanationsAbsent,
+    tool_request_matches: actionMatches,
+    execution_facts_match: factsMatch,
     action_evidence_matches: evidenceMatches,
-    trusted_world_state_matches: worldStateMatches,
-    pass: payloadKeysMatch
-      && authorityMatches
-      && recentMatches
-      && permissionMatches
-      && evidenceMatches
-      && worldStateMatches,
+    action_evidence_checks: actionEvidenceChecks,
+    action_scope: {
+      cwd: typeof evidence?.cwd === "string" ? evidence.cwd : null,
+      workspace_root: typeof facts?.workspace_root === "string" ? facts.workspace_root : null,
+      requested_workdir: typeof expectedArguments?.workdir === "string" ? expectedArguments.workdir : null,
+    },
+    pass: payloadKeysMatch && historyAbsent && explanationsAbsent && actionMatches && factsMatch && evidenceMatches,
   };
+}
+
+function permissionGuardianPayloadContract(inputText, script) {
+  let payload = null;
+  try {
+    payload = JSON.parse(inputText);
+  } catch {
+    // Invalid or wrapped evidence fails the exact Guardian request contract below.
+  }
+  return permissionGuardianShellPayloadContract(payload,
+    permissionRestartGuardianExpected(script).shellArguments, script.expectedPermissionRisks ?? []);
 }
 
 function permissionRestartGuardianReviewRole(body, script) {
@@ -2917,107 +2905,13 @@ function permissionTempEscalationMainRole(body, script) {
 
 function permissionTempGuardianPayloadContract(inputText, script) {
   let payload = null;
-  let taskContext = null;
   try {
     payload = JSON.parse(inputText);
-    taskContext = typeof payload?.task_context === "string"
-      ? JSON.parse(payload.task_context)
-      : null;
   } catch {
     // Invalid or wrapped evidence fails the exact Guardian request contract below.
   }
-  const payloadKeysMatch = exactKeys(payload, [
-    "action_evidence",
-    "permission_request",
-    "recent_committed_response",
-    "task_context",
-    "trusted_world_state",
-  ]);
-  const authority = Array.isArray(taskContext?.canonical_user_authority)
-    ? taskContext.canonical_user_authority
-    : [];
-  const authorityTexts = authority.map((item) => typeof item?.text === "string" ? item.text : null);
-  const authorityIds = authority.map((item) => typeof item?.history_item_id === "string"
-    ? item.history_item_id
-    : null);
-  const authorityMatches = exactKeys(taskContext, ["authority_session_id", "canonical_user_authority"])
-    && typeof taskContext.authority_session_id === "string"
-    && taskContext.authority_session_id.length > 0
-    && authority.length === 1
-    && authority.every((item) => exactKeys(item, ["history_item_id", "kind", "text"])
-      && item.kind === "user_turn"
-      && typeof item.history_item_id === "string"
-      && item.history_item_id.length > 0)
-    && authorityTexts[0] === script.taskPrompt
-    && new Set(authorityIds).size === authorityIds.length;
-  const recent = payload?.recent_committed_response;
-  const toolRequest = recent?.tool_request;
-  const expected = permissionTempEscalationExpected(script);
-  const recentMatches = exactKeys(recent, [
-    "assistant_text",
-    "prior_committed_tool_results",
-    "response_id",
-    "tool_request",
-  ])
-    && typeof recent.response_id === "string"
-    && recent.response_id.length > 0
-    && typeof recent.assistant_text === "string"
-    && Array.isArray(recent.prior_committed_tool_results)
-    && recent.prior_committed_tool_results.length === 0
-    && exactKeys(toolRequest, ["arguments_json", "call_id", "tool_name"])
-    && toolRequest.call_id === PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID
-    && toolRequest.tool_name === "shell"
-    && toolRequest.arguments_json === expected.elevatedArguments;
-  const permission = payload?.permission_request;
-  const permissionMatches = exactKeys(permission, [
-    "access",
-    "details",
-    "outside_workspace",
-    "risks",
-    "summary",
-    "targets",
-  ])
-    && permission.access === "shell"
-    && typeof permission.summary === "string"
-    && permission.summary.trim().length > 0
-    && Array.isArray(permission.details)
-    && permission.details.some((detail) => (
-      detail === `Requested sandbox elevation: ${script.justification}`
-    ))
-    && Array.isArray(permission.targets)
-    && permission.targets.length > 0
-    && permission.targets.every((target) => typeof target === "string" && target.length > 0)
-    && permission.outside_workspace === true
-    && Array.isArray(permission.risks)
-    && permission.risks.length === 0;
-  const evidenceMatches = exactKeys(payload?.action_evidence, ["kind"])
-    && payload.action_evidence.kind === "permission_request";
-  const worldStateMatches = payload?.trusted_world_state !== null
-    && typeof payload?.trusted_world_state === "object"
-    && !Array.isArray(payload.trusted_world_state)
-    && Object.keys(payload.trusted_world_state).length > 0;
-  return {
-    json_valid: payload !== null,
-    payload_keys_match: payloadKeysMatch,
-    authority_count: authority.length,
-    authority_text_hashes: authorityTexts.map((text) => text === null
-      ? null
-      : sha256(Buffer.from(text, "utf8"))),
-    authority_identity_hashes: authorityIds.map((id) => id === null
-      ? null
-      : sha256(Buffer.from(id, "utf8"))),
-    authority_matches: authorityMatches,
-    recent_committed_response_matches: recentMatches,
-    permission_request_matches: permissionMatches,
-    action_evidence_matches: evidenceMatches,
-    trusted_world_state_matches: worldStateMatches,
-    pass: payloadKeysMatch
-      && authorityMatches
-      && recentMatches
-      && permissionMatches
-      && evidenceMatches
-      && worldStateMatches,
-  };
+  return permissionGuardianShellPayloadContract(payload,
+    permissionTempEscalationExpected(script).elevatedArguments);
 }
 
 function permissionTempEscalationGuardianRole(body, script) {
@@ -3806,9 +3700,8 @@ function parsedTarget(request) {
   };
 }
 
-function routeFor(target, mcpPeerEnabled = false) {
+function routeFor(target) {
   if (!target.exact_target) return "unknown";
-  if (mcpPeerEnabled && target.pathname === "/mcp") return "mcp_peer";
   if (target.pathname === "/v1/models") return "models";
   if (target.pathname === "/api/v1/models") return "lm_studio_models";
   if (target.pathname === "/v1/responses") return "responses";
@@ -3910,7 +3803,6 @@ export class ScriptedProvider {
   #closePromise = null;
   #closeObservation = null;
   #doclingReadinessStatus;
-  #mcpPeerToken;
   #doclingReadinessRequestCount = 0;
   #doclingReadinessReleased = false;
   #doclingReadinessReleasedByCleanup = false;
@@ -3927,7 +3819,6 @@ export class ScriptedProvider {
     responseBehavior: configuredResponseBehavior = "complete",
     responsePacing: configuredResponsePacing = null,
     doclingReadinessStatus = null,
-    mcpPeerToken = null,
     turns = null,
     orderedConversation = false,
     script = null,
@@ -3947,10 +3838,6 @@ export class ScriptedProvider {
     this.responseBehavior = responseBehavior(configuredResponseBehavior);
     this.responsePacing = responsePacing(configuredResponsePacing);
     this.#doclingReadinessStatus = optionalHttpStatus(doclingReadinessStatus, "doclingReadinessStatus");
-    if (mcpPeerToken !== null && (typeof mcpPeerToken !== "string" || !/^[A-Za-z0-9._~-]{32,256}$/.test(mcpPeerToken))) {
-      throw new TypeError("mcpPeerToken requires 32 through 256 ASCII token characters");
-    }
-    this.#mcpPeerToken = mcpPeerToken;
     this.#doclingReadinessRelease = new Promise((resolve) => { this.#releaseDoclingReadiness = resolve; });
     this.script = providerScript(script);
     if (this.responsePacing !== null && this.responseBehavior !== "complete") {
@@ -4096,7 +3983,6 @@ export class ScriptedProvider {
         : scriptedResponseMaximum(this.script),
       scripted_response_roles: [...this.#acceptedRoles],
       docling_readiness_configured: this.#doclingReadinessStatus !== null,
-      mcp_peer_configured: this.#mcpPeerToken !== null,
       docling_readiness_status: this.#doclingReadinessStatus,
       docling_readiness_request_count: this.#doclingReadinessRequestCount,
       docling_readiness_released: this.#doclingReadinessReleased,
@@ -4232,7 +4118,7 @@ export class ScriptedProvider {
 
   async #handleRequest(request, response) {
     const target = parsedTarget(request);
-    const route = routeFor(target, this.#mcpPeerToken !== null);
+    const route = routeFor(target);
     const row = {
       schema_version: "desktop-e2e.scripted-provider-request.v1",
       sequence: this.#ledger.length + 1,
@@ -4356,26 +4242,6 @@ export class ScriptedProvider {
       row.response_phase = "rejected";
       row.response_status = 400;
       fixedError(response, 400, "invalid_json");
-      return;
-    }
-    if (route === "mcp_peer") {
-      const rpc = decoded.value;
-      const pass = rpc?.jsonrpc === "2.0" && Number.isSafeInteger(rpc.id) && rpc.method === "tools/list"
-        && rpc.params !== null && typeof rpc.params === "object" && !Array.isArray(rpc.params) && Object.keys(rpc.params).length === 0;
-      const authorized = request.headers.authorization === `Bearer ${this.#mcpPeerToken}`;
-      row.contract = { pass, rpc_method: typeof rpc?.method === "string" ? rpc.method : null, authorized };
-      row.response_phase = "completed";
-      row.response_status = !authorized ? 401 : pass ? 200 : 422;
-      if (!authorized || !pass) {
-        fixedError(response, row.response_status, authorized ? "unsupported_mcp_fixture_request" : "unauthorized");
-      } else {
-        writeResponse(response, 200, "application/json; charset=utf-8", {
-          jsonrpc: "2.0", id: rpc.id,
-          result: { tools: ["delegate_task", "task_status", "task_artifacts", "cancel_task"].map(name => ({
-            name, description: "Isolated GUI connection fixture; execution is not accepted.", inputSchema: { type: "object", properties: {} },
-          })) },
-        });
-      }
       return;
     }
     if (this.script !== null) {
@@ -4999,7 +4865,7 @@ export class ScriptedProvider {
     row.response_status = 200;
     let payload;
     const guardianDecision = { ...PERMISSION_RESTART_GUARDIAN_ALLOW,
-      decision: this.script.guardianDecision ?? "allow" };
+      risk_level: { allow: "low", ask_user: "high", deny: "critical" }[this.script.guardianDecision ?? "allow"] };
     if (this.script.apiMode === "chat_completions" && role === "guardian_seed") {
       payload = permissionRestartGuardianChatTextSse(
         this.modelId,

@@ -52,6 +52,7 @@ import {
   type SessionSettingsState,
 } from "./session_settings_state.ts";
 import {
+  configCommandValues,
   configDraftAppliesTo,
   sameConfigMutationTarget,
 } from "./config_mutation.ts";
@@ -168,6 +169,7 @@ export interface SideChatCatalogEntry {
   identityRevision: number;
   baseUrl: string;
   providerProfile: ProviderProfile;
+  apiKeyEnv: string;
   configGeneration: string;
   models: SideChatCatalogModel[];
   status: Exclude<SideChatCatalogStatus, "idle">;
@@ -181,6 +183,7 @@ export interface SideChatCatalogTarget {
   readonly identityRevision: number;
   readonly baseUrl: string;
   readonly providerProfile: ProviderProfile;
+  readonly apiKeyEnv: string;
   readonly configGeneration: string;
 }
 
@@ -255,6 +258,7 @@ export interface UiLocalState {
   configDirty: boolean;
   configDraftValues: Map<string, string>;
   configDraftBaselineValues: Map<string, string>;
+  configDraftEditedKeys: Set<string>;
   configDraftTarget: ConfigMutationTarget | null;
   configDraftRevision: bigint;
   nextConfigMutationGeneration: bigint;
@@ -353,6 +357,7 @@ export function createUiLocalState(): UiLocalState {
     configDirty: false,
     configDraftValues: new Map(),
     configDraftBaselineValues: new Map(),
+    configDraftEditedKeys: new Set(),
     configDraftTarget: null,
     configDraftRevision: 0n,
     nextConfigMutationGeneration: 1n,
@@ -593,6 +598,7 @@ export function sideChatCatalogKey(
   target: ConfigMutationTarget,
   baseUrl: string,
   providerProfile: ProviderProfile,
+  apiKeyEnv = "",
 ): string {
   return [
     target.workspacePath,
@@ -600,6 +606,7 @@ export function sideChatCatalogKey(
     target.configGeneration,
     canonicalSideChatCatalogBaseUrl(baseUrl),
     providerProfile,
+    apiKeyEnv.trim(),
   ].join("\u0000");
 }
 
@@ -610,8 +617,8 @@ export function sideChatCatalogViewForState(
   const settings = globalSideChatCatalogSettings(uiState, state);
   if (!settings) return emptySideChatCatalogView();
   const baseUrl = canonicalSideChatCatalogBaseUrl(settings.baseUrl);
-  const { providerProfile } = settings;
-  const key = sideChatCatalogKey(state.config_target, baseUrl, providerProfile);
+  const { providerProfile, apiKeyEnv } = settings;
+  const key = sideChatCatalogKey(state.config_target, baseUrl, providerProfile, apiKeyEnv);
   const local = uiState.sideChatCatalogs.get(key);
   if (
     local
@@ -619,6 +626,7 @@ export function sideChatCatalogViewForState(
     && local.identityRevision === uiState.sideChatCatalogIdentityRevision
     && local.baseUrl === baseUrl
     && local.providerProfile === providerProfile
+    && local.apiKeyEnv === apiKeyEnv
     && local.configGeneration === state.config_target.configGeneration
   ) {
     return {
@@ -629,7 +637,7 @@ export function sideChatCatalogViewForState(
       error: local.error,
     };
   }
-  const seeded = mainProviderCatalogSeed(state, baseUrl, providerProfile);
+  const seeded = mainProviderCatalogSeed(state, baseUrl, providerProfile, apiKeyEnv);
   if (seeded.length > 0) {
     return {
       status: "ready",
@@ -818,13 +826,14 @@ export function beginSideChatCatalogLoad(
   const settings = globalSideChatCatalogSettings(uiState, state);
   if (!settings) return null;
   const baseUrl = canonicalSideChatCatalogBaseUrl(settings.baseUrl);
-  const key = sideChatCatalogKey(state.config_target, baseUrl, settings.providerProfile);
+  const key = sideChatCatalogKey(state.config_target, baseUrl, settings.providerProfile, settings.apiKeyEnv);
   const request = beginAsyncTransaction(uiState.sideChatCatalogTransaction, {
     key,
     configTarget: { ...state.config_target },
     identityRevision: uiState.sideChatCatalogIdentityRevision,
     baseUrl,
     providerProfile: settings.providerProfile,
+    apiKeyEnv: settings.apiKeyEnv,
     configGeneration: state.config_target.configGeneration,
   } satisfies SideChatCatalogTarget, "supersede", (token, target) => ({ token, ...target }));
   const previous = sideChatCatalogViewForState(uiState, state);
@@ -833,6 +842,7 @@ export function beginSideChatCatalogLoad(
     identityRevision: request.identityRevision,
     baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: previous.models,
     status: "loading",
@@ -858,6 +868,7 @@ export function finishSideChatCatalogLoad(
   }
   const responseMatches = canonicalSideChatCatalogBaseUrl(result.baseUrl) === request.baseUrl
     && result.providerProfile === request.providerProfile
+    && result.apiKeyEnv === request.apiKeyEnv
     && result.configGeneration === request.configGeneration;
   if (!responseMatches) {
     uiState.sideChatCatalogs.set(request.key, {
@@ -865,6 +876,7 @@ export function finishSideChatCatalogLoad(
       identityRevision: request.identityRevision,
       baseUrl: request.baseUrl,
       providerProfile: request.providerProfile,
+      apiKeyEnv: request.apiKeyEnv,
       configGeneration: request.configGeneration,
       models: [],
       status: "error",
@@ -878,6 +890,7 @@ export function finishSideChatCatalogLoad(
     identityRevision: request.identityRevision,
     baseUrl: request.baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: result.models,
     status: "ready",
@@ -907,6 +920,7 @@ export function failSideChatCatalogLoad(
     identityRevision: request.identityRevision,
     baseUrl: request.baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: previous?.models ?? [],
     status: "error",
@@ -934,7 +948,8 @@ function sideChatCatalogRequestStillTargets(
     && request.identityRevision === uiState.sideChatCatalogIdentityRevision
     && settings !== null
     && canonicalSideChatCatalogBaseUrl(settings.baseUrl) === request.baseUrl
-    && settings.providerProfile === request.providerProfile;
+    && settings.providerProfile === request.providerProfile
+    && settings.apiKeyEnv === request.apiKeyEnv;
 }
 
 function deleteLoadingSideChatCatalogEntry(
@@ -956,6 +971,7 @@ function rejectStaleSideChatCatalogEntry(
     identityRevision: request.identityRevision,
     baseUrl: request.baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: [],
     status: "error",
@@ -968,12 +984,14 @@ function mainProviderCatalogSeed(
   state: DesktopWebState,
   baseUrl: string,
   providerProfile: ProviderProfile,
+  apiKeyEnv: string,
 ): SideChatCatalogModel[] {
   if (
     !state.provider_catalog_base_url
     || canonicalSideChatCatalogBaseUrl(state.provider_catalog_base_url) !== baseUrl
     || state.provider_catalog_profile !== providerProfile
     || state.provider_effective_profile !== providerProfile
+    || (state.provider_catalog_api_key_env ?? "").trim() !== apiKeyEnv
   ) return [];
   return state.provider_model_ids.flatMap((id, index) => {
     const modelId = id.trim();
@@ -999,7 +1017,7 @@ function emptySideChatCatalogView(): SideChatCatalogView {
 function globalSideChatCatalogSettings(
   uiState: UiLocalState,
   state: Pick<DesktopWebState, "config_fields" | "config_target">,
-): { baseUrl: string; providerProfile: ProviderProfile; model: string } | null {
+): { baseUrl: string; providerProfile: ProviderProfile; model: string; apiKeyEnv: string } | null {
   const draftApplies = configDraftAppliesTo(uiState, state.config_target);
   const value = (key: string): string | null => {
     const projected = state.config_fields.find((field) => field.key === key)?.value;
@@ -1009,8 +1027,20 @@ function globalSideChatCatalogSettings(
   const baseUrl = value("side_chat.base_url");
   const model = value("side_chat.model");
   const providerProfile = value("side_chat.provider_profile");
+  let apiKeyEnv = (value("side_chat.api_key_env") ?? "").trim();
   if (baseUrl === null || model === null || !isProviderProfile(providerProfile)) return null;
-  return { baseUrl, model, providerProfile };
+  if (draftApplies) {
+    const baselineUrl = uiState.configDraftBaselineValues.get("side_chat.base_url")
+      ?? state.config_fields.find(field => field.key === "side_chat.base_url")?.value ?? "";
+    const baselineProfile = uiState.configDraftBaselineValues.get("side_chat.provider_profile")
+      ?? state.config_fields.find(field => field.key === "side_chat.provider_profile")?.value;
+    const connectionChanged = canonicalSideChatCatalogBaseUrl(baseUrl) !== canonicalSideChatCatalogBaseUrl(baselineUrl)
+      || providerProfile !== baselineProfile;
+    const commandValues = configCommandValues(uiState, state.config_target,
+      state.config_fields.map(field => ({ key: field.key, text: value(field.key) ?? field.value })));
+    if (connectionChanged && !commandValues.some(value => value.key === "side_chat.api_key_env")) apiKeyEnv = "";
+  }
+  return { baseUrl, model, providerProfile, apiKeyEnv };
 }
 
 function isProviderProfile(value: string | null): value is ProviderProfile {
@@ -1028,7 +1058,9 @@ export function recordSideChatCatalogConfigEdit(
 ): void {
   const identityChanged = key === "side_chat.base_url"
     ? canonicalSideChatCatalogBaseUrl(previous) !== canonicalSideChatCatalogBaseUrl(next)
-    : key === "side_chat.provider_profile" && previous !== next;
+    : key === "side_chat.api_key_env"
+      ? previous.trim() !== next.trim()
+      : key === "side_chat.provider_profile" && previous !== next;
   if (identityChanged) uiState.sideChatCatalogIdentityRevision += 1;
 }
 

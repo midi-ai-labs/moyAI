@@ -4860,7 +4860,7 @@ fn pre_admission_terminal_fence_purges_the_claimed_trigger_before_completion() {
 }
 
 #[tokio::test]
-async fn durable_activity_projection_restores_three_completed_paths_tasks_and_results() {
+async fn durable_activity_projection_restores_exact_completed_results_after_restart() {
     let (original_runtime, root_session, config) =
         direct_runtime_fixture("durable-desktop-projection", 4).await;
     let protocol_store = original_runtime.store.protocol_event_store();
@@ -4940,6 +4940,35 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
                 },
             })
             .expect("durable child result");
+        protocol_store
+            .seed_history_item_for_test(&HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: child.session.id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 2,
+                created_at_ms: SystemClock::now_ms(),
+                payload: HistoryItemPayload::Error {
+                    message: "earlier retry error".to_string(),
+                },
+            })
+            .expect("earlier retry error");
+        if task_name == "tests" {
+            protocol_store
+                .seed_history_item_for_test(&HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id: child.session.id,
+                    scope: HistoryScope::Turn { turn_id },
+                    sequence_no: 3,
+                    created_at_ms: SystemClock::now_ms(),
+                    payload: HistoryItemPayload::AssistantMessage {
+                        response_id: ModelResponseId::new(),
+                        content: vec![ContentPart::Text {
+                            text: "unrelated later assistant message".to_string(),
+                        }],
+                    },
+                })
+                .expect("unrelated later assistant message");
+        }
         terminalize_admitted_test_session(
             &original_runtime,
             child.session.id,
@@ -4948,7 +4977,7 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
             &terminal_event(
                 child.session.id,
                 TurnTerminalOutcome::Completed,
-                Some(response_id),
+                (task_name != "review").then_some(response_id),
             ),
         )
         .await;
@@ -4992,9 +5021,20 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
         assert_eq!(record.agent_path, agent_path);
         assert_eq!(record.task_name, task_name);
         assert_eq!(record.task_preview, task);
-        assert!(matches!(record.status, AgentStatus::Completed(Some(_))));
+        if task_name == "review" {
+            assert!(matches!(record.status, AgentStatus::Completed(None)));
+        } else {
+            assert!(matches!(record.status, AgentStatus::Completed(Some(_))));
+        }
         assert!(!record.is_current_turn);
-        assert_eq!(record.result_preview, result);
+        assert_eq!(
+            record.result_preview,
+            if task_name == "review" {
+                "Completed".to_string()
+            } else {
+                result
+            }
+        );
         assert!(record.current_activity.is_empty());
 
         let mut running = session;

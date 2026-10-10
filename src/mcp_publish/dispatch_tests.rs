@@ -999,3 +999,54 @@ async fn bounded_read_keeps_continuation_without_canonical_output_files() {
         0
     );
 }
+
+#[tokio::test]
+async fn published_read_distinguishes_requested_range_from_output_cap() {
+    let (_directory, store, profile) = fixture().await;
+    let source = legacy_target_fields(&profile).2.join("visible.txt");
+    let counts_before = storage_counts(&store);
+    let mut config = ResolvedConfig::default();
+    config.tool_output.max_lines = 1;
+    let reader = PublishReadDispatcher::new(profile, store.clone(), config, vec![])
+        .await
+        .unwrap();
+
+    let complete = call(
+        &reader,
+        "read",
+        json!({"path": "visible.txt", "offset": 1, "limit": 1}),
+    )
+    .await;
+    let capped = call(
+        &reader,
+        "read",
+        json!({"path": "visible.txt", "offset": 1, "limit": 2}),
+    )
+    .await;
+    assert_eq!(complete["isError"], false);
+    assert_eq!(capped["isError"], false);
+    assert_eq!(complete["content"], capped["content"]);
+    assert_eq!(complete["content"][0]["text"], "1: alpha");
+    assert_eq!(complete["structuredContent"]["requested_end_line"], 1);
+    assert_eq!(capped["structuredContent"]["requested_end_line"], 2);
+    for result in [&complete, &capped] {
+        let metadata = &result["structuredContent"];
+        assert_eq!(metadata["start_line"], 1);
+        assert_eq!(metadata["end_line"], 1);
+        assert_eq!(metadata["total_lines"], 2);
+        assert_eq!(metadata["truncated"], true);
+        assert_eq!(metadata["truncation_kind"], "line_page");
+        assert_eq!(metadata["next_offset"], 2);
+        assert_eq!(metadata["edit_baseline"]["recorded"], false);
+        assert_eq!(metadata["edit_baseline"]["reason"], "mcp_read_only_context");
+    }
+
+    assert_eq!(storage_counts(&store), counts_before);
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "alpha\nbeta\n");
+    assert_eq!(
+        std::fs::read_dir(&store.paths().truncation_dir)
+            .unwrap()
+            .count(),
+        0
+    );
+}

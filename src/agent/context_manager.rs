@@ -198,6 +198,45 @@ impl ContextManager {
         project_model_messages(&self.history_items, supports_images)
     }
 
+    /// A model-written continuation note covers completed history before its
+    /// request. Keep explicit input and the most recent response verbatim;
+    /// response units already include every native tool call and output.
+    pub(crate) fn model_compaction_source_item_ids(&self) -> Vec<HistoryItemId> {
+        let active = self.active_history_items();
+        let latest_response = active.iter().rev().find_map(|item| match item.payload {
+            HistoryItemPayload::AssistantMessage { response_id, .. }
+            | HistoryItemPayload::ToolCall { response_id, .. } => Some(response_id),
+            _ => None,
+        });
+        let protected = active
+            .iter()
+            .filter(|item| match &item.payload {
+                HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::SteerTurn { .. } => true,
+                HistoryItemPayload::InterAgentCommunication { communication } => {
+                    communication.trigger_turn
+                }
+                HistoryItemPayload::AssistantMessage { response_id, .. }
+                | HistoryItemPayload::ToolCall { response_id, .. } => {
+                    Some(*response_id) == latest_response
+                }
+                // Legacy replay snapshots can hold the only exact initial task.
+                // Retain them rather than interpreting their model-written body
+                // as new user authority or guessing at a historical split.
+                HistoryItemPayload::Compaction {
+                    clm_checkpoint: Some(_),
+                    ..
+                } => true,
+                _ => false,
+            })
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        self.semantic_compaction_units()
+            .into_iter()
+            .filter(|unit| !unit.iter().any(|id| protected.contains(id)))
+            .flatten()
+            .collect()
+    }
+
     pub fn model_messages_excluding(
         &self,
         excluded_item_ids: &HashSet<HistoryItemId>,
@@ -316,7 +355,7 @@ impl ContextManager {
                             output_text,
                             metadata,
                         ),
-                        metadata: serde_json::Value::Null,
+                        metadata: metadata.clone(),
                     });
                 }
                 HistoryItemPayload::Error { message } => {
@@ -479,6 +518,31 @@ impl ContextManager {
                     }
                 }
                 HistoryItemPayload::Compaction {
+                    clm_checkpoint: Some(checkpoint),
+                    ..
+                } => checkpoint
+                    .messages()
+                    .expect("validated legacy checkpoint")
+                    .into_iter()
+                    .take(checkpoint.protected_prefix_len())
+                    .filter_map(|message| match message {
+                        ModelMessage::User { content } | ModelMessage::Agent { content } => {
+                            Some(content)
+                        }
+                        ModelMessage::UserParts { parts } => Some(
+                            parts
+                                .into_iter()
+                                .filter_map(|part| match part {
+                                    ModelContentPart::Text { text } => Some(text),
+                                    ModelContentPart::Image { .. } => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        _ => None,
+                    })
+                    .collect(),
+                HistoryItemPayload::Compaction {
                     layout,
                     preserved_user_messages,
                     ..
@@ -507,6 +571,8 @@ impl ContextManager {
                 sequence_no: i64::MAX,
                 created_at_ms: 0,
                 payload: HistoryItemPayload::Compaction {
+                    clm_checkpoint: None,
+
                     mode: CompactionMode::Automatic,
                     layout: CompactionLayout::UserAnchoredCheckpoint,
                     preserved_user_messages,
@@ -790,19 +856,52 @@ fn project_model_messages(
                             call_id: model_call_id,
                             tool_name,
                             result,
-                            metadata: serde_json::Value::Null,
+                            metadata: metadata.clone(),
                         },
                     ));
                 }
             }
             HistoryItemPayload::Compaction {
                 layout,
+                clm_checkpoint,
                 preserved_user_messages,
                 summary,
                 replacement_item_ids,
                 ..
             } => {
-                if layout.appends_checkpoint() {
+                if *layout == CompactionLayout::ClmCheckpoint {
+                    let insertion_index = replacement_item_ids
+                        .iter()
+                        .filter_map(|id| index_by_id.get(id).copied())
+                        .min()
+                        .unwrap_or(index);
+                    let checkpoint = clm_checkpoint
+                        .as_ref()
+                        .expect("validated CLM checkpoint layout");
+                    for (priority, message) in checkpoint
+                        .messages()
+                        .expect("validated CLM checkpoint")
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let message = match message {
+                            ModelMessage::UserParts { parts } if !supports_images => {
+                                ModelMessage::User {
+                                    content: parts
+                                        .into_iter()
+                                        .filter_map(|part| match part {
+                                            ModelContentPart::Text { text } => Some(text),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                }
+                            }
+                            message => message,
+                        };
+                        projected.push((insertion_index, priority, message));
+                    }
+                } else if layout.appends_checkpoint() {
                     for (priority, message) in preserved_user_messages.iter().enumerate() {
                         projected.push((
                             index,
@@ -897,6 +996,33 @@ fn model_visible_tool_output(
             && is_line_page
             && let (Some(total_lines), Some(next_offset)) = (total_lines, next_offset)
         {
+            if let (Some(end_line), Some(requested_end_line)) = (
+                tool_metadata
+                    .get("end_line")
+                    .and_then(serde_json::Value::as_u64),
+                tool_metadata
+                    .get("requested_end_line")
+                    .and_then(serde_json::Value::as_u64),
+            ) {
+                if end_line >= requested_end_line {
+                    return append_model_visible_lines(
+                        output_text,
+                        &[format!(
+                            "Requested line range fully returned. File total lines: {total_lines}; additional lines are outside this request."
+                        )],
+                    );
+                }
+                let remaining_limit = requested_end_line - end_line;
+                return append_model_visible_lines(
+                    output_text,
+                    &[
+                        "Warning: truncated output.".to_string(),
+                        format!(
+                            "Requested line range incomplete. File total lines: {total_lines}. Remaining requested lines can be read using `offset`: {next_offset}, `limit`: {remaining_limit}."
+                        ),
+                    ],
+                );
+            }
             return append_model_visible_lines(
                 output_text,
                 &[
@@ -1582,6 +1708,57 @@ mod tests {
     }
 
     #[test]
+    fn read_requested_range_completion_does_not_instruct_further_reading() {
+        let flat = serde_json::json!({
+            "truncated": true,
+            "truncation_kind": "line_page",
+            "next_offset": 121,
+            "end_line": 120,
+            "requested_end_line": 120,
+            "total_lines": 1_000
+        });
+        let nested = serde_json::json!({"success": true, "tool_metadata": flat.clone()});
+        for metadata in [&flat, &nested] {
+            let projected = model_visible_tool_output(
+                "read",
+                ToolLifecycleStatus::Completed,
+                "101: first requested line\n120: last requested line",
+                metadata,
+            );
+            assert!(projected.ends_with(
+                "Requested line range fully returned. File total lines: 1000; additional lines are outside this request."
+            ));
+            assert!(!projected.contains("Warning:"));
+            assert!(!projected.contains("Continue with"));
+            assert!(!projected.contains("`offset`"));
+        }
+    }
+
+    #[test]
+    fn read_incomplete_requested_range_keeps_the_remaining_limit() {
+        let flat = serde_json::json!({
+            "truncated": true,
+            "truncation_kind": "line_page",
+            "next_offset": 111,
+            "end_line": 110,
+            "requested_end_line": 120,
+            "total_lines": 1_000
+        });
+        let nested = serde_json::json!({"success": true, "tool_metadata": flat.clone()});
+        for metadata in [&flat, &nested] {
+            let projected = model_visible_tool_output(
+                "read",
+                ToolLifecycleStatus::Completed,
+                "101: first requested line\n110: last returned line",
+                metadata,
+            );
+            assert!(projected.ends_with(
+                "Warning: truncated output.\nRequested line range incomplete. File total lines: 1000. Remaining requested lines can be read using `offset`: 111, `limit`: 10."
+            ));
+        }
+    }
+
+    #[test]
     fn read_output_uses_a_repeatable_offset_instead_of_an_opaque_cursor() {
         assert_eq!(
             model_visible_tool_output(
@@ -2032,6 +2209,52 @@ mod tests {
     }
 
     #[test]
+    fn read_range_status_is_stable_live_after_replay_and_in_compaction_input() {
+        for requested_end_line in [110, 120] {
+            let (mut context, _, _) = provider_tool_round();
+            for item in &mut context.history_items {
+                match &mut item.payload {
+                    HistoryItemPayload::ToolCall { arguments_json, .. } => {
+                        *arguments_json = serde_json::json!({
+                            "path": "task.md", "offset": 101,
+                            "limit": requested_end_line - 100
+                        })
+                        .to_string();
+                    }
+                    HistoryItemPayload::ToolOutput { metadata, .. } => {
+                        *metadata = serde_json::json!({"success": true, "tool_metadata": {
+                            "truncated": true, "truncation_kind": "line_page",
+                            "end_line": 110, "next_offset": 111,
+                            "requested_end_line": requested_end_line,
+                            "total_lines": 1_000
+                        }});
+                    }
+                    _ => {}
+                }
+            }
+            let items = context.history_items.clone();
+            let mut live = ContextManager::from_active_history(items[..2].to_vec(), Some(2), 2);
+            live.ingest_committed_delta(vec![items[2].clone()], Some(3));
+            let expected = serde_json::to_value(context.model_messages(false)).unwrap();
+            let selected_ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+            for projection in [
+                live.model_messages(false),
+                live.model_messages(false),
+                live.model_messages_for_items(&selected_ids, false),
+                live.model_messages_excluding(&HashSet::new(), false),
+            ] {
+                assert_eq!(serde_json::to_value(projection).unwrap(), expected);
+            }
+            assert_eq!(
+                serde_json::to_value(&live.history_items).unwrap(),
+                serde_json::to_value(&items).unwrap()
+            );
+            let result = expected[2]["result"].as_str().expect("read tool result");
+            assert_eq!(result.contains("Warning:"), requested_end_line == 120);
+        }
+    }
+
+    #[test]
     fn canonical_paginated_tool_output_projects_the_same_cursor_live_and_after_replay() {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
@@ -2112,6 +2335,7 @@ mod tests {
             });
             let nested = serde_json::json!({"tool_metadata": flat.clone()});
             for metadata in [flat, nested] {
+                let expected_metadata = metadata.clone();
                 let session_id = SessionId::new();
                 let turn_id = TurnId::new();
                 let response_id = ModelResponseId::new();
@@ -2197,7 +2421,7 @@ mod tests {
                         && result.matches(SHELL_SANDBOX_PLAN_LABEL).count() == 1
                         && result.contains("effect_started: true")
                         && result.matches("Sandbox note:").count() == usize::from(hint.is_some())
-                        && metadata.is_null()
+                        && metadata == &expected_metadata
                 ));
             }
         }
@@ -2273,6 +2497,8 @@ mod tests {
             sequence_no: 4,
             created_at_ms: 4,
             payload: HistoryItemPayload::Compaction {
+                clm_checkpoint: None,
+
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                 preserved_user_messages: vec!["first".to_string(), "second".to_string()],
@@ -2356,6 +2582,8 @@ mod tests {
                 sequence_no: 3,
                 created_at_ms: 3,
                 payload: HistoryItemPayload::Compaction {
+                    clm_checkpoint: None,
+
                     mode: crate::protocol::CompactionMode::Automatic,
                     layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                     preserved_user_messages: vec!["old context".to_string()],
@@ -2395,6 +2623,8 @@ mod tests {
             sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::Compaction {
+                clm_checkpoint: None,
+
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::LegacyPrefix,
                 preserved_user_messages: Vec::new(),
@@ -2479,6 +2709,8 @@ mod tests {
             sequence_no: 5,
             created_at_ms: 5,
             payload: HistoryItemPayload::Compaction {
+                clm_checkpoint: None,
+
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                 preserved_user_messages: Vec::new(),
@@ -2526,6 +2758,8 @@ mod tests {
             sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::Compaction {
+                clm_checkpoint: None,
+
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                 preserved_user_messages: vec!["original task".to_string()],
@@ -2557,6 +2791,8 @@ mod tests {
             sequence_no: 6,
             created_at_ms: 6,
             payload: HistoryItemPayload::Compaction {
+                clm_checkpoint: None,
+
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                 preserved_user_messages: vec![
@@ -2773,6 +3009,8 @@ mod tests {
             sequence_no: 4,
             created_at_ms: 4,
             payload: HistoryItemPayload::Compaction {
+                clm_checkpoint: None,
+
                 mode: crate::protocol::CompactionMode::Automatic,
                 layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                 preserved_user_messages: vec!["original task".to_string()],

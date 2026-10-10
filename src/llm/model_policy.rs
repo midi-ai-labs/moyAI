@@ -85,12 +85,22 @@ impl ModelPolicy {
                 Some(&config.model.system_prompt),
             ),
             context_window: config.model.context_window,
-            working_context_token_limit: context_limits.working,
+            working_context_token_limit: context_limits.working.min(
+                config
+                    .model
+                    .compaction_budget_tokens
+                    .unwrap_or(context_limits.working),
+            ),
             effective_context_token_limit: context_limits.effective_full,
             input_modalities,
             supports_tools: config.model.supports_tools,
             supports_parallel_tool_calls: config.model.parallel_tool_calls,
         }
+    }
+
+    /// Automatic compaction trigger captured with the turn; generation remains host-owned.
+    pub fn compaction_budget_tokens(&self) -> u32 {
+        self.working_context_token_limit
     }
 
     pub fn transport_profile(
@@ -342,6 +352,60 @@ mod tests {
         )
         .expect_err("capabilities must not be inherited by an id-only override");
         assert!(error.to_string().contains("no explicit capability profile"));
+    }
+
+    #[test]
+    fn compaction_budget_defaults_to_working_limit_without_output_reservation() {
+        for context_window in [1, 8_192, 32_768, 131_072] {
+            let mut config = ResolvedConfig::default();
+            config.model.context_window = context_window;
+            for legacy_output in [1, 32_768, 65_536] {
+                config.model.max_output_tokens = legacy_output;
+                let policy = ModelPolicy::from_config(&config);
+                assert_eq!(
+                    policy.compaction_budget_tokens(),
+                    ContextWindowLimits::resolve(
+                        context_window,
+                        config.session.overflow_margin_tokens
+                    )
+                    .working
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_compaction_budget_is_captured_without_changing_transport_limit() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 131_072;
+        config.model.compaction_budget_tokens = Some(98_304);
+        config.normalize_and_validate_provider_runtime().unwrap();
+        let policy = ModelPolicy::from_config(&config);
+        config.model.compaction_budget_tokens = Some(65_536);
+
+        assert_eq!(policy.compaction_budget_tokens(), 98_304);
+        assert_eq!(policy.effective_context_token_limit, 124_518);
+        let transport = policy.transport_profile(config.model.provider_profile);
+        assert_eq!(transport.context_window, 124_518);
+        assert_eq!(
+            transport.max_output_tokens,
+            RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn explicit_compaction_threshold_cannot_delay_the_normal_working_boundary() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 131_072;
+        config.model.compaction_budget_tokens = Some(124_518);
+        config.normalize_and_validate_provider_runtime().unwrap();
+        let policy = ModelPolicy::from_config(&config);
+        assert_eq!(policy.working_context_token_limit, 117_964);
+        assert_eq!(
+            policy.compaction_budget_tokens(),
+            policy.working_context_token_limit
+        );
+        assert_eq!(policy.effective_context_token_limit, 124_518);
     }
 
     #[test]

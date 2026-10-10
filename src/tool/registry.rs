@@ -201,6 +201,10 @@ impl ToolRegistry {
             "update_plan".to_string(),
             Arc::new(crate::tool::update_plan::UpdatePlanTool),
         );
+        tools.insert(
+            "compact_context".to_string(),
+            Arc::new(crate::tool::compact_context::CompactContextTool),
+        );
         insert_goal_tools(&mut tools);
         Self {
             tools,
@@ -435,6 +439,10 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
         "update_plan".to_string(),
         Arc::new(crate::tool::update_plan::UpdatePlanTool),
     );
+    tools.insert(
+        "compact_context".to_string(),
+        Arc::new(crate::tool::compact_context::CompactContextTool),
+    );
     tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
     insert_managed_shell_tools(tools);
@@ -637,6 +645,7 @@ mod tests {
             super::ToolRegistry::core_agent().available_tool_names(),
             vec![
                 "apply_patch",
+                "compact_context",
                 "create_goal",
                 "current_time",
                 "get_goal",
@@ -676,6 +685,37 @@ mod tests {
     fn core_agent_registry_exposes_only_the_canonical_update_plan_surface() {
         let names = super::ToolRegistry::core_agent().available_tool_names();
         assert!(names.contains(&"update_plan".to_string()));
+    }
+
+    #[test]
+    fn compact_context_is_available_as_an_internal_read_in_all_agent_configs() {
+        let mut config = crate::config::ResolvedConfig::default();
+        for enabled in [false, true] {
+            config.multi_agent.enabled = enabled;
+            config.docling.enabled = enabled;
+            config.mcp.enabled = enabled;
+            let mut registry = super::ToolRegistry::core_agent_for_config(&config);
+            registry.retain_effect_with_exceptions(
+                crate::tool::ToolEffectClass::Read,
+                Some(&config.mcp),
+                &[],
+            );
+            assert!(
+                registry
+                    .available_tool_names()
+                    .contains(&"compact_context".to_string())
+            );
+            assert_eq!(
+                registry
+                    .validate_call_effect(
+                        "compact_context",
+                        &serde_json::json!({ "summary": "Continue verifying" }),
+                        &config.mcp,
+                    )
+                    .expect("internal read"),
+                crate::tool::ToolEffectClass::Read
+            );
+        }
     }
 
     #[test]

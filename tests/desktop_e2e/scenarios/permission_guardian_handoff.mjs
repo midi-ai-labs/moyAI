@@ -8,9 +8,8 @@ import { createPermissionRestartGuardianProviderScript, startScriptedProvider } 
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { quiesceProviderResource } from "./provider_restart.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
-import { captureScenarioScreenshot } from "./observations.mjs";
+import { captureScenarioScreenshot, observePermissionSurface } from "./observations.mjs";
 import { action, wait, trustedClick } from "./hub_browser_enrollment.mjs";
-import { observeReceiverPermissionSurface } from "./mcp_receiver_permission.mjs";
 import { observeRunNextTurnSurface, settledComposer } from "./run_next_turn.mjs";
 import { exactPermissionRestartGuardianLedger, permissionRestartGuardianFixtureConfig, submitGuardianPrompt } from "./permission_restart_guardian.mjs";
 
@@ -127,7 +126,7 @@ export function createGuardianHandoffScenario(decision = "approve") {
       const commands = new DesktopCommandProbe(cdp, { probeId: "guardian-handoff-commands", commands: ["submit_prompt", "answer_permission", "cancel_run"] });
       let primaryError = null;
       const sample = async () => {
-        const value = { surface: await observeReceiverPermissionSurface(cdp), ledger: state.provider.requestLedger, receipt: await receipt(state.plan.receiptPath) };
+        const value = { surface: await observePermissionSurface(cdp), ledger: state.provider.requestLedger, receipt: await receipt(state.plan.receiptPath) };
         if (value.ledger.some(row => row.contract?.pass === false || row.response_phase === "rejected")) throw fail("scripted provider contract failed", value);
         return value;
       };

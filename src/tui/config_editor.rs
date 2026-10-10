@@ -8,7 +8,7 @@ use crate::config::field::{build_resolved_config_from_field_values, parse_config
 use crate::config::loader::{
     acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
 };
-use crate::config::model::{AccessMode, ResolvedConfig};
+use crate::config::model::{AccessMode, ApproveConfig, ResolvedConfig};
 use crate::config::{ConfigField, ConfigLoader, ProviderEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,7 @@ pub struct ConfigEditorState {
     pub fields: Vec<ConfigFieldState>,
     pub selected: usize,
     pub feedback: Option<String>,
+    imported_approve: Option<ApproveConfig>,
 }
 
 impl ConfigEditorState {
@@ -76,6 +77,7 @@ impl ConfigEditorState {
                 .collect(),
             selected: 0,
             feedback: None,
+            imported_approve: None,
         }
     }
 
@@ -85,6 +87,11 @@ impl ConfigEditorState {
             .fields
             .retain(|field| !field.key.is_host_owned_generation());
         editor
+    }
+
+    pub(crate) fn with_imported_approve(mut self, approve: ApproveConfig) -> Self {
+        self.imported_approve = Some(approve);
+        self
     }
 
     pub fn from_config_values(
@@ -105,9 +112,28 @@ impl ConfigEditorState {
             .map(|(key, _)| key.clone())
             .collect::<std::collections::HashSet<_>>();
         let mut candidate = Self::from_config(config);
+        let explicit_private = candidate
+            .fields
+            .iter()
+            .filter(|field| {
+                !field.key.is_approve()
+                    && field.key.is_connection_private_value()
+                    && values.iter().any(|(key, value)| {
+                        key == field.key.label()
+                            && !field
+                                .key
+                                .redacted_input_preserves_configured(&field.value, value)
+                    })
+            })
+            .map(|field| field.key)
+            .collect::<std::collections::HashSet<_>>();
         candidate.replace_values_by_key(values)?;
         for field in &mut candidate.fields {
-            if keys.contains(field.key.label()) {
+            if !field.key.is_approve()
+                && !field.key.is_connection_private_value()
+                && keys.contains(field.key.label())
+                || explicit_private.contains(&field.key)
+            {
                 field.dirty = true;
             }
         }
@@ -115,6 +141,32 @@ impl ConfigEditorState {
     }
 
     pub fn replace_values_by_key(&mut self, values: Vec<(String, String)>) -> Result<(), String> {
+        let connections = [
+            (
+                ConfigField::BaseUrl,
+                ConfigField::ProviderProfile,
+                ConfigField::ApiKeyEnv,
+            ),
+            (
+                ConfigField::SideChatBaseUrl,
+                ConfigField::SideChatProviderProfile,
+                ConfigField::SideChatApiKeyEnv,
+            ),
+            (
+                ConfigField::ApproveBaseUrl,
+                ConfigField::ApproveProviderProfile,
+                ConfigField::ApproveApiKeyEnv,
+            ),
+        ]
+        .map(|(url, profile, credential)| {
+            let value = |key| {
+                self.fields
+                    .iter()
+                    .find(|field| field.key == key)
+                    .map(|field| field.value.clone())
+            };
+            (url, profile, credential, value(url), value(profile))
+        });
         let mut seen = std::collections::HashSet::new();
         let mut updates = Vec::with_capacity(values.len());
         for (key, value) in values {
@@ -138,6 +190,23 @@ impl ConfigEditorState {
             }
             field.dirty = field.value != value;
             field.value = value;
+        }
+        for (url, profile, credential, previous_url, previous_profile) in connections {
+            let changed = self.fields.iter().any(|field| {
+                if field.key == url {
+                    ProviderEndpoint::parse(&field.value).ok()
+                        != previous_url
+                            .as_deref()
+                            .and_then(|value| ProviderEndpoint::parse(value).ok())
+                } else {
+                    field.key == profile && Some(&field.value) != previous_profile.as_ref()
+                }
+            });
+            if changed && seen.contains(credential.label()) {
+                if let Some(field) = self.fields.iter_mut().find(|field| field.key == credential) {
+                    field.dirty = true;
+                }
+            }
         }
         Ok(())
     }
@@ -174,9 +243,16 @@ impl ConfigEditorState {
         let fields = self
             .fields
             .iter()
+            .filter(|field| {
+                (!field.key.is_approve() && !field.key.is_connection_private_value()) || field.dirty
+            })
             .map(|field| (field.key, field.value.as_str()))
             .collect::<Vec<_>>();
-        build_resolved_config_from_field_values(base, &fields)
+        let mut base = base.clone();
+        if let Some(approve) = &self.imported_approve {
+            base.approve = Some(approve.clone());
+        }
+        build_resolved_config_from_field_values(&base, &fields)
     }
 
     pub fn save_global(
@@ -372,13 +448,114 @@ fn prepare_config_section_update(
         .filter(|field| field.dirty)
         .map(|field| (field.key, field.value.as_str()))
         .collect::<Vec<_>>();
-    let dirty = !dirty_values.is_empty();
+    let dirty = !dirty_values.is_empty() || editor.imported_approve.is_some();
     let mut existing = read_toml_document(path)?;
     if dirty {
+        let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
+        let previous =
+            ConfigLoader::resolve_forward_compatible_global_config_text_without_environment(
+                path, &text,
+            )
+            .map_err(|error| error.to_string())?;
+        let previous_approve = previous.approve.clone();
         let patch = parse_config_field_patch(&dirty_values)?;
+        let mut resolved = crate::config::merge::apply_patch(previous.clone(), patch.clone());
+        resolved.normalize_and_validate_provider_runtime()?;
         let patch = toml::Value::try_from(patch).map_err(|error| error.to_string())?;
-        for (field, _) in dirty_values {
-            apply_dirty_toml_field(&mut existing, &patch, field)?;
+        for (field, _) in &dirty_values {
+            if !field.is_approve() {
+                apply_dirty_toml_field(&mut existing, &patch, *field)?;
+            }
+        }
+        let main_changed = ProviderEndpoint::parse(&previous.model.base_url).ok()
+            != ProviderEndpoint::parse(&resolved.model.base_url).ok()
+            || previous.model.provider_profile != resolved.model.provider_profile;
+        let side_changed = ProviderEndpoint::parse(&previous.side_chat.base_url).ok()
+            != ProviderEndpoint::parse(&resolved.side_chat.base_url).ok()
+            || previous.side_chat.provider_profile != resolved.side_chat.provider_profile;
+        for (changed, section_name, api_key_env) in [
+            (main_changed, "model", &resolved.model.api_key_env),
+            (side_changed, "side_chat", &resolved.side_chat.api_key_env),
+        ] {
+            if changed {
+                let section = existing
+                    .as_table_mut()
+                    .expect("TOML root is a table")
+                    .entry(section_name.to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| {
+                        format!("global config section `{section_name}` must be a TOML table")
+                    })?;
+                // Main and Sub have no inherited credential default. Remove the
+                // old reference when the new target has none.
+                if let Some(reference) = api_key_env {
+                    section.insert(
+                        "api_key_env".to_string(),
+                        toml::Value::String(reference.clone()),
+                    );
+                } else {
+                    section.remove("api_key_env");
+                }
+                if section_name == "model" {
+                    section.insert(
+                        "extra_headers".to_string(),
+                        toml::Value::try_from(&resolved.model.extra_headers)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    if let Some(body) = &resolved.model.extra_body_json {
+                        section.insert(
+                            "extra_body_json".to_string(),
+                            toml::Value::try_from(body).map_err(|error| error.to_string())?,
+                        );
+                    } else {
+                        section.remove("extra_body_json");
+                    }
+                }
+            }
+        }
+        let approve_values = dirty_values
+            .iter()
+            .copied()
+            .filter(|(field, _)| field.is_approve())
+            .collect::<Vec<_>>();
+        if !approve_values.is_empty()
+            || editor.imported_approve.is_some()
+            || previous_approve.is_some()
+        {
+            let base_text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
+            let mut base =
+                ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+                    path, &base_text,
+                )
+                .map_err(|error| error.to_string())?
+                .resolved_config;
+            if let Some(approve) = previous_approve {
+                // Materialize older partial sections before a Main edit can
+                // change the independent approval connection on reload.
+                base.approve = Some(approve);
+            }
+            if let Some(approve) = &editor.imported_approve {
+                base.approve = Some(approve.clone());
+            }
+            let resolved = build_resolved_config_from_field_values(&base, &approve_values)?;
+            if let Some(approve) = resolved.approve {
+                let mut snapshot =
+                    toml::Value::try_from(&approve).map_err(|error| error.to_string())?;
+                // An omitted credential reference would inherit Main when this
+                // independent snapshot is loaded into a fresh config owner.
+                snapshot
+                    .as_table_mut()
+                    .expect("Approve serializes as a table")
+                    .insert(
+                        "api_key_env".to_string(),
+                        toml::Value::String(approve.api_key_env.unwrap_or_default()),
+                    );
+                existing
+                    .as_table_mut()
+                    .expect("TOML root is a table")
+                    .insert("approve".to_string(), snapshot);
+            }
         }
     }
     normalize_provider_endpoint_in_document(&mut existing)?;
@@ -504,7 +681,7 @@ mod tests {
         ConfigEditorState, ConfigField, GlobalConfigAdoptionPolicy, compare_and_set_access_mode,
         parse_editor_patch, save_access_mode,
     };
-    use crate::config::{AccessMode, ProviderProfile, ResolvedConfig};
+    use crate::config::{AccessMode, ConfigLoader, ProviderProfile, ResolvedConfig};
 
     fn save_config_sections(
         path: &camino::Utf8Path,
@@ -528,6 +705,289 @@ mod tests {
             GlobalConfigAdoptionPolicy::StrictCurrentSchema,
         )
         .map(|(resolved_config, _)| resolved_config)
+    }
+
+    fn approval_save_fixture(path: &camino::Utf8Path) -> ResolvedConfig {
+        std::fs::write(path, "[model]\nbase_url='https://main.example/v1'\nmodel='main-before'\nprovider_profile='openai_compatible'\napi_key_env='MAIN_TEST_KEY'\ncontext_window=32768\nrequest_timeout_ms=4000\nconnect_timeout_ms=1500\nmax_retries=2\n[model.extra_headers]\nX-Test='main-header'\n").unwrap();
+        load_saved_config(path)
+    }
+
+    fn load_saved_config(path: &camino::Utf8Path) -> ResolvedConfig {
+        crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+            path,
+            &std::fs::read_to_string(path).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn approval_inheritance_survives_complete_setup_and_unrelated_editor_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let base = approval_save_fixture(&path);
+        let values = ConfigField::ALL
+            .into_iter()
+            .map(|key| (key.label().to_string(), key.editor_value(&base)))
+            .collect();
+        let setup = ConfigEditorState::from_complete_config_values(&base, values).unwrap();
+        assert!(
+            setup
+                .build_resolved_config(&base)
+                .unwrap()
+                .approve
+                .is_none()
+        );
+        save_config_sections_resolved(&path, &setup).unwrap();
+        assert!(load_saved_config(&path).approve.is_none());
+        for key in [ConfigField::Model, ConfigField::DoclingEnabled] {
+            let base = load_saved_config(&path);
+            let value = if key == ConfigField::Model {
+                "main-after"
+            } else {
+                "false"
+            };
+            let mut editor = ConfigEditorState::from_tui_config(&base);
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .unwrap();
+            field.value = value.to_string();
+            field.dirty = true;
+            assert!(
+                editor
+                    .build_resolved_config(&base)
+                    .unwrap()
+                    .approve
+                    .is_none()
+            );
+            save_config_sections_resolved(&path, &editor).unwrap();
+            assert!(load_saved_config(&path).approve.is_none());
+        }
+    }
+
+    #[test]
+    fn first_approval_edit_persists_a_complete_independent_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let base = approval_save_fixture(&path);
+        let editor = ConfigEditorState::from_config_values(
+            &base,
+            vec![("approve.model".into(), "fast-judge".into())],
+        )
+        .unwrap();
+        let committed = save_config_sections_resolved(&path, &editor).unwrap();
+        let snapshot = committed.approve.clone().unwrap();
+        assert_eq!(snapshot.model, "fast-judge");
+        assert_eq!(snapshot.api_key_env, base.model.api_key_env);
+        assert_eq!(snapshot.extra_headers, base.model.extra_headers);
+        let document: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(document["approve"].as_table().unwrap().len(), 9);
+        let editor = ConfigEditorState::from_config_values(
+            &committed,
+            vec![
+                (
+                    "model.base_url".into(),
+                    "https://other-main.example/v1".into(),
+                ),
+                ("model.model".into(), "main-after".into()),
+                ("model.api_key_env".into(), "ANOTHER_MAIN_KEY".into()),
+                ("model.request_timeout_ms".into(), "9999".into()),
+            ],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &editor).unwrap();
+        assert_eq!(load_saved_config(&path).approve, Some(snapshot));
+    }
+
+    #[test]
+    fn main_save_materializes_an_existing_partial_approval_before_main_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        approval_save_fixture(&path);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\n[approve]\nmodel='old-partial-judge'\n");
+        std::fs::write(&path, text).unwrap();
+        let base = load_saved_config(&path);
+        let snapshot = base.approve.clone().unwrap();
+        let editor = ConfigEditorState::from_config_values(
+            &base,
+            vec![
+                (
+                    "model.base_url".into(),
+                    "https://new-main.example/v1".into(),
+                ),
+                ("model.api_key_env".into(), "NEW_MAIN_KEY".into()),
+                ("model.extra_headers_json".into(), "{}".into()),
+                ("model.context_window".into(), "65536".into()),
+            ],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &editor).unwrap();
+        let loaded = load_saved_config(&path);
+        assert_eq!(loaded.approve, Some(snapshot));
+        assert_eq!(loaded.model.base_url, "https://new-main.example/v1");
+        let document: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(document["approve"].as_table().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn approval_endpoint_and_profile_changes_clear_credentials_after_save_and_reload() {
+        for changed_field in [
+            ConfigField::ApproveBaseUrl,
+            ConfigField::ApproveProviderProfile,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+            let base = approval_save_fixture(&path);
+            let editor = ConfigEditorState::from_config_values(
+                &base,
+                vec![("approve.model".into(), "fast-judge".into())],
+            )
+            .unwrap();
+            let base = save_config_sections_resolved(&path, &editor).unwrap();
+            let value = if changed_field == ConfigField::ApproveBaseUrl {
+                "https://other-judge.example/v1"
+            } else {
+                "lm_studio"
+            };
+            let editor = ConfigEditorState::from_config_values(
+                &base,
+                vec![(changed_field.label().into(), value.into())],
+            )
+            .unwrap();
+            let applied = editor.build_resolved_config(&base).unwrap();
+            assert_eq!(applied.approve.as_ref().unwrap().api_key_env, None);
+            assert!(applied.approve.as_ref().unwrap().extra_headers.is_empty());
+            save_config_sections_resolved(&path, &editor).unwrap();
+            let loaded = load_saved_config(&path);
+            assert_eq!(loaded.approve.as_ref().unwrap().api_key_env, None);
+            assert!(loaded.approve.as_ref().unwrap().extra_headers.is_empty());
+            assert_eq!(loaded.model.api_key_env.as_deref(), Some("MAIN_TEST_KEY"));
+            let document: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(document["approve"]["api_key_env"].as_str(), Some(""));
+        }
+    }
+
+    #[test]
+    fn approval_explicit_same_key_and_anonymous_replacement_survive_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let base = approval_save_fixture(&path);
+        let editor = ConfigEditorState::from_config_values(
+            &base,
+            vec![
+                ("approve.base_url".into(), "https://judge.example/v1".into()),
+                ("approve.api_key_env".into(), "MAIN_TEST_KEY".into()),
+            ],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &editor).unwrap();
+        let base = load_saved_config(&path);
+        assert_eq!(
+            base.approve.as_ref().unwrap().api_key_env.as_deref(),
+            Some("MAIN_TEST_KEY")
+        );
+        assert!(base.approve.as_ref().unwrap().extra_headers.is_empty());
+        let editor = ConfigEditorState::from_config_values(
+            &base,
+            vec![("approve.api_key_env".into(), "".into())],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &editor).unwrap();
+        assert_eq!(
+            load_saved_config(&path)
+                .approve
+                .as_ref()
+                .unwrap()
+                .api_key_env,
+            None
+        );
+    }
+
+    #[test]
+    fn main_and_sub_connection_edits_clear_private_values_after_apply_save_and_reload() {
+        for role in ["model", "side_chat"] {
+            for (field, value) in [
+                ("base_url", "https://new.example/v1"),
+                ("provider_profile", "lm_studio"),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+                std::fs::write(&path, "[model]\nbase_url='https://old.example/v1'\nprovider_profile='openai_compatible'\napi_key_env='OLD_MAIN_KEY'\n[model.extra_headers]\nAuthorization='Bearer old-secret'\n[side_chat]\nbase_url='https://old.example/v1'\nprovider_profile='openai_compatible'\napi_key_env='OLD_SUB_KEY'\n[future]\nretained=true\n").unwrap();
+                let base = ConfigLoader::resolve_forward_compatible_global_config_text_without_environment(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+                let editor = ConfigEditorState::from_config_values(
+                    &base,
+                    vec![(format!("{role}.{field}"), value.into())],
+                )
+                .unwrap();
+                let applied = editor.build_resolved_config(&base).unwrap();
+                if role == "model" {
+                    assert_eq!(applied.model.api_key_env, None);
+                    assert!(applied.model.extra_headers.is_empty());
+                } else {
+                    assert_eq!(applied.side_chat.api_key_env, None);
+                }
+                save_config_sections(&path, &editor).unwrap();
+                let reopened = ConfigLoader::resolve_forward_compatible_global_config_text_without_environment(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+                if role == "model" {
+                    assert_eq!(reopened.model.api_key_env, None);
+                    assert!(reopened.model.extra_headers.is_empty());
+                    assert_eq!(reopened.side_chat.api_key_env, base.side_chat.api_key_env);
+                } else {
+                    assert_eq!(reopened.side_chat.api_key_env, None);
+                    assert_eq!(reopened.model.api_key_env, base.model.api_key_env);
+                    assert_eq!(reopened.model.extra_headers, base.model.extra_headers);
+                }
+                let document: toml::Value =
+                    toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(document["future"]["retained"].as_bool(), Some(true));
+                assert!(document[role].get("api_key_env").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn imported_approval_equal_to_main_keeps_explicit_ownership_and_private_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let base = approval_save_fixture(&path);
+        let snapshot = crate::config::ApproveConfig::from_model(&base.model);
+        let values = ConfigField::ALL
+            .into_iter()
+            .filter(|field| !field.is_approve())
+            .map(|key| (key.label().into(), key.editor_value(&base)))
+            .collect();
+        let editor = ConfigEditorState::from_complete_config_values(&base, values)
+            .unwrap()
+            .with_imported_approve(snapshot.clone());
+        assert_eq!(
+            editor.build_resolved_config(&base).unwrap().approve,
+            Some(snapshot.clone())
+        );
+        save_config_sections_resolved(&path, &editor).unwrap();
+        assert_eq!(load_saved_config(&path).approve, Some(snapshot));
+        let base = load_saved_config(&path);
+        let later = ConfigEditorState::from_config_values(
+            &base,
+            vec![("approve.model".into(), "later-judge".into())],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &later).unwrap();
+        let base = load_saved_config(&path);
+        let unrelated = ConfigEditorState::from_config_values(
+            &base,
+            vec![("model.model".into(), "later-main".into())],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &unrelated).unwrap();
+        assert_eq!(
+            load_saved_config(&path).approve.as_ref().unwrap().model,
+            "later-judge"
+        );
     }
 
     fn shared_hub_config() -> crate::device_network::SharedHubConfig {
@@ -1174,6 +1634,61 @@ mod tests {
     }
 
     #[test]
+    fn main_and_sub_save_preserve_same_target_and_explicit_reentered_credentials() {
+        for (role, reference) in [("model", "MAIN_KEY"), ("side_chat", "SUB_KEY")] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml")).unwrap();
+            let seed = format!(
+                "[{role}]\nbase_url = \"https://old.example.test/v1\"\nprovider_profile = \"openai_compatible\"\napi_key_env = \"{reference}\"\n"
+            );
+            std::fs::write(&path, &seed).unwrap();
+            let base =
+                ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+                    &path, &seed,
+                )
+                .unwrap()
+                .resolved_config;
+            let same = ConfigEditorState::from_config_values(
+                &base,
+                vec![(format!("{role}.model"), "another-model".into())],
+            )
+            .unwrap();
+            let saved = save_config_sections(&path, &same).unwrap();
+            let reference_of = |config: &ResolvedConfig| {
+                if role == "model" {
+                    config.model.api_key_env.clone()
+                } else {
+                    config.side_chat.api_key_env.clone()
+                }
+            };
+            assert_eq!(reference_of(&saved).as_deref(), Some(reference));
+            let explicit = ConfigEditorState::from_complete_config_values(
+                &saved,
+                vec![
+                    (
+                        format!("{role}.base_url"),
+                        "https://new.example.test/v1".into(),
+                    ),
+                    (format!("{role}.api_key_env"), reference.into()),
+                ],
+            )
+            .unwrap();
+            let applied = explicit.build_resolved_config(&saved).unwrap();
+            assert_eq!(reference_of(&applied).as_deref(), Some(reference));
+            let saved = save_config_sections(&path, &explicit).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let reopened =
+                ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+                    &path, &text,
+                )
+                .unwrap()
+                .resolved_config;
+            assert_eq!(reference_of(&saved).as_deref(), Some(reference));
+            assert_eq!(reference_of(&reopened).as_deref(), Some(reference));
+        }
+    }
+
+    #[test]
     fn complete_config_values_persist_even_when_they_match_environment_effective_values() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
@@ -1217,6 +1732,105 @@ mod tests {
         assert!(saved.contains("environment-model"));
         assert!(saved.contains("openai_compatible"));
         assert!(saved.contains("COMPLETE_CONFIG_SECRET"));
+    }
+
+    #[test]
+    fn environment_connection_materialization_does_not_restore_old_credentials() {
+        const CHILD_MODE: &str = "MOYAI_CONFIG_CREDENTIAL_MATERIALIZATION_TEST";
+        const TEST_NAME: &str = "tui::config_editor::tests::environment_connection_materialization_does_not_restore_old_credentials";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+            let seed = "[model]\nbase_url='https://old.example.test/v1'\nprovider_profile='openai_compatible'\napi_key_env='OLD_KEY'\nextra_body_json={token='old-secret'}\n[model.extra_headers]\nAuthorization='Bearer old-secret'\n[future]\nretained=true\n";
+            std::fs::write(&path, seed).unwrap();
+            let effective =
+                ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+                    &path, seed,
+                )
+                .unwrap()
+                .resolved_config;
+            assert!(effective.model.api_key_env.is_none());
+            assert!(effective.model.extra_headers.is_empty());
+            let editor = if mode == "model" {
+                ConfigEditorState::from_config_values(
+                    &effective,
+                    vec![("model.model".into(), "saved-model".into())],
+                )
+                .unwrap()
+            } else {
+                ConfigEditorState::from_complete_config_values(
+                    &effective,
+                    vec![
+                        ("model.base_url".into(), effective.model.base_url.clone()),
+                        (
+                            "model.provider_profile".into(),
+                            effective.model.provider_profile.as_str().into(),
+                        ),
+                        ("model.model".into(), "saved-model".into()),
+                    ],
+                )
+                .unwrap()
+            };
+            let saved = save_config_sections(&path, &editor).unwrap();
+            assert!(saved.model.api_key_env.is_none());
+            assert!(saved.model.extra_headers.is_empty());
+            let text = std::fs::read_to_string(&path).unwrap();
+            let reopened =
+                ConfigLoader::resolve_forward_compatible_global_config_text_without_environment(
+                    &path, &text,
+                )
+                .unwrap();
+            let document: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(document["future"]["retained"].as_bool(), Some(true));
+            if mode == "model" {
+                assert_eq!(reopened.model.base_url, "https://old.example.test/v1");
+                assert_eq!(reopened.model.api_key_env.as_deref(), Some("OLD_KEY"));
+                assert_eq!(
+                    reopened
+                        .model
+                        .extra_headers
+                        .get("Authorization")
+                        .map(String::as_str),
+                    Some("Bearer old-secret")
+                );
+            } else {
+                assert!(
+                    reopened.model.api_key_env.is_none(),
+                    "materializing the effective target must not restore the old key"
+                );
+                assert!(reopened.model.extra_headers.is_empty());
+                assert!(document["model"].get("extra_body_json").is_none());
+            }
+            return;
+        }
+        let executable = std::env::current_exe().unwrap();
+        for mode in ["url", "profile", "model"] {
+            let mut child = Command::new(&executable);
+            child
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_MODE, mode);
+            for key in ConfigField::ALL
+                .into_iter()
+                .filter_map(ConfigField::env_override)
+            {
+                child.env_remove(key);
+            }
+            child
+                .env_remove("MOYAI_PROVIDER_METADATA_MODE")
+                .env_remove("MOYAI_PROVIDER_API_MODE");
+            if mode == "profile" {
+                child.env("MOYAI_PROVIDER_PROFILE", "openai_responses");
+            } else {
+                child.env("MOYAI_BASE_URL", "https://new.example.test/v1");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

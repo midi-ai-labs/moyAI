@@ -46,6 +46,9 @@ pub struct SessionRuntimeEventSubscription {
 pub trait RunEventSink {
     fn emit(&mut self, event: RunEvent) -> Result<(), RuntimeError>;
 
+    /// Best-effort private evidence. Renderers and canonical history ignore this channel.
+    fn record_compaction_diagnostic(&mut self, _diagnostic: &super::CompactionDiagnostic) {}
+
     fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
         None
     }

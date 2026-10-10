@@ -90,35 +90,26 @@ function liveChatCaptures() {
     "Exit code: 0",
     "1 passed in 0.10s",
   ].join("\n");
+  const executableArguments = JSON.parse(elevated.tool_calls[0].function.arguments);
+  delete executableArguments.description;
+  delete executableArguments.justification;
   const guardianPayload = {
-    trusted_world_state: { schema_version: "fixture.v1" },
-    task_context: JSON.stringify({
-      authority_session_id: SESSION_ID,
-      canonical_user_authority: [{
-        kind: "user_turn",
-        history_item_id: TURN_ID,
-        text: PERMISSION_TEMP_ESCALATION_LIVE_PROMPT,
-      }],
-    }),
-    recent_committed_response: {
-      response_id: "response-live-chat-elevated",
-      assistant_text: "",
-      tool_request: {
-        call_id: elevatedId,
-        tool_name: "shell",
-        arguments_json: elevated.tool_calls[0].function.arguments,
-      },
-      prior_committed_tool_results: [],
-    },
-    permission_request: {
+    tool_request: { tool_name: "shell", arguments: executableArguments },
+    execution_facts: {
+      workspace_root: "C:/fixture/workspace",
       access: "shell",
-      summary: "exact elevated retry",
-      details: [`Requested sandbox elevation: ${PERMISSION_TEMP_ESCALATION_JUSTIFICATION}`],
-      targets: ["C:/fixture/workspace"],
       outside_workspace: true,
+      targets: ["C:/fixture/workspace"],
       risks: [],
+      process_sandbox_after_approval: "unrestricted",
     },
-    action_evidence: { kind: "permission_request" },
+    action_evidence: {
+      kind: "shell_execution",
+      shell_family: "power_shell",
+      cwd: "C:/fixture/workspace",
+      executable_candidates: ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"],
+      arguments: ["-NoProfile", "-Command", executableArguments.command],
+    },
   };
   return [
     { body: taskBody([system, user]) },
