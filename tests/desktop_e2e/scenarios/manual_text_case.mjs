@@ -14,6 +14,7 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
   observationTimeoutMs = 15 * 60 * 1000 }) {
   const stem = id.replace(/^manual\./, "");
   const owner = `scenario:${id}`;
+  const caseTimeoutMs = options.observationTimeoutMs ?? observationTimeoutMs;
   const state = { steps: [], baseline: null, live: null, cleanup: null, quiesced: false };
   return Object.freeze({ id, productOracle: "pass", manualGate: "pending", databaseRequired: true, requestGracefulExit,
     async prepare({ context, sink, phase }) {
@@ -24,7 +25,7 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
       await prepareWorkspace({ context, sink, options, owner, stem, spec: spec.toString("utf8"), phase });
       state.baseline = await manualLiveGeneratedFiles(context, sink, `${stem}/baseline`, outputs);
       await sink.record(`${stem}-input`, { options, spec: { path: specPath, sha256: crypto.createHash("sha256").update(spec).digest("hex") },
-        requests: state.steps, baseline: state.baseline, observation_timeout_ms: observationTimeoutMs,
+        requests: state.steps, baseline: state.baseline, observation_timeout_ms: caseTimeoutMs,
         provider_lifecycle: "external-unmanaged", provider_owned: false }, { phase, owner });
     },
     async execute({ context, driver, sink }) {
@@ -36,7 +37,7 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
           || initial.provider_effective_model_id !== options.model || initial.provider_effective_api_key_env !== options.apiKeyEnv
           || Number(initial.provider_effective_context_window) !== 131072) throw new DesktopE2eError("product", `${stem}-provider-config`, "effective provider differs from explicit manual inputs", {});
         await beforeStages({ context, driver, sink, options, owner, stem });
-        state.live = new ManualLiveSession({ context, driver, sink, options, owner, stem, capturePaths: outputs });
+        state.live = new ManualLiveSession({ context, driver, sink, options, owner, stem, capturePaths: outputs, observationTimeoutMs: caseTimeoutMs });
         await state.live.open();
         const acquired = [];
         const failures = [];
@@ -44,7 +45,7 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
         let last = null;
         let previous = state.baseline;
         for (const step of state.steps) {
-          const result = await state.live.send(step.prompt, { stage: step.name, timeoutMs: observationTimeoutMs });
+          const result = await state.live.send(step.prompt, { stage: step.name });
           last = result;
           const projection = result.terminal.projection;
           const sessionId = projection.run_target?.sessionId;
@@ -65,15 +66,18 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
           if (result.incomplete) break;
           if (manualLiveTerminalDecision(result.terminal) !== "completed") { failures.push(`${step.name}:desktop-terminal-not-completed`); break; }
           if (failures.length) break;
-          failures.push(...await checkStage({ context, sink, options, owner, stem, step, row, baseline: state.baseline, previous, generated }));
+          failures.push(...await checkStage({ context, sink, options, owner, stem, step, row, baseline: state.baseline, previous, generated,
+            observationBudget: state.live.observationBudget }));
+          state.live.observationBudget.assertRemaining(`${stem} ${step.name} verification`);
           previous = generated;
           if (failures.length) break;
         }
         const transcript = await manualLiveExportTranscript({ context, input: state.live.input, sink, owner, stem,
-          sessionId: firstSession, prompt: state.steps[0].prompt });
+          sessionId: firstSession, prompt: state.steps[0].prompt, observationBudget: state.live.observationBudget });
+        state.live.observationBudget.assertRemaining(`${stem} case completion`);
         const summary = { schema_version: "desktop-e2e.manual-text-case.v1", scenario: id, approval_mode: options.approvalMode,
           machine_gate: last.incomplete ? "operator_review_incomplete" : failures.length ? "fail" : "pass",
-          stages: acquired, transcript, failures, manual_review: manualReview, manual_verdict: "pending",
+          stages: acquired, transcript, failures, observation_budget: state.live.observationBudget.snapshot(), manual_review: manualReview, manual_verdict: "pending",
           external_verification: last.incomplete || failures.some(value => value.includes("desktop-terminal")) ? "not_reached" : "see_stage_evidence",
           provider_cleanup: "none_external_unmanaged", workspace_outside_scope: "manual_public_evidence_review_pending" };
         await sink.writeJson(`${stem}/summary.json`, summary);

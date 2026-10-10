@@ -359,9 +359,9 @@ export async function waitForProductStage({ label, timeoutMs = 30_000, sample, a
   }
 }
 
-export async function trustedClick(input, locator) {
+export async function trustedClick(input, locator, acquisitionOptions) {
   const start = (await input.snapshotProbe()).sequence;
-  const target = await input.click(locator);
+  const target = await input.click(locator, acquisitionOptions);
   const snapshot = await input.snapshotProbe(start);
   return {
     target,

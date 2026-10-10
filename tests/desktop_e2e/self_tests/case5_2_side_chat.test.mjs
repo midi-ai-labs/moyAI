@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ManualObservationBudget } from "../core/deadline.mjs";
 
 import {
   case52Stage5ActiveContextMatches,
@@ -146,7 +147,7 @@ function completedTerminalSurface({ staleDom = false, answer = ANSWER } = {}) {
   return completed;
 }
 
-function terminalDomExecution(observeTerminal, { timeoutMs = 20_000 } = {}) {
+function terminalDomExecution(observeTerminal, { timeoutMs = 20_000, observationBudgetFactory = null } = {}) {
   const state = {
     phase: "ready",
     now: 1_000,
@@ -155,10 +156,12 @@ function terminalDomExecution(observeTerminal, { timeoutMs = 20_000 } = {}) {
     observations: 0,
     removed: false,
   };
+  const observationBudget = observationBudgetFactory?.(state) ?? null;
   const run = () => executeCase52SideChatStage({
     cdp: {}, input: {}, sink: { async record() {}, async writeJson() { return {}; } },
     sessionId: SESSION, providerProfile: PROFILE, providerBaseUrl: BASE_URL, model: MODEL,
-    promptInput: { text: QUESTION }, timeoutMs,
+    promptInput: { text: QUESTION }, timeoutMs: observationBudget === null ? timeoutMs : Math.max(1, observationBudget.remainingMs()),
+    observationBudget,
   }, {
     now: () => state.now,
     sleep: async (milliseconds) => {
@@ -177,7 +180,8 @@ function terminalDomExecution(observeTerminal, { timeoutMs = 20_000 } = {}) {
       assert.equal(await accept(value), true);
       return { value };
     },
-    click: async (_input, locator) => {
+    click: async (_input, locator, acquisitionOptions) => {
+      acquisitionOptions?.beforeDispatch?.();
       if (locator.identity.action === "send-side-chat") {
         state.phase = "terminal";
         state.calls.push({
@@ -748,6 +752,61 @@ test("executeCase52SideChatStage waits for bounded Side DOM settlement after can
   assert.deepEqual(state.sleeps, [500, 500]);
   assert.equal(state.observations, 3);
   assert.equal(state.removed, true);
+});
+
+test("Stage5 consumes the remaining case budget without restarting it after earlier stages", async () => {
+  let budget;
+  const { run, state } = terminalDomExecution(() => completedTerminalSurface({ staleDom: true }), {
+    observationBudgetFactory: (current) => {
+      budget = new ManualObservationBudget({ timeoutMs: 1_800, now: () => current.now });
+      current.now = 0;
+      budget.beginOnce();
+      current.now = 1_000;
+      return budget;
+    },
+  });
+  await assert.rejects(run, (error) => error.code === "manual-observation-timeout");
+  assert.deepEqual(state.sleeps, [500, 300]);
+  assert.equal(budget.snapshot().deadline_ms, 1_800);
+  assert.equal(state.now, 1_800);
+  assert.equal(state.calls.length, 1);
+  assert.equal(state.removed, true);
+});
+
+test("an explicit case budget permits Stage5 observation beyond its omitted-option one-hour ceiling", async () => {
+  const { run, state } = terminalDomExecution((_index, current) => {
+    current.now = 3_661_000;
+    return completedTerminalSurface();
+  }, {
+    observationBudgetFactory: (current) => {
+      const budget = new ManualObservationBudget({ timeoutMs: 7_200_000, now: () => current.now });
+      current.now = 0;
+      budget.beginOnce();
+      current.now = 1_000;
+      return budget;
+    },
+  });
+  const result = await run();
+  assert.equal(result.answer, ANSWER);
+  assert.equal(state.now, 3_661_000);
+  assert.equal(state.calls.length, 1);
+  assert.equal(state.removed, true);
+});
+
+test("an exhausted case budget rejects Stage5 before a Side request or probe is created", async () => {
+  const { run, state } = terminalDomExecution(() => completedTerminalSurface(), {
+    observationBudgetFactory: (current) => {
+      const budget = new ManualObservationBudget({ timeoutMs: 1_000, now: () => current.now });
+      current.now = 0;
+      budget.beginOnce();
+      current.now = 1_000;
+      return budget;
+    },
+  });
+  await assert.rejects(run, (error) => error.code === "manual-observation-timeout");
+  assert.deepEqual(state.calls, []);
+  assert.deepEqual(state.sleeps, []);
+  assert.equal(state.removed, false);
 });
 
 test("executeCase52SideChatStage bounds a persistent completed-canonical Side DOM mismatch", async () => {

@@ -571,8 +571,12 @@ function validateArguments(options) {
     throw new TypeError("case5_2 Stage5 promptInput.text is required");
   }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > DEFAULT_TIMEOUT_MS) {
-    throw new TypeError("case5_2 Stage5 timeoutMs must be between 1000 and 3600000");
+  const sharedBudget = options.observationBudget !== undefined && options.observationBudget !== null;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < (sharedBudget ? 1 : 1_000)
+    || timeoutMs > (sharedBudget ? 7_200_000 : DEFAULT_TIMEOUT_MS)) {
+    throw new TypeError(sharedBudget
+      ? "case5_2 Stage5 timeoutMs must be a positive remaining case budget up to 7200000"
+      : "case5_2 Stage5 timeoutMs must be between 1000 and 3600000");
   }
   const evidenceName = options.evidenceName ?? "case5_2-stage5";
   if (!EVIDENCE_NAME.test(evidenceName)) throw new TypeError("case5_2 Stage5 evidenceName is invalid");
@@ -606,23 +610,27 @@ export async function executeCase52SideChatStage(options, injected = {}) {
     cdp, input, sink, sessionId, providerProfile, providerBaseUrl, model, promptInput,
     commandProbe: suppliedCommandProbe = null,
     apiKeyEnv = "",
+    observationBudget = null,
   } = options;
   const submittedQuestion = promptInput.text.trim();
   const dependencies = { ...defaultDependencies(cdp), ...injected };
   const started = dependencies.now();
   const deadline = started + timeoutMs;
+  const remaining = (ceiling) => observationBudget?.assertRemaining("case5_2 Stage5", Math.min(ceiling, Math.max(1, deadline - dependencies.now())))
+    ?? Math.min(ceiling, Math.max(1, deadline - dependencies.now()));
   let commandProbe = suppliedCommandProbe;
   let ownsCommandProbe = false;
   let primaryError = null;
   let cleanupError = null;
   let outcome = null;
   try {
+    observationBudget?.assertRemaining("case5_2 Stage5 preparation");
     let initial = await dependencies.observe();
     if (!initial?.side?.pane_visible) {
       await dependencies.click(input, SHOW_SIDE);
       initial = (await dependencies.waitForStage({
         label: "case5_2 Stage5 Side Chat pane",
-        timeoutMs: Math.min(30_000, Math.max(1, deadline - dependencies.now())),
+        timeoutMs: remaining(30_000),
         sample: dependencies.observe,
         accept: (surface) => surface?.side?.pane_count === 1 && surface.side.pane_visible === true,
         code: "case5_2-stage5-side-pane",
@@ -648,7 +656,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
     await dependencies.insert(input, SIDE_PROMPT, promptInput.text);
     const drafted = (await dependencies.waitForStage({
       label: "case5_2 Stage5 Side question draft",
-      timeoutMs: Math.min(30_000, Math.max(1, deadline - dependencies.now())),
+      timeoutMs: remaining(30_000),
       sample: dependencies.observe,
       accept: (surface) => case52Stage5MainMatches(surface, main)
         && surface?.projection?.side_chat?.draft_text === promptInput.text
@@ -678,11 +686,14 @@ export async function executeCase52SideChatStage(options, injected = {}) {
       ownsCommandProbe = true;
     }
     const commandStart = (await commandProbe.snapshot()).sequence;
+    observationBudget?.assertRemaining("case5_2 Stage5 Side Send");
     const sendStarted = dependencies.now();
-    const send = await dependencies.click(input, SIDE_SEND);
+    const send = await dependencies.click(input, SIDE_SEND, {
+      beforeDispatch: () => observationBudget?.assertRemaining("case5_2 Stage5 Side Send"),
+    });
     const admittedCommand = await dependencies.waitForStage({
       label: "case5_2 Stage5 exact Side submit command",
-      timeoutMs: Math.min(COMMAND_ADMISSION_TIMEOUT_MS, Math.max(1, deadline - dependencies.now())),
+      timeoutMs: remaining(COMMAND_ADMISSION_TIMEOUT_MS),
       sample: () => commandProbe.snapshot(commandStart),
       accept: (snapshot) => Array.isArray(snapshot?.calls) && snapshot.calls.length >= 1,
       code: "case5_2-stage5-submit-command",
@@ -711,7 +722,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
     let terminalDomSettleMs = 0;
     let lastTerminalDomMismatch = null;
     let nextProgressAt = sendStarted + PROGRESS_EVIDENCE_MS;
-    while (dependencies.now() < deadline) {
+    while (dependencies.now() < deadline && observationBudget?.expired !== true) {
       if (terminalDomSettleStarted !== null
         && dependencies.now() - terminalDomSettleStarted >= TERMINAL_DOM_SETTLE_GRACE_MS) {
         throw terminalDomSettleFailure(
@@ -723,12 +734,13 @@ export async function executeCase52SideChatStage(options, injected = {}) {
       const terminalDomDeadline = terminalDomSettleStarted === null
         ? deadline
         : Math.min(deadline, terminalDomSettleStarted + TERMINAL_DOM_SETTLE_GRACE_MS);
-      const remaining = Math.max(1, terminalDomDeadline - dependencies.now());
+      const attemptRemaining = remaining(Math.max(1, terminalDomDeadline - dependencies.now()));
       const surface = await attemptBeforeDeadline(
         dependencies.observe,
-        Math.min(MAX_OBSERVATION_ATTEMPT_MS, remaining),
+        Math.min(MAX_OBSERVATION_ATTEMPT_MS, attemptRemaining),
         "case5_2 Stage5 Side Chat observation",
       );
+      observationBudget?.assertRemaining("case5_2 Stage5 response observation");
       if (!case52Stage5MainMatches(surface, main)) {
         throw productFailure(
           "case5_2-stage5-main-owner-drift",
@@ -792,7 +804,7 @@ export async function executeCase52SideChatStage(options, injected = {}) {
           beforeSend,
           surface,
           leaks,
-          remainingMs: Math.max(1, deadline - dependencies.now()),
+          remainingMs: remaining(LEAK_STOP_TIMEOUT_MS),
         });
       }
       if (["failed", "cancelled"].includes(side?.status) || (side?.last_error ?? "") !== "") {
@@ -853,9 +865,10 @@ export async function executeCase52SideChatStage(options, injected = {}) {
       const sleepDeadline = terminalDomSettleStarted === null
         ? deadline
         : Math.min(deadline, terminalDomSettleStarted + TERMINAL_DOM_SETTLE_GRACE_MS);
-      await dependencies.sleep(Math.min(POLL_MS, Math.max(1, sleepDeadline - dependencies.now())));
+      await dependencies.sleep(remaining(Math.min(POLL_MS, Math.max(1, sleepDeadline - dependencies.now()))));
     }
     if (terminal === null) {
+      observationBudget?.assertRemaining("case5_2 Stage5 terminal observation");
       if (terminalDomSettleStarted !== null) {
         throw terminalDomSettleFailure(
           lastTerminalDomMismatch,

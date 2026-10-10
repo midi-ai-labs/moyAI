@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { lstat, readFile, readdir } from "node:fs/promises";
-import { waitForObservation } from "../core/deadline.mjs";
+import { waitForObservation, ManualObservationBudget, normalizeManualObservationTimeout } from "../core/deadline.mjs";
 import { canonicalU64, canonicalUlid, canonicalWorkspace } from "../core/canonical_identity.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { WebviewInput, assertTrustedProbeSequence, assertTrustedTextInsertion } from "./webview_input.mjs";
@@ -39,7 +39,7 @@ export function manualLivePrompt(spec) { return manualLiveSection(spec, "Canonic
 export function normalizeManualLiveOptions(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new TypeError("manual scenario requires explicit options");
   const allowed = new Set(["provider_base_url", "model", "api_key_env", "python_executable", "approval_mode",
-    "side_model", "side_api_key_env", "approve_model", "approve_api_key_env", "access_mode"]);
+    "side_model", "side_api_key_env", "approve_model", "approve_api_key_env", "access_mode", "observation_timeout_ms"]);
   if (Object.keys(raw).some(key => !allowed.has(key))) throw new TypeError("unknown manual scenario option");
   const url = new URL(raw.provider_base_url);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash
@@ -66,8 +66,10 @@ export function normalizeManualLiveOptions(raw) {
   if (!["stop", "operator"].includes(approvalMode)) throw new TypeError("approval_mode must be stop or operator");
   const accessMode = raw.access_mode === undefined ? "default" : raw.access_mode;
   if (!["default", "auto_review", "full_access"].includes(accessMode)) throw new TypeError("access_mode must be default, auto_review, or full_access");
+  const observationTimeoutMs = normalizeManualObservationTimeout(raw.observation_timeout_ms);
   return Object.freeze({ providerBaseUrl: url.href.replace(/\/$/, ""), model: raw.model, apiKeyEnv,
-    pythonExecutable: raw.python_executable, approvalMode, accessMode, ...roles });
+    pythonExecutable: raw.python_executable, approvalMode, accessMode, ...roles,
+    ...(observationTimeoutMs === undefined ? {} : { observationTimeoutMs }) });
 }
 
 export function manualLiveFixtureConfig(options) {
@@ -195,9 +197,14 @@ export function manualLivePermissionLocator(request, decision) {
     identity: { tag: "BUTTON", action, focusKey: `permission:${request.confirmation_id}:${focusAction}` } };
 }
 
-export async function manualLiveClick(input, locator, sink, action, { owner = "scenario:manual.case1", stem = "case1" } = {}) {
+export async function manualLiveClick(input, locator, sink, action, { owner = "scenario:manual.case1", stem = "case1", observationBudget = null } = {}) {
   const before = await input.snapshotProbe();
-  const target = await input.click(locator);
+  const beforeDispatch = observationBudget !== null && ["send", "approve-permission"].includes(locator.identity.action)
+    ? () => {
+      if (locator.identity.action === "send") observationBudget.beginOnce();
+      observationBudget.assertRemaining(action);
+    } : null;
+  const target = await input.click(locator, beforeDispatch === null ? undefined : { beforeDispatch });
   const events = assertTrustedProbeSequence(await input.snapshotProbe(before.sequence), {
     afterSequence: before.sequence, expected: [{ type: "click", identity: locator.identity }] });
   const result = { action, target, events };
@@ -226,7 +233,7 @@ export async function manualLiveGeneratedFiles(context, sink, evidenceStem = "ca
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-export async function manualLiveExternalProcess({ context, sink, options, label, args, owner = "scenario:manual.case1", stem = "case1", phase = "executing" }) {
+export async function manualLiveExternalProcess({ context, sink, options, label, args, owner = "scenario:manual.case1", stem = "case1", phase = "executing", observationBudget = null }) {
   const stdoutPath = path.join(context.paths.logs, `${label}.stdout.log`);
   const stderrPath = path.join(context.paths.logs, `${label}.stderr.log`);
   const excluded = ["temp", "tmp", "tmpdir", options.apiKeyEnv, options.sideApiKeyEnv, options.approveApiKeyEnv]
@@ -234,7 +241,8 @@ export async function manualLiveExternalProcess({ context, sink, options, label,
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !excluded.includes(key.toLowerCase())));
   Object.assign(env, { PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1", TEMP: context.paths.logs, TMP: context.paths.logs, TMPDIR: context.paths.logs });
   const result = await runWindowsExternalProcess({ executionRoot: context.root, executable: options.pythonExecutable, args,
-    cwd: context.paths.workspace, env, stdoutPath, stderrPath, timeoutMs: 120_000, maxOutputBytes: MAX_OUTPUT_BYTES, label });
+    cwd: context.paths.workspace, env, stdoutPath, stderrPath,
+    timeoutMs: observationBudget?.assertRemaining(label, 120_000) ?? 120_000, maxOutputBytes: MAX_OUTPUT_BYTES, label });
   const captures = await Promise.all([[stdoutPath, result.output.stdout], [stderrPath, result.output.stderr]].map(async ([candidate, expected]) => {
     const bytes = await readFile(candidate);
     if (bytes.length !== expected.size_bytes || sha256(bytes) !== expected.sha256) throw new DesktopE2eError("harness", "case1-external-output-changed", "external output changed after Job settlement", { candidate });
@@ -252,7 +260,7 @@ export function manualLiveManifestDiff(before, after) {
       || old.get(name).size_bytes !== next.get(name).size_bytes || old.get(name).symbolic_link !== next.get(name).symbolic_link).sort();
 }
 
-export async function manualLiveExportTranscript({ context, input, sink, sessionId, prompt, owner = "scenario:manual.case1", stem = "case1" }) {
+export async function manualLiveExportTranscript({ context, input, sink, sessionId, prompt, owner = "scenario:manual.case1", stem = "case1", observationBudget = null }) {
   const directory = path.join(context.paths.workspace, ".moyai", "transcript-exports");
   const list = async () => {
     try {
@@ -262,8 +270,9 @@ export async function manualLiveExportTranscript({ context, input, sink, session
     } catch (error) { if (error.code === "ENOENT") return []; throw error; }
   };
   if ((await list()).length !== 0) throw failure("case1-export-not-fresh", "fresh workspace already contains transcript exports", {});
+  observationBudget?.assertRemaining("Manual transcript export");
   await manualLiveClick(input, EXPORT, sink, "export-transcript", { owner, stem });
-  const observed = await waitForObservation({ label: "Manual transcript export", timeoutMs: 10_000, pollMs: 100,
+  const observed = await waitForObservation({ label: "Manual transcript export", timeoutMs: observationBudget?.assertRemaining("Manual transcript export", 10_000) ?? 10_000, pollMs: 100,
     retrySampleErrors: false, sample: list, accept: rows => rows.length === 1 });
   const candidate = path.join(directory, observed.value[0].name);
   const bytes = await readFile(candidate);
@@ -272,8 +281,11 @@ export async function manualLiveExportTranscript({ context, input, sink, session
 }
 
 export class ManualLiveSession {
-  constructor({ context, driver, sink, options, owner, stem, capturePaths = ["calculator.py", "test_calculator.py"] }) {
+  constructor({ context, driver, sink, options, owner, stem, capturePaths = ["calculator.py", "test_calculator.py"],
+    observationTimeoutMs = 15 * 60 * 1000, now = () => Date.now(), operatorReview = waitForOperatorReview }) {
     Object.assign(this, { context, driver, sink, options, owner, stem, capturePaths, input: null, commands: null, lastTerminal: null });
+    this.observationBudget = new ManualObservationBudget({ timeoutMs: options.observationTimeoutMs ?? observationTimeoutMs, now });
+    this.operatorReview = operatorReview;
   }
   async open() {
     const initial = await observeProviderTurnSurface(this.driver);
@@ -287,15 +299,16 @@ export class ManualLiveSession {
     this.commands = new DesktopCommandProbe(this.driver, { probeId: `manual-${this.stem}-permission`, commands: ["answer_permission", "cancel_run"] });
     await this.commands.install();
   }
-  async send(prompt, { stage = null, timeoutMs = 15 * 60 * 1000 } = {}) {
+  async send(prompt, { stage = null } = {}) {
     const { context, driver: cdp, sink, options, owner: OWNER } = this;
     const prefix = stage === null ? this.stem : `${this.stem}-${stage}`;
     const state = { input: this.input, commands: this.commands, prompt };
     const previousTurnId = this.lastTerminal?.run_target?.expectedState?.latestTurnId ?? null;
-    const click = (...args) => manualLiveClick(...args, { owner: this.owner, stem: prefix });
+    const click = (...args) => manualLiveClick(...args, { owner: this.owner, stem: prefix, observationBudget: this.observationBudget });
     const generatedFiles = (...args) => manualLiveGeneratedFiles(...args, this.capturePaths);
+    this.observationBudget.assertRemaining(`${prefix} next request`);
     if (this.lastTerminal !== null) {
-      await waitForObservation({ label: "Manual continuation composer settles", timeoutMs: 10000, retrySampleErrors: false,
+      await waitForObservation({ label: "Manual continuation composer settles", timeoutMs: this.observationBudget.assertRemaining("Manual continuation composer settles", 10000), retrySampleErrors: false,
         sample: () => observeRunNextTurnSurface(cdp), accept: value => settledComposer(value)
           && value.projection.run_target.sessionId === this.lastTerminal.run_target.sessionId });
     }
@@ -303,11 +316,11 @@ export class ManualLiveSession {
         const before = await state.input.snapshotProbe();
         await state.input.insertText(PROMPT, state.prompt);
         const typing = assertTrustedTextInsertion(await state.input.snapshotProbe(before.sequence), { afterSequence: before.sequence, identity: PROMPT.identity, text: state.prompt });
-        await waitForObservation({ label: `${prefix} prompt ready`, timeoutMs: 10_000, retrySampleErrors: false, sample: () => observeProviderTurnSurface(cdp), accept: value => value.prompt?.value === state.prompt && value.send?.enabled === true });
+        await waitForObservation({ label: `${prefix} prompt ready`, timeoutMs: this.observationBudget.assertRemaining(`${prefix} prompt ready`, 10_000), retrySampleErrors: false, sample: () => observeProviderTurnSurface(cdp), accept: value => value.prompt?.value === state.prompt && value.send?.enabled === true });
+        this.observationBudget.assertRemaining(`${prefix} Send`);
         const send = await click(state.input, SEND, sink, "send-canonical-prompt");
         await captureScenarioScreenshot({ cdp, sink, name: `${prefix}-request-sent`, owner: OWNER });
-        await sink.record(`${prefix}-prompt-sent`, { typing, send, prompt: state.prompt }, { phase: "executing", owner: OWNER });
-        const turnDeadline = Date.now() + timeoutMs;
+        await sink.record(`${prefix}-prompt-sent`, { typing, send, prompt: state.prompt, observation_budget: this.observationBudget.snapshot() }, { phase: "executing", owner: OWNER });
         let firstRenderDiscrepancyAt = null;
         const renderEvidence = surface => ({
           projection: { run_target: surface.projection.run_target,
@@ -332,11 +345,12 @@ export class ManualLiveSession {
         }, { phase: "executing", owner: OWNER });
         const waitTerminal = async previousId => {
           const observed = await waitForObservation({ label: `${prefix} completion or review request`,
-            timeoutMs: Math.max(1, turnDeadline - Date.now()), pollMs: 500, retrySampleErrors: false,
+            timeoutMs: this.observationBudget.assertRemaining(`${prefix} completion or review request`), pollMs: 500, retrySampleErrors: false,
             sample: () => sampleTerminal(value => manualLiveProjectionTerminalDecision(value) === "completed"
               && value.projection.run_target.expectedState.latestTurnId !== previousTurnId),
             accept: value => manualLiveTurnObservationReady(value,
               { previousConfirmationId: previousId, previousTurnId }) });
+          this.observationBudget.assertRemaining(`${prefix} acquired terminal or review request`);
           if (manualLiveTerminalDecision(observed.value) === "completed") await recordRenderedSettlement(observed.value);
           return observed;
         };
@@ -361,13 +375,13 @@ export class ManualLiveSession {
           approvals.push(item);
           await sink.record("case1-approval-awaiting-review", item, { phase: "executing", owner: OWNER });
           const reviewed = options.approvalMode === "operator"
-            ? await waitForOperatorReview(request, { timeoutMs: Math.min(5 * 60 * 1000, Math.max(1, turnDeadline - Date.now())),
+            ? await this.operatorReview(request, { timeoutMs: this.observationBudget.assertRemaining(`${prefix} operator review`, 5 * 60 * 1000),
               evidence: { request: evidence, pending: pendingEvidence, screenshot } })
             : { status: "not_decided", reason: "default-stop" };
           item.operator_review = reviewed;
           const current = await observeProviderTurnSurface(cdp);
           if (operatorRequestFingerprint(manualLivePermissionRequest(current.projection)) !== requestSha256) throw new DesktopE2eError("harness", "case1-review-stale", "reviewed permission request or owner changed before GUI decision", { request, current });
-          const decision = reviewed.status === "decided" ? reviewed.decision : "stop";
+          const decision = !this.observationBudget.expired && reviewed.status === "decided" ? reviewed.decision : "stop";
           const locator = manualLivePermissionLocator(request, decision);
           await click(state.input, locator, sink, `operator-${decision}-permission`);
           const commandsAfter = await waitForObservation({ label: "Case1 exact permission GUI command", timeoutMs: 5000, retrySampleErrors: false,
@@ -384,7 +398,7 @@ export class ManualLiveSession {
           await sink.record("case1-approval-decision", item, { phase: "executing", owner: OWNER });
           if (decision === "approve") { observed = await waitTerminal(request.confirmation_id); continue; }
           approval = true;
-          reviewStopReason = reviewed.status === "decided" ? `operator-${decision}` : reviewed.reason;
+          reviewStopReason = this.observationBudget.expired ? "observation-timeout" : reviewed.status === "decided" ? `operator-${decision}` : reviewed.reason;
           observed = await waitForObservation({ label: `${prefix} operator Stop terminal`, timeoutMs: 30_000, pollMs: 100,
             retrySampleErrors: false, sample: () => sampleTerminal(value => manualLiveStopOwnerReady(value, request)),
             accept: value => manualLiveStopObservationReady(value, request) });
@@ -397,9 +411,16 @@ export class ManualLiveSession {
     return { terminal, approvals, incomplete: approval, incompleteReason: reviewStopReason };
   }
   async close() {
+    const observation = { ...this.observationBudget.snapshot(), status: this.observationBudget.expired ? "timed_out_incomplete" : "within_budget" };
+    let observationError = null;
+    try {
+      await this.sink.writeJson(`${this.stem}/observation-budget.json`, observation);
+      await this.sink.record(`${this.stem}-observation-budget`, observation, { phase: "executing", owner: this.owner });
+    } catch (error) { observationError = error; }
     const result = { input: null, commands: null };
     if (this.commands !== null) { try { result.commands = await this.commands.remove(); } catch (error) { result.commands = { failure: error.message }; } }
     if (this.input !== null) { try { result.input = await this.input.cleanup(); } catch (error) { result.input = { failure: error.message }; } }
+    if (observationError !== null) throw observationError;
     return result;
   }
 }

@@ -21,7 +21,7 @@ const SPEC = fileURLToPath(new URL("../../manual_ST/case2/spec.md", import.meta.
 const CONTRACT = fileURLToPath(new URL("../../manual_ST/case2/scenario_contract.md", import.meta.url));
 const ACL_SCRIPT = fileURLToPath(new URL("../drivers/manual_case2_capture.ps1", import.meta.url));
 const OUTPUTS = ["space_invader.py", "test_space_invader.py", "README.md"];
-const TURN_TIMEOUT_MS = 30 * 60 * 1000;
+const CASE_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const fail = (code, message, evidence = {}) => new DesktopE2eError("product", code, message, evidence);
@@ -181,7 +181,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
       state.image = { source_path: options.imageSource, source_filename: path.basename(options.imageSource), workspace_path: imagePath,
         workspace_filename: imageName, size_bytes: image.length, sha256: sha256(image) };
       state.baseline = await manualLiveGeneratedFiles(context, sink, "case2/baseline", ["scenario_contract.md", imageName]);
-      await sink.record("case2-input", { options, prompt: state.prompt, image: state.image, baseline: state.baseline, observation_timeout_ms: TURN_TIMEOUT_MS,
+      await sink.record("case2-input", { options, prompt: state.prompt, image: state.image, baseline: state.baseline, observation_timeout_ms: options.observationTimeoutMs ?? CASE_TIMEOUT_MS,
         spec: { path: SPEC, sha256: sha256(spec) }, contract: { path: CONTRACT, sha256: sha256(contract) },
         model_capability: "unknown_unless_separate_provider_metadata_proves_support", runtime_image_policy: "existing_default_supports_images_true",
         provider_lifecycle: "external-unmanaged", provider_owned: false }, { phase, owner: OWNER });
@@ -195,7 +195,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
           || p.provider_effective_model_id !== options.model || p.provider_effective_api_key_env !== options.apiKeyEnv
           || Number(p.provider_effective_context_window) !== 131072) throw fail("case2-provider-config", "effective provider differs from explicit inputs");
         state.live = new ManualLiveSession({ context, driver: cdp, sink, options, owner: OWNER, stem: "case2",
-          capturePaths: [...OUTPUTS, "scenario_contract.md", state.image.workspace_filename] });
+          capturePaths: [...OUTPUTS, "scenario_contract.md", state.image.workspace_filename], observationTimeoutMs: CASE_TIMEOUT_MS });
         await state.live.open();
         state.nativeOwner = { executionRoot: context.root, ownerPath: runtime.desktop_owner_path, expectedOwner: runtime.desktop_owner };
         await manualLiveClick(state.live.input, action("toggle-attachment-tray"), sink, "open-attachment-tray", { owner: OWNER, stem: "case2" });
@@ -224,7 +224,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
         await sink.writeJson("case2/attachment.json", { selection, image: state.image, projection: attached.value.projection });
         await captureScenarioScreenshot({ cdp, sink, name: "case2-image-attached", owner: OWNER });
         const expectedUserBody = `${state.prompt}\n${attachedPath} (${state.image.size_bytes} bytes)`;
-        const live = await state.live.send(state.prompt, { timeoutMs: TURN_TIMEOUT_MS });
+        const live = await state.live.send(state.prompt);
         const projection = live.terminal.projection;
         await sink.writeJson("case2/final-projection.json", live.terminal);
         await captureScenarioScreenshot({ cdp, sink, name: "case2-terminal", owner: OWNER });
@@ -251,17 +251,19 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
         if (!live.incomplete) {
           for (const name of OUTPUTS) if (!generated.some(row => row.path === name && row.source !== null && row.symbolic_link !== true)) failures.push(`missing-${name}`);
           if (!failures.length) for (const [label, args] of [["case2-pycompile", ["-m", "py_compile", "space_invader.py"]], ["case2-unittest", ["-m", "unittest"]]]) {
-            const result = await manualLiveExternalProcess({ context, sink, options, owner: OWNER, stem: "case2", label, args });
+            const result = await manualLiveExternalProcess({ context, sink, options, owner: OWNER, stem: "case2", label, args, observationBudget: state.live.observationBudget });
             const verdict = label === "case2-unittest" ? manualLiveUnittestResult(result.result, result.stdout, result.stderr)
               : { exit_code: result.result.outcome.root_exit_code, pass: result.result.outcome.root_exit_code === 0 };
             external.push({ label, ...verdict });
             if (!verdict.pass) { failures.push(`${label}-failed-or-empty`); break; }
           }
         }
-        const transcript = await manualLiveExportTranscript({ context, input: state.live.input, sink, owner: OWNER, stem: "case2", sessionId, prompt: expectedUserBody });
+        const transcript = await manualLiveExportTranscript({ context, input: state.live.input, sink, owner: OWNER, stem: "case2", sessionId, prompt: expectedUserBody, observationBudget: state.live.observationBudget });
+        state.live.observationBudget.assertRemaining("case2 case completion");
         const summary = { schema_version: "desktop-e2e.manual-case2.v1", mode: "case2c", image: state.image,
           machine_gate: live.incomplete ? "operator_review_incomplete" : failures.length ? "fail" : "pass",
           incomplete_reason: live.incompleteReason, approvals: live.approvals, history, generated, transcript, prepared_requests: capture,
+          observation_budget: state.live.observationBudget.snapshot(),
           external_verification: external, diagnostics, failures, model_capability: "unknown_unless_separate_provider_metadata_proves_support",
           provider_selected_model_summary: p.provider_selected_model_summary ?? [], manual_verdict: "pending",
           manual_review: ["Read source/test/README against every public contract requirement; generated tests alone do not prove compliance.",

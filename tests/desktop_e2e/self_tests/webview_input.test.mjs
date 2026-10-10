@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ManualObservationBudget } from "../core/deadline.mjs";
 
 import {
   WebviewInput,
@@ -212,6 +213,41 @@ test("pointer press and release use the exact semantic center and remain separat
     modifiers: 0,
   });
   await assert.rejects(input.pointerUp(), (error) => error.code === "pointer-not-pressed");
+});
+
+test("first Send starts its observation budget after stable target acquisition and immediately before native press", async () => {
+  let now = 0;
+  const budget = new ManualObservationBudget({ timeoutMs: 100, now: () => now });
+  const cdp = new FakeCdp([targetObservation(), targetObservation(), targetObservation()]);
+  const input = new WebviewInput(cdp, { targetAcquisitionPollMs: 10, now: () => now,
+    wait: async milliseconds => { now += milliseconds; assert.equal(budget.snapshot().started_at_ms, null); } });
+  let callbacks = 0;
+  await input.click(showShortcuts, { stableHitSamples: 3, beforeDispatch: () => {
+    callbacks += 1;
+    assert.deepEqual(cdp.calls.map(call => call.params.type), ["mouseMoved"]);
+    assert.equal(input.pointerPressed, false);
+    budget.beginOnce();
+    budget.assertRemaining("first Send");
+  } });
+  assert.equal(callbacks, 1);
+  assert.equal(budget.snapshot().started_at_ms, 20);
+  assert.equal(budget.snapshot().deadline_ms, 120);
+  assert.deepEqual(cdp.calls.map(call => call.params.type), ["mouseMoved", "mousePressed", "mouseReleased"]);
+});
+
+test("a later Send that expires during target acquisition never presses or retains cleanup input", async () => {
+  let now = 0;
+  const budget = new ManualObservationBudget({ timeoutMs: 20, now: () => now });
+  budget.beginOnce();
+  const cdp = new FakeCdp([targetObservation(), targetObservation(), targetObservation()]);
+  const input = new WebviewInput(cdp, { targetAcquisitionPollMs: 10, now: () => now,
+    wait: async milliseconds => { now += milliseconds; } });
+  await assert.rejects(input.click(showShortcuts, { stableHitSamples: 3,
+    beforeDispatch: () => budget.assertRemaining("later Send") }), error => error.code === "manual-observation-timeout");
+  assert.equal(input.pointerPressed, false);
+  assert.deepEqual(cdp.calls.map(call => call.params.type), ["mouseMoved"]);
+  assert.deepEqual(await input.releasePressedInputs(), { pointer_released: false, released_keys: [] });
+  assert.equal(cdp.calls.length, 1);
 });
 
 const sidePromptWheelTarget = { selector: 'textarea[data-config-key="side_chat.system_prompt"]',

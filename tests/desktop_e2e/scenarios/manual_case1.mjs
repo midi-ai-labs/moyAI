@@ -51,7 +51,7 @@ export {
 const OWNER = "scenario:manual.case1";
 const SPEC = fileURLToPath(new URL("../../manual_ST/case1/spec.md", import.meta.url));
 const CONTEXT_WINDOW = 131_072;
-const TURN_TIMEOUT_MS = 15 * 60 * 1000;
+const CASE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const PROMPT = { selector: "section.composer textarea#prompt", identity: { tag: "TEXTAREA", id: "prompt" } };
 const SEND = { selector: 'section.composer button[data-action="send"]', identity: { tag: "BUTTON", action: "send" } };
@@ -92,7 +92,8 @@ export function createManualCase1Scenario(rawOptions = {}) {
       const spec = await readFile(SPEC);
       state.prompt = manualCase1Prompt(spec.toString("utf8"));
       await prepareDesktopFixture({ context, sink, phase, owner: OWNER, configText: manualCase1FixtureConfig(options), sentinelName: null, sentinelText: "" });
-      await sink.record("case1-input", { options, spec: { path: SPEC, sha256: sha256(spec) }, prompt: state.prompt, context_window: CONTEXT_WINDOW, provider_lifecycle: "external-unmanaged", provider_owned: false }, { phase, owner: OWNER });
+      await sink.record("case1-input", { options, spec: { path: SPEC, sha256: sha256(spec) }, prompt: state.prompt, context_window: CONTEXT_WINDOW,
+        observation_timeout_ms: options.observationTimeoutMs ?? CASE_TIMEOUT_MS, provider_lifecycle: "external-unmanaged", provider_owned: false }, { phase, owner: OWNER });
     },
     async execute({ context, driver: cdp, sink }) {
       let primaryError = null;
@@ -103,7 +104,7 @@ export function createManualCase1Scenario(rawOptions = {}) {
         if (p.provider_effective_profile !== "openai_compatible" || p.provider_effective_base_url !== options.providerBaseUrl
           || p.provider_effective_model_id !== options.model || p.provider_effective_api_key_env !== options.apiKeyEnv
           || Number(p.provider_effective_context_window) !== CONTEXT_WINDOW) throw failure("case1-provider-config", "Case1 did not use the explicit connection and context budget", { projection: p });
-        state.live = new ManualLiveSession({ context, driver: cdp, sink, options, owner: OWNER, stem: "case1" });
+        state.live = new ManualLiveSession({ context, driver: cdp, sink, options, owner: OWNER, stem: "case1", observationTimeoutMs: CASE_TIMEOUT_MS });
         await state.live.open();
         const live = await state.live.send(state.prompt);
         const terminal = live.terminal;
@@ -124,15 +125,16 @@ export function createManualCase1Scenario(rawOptions = {}) {
         let transcript = null;
         const failures = predicates.failures;
         if (predicates.run_external_unittest) {
-          const result = await external({ context, sink, options, label: "case1-unittest", args: ["-m", "unittest"] });
+          const result = await external({ context, sink, options, label: "case1-unittest", args: ["-m", "unittest"], observationBudget: state.live.observationBudget });
           unittest = { status: "executed", ...manualCase1UnittestResult(result.result, result.stdout, result.stderr) };
           if (!unittest.pass) failures.push("external-unittest-failed-or-empty");
         }
-        transcript = await exportTranscript({ context, input: state.live.input, sink, sessionId, prompt: state.prompt });
+        transcript = await exportTranscript({ context, input: state.live.input, sink, sessionId, prompt: state.prompt, observationBudget: state.live.observationBudget });
         await captureScenarioScreenshot({ cdp, sink, name: "case1-artifacts-and-transcript", owner: OWNER });
+        state.live.observationBudget.assertRemaining("case1 case completion");
         state.summary = {
           schema_version: "desktop-e2e.manual-case1.v1", machine_gate: approval ? options.approvalMode === "stop" ? "unreviewed_approval_operator_stopped_incomplete" : "operator_review_incomplete" : failures.length === 0 ? "pass" : "fail",
-          approval_mode: options.approvalMode, review_stop_reason: reviewStopReason,
+          approval_mode: options.approvalMode, review_stop_reason: reviewStopReason, observation_budget: state.live.observationBudget.snapshot(),
           user_request: state.prompt, session_id: sessionId, turn_id: turnId,
           metrics: history.metrics, terminal: terminal.projection.run_target, diagnostics: predicates.diagnostics, tools: history.work_summaries, approvals,
           public_history: historyEvidence, agent_unittest: history.agent_unittest, exact_tool_call_result_pairs: history.exact_tool_call_result_pairs,

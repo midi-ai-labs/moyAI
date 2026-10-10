@@ -24,7 +24,7 @@ import {
   classifyCase52RestartTurnPage,
 } from "../case5_2_predicates.mjs";
 import { inventoryCase52CleanSeed, copyCase52CleanSeed } from "../core/clean_seed.mjs";
-import { waitForObservation } from "../core/deadline.mjs";
+import { ManualObservationBudget, normalizeManualObservationTimeout, waitForObservation } from "../core/deadline.mjs";
 import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { waitForSemanticTargetSettlement } from "../core/semantic_target_settlement.mjs";
@@ -72,6 +72,18 @@ const EXTERNAL_UNMANAGED_LIFECYCLE = "external-unmanaged";
 const GUI_CONNECTION_BASELINE_BASE_URL = "http://127.0.0.1:9";
 const GUI_CONNECTION_BASELINE_MODEL = "moyai-case5-2-before-gui-save";
 const MAIN_API_KEY_ENV = "";
+
+function case52ObservationTimeout(budget, label, ceiling) {
+  return budget?.assertRemaining(label, ceiling) ?? ceiling;
+}
+
+async function case52WaitForObservation(options, budget) {
+  const result = await waitForObservation({ ...options,
+    timeoutMs: case52ObservationTimeout(budget, options.label, options.timeoutMs),
+  });
+  budget?.assertRemaining(options.label);
+  return result;
+}
 
 const PROMPT = Object.freeze({
   selector: "section.composer textarea#prompt",
@@ -409,6 +421,7 @@ export function normalizeCase52Options(options) {
     "approve_model",
     "expected_main_variant",
     "expected_side_variant",
+    "observation_timeout_ms",
   ]);
   const unknown = Object.keys(options).filter((key) => !allowed.has(key));
   if (unknown.length > 0) throw new TypeError(`unknown manual.case5_2 option: ${unknown.join(",")}`);
@@ -449,6 +462,9 @@ export function normalizeCase52Options(options) {
     throw new TypeError("manual.case5_2 configure_main_via_gui is supported only by lm_studio");
   }
   const common = {
+    ...(options.observation_timeout_ms === undefined ? {} : {
+      observationTimeoutMs: normalizeManualObservationTimeout(options.observation_timeout_ms),
+    }),
     fixtureSource: path.resolve(options.fixture_source),
     providerBaseUrl: canonicalProviderBaseUrl(options.provider_base_url, providerProfile),
     providerProfile,
@@ -689,9 +705,12 @@ function exactCatalogRow(snapshot, key) {
   return matches[0];
 }
 
-async function providerSnapshot(options) {
+async function providerSnapshot(options, observationBudget = null) {
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
-    const models = await providerJson(options.providerBaseUrl, "/models", { apiKeyEnv: options.apiKeyEnv });
+    const models = await providerJson(options.providerBaseUrl, "/models", {
+      apiKeyEnv: options.apiKeyEnv,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 provider checkpoint", 300_000),
+    });
     return {
       captured_at: new Date().toISOString(),
       provider_profile: options.providerProfile,
@@ -699,8 +718,10 @@ async function providerSnapshot(options) {
     };
   }
   const [v1, v0] = await Promise.all([
-    providerJson(options.providerBaseUrl, "/api/v1/models", { apiKeyEnv: options.apiKeyEnv }),
-    providerJson(options.providerBaseUrl, "/api/v0/models", { apiKeyEnv: options.apiKeyEnv }),
+    providerJson(options.providerBaseUrl, "/api/v1/models", { apiKeyEnv: options.apiKeyEnv,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 provider checkpoint", 300_000) }),
+    providerJson(options.providerBaseUrl, "/api/v0/models", { apiKeyEnv: options.apiKeyEnv,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 provider checkpoint", 300_000) }),
   ]);
   return { captured_at: new Date().toISOString(), v1, v0 };
 }
@@ -1324,6 +1345,7 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
 }
 
 async function runOwnedExternalProcess({ context, executable, args, cwd, env, timeoutMs, state, label }) {
+  timeoutMs = case52ObservationTimeout(state.observationBudget, label, timeoutMs);
   const outputRoot = path.join(context.paths.logs, "external-process-output");
   await mkdir(outputRoot, { recursive: true });
   const stdoutPath = path.join(outputRoot, `${label}.stdout.raw`);
@@ -1812,9 +1834,9 @@ async function desktopProjection(cdp) {
   return invokeDesktopCommand(cdp, "desktop_state");
 }
 
-async function trustedClick(input, locator, { stableHitSamples = 1 } = {}) {
+async function trustedClick(input, locator, { stableHitSamples = 1, beforeDispatch } = {}) {
   const start = (await input.snapshotProbe()).sequence;
-  const target = await input.click(locator, { stableHitSamples });
+  const target = await input.click(locator, { stableHitSamples, beforeDispatch });
   const snapshot = await input.snapshotProbe(start);
   const probe = assertTrustedProbeSequence(snapshot, {
     afterSequence: start,
@@ -1827,8 +1849,8 @@ async function trustedClick(input, locator, { stableHitSamples = 1 } = {}) {
   return { target, probe };
 }
 
-async function recordTrustedClick({ input, locator, action, sink, stableHitSamples = 1 }) {
-  const acquisition = await trustedClick(input, locator, { stableHitSamples });
+async function recordTrustedClick({ input, locator, action, sink, stableHitSamples = 1, beforeDispatch }) {
+  const acquisition = await trustedClick(input, locator, { stableHitSamples, beforeDispatch });
   await sink.record("case5_2-trusted-action", { action, input_kind: "browser_trusted", ...acquisition }, {
     phase: "executing",
     owner: OWNER,
@@ -2565,8 +2587,8 @@ export function case52SideScreenshotSurfaceReady(surface, options, sessionId) {
     && surface.manual.value === options.sideModel;
 }
 
-async function waitSettingsOverlay(cdp, expected) {
-  return waitForObservation({
+async function waitSettingsOverlay(cdp, expected, observationBudget = null) {
+  return case52WaitForObservation({
     label: `case5_2 Settings overlay ${expected}`,
     timeoutMs: 30_000,
     pollMs: 100,
@@ -2574,17 +2596,18 @@ async function waitSettingsOverlay(cdp, expected) {
     accept: (projection) => projection?.overlay === expected
       && projection?.confirmation_visible === false
       && projection?.confirmation == null,
-  });
+  }, observationBudget);
 }
 
-async function openSideSettings({ cdp, input, sink }) {
+async function openSideSettings({ cdp, input, sink, observationBudget = null }) {
+  observationBudget?.assertRemaining("case5_2 open Side Settings");
   await recordTrustedClick({ input, locator: SHOW_SETTINGS, action: "open-settings", sink });
-  await waitSettingsOverlay(cdp, "config");
+  await waitSettingsOverlay(cdp, "config", observationBudget);
   await recordTrustedClick({ input, locator: SIDE_SETTINGS_NAV, action: "navigate-side-chat-settings", sink });
   return waitForSideScreenshotObservation({
     action: "navigating to Side Chat Settings",
     label: "visible Side Chat Settings section",
-    timeoutMs: 30_000,
+    timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 Side Settings", 30_000),
     pollMs: 100,
     sample: () => observeSideSettings(cdp),
     accept: (surface) => surface.settings.count === 1
@@ -2596,12 +2619,13 @@ async function openSideSettings({ cdp, input, sink }) {
   });
 }
 
-async function closeSettings({ cdp, input, sink }) {
+async function closeSettings({ cdp, input, sink, observationBudget = null }) {
+  observationBudget?.assertRemaining("case5_2 close Settings");
   await recordTrustedClick({ input, locator: CLOSE_SETTINGS, action: "close-settings", sink });
-  await waitSettingsOverlay(cdp, "none");
+  await waitSettingsOverlay(cdp, "none", observationBudget);
 }
 
-async function trustedSelectSideProviderProfile({ cdp, input, sink, options }) {
+async function trustedSelectSideProviderProfile({ cdp, input, sink, options, observationBudget = null }) {
   const initial = await exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector);
   if (initial.count !== 1) throw new Error("Side Chat provider profile target cardinality drifted");
   if (initial.value === options.providerProfile) {
@@ -2625,13 +2649,13 @@ async function trustedSelectSideProviderProfile({ cdp, input, sink, options }) {
       afterSequence: start,
       expected: [{ type: "change", identity: SIDE_PROVIDER_PROFILE.identity }],
     });
-    const settled = await waitForObservation({
+    const settled = await case52WaitForObservation({
       label: `${action} exact value`,
       timeoutMs: 10_000,
       pollMs: 100,
       sample: () => exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector),
       accept: (value) => value.count === 1 && value.value === expected,
-    });
+    }, observationBudget);
     const evidence = { action, expected, probe, final: settled.value };
     selections.push(evidence);
     await sink.record("case5_2-trusted-side-provider-profile", evidence, { phase: "executing", owner: OWNER });
@@ -2660,7 +2684,9 @@ export async function configureSideChat({
   options,
   sessionId,
   evidenceName = "case5_2-side-chat-configured",
+  observationBudget = null,
 }) {
+  observationBudget?.assertRemaining("case5_2 configure Side Chat");
   const before = await desktopProjection(cdp);
   const prior = before?.side_chat?.configured === true ? structuredClone(before.side_chat) : null;
   const replaceBinding = prior !== null && !exactSideChatProjection(before, options, sessionId);
@@ -2672,8 +2698,8 @@ export async function configureSideChat({
   let primaryError = null;
   try {
     await commandProbe.install();
-    const opened = await openSideSettings({ cdp, input, sink });
-    const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
+    const opened = await openSideSettings({ cdp, input, sink, observationBudget });
+    const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options, observationBudget });
     await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
     await replaceExactText({ cdp, input, locator: SIDE_API_KEY, text: options.sideApiKeyEnv ?? "", action: "side-chat-api-key-env", sink });
     let surface = await observeSideSettings(cdp);
@@ -2685,16 +2711,16 @@ export async function configureSideChat({
         sink,
         stableHitSamples: 3,
       });
-      surface = (await waitForObservation({
+      surface = (await case52WaitForObservation({
         label: "Side Chat manual model input",
         timeoutMs: 10_000,
         pollMs: 100,
         sample: () => observeSideSettings(cdp),
         accept: (value) => value.details.open === true && value.manual.visible === true && value.manual.enabled === true,
-      })).value;
+      }, observationBudget)).value;
     }
     await replaceExactText({ cdp, input, locator: SIDE_MANUAL_MODEL, text: options.sideModel, action: "side-chat-model", sink });
-    const committable = await waitForObservation({
+    const committable = await case52WaitForObservation({
       label: "global Side Chat Settings save admission",
       timeoutMs: 10_000,
       pollMs: 100,
@@ -2705,14 +2731,14 @@ export async function configureSideChat({
         && value.manual.value === options.sideModel
         && value.save.count === 1 && value.save.visible === true
         && (value.dirty === false || value.save.enabled === true),
-    });
+    }, observationBudget);
     let saved = committable;
     if (committable.value.dirty) {
       const expectedSave = case52ExpectedSideGlobalSave(committable.value, options);
       expectedCommands.push(expectedSave);
       const baselineTarget = structuredClone(committable.value.projection.config_target);
       await recordTrustedClick({ input, locator: SAVE_GLOBAL_CONFIG, action: "save-global-side-chat-settings", sink });
-      saved = await waitForObservation({
+      saved = await case52WaitForObservation({
         label: "global Side Chat Settings saved",
         timeoutMs: 60_000,
         pollMs: 100,
@@ -2730,22 +2756,22 @@ export async function configureSideChat({
           && value.fatal_count === 0
           && value.recoverable_error_count === 0
           && value.validation_error_count === 0,
-      });
+      }, observationBudget);
     }
-    await closeSettings({ cdp, input, sink });
+    await closeSettings({ cdp, input, sink, observationBudget });
 
     let deleted = null;
     if (replaceBinding) {
       let deleteSurface = await observeSideSettings(cdp);
       if (!deleteSurface.side_pane.visible) {
         await recordTrustedClick({ input, locator: SHOW_SIDE_CHAT, action: "show-existing-side-chat-for-replacement", sink });
-        deleteSurface = (await waitForObservation({
+        deleteSurface = (await case52WaitForObservation({
           label: "existing Side Chat visible before replacement",
           timeoutMs: 10_000,
           pollMs: 100,
           sample: () => observeSideSettings(cdp),
           accept: (value) => value.side_pane.visible === true && value.delete_trigger.enabled === true,
-        })).value;
+        }, observationBudget)).value;
       }
       const expectedDelete = {
         command: "delete_side_chat",
@@ -2757,15 +2783,15 @@ export async function configureSideChat({
       };
       expectedCommands.push(expectedDelete);
       await recordTrustedClick({ input, locator: REQUEST_DELETE_SIDE_CHAT, action: "request-side-chat-replacement", sink });
-      await waitForObservation({
+      await case52WaitForObservation({
         label: "Side Chat replacement confirmation",
         timeoutMs: 10_000,
         pollMs: 100,
         sample: () => observeSideSettings(cdp),
         accept: (value) => value.delete_dialog.visible === true && value.delete_confirm.enabled === true,
-      });
+      }, observationBudget);
       await recordTrustedClick({ input, locator: CONFIRM_DELETE_SIDE_CHAT, action: "confirm-side-chat-replacement", sink });
-      deleted = await waitForObservation({
+      deleted = await case52WaitForObservation({
         label: "old Side Chat snapshot deleted before replacement",
         timeoutMs: 30_000,
         pollMs: 100,
@@ -2774,7 +2800,7 @@ export async function configureSideChat({
           && projection.side_chat.owner_session_id === sessionId
           && projection.side_chat.chat_id === null
           && projection.side_chat.deleting === false,
-      });
+      }, observationBudget);
     }
 
     let materialized = null;
@@ -2789,7 +2815,7 @@ export async function configureSideChat({
       };
       expectedCommands.push(expectedEnsure);
       await recordTrustedClick({ input, locator: SHOW_SIDE_CHAT, action: "materialize-side-chat-from-global-defaults", sink });
-      materialized = await waitForObservation({
+      materialized = await case52WaitForObservation({
         label: "selected-session Side Chat snapshot materialized from global defaults",
         timeoutMs: 30_000,
         pollMs: 100,
@@ -2798,19 +2824,19 @@ export async function configureSideChat({
           && value.side_pane.visible === true
           && value.fatal_count === 0
           && value.recoverable_error_count === 0,
-      });
+      }, observationBudget);
     }
 
-    const commandObservation = await waitForObservation({
+    const commandObservation = await case52WaitForObservation({
       label: "exact global Side Chat save and snapshot commands",
       timeoutMs: 10_000,
       pollMs: 50,
       sample: () => commandProbe.snapshot(),
       accept: (snapshot) => snapshot.calls.length >= expectedCommands.length,
-    });
+    }, observationBudget);
     const commands = assertExactDesktopCommandSequence(commandObservation.value, { expected: expectedCommands });
 
-    await openSideSettings({ cdp, input, sink });
+    await openSideSettings({ cdp, input, sink, observationBudget });
     surface = await observeSideSettings(cdp);
     if (surface.details.open !== true) {
       await recordTrustedClick({
@@ -2824,7 +2850,7 @@ export async function configureSideChat({
     const screenshotSurface = await waitForSideScreenshotObservation({
       action: "showing the materialized Side Chat global defaults",
       label: "visible global Side Chat Settings and selected-session snapshot",
-      timeoutMs: 10_000,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 Side Settings screenshot", 10_000),
       pollMs: 100,
       sample: () => observeSideSettings(cdp),
       accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
@@ -2847,7 +2873,7 @@ export async function configureSideChat({
       screenshot_surface: screenshotSurface.value,
       screenshot,
     }, { phase: "executing", owner: OWNER });
-    await closeSettings({ cdp, input, sink });
+    await closeSettings({ cdp, input, sink, observationBudget });
     const projection = await desktopProjection(cdp);
     if (!exactSideChatProjection(projection, options, sessionId)) {
       throw productFailure("case5_2-side-chat-persistence", "the selected-session Side Chat snapshot did not remain attached after global Settings closed", { projection: projection.side_chat });
@@ -2873,12 +2899,12 @@ export async function configureSideChat({
   }
 }
 
-async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId }) {
+async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId, observationBudget = null }) {
   const initial = await desktopProjection(cdp);
   if (!exactSideChatProjection(initial, options, sessionId)) {
     throw productFailure("case5_2-side-chat-restart", "Side Chat configuration was not restored for the same Project Chat after Desktop restart", { side_chat: initial.side_chat });
   }
-  const visible = await openSideSettings({ cdp, input, sink });
+  const visible = await openSideSettings({ cdp, input, sink, observationBudget });
   if (!exactSideChatProjection(visible.value.projection, options, sessionId)
     || visible.value.base.value !== options.providerBaseUrl
     || visible.value.profile.value !== options.providerProfile) {
@@ -2896,14 +2922,14 @@ async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId }) 
   const exact = await waitForSideScreenshotObservation({
     action: "showing the restored Side Chat model",
     label: "restarted Side Chat Settings exact values",
-    timeoutMs: 10_000,
+    timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 restored Side Settings", 10_000),
     pollMs: 100,
     sample: () => observeSideSettings(cdp),
     accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
   });
   const screenshot = await captureScenarioScreenshot({ cdp, sink, name: "case5_2-side-chat-restored", owner: OWNER });
   await sink.record("case5_2-side-chat-restored", { surface: exact.value, screenshot }, { phase: "executing", owner: OWNER });
-  await closeSettings({ cdp, input, sink });
+  await closeSettings({ cdp, input, sink, observationBudget });
 }
 
 function configField(projection, key) {
@@ -3146,7 +3172,7 @@ async function stopProviderControlTokenLeak({ cdp, input, sink, stage, projectio
   throw case52ProviderControlTokenLeakFailure(stage, evidence);
 }
 
-async function waitForStageTerminal({ context, cdp, input, sink, baseline, referenceManifest, stage, expectedSessionId, expectedTurnId, expectedPrompt }) {
+async function waitForStageTerminal({ context, cdp, input, sink, baseline, referenceManifest, stage, expectedSessionId, expectedTurnId, expectedPrompt, observationBudget = null }) {
   const started = Date.now();
   let nextManifestAt = started;
   let nextProgressAt = started + PROGRESS_EVIDENCE_MS;
@@ -3159,7 +3185,11 @@ async function waitForStageTerminal({ context, cdp, input, sink, baseline, refer
   };
   let lastProjection = null;
   while (Date.now() - started < STAGE_TIMEOUT_MS) {
-    const projection = await desktopProjection(cdp);
+    const projection = observationBudget === null ? await desktopProjection(cdp)
+      : (await case52WaitForObservation({
+        label: `${stage.id} Desktop projection`, timeoutMs: 55_000, pollMs: 100,
+        sample: () => desktopProjection(cdp), accept: () => true, retrySampleErrors: false,
+      }, observationBudget)).value;
     lastProjection = projection;
     const providerControlTokenLeaks = case52ProviderControlTokenLeaks(projection);
     if (providerControlTokenLeaks.length > 0) {
@@ -3220,7 +3250,7 @@ async function waitForStageTerminal({ context, cdp, input, sink, baseline, refer
       }, { phase: "executing", owner: OWNER });
       nextProgressAt = now + PROGRESS_EVIDENCE_MS;
     }
-    await delay(STAGE_POLL_MS);
+    await delay(case52ObservationTimeout(observationBudget, `${stage.id} terminal observation`, STAGE_POLL_MS));
   }
   throw productFailure("case5_2-stage-timeout", `${stage.id} did not reach a normal terminal before the bounded observation ceiling`, {
     elapsed_ms: Date.now() - started,
@@ -3272,8 +3302,8 @@ export function case52NewTurnAcquisitionAccepted(projection, {
     && rowRevision === previousRevision + 1n;
 }
 
-async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState }) {
-  return waitForObservation({
+async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState, observationBudget = null }) {
+  return case52WaitForObservation({
     label: "case5_2 trusted Send turn acquisition",
     timeoutMs: 30_000,
     pollMs: 100,
@@ -3282,10 +3312,11 @@ async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpected
       expectedSessionId,
       previousExpectedState,
     }),
-  });
+  }, observationBudget);
 }
 
-async function executeStage({ context, cdp, input, sink, baseline, referenceManifest, stage, promptInput, expectedSessionId }) {
+async function executeStage({ context, cdp, input, sink, baseline, referenceManifest, stage, promptInput, expectedSessionId, observationBudget = null }) {
+  observationBudget?.assertRemaining(`${stage.id} preparation`);
   const prompt = promptInput.text;
   const wirePrompt = prompt.trim();
   const sourceIdentity = {
@@ -3307,7 +3338,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
   await insertExactText({ cdp, input, locator: PROMPT, text: prompt, action: `${stage.id}-prompt`, sink });
   let consecutiveOwnerMatches = 0;
   let lastMatchingRunTarget = null;
-  const composerSettlement = await waitForObservation({
+  const composerSettlement = await case52WaitForObservation({
     label: `case5_2 ${stage.id} GUI new-request composer settlement`,
     timeoutMs: 30_000,
     pollMs: 100,
@@ -3339,7 +3370,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       lastMatchingRunTarget = structuredClone(expectedRunTarget);
       return consecutiveOwnerMatches >= 2;
     },
-  });
+  }, observationBudget);
   const settledProjection = composerSettlement.value.projection;
   const settledRunTarget = composerSettlement.value.backend_run_target;
   const settledDraftTarget = composerSettlement.value.backend_draft_target;
@@ -3381,14 +3412,18 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       action: `${stage.id}-send`,
       sink,
       stableHitSamples: 3,
+      beforeDispatch: () => {
+        observationBudget?.beginOnce();
+        observationBudget?.assertRemaining(`${stage.id} Main Send`);
+      },
     });
-    const commandObservation = await waitForObservation({
+    const commandObservation = await case52WaitForObservation({
       label: `case5_2 ${stage.id} exact trusted Send command`,
       timeoutMs: 10_000,
       pollMs: 50,
       sample: () => sendCommandProbe.snapshot(commandStart),
       accept: (snapshot) => snapshot.calls.length >= 1,
-    });
+    }, observationBudget);
     sendCommand = assertExactDesktopCommandSequence(commandObservation.value, {
       afterSequence: commandStart,
       expected: [{
@@ -3409,11 +3444,12 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       expected_target: settledDraftTarget,
       expected_run_target: settledRunTarget,
       cancel_run_count: 0,
+      observation_budget: observationBudget?.snapshot() ?? null,
     }, { phase: "executing", owner: OWNER });
   } finally {
     await sendCommandProbe.remove();
   }
-  const acquired = await waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState });
+  const acquired = await waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState, observationBudget });
   const acquiredProjection = acquired.value;
   const row = selectedSessionRow(acquiredProjection);
   const sessionId = row.session_id;
@@ -3435,6 +3471,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     send,
     send_command_sequence: sendCommand?.last_sequence ?? null,
     acquisition_elapsed_ms: acquired.elapsed_ms,
+    observation_budget: observationBudget?.snapshot() ?? null,
   }, { phase: "executing", owner: OWNER });
   const terminal = await waitForStageTerminal({
     context,
@@ -3447,6 +3484,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     expectedSessionId: sessionId,
     expectedTurnId: turnId,
     expectedPrompt: wirePrompt,
+    observationBudget,
   });
   const terminalIdentity = selectedNavigationIdentity(terminal.projection);
   const screenshot = await captureScenarioScreenshot({ cdp, sink, name: `case5_2-${stage.id}-terminal`, owner: OWNER });
@@ -3460,6 +3498,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     monitor: terminal.monitor,
     projection: projectionIdentity,
     screenshot,
+    observation_budget: observationBudget?.snapshot() ?? null,
   }, { phase: "executing", owner: OWNER });
   return {
     stage: stage.id,
@@ -3742,11 +3781,11 @@ async function runFinalEvaluator({
   return { report, finalManifest };
 }
 
-async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeHistory }) {
+async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeHistory, observationBudget = null }) {
   let acceptedSince = null;
   let observed;
   try {
-    observed = await waitForObservation({
+    observed = await case52WaitForObservation({
       label: "case5_2 same-session restart continuity",
       timeoutMs: 60_000,
       pollMs: 100,
@@ -3774,7 +3813,7 @@ async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeH
         return now - acceptedSince >= RESTORE_STABILITY_MS;
       },
       retrySampleErrors: false,
-    });
+    }, observationBudget);
   } catch (error) {
     if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
     throw productFailure(
@@ -3812,10 +3851,11 @@ async function waitForRestartTurnPage({
   requireLatestSuffix,
   previousOffset = null,
   allowCommandPalette = false,
+  observationBudget = null,
 }) {
   let observed;
   try {
-    observed = await waitForObservation({
+    observed = await case52WaitForObservation({
       label: requireLatestSuffix
         ? "case5_2 restarted latest bounded turn page"
         : "case5_2 previous turn page settlement",
@@ -3846,7 +3886,7 @@ async function waitForRestartTurnPage({
         return previousOffset === null || page.metadata.offset !== previousOffset;
       },
       retrySampleErrors: false,
-    });
+    }, observationBudget);
   } catch (error) {
     if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
     throw productFailure(
@@ -3869,7 +3909,7 @@ async function waitForRestartTurnPage({
   return observed;
 }
 
-async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
+async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink, observationBudget = null }) {
   const start = (await input.snapshotProbe()).sequence;
   await input.pressKey("Escape");
   const snapshot = await input.snapshotProbe(start);
@@ -3880,14 +3920,14 @@ async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
       { type: "keyup", key: "Escape", code: "Escape" },
     ],
   });
-  const closed = await waitForObservation({
+  const closed = await case52WaitForObservation({
     label: "case5_2 restart history command palette closed",
     timeoutMs: 10_000,
     pollMs: 100,
     sample: () => desktopProjection(cdp),
     accept: (projection) => projection?.overlay === "none",
     retrySampleErrors: false,
-  });
+  }, observationBudget);
   await sink.record("case5_2-trusted-action", {
     action: "close-restart-history-command-palette",
     input_kind: "browser_trusted",
@@ -3896,14 +3936,14 @@ async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
   }, { phase: "executing", owner: OWNER });
 }
 
-export async function waitForCase52RestartHistoryTarget({ input }) {
+export async function waitForCase52RestartHistoryTarget({ input, observationBudget = null }) {
   let observed;
   try {
     observed = await waitForSemanticTargetSettlement({
       input,
       locator: PREVIOUS_TURN_PAGE,
       label: "case5_2 restart history semantic target",
-      timeoutMs: 10_000,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 restart history target", 10_000),
       pollMs: 16,
     });
   } catch (error) {
@@ -3933,6 +3973,7 @@ async function expandRestartHistory({
   admissionRevision,
   total,
   limit,
+  observationBudget = null,
 }) {
   const initial = await waitForRestartTurnPage({
     cdp,
@@ -3942,6 +3983,7 @@ async function expandRestartHistory({
     total,
     limit,
     requireLatestSuffix: true,
+    observationBudget,
   });
   if (initial.value.page.decision === "ready") {
     return { projection: initial.value.projection, pages: [], initial: initial.value.page.metadata };
@@ -3953,14 +3995,14 @@ async function expandRestartHistory({
     action: "open-restart-history-command-palette",
     sink,
   });
-  await waitForObservation({
+  await case52WaitForObservation({
     label: "case5_2 restart history command palette",
     timeoutMs: 10_000,
     pollMs: 100,
     sample: () => desktopProjection(cdp),
     accept: (projection) => projection?.overlay === "command_palette",
     retrySampleErrors: false,
-  });
+  }, observationBudget);
   await replaceExactText({
     cdp,
     input,
@@ -3982,7 +4024,7 @@ async function expandRestartHistory({
       );
     }
     const before = current.page.metadata;
-    await waitForCase52RestartHistoryTarget({ input });
+    await waitForCase52RestartHistoryTarget({ input, observationBudget });
     const action = await recordTrustedClick({
       input,
       locator: PREVIOUS_TURN_PAGE,
@@ -3999,6 +4041,7 @@ async function expandRestartHistory({
       requireLatestSuffix: false,
       previousOffset: before.offset,
       allowCommandPalette: true,
+      observationBudget,
     });
     const after = settled.value.page.metadata;
     const failures = case52RestartPreviousPageTransitionFailures({ before, after });
@@ -4023,13 +4066,13 @@ async function expandRestartHistory({
     pages.push({ before, after });
     current = settled.value;
   }
-  await closeCommandPaletteWithTrustedEscape({ cdp, input, sink });
+  await closeCommandPaletteWithTrustedEscape({ cdp, input, sink, observationBudget });
   return { projection: current.projection, pages, initial: initial.value.page.metadata };
 }
 
 export async function providerMustKeepSideUnloaded({ options, sink, state, name, providerIo = {} }) {
   const capture = providerIo.capture ?? (async () => {
-    const snapshot = await providerSnapshot(options);
+    const snapshot = await providerSnapshot(options, state.observationBudget);
     return { snapshot, models: case52ProviderModelState(snapshot, options) };
   });
   const captured = await capture();
@@ -4176,9 +4219,98 @@ async function cleanupWebviewInput(input, state, label) {
   }
 }
 
+export async function settleCase52ObservationTimeout({ cdp, input, sink, observationBudget }, injected = {}) {
+  const dependencies = {
+    observe: () => desktopProjection(cdp),
+    click: (locator, action) => recordTrustedClick({ input, locator, action, sink }),
+    wait: waitForObservation,
+    createProbe: () => new DesktopCommandProbe(cdp, {
+      probeId: "case5-2-observation-stop", commands: ["cancel_run", "cancel_side_chat"],
+    }),
+    ...injected,
+  };
+  const before = await dependencies.observe();
+  const mainActive = before?.busy === true || before?.agent_tree_active === true
+    || before?.task_activity_state === "running" || before?.run_status_key === "running";
+  const side = before?.side_chat;
+  const expected = [];
+  if (mainActive) expected.push({ command: "cancel_run", args: { expectedTarget: structuredClone(before.stop_target) } });
+  if (side?.status === "running") expected.push({ command: "cancel_side_chat", args: {
+    ownerSessionId: side.owner_session_id, chatId: side.chat_id, expectedGeneration: side.generation,
+  } });
+  const probe = dependencies.createProbe();
+  await probe.install();
+  let terminal = before;
+  let commands;
+  try {
+    const start = (await probe.snapshot()).sequence;
+    if (mainActive) await dependencies.click(STOP, "observation-timeout-main-stop");
+    if (side?.status === "running") await dependencies.click({
+      selector: 'aside.side-chat-pane[data-pane-mode="side-chat"] button[data-action="cancel-side-chat"]',
+      identity: { tag: "BUTTON", action: "cancel-side-chat" },
+    }, "observation-timeout-side-cancel");
+    if (expected.length > 0) {
+      terminal = (await dependencies.wait({
+        label: "case5_2 observation timeout Stop settlement", timeoutMs: 120_000, pollMs: 100,
+        retrySampleErrors: false, sample: dependencies.observe,
+        accept: (projection) => {
+          const target = projection?.run_target;
+          const stoppedOwner = before.stop_target;
+          const sameMainOwner = stoppedOwner?.kind === "root"
+            ? target?.workspacePath === stoppedOwner.workspacePath
+                && target.sessionId === stoppedOwner.sessionId
+                && target.expectedState?.kind === "idle"
+                && target.expectedState.latestTurnId === stoppedOwner.latestTurnId
+                && target.expectedState.admissionRevision === stoppedOwner.admissionRevision
+            : stoppedOwner?.kind === "turn"
+              && target?.workspacePath === stoppedOwner.workspacePath
+              && target.sessionId === stoppedOwner.sessionId
+              && target.expectedState?.kind === "idle"
+              && target.expectedState.latestTurnId === stoppedOwner.turnId
+              && target.expectedState.admissionRevision === stoppedOwner.admissionRevision;
+          const mainSettled = !mainActive || (projection?.busy === false
+            && projection.agent_tree_active === false && projection.task_activity_state === "idle"
+            && projection.post_run_refresh_pending === false && projection.background_mutation_pending === false
+            && projection.async_polling_required === false
+            && Array.isArray(projection.pending_async_operations) && projection.pending_async_operations.length === 0
+            && projection.stop_target === null
+            && (stoppedOwner?.kind === "root"
+              || ["cancelled", "completed", "failed"].includes(projection.run_status_key))
+            && sameMainOwner);
+          const currentSide = projection?.side_chat;
+          const sideSettled = side?.status !== "running" || (currentSide?.owner_session_id === side.owner_session_id
+            && currentSide.chat_id === side.chat_id && currentSide.can_cancel === false
+            && ["cancelled", "completed", "failed"].includes(currentSide.status)
+            && (mainActive || isDeepStrictEqual(target, before.run_target)));
+          return mainSettled && sideSettled;
+        },
+      })).value;
+    }
+    const commandSnapshot = await dependencies.wait({
+      label: "case5_2 exact observation timeout commands", timeoutMs: 10_000, pollMs: 50,
+      retrySampleErrors: false, sample: () => probe.snapshot(start),
+      accept: (snapshot) => snapshot.calls.length >= expected.length,
+    });
+    commands = assertExactDesktopCommandSequence(commandSnapshot.value, { afterSequence: start, expected });
+  } finally {
+    await probe.remove();
+  }
+  const evidence = {
+    observation_budget: observationBudget.snapshot(), commands,
+    main_stop_target: mainActive ? before.stop_target : null,
+    side_cancel_target: expected.find((row) => row.command === "cancel_side_chat")?.args ?? null,
+    terminal: { run_target: terminal.run_target, run_status_key: terminal.run_status_key,
+      task_activity_state: terminal.task_activity_state, side_status: terminal.side_chat?.status ?? null },
+  };
+  await sink.record("case5_2-observation-timeout-settled", evidence, { phase: "executing", owner: OWNER });
+  return evidence;
+}
+
 export function createCase52Scenario(rawOptions = {}) {
   const options = normalizeCase52Options(rawOptions);
   const state = {
+    observationBudget: options.observationTimeoutMs === undefined ? null
+      : new ManualObservationBudget({ timeoutMs: options.observationTimeoutMs }),
     credentialEnvNames: [options.apiKeyEnv ?? "", options.sideApiKeyEnv ?? "", options.approveApiKeyEnv ?? ""],
     baseline: null,
     seed: null,
@@ -4352,6 +4484,7 @@ export function createCase52Scenario(rawOptions = {}) {
       let activeInput = null;
       let activeCdp = firstCdp;
       let primaryError = null;
+      const observationBudget = state.observationBudget;
       try {
         const initialShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
           evidenceOwner: OWNER,
@@ -4392,6 +4525,7 @@ export function createCase52Scenario(rawOptions = {}) {
           stage: STAGES[0],
           promptInput: state.promptInputs.stage1,
           expectedSessionId: null,
+          observationBudget,
         });
         const stage1ConfigFailures = mainConfigurationFailures(stage1.terminal, options, { sessionRequired: true });
         if (stage1ConfigFailures.length > 0) {
@@ -4400,7 +4534,7 @@ export function createCase52Scenario(rawOptions = {}) {
             session_id: stage1.sessionId,
           });
         }
-        await configureSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId });
+        await configureSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId, observationBudget });
         await providerMustKeepSideUnloaded({ options, sink, state, name: "side-configured-no-request" });
         const stage1Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage1" });
         const stage1Failures = case52Stage1ManifestFailures(stage1Manifest);
@@ -4418,6 +4552,7 @@ export function createCase52Scenario(rawOptions = {}) {
           stage: STAGES[1],
           promptInput: state.promptInputs.stage2,
           expectedSessionId: stage1.sessionId,
+          observationBudget,
         });
         const stage2Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage2" });
         const stage2Failures = case52Stage2ManifestFailures(stage1Manifest, stage2Manifest);
@@ -4435,6 +4570,7 @@ export function createCase52Scenario(rawOptions = {}) {
           stage: STAGES[2],
           promptInput: state.promptInputs.stage3,
           expectedSessionId: stage1.sessionId,
+          observationBudget,
         });
         const stage3Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage3" });
         const stage3Evaluation = await runWorkspaceStableEvaluator({
@@ -4449,6 +4585,7 @@ export function createCase52Scenario(rawOptions = {}) {
         const stage3Suite = stage3Evaluation.result;
         const stage3PostEvaluatorManifest = stage3Evaluation.afterManifest;
         assertPythonTestWithinBounds("stage3-public-suite", stage3Suite);
+        observationBudget?.assertRemaining("case5_2 Stage3 evaluator settled");
         if (stage3Suite.exit_code !== 0) {
           throw productFailure("case5_2-stage3-public-suite", "Stage 3 external backend suite failed", stage3Suite);
         }
@@ -4456,8 +4593,10 @@ export function createCase52Scenario(rawOptions = {}) {
 
         await cleanupWebviewInput(activeInput, state, "generation-1-before-restart");
         activeInput = null;
+        observationBudget?.assertRemaining("case5_2 Desktop restart");
         const restarted = await host.restart({ context, scenario: this, sink, driver: activeCdp, phase: "executing" });
         activeCdp = restarted.driver;
+        observationBudget?.assertRemaining("case5_2 Desktop restarted");
         const restartShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
           evidenceOwner: OWNER,
           screenshotStem: "case5_2-restart-shell-ready",
@@ -4491,6 +4630,7 @@ export function createCase52Scenario(rawOptions = {}) {
           admissionRevision: stage3Owner.admissionRevision,
           total: stage3.terminal.turn_page_total,
           limit: stage3.terminal.turn_page_limit,
+          observationBudget,
         });
         const restored = await stableRestartProjection({
           cdp: activeCdp,
@@ -4498,6 +4638,7 @@ export function createCase52Scenario(rawOptions = {}) {
           turnId: stage3.turnId,
           prompt: stage3.wirePrompt,
           beforeHistory: stage3.history,
+          observationBudget,
         });
         const restoredProjection = restored.value;
         const restoreConfigFailures = mainConfigurationFailures(restoredProjection, options, { sessionRequired: true });
@@ -4523,7 +4664,7 @@ export function createCase52Scenario(rawOptions = {}) {
           screenshot: restartScreenshot,
         }, { phase: "executing", owner: OWNER });
 
-        await verifyRestoredSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId });
+        await verifyRestoredSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId, observationBudget });
         await providerMustKeepSideUnloaded({ options, sink, state, name: "restart-side-restored-no-request" });
 
         const stage4 = await executeStage({
@@ -4536,6 +4677,7 @@ export function createCase52Scenario(rawOptions = {}) {
           stage: STAGES[3],
           promptInput: state.promptInputs.stage4,
           expectedSessionId: stage1.sessionId,
+          observationBudget,
         });
         if (!exactSideChatProjection(stage4.terminal, options, stage1.sessionId)) {
           throw productFailure("case5_2-side-chat-final-drift", "Side Chat binding or empty persisted state drifted during Stage 4", {
@@ -4567,6 +4709,7 @@ export function createCase52Scenario(rawOptions = {}) {
         });
         const evaluation = evaluated.report;
         const stage4FinalManifest = evaluated.finalManifest;
+        observationBudget?.assertRemaining("case5_2 final evaluators settled");
 
         const stage5Options = case52Stage5Options(options);
         if (stage5Options !== options) {
@@ -4577,6 +4720,7 @@ export function createCase52Scenario(rawOptions = {}) {
             options: stage5Options,
             sessionId: stage1.sessionId,
             evidenceName: "case5_2-side-chat-stage5-reconfigured",
+            observationBudget,
           });
         }
         await providerMustKeepSideUnloaded({ options, sink, state, name: "stage5-before-side-send" });
@@ -4590,7 +4734,8 @@ export function createCase52Scenario(rawOptions = {}) {
           model: stage5Options.sideModel,
           apiKeyEnv: stage5Options.sideApiKeyEnv ?? "",
           promptInput: state.sidePromptInput,
-          timeoutMs: QUALITY_REQUEST_TIMEOUT_MS,
+          timeoutMs: observationBudget?.assertRemaining("case5_2 Stage5 observation") ?? QUALITY_REQUEST_TIMEOUT_MS,
+          observationBudget,
         });
         const stage5Manifest = await storeStageManifest({
           context,
@@ -4641,9 +4786,11 @@ export function createCase52Scenario(rawOptions = {}) {
           restoredSideChat: restoredProjection.side_chat,
           providerSummary: case52SideProviderSummary(options, state.sideProviderSamples),
         });
+        observationBudget?.assertRemaining("case5_2 final evidence acceptance");
         const summary = {
           schema_version: "desktop-e2e.case5_2-summary.v1",
           options: case52EvidenceOptions(options),
+          observation_budget: observationBudget?.snapshot() ?? null,
           session_id: stage1.sessionId,
           stages: [stage1, stage2, stage3, stage4].map((item) => ({
             stage: item.stage,
@@ -4700,6 +4847,22 @@ export function createCase52Scenario(rawOptions = {}) {
         state.acceptedEnd = true;
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
+        if (observationBudget?.expired === true) {
+          const timeout = productFailure("case5_2-observation-timeout", "case5_2 exhausted its shared observation budget", {
+            ...observationBudget.snapshot(), cause: errorObservation(error),
+          });
+          try {
+            timeout.evidence.settlement = await settleCase52ObservationTimeout({
+              cdp: activeCdp, input: activeInput, sink, observationBudget,
+            });
+          } catch (settlementError) {
+            error = new DesktopE2eError("harness", "case5_2-observation-timeout-stop",
+              "case5_2 observation ended, but its exact GUI Stop and terminal settlement failed", {
+                observed_product_failure: errorObservation(timeout), settlement_error: errorObservation(settlementError),
+              });
+          }
+          if (error?.code !== "case5_2-observation-timeout-stop") error = timeout;
+        }
         primaryError = error;
         throw error;
       } finally {

@@ -65,9 +65,9 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 machine gateの後も、各specの成果物、API / CLI、test内容、作業範囲、途中出力と最終回答をtask-local reviewで確認するまでは`manual_pending`である。Case1後にレビューする依頼では後続caseを自動実行しない。
 
-これらのscenarioは未レビューの承認要求を既定で操作停止する。`approval_mode: "operator"` を指定してstdinを保持すると、要求・生成source・画面を保存した後、stdoutへ `operator-review-request` が出る。operatorが内容を確認し、表示された `confirmation_id`、`request_sha256`、`decision`（`approve` / `stop` / `deny`）だけを持つJSONを1行でstdinへ返す。その一件のownerと内容を再確認して既存GUIボタンを操作し、許可した場合は同じ実行を続ける。恒久許可ルールは作らない。EOF、5分のreview timeout、操作停止は未完了として扱う。各turnの観測期限はCase4 / Case5が60分、Case2 / Case6 / Case7が30分、Case1 / Case3が15分で、承認reviewの待機も含む。Case4は5段階の実装・文書・testを一つのturnで実行し、15分で作業途中のまま観測が終了した。Case5はrepository調査と3文書を一つのturnで実行し、30分の期限までに文書生成へ到達せず最後の承認待ちが残り52秒に制限された。Case6は15分内に7回の承認reviewが発生し、最後のreview待機が残り約67秒に制限された。各実測に基づき上限を広げた。共通text adapterとCase2 adapterは観測期限をinput evidenceへ記録する。この観測期限の指定でproductのrequest timeoutやhost設定は変更しない。
+これらのscenarioは未レビューの承認要求を既定で操作停止する。`approval_mode: "operator"` を指定してstdinを保持すると、要求・生成source・画面を保存した後、stdoutへ `operator-review-request` が出る。operatorが内容を確認し、表示された `confirmation_id`、`request_sha256`、`decision`（`approve` / `stop` / `deny`）だけを持つJSONを1行でstdinへ返す。その一件のownerと内容を再確認して既存GUIボタンを操作し、許可した場合は同じ実行を続ける。恒久許可ルールは作らない。EOF、5分またはケース残予算の短い方のreview timeout、操作停止は未完了として扱う。
 
-Case5のoptional `observation_timeout_ms`は、1 turn全体の観測期限を正の整数msで指定する。省略時は60分、最大120分（`7200000`）とする。Mainの継続要求、Compaction、承認待ちで期限をリセットせず、moyAIの要求timeoutやprovider設定は変更しない。
+Case1〜Case7のoptional `observation_timeout_ms`は、ケース全体の観測予算を正の安全な整数msで指定する。最大120分（`7200000`）とし、省略時の時間はCase4 / Case5が60分、Case2 / Case6 / Case7が30分、Case1 / Case3が15分を維持する。最初のMain送信からケース終了まで、後続turn、段階間の検証、Compaction、承認待ち、外部verificationとtranscript exportで同じ残予算を使い、期限をリセットしない。予算をinput evidenceへ記録し、終了時の残時間と期限切れによる未完了を`observation-budget.json`へ保存する。期限後は新しい送信や承認を行わず、既存のStop・正常終了・cleanupをそれぞれの既存上限内で完了する。moyAIのrequest timeoutやprovider設定は変更しない。
 
 共通manual driverは通常完了時とStop後、Rust projectionの実行対象とcomposerの`data-run-target`が一致し、使用量の件数・表示文・title・state classが同じprojectionの値と揃うまで既存期限内で待つ。表示に差があれば最初の差分を、揃った時点では公開targetと使用量の観測を`*-terminal-render` evidenceへ記録する。認証情報は含めない。Stop後は同じworkspace / session / turn / admission revisionのidle状態と非同期処理の完了に加え、実画面のdialogとbackdropが閉じるまで待ってからterminalを撮影し、transcriptをexportする。Stopによる未完了の分類は維持し、exportの失敗を省略して合格扱いにはしない。
 
@@ -80,6 +80,8 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 Case5_2の`api_key_env`はMain認証、optional `side_api_key_env`はSide認証の環境変数名を設定する。Sideの指定がなければ認証なしとなる。同じキーを使う場合は、両方に同じ環境変数名を明示する。MainのheadersはSideへ継承しない。実キーはprocess環境にだけ設定し、fixtureやevidenceへ保存しない。access modeはspecどおり`auto_review`を維持し、既存Guardianの判断を試験対象とする。
 
 Case5_2のoptional `approve_model` / `approve_api_key_env`もMainと同じ接続先・profileの独立したApprove設定へ渡す。省略時は従来のMain継承を維持し、modelだけ指定した場合は認証なしとする。環境変数名だけ指定した場合はMainと同じmodel IDを設定する。判定のprompt、出力形式、権限判断は既存Guardianを使用し、providerのgeneration設定を追加しない。SubのStage 5問い合わせmodelとApproveの判定modelはそれぞれ維持する。
+
+Case5_2もoptional `observation_timeout_ms`を正のsafe integer、最大7200000 msで受理する。指定時は最初のMain SendからStage 5まで同じケース期限を使い、stage・承認・再起動で更新しない。期限切れでは新しい送信を止め、activeなMain / SideだけのGUI Stop / Cancel、terminal取得、cleanupを記録する。省略時のMain各stage最大12時間とStage 5最大1時間、providerの1時間タイムアウトは維持する。
 
 `manual.case5_2` はStage 1〜4のmachine predicateとcleanupが成立した時点でも`manual_pending`を返す。従来の100点rubricはStage 1〜4の比較条件として維持する。Stage 5のSide問い合わせは別の定性rubricで採点し、query経路、回答品質、context truncationの観測可否を分離する。transcript、成果物、公開・hidden evaluator evidence、Stage 5回答をtask-local rubricで人手採点し、その結果を`RESULTS.md`へ確定するまではfull PASSではない。
 

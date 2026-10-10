@@ -746,7 +746,8 @@ export class WebviewInput {
     }
   }
 
-  async pointerDown(locatorValue, acquisitionOptions) {
+  async pointerDown(locatorValue, { beforeDispatch, ...acquisitionOptions } = {}) {
+    invariant(beforeDispatch === undefined || typeof beforeDispatch === "function", "beforeDispatch must be a function");
     if (this.#pressedPointer !== null) {
       throw new WebviewInputError("pointer-already-pressed", "a WebView pointer press is already active", this.#pressedPointer);
     }
@@ -760,6 +761,7 @@ export class WebviewInput {
       buttons: 0,
       modifiers,
     });
+    beforeDispatch?.();
     this.#pressedPointer = { ...target, modifiers, delivery: "pending" };
     try {
       await this.#cdp.call("Input.dispatchMouseEvent", {

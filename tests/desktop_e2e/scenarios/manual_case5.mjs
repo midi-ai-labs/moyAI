@@ -15,10 +15,10 @@ export const MANUAL_CASE5_COPY_RULE = Object.freeze({ ...CASE5_2_CLEAN_SEED_COPY
 });
 
 export function normalizeManualCase5Options(raw) {
-  const { fixture_source, observation_timeout_ms = 60 * 60 * 1000, ...connection } = raw;
+  const { fixture_source, ...connection } = raw;
   if (typeof fixture_source !== "string" || !path.isAbsolute(fixture_source) || fixture_source.includes("\0")) throw new TypeError("case5 fixture_source must be an absolute repository fixture path");
-  if (!Number.isSafeInteger(observation_timeout_ms) || observation_timeout_ms <= 0 || observation_timeout_ms > 120 * 60 * 1000) throw new TypeError("case5 observation_timeout_ms must be a positive integer of at most 7200000ms");
-  return Object.freeze({ ...normalizeManualLiveOptions(connection), fixtureSource: path.resolve(fixture_source), observationTimeoutMs: observation_timeout_ms });
+  const options = normalizeManualLiveOptions(connection);
+  return Object.freeze({ ...options, fixtureSource: path.resolve(fixture_source), observationTimeoutMs: options.observationTimeoutMs ?? 60 * 60 * 1000 });
 }
 export function manualCase5Input(spec) { return { prompt: manualLiveSection(spec, "Canonical user request"), task: manualLiveSection(spec, "Canonical task.md", "markdown") }; }
 export function manualCase5ScopeFailures(before, after) {

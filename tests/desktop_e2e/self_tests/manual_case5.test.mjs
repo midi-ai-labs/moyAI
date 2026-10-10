@@ -30,7 +30,7 @@ test("case5 docs-only gate requires three physical nonempty documents and preser
   assert.deepEqual(manualCase5ScopeFailures(before, after.map(row => row.path === "README.md" ? { path: row.path, symbolic_link: true } : row)), ["missing-or-empty-document:README.md"]);
 });
 
-test("case5 observation override validates a bounded turn horizon", () => {
+test("case5 observation override uses the common bounded case budget", () => {
   assert.equal(normalizeManualCase5Options(RAW).observationTimeoutMs, 3_600_000);
   assert.equal(normalizeManualCase5Options({ ...RAW, observation_timeout_ms: 7_200_000 }).observationTimeoutMs, 7_200_000);
   for (const value of [0, -1, 7_200_001, 1.5, "7200000", null, true, Number.MAX_SAFE_INTEGER + 1]) {

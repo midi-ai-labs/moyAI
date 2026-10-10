@@ -135,7 +135,8 @@ test("manual send focuses the exact prompt after native attachment return and be
   const input = {
     snapshotProbe: async (after = 0) => ({ found: true, sequence: events.length, dropped_through: 0,
       events: structuredClone(events.filter(event => event.sequence > after)) }),
-    click: async locator => {
+    click: async (locator, options) => {
+      options?.beforeDispatch?.();
       operations.push(["click", locator.selector]); active = locator.identity;
       emit({ type: "click", ...locator.identity });
       if (locator.identity.action === "send") { turn += 1; pendingRender = true; }

@@ -13,12 +13,12 @@ export function createManualCase4Scenario(raw = {}) {
   return createManualTextCase({ id: "manual.case4", options, specPath: SPEC, observationTimeoutMs: 60 * 60 * 1000,
     stages: spec => [{ name: "stage1", prompt: manualCase4Input(spec).prompt }], outputs: OUTPUTS,
     async prepareWorkspace({ context, spec }) { await writeFile(path.join(context.paths.workspace, "task.md"), manualCase4Input(spec).task, { flag: "wx" }); },
-    async checkStage({ context, sink, options, owner, stem, row, generated }) {
+    async checkStage({ context, sink, options, owner, stem, row, generated, observationBudget }) {
       const missing = OUTPUTS.filter(name => !generated.some(item => item.path === name));
       if (missing.length) return missing.map(name => `missing-${name}`);
       row.external_verification = [];
       for (const [label, args] of [["case4-unittest", ["-m", "unittest"]], ["case4-integration", ["-m", "unittest", "test_integration", "-v"]]]) {
-        const result = await manualLiveExternalProcess({ context, sink, options, owner, stem, label, args });
+        const result = await manualLiveExternalProcess({ context, sink, options, owner, stem, label, args, observationBudget });
         const verification = manualLiveUnittestResult(result.result, result.stdout, result.stderr);
         row.external_verification.push({ label, ...verification });
         if (!verification.pass) return [`${label}-failed-or-empty`];
