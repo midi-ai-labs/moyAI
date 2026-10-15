@@ -48,17 +48,104 @@ export function approvalVisibleBeforeScroll(observation) {
   return observation?.count === 1 && observation.visible === true && observation.enabled === true
     && observation.center_in_viewport === true && observation.center_in_scroll_clip === true && observation.center_hit === true;
 }
+export async function navigateOnboardingApproval({ input, driver, sink }, approvalId, before, timeoutMs = 30_000) {
+  if (approvalVisibleBeforeScroll(before)) return null;
+  const notice = { selector: '.shared-work-message.has-approval a[href="#shared-approval-title"]',
+    identity: { tag: "A", href: "#shared-approval-title" } };
+  const { observation: noticeBefore } = await input.observeExactTarget(notice);
+  await sink.record("onboarding-approval-notice-before-navigation", { id: approvalId, observation: noticeBefore }, { phase: "executing", owner: OWNER });
+  if (!approvalVisibleBeforeScroll(noticeBefore)) throw fail("Approval action and its navigation notice are not visible", { id: approvalId, before, notice: noticeBefore });
+  await trustedClick(input, driver, notice, sink);
+  const target = sharedActionTarget("approve", approvalId);
+  const { observation: after } = await wait("The visible approval notice reaches the same approval action",
+    () => input.observeExactTarget(target), value => approvalVisibleBeforeScroll(value.observation), timeoutMs);
+  const navigation = { notice_before_navigation: noticeBefore, observation_after_navigation: after };
+  await sink.record("onboarding-approval-after-navigation", { id: approvalId, ...navigation }, { phase: "executing", owner: OWNER });
+  return navigation;
+}
 export function completedRequestorIdentityAccepted(shared, expected) {
   const summary = shared?.status?.jobs.find(job => job.id === expected.job_id);
   return shared?.detail?.id === expected.job_id && shared.detail.state === "succeeded"
     && summary?.state === "succeeded" && summary.requestor?.user_id === expected.user_id
     && summary.requestor.display_name === expected.display_name;
 }
+export function takeOnboardingUpstreamApiKey(name, environment = process.env) {
+  if (name === undefined) return null;
+  if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new TypeError("upstreamApiKeyEnv must name a private child environment variable");
+  const names = Object.keys(environment).filter(key => key.toUpperCase() === name.toUpperCase());
+  const value = names.length === 1 ? environment[names[0]] : undefined;
+  for (const key of names) delete environment[key];
+  if (typeof value !== "string" || value.trim() === "" || /[\r\n\0]/.test(value)) throw new TypeError("The onboarding upstream credential is missing or invalid");
+  return value;
+}
+export function onboardingHubModelsAccepted(projection, expected) {
+  return projection?.status === "connected" && ["main", "side_chat", "approve"].every(role => expected[role] === null
+    || projection[`${role}_mode`] === "hub" && projection[`${role}_uses_default`] === (role !== "approve")
+      && projection[`${role}_confirmation`] === "confirmed"
+      && projection[`${role}_review`]?.selection?.preferred_model_id === expected[role]
+      && isDeepStrictEqual(projection[`${role}_review`]?.selection?.allowed_model_ids, [expected[role]]));
+}
+export async function prepareOnboardingHubModels({ page, hub, providerBaseUrl, mainModel, sideModel = mainModel, approveModel = null, apiKey = null }) {
+  const roles = { main: mainModel, side_chat: sideModel, approve: approveModel };
+  const registrations = new Map();
+  const endpoint = new URL(providerBaseUrl);
+  endpoint.pathname = endpoint.pathname.replace(/\/+$/, "").replace(/(?:\/v1)+$/, "");
+  const registeredEndpoint = endpoint.href.replace(/\/+$/, "");
+  await page.locator('nav a[href="#models"]').click();
+  for (const [role, model] of Object.entries(roles)) {
+    if (model === null || registrations.has(model)) continue;
+    const label = role === "main" ? "WinBの標準AI" : role === "side_chat" ? "WinBのSub AI" : "WinBのApprove AI";
+    if (apiKey !== null) {
+      try { await page.locator("#api-key").fill(apiKey); }
+      catch { throw new DesktopE2eError("harness", "onboarding-private-key-input", "Could not enter the private upstream credential"); }
+    }
+    await page.locator("#endpoint").fill(providerBaseUrl);
+    await page.locator("#profile").selectOption("openai_compatible_chat");
+    await page.locator("#discover").click();
+    await page.locator(`#model option[value=${JSON.stringify(model)}]`).waitFor({ state: "attached" });
+    await page.locator("#model").selectOption(model);
+    await page.locator("#label").fill(label);
+    await page.locator("#allow-tools").setChecked(role === "main");
+    await page.locator("#register").click();
+    await page.locator("#model-rows tr").filter({ hasText: label }).waitFor();
+    const option = page.locator("#team-standard-side-model").getByRole("option", { name: label, exact: true });
+    await option.waitFor({ state: "attached" });
+    const id = await option.getAttribute("value");
+    const snapshot = await hub.command("hub_snapshot");
+    const registered = snapshot.store.catalog.models.find(value => value.id === id && value.label === label);
+    const deployment = snapshot.deployments.find(({ deployment: value }) => value.logical_model_id === id
+      && value.enabled && value.provider_model === model && value.provider_profile === "openai_compatible_chat"
+      && value.endpoint === registeredEndpoint);
+    if (!registered || registered.capabilities.includes("tools") !== (role === "main") || !deployment) {
+      throw fail("Hub did not register the requested model and capabilities", { role, model, logical_model_id: id });
+    }
+    registrations.set(model, id);
+  }
+  const expected = Object.fromEntries(Object.entries(roles).map(([role, model]) => [role, model === null ? null : registrations.get(model)]));
+  await page.locator("#team-standard-model").selectOption(expected.main);
+  await page.locator("#team-standard-side-model").selectOption(expected.side_chat);
+  if (expected.approve !== null) await page.locator("#team-standard-approve-model").selectOption(expected.approve);
+  await page.locator("#team-standard-save").click();
+  await wait("Hub saves the requested Main, Side and optional Approve standards", async () => {
+    const snapshot = await hub.command("hub_snapshot");
+    return { main: snapshot.store.catalog.team_default_model_id ?? null,
+      side_chat: snapshot.store.catalog.team_default_side_model_id ?? null,
+      approve: snapshot.store.catalog.team_default_approve_model_id ?? null,
+      ready: await page.locator("#team-standard-model").isEnabled() };
+  }, value => value.ready && Object.keys(expected).every(role => value[role] === expected[role]));
+  return expected;
+}
 export function createOnboardingWinAbScenario(options = {}) {
-  const { runnerBinary, runnerTestBinary, liveProvider, expectProviderFailure = false, ...hubOptions } = options;
+  const { runnerBinary, runnerTestBinary, liveProvider, upstreamApiKeyEnv, sideModel, approveModel, expectProviderFailure = false, ...hubOptions } = options;
   const live = liveProvider === undefined ? null : normalizeProviderConnectionLiveOptions(liveProvider, { extendedConnection: false });
   if (typeof expectProviderFailure !== "boolean" || (expectProviderFailure && !live)) throw new TypeError("expectProviderFailure requires explicit live provider options");
+  if (!live && [upstreamApiKeyEnv, sideModel, approveModel].some(value => value !== undefined)) throw new TypeError("Upstream credentials and role models require explicit live provider options");
+  const roleModel = value => value === undefined ? undefined
+    : normalizeProviderConnectionLiveOptions({ provider_base_url: live.providerBaseUrl, model: value }, { extendedConnection: false }).model;
+  const sideProviderModel = roleModel(sideModel), approveProviderModel = roleModel(approveModel);
   const settings = normalizeHubBrowserOptions(hubOptions);
+  // Consume the private child environment before any Hub, browser, Desktop or Runner is spawned.
+  let upstreamApiKey = takeOnboardingUpstreamApiKey(upstreamApiKeyEnv);
   const a = { name: "a", label: "WinA (操作PC)", input: null }, b = { name: "b", label: "WinB (実行PC)", input: null };
   const state = { resource: null, provider: null, runner: null, close: null, failures: [], environment: {}, consent: false };
   const prepare = args => prepareDesktopFixture({ ...args, owner: OWNER, configMode: "absent", sentinelName: null, sentinelText: "" });
@@ -192,17 +279,14 @@ export function createOnboardingWinAbScenario(options = {}) {
       try {
         await attach(a, { context, runtime, driver, sink }); await checkpoint(a, "first-launch");
         await page.locator('nav a[href="#team-onboarding"]').click(); await nextStep("Hubへの接続を開始してください", ["Hub管理者", "このHub管理画面"]); await hubCheckpoint("onboarding-initial");
-        await page.locator('nav a[href="#models"]').click();
-        await page.locator("#endpoint").fill(live?.providerBaseUrl ?? state.provider.baseUrl);
-        await page.locator("#profile").selectOption("openai_compatible_chat");
-        await page.locator("#discover").click();
-        const providerModel = live?.model ?? "shared-workflow";
-        await page.locator(`#model option[value=${JSON.stringify(providerModel)}]`).waitFor({ state: "attached" });
-        await page.locator("#model").selectOption(providerModel);
-        await page.locator("#label").fill("WinBの標準AI");
-        await page.locator("#allow-tools").check();
-        await page.locator("#register").click();
-        await page.locator("#model-rows tr").filter({ hasText: "WinBの標準AI" }).waitFor();
+        let standardModels;
+        const credentialSupplied = upstreamApiKey !== null;
+        try {
+          standardModels = await prepareOnboardingHubModels({ page, hub,
+            providerBaseUrl: live?.providerBaseUrl ?? state.provider.baseUrl, mainModel: live?.model ?? "shared-workflow",
+            sideModel: sideProviderModel, approveModel: approveProviderModel, apiKey: upstreamApiKey });
+        } finally { upstreamApiKey = null; }
+        await sink.record("onboarding-hub-standard-models", { ...standardModels, credential_supplied: credentialSupplied }, { phase: "executing", owner: OWNER });
         await hubCheckpoint("shared-ai-registered");
         await page.locator('nav a[href="#device-network"]').click(); await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
         await hubCheckpoint("network-before-start"); await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
@@ -220,14 +304,38 @@ export function createOnboardingWinAbScenario(options = {}) {
         await enroll(b, "hub");
         await wait("Hub connection completes B's first-use setup without a password", () => projection(b, "desktop_state"),
           p => p.startup.initial_setup_required === false && p.startup.onboarding_intent === null);
+        if (standardModels.approve !== null) {
+          const before = await wait("B adopts Main and Side before explicitly choosing Approve", () => projection(b, "hub_projection"),
+            p => onboardingHubModelsAccepted(p, { ...standardModels, approve: null }));
+          await click(b, action("show-config", '[data-surface="hub"]'));
+          const target = byId("ai-approve-model", "SELECT");
+          const values = await wait("B's Approve dropdown offers the registered logical model", () => b.driver.evaluate(`(() => {
+            const select = document.querySelector(${JSON.stringify(target.selector)});
+            return select && !select.disabled ? Array.from(select.options).filter(o => !o.disabled).map(o => o.value) : [];
+          })()`), values => values.includes(standardModels.approve));
+          await click(b, target); await b.input.pressKey("Home");
+          for (let index = 0; index < values.indexOf(standardModels.approve); index++) await b.input.pressKey("ArrowDown");
+          await b.input.pressKey("Enter");
+          await wait("B retains the explicit Approve model before saving", () => b.driver.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.value`),
+            value => value === standardModels.approve);
+          await checkpoint(b, "approve-selection-before-save");
+          await click(b, action("hub-save-approve", '[data-ai-connection="approve"]'));
+          const saved = await wait("B confirms its explicit Approve model without changing Main or Side", () => projection(b, "hub_projection"),
+            p => onboardingHubModelsAccepted(p, standardModels));
+          await sink.record("onboarding-explicit-approve", { pc: b.name, before_settings_revision: before.settings_revision,
+            settings_revision: saved.settings_revision, review: saved.approve_review, uses_default: saved.approve_uses_default,
+            confirmation: saved.approve_confirmation }, { phase: "executing", owner: OWNER });
+          await click(b, action("close-overlay", ".settings-modal"));
+          await click(b, action("show-hub", "aside.sidebar")); await click(b, byId("hub-tab-devices"));
+        }
         const models = await wait("B adopts the Hub standard model for Main and Side", () => projection(b, "hub_projection"),
-          p => p.status === "connected" && p.main_mode === "hub" && p.side_chat_mode === "hub"
-            && p.main_review && p.main_uses_default === true && p.side_chat_uses_default === true);
+          p => onboardingHubModelsAccepted(p, standardModels));
         const localConfig = await readFile(b.context.paths.config_file, "utf8");
-        if (localConfig.includes(live?.providerBaseUrl ?? state.provider.baseUrl) || localConfig.includes(live?.model ?? "shared-workflow"))
+        if ([live?.providerBaseUrl ?? state.provider.baseUrl, live?.model ?? "shared-workflow", sideProviderModel, approveProviderModel]
+          .filter(value => value !== undefined).some(value => localConfig.includes(value)))
           throw fail("WinB must not receive the provider URL or manual model configuration");
         await sink.record("onboarding-hub-only-ai", { endpoint: models.endpoint, main: models.main_review,
-          side: models.side_chat_review, manual_provider_config_absent: true }, { phase: "executing", owner: OWNER });
+          side: models.side_chat_review, approve: models.approve_review, manual_provider_config_absent: true }, { phase: "executing", owner: OWNER });
         await renameDevice(b);
         if (!isolatedDevicesAccepted(a.identity, b.identity)) throw fail("A and B must have distinct live processes and credentials");
         await sink.record("onboarding-two-pcs", { a: a.identity, b: b.identity }, { phase: "executing", owner: OWNER });
@@ -318,6 +426,9 @@ export function createOnboardingWinAbScenario(options = {}) {
             approvalVisibility.push({ id: p.approval.id, visible_before_scroll: approvalVisibleBeforeScroll(observation), observation });
             await sink.record("onboarding-approval-before-scroll", approvalVisibility.at(-1), { phase: "executing", owner: OWNER });
             await checkpoint(a, `approval-${approvals.size}`);
+            const navigation = await navigateOnboardingApproval(a, p.approval.id, observation);
+            approvalVisibility.at(-1).navigation = navigation;
+            if (navigation) { desktopActions++; await checkpoint(a, `approval-${approvals.size}-after-notice-navigation`); }
             if (p.approval.request.access === "shell") {
               const operation = await a.driver.evaluate(`document.querySelector('[data-shared-region="approval"]')?.innerText`);
               const commands = p.approval.request.details.filter(text => text.startsWith("Command: ")).map(text => text.slice("Command: ".length));
@@ -407,7 +518,11 @@ export function createOnboardingWinAbScenario(options = {}) {
           files, project_id: projectId, environment_id: environmentId, device_names: { controller: a.label, executor: b.label }, requestor: finalJob.requestor, approvals: approvals.size, approval_visibility: approvalVisibility, provider_calls: state.provider?.requests.length ?? null,
           actual_tools: state.provider?.requests.flatMap(r => r.messages.filter(m => m.role === "assistant").flatMap(m => m.tool_calls ?? []).map(t => t.function.name)) ?? null,
           caveats: ["One Windows host and account, two isolated actual Tauri processes; no VM/network installation proof.", live ? "Live provider; canonical tool counts must be audited from persisted runtime evidence, not mock request history." : "Scripted plan proves real tool/file/approval transport and execution, not LLM quality.", "Hub/A/B UI mutations use controls; fixture prepares processes and source CSV. Both PCs are renamed after approval; the controller's current actor and completed request keep that PC name. Device approval and project PC assignment require no person/password setup.", "Checkpoint switches and explicit actions are lower bounds; helper keyboard navigation, native controls and Hub browser actions are recorded separately."] }, { phase: "executing", owner: OWNER });
-        if (!approvalVisibility.length || approvalVisibility.some(row => !row.visible_before_scroll)) throw fail("Approval needed scrolling before its action could be found", { approval_visibility: approvalVisibility, artifacts_verified: true });
+        if (!approvalVisibility.length || approvalVisibility.some(row => !row.visible_before_scroll
+          && !(approvalVisibleBeforeScroll(row.navigation?.notice_before_navigation)
+            && approvalVisibleBeforeScroll(row.navigation?.observation_after_navigation)))) {
+          throw fail("Approval was not reachable directly or through its visible notice", { approval_visibility: approvalVisibility, artifacts_verified: true });
+        }
         return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
         await hubCheckpoint("failure").catch(() => {});

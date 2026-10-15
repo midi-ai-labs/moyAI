@@ -59,6 +59,12 @@ API keyが必要な既存接続では、`upstreamCredentialFile` に同endpoint�
 
 同scenarioのconfigに `liveProvider: { "provider_base_url": "http://host:port/v1", "model": "model-id" }` を明示すると、固定応答providerを起動せず指定済みの実LLMを使用する。外部providerは起動・停止しない。実装待ちは最大15分とし、結果の2行形式を依頼に明記する。実LLMの承認は自動許可せず、execution rootの `live-approval-N.json` に操作と実行先を保存する。担当者が内容と対象スクリプトを確認した後、同rootの `live-approval-N-decision.json` に一致する `approval_id`、`request_sha256`、`decision: "approve"` を記録した場合だけGUI承認する（各承認の確認待ちは最大5分）。このファイルは今回の隔離試験専用で、製品の権限設定を変更しない。実モデルのtool数はmock requestから推測せず、保存された実行履歴から別途確認する。
 
+認証が必要なlive接続では、config直下の `upstreamApiKeyEnv` に試験専用の子process環境変数名だけを指定する。キー本文はcommand line・config・証拠へ書かない。scenarioはHub・browser・Desktopの起動前に値を非公開のメモリへ取り出してその環境変数を除去し、公開Hub画面のAPI key欄から通常のモデル取得・登録を行う。入力操作の失敗にキー本文や元の例外を含めない。
+
+同じlive接続先でSub／Approveに別モデルを使う場合は、config直下の `sideModel`／`approveModel` にprovider model IDを指定する。同じIDは一度だけ登録し、Mainはtools有効、Mainと異なる補助モデルはtools無効で登録する。Main／Sideの標準モデルは公開Hub画面で明示保存し、Bの採用をHubの論理model IDと照合する。Side省略時はMainと同じモデルを使い、Approve標準は指定した場合だけ設定する。Approveは自動採用されないため、指定時はBのAI接続画面でも明示保存する。固定応答でもMain／Sideの標準用途を保存する。CSV試験で実行するLLM作業はMainであり、Sub／Approveの設定採用と推論品質を区別する。
+
+承認ボタンが移動前の画面外にある場合は、画面内の承認通知リンクを実際に操作し、同じ承認IDのボタンへ到達できることを確認する。移動前の観測は保持し、リンク操作前後の画像と位置・hit判定を保存する。通知が存在するだけでは合格にせず、リンクや移動先が遮られている場合も失敗とする。
+
 接続不能時の表示を検証する場合は、停止済みの隔離endpointを指定した同configへ `expectProviderFailure: true` を追加する。失敗理由が閉じた詳細を開かずに日本語で表示され、「続きの依頼へ」から未送信の入力欄へ移動できることを判定する。これは失敗表示の試験であり、実LLMの実装成功には数えない。
 
 省略時の `--desktop-isolation user-wide` は、既存の Desktop があると起動前に停止する従来の試験である。実利用中の Desktop と共存させる場合だけ、`desktop-e2e` feature 付きの専用 Desktop と `--desktop-isolation fixture` を明示する。通常配布版は隔離用の環境変数が渡された起動を拒否する。どちらのモードでも共通の GUI admission を一つだけ取得し、別 execution の GUI 操作を並行させない。
