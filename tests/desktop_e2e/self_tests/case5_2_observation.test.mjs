@@ -10,11 +10,11 @@ const options = {
 
 test("Case5_2 accepts an optional case observation ceiling and preserves product timeout and omitted defaults", () => {
   const omitted = normalizeCase52Options(options);
-  const bounded = normalizeCase52Options({ ...options, observation_timeout_ms: 7_200_000 });
+  const bounded = normalizeCase52Options({ ...options, observation_timeout_ms: 43_200_000 });
   assert.equal(Object.hasOwn(omitted, "observationTimeoutMs"), false);
-  assert.equal(bounded.observationTimeoutMs, 7_200_000);
+  assert.equal(bounded.observationTimeoutMs, 43_200_000);
   assert.equal(case52FixtureConfig(bounded), case52FixtureConfig(omitted));
-  for (const value of [0, -1, 7_200_001, 1.5, "7200000", null, Number.MAX_SAFE_INTEGER + 1]) {
+  for (const value of [0, -1, 1.5, "7200000", null, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => normalizeCase52Options({ ...options, observation_timeout_ms: value }), TypeError);
   }
 });
@@ -24,21 +24,30 @@ const mainIdle = { workspacePath: mainTarget.workspacePath, sessionId: mainTarge
   expectedState: { kind: "idle", latestTurnId: mainTarget.turnId, admissionRevision: mainTarget.admissionRevision } };
 const sideTarget = { owner_session_id: "session", chat_id: "side", generation: "9007199254740993", status: "running", can_cancel: true };
 
-function execution({ main = false, side = false, duplicate = false, root = false, unbound = false } = {}) {
+function execution({ main = false, side = false, duplicate = false, root = false, unbound = false, permission = false, mismatchedPermission = false, remote = false } = {}) {
   const stopTarget = root ? { kind: "root", workspacePath: mainTarget.workspacePath,
     sessionId: unbound ? null : mainTarget.sessionId, latestTurnId: unbound ? null : mainTarget.turnId,
     admissionRevision: mainTarget.admissionRevision, rootGeneration: "8", permissionConfirmationId: null } : mainTarget;
   const idleTarget = unbound ? { ...mainIdle, sessionId: null,
-    expectedState: { ...mainIdle.expectedState, latestTurnId: null } } : mainIdle;
+    expectedState: { ...mainIdle.expectedState, latestTurnId: null } } : structuredClone(mainIdle);
   const before = { busy: main, agent_tree_active: main, task_activity_state: main ? "running" : "idle",
     run_status_key: main ? "running" : "completed", stop_target: main ? stopTarget : null,
     run_target: main && !root ? { ...mainIdle, expectedState: { kind: "turn", turnId: "turn", admissionRevision: "7" } } : idleTarget,
     side_chat: side ? sideTarget : { ...sideTarget, status: "idle", can_cancel: false } };
+  if (permission) {
+    before.confirmation_visible = true;
+    before.confirmation_id = "3";
+    before.confirmation = { summary: "Read a source file", remote };
+    before.run_target = { ...before.run_target, sessionId: "01M4N29EW9F8WV6X3A11H6CYET",
+      permissionConfirmationId: mismatchedPermission ? "4" : "3" };
+    before.stop_target = { ...stopTarget, sessionId: before.run_target.sessionId };
+    idleTarget.sessionId = before.run_target.sessionId;
+  }
   const terminal = { ...before, busy: false, agent_tree_active: false, task_activity_state: "idle",
     run_status_key: root ? "idle" : main ? "cancelled" : "completed", run_target: idleTarget, stop_target: null,
     post_run_refresh_pending: false, background_mutation_pending: false, async_polling_required: false,
     pending_async_operations: [], side_chat: { ...before.side_chat, status: side ? "cancelled" : "idle", can_cancel: false } };
-  const calls = [], clicks = [], records = [], waits = [];
+  const calls = [], clicks = [], locators = [], records = [], waits = [];
   let removed = false, stopped = false;
   const probe = {
     async install() {},
@@ -57,7 +66,8 @@ function execution({ main = false, side = false, duplicate = false, root = false
     createProbe: () => probe,
     click: async (locator) => {
       clicks.push(locator.identity.action);
-      const command = locator.identity.action === "cancel-run" ? { command: "cancel_run", args: { expectedTarget: stopTarget } }
+      locators.push(locator);
+      const command = locator.identity.action === "cancel-run" ? { command: "cancel_run", args: { expectedTarget: before.stop_target } }
         : { command: "cancel_side_chat", args: { ownerSessionId: "session", chatId: "side", expectedGeneration: "9007199254740993" } };
       calls.push({ sequence: calls.length + 1, ...command });
       if (duplicate) calls.push({ sequence: calls.length + 1, ...command });
@@ -71,13 +81,14 @@ function execution({ main = false, side = false, duplicate = false, root = false
       return { value };
     },
   });
-  return { run, clicks, calls, records, waits, removed: () => removed };
+  return { run, clicks, locators, calls, records, waits, before, removed: () => removed };
 }
 
 test("Case5_2 observation timeout sends one exact Main Stop and settles its terminal owner", async () => {
   const current = execution({ main: true });
   const evidence = await current.run();
   assert.deepEqual(current.clicks, ["cancel-run"]);
+  assert.equal(current.locators[0].selector, 'section.run-strip button[data-action="cancel-run"][aria-label="メインチャットを停止"]');
   assert.deepEqual(current.calls[0].args.expectedTarget, mainTarget);
   assert.deepEqual(current.waits, [120_000, 10_000]);
   assert.equal(evidence.terminal.run_status_key, "cancelled");
@@ -124,4 +135,28 @@ test("Case5_2 timeout command mismatch still removes its probe and does not clai
   await assert.rejects(current.run, error => error.code === "desktop-command-probe-cardinality");
   assert.equal(current.records.length, 0);
   assert.equal(current.removed(), true);
+});
+
+test("Case5_2 timeout uses the visible permission Stop for its exact Main owner", async () => {
+  const current = execution({ main: true, permission: true });
+  await current.run();
+  assert.deepEqual(current.clicks, ["cancel-run"]);
+  assert.equal(current.locators[0].selector, '.permission-confirmation[data-permission-id="3"] button[data-action="cancel-run"][data-permission-action]');
+  assert.equal(current.locators[0].identity.focusKey, "permission:3:stop");
+  assert.deepEqual(current.calls[0].args.expectedTarget, current.before.stop_target);
+  assert.equal(current.removed(), true);
+});
+
+test("Case5_2 timeout does not dispatch to a different visible permission identity", async () => {
+  const current = execution({ main: true, permission: true, mismatchedPermission: true });
+  await assert.rejects(current.run, error => error.code === "case5_2-timeout-permission-owner");
+  assert.deepEqual(current.clicks, []);
+  assert.deepEqual(current.calls, []);
+});
+
+test("Case5_2 timeout does not use a remote permission abort as the local Main Stop", async () => {
+  const current = execution({ main: true, permission: true, remote: { peer_id: "remote-peer" } });
+  await assert.rejects(current.run, error => error.code === "case5_2-timeout-permission-owner");
+  assert.deepEqual(current.clicks, []);
+  assert.deepEqual(current.calls, []);
 });

@@ -773,13 +773,13 @@ test("Stage5 consumes the remaining case budget without restarting it after earl
   assert.equal(state.removed, true);
 });
 
-test("an explicit case budget permits Stage5 observation beyond its omitted-option one-hour ceiling", async () => {
+test("an explicit case budget permits Stage5 observation beyond 120 minutes", async () => {
   const { run, state } = terminalDomExecution((_index, current) => {
-    current.now = 3_661_000;
+    current.now = 10_801_000;
     return completedTerminalSurface();
   }, {
     observationBudgetFactory: (current) => {
-      const budget = new ManualObservationBudget({ timeoutMs: 7_200_000, now: () => current.now });
+      const budget = new ManualObservationBudget({ timeoutMs: 43_200_000, now: () => current.now });
       current.now = 0;
       budget.beginOnce();
       current.now = 1_000;
@@ -788,7 +788,7 @@ test("an explicit case budget permits Stage5 observation beyond its omitted-opti
   });
   const result = await run();
   assert.equal(result.answer, ANSWER);
-  assert.equal(state.now, 3_661_000);
+  assert.equal(state.now, 10_801_000);
   assert.equal(state.calls.length, 1);
   assert.equal(state.removed, true);
 });

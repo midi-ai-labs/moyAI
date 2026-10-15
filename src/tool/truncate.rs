@@ -11,7 +11,7 @@ use crate::tool::TruncatedToolOutput;
 #[derive(Debug, Clone, Default)]
 pub struct ToolTruncator;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BoundedPipeOutput {
     pub bytes: Vec<u8>,
     pub truncated: bool,

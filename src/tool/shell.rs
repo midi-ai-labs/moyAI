@@ -1277,6 +1277,18 @@ fn shell_literal_paths(
             }
             // Preserve existing literal absolute evidence, including nested
             // interpreter arguments, without reinterpreting relative child code.
+            let value = match cfg!(windows)
+                .then(|| windows_provider_path(value))
+                .flatten()
+            {
+                Some(WindowsProviderPath::FileSystem(path)) => path,
+                Some(WindowsProviderPath::Unresolved) => {
+                    // Unknown providers and PSDrives are not filesystem evidence.
+                    paths.unresolved = true;
+                    continue;
+                }
+                None => value,
+            };
             let drive_relative = cfg!(windows) && is_windows_drive_relative(value);
             if drive_relative
                 && (!known_cwd || child || !word.literal || !(path_command || word.redirection))
@@ -1385,15 +1397,23 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
             if let Some(path) = resolved {
                 paths.push(path);
                 quoted_path_ranges.push(candidate.start()..candidate.end());
+            } else if cfg!(windows) && windows_provider_path(candidate.as_str()).is_some() {
+                quoted_path_ranges.push(candidate.start()..candidate.end());
             }
         }
     }
 
     if cfg!(windows) {
         static ABSOLUTE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-            Regex::new(r#"(?i)(?:[A-Z]:[\\/]|\\\\|//)[^\s"'|;,<>]+"#).expect("windows path regex")
+            Regex::new(
+                r#"(?i)(?:^|[\s"'|;=,()<>\[\]{}])((?:(?:Microsoft\.PowerShell\.Core\\)?FileSystem::)?(?:[A-Z]:[\\/]|\\\\|//)[^\s"'|;,<>]+)"#,
+            )
+            .expect("windows path regex")
         });
-        for candidate in ABSOLUTE.find_iter(command) {
+        for capture in ABSOLUTE.captures_iter(command) {
+            let Some(candidate) = capture.get(1) else {
+                continue;
+            };
             if quoted_path_ranges
                 .iter()
                 .any(|range| range.contains(&candidate.start()))
@@ -1401,8 +1421,7 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
             {
                 continue;
             }
-            let path = Utf8PathBuf::from(candidate.as_str().replace('/', "\\"));
-            if path.is_absolute() {
+            if let Some(path) = resolve_quoted_windows_path(workdir, candidate.as_str()) {
                 paths.push(path);
             }
         }
@@ -1451,7 +1470,40 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
     paths
 }
 
+enum WindowsProviderPath<'a> {
+    FileSystem(&'a str),
+    Unresolved,
+}
+
+fn windows_provider_path(value: &str) -> Option<WindowsProviderPath<'_>> {
+    let (name, path) = value.split_once(':')?;
+    if name.len() <= 1
+        || name.starts_with('\\')
+        || path.starts_with("//")
+        || !name.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '\\')
+        })
+    {
+        return None;
+    }
+    Some(match path.strip_prefix(':') {
+        Some(path)
+            if (name.eq_ignore_ascii_case("FileSystem")
+                || name.eq_ignore_ascii_case(r"Microsoft.PowerShell.Core\FileSystem"))
+                && Utf8Path::new(path).is_absolute() =>
+        {
+            WindowsProviderPath::FileSystem(path)
+        }
+        _ => WindowsProviderPath::Unresolved,
+    })
+}
+
 fn resolve_quoted_windows_path(workdir: &Utf8Path, value: &str) -> Option<Utf8PathBuf> {
+    let value = match windows_provider_path(value) {
+        Some(WindowsProviderPath::FileSystem(path)) => path,
+        Some(WindowsProviderPath::Unresolved) => return None,
+        None => value,
+    };
     let path = Utf8PathBuf::from(value.replace('/', "\\"));
     if path.is_absolute() {
         return Some(path);
@@ -1704,6 +1756,17 @@ fn process_argv_literal_paths(workdir: &Utf8Path, argv: &[String]) -> ShellLiter
                 .map(|(_, value)| value),
         ) {
             let candidate = candidate.trim_matches(['"', '\'']);
+            let candidate = match cfg!(windows)
+                .then(|| windows_provider_path(literal_path_value(candidate)))
+                .flatten()
+            {
+                Some(WindowsProviderPath::FileSystem(path)) => path,
+                Some(WindowsProviderPath::Unresolved) => {
+                    paths.unresolved = true;
+                    continue;
+                }
+                None => candidate,
+            };
             let resolved = if cfg!(windows) {
                 resolve_quoted_windows_path(workdir, candidate)
             } else {
@@ -3358,6 +3421,323 @@ mod tests {
         assert_eq!(intent.guarded.absolute, selected);
         assert!(intent.targets.contains(&sibling));
         assert!(intent.outside_workspace);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_registry_provider_paths_do_not_become_filesystem_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        for command in [
+            r"Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'",
+            r#"Get-ItemProperty "HKCU:\Software\User Settings\Current""#,
+            r"Get-Item HKLM:\SOFTWARE",
+            r"Get-Item 'HKLM:SOFTWARE'",
+            r"Get-Item 'Cert:\CurrentUser\My'",
+            r"Get-Item 'FileSystem:M:\outside folder\target.txt'",
+            r"Get-Item 'OtherModule\FileSystem::M:\outside folder\target.txt'",
+            r"Get-Item 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Component Based Servicing'",
+            r"Get-Item 'Microsoft.PowerShell.Core\Registry::HKEY_CURRENT_USER\Software'",
+            r"Get-Item 'HKLM:\SOFTWARE\Example Key \\server\shared folder'",
+            r"Remove-Item 'HKLM:\SOFTWARE\Example Key'",
+            r#"powershell -NoProfile -Command "Test-Path 'HKLM:\SOFTWARE\Component Based Servicing'""#,
+            r#"powershell -NoProfile -Command "Get-Item 'HKLM:\SOFTWARE\Example Key \\server\shared folder'""#,
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+
+            assert!(!intent.outside_workspace, "{command}: {:?}", intent.targets);
+            assert!(
+                intent.targets.iter().all(|target| {
+                    target == &workspace.cwd
+                        || intent.execution.programs.iter().any(|program| {
+                            crate::workspace::PathGuard::stable_identity_key(target)
+                                == crate::workspace::PathGuard::stable_identity_key(program.path())
+                        })
+                }),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "unsupported provider must retain review: {command}: {:?}",
+                intent.risks
+            );
+            if command.starts_with("Remove-Item") {
+                assert!(
+                    intent
+                        .risks
+                        .contains(&crate::tool::PermissionRisk::DestructiveDelete)
+                );
+            }
+            assert_eq!(intent.details[0], format!("Command: {command}"));
+            let request = crate::tool::PermissionRequest {
+                access: crate::workspace::AccessKind::Shell,
+                summary: intent.description,
+                details: intent.details,
+                targets: intent.targets,
+                outside_workspace: intent.outside_workspace,
+                risks: intent.risks,
+                agent_path: None,
+                agent_task_name: None,
+            };
+            for mode in [AccessMode::Default, AccessMode::AutoReview] {
+                assert!(
+                    !crate::tool::context::access_mode_allows_permission(mode, &request),
+                    "provider requires a decision: {command}: {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_registry_provider_paths_preserve_real_filesystem_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let drive_path = Utf8PathBuf::from(r"M:\outside folder\日本語 target.txt");
+        let unc_path = Utf8PathBuf::from(r"\\server\shared folder\target.txt");
+
+        for command in [
+            format!(
+                "Get-Item 'HKLM:\\SOFTWARE\\Component Based Servicing'; Get-Item '{drive_path}'; Get-Item '{unc_path}'"
+            ),
+            format!(
+                "powershell -NoProfile -Command \"Get-Item 'HKCU:\\Software\\User Settings'; Get-Item '{drive_path}'; Get-Item '{unc_path}'\""
+            ),
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+
+            assert!(intent.outside_workspace, "{command}");
+            assert!(
+                intent.targets.contains(&drive_path),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent.targets.contains(&unc_path),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent.targets.iter().all(|target| {
+                    target == &workspace.cwd
+                        || target == &drive_path
+                        || target == &unc_path
+                        || intent.execution.programs.iter().any(|program| {
+                            crate::workspace::PathGuard::stable_identity_key(target)
+                                == crate::workspace::PathGuard::stable_identity_key(program.path())
+                        })
+                }),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+            assert!(intent.risks.contains(&crate::tool::PermissionRisk::Network));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_filesystem_provider_paths_keep_filesystem_boundaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external = Utf8PathBuf::from(r"M:\outside folder\日本語 target.txt");
+        let unc = Utf8PathBuf::from(r"\\server\shared folder\target.txt");
+        let unc_stream = Utf8PathBuf::from(r"\\server\shared folder\target.txt:stream");
+
+        for (literal, expected, outside) in [
+            (format!("FileSystem::{root}"), &root, false),
+            (format!("FileSystem::{external}"), &external, true),
+            (
+                format!("Microsoft.PowerShell.Core\\FileSystem::{external}"),
+                &external,
+                true,
+            ),
+            (
+                format!("Microsoft.PowerShell.Core\\FileSystem::{unc}"),
+                &unc,
+                true,
+            ),
+            (unc_stream.to_string(), &unc_stream, true),
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": format!("Get-Item -LiteralPath '{literal}'"),
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+
+            assert_eq!(
+                intent.outside_workspace, outside,
+                "{literal}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent.targets.contains(expected),
+                "{literal}: {:?}",
+                intent.targets
+            );
+            assert!(
+                !intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "known filesystem provider: {literal}: {:?}",
+                intent.risks
+            );
+        }
+
+        for command in [
+            r"Get-Item Microsoft.PowerShell.Core\FileSystem::M:\outside\target.txt",
+            r#"powershell -Command "Get-Item Microsoft.PowerShell.Core\FileSystem::M:\outside\target.txt""#,
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+            assert!(intent.outside_workspace);
+            assert!(
+                intent
+                    .targets
+                    .contains(&Utf8PathBuf::from(r"M:\outside\target.txt")),
+                "{command}: {:?}",
+                intent.targets
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_filesystem_provider_paths_keep_drive_relative_cwd_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(root.join("nested")).expect("workspace directories");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let drive = &root.as_str()[..2];
+        let literal = format!("FileSystem::{drive}..\\provider-outside.txt");
+        for command in [
+            format!("Get-Item '{literal}'"),
+            format!("python -c '{literal}'"),
+            format!("Set-Location nested; Get-Item '{literal}'"),
+            format!("powershell -Command \"Get-Item '{literal}'\""),
+            format!("Get-Item 'Microsoft.PowerShell.Core\\{literal}'"),
+            r"Get-Item 'FileSystem::..\provider-outside.txt'".into(),
+            r#"powershell -Command "Get-Item 'FileSystem::..\provider-outside.txt'""#.into(),
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+            assert!(
+                !intent.outside_workspace,
+                "unresolved cwd: {command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                !intent
+                    .targets
+                    .contains(&root.parent().unwrap().join("provider-outside.txt"))
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_argv_provider_paths_keep_review_and_real_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let guarded = crate::workspace::PathGuard::require_path(
+            &workspace,
+            &root,
+            crate::workspace::AccessKind::Shell,
+        )
+        .expect("guard");
+        for argument in [
+            r"HKLM:\SOFTWARE\Example Key \\server\shared folder",
+            r"--path=HKLM:\SOFTWARE\Example Key \\server\shared folder",
+            r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE",
+            r"FileSystem:M:\outside folder\target.txt",
+            r"OtherModule\FileSystem::M:\outside folder\target.txt",
+            r"FileSystem::C:..\provider-outside.txt",
+            r"--path=FileSystem::..\provider-outside.txt",
+        ] {
+            let argv = vec!["formatter".into(), argument.into()];
+            assert!(
+                !super::process_argv_references_outside_workspace(&workspace, &guarded, &argv),
+                "unknown provider: {argument}"
+            );
+            let risks = super::process_argv_permission_risks(&workspace, &guarded, &argv, &[]);
+            assert!(
+                risks.contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "{argument}"
+            );
+            assert!(
+                !risks.contains(&crate::tool::PermissionRisk::Network),
+                "{argument}"
+            );
+        }
+
+        let drive_path = Utf8PathBuf::from(r"M:\outside folder\日本語 target.txt");
+        let unc_path = Utf8PathBuf::from(r"\\server\shared folder\target.txt");
+        let argv = vec![
+            "formatter".into(),
+            r"HKLM:\SOFTWARE\Example Key \\fake\share".into(),
+            format!("--path=Microsoft.PowerShell.Core\\FileSystem::{drive_path}"),
+            unc_path.to_string(),
+        ];
+        let paths = super::process_argv_literal_paths(&root, &argv);
+        assert_eq!(paths.paths.len(), 2);
+        assert!(paths.paths.contains(&drive_path));
+        assert!(paths.paths.contains(&unc_path));
+        assert!(super::process_argv_references_outside_workspace(
+            &workspace, &guarded, &argv
+        ));
+        let risks = super::process_argv_permission_risks(&workspace, &guarded, &argv, &[]);
+        assert!(risks.contains(&crate::tool::PermissionRisk::UnclassifiedShell));
+        assert!(risks.contains(&crate::tool::PermissionRisk::Network));
+
+        let argv = vec!["formatter".into(), format!("--path=FileSystem::{root}")];
+        assert!(!super::process_argv_references_outside_workspace(
+            &workspace, &guarded, &argv
+        ));
+        assert!(
+            !super::process_argv_permission_risks(&workspace, &guarded, &argv, &[])
+                .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+        );
     }
 
     #[cfg(windows)]

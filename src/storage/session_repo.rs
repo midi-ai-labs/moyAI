@@ -4252,14 +4252,13 @@ impl SqliteSessionRepository {
         admission_id: AdmissionId,
         turn_id: TurnId,
     ) -> Result<RunAdmissionLeaseRenewalOutcome, StorageError> {
-        self.renew_admitted_run_lease_at(
+        self.renew_admitted_run_lease_with_clock(
             session_id,
             admission_id,
             turn_id,
-            SystemClock::now_ms(),
             RUN_ADMISSION_LEASE_DURATION_MS,
+            SystemClock::now_ms,
         )
-        .await
     }
 
     pub async fn renew_admitted_run_lease_at(
@@ -4270,12 +4269,31 @@ impl SqliteSessionRepository {
         now_ms: i64,
         lease_duration_ms: i64,
     ) -> Result<RunAdmissionLeaseRenewalOutcome, StorageError> {
-        let now = normalize_run_lease_now_ms(now_ms);
-        let requested_expiry = run_lease_expiry_ms(now, lease_duration_ms);
+        self.renew_admitted_run_lease_with_clock(
+            session_id,
+            admission_id,
+            turn_id,
+            lease_duration_ms,
+            || now_ms,
+        )
+    }
+
+    fn renew_admitted_run_lease_with_clock(
+        &self,
+        session_id: SessionId,
+        admission_id: AdmissionId,
+        turn_id: TurnId,
+        lease_duration_ms: i64,
+        now_ms: impl FnOnce() -> i64,
+    ) -> Result<RunAdmissionLeaseRenewalOutcome, StorageError> {
         let admission_id_text = admission_id.to_string();
         let turn_id_text = turn_id.to_string();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Both the shared connection and SQLite's writer lock can delay renewal.
+        // Check freshness and extend the lease using the time after those waits.
+        let now = normalize_run_lease_now_ms(now_ms());
+        let requested_expiry = run_lease_expiry_ms(now, lease_duration_ms);
         let state = session_runtime_state_from_connection(&transaction, session_id)?;
         let outcome = match state {
             Some(runtime_state) if runtime_state.status == SessionStatus::Running => {
@@ -22864,6 +22882,293 @@ mod tests {
                 .expect("unrelated terminal lease outcome"),
             RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
         ));
+    }
+
+    fn lease_renewal_waiting_for_writer(
+        repository: SqliteSessionRepository,
+        session_id: SessionId,
+        admission_id: AdmissionId,
+        turn_id: TurnId,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> (
+        std::thread::JoinHandle<Result<RunAdmissionLeaseRenewalOutcome, StorageError>>,
+        std::sync::mpsc::Sender<()>,
+        Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        use std::cell::RefCell;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use std::time::Duration;
+
+        thread_local! {
+            static WRITER_WAIT: RefCell<Option<(Sender<()>, Receiver<()>)>> =
+                const { RefCell::new(None) };
+        }
+
+        fn wait_for_writer(_: i32) -> bool {
+            WRITER_WAIT.with(|wait| {
+                let Some((blocked, resume)) = wait.borrow_mut().take() else {
+                    return false;
+                };
+                blocked.send(()).is_ok() && resume.recv_timeout(Duration::from_secs(5)).is_ok()
+            })
+        }
+
+        let clock = Arc::new(AtomicI64::new(now_ms));
+        let renewal_clock = Arc::clone(&clock);
+        let (blocked_tx, blocked_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            WRITER_WAIT.with(|wait| *wait.borrow_mut() = Some((blocked_tx, resume_rx)));
+            repository
+                .connection
+                .lock()
+                .expect("sqlite mutex")
+                .busy_handler(Some(wait_for_writer))
+                .expect("synchronized busy handler");
+            let result = repository.renew_admitted_run_lease_with_clock(
+                session_id,
+                admission_id,
+                turn_id,
+                lease_duration_ms,
+                || renewal_clock.load(Ordering::SeqCst),
+            );
+            repository
+                .connection
+                .lock()
+                .expect("sqlite mutex")
+                .busy_timeout(Duration::from_secs(5))
+                .expect("restore default busy timeout");
+            result
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("renewal must encounter the held SQLite writer lock");
+        (worker, resume_tx, clock)
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_samples_clock_after_sqlite_writer_wait() {
+        use std::sync::atomic::Ordering;
+
+        // The callback runs only after SQLite has encountered the other writer.
+        // Advancing the injected clock there avoids a wall-clock sleep or a race
+        // between starting the renewal thread and reaching BEGIN IMMEDIATE.
+        for after_wait in [1_500, 2_000, 2_001] {
+            let (store, session_id) = test_repo().await;
+            let repository = store.session_repo();
+            let turn_id = TurnId::new();
+            let admission = repository
+                .admit_session_turn_at(session_id, turn_id, 1_000, 1_000)
+                .await
+                .expect("initial admission")
+                .expect("admitted owner");
+            let before = stored_admission_state(&store, session_id);
+            let protocol_before = protocol_turn_table_counts(&store, session_id, turn_id);
+            assert_eq!(before.3, Some(2_000));
+            let mut writer = Connection::open(&store.paths().database_path)
+                .expect("independent SQLite connection");
+            let transaction = writer
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("hold SQLite writer lock");
+            let (worker, resume_tx, clock) = lease_renewal_waiting_for_writer(
+                repository,
+                session_id,
+                admission.admission_id,
+                turn_id,
+                1_000,
+                1_000,
+            );
+            clock.store(after_wait, Ordering::SeqCst);
+            transaction.commit().expect("release SQLite writer lock");
+            resume_tx.send(()).expect("resume blocked renewal");
+            let outcome = worker.join().expect("renewal worker").expect("renewal");
+
+            let after = stored_admission_state(&store, session_id);
+            if after_wait < 2_000 {
+                assert!(matches!(outcome, RunAdmissionLeaseRenewalOutcome::Renewed));
+                assert_eq!(
+                    after,
+                    (before.0, before.1, before.2, Some(after_wait + 1_000)),
+                    "a fresh owner receives a full lease from the post-wait time"
+                );
+            } else {
+                assert!(matches!(
+                    outcome,
+                    RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+                ));
+                assert_eq!(after, before, "waiting must not revive an expired owner");
+            }
+            assert_eq!(
+                protocol_turn_table_counts(&store, session_id, turn_id),
+                protocol_before,
+                "renewal must not append recovery or terminal history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_observes_owner_stop_and_terminal_changes_while_waiting() {
+        use std::sync::atomic::Ordering;
+
+        for change in [
+            "replacement",
+            "interrupt",
+            "tree_stop",
+            "completed",
+            "cancelled",
+            "failed",
+        ] {
+            let (store, session_id) = test_repo().await;
+            let repository = store.session_repo();
+            let turn_id = TurnId::new();
+            let now = SystemClock::now_ms();
+            let lease_duration = 60_000;
+            let admission = repository
+                .admit_session_turn_at(session_id, turn_id, now, lease_duration)
+                .await
+                .expect("initial admission")
+                .expect("admitted owner");
+            let other_store = StoreBundle::new(
+                SqliteStore::open(store.paths()).expect("independent repository connection"),
+            );
+            let other_repository = other_store.session_repo();
+            let mut writer =
+                Connection::open(&store.paths().database_path).expect("independent SQLite writer");
+            let transaction = writer
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("hold SQLite writer lock");
+            let (worker, resume_tx, clock) = lease_renewal_waiting_for_writer(
+                repository,
+                session_id,
+                admission.admission_id,
+                turn_id,
+                now,
+                lease_duration,
+            );
+            transaction.commit().expect("release SQLite writer lock");
+
+            // The renewal is still inside its busy callback. Use a different
+            // connection to commit the normal state transition before it retries.
+            match change {
+                "replacement" => {
+                    let replacement = other_repository
+                        .admit_session_turn_at(
+                            session_id,
+                            TurnId::new(),
+                            now + lease_duration + 1,
+                            lease_duration,
+                        )
+                        .await
+                        .expect("recover expired owner")
+                        .expect("replacement admission");
+                    assert_ne!(replacement.admission_id, admission.admission_id);
+                }
+                "interrupt" => {
+                    assert!(matches!(
+                        other_repository
+                            .request_exact_execution_interrupt(
+                                session_id,
+                                turn_id,
+                                admission.admission_revision,
+                                crate::protocol::TurnInterruptionCause::UserStop,
+                            )
+                            .await
+                            .expect("request exact Stop"),
+                        ExactExecutionInterruptRequestSettlement::Recorded
+                    ));
+                }
+                "tree_stop" => {
+                    other_repository
+                        .record_agent_tree_stop_fence_for_expected_state(
+                            session_id,
+                            crate::protocol::TurnInterruptionCause::UserStop,
+                            ActiveTurnExpectation::Turn {
+                                turn_id,
+                                revision: admission.admission_revision,
+                            },
+                        )
+                        .await
+                        .expect("record tree Stop")
+                        .expect("exact owner tree fence");
+                }
+                _ => {
+                    let terminal = match change {
+                        "completed" => completed_terminal_for_response(session_id, None),
+                        "cancelled" => RunEvent::TurnTerminal {
+                            session_id,
+                            terminal: Box::new(pre_admission_user_stopped_terminal()),
+                        },
+                        "failed" => failed_terminal(session_id, "failure before renewal"),
+                        _ => unreachable!("known transition"),
+                    };
+                    assert!(matches!(
+                        other_repository
+                            .settle_admitted_turn_with_protocol_event(
+                                session_id,
+                                admission.admission_id,
+                                &terminal,
+                                turn_id,
+                                None,
+                                None,
+                            )
+                            .await
+                            .expect("terminal before renewal"),
+                        AdmittedTerminalSettlement::Applied { .. }
+                    ));
+                }
+            }
+            clock.store(now + lease_duration + 1, Ordering::SeqCst);
+            let expected_state = stored_admission_state(&other_store, session_id);
+            let expected_protocol = protocol_turn_table_counts(&other_store, session_id, turn_id);
+            let expected_terminal = other_repository
+                .durable_terminal_for_turn(session_id, turn_id)
+                .await
+                .expect("terminal before renewal resumes");
+            resume_tx.send(()).expect("resume blocked renewal");
+            let outcome = worker.join().expect("renewal worker").expect("renewal");
+            match change {
+                "replacement" => assert!(matches!(
+                    outcome,
+                    RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+                )),
+                "interrupt" => assert!(matches!(
+                    outcome,
+                    RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                        crate::protocol::TurnInterruptionCause::UserStop
+                    )
+                )),
+                "tree_stop" => assert!(matches!(
+                    outcome,
+                    RunAdmissionLeaseRenewalOutcome::StopFenced(TurnTerminalOutcome::Interrupted {
+                        cause: crate::protocol::TurnInterruptionCause::UserStop,
+                    })
+                )),
+                _ => {
+                    let RunAdmissionLeaseRenewalOutcome::Terminal(terminal) = outcome else {
+                        panic!("{change} must remain terminal: {outcome:?}");
+                    };
+                    let expected_status = match change {
+                        "completed" => SessionStatus::Completed,
+                        "cancelled" => SessionStatus::Cancelled,
+                        "failed" => SessionStatus::Failed,
+                        _ => unreachable!("known terminal transition"),
+                    };
+                    assert_eq!(terminal.session_status(), expected_status);
+                    assert_eq!(
+                        serde_json::to_value(Some(terminal)).expect("renewal terminal"),
+                        serde_json::to_value(expected_terminal).expect("winning terminal")
+                    );
+                }
+            }
+            assert_eq!(stored_admission_state(&store, session_id), expected_state);
+            assert_eq!(
+                protocol_turn_table_counts(&store, session_id, turn_id),
+                expected_protocol,
+                "renewal must not overwrite the winning {change} transition"
+            );
+        }
     }
 
     #[tokio::test]

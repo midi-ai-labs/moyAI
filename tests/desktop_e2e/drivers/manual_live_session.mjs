@@ -10,7 +10,7 @@ import { runWindowsExternalProcess } from "./windows_external_process.mjs";
 import { operatorRequestFingerprint, waitForOperatorReview } from "./operator_review.mjs";
 import { observeProviderTurnSurface, providerRenderedTerminalFailures } from "../scenarios/provider_restart.mjs";
 import { observeRunNextTurnSurface, settledComposer } from "../scenarios/run_next_turn.mjs";
-import { captureScenarioScreenshot } from "../scenarios/observations.mjs";
+import { captureScenarioScreenshot, selectedNavigationIdentity } from "../scenarios/observations.mjs";
 
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const PROMPT = { selector: "section.composer textarea#prompt", identity: { tag: "TEXTAREA", id: "prompt" } };
@@ -260,7 +260,56 @@ export function manualLiveManifestDiff(before, after) {
       || old.get(name).size_bytes !== next.get(name).size_bytes || old.get(name).symbolic_link !== next.get(name).symbolic_link).sort();
 }
 
-export async function manualLiveExportTranscript({ context, input, sink, sessionId, prompt, owner = "scenario:manual.case1", stem = "case1", observationBudget = null }) {
+function exportStatus(message) {
+  const refusals = new Map([
+    ["transcript export cannot start while another operation is active", "operation-active"],
+    ["select a session before exporting transcript", "selection-required"],
+    ["transcript export target is no longer available", "target-unavailable"],
+    ["open transcript has no rows to export", "empty-transcript"],
+  ]);
+  if (refusals.has(message)) return { kind: refusals.get(message), message };
+  if (message?.startsWith("transcript markdown export failed: ")) return { kind: "write-failed", message: "transcript markdown export failed: [detail omitted]" };
+  if (message?.startsWith("会話をMarkdownで保存しました: ")) return { kind: "saved", message: "会話をMarkdownで保存しました: [path omitted]" };
+  // Unknown status, titles, transcript text and config values are not needed to identify the export owner.
+  return { kind: "other", message: null, sha256: typeof message === "string" ? sha256(message) : null };
+}
+
+function exportState(surface) {
+  const p = surface?.projection;
+  const target = value => value == null ? null : ({ workspacePath: value.workspacePath ?? null,
+    sessionId: value.sessionId ?? null, runtimeOwnerToken: value.runtimeOwnerToken ?? null,
+    expectedState: value.expectedState == null ? null : { kind: value.expectedState.kind ?? null,
+      latestTurnId: value.expectedState.latestTurnId ?? null, admissionRevision: value.expectedState.admissionRevision ?? null } });
+  return { workspace_path: p?.workspace_path ?? null,
+    selected_session_id: selectedNavigationIdentity(p).session_id,
+    run_target: target(p?.run_target), draft_target: target(p?.draft_target),
+    composer: { count: surface?.composer?.count ?? null, visible: surface?.composer?.visible ?? null,
+      run_target: target(surface?.composer?.run_target) },
+    status: exportStatus(p?.status_message), run_status_key: p?.run_status_key ?? null,
+    busy: p?.busy ?? null, navigation_loading: p?.navigation_loading ?? null,
+    post_run_refresh_pending: p?.post_run_refresh_pending ?? null,
+    history_export_enabled: p?.history_export_enabled ?? null };
+}
+
+function exportDiagnosticError(error) {
+  return { code: error?.code ?? null, name: error?.name ?? "Error",
+    message_sha256: sha256(String(error?.message ?? error)) };
+}
+
+function exportOwnerKnown(state, workspace, sessionId) {
+  const sameWorkspace = value => typeof value === "string" && path.resolve(value) === path.resolve(workspace);
+  return sameWorkspace(state?.workspace_path)
+    && state.busy === false && state.navigation_loading === false && state.post_run_refresh_pending === false
+    && state.composer.count === 1 && state.composer.visible === true
+    && state.run_target?.expectedState?.kind === "idle" && canonicalUlid(state.run_target.expectedState.latestTurnId)
+    && canonicalU64(state.run_target.expectedState.admissionRevision)
+    && JSON.stringify(state.run_target) === JSON.stringify(state.composer.run_target)
+    && [state.run_target, state.draft_target, state.composer.run_target].every(target =>
+      sameWorkspace(target?.workspacePath) && target.sessionId === sessionId);
+}
+
+export async function manualLiveExportTranscript({ context, driver, input, sink, sessionId, prompt, owner = "scenario:manual.case1", stem = "case1", observationBudget = null },
+  { wait = waitForObservation } = {}) {
   const directory = path.join(context.paths.workspace, ".moyai", "transcript-exports");
   const list = async () => {
     try {
@@ -271,9 +320,54 @@ export async function manualLiveExportTranscript({ context, input, sink, session
   };
   if ((await list()).length !== 0) throw failure("case1-export-not-fresh", "fresh workspace already contains transcript exports", {});
   observationBudget?.assertRemaining("Manual transcript export");
-  await manualLiveClick(input, EXPORT, sink, "export-transcript", { owner, stem });
-  const observed = await waitForObservation({ label: "Manual transcript export", timeoutMs: observationBudget?.assertRemaining("Manual transcript export", 10_000) ?? 10_000, pollMs: 100,
-    retrySampleErrors: false, sample: list, accept: rows => rows.length === 1 });
+  if (typeof driver?.evaluate !== "function" || !canonicalUlid(sessionId)) throw new DesktopE2eError("harness", "manual-export-observer", "transcript export requires its public driver and exact session owner", {});
+  const capture = async () => {
+    try {
+      const observed = await wait({ label: "Manual transcript export public state", timeoutMs: 1000,
+        retrySampleErrors: false, sample: async () => exportState(await observeProviderTurnSurface(driver)), accept: () => true });
+      return { state: observed.value, error: null };
+    } catch (error) { return { state: null, error: exportDiagnosticError(error) }; }
+  };
+  const before = await capture();
+  await sink.record(`${stem}-export-observation`, { before }, { phase: "executing", owner });
+  let observed, acquiredError = null, trustedClick = false, timeoutMs = null;
+  try {
+    await manualLiveClick(input, EXPORT, sink, "export-transcript", { owner, stem });
+    trustedClick = true;
+    timeoutMs = observationBudget?.assertRemaining("Manual transcript export", 10_000) ?? 10_000;
+    observed = await wait({ label: "Manual transcript export", timeoutMs, pollMs: 100,
+      retrySampleErrors: false, sample: list, accept: rows => rows.length === 1 });
+  } catch (error) { acquiredError = error; }
+  const diagnostics = { before, after: await capture(), trusted_click: trustedClick, timeout_ms: timeoutMs };
+  let evidenceError = null;
+  try {
+    await sink.record(`${stem}-export-observation`, { ...diagnostics,
+      acquisition: acquiredError === null ? "acquired" : "failed",
+      error: acquiredError === null ? null : exportDiagnosticError(acquiredError) }, { phase: "executing", owner });
+  } catch (error) { evidenceError = exportDiagnosticError(error); }
+  if (acquiredError !== null) {
+    const evidence = { original_error: exportDiagnosticError(acquiredError), observation: acquiredError.evidence ?? null, export: diagnostics,
+      ...(evidenceError === null ? {} : { evidence_capture_error: evidenceError }) };
+    let failureOwner = acquiredError.owner ?? "harness", code = acquiredError.code ?? "manual-export-acquisition";
+    let message = acquiredError.message;
+    const knownOwner = trustedClick && evidenceError === null && before.error === null && diagnostics.after.error === null
+      && exportOwnerKnown(before.state, context.paths.workspace, sessionId)
+      && exportOwnerKnown(diagnostics.after.state, context.paths.workspace, sessionId)
+      && JSON.stringify(before.state.run_target) === JSON.stringify(diagnostics.after.state.run_target);
+    if (knownOwner && code === "observation-timeout" && Array.isArray(evidence.observation?.last_value)
+      && evidence.observation.last_value.length === 0 && evidence.observation.last_error === null) {
+      if (canonicalUlid(before.state.selected_session_id) && before.state.selected_session_id !== sessionId
+        && before.state.selected_session_id === diagnostics.after.state.selected_session_id) {
+        failureOwner = "product"; code = "manual-export-owner-mismatch"; message = "transcript export selection differs from the acquired current session";
+      } else if (!["saved", "other"].includes(diagnostics.after.state.status.kind)
+        && before.state.status.kind !== diagnostics.after.state.status.kind) {
+        failureOwner = "product"; code = "manual-export-rejected"; message = "the acquired public export action was explicitly rejected";
+      }
+    }
+    if (evidenceError !== null) failureOwner = "harness";
+    throw new DesktopE2eError(failureOwner, code, message, evidence);
+  }
+  if (evidenceError !== null) throw new DesktopE2eError("harness", "manual-export-evidence", "transcript was acquired but export diagnostic evidence could not be saved", { export: diagnostics, evidence_capture_error: evidenceError });
   const candidate = path.join(directory, observed.value[0].name);
   const bytes = await readFile(candidate);
   if (!manualLiveTranscriptResult(bytes.toString("utf8"), { sessionId, prompt }).pass) throw failure("case1-export-content", "canonical transcript does not preserve this session and prompt", { candidate, sessionId });
@@ -282,9 +376,9 @@ export async function manualLiveExportTranscript({ context, input, sink, session
 
 export class ManualLiveSession {
   constructor({ context, driver, sink, options, owner, stem, capturePaths = ["calculator.py", "test_calculator.py"],
-    observationTimeoutMs = 15 * 60 * 1000, now = () => Date.now(), operatorReview = waitForOperatorReview }) {
+    now = () => Date.now(), operatorReview = waitForOperatorReview }) {
     Object.assign(this, { context, driver, sink, options, owner, stem, capturePaths, input: null, commands: null, lastTerminal: null });
-    this.observationBudget = new ManualObservationBudget({ timeoutMs: options.observationTimeoutMs ?? observationTimeoutMs, now });
+    this.observationBudget = new ManualObservationBudget({ timeoutMs: options.observationTimeoutMs, now });
     this.operatorReview = operatorReview;
   }
   async open() {
@@ -411,7 +505,8 @@ export class ManualLiveSession {
     return { terminal, approvals, incomplete: approval, incompleteReason: reviewStopReason };
   }
   async close() {
-    const observation = { ...this.observationBudget.snapshot(), status: this.observationBudget.expired ? "timed_out_incomplete" : "within_budget" };
+    const observation = { ...this.observationBudget.snapshot(), status: this.observationBudget.timeoutMs === null
+      ? "unbounded" : this.observationBudget.expired ? "timed_out_incomplete" : "within_budget" };
     let observationError = null;
     try {
       await this.sink.writeJson(`${this.stem}/observation-budget.json`, observation);

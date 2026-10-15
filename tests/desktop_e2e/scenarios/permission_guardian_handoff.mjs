@@ -1,5 +1,6 @@
 import path from "node:path";
 import { readFile } from "node:fs/promises";
+import { ManualObservationBudget } from "../core/deadline.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { canonicalU64 } from "../core/canonical_identity.mjs";
 import { DesktopCommandProbe, assertExactDesktopCommandSequence } from "../drivers/desktop_command_probe.mjs";
@@ -12,6 +13,8 @@ import { captureScenarioScreenshot, observePermissionSurface } from "./observati
 import { action, wait, trustedClick } from "./hub_browser_enrollment.mjs";
 import { observeRunNextTurnSurface, settledComposer } from "./run_next_turn.mjs";
 import { exactPermissionRestartGuardianLedger, permissionRestartGuardianFixtureConfig, submitGuardianPrompt } from "./permission_restart_guardian.mjs";
+import { manualLiveClick } from "../drivers/manual_live_session.mjs";
+import { settleCase52ObservationTimeout } from "./case5_2.mjs";
 
 const DIALOG = '[role="alertdialog"][data-permission-id]';
 const SEED_PROMPT = "seed guardian authority";
@@ -30,7 +33,7 @@ export function guardianHandoffSeedReady({ surface, ledger }) {
 }
 
 export function guardianHandoffPlan(root, decision) {
-  if (!path.isAbsolute(root) || !["approve", "abort"].includes(decision)) throw new TypeError("handoff requires an absolute fixture workspace and approve/abort");
+  if (!path.isAbsolute(root) || !["approve", "abort", "stop"].includes(decision)) throw new TypeError("handoff requires an absolute fixture workspace and approve/abort/stop");
   const receiptPath = path.join(root, "guardian-approved-effect.txt");
   const quoted = `'${receiptPath.replaceAll("'", "''")}'`;
   const command = [
@@ -91,10 +94,10 @@ async function footerObservation(cdp) {
   })()`);
 }
 
-export function guardianHandoffFooterFailures(value) {
+export function guardianHandoffFooterFailures(value, { decision = "approve" } = {}) {
   const failures = [];
   if (!value?.footer || value.footer.top < 0 || value.footer.bottom > value.viewport?.height) failures.push("footer-outside-viewport");
-  for (const action of ["approve-permission", "abort-permission"]) {
+  for (const action of ["approve-permission", "abort-permission", ...(decision === "stop" ? ["cancel-run"] : [])]) {
     const rows = value?.buttons?.filter(row => row.action === action) ?? [];
     if (rows.length !== 1 || !rows[0].enabled || !rows[0].reachable
       || rows[0].rect.top < 0 || rows[0].rect.bottom > value.viewport?.height) failures.push(`button-not-reachable:${action}`);
@@ -103,7 +106,7 @@ export function guardianHandoffFooterFailures(value) {
 }
 
 export function createGuardianHandoffScenario(decision = "approve") {
-  if (!["approve", "abort"].includes(decision)) throw new TypeError("unknown handoff decision");
+  if (!["approve", "abort", "stop"].includes(decision)) throw new TypeError("unknown handoff decision");
   const id = `permission.guardian-handoff-${decision}`, owner = `scenario:${id}`;
   const state = { provider: null, plan: null, acceptedLedger: null, quiesceOutcome: null, cleanupFailures: [] };
   return Object.freeze({
@@ -141,14 +144,31 @@ export function createGuardianHandoffScenario(decision = "approve") {
         const pending = await wait("Guardian asks the real Desktop user without executing", sample,
           value => guardianHandoffPendingFailures(value, state.plan.command).length === 0);
         const footer = await footerObservation(cdp);
-        if (guardianHandoffFooterFailures(footer).length) throw fail("long approval hides decision buttons", footer);
+        if (guardianHandoffFooterFailures(footer, { decision }).length) throw fail("long approval hides decision buttons", footer);
         const screenshot = await captureScenarioScreenshot({ cdp, sink, name: "guardian-handoff-long-approval", owner });
         const unanswered = assertExactDesktopCommandSequence(await commands.snapshot(), { expected: [seed.expected, task.expected] });
         await sink.record("guardian-handoff-awaiting-user", { pending, footer, unanswered, screenshot }, { phase: "executing", owner });
-        await trustedClick(input, cdp, action(`${decision === "approve" ? "approve" : "abort"}-permission`, DIALOG), sink);
-        const expected = [seed.expected, task.expected, { command: "answer_permission", args: {
-          decision: decision === "approve" ? "approved" : "abort", confirmationId: pending.surface.projection.confirmation_id,
-        } }];
+        let expected;
+        if (decision === "stop") {
+          // Exercise the same modal Stop selection used by Case5_2, borrowing the
+          // installed observer so this scenario never replaces another probe owner.
+          const settled = await settleCase52ObservationTimeout({ cdp, input, sink,
+            observationBudget: new ManualObservationBudget({}) }, {
+            createProbe: () => ({ install: async () => {}, remove: async () => {},
+              snapshot: afterSequence => commands.snapshot(afterSequence) }),
+            click: (locator, name) => manualLiveClick(input, locator, sink, name,
+              { owner, stem: "guardian-handoff" }),
+          });
+          expected = [seed.expected, task.expected, { command: "cancel_run", args: {
+            expectedTarget: pending.surface.projection.stop_target,
+          } }];
+          await sink.record("guardian-handoff-stop-settled", settled, { phase: "executing", owner });
+        } else {
+          await trustedClick(input, cdp, action(`${decision === "approve" ? "approve" : "abort"}-permission`, DIALOG), sink);
+          expected = [seed.expected, task.expected, { command: "answer_permission", args: {
+            decision: decision === "approve" ? "approved" : "abort", confirmationId: pending.surface.projection.confirmation_id,
+          } }];
+        }
         await wait("one exact human decision command", () => commands.snapshot(), value => value.calls.length >= expected.length);
         assertExactDesktopCommandSequence(await commands.snapshot(), { expected });
         const terminal = await wait("Guardian handoff outcome settles", sample,

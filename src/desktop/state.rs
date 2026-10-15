@@ -269,6 +269,10 @@ impl DesktopState {
                 break;
             }
         }
+        // A fresh draft stays unselected even when the query supplies a default history row.
+        if self.selected_session_id().is_none() && self.app_state.current_session_id.is_none() {
+            snapshot.selected_session_index = snapshot.session_rows.len();
+        }
         self.snapshot = snapshot;
         self.clamp_artifact_selection();
     }
@@ -1275,6 +1279,11 @@ impl DesktopState {
         let turn_items = open_session.turn_items();
         let detail = open_session.stored_detail().clone();
         self.apply_root_session_config(&session);
+        if self.app_state.current_session_id == Some(session.id)
+            && open_session.admission_revision() > self.app_state.active_turn_expectation.revision()
+        {
+            self.app_state.active_turn_expectation = open_session.active_turn_expectation();
+        }
         self.app_state.refresh_plan_from_turn_items(turn_items);
         if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
         {
@@ -2581,6 +2590,259 @@ mod tests {
         }
     }
 
+    fn running_progress_read(
+        session: &SessionRecord,
+        turn_id: crate::protocol::TurnId,
+        revision: u64,
+        prior_items: &[crate::protocol::TurnItem],
+    ) -> CanonicalSessionRead {
+        let mut session = session.clone();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        session.updated_at_ms = revision as i64 + 2;
+        let mut items = prior_items.to_vec();
+        items.push(turn_item(
+            session.id,
+            turn_id,
+            1,
+            TurnItemPayload::UserMessage {
+                text: format!("request {revision}"),
+            },
+        ));
+        for index in 0..revision {
+            items.push(turn_item(
+                session.id,
+                turn_id,
+                index as i64 + 2,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: if index == 0 {
+                        crate::protocol::ToolLifecycleStatus::Completed
+                    } else {
+                        crate::protocol::ToolLifecycleStatus::Running
+                    },
+                    title: format!("read document {index}"),
+                    summary: String::new(),
+                },
+            ));
+        }
+        let mut read = canonical_read(&session, Vec::new(), items);
+        read.active_turn_id = Some(turn_id);
+        read.latest_turn_id = Some(turn_id);
+        read.active_turn_sequence_no = Some(revision as _);
+        read.admission_revision = revision;
+        read.turn_progress = Some(crate::session::model::CanonicalTurnProgress {
+            turn_id,
+            model_request_count: revision as usize * 2,
+            tool_call_count: revision as usize,
+            completed_tool_count: 1,
+            declined_tool_count: 0,
+            cancelled_tool_count: 0,
+            failed_tool_count: 0,
+            compaction_count: 0,
+        });
+        read
+    }
+
+    #[test]
+    fn continued_turn_progress_updates_running_summary_for_second_and_third_turns() {
+        let session = session_record(SessionId::new());
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        let mut previous_items = Vec::new();
+        for revision in 1..=3 {
+            let turn_id = crate::protocol::TurnId::new();
+            let read = running_progress_read(&session, turn_id, revision, &previous_items);
+            if revision == 1 {
+                state.load_open_session(&read);
+            } else {
+                state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+                    session_id: session.id,
+                    title: session.title.clone(),
+                });
+                assert_eq!(state.app_state.progress.model_requests, 0);
+                assert!(state.app_state.tool_statuses.is_empty());
+            }
+            state.refresh_open_session_projection(&read);
+            assert_eq!(
+                state.app_state.progress.model_requests,
+                revision as usize * 2,
+                "running canonical counts must follow this admission, including turns 2 and 3"
+            );
+            assert_eq!(
+                state.app_state.progress.tool_calls_started,
+                revision as usize
+            );
+            assert_eq!(state.app_state.progress.tool_calls_completed, 1);
+            assert_eq!(state.app_state.tool_statuses.len(), revision as usize);
+            assert_eq!(
+                state.app_state.active_turn_expectation,
+                ActiveTurnExpectation::Turn { turn_id, revision }
+            );
+            let detail = state.selected_detail();
+            let summary = detail
+                .transcript_rows
+                .iter()
+                .find(|row| {
+                    row.row_kind
+                        == super::super::models::DesktopTranscriptRowKind::WorkSummaryRunning
+                })
+                .expect("public running summary");
+            assert!(
+                summary
+                    .body
+                    .contains(&format!("モデル要求: {}", revision * 2)),
+                "the public summary must use the current canonical count: {}",
+                summary.body
+            );
+            let progress = state.app_state.progress.clone();
+            let tools = state.app_state.tool_statuses.clone();
+            state.refresh_open_session_projection(&read);
+            assert_eq!(
+                state.app_state.progress, progress,
+                "duplicate refresh is idempotent"
+            );
+            assert_eq!(state.app_state.tool_statuses, tools);
+
+            state.apply_run_event(&terminal_event(
+                session.id,
+                crate::protocol::TurnTerminalOutcome::Completed,
+            ));
+            let mut terminal_read = read;
+            terminal_read.active_turn_id = None;
+            terminal_read.active_turn_sequence_no = None;
+            terminal_read.session.status = SessionStatus::Completed;
+            terminal_read.session.completed_at_ms = Some(revision as i64 + 3);
+            terminal_read.session.updated_at_ms += 1;
+            terminal_read.history.session = terminal_read.session.clone();
+            terminal_read.turns.session = terminal_read.session.clone();
+            terminal_read.turns.items.push(turn_item(
+                session.id,
+                turn_id,
+                revision as i64 + 2,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            ));
+            terminal_read.turns.total = terminal_read.turns.items.len();
+            state.refresh_open_session_projection(&terminal_read);
+            assert_eq!(
+                state.app_state.active_turn_expectation,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_id),
+                    revision
+                }
+            );
+            previous_items = terminal_read.turns.items;
+        }
+    }
+
+    #[test]
+    fn continued_turn_progress_uses_retained_metadata_for_a_noncontiguous_stale_page() {
+        let session = session_record(SessionId::new());
+        let current_turn = crate::protocol::TurnId::new();
+        let current = running_progress_read(&session, current_turn, 3, &[]);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&current);
+        state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+            session_id: session.id,
+            title: session.title.clone(),
+        });
+        let mut stale = running_progress_read(&session, crate::protocol::TurnId::new(), 1, &[]);
+        stale.turns.offset = current.turns.total + 10;
+        stale.turns.total = stale.turns.offset + stale.turns.items.len();
+        state.refresh_open_session_projection(&stale);
+        let accepted = state.open_session.as_ref().unwrap();
+        assert_eq!(accepted.active_turn_id(), Some(current_turn));
+        assert_eq!(accepted.admission_revision(), 3);
+        assert_eq!(
+            accepted
+                .turn_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            current
+                .turns
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.app_state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id: current_turn,
+                revision: 3
+            }
+        );
+        assert_eq!(state.app_state.progress.model_requests, 6);
+        assert_eq!(state.app_state.progress.tool_calls_started, 3);
+        assert_eq!(state.app_state.tool_statuses.len(), 3);
+    }
+
+    #[test]
+    fn continued_turn_progress_keeps_same_revision_other_turn_rejected() {
+        let session = session_record(SessionId::new());
+        let current_turn = crate::protocol::TurnId::new();
+        let current = running_progress_read(&session, current_turn, 2, &[]);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&current);
+        state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+            session_id: session.id,
+            title: session.title.clone(),
+        });
+        let mut different = running_progress_read(&session, crate::protocol::TurnId::new(), 2, &[]);
+        different.turns.offset = current.turns.total + 10;
+        different.turns.total = different.turns.offset + different.turns.items.len();
+        state.refresh_open_session_projection(&different);
+        assert_eq!(
+            state.app_state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id: current_turn,
+                revision: 2
+            }
+        );
+        assert_eq!(
+            state.app_state.progress.model_requests, 0,
+            "same-revision different-turn metadata must not bypass the existing progress guard"
+        );
+        assert_eq!(state.app_state.progress.tool_calls_started, 0);
+        assert!(state.app_state.tool_statuses.is_empty());
+        state.refresh_open_session_projection(&current);
+        assert_eq!(state.app_state.progress.model_requests, 4);
+        assert_eq!(state.app_state.progress.tool_calls_started, 2);
+    }
+
     fn assert_nested_file_change_projection(state: &mut DesktopState) {
         let session_id = SessionId::new();
         let turn_id = crate::protocol::TurnId::new();
@@ -2918,6 +3180,78 @@ mod tests {
                 .contains("turn_progress"),
             "the process-local projection does not alter stored/exported contracts"
         );
+    }
+
+    #[test]
+    fn snapshot_refresh_preserves_fresh_chat_until_its_created_owner_is_loaded() {
+        let old_id = SessionId::new();
+        let new_id = SessionId::new();
+        let old_row = session_row(old_id, "previous chat", SessionStatus::Completed);
+        let mut state = DesktopState::new(
+            snapshot(vec![old_row.clone()], 0),
+            ResolvedConfig::default(),
+        );
+        state.start_new_chat();
+
+        state.replace_snapshot_preserving_current_owner(snapshot(vec![old_row.clone()], 0));
+
+        assert_eq!(state.app_state.current_session_id, None);
+        assert_eq!(state.selected_session_id(), None);
+        assert_eq!(state.snapshot.session_rows[0].session_id, old_id);
+        state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+            session_id: new_id,
+            title: "created chat".into(),
+        });
+        assert_eq!(state.app_state.current_session_id, Some(new_id));
+        assert_eq!(state.selected_session_id(), None);
+
+        state.replace_snapshot_preserving_current_owner(snapshot(
+            vec![
+                session_row(new_id, "created chat", SessionStatus::Running),
+                old_row.clone(),
+            ],
+            1,
+        ));
+        assert_eq!(state.selected_session_id(), Some(new_id));
+        state.apply_run_event(&terminal_event(
+            new_id,
+            crate::protocol::TurnTerminalOutcome::Completed,
+        ));
+        state.replace_snapshot_preserving_current_owner(snapshot(
+            vec![
+                old_row,
+                session_row(new_id, "created chat", SessionStatus::Completed),
+            ],
+            0,
+        ));
+        assert_eq!(state.selected_session_id(), Some(new_id));
+        assert_eq!(state.app_state.current_session_id, Some(new_id));
+    }
+
+    #[test]
+    fn snapshot_refresh_preserves_an_explicit_other_chat_selection() {
+        let current_id = SessionId::new();
+        let selected_id = SessionId::new();
+        let current_row = session_row(current_id, "current chat", SessionStatus::Completed);
+        let selected_row = session_row(selected_id, "selected chat", SessionStatus::Completed);
+        let mut state = DesktopState::new(
+            snapshot(vec![current_row.clone(), selected_row.clone()], 0),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&canonical_read(
+            &session_record(current_id),
+            Vec::new(),
+            Vec::new(),
+        ));
+        state.select_session(1);
+
+        state.replace_snapshot_preserving_current_owner(snapshot(
+            vec![selected_row, current_row],
+            1,
+        ));
+
+        assert_eq!(state.selected_session_id(), Some(selected_id));
+        assert_eq!(state.app_state.current_session_id, Some(current_id));
     }
 
     #[test]

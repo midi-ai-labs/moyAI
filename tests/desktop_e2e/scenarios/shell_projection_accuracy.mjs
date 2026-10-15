@@ -9,11 +9,12 @@ import { assertExactDesktopCommandSequence } from "../drivers/desktop_command_pr
 import { WebviewInput } from "../drivers/webview_input.mjs";
 import { manualLiveClick, manualLiveExportTranscript, manualLivePermissionLocator,
   manualLivePermissionRequest, manualLiveTranscriptResult } from "../drivers/manual_live_session.mjs";
-import { runReadOnlySqlite } from "./permission_temp_escalation.mjs";
+import { runReadOnlySqlite } from "./permission_temp_write.mjs";
 import { captureScenarioScreenshot, observePermissionSurface } from "./observations.mjs";
 import { acquireInteractiveShell } from "./shell_baseline.mjs";
 import { createProviderChatToolContinuationScenario, exactChatToolContinuationLedger,
   exactTurnOwner, observeChatToolContinuationSurface, terminalSettled } from "./provider_chat_tool_continuation.mjs";
+import { case52TranscriptExportResult } from "./case5_2.mjs";
 
 export const SHELL_PROJECTION_FIXTURE_NAME = "shell_sgr_fixture.py";
 const OUTPUT_MAX_BYTES = 2048;
@@ -28,7 +29,7 @@ function variant(mode) {
   const success = mode === "success";
   return { success, marker: success ? "SGR_STDOUT_OK" : "SGR_STDERR_FAIL", stream: success ? "Stdout" : "Stderr",
     code: success ? 0 : 1, color: success ? "32" : "31", status: success ? "完了" : "失敗",
-    prompt: `Run the bounded ${mode} SGR fixture once, then report its observed result.`,
+    prompt: `Run the bounded ${mode} SGR fixture once.\n\nReport its observed result.`,
     response: success ? "SGR_SUCCESS_RECORDED" : "SGR_FAILURE_RECORDED" };
 }
 
@@ -42,7 +43,7 @@ export function shellProjectionAccuracyCall(context, mode) {
   // Keep the actual range operator and quoted Python data that exposed the two
   // classifier errors. The Python-c expression is still explicitly reviewed.
   return { prompt: v.prompt, name: "shell", arguments: {
-    command: `1..${v.success ? 5 : 10}|Out-Null; python -c "'g2.move_player'"; python -B -m shell_sgr_fixture`,
+    command: `1..${v.success ? 5 : 10}|Out-Null; Test-Path 'HKLM:\\SOFTWARE'|Out-Null; uv run --offline --no-project python -Bc "'g2.move_player';import shell_sgr_fixture"`,
     workdir: context.paths.workspace,
   }, outputMarker: v.success ? v.marker : "lifecycle_status: completed\nkind: process_exit_nonzero\nautomatic_retry: false\nexit_code: 1",
   outputMaxBytes: OUTPUT_MAX_BYTES, responseText: v.response };
@@ -58,7 +59,12 @@ export function shellProjectionPermissionFailures(sample, call, { includeDom = t
   if (exactTurnOwner(p, "turn") === null || p?.confirmation_visible !== true
     || !canonicalU64(p.confirmation_id) || p.confirmation?.remote) failures.push("permission-owner-mismatch");
   if (p?.confirmation?.outside_workspace !== false
-    || !isDeepStrictEqual(p?.confirmation?.risks, ["unclassified dynamic/indirect shell construct"])) failures.push("permission-risk-mismatch");
+    || !isDeepStrictEqual(p?.confirmation?.risks, ["external connection/setup", "unclassified dynamic/indirect shell construct"])) failures.push("permission-risk-mismatch");
+  const targets = p?.confirmation?.targets;
+  const pathKey = value => value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+  if (!Array.isArray(targets)
+    || !targets.some(target => typeof target === "string" && pathKey(target) === pathKey(call.arguments.workdir))
+    || targets.some(target => typeof target !== "string" || pathKey(target) === "m:/software")) failures.push("permission-target-mismatch");
   if (!p?.confirmation?.details?.includes(`Command: ${call.arguments.command}`)) failures.push("permission-command-mismatch");
   if (includeDom) {
     if (d?.count !== 1 || !d.visible || d.busy || d.id !== p?.confirmation_id
@@ -217,9 +223,10 @@ export function shellProjectionVisibleFailures(display, { mode, turnId, exportPa
   return failures;
 }
 
-export function shellProjectionExportFailures(text, { sessionId, call, mode }) {
+export function shellProjectionExportFailures(text, { sessionId, call, mode, terminalProjection }) {
   const v = variant(mode), failures = [];
   if (!manualLiveTranscriptResult(text, { sessionId, prompt: call.prompt }).pass) failures.push("export-owner-mismatch");
+  if (!case52TranscriptExportResult(text, { sessionId, prompts: { stage4: { text: call.prompt } }, terminalProjection }).pass) failures.push("case52-export-mismatch");
   if (shellProjectionHasSgr(text) || !new RegExp(`${v.stream}:\\s*${v.marker}`, "u").test(text)
     || !text.includes(v.response)) failures.push("export-result-mismatch");
   return failures;
@@ -255,7 +262,8 @@ async function captureTerminal({ context, cdp, sink, sample, call, mode, owner, 
       sample: () => observeDisplay(cdp, turnOwner.turnId), accept: display => shellProjectionVisibleFailures(display,
         { mode, turnId: turnOwner.turnId, exportPath: exported.source_path }).length === 0 });
     const bytes = await readFile(exported.source_path), text = bytes.toString("utf8");
-    const exportFailures = shellProjectionExportFailures(text, { sessionId: turnOwner.sessionId, call, mode });
+    const exportFailures = shellProjectionExportFailures(text, { sessionId: turnOwner.sessionId, call, mode,
+      terminalProjection: sample.surface.projection });
     if (exportFailures.length) throw fail("shell-projection-export-content", "Export did not preserve the clean displayed result", { path: exported.source_path, failures: exportFailures });
     const captured = { ...sample, display: observation.value, fixture: { path: fixturePath, sha256: sha256(fixture), size_bytes: fixture.length },
       export: { ...exported, sha256: sha256(bytes), size_bytes: bytes.length,

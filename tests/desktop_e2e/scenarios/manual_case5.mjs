@@ -18,7 +18,7 @@ export function normalizeManualCase5Options(raw) {
   const { fixture_source, ...connection } = raw;
   if (typeof fixture_source !== "string" || !path.isAbsolute(fixture_source) || fixture_source.includes("\0")) throw new TypeError("case5 fixture_source must be an absolute repository fixture path");
   const options = normalizeManualLiveOptions(connection);
-  return Object.freeze({ ...options, fixtureSource: path.resolve(fixture_source), observationTimeoutMs: options.observationTimeoutMs ?? 60 * 60 * 1000 });
+  return Object.freeze({ ...options, fixtureSource: path.resolve(fixture_source) });
 }
 export function manualCase5Input(spec) { return { prompt: manualLiveSection(spec, "Canonical user request"), task: manualLiveSection(spec, "Canonical task.md", "markdown") }; }
 export function manualCase5ScopeFailures(before, after) {
@@ -31,7 +31,6 @@ export function createManualCase5Scenario(raw = {}) {
   const options = normalizeManualCase5Options(raw);
   let seed = null;
   return createManualTextCase({ id: "manual.case5", options, specPath: SPEC, outputs: OUTPUTS,
-    observationTimeoutMs: options.observationTimeoutMs,
     stages: spec => [{ name: "stage1", prompt: manualCase5Input(spec).prompt }],
     async prepareWorkspace({ context, sink, options, spec, phase, owner }) {
       for (const name of ["backend", "frontend", "examples", "data"]) {

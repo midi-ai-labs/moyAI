@@ -46,7 +46,7 @@ function Read-MoyaiDeployment([string]$Root, [switch]$VerifyHashes, [switch]$All
     if ($file.sha256 -notmatch '^[a-f0-9]{64}$') { throw "配布物の照合情報が不正です。配布担当から一式を受け取り直してください。対象: $($file.path)" }
     if ($VerifyHashes -and $present -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $file.sha256) { throw "配布物のファイルが元の内容と一致しません。信頼できる配布元からZIPを受け取り直し、別のフォルダーへ展開してください。対象: $($file.path)" }
   }
-  foreach ($required in @('app/bin/moyai-desktop.exe', 'app/bin/moyai-runner.exe', 'scripts/common.ps1', 'scripts/runtime-access.ps1', 'scripts/Start-moyAI.ps1', 'scripts/Setup-moyAI.ps1')) {
+  foreach ($required in @('app/bin/moyai-desktop.exe', 'app/bin/moyai-runner.exe', 'app/bin/moyai-sandbox.exe', 'scripts/common.ps1', 'scripts/runtime-access.ps1', 'scripts/Start-moyAI.ps1', 'scripts/Setup-moyAI.ps1')) {
     if (-not $seen.ContainsKey((Resolve-MoyaiChild $Root $required))) { throw "配布物の一覧に必要なファイルがありません。配布担当へ確認してください。対象: $required" }
   }
   if ($manifest.hub) {

@@ -27,6 +27,18 @@ export function manualCase3CliResult(result, stdout, stderr, { exit, suffix = nu
     : lastLine === suffix || lastLine?.endsWith(` ${suffix}`) || lastLine?.endsWith(`=${suffix}`) || lastLine?.endsWith(`: ${suffix}`));
 }
 
+export async function manualCase3VerifyCli({ context, sink, options, owner, stem, row, observationBudget }, external = manualLiveExternalProcess) {
+  row.external_cli = [];
+  for (const [argv, expected] of [ [["2", "+", "3"], { exit: 0, suffix: "5" }], [["2", "pow", "3"], { exit: 0, suffix: "8" }],
+    [["sin", "0"], { exit: 0, suffix: "0" }], [["cos", "0"], { exit: 0, suffix: "1" }], [["sqrt", "16"], { exit: 0, suffix: "4" }],
+    [["8", "+"], { exit: 1 }], [["log", "10"], { exit: 1 }] ]) {
+    const result = await external({ context, sink, options, owner, stem, label: `case3-cli-${row.external_cli.length + 1}`, args: ["-X", "utf8", "calculator.py", ...argv], observationBudget });
+    const pass = manualCase3CliResult(result.result, result.stdout, result.stderr, expected);
+    row.external_cli.push({ argv, expected, pass, exit_code: result.result.outcome.root_exit_code });
+  }
+  return row.external_cli.every(result => result.pass) ? [] : ["stage3:external-cli-contract-failed"];
+}
+
 export function createManualCase3Scenario(raw = {}) {
   const options = normalizeManualCase3Options(raw);
   return createManualTextCase({ id: "manual.case3", options, specPath: SPEC, stages: manualCase3Stages, outputs: OUTPUTS,
@@ -50,15 +62,7 @@ export function createManualCase3Scenario(raw = {}) {
         if (!row.external_unittest.pass) return [`${step.name}:external-unittest-failed-or-empty`];
       }
       if (step.name === "stage3") {
-        row.external_cli = [];
-        for (const [argv, expected] of [ [["2", "+", "3"], { exit: 0, suffix: "5" }], [["2", "pow", "3"], { exit: 0, suffix: "8" }],
-          [["sin", "0"], { exit: 0, suffix: "0" }], [["cos", "0"], { exit: 0, suffix: "1" }], [["sqrt", "16"], { exit: 0, suffix: "4" }],
-          [["8", "+"], { exit: 1 }], [["log", "10"], { exit: 1 }] ]) {
-          const result = await manualLiveExternalProcess({ context, sink, options, owner, stem, label: `case3-cli-${row.external_cli.length + 1}`, args: ["-X", "utf8", "calculator.py", ...argv], observationBudget });
-          const pass = manualCase3CliResult(result.result, result.stdout, result.stderr, expected);
-          row.external_cli.push({ argv, expected, pass, exit_code: result.result.outcome.root_exit_code });
-          if (!pass) return ["stage3:external-cli-contract-failed"];
-        }
+        return manualCase3VerifyCli({ context, sink, options, owner, stem, row, observationBudget });
       }
       return [];
     }, manualReview: ["Read all three turns and document/source/test changes; confirm docs-only stages and the existing API argument meaning were preserved.",

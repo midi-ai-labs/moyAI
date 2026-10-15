@@ -37,7 +37,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 現行開発版のWindows配布物では、次の順に進みます。
 
-1. ZIP全体を展開して `Setup-moyAI.cmd` を実行し、スタートメニューから **moyAI** を開きます。インストールせず使う場合は `Start-moyAI.cmd` を開きます。
+1. ZIP全体を展開して `Setup-moyAI.cmd` を実行し、スタートメニューから **moyAI** を開きます。インストールせず使う場合は `Start-moyAI.cmd` を開きます。新しく起動するたびにWindowsの管理者承認を行います。取り消すと起動を中止します。
 2. 初回画面で目的を選びます。
 
    | 目的 | 選ぶ項目 |
@@ -84,6 +84,8 @@ moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile 
 
 開発版配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
+WindowsのRunとTUIは、起動時に一度の管理者承認が必要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
+
 ## プロジェクトごとの指示
 
 `AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、`.moyai/commands/*.md`、ローカルの `SKILL.md` を利用できます。ファイルとツールの利用範囲は、選択した作業フォルダーと操作権限に従います。Hubプロジェクトへ再参加するときも、AIが通常の作業として実ファイルから状態を把握し、専用の履歴復元処理は行いません。
@@ -96,9 +98,13 @@ moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile 
 
 「承認を求める」と「代理で承認」は同じWindowsの作業フォルダー保護を使い、後者はAIが操作の許可を審査します。「フルアクセス」は現在のWindows利用者の権限で実行します。これはOS全体の完全隔離を保証するものではありません。ネイティブなプロセス保護はWindowsのみで、他OSでは保護が必要なプロセス操作を拒否します。Unixの既存ファイル更新・削除は、バックアップを残した部分完了エラーになる場合があり、表示された保存先の確認が必要です。
 
+起動時の承認で一時SYSTEM sandbox helperを準備します。通常アプリとRunnerは一般ユーザー権限のまま動作し、この承認で個々のtool操作を許可したり、失敗した制限付きcommandをフルアクセスで自動再実行したりしません。現在の起動経路はlocal Windows SAM accountを対象とし、非対応のaccount種別やhelperの準備失敗では起動を中止します。許可済みworkspace / TEMP内での標準Python private directoryとpytest一時directoryの利用は、project fileの変更や制限外実行の依頼なしに動作することが要件です。workspace外や別effectへの制限は別に確認します。
+
+通常の配置フォルダーから起動してください。helperや同梱runtimeまでのpathにjunction・symbolic linkなどのreparse pointがある場合は起動を拒否するため、配布物全体を通常のフォルダーへ移してください。
+
 停止や発言の編集は、作成済みファイルや起動済みアプリを元に戻しません。編集・再送できるのは最新の発言だけです。本文を編集しても元の画像や添付は保持します。添付を変更する場合は、新しい依頼として送ってください。停止要求の受付と、実プロセスの停止確認は別です。
 
-RunnerはWindows利用者のログオン中に動作します。OSサービス運用、HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
+RunnerはWindows利用者のログオン中に動作します。Desktopが起動するRunnerは承認済みhelperへ接続し、二度目のUACなしで独立したlifetime leaseを保持します。最後のownerが終了するとhelperを清算します。Windowsログオン時の自動起動を含め、独立して起動するRunnerは自身の起動時に管理者承認を要求します。一時helperがRunner自体をWindows serviceとして動かすわけではありません。HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
 
 ## 開発・検証
 
@@ -118,9 +124,11 @@ npm run test:desktop-web
 npm run verify:gui -- --suite smoke
 ```
 
+Windowsのnative sandbox試験には、明示的に起動承認したhelper testhostが必要です。対応するlibtestのビルドと実行は[Windows sandbox試験ガイド](docs/testing-windows-sandbox.md)に従ってください。
+
 [GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanupを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
+公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 
 ## License
 

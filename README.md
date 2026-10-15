@@ -37,7 +37,7 @@ Documentation and explanatory comments use built-in writing guidance inspired by
 
 For a current development Windows package:
 
-1. Extract the whole ZIP and run `Setup-moyAI.cmd`. Open **moyAI** from the Start menu. Portable use starts with `Start-moyAI.cmd`.
+1. Extract the whole ZIP and run `Setup-moyAI.cmd`. Open **moyAI** from the Start menu. Portable use starts with `Start-moyAI.cmd`. Accept the Windows administrator approval on each new startup; cancelling it stops startup.
 2. Choose your role in the first-use screen:
 
    | Purpose | Entry |
@@ -90,6 +90,8 @@ moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile 
 
 Installed development packages keep binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
+On Windows, Run and TUI require one administrator approval at startup. Help, version and metadata-only commands do not start the sandbox helper.
+
 ## Project Instructions
 
 Project instructions can come from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md` and local `SKILL.md` files. Files and tools remain subject to the selected workspace and permission mode. Existing files are the source of project state; rejoining a Hub project does not need a special history-restoration procedure.
@@ -102,9 +104,13 @@ Windows x64 is the primary supported and verified deployment. Distribution needs
 
 **Ask for approval** and **Approve for me** share Windows workspace restrictions; the latter uses an AI reviewer for permission decisions. **Full access** runs approved processes with the current Windows user's authority. These restrictions are not a complete OS isolation boundary. Native process sandboxing is Windows-only; restricted process operations fail closed elsewhere. Unix updates/deletes may return a partial-commit error with a preserved backup, which must be reviewed.
 
+Startup approval prepares a temporary SYSTEM sandbox helper; the app and Runner remain ordinary user processes. It does not approve individual tool operations or automatically rerun a failed restricted command with full access. The current startup path supports local Windows SAM accounts. Unsupported account types and helper preparation failures stop startup. Standard Python private-directory and pytest temporary-directory access inside the allowed workspace/TEMP must work without changing project files or requesting unrestricted execution; outside and other-effect restrictions remain separate checks.
+
+Start from an ordinary installation folder. Startup refuses a helper or bundled runtime reached through a junction, symbolic link or other reparse point; move the complete package to an ordinary folder if that check fails.
+
 Stop and editing a request do not undo files already written or applications already started. Only the latest user message can be edited and resent. Text edits keep the original images and attachments; to change them, send a new request. A shared job's accepted cancellation is not proof that its process has stopped.
 
-Runner operates while its Windows user is logged in. Windows service operation, automatic Hub root-CA replacement, and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
+Runner operates while its Windows user is logged in. A Runner started by Desktop attaches to the approved startup helper without a second UAC and keeps its own lifetime lease. The helper is cleaned up after the last owner exits. An independently started Runner, including Windows logon autostart, requests its own startup approval. The temporary helper does not run Runner itself as a Windows service. Automatic Hub root-CA replacement and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
 
 ## Development and Verification
 
@@ -124,9 +130,11 @@ npm run test:desktop-web
 npm run verify:gui -- --suite smoke
 ```
 
+Windows native sandbox tests require an explicitly approved helper testhost. Follow the [Windows sandbox test guide](docs/testing-windows-sandbox.md) to build and run the matching libtest.
+
 Use the [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md) and [manual test entrypoint](tests/manual_ST/README.md) to select checks for the changed behavior. Real-window evidence and Live LLM behavior must be distinguished from fixture tests. Source ownership is visible in [src/](src/) and [the multi-PC design](docs/design/multi-device-session.md); implementation details belong with their code and tests rather than being duplicated here.
 
-Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner and cleanup, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
+Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner, cleanup and the sandbox helper, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
 
 ## License
 

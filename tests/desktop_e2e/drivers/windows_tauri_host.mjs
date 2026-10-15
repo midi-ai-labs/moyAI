@@ -165,6 +165,17 @@ export class WindowsTauriHost {
   #desktopOwner = null;
   #parentHost = null;
   #companions = [];
+  #runtime = null;
+
+  // A scenario may restart Desktop as part of its own test. Suite callers must
+  // acquire the current attachment instead of keeping that closed CDP client.
+  async attachedRuntime() {
+    if (this.#desktop === null || this.#desktop.exitCode !== null || this.#driver === null || this.#runtime === null) {
+      throw new DesktopE2eError("harness", "desktop-attachment-not-live", "the suite Desktop is no longer attached");
+    }
+    await this.#checkDesktops([this.#desktopOwner]);
+    return { driver: this.#driver, runtime: structuredClone(this.#runtime) };
+  }
 
   async #checkDesktops(owned = []) {
     const root = this.#parentHost ?? this;
@@ -278,13 +289,14 @@ export class WindowsTauriHost {
       startup_target: scenario.startupTarget ?? "workspace",
       arguments: launchArguments,
     }, { phase, owner: "desktop-app" });
-    return {
+    this.#runtime = {
       generation: this.#generation,
       desktop_process_id: this.#desktop.pid,
       desktop_owner: owner,
       desktop_owner_path: this.#desktopOwnerPath,
       launch_started_at: launchStartedAt,
     };
+    return structuredClone(this.#runtime);
   }
 
   async attach({ context, sink, runtime, phase }) {

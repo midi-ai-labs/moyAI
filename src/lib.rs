@@ -19,6 +19,7 @@ pub mod protocol;
 pub mod remote_agent;
 pub mod runner;
 pub mod runtime;
+pub mod sandbox_broker;
 pub mod session;
 pub mod skill;
 pub mod storage;

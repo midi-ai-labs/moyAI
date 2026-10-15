@@ -31,9 +31,9 @@ pub use recording::{
     CanonicalRuntimeEventProjector, CanonicalRuntimeProjectionReport, ProtocolRecordingSink,
 };
 pub use store::{
-    ActiveHistoryPage, ActiveHistorySnapshot, CanonicalProtocolFence, CanonicalProtocolSnapshot,
-    MAX_PROTOCOL_PAGE_LIMIT, ProtocolEventStore, ProtocolPage, ProtocolPageRequest,
-    SqliteProtocolEventStore,
+    ActiveHistoryPage, ActiveHistorySnapshot, CanonicalHistorySnapshot, CanonicalProtocolFence,
+    CanonicalProtocolSnapshot, MAX_PROTOCOL_PAGE_LIMIT, ProtocolEventStore, ProtocolPage,
+    ProtocolPageRequest, SqliteProtocolEventStore,
 };
 pub(crate) use store::{
     canonical_protocol_snapshot_from_connection, fork_agent_context_in_transaction_for_spawn,

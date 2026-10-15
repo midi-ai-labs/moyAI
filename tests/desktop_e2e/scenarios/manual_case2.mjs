@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createReadStream } from "node:fs";
 import { lstat, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { canonicalUlid } from "../core/canonical_identity.mjs";
 import { waitForObservation } from "../core/deadline.mjs";
@@ -21,7 +22,6 @@ const SPEC = fileURLToPath(new URL("../../manual_ST/case2/spec.md", import.meta.
 const CONTRACT = fileURLToPath(new URL("../../manual_ST/case2/scenario_contract.md", import.meta.url));
 const ACL_SCRIPT = fileURLToPath(new URL("../drivers/manual_case2_capture.ps1", import.meta.url));
 const OUTPUTS = ["space_invader.py", "test_space_invader.py", "README.md"];
-const CASE_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const fail = (code, message, evidence = {}) => new DesktopE2eError("product", code, message, evidence);
@@ -110,29 +110,57 @@ async function preparePrivateCapture({ context, sink, options, captureDirectory 
   if (!pass) throw new DesktopE2eError("environment", "case2-capture-acl", "private capture ACL/account/readback was not established before launch", { acl, result, output });
 }
 
-async function preparedRequests(directory, sink) {
+export async function manualCase2CaptureSnapshot(directory, { requireEmpty = false } = {}) {
   const entries = await readdir(directory, { withFileTypes: true }).catch(error => {
     if (error.code === "ENOENT") return []; throw error;
   });
+  if (requireEmpty && entries.length) throw new DesktopE2eError("harness", "case2-capture-not-fresh", "standalone Case2 capture must start empty", {});
+  const files = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const candidate = path.join(directory, entry.name);
+    const item = await lstat(candidate);
+    if (!item.isFile() || item.isSymbolicLink()) throw new DesktopE2eError("harness", "case2-capture-file", "capture entry is not a physical file", { filename: entry.name });
+    const hash = crypto.createHash("sha256");
+    let size = 0;
+    for await (const chunk of createReadStream(candidate)) { hash.update(chunk); size += chunk.length; }
+    if (size !== item.size) throw new DesktopE2eError("harness", "case2-capture-bytes", "capture changed while taking its baseline", { filename: entry.name });
+    files.push({ filename: entry.name, size_bytes: size, sha256: hash.digest("hex") });
+  }
+  return { source: "capture_filename_bytes_sha256", files };
+}
+
+export async function manualCase2PreparedRequests(directory, sink, baseline) {
+  const current = await manualCase2CaptureSnapshot(directory);
+  const currentFiles = new Map(current.files.map(row => [row.filename, row]));
+  const oldFiles = new Map(baseline.files.map(row => [row.filename, row]));
+  const changed = baseline.files.filter(row => {
+    const next = currentFiles.get(row.filename);
+    return !next || next.size_bytes !== row.size_bytes || next.sha256 !== row.sha256;
+  });
+  if (changed.length) throw new DesktopE2eError("harness", "case2-capture-baseline-changed", "earlier capture files changed or disappeared during Case2", { baseline, changed });
+  const added = current.files.filter(row => !oldFiles.has(row.filename));
+  const addedFiles = new Map(added.map(row => [row.filename, row]));
   const captures = [];
-  for (const entry of entries.filter(row => row.name.endsWith(".metadata.json")).sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!entry.isFile() || entry.isSymbolicLink()) throw new DesktopE2eError("harness", "case2-capture-file", "request metadata is not a physical file", {});
-    const metadata = JSON.parse(await readFile(path.join(directory, entry.name), "utf8"));
-    const bodyName = entry.name.replace(/\.metadata\.json$/, ".request.json");
+  for (const entry of added.filter(row => row.filename.endsWith(".metadata.json"))) {
+    const metadataBytes = await readFile(path.join(directory, entry.filename));
+    if (sha256(metadataBytes) !== entry.sha256) throw new DesktopE2eError("harness", "case2-capture-bytes", "request metadata changed while reading it", { filename: entry.filename });
+    const metadata = JSON.parse(metadataBytes.toString("utf8"));
+    const bodyName = entry.filename.replace(/\.metadata\.json$/, ".request.json");
     if (metadata.schema_version !== 2 || metadata.capture_stage !== "prepared" || metadata.transport !== "http"
-      || metadata.request_body_file !== bodyName || typeof metadata.request_id !== "string") {
+      || metadata.request_body_file !== bodyName || typeof metadata.request_id !== "string" || !addedFiles.has(bodyName)) {
       throw new DesktopE2eError("harness", "case2-capture-owner", "prepared request metadata does not own its body", {});
     }
     const candidate = path.join(directory, bodyName);
     const item = await lstat(candidate);
     if (!item.isFile() || item.isSymbolicLink() || item.size > MAX_CAPTURE_BYTES) throw new DesktopE2eError("harness", "case2-capture-size", "prepared request cannot be read as a bounded physical file", {});
     const bytes = await readFile(candidate);
-    if (bytes.length !== metadata.request_body_bytes) throw new DesktopE2eError("harness", "case2-capture-bytes", "request body length differs from metadata", {});
+    if (bytes.length !== metadata.request_body_bytes || sha256(bytes) !== addedFiles.get(bodyName).sha256) throw new DesktopE2eError("harness", "case2-capture-bytes", "request body differs from captured metadata or snapshot", {});
     captures.push({ request_id: metadata.request_id, capture_stage: "prepared", api_mode: metadata.api_mode,
       endpoint_path: metadata.endpoint_path, request_body_sha256: sha256(bytes), request_body_bytes: bytes.length,
       ...manualCase2ImageDiagnostics(JSON.parse(bytes.toString("utf8"))) });
   }
   const summary = { source: "task_local_prepared_http_dto", requests: captures,
+    capture_scope: { attribution: "new_filename_pairs_after_case_entry", baseline, baseline_unchanged: true, new_files: added },
     provider_attempt_and_receipt: "unverified_not_proved_by_prepared_capture" };
   await sink.writeJson("case2/prepared-requests.json", summary);
   return summary;
@@ -156,9 +184,9 @@ async function settlePicker(state) {
 
 export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePrivateCapture } = {}) {
   const options = normalizeManualCase2Options(raw);
-  const state = { prompt: null, image: null, baseline: null, captureDirectory: null, live: null, cleanup: null,
+  const state = { prompt: null, image: null, baseline: null, captureDirectory: null, captureBaseline: null, live: null, cleanup: null,
     nativeOwner: null, nativeBefore: null, nativeCandidate: null, pickerDispatched: false, pickerCleanupFailure: null, quiesced: false };
-  return Object.freeze({ id: "manual.case2", productOracle: "pass", manualGate: "pending", databaseRequired: true,
+  return Object.freeze({ id: "manual.case2", productOracle: "pass", manualGate: "pending", databaseRequired: true, prepareBeforeLaunch: true,
     get environment() { return state.captureDirectory === null ? {} : { MOYAI_HTTP_REQUEST_CAPTURE_DIR: state.captureDirectory }; },
     async requestGracefulExit(cdp) {
       try { await settlePicker(state); }
@@ -181,7 +209,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
       state.image = { source_path: options.imageSource, source_filename: path.basename(options.imageSource), workspace_path: imagePath,
         workspace_filename: imageName, size_bytes: image.length, sha256: sha256(image) };
       state.baseline = await manualLiveGeneratedFiles(context, sink, "case2/baseline", ["scenario_contract.md", imageName]);
-      await sink.record("case2-input", { options, prompt: state.prompt, image: state.image, baseline: state.baseline, observation_timeout_ms: options.observationTimeoutMs ?? CASE_TIMEOUT_MS,
+      await sink.record("case2-input", { options, prompt: state.prompt, image: state.image, baseline: state.baseline, observation_timeout_ms: options.observationTimeoutMs ?? null,
         spec: { path: SPEC, sha256: sha256(spec) }, contract: { path: CONTRACT, sha256: sha256(contract) },
         model_capability: "unknown_unless_separate_provider_metadata_proves_support", runtime_image_policy: "existing_default_supports_images_true",
         provider_lifecycle: "external-unmanaged", provider_owned: false }, { phase, owner: OWNER });
@@ -189,13 +217,15 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
     async execute({ context, driver: cdp, sink, runtime }) {
       let primaryError = null;
       try {
+        state.captureBaseline = await manualCase2CaptureSnapshot(state.captureDirectory, { requireEmpty: context.manualSuite?.shared_profile !== true });
+        await sink.writeJson("case2/capture-baseline.json", state.captureBaseline);
         await acquireInteractiveShell({ context, driver: cdp, sink }, { evidenceOwner: OWNER, screenshotStem: "case2-ready" });
         const p = (await observeProviderTurnSurface(cdp)).projection;
         if (p.provider_effective_profile !== "openai_compatible" || p.provider_effective_base_url !== options.providerBaseUrl
           || p.provider_effective_model_id !== options.model || p.provider_effective_api_key_env !== options.apiKeyEnv
           || Number(p.provider_effective_context_window) !== 131072) throw fail("case2-provider-config", "effective provider differs from explicit inputs");
         state.live = new ManualLiveSession({ context, driver: cdp, sink, options, owner: OWNER, stem: "case2",
-          capturePaths: [...OUTPUTS, "scenario_contract.md", state.image.workspace_filename], observationTimeoutMs: CASE_TIMEOUT_MS });
+          capturePaths: [...OUTPUTS, "scenario_contract.md", state.image.workspace_filename] });
         await state.live.open();
         state.nativeOwner = { executionRoot: context.root, ownerPath: runtime.desktop_owner_path, expectedOwner: runtime.desktop_owner };
         await manualLiveClick(state.live.input, action("toggle-attachment-tray"), sink, "open-attachment-tray", { owner: OWNER, stem: "case2" });
@@ -233,7 +263,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
         if (!live.incomplete && diagnostics.terminal_decision !== "completed") {
           const stopped = { machine_gate: "fail", diagnostics, history: manualLiveHistory(projection),
             generated: await manualLiveGeneratedFiles(context, sink, "case2/generated", [...OUTPUTS, "scenario_contract.md", state.image.workspace_filename]),
-            prepared_requests: await preparedRequests(state.captureDirectory, sink), approvals: live.approvals,
+            prepared_requests: await manualCase2PreparedRequests(state.captureDirectory, sink, state.captureBaseline), approvals: live.approvals,
             external_verification: "not_reached", transcript: "not_reached_failed_terminal", manual_verdict: "pending" };
           await sink.writeJson("case2/summary.json", stopped);
           throw fail("case2-desktop-terminal", "Case2 did not complete; downstream artifact verification was not reached", stopped);
@@ -242,7 +272,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
         if (!canonicalUlid(sessionId)) throw new DesktopE2eError("harness", "case2-terminal-owner", "Case2 has no exact terminal owner", {});
         const history = manualLiveHistory(projection);
         const generated = await manualLiveGeneratedFiles(context, sink, "case2/generated", [...OUTPUTS, "scenario_contract.md", state.image.workspace_filename]);
-        const capture = await preparedRequests(state.captureDirectory, sink);
+        const capture = await manualCase2PreparedRequests(state.captureDirectory, sink, state.captureBaseline);
         const failures = manualCase2FixtureFailures(state.baseline, generated, state.image.workspace_filename);
         if (history.users.length !== 1 || history.users[0] !== expectedUserBody) failures.push("canonical-user-request-or-image-mismatch");
         if (!capture.requests.some(row => row.model === options.model && row.image_count === 1
@@ -258,7 +288,7 @@ export function createManualCase2Scenario(raw = {}, { prepareCapture = preparePr
             if (!verdict.pass) { failures.push(`${label}-failed-or-empty`); break; }
           }
         }
-        const transcript = await manualLiveExportTranscript({ context, input: state.live.input, sink, owner: OWNER, stem: "case2", sessionId, prompt: expectedUserBody, observationBudget: state.live.observationBudget });
+        const transcript = await manualLiveExportTranscript({ context, driver: cdp, input: state.live.input, sink, owner: OWNER, stem: "case2", sessionId, prompt: expectedUserBody, observationBudget: state.live.observationBudget });
         state.live.observationBudget.assertRemaining("case2 case completion");
         const summary = { schema_version: "desktop-e2e.manual-case2.v1", mode: "case2c", image: state.image,
           machine_gate: live.incomplete ? "operator_review_incomplete" : failures.length ? "fail" : "pass",

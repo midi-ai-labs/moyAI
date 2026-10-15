@@ -10,11 +10,10 @@ import { ManualLiveSession, manualLiveFixtureConfig, manualLiveHistory, manualLi
   manualLiveExportTranscript, manualLiveTerminalDecision } from "../drivers/manual_live_session.mjs";
 
 export function createManualTextCase({ id, options, specPath, stages, outputs, prepareWorkspace = async () => {},
-  checkStage = async () => [], manualReview, fixtureConfig = manualLiveFixtureConfig(options), beforeStages = async () => {},
-  observationTimeoutMs = 15 * 60 * 1000 }) {
+  checkStage = async () => [], manualReview, fixtureConfig = manualLiveFixtureConfig(options), beforeStages = async () => {} }) {
   const stem = id.replace(/^manual\./, "");
   const owner = `scenario:${id}`;
-  const caseTimeoutMs = options.observationTimeoutMs ?? observationTimeoutMs;
+  const caseTimeoutMs = options.observationTimeoutMs ?? null;
   const state = { steps: [], baseline: null, live: null, cleanup: null, quiesced: false };
   return Object.freeze({ id, productOracle: "pass", manualGate: "pending", databaseRequired: true, requestGracefulExit,
     async prepare({ context, sink, phase }) {
@@ -37,7 +36,7 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
           || initial.provider_effective_model_id !== options.model || initial.provider_effective_api_key_env !== options.apiKeyEnv
           || Number(initial.provider_effective_context_window) !== 131072) throw new DesktopE2eError("product", `${stem}-provider-config`, "effective provider differs from explicit manual inputs", {});
         await beforeStages({ context, driver, sink, options, owner, stem });
-        state.live = new ManualLiveSession({ context, driver, sink, options, owner, stem, capturePaths: outputs, observationTimeoutMs: caseTimeoutMs });
+        state.live = new ManualLiveSession({ context, driver, sink, options, owner, stem, capturePaths: outputs });
         await state.live.open();
         const acquired = [];
         const failures = [];
@@ -72,7 +71,7 @@ export function createManualTextCase({ id, options, specPath, stages, outputs, p
           previous = generated;
           if (failures.length) break;
         }
-        const transcript = await manualLiveExportTranscript({ context, input: state.live.input, sink, owner, stem,
+        const transcript = await manualLiveExportTranscript({ context, driver, input: state.live.input, sink, owner, stem,
           sessionId: firstSession, prompt: state.steps[0].prompt, observationBudget: state.live.observationBudget });
         state.live.observationBudget.assertRemaining(`${stem} case completion`);
         const summary = { schema_version: "desktop-e2e.manual-text-case.v1", scenario: id, approval_mode: options.approvalMode,

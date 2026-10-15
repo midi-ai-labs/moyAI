@@ -29,8 +29,8 @@ struct ResolvedExecutableInner {
 }
 
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WindowsExecutableIdentity {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum WindowsExecutableIdentity {
     Extended {
         volume_serial_number: u64,
         file_id: [u8; 16],
@@ -68,6 +68,11 @@ struct UnixDirectoryIdentity {
 }
 
 impl ResolvedExecutable {
+    #[cfg(windows)]
+    pub(crate) fn windows_identity(&self) -> &WindowsExecutableIdentity {
+        &self.inner.identity
+    }
+
     pub(crate) fn resolve(
         program: &str,
         cwd: &Utf8Path,

@@ -2354,6 +2354,65 @@ mod tests {
     }
 
     #[test]
+    fn continued_turn_progress_rejects_wrong_session_old_admission_and_other_turn() {
+        let (state, mut progress, item) = canonical_wait_progress_fixture();
+        let session_id = item.session_id;
+        let turn_id = item.turn_id;
+        let mut session = test_session(session_id);
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        progress.model_request_count = 7;
+        let mut current = canonical_read(&session, vec![item.clone()], Vec::new(), Some(turn_id));
+        current.admission_revision = 3;
+        current.turn_progress = Some(progress.clone());
+        let mut state = state;
+        state.load_canonical_session_read(&current);
+        let before = state.progress.clone();
+        let tools = state.tool_statuses.clone();
+        let mut stale = current.clone();
+        stale.admission_revision = 2;
+        assert!(!state.refresh_canonical_conversation(&stale));
+        assert_eq!(state.progress, before);
+        let mut other = current.clone();
+        other.active_turn_id = Some(TurnId::new());
+        other.latest_turn_id = other.active_turn_id;
+        other.turn_progress.as_mut().unwrap().turn_id = other.active_turn_id.unwrap();
+        assert!(!state.refresh_canonical_conversation(&other));
+        let mut different_session = current.clone();
+        different_session.session.id = SessionId::new();
+        assert!(!state.refresh_canonical_conversation(&different_session));
+        let mut wrong_progress = progress.clone();
+        wrong_progress.turn_id = TurnId::new();
+        state.reconcile_turn_progress(session_id, &wrong_progress, &[]);
+        state.reconcile_turn_progress(SessionId::new(), &progress, &[]);
+        assert_eq!(state.progress, before);
+        assert_eq!(state.tool_statuses, tools);
+        assert_eq!(
+            state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: 3
+            }
+        );
+        assert!(state.refresh_canonical_conversation(&current));
+        assert_eq!(state.progress, before);
+        assert_eq!(state.tool_statuses, tools);
+        state.apply_terminal_outcome_projection(&TurnTerminalOutcome::Completed);
+        assert!(
+            !state.refresh_canonical_conversation(&current),
+            "a late running read cannot revive this completed admission"
+        );
+        assert_eq!(
+            state.active_turn_expectation,
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_id),
+                revision: 3
+            }
+        );
+        assert_eq!(state.run_status, RunStatus::Completed);
+    }
+
+    #[test]
     fn terminal_reload_rebuilds_latest_turn_compactions_from_canonical_items() {
         let session_id = SessionId::new();
         let previous_turn_id = TurnId::new();

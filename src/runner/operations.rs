@@ -612,6 +612,11 @@ fn launch_process() -> Result<std::process::Child, RunnerError> {
             .open(paths.data_dir.join("runner.log"))
             .map_err(error)?;
         let mut command = std::process::Command::new(executable);
+        if let Some(endpoint) =
+            crate::sandbox_broker::inherited_endpoint().map_err(|error| RunnerError::new(error))?
+        {
+            command.env("MOYAI_SANDBOX_ENDPOINT", endpoint);
+        }
         #[cfg(feature = "desktop-e2e")]
         if let Some(registry) = fixture_registry {
             command

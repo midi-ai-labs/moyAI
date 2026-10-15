@@ -64,10 +64,12 @@ test("one registry binds every reusable scenario to the common runner contract",
     "manual.case6",
     "manual.case7",
     "manual.case5_2",
+    "manual.suite",
+    "manual.suite-controls",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
-    "manual.permission-guardian-openai-compatible",
-    "manual.permission-temp-escalation-lm-studio",
+    "manual.permission-temp-write-openai-compatible",
+    "manual.permission-temp-write-lm-studio",
     "native-dialog.cancel",
     "navigation.session-management",
     "navigation.workspace-controls",
@@ -92,7 +94,8 @@ test("one registry binds every reusable scenario to the common runner contract",
     "permission.restart-guardian-chat",
     "permission.guardian-handoff-approve",
     "permission.guardian-handoff-abort",
-    "permission.temp-escalation",
+    "permission.guardian-handoff-stop",
+    "permission.temp-write",
     "provider.chat-tool-continuation",
     "history.tool-operation-failure",
     "permission.shell-projection-success",
@@ -122,7 +125,9 @@ test("one registry binds every reusable scenario to the common runner contract",
     "side-chat.session",
   ]);
   for (const id of scenarioIds) {
-    const options = id === "manual.case2"
+    const options = id === "manual.suite"
+      ? { cases: [{ scenario: "manual.case1", options: { ...liveProviderOptions, python_executable: "C:/fixture/python.exe" } }] }
+      : id === "manual.case2"
       ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", image_source: "C:/fixture/reference.jpg" }
       : id === "manual.case5"
         ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/repository" }
@@ -138,9 +143,9 @@ test("one registry binds every reusable scenario to the common runner contract",
         ? liveProviderOptions
         : id === "manual.provider-lm-studio-thinking"
           ? lmStudioThinkingOptions
-          : id === "manual.permission-guardian-openai-compatible"
+          : id === "manual.permission-temp-write-openai-compatible"
             ? liveProviderOptions
-            : id === "manual.permission-temp-escalation-lm-studio"
+            : id === "manual.permission-temp-write-lm-studio"
               ? lmStudioThinkingOptions
               : {};
     const scenario = createScenario(id, options);
@@ -169,9 +174,13 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("permission.restart-guardian-chat"),
   );
   assert.notEqual(
-    createScenario("permission.temp-escalation"),
-    createScenario("permission.temp-escalation"),
+    createScenario("permission.temp-write"),
+    createScenario("permission.temp-write"),
   );
+  for (const retired of ["permission.temp-escalation", "manual.permission-temp-escalation-lm-studio",
+    "manual.permission-guardian-openai-compatible"]) {
+    assert.throws(() => createScenario(retired), /unknown/u);
+  }
   assert.notEqual(
     createScenario("provider.chat-tool-continuation"),
     createScenario("provider.chat-tool-continuation"),
@@ -203,12 +212,12 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
   );
   assert.notEqual(
-    createScenario("manual.permission-guardian-openai-compatible", liveProviderOptions),
-    createScenario("manual.permission-guardian-openai-compatible", liveProviderOptions),
+    createScenario("manual.permission-temp-write-openai-compatible", liveProviderOptions),
+    createScenario("manual.permission-temp-write-openai-compatible", liveProviderOptions),
   );
   assert.notEqual(
-    createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
-    createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
+    createScenario("manual.permission-temp-write-lm-studio", lmStudioThinkingOptions),
+    createScenario("manual.permission-temp-write-lm-studio", lmStudioThinkingOptions),
   );
   assert.throws(
     () => createScenario("manual.provider-openai-compatible"),
@@ -219,11 +228,11 @@ test("one registry binds every reusable scenario to the common runner contract",
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(
-    () => createScenario("manual.permission-guardian-openai-compatible"),
+    () => createScenario("manual.permission-temp-write-openai-compatible"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(
-    () => createScenario("manual.permission-temp-escalation-lm-studio"),
+    () => createScenario("manual.permission-temp-write-lm-studio"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(() => createScenario("run-95"), /unknown Desktop E2E scenario/);

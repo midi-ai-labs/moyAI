@@ -22,9 +22,8 @@ export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_API_MODES = Object.fr
   "responses",
   "chat_completions",
 ]);
-export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND = "permission_temp_escalation";
-export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES = 4;
-export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS = 300_000;
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND = "permission_temp_write";
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND = "chat_tool_continuation";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
@@ -334,36 +333,15 @@ function permissionRestartGuardianScript(value) {
   });
 }
 
-function permissionTempEscalationScript(value) {
-  const expectedKeys = [
-    "command",
-    "guardianDelayMs",
-    "justification",
-    "kind",
-    "responseText",
-    "taskPrompt",
-  ];
-  if (!exactKeys(value, expectedKeys)
-    || value.kind !== SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-    throw new TypeError("permission TEMP escalation scripted provider mode must use its exact schema");
+function permissionTempWriteScript(value) {
+  if (!exactKeys(value, ["command", "kind", "responseText", "taskPrompt"])
+    || value.kind !== SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+    throw new TypeError("permission TEMP write scripted provider mode must use its exact schema");
   }
-  const guardianDelayMs = nonNegativeInteger(
-    value.guardianDelayMs,
-    "script.guardianDelayMs",
-  );
-  if (guardianDelayMs > SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS) {
-    throw new TypeError(
-      `script.guardianDelayMs must not exceed ${SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS}`,
-    );
-  }
-  return Object.freeze({
-    kind: value.kind,
+  return Object.freeze({ kind: value.kind,
     taskPrompt: nonEmptyString(value.taskPrompt, "script.taskPrompt"),
     command: nonEmptyString(value.command, "script.command"),
-    justification: nonEmptyString(value.justification, "script.justification"),
-    responseText: nonEmptyString(value.responseText, "script.responseText"),
-    guardianDelayMs,
-  });
+    responseText: nonEmptyString(value.responseText, "script.responseText") });
 }
 
 function chatToolContinuationScript(value) {
@@ -471,8 +449,8 @@ function providerScript(value) {
   if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return permissionRestartGuardianScript(value);
   }
-  if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-    return permissionTempEscalationScript(value);
+  if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+    return permissionTempWriteScript(value);
   }
   if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return chatToolContinuationScript(value);
@@ -497,8 +475,8 @@ function scriptedResponseMaximum(script) {
   if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES;
   }
-  if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-    return SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES;
+  if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+    return SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES;
   }
   if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
@@ -571,21 +549,9 @@ export function createPermissionRestartGuardianProviderScript({
   });
 }
 
-export function createPermissionTempEscalationProviderScript({
-  taskPrompt,
-  command,
-  justification,
-  responseText,
-  guardianDelayMs = 0,
-} = {}) {
-  return permissionTempEscalationScript({
-    kind: SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND,
-    taskPrompt,
-    command,
-    justification,
-    responseText,
-    guardianDelayMs,
-  });
+export function createPermissionTempWriteProviderScript({ taskPrompt, command, responseText } = {}) {
+  return permissionTempWriteScript({ kind: SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND,
+    taskPrompt, command, responseText });
 }
 
 export function createChatToolContinuationProviderScript({ call } = {}) {
@@ -777,14 +743,8 @@ const SIDE_CHAT_QUOTE_WRITE_CALL_ID = "call_side_chat_quote_write";
 const SIDE_CHAT_QUOTE_WRITE_ITEM_ID = "fc_side_chat_quote_write";
 const PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID = "call_permission_restart_guardian_shell";
 const PERMISSION_RESTART_GUARDIAN_SHELL_ITEM_ID = "fc_permission_restart_guardian_shell";
-const PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID =
-  "call_permission_temp_escalation_restricted";
-const PERMISSION_TEMP_ESCALATION_RESTRICTED_ITEM_ID =
-  "fc_permission_temp_escalation_restricted";
-const PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID =
-  "call_permission_temp_escalation_elevated";
-const PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID =
-  "fc_permission_temp_escalation_elevated";
+const PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID = "call_permission_temp_write_restricted";
+const PERMISSION_TEMP_WRITE_RESTRICTED_ITEM_ID = "fc_permission_temp_write_restricted";
 const PERMISSION_RESTART_GUARDIAN_ALLOW = Object.freeze({
   risk_level: "low",
   rationale: "bounded deterministic fixture command",
@@ -2761,248 +2721,76 @@ function permissionRestartGuardianChatRequestContract(body, modelId, script) {
   };
 }
 
-function permissionTempEscalationExpected(script) {
-  return {
-    restrictedArguments: JSON.stringify({
-      command: script.command,
-      sandbox_permissions: "use_default",
-    }),
-    elevatedArguments: JSON.stringify({
-      command: script.command,
-      sandbox_permissions: "require_escalated",
-      justification: script.justification,
-    }),
-  };
+function permissionTempWriteExpected(script) {
+  return { restrictedArguments: JSON.stringify({ command: script.command, sandbox_permissions: "use_default" }) };
 }
 
-function permissionTempEscalationCallMatches(item, callId, argumentsJson) {
+function permissionTempWriteCallMatches(item, callId, argumentsJson) {
   return exactKeys(item, ["arguments", "call_id", "name", "type"])
-    && item.type === "function_call"
-    && item.call_id === callId
-    && item.name === "shell"
-    && item.arguments === argumentsJson;
+    && item.type === "function_call" && item.call_id === callId
+    && item.name === "shell" && item.arguments === argumentsJson;
 }
 
-function permissionTempEscalationOutput(item, callId) {
+function permissionTempWriteOutput(item, callId) {
   return exactKeys(item, ["call_id", "output", "type"])
-    && item.type === "function_call_output"
-    && item.call_id === callId
-    && typeof item.output === "string"
-    && item.output.trim().length > 0
-    ? item.output
-    : null;
+    && item.type === "function_call_output" && item.call_id === callId
+    && typeof item.output === "string" && item.output.trim().length > 0 ? item.output : null;
 }
 
-function permissionTempFailureOutputContract(output, script) {
+export function permissionTempWriteOutputContract(output, script) {
   const text = typeof output === "string" ? output : "";
-  const lines = text.split(/\r?\n/u);
-  const noteCount = text.split("Sandbox note:").length - 1;
   const contract = {
     output_non_empty: text.trim().length > 0,
-    command_matches: lines.includes(`Command: ${script.command}`),
-    host_non_success: text.includes("Tool outcome (host projection): non-success"),
-    shell_tool: text.includes('tool: "shell"'),
-    completed_lifecycle: text.includes("lifecycle_status: completed"),
-    hint_kind: text.includes("kind: workspace_write_effect_temp_access_denied"),
-    automatic_retry_false: text.includes("automatic_retry: false"),
-    exit_code_one: text.includes("exit_code: 1"),
-    guidance_present: text.includes("guidance: Sandbox note:"),
-    exact_escalation_hint: text.includes("sandbox_permissions=require_escalated"),
-    no_project_workaround_hint: text.includes(
-      "do not change project files solely to bypass this sandbox restriction",
-    ),
-    single_note: noteCount === 1,
-    same_line_windows_signature: /^.*permissionerror: \[winerror 5\].*moyai-sandbox-effect-.*$/imu
-      .test(text),
-  };
-  return {
-    ...contract,
-    output_size_bytes: output === null ? null : Buffer.byteLength(text, "utf8"),
-    output_sha256: output === null ? null : sha256(Buffer.from(text, "utf8")),
-    pass: Object.values(contract).every((value) => value === true),
-  };
-}
-
-function permissionTempSuccessOutputContract(output, script) {
-  const text = typeof output === "string" ? output : "";
-  const lines = text.split(/\r?\n/u);
-  const contract = {
-    output_non_empty: text.trim().length > 0,
-    command_matches: lines.includes(`Command: ${script.command}`),
-    exit_code_zero: text.includes("Exit code: 0"),
+    command_matches: text.split(/\r?\n/u).includes(`Command: ${script.command}`),
+    exit_code_zero: text.split(/\r?\n/u).includes("Exit code: 0"),
     pytest_passed: /(?:^|\n)1 passed(?:\s|$)/u.test(text),
-    effect_temp_absent: !text.includes("moyai-sandbox-effect-"),
     sandbox_note_absent: !text.includes("Sandbox note:"),
+    non_success_absent: !text.includes("Tool outcome (host projection): non-success"),
   };
-  return {
-    ...contract,
+  return { ...contract,
     output_size_bytes: output === null ? null : Buffer.byteLength(text, "utf8"),
     output_sha256: output === null ? null : sha256(Buffer.from(text, "utf8")),
-    pass: Object.values(contract).every((value) => value === true),
-  };
+    pass: Object.values(contract).every(value => value === true) };
 }
 
-function permissionTempEscalationMainRole(body, script) {
+function permissionTempWriteMainRole(body, script) {
   const input = Array.isArray(body?.input) ? body.input : [];
-  const expected = permissionTempEscalationExpected(script);
   const taskUser = exactInputText(input[0]);
-  const restrictedCall = input[1];
-  const restrictedOutputItem = input[2];
-  const elevatedCall = input[3];
-  const elevatedOutputItem = input[4];
-  const restrictedCallMatches = permissionTempEscalationCallMatches(
-    restrictedCall,
-    PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
-    expected.restrictedArguments,
-  );
-  const restrictedOutput = permissionTempEscalationOutput(
-    restrictedOutputItem,
-    PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
-  );
-  const restrictedOutputContract = permissionTempFailureOutputContract(restrictedOutput, script);
-  const elevatedCallMatches = permissionTempEscalationCallMatches(
-    elevatedCall,
-    PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID,
-    expected.elevatedArguments,
-  );
-  const elevatedOutput = permissionTempEscalationOutput(
-    elevatedOutputItem,
-    PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID,
-  );
-  const elevatedOutputContract = permissionTempSuccessOutputContract(elevatedOutput, script);
+  const callMatches = permissionTempWriteCallMatches(input[1],
+    PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID, permissionTempWriteExpected(script).restrictedArguments);
+  const output = permissionTempWriteOutput(input[2], PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID);
+  const restrictedOutput = permissionTempWriteOutputContract(output, script);
   const initial = input.length === 1 && taskUser === script.taskPrompt;
-  const escalation = input.length === 3
-    && taskUser === script.taskPrompt
-    && restrictedCallMatches
-    && restrictedOutputContract.pass;
-  const continuation = input.length === 5
-    && taskUser === script.taskPrompt
-    && restrictedCallMatches
-    && restrictedOutputContract.pass
-    && elevatedCallMatches
-    && elevatedOutputContract.pass;
-  const role = initial
-    ? "temp_initial"
-    : escalation
-      ? "temp_escalation"
-      : continuation
-        ? "temp_continuation"
-        : null;
-  return {
-    role,
-    evidence: {
-      input_count: input.length,
-      input_item_types: input.map((item) => typeof item?.type === "string" ? item.type : null),
+  const continuation = input.length === 3 && taskUser === script.taskPrompt
+    && callMatches && restrictedOutput.pass;
+  return { role: initial ? "temp_initial" : continuation ? "temp_continuation" : null,
+    evidence: { input_count: input.length,
+      input_item_types: input.map(item => typeof item?.type === "string" ? item.type : null),
       task_prompt_sha256: taskUser === null ? null : sha256(Buffer.from(taskUser, "utf8")),
       task_prompt_matches: taskUser === script.taskPrompt,
-      restricted_call_matches: restrictedCallMatches,
-      restricted_output: restrictedOutputContract,
-      elevated_call_matches: elevatedCallMatches,
-      elevated_output: elevatedOutputContract,
-    },
-  };
+      restricted_call_matches: callMatches, restricted_output: restrictedOutput } };
 }
 
-function permissionTempGuardianPayloadContract(inputText, script) {
-  let payload = null;
-  try {
-    payload = JSON.parse(inputText);
-  } catch {
-    // Invalid or wrapped evidence fails the exact Guardian request contract below.
-  }
-  return permissionGuardianShellPayloadContract(payload,
-    permissionTempEscalationExpected(script).elevatedArguments);
-}
-
-function permissionTempEscalationGuardianRole(body, script) {
-  const input = Array.isArray(body?.input) ? body.input : [];
-  const inputText = input.length === 1 ? exactInputText(input[0]) : null;
-  const payload = permissionTempGuardianPayloadContract(inputText ?? "", script);
-  return {
-    role: input.length === 1 && payload.pass ? "temp_guardian" : null,
-    evidence: {
-      input_count: input.length,
-      input_text_size_bytes: inputText === null ? null : Buffer.byteLength(inputText, "utf8"),
-      input_text_sha256: inputText === null ? null : sha256(Buffer.from(inputText, "utf8")),
-      payload,
-    },
-  };
-}
-
-function permissionTempEscalationRequestContract(body, modelId, script) {
-  const guardianShape = Object.hasOwn(body ?? {}, "reasoning")
-    || !Object.hasOwn(body ?? {}, "tools");
-  const classified = guardianShape
-    ? permissionTempEscalationGuardianRole(body, script)
-    : permissionTempEscalationMainRole(body, script);
+function permissionTempWriteRequestContract(body, modelId, script) {
+  const classified = permissionTempWriteMainRole(body, script);
   const model = typeof body?.model === "string" ? body.model : null;
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
-  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
-    ? Object.keys(body).sort()
-    : [];
-  const expectedKeys = guardianShape ? GUARDIAN_RESPONSES_KEYS : TOOL_RESPONSES_KEYS;
-  const tools = guardianShape ? null : shellToolsContract(body?.tools);
-  const generation = clientGenerationContract(body);
-  const common = {
-    ...generation,
-    script_kind: script.kind,
-    role: classified.role,
-    role_evidence: classified.evidence,
+  const tools = shellToolsContract(body?.tools);
+  const task = { ...clientGenerationContract(body), script_kind: script.kind,
+    role: classified.role, role_evidence: classified.evidence,
     model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
     instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
-    top_level_keys: topLevelKeys,
-    model_matches: model === modelId,
-    instructions_non_empty: instructions !== null && instructions.trim().length > 0,
-    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(expectedKeys),
-    stream_true: body?.stream === true,
-    store_false: body?.store === false,
-  };
-  if (guardianShape) {
-    const guardian = {
-      ...common,
-      guardian_instructions_match: instructions?.includes("independent permission guardian") === true,
-      max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
-      reasoning_absent: !Object.hasOwn(body ?? {}, "reasoning"),
-      tools_absent: !Object.hasOwn(body ?? {}, "tools")
-        && !Object.hasOwn(body ?? {}, "tool_choice")
-        && !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
-    };
-    return {
-      ...guardian,
-      pass: guardian.client_generation_fields_absent
-        && guardian.role === "temp_guardian"
-        && guardian.model_matches
-        && guardian.instructions_non_empty
-        && guardian.guardian_instructions_match
-        && guardian.top_level_keys_match
-        && guardian.max_output_tokens_absent
-        && guardian.reasoning_absent
-        && guardian.tools_absent
-        && guardian.stream_true
-        && guardian.store_false,
-    };
-  }
-  const task = {
-    ...common,
+    top_level_keys: body && typeof body === "object" ? Object.keys(body).sort() : [],
+    model_matches: model === modelId, instructions_non_empty: !!instructions?.trim(),
+    top_level_keys_match: exactKeys(body, TOOL_RESPONSES_KEYS),
+    stream_true: body?.stream === true, store_false: body?.store === false,
     max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     tool_choice_auto: body?.tool_choice === "auto",
-    parallel_tool_calls_false: body?.parallel_tool_calls === false,
-    tools,
-  };
-  return {
-    ...task,
-    pass: task.client_generation_fields_absent
-      && task.role !== null
-      && task.model_matches
-      && task.instructions_non_empty
-      && task.top_level_keys_match
-      && task.max_output_tokens_absent
-      && task.tool_choice_auto
-      && task.parallel_tool_calls_false
-      && task.tools.pass
-      && task.stream_true
-      && task.store_false,
-  };
+    parallel_tool_calls_false: body?.parallel_tool_calls === false, tools };
+  return { ...task, pass: task.client_generation_fields_absent && task.role !== null
+    && task.model_matches && task.instructions_non_empty && task.top_level_keys_match
+    && task.max_output_tokens_absent && task.tool_choice_auto && task.parallel_tool_calls_false
+    && tools.pass && task.stream_true && task.store_false };
 }
 
 function catalog(modelId, supportsTools = false) {
@@ -3115,43 +2903,6 @@ function waitForPacingIntervalOrClose(milliseconds, closePromise) {
   });
 }
 
-async function waitForGuardianResponseDelay(response, row, configuredDelayMs) {
-  const startedAt = process.hrtime.bigint();
-  const observation = {
-    schema_version: "desktop-e2e.scripted-provider-guardian-delay.v1",
-    configured_delay_ms: configuredDelayMs,
-    delay_elapsed_ms: null,
-    delay_completed: false,
-    peer_close_observed: false,
-    headers_sent_elapsed_ms: null,
-  };
-  row.response_delay = observation;
-  let resolveClose;
-  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
-  const markPeerClose = () => {
-    observation.peer_close_observed = true;
-    resolveClose();
-  };
-  response.once("close", markPeerClose);
-  response.once("error", markPeerClose);
-  row.response_phase = "delaying";
-  let outcome = "elapsed";
-  while (outcome === "elapsed") {
-    const remainingMs = configuredDelayMs - elapsedMonotonicMs(startedAt);
-    if (remainingMs <= 0) break;
-    outcome = await waitForPacingIntervalOrClose(remainingMs, closePromise);
-  }
-  observation.delay_elapsed_ms = elapsedMonotonicMs(startedAt);
-  response.off("close", markPeerClose);
-  response.off("error", markPeerClose);
-  if (outcome !== "elapsed" || response.destroyed || response.socket?.destroyed === true) {
-    observation.peer_close_observed = true;
-    row.response_phase = "peer_closed";
-    return null;
-  }
-  observation.delay_completed = true;
-  return { observation, startedAt };
-}
 
 async function writePacedResponses(response, row, responseText, pacing, options = {}) {
   const startedAt = process.hrtime.bigint();
@@ -3658,37 +3409,15 @@ function permissionRestartGuardianShellSse(script) {
   return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
 }
 
-function permissionTempEscalationShellSse(script, elevated) {
-  const expected = permissionTempEscalationExpected(script);
-  const item = {
-    type: "function_call",
-    id: elevated
-      ? PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID
-      : PERMISSION_TEMP_ESCALATION_RESTRICTED_ITEM_ID,
-    call_id: elevated
-      ? PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID
-      : PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
-    name: "shell",
-    arguments: elevated ? expected.elevatedArguments : expected.restrictedArguments,
-  };
-  const responseStem = elevated ? "elevated" : "restricted";
-  const events = [
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: `resp_permission_temp_escalation_${responseStem}`,
-        output: [item],
-        usage: {
-          input_tokens: 8,
-          output_tokens: 6,
-          total_tokens: 14,
-          output_tokens_details: { reasoning_tokens: 0 },
-        },
-      },
-    },
-  ];
-  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+function permissionTempWriteShellSse(script) {
+  const item = { type: "function_call", id: PERMISSION_TEMP_WRITE_RESTRICTED_ITEM_ID,
+    call_id: PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID, name: "shell",
+    arguments: permissionTempWriteExpected(script).restrictedArguments };
+  return [ { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_permission_temp_write_restricted",
+      output: [item], usage: { input_tokens: 8, output_tokens: 6, total_tokens: 14,
+        output_tokens_details: { reasoning_tokens: 0 } } } } ]
+    .map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
 }
 
 function parsedTarget(request) {
@@ -3856,8 +3585,8 @@ export class ScriptedProvider {
     const releaseHeldGuardianToolInitial = this.script?.kind
       === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
       && this.responseBehavior === "hold_until_release";
-    const releaseHeldTempEscalation = this.script?.kind
-      === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND
+    const releaseHeldTempWrite = this.script?.kind
+      === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND
       && this.responseBehavior === "hold_until_release";
     const releaseHeldChatContinuation = this.script?.kind
       === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
@@ -3873,7 +3602,7 @@ export class ScriptedProvider {
       && this.responseBehavior !== "complete"
       && !releaseHeldToolErrorInitial
       && !releaseHeldGuardianToolInitial
-      && !releaseHeldTempEscalation
+      && !releaseHeldTempWrite
       && !releaseHeldChatContinuation
       && !releaseHeldResponsesCompaction) {
       throw new TypeError("scripted provider mode owns its response lifecycle");
@@ -3883,7 +3612,7 @@ export class ScriptedProvider {
     }
     if (this.responseBehavior === "hold_until_release") {
       if (releaseHeldGuardianToolInitial
-        || releaseHeldTempEscalation
+        || releaseHeldTempWrite
         || releaseHeldChatContinuation
         || releaseHeldResponsesCompaction) {
         let release;
@@ -3891,8 +3620,8 @@ export class ScriptedProvider {
         this.#scriptRoleRelease = {
           role: releaseHeldGuardianToolInitial
             ? "guardian_tool_initial"
-            : releaseHeldTempEscalation
-              ? "temp_escalation"
+            : releaseHeldTempWrite
+              ? "temp_continuation"
               : releaseHeldChatContinuation ? "chat_continuation" : "compaction_empty",
           promise,
           release,
@@ -4287,8 +4016,8 @@ export class ScriptedProvider {
           this.expectedPrompt,
           this.script,
         );
-      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-        row.contract = permissionTempEscalationRequestContract(
+      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+        row.contract = permissionTempWriteRequestContract(
           decoded.value,
           this.modelId,
           this.script,
@@ -4326,8 +4055,8 @@ export class ScriptedProvider {
         await this.#handleSideChatSessionResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
         await this.#handleResponsesCompactionResponse(response, row);
-      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-        await this.#handlePermissionTempEscalationResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+        await this.#handlePermissionTempWriteResponse(response, row);
       } else {
         await this.#handlePermissionRestartGuardianResponse(response, row);
       }
@@ -4755,71 +4484,30 @@ export class ScriptedProvider {
     writeResponse(response, 200, "text/event-stream", payload);
   }
 
-  async #handlePermissionTempEscalationResponse(response, row) {
+  async #handlePermissionTempWriteResponse(response, row) {
     if (!row.contract.pass) {
-      row.response_phase = "rejected";
-      row.response_status = 422;
-      fixedError(response, 422, "request_contract_mismatch");
-      return;
+      row.response_phase = "rejected"; row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch"); return;
     }
     const role = row.contract.role;
     if (this.#acceptedRoles.has(role)) {
-      row.response_phase = "rejected";
-      row.response_status = 409;
-      fixedError(response, 409, "script_role_already_consumed");
-      return;
+      row.response_phase = "rejected"; row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed"); return;
     }
-    const prerequisites = {
-      temp_initial: [],
-      temp_escalation: ["temp_initial"],
-      temp_guardian: ["temp_initial", "temp_escalation"],
-      temp_continuation: ["temp_initial", "temp_escalation", "temp_guardian"],
-    };
-    if (!Array.isArray(prerequisites[role])
-      || prerequisites[role].some((required) => !this.#acceptedRoles.has(required))) {
-      row.response_phase = "rejected";
-      row.response_status = 409;
-      fixedError(response, 409, "script_role_prerequisite_missing");
-      return;
+    if (role === "temp_continuation" && !this.#acceptedRoles.has("temp_initial")) {
+      row.response_phase = "rejected"; row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing"); return;
     }
-
-    this.#acceptedRoles.add(role);
-    this.#acceptedResponseCount += 1;
-    if (role === "temp_escalation" && this.responseBehavior === "hold_until_release") {
-      if (this.#scriptRoleRelease?.role !== role) {
-        throw new Error("permission TEMP escalation release owner is missing");
-      }
-      row.response_phase = "held";
-      await this.#scriptRoleRelease.promise;
+    this.#acceptedRoles.add(role); this.#acceptedResponseCount += 1;
+    if (role === "temp_continuation" && this.responseBehavior === "hold_until_release") {
+      if (this.#scriptRoleRelease?.role !== role) throw new Error("permission TEMP write release owner is missing");
+      row.response_phase = "held"; await this.#scriptRoleRelease.promise;
     }
-    const guardianDelay = role === "temp_guardian"
-      ? await waitForGuardianResponseDelay(response, row, this.script.guardianDelayMs)
-      : null;
-    if (role === "temp_guardian" && guardianDelay === null) return;
     this.#successfulResponseCount += 1;
-    row.response_phase = "completed";
-    row.response_status = 200;
-    let payload;
-    if (role === "temp_initial") {
-      payload = permissionTempEscalationShellSse(this.script, false);
-    } else if (role === "temp_escalation") {
-      payload = permissionTempEscalationShellSse(this.script, true);
-    } else if (role === "temp_guardian") {
-      payload = responsesSse(JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW), {
-        itemId: "msg_permission_temp_escalation_allow",
-        responseId: "resp_permission_temp_escalation_allow",
-      });
-    } else {
-      payload = responsesSse(this.script.responseText, {
-        itemId: "msg_permission_temp_escalation_done",
-        responseId: "resp_permission_temp_escalation_done",
-      });
-    }
-    if (guardianDelay !== null) {
-      guardianDelay.observation.headers_sent_elapsed_ms = elapsedMonotonicMs(
-        guardianDelay.startedAt,
-      );
-    }
+    row.response_phase = "completed"; row.response_status = 200;
+    const payload = role === "temp_initial" ? permissionTempWriteShellSse(this.script)
+      : responsesSse(this.script.responseText, { itemId: "msg_permission_temp_write_done",
+        responseId: "resp_permission_temp_write_done" });
     writeResponse(response, 200, "text/event-stream", payload);
   }
 

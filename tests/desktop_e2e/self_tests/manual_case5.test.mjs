@@ -30,10 +30,10 @@ test("case5 docs-only gate requires three physical nonempty documents and preser
   assert.deepEqual(manualCase5ScopeFailures(before, after.map(row => row.path === "README.md" ? { path: row.path, symbolic_link: true } : row)), ["missing-or-empty-document:README.md"]);
 });
 
-test("case5 observation override uses the common bounded case budget", () => {
-  assert.equal(normalizeManualCase5Options(RAW).observationTimeoutMs, 3_600_000);
-  assert.equal(normalizeManualCase5Options({ ...RAW, observation_timeout_ms: 7_200_000 }).observationTimeoutMs, 7_200_000);
-  for (const value of [0, -1, 7_200_001, 1.5, "7200000", null, true, Number.MAX_SAFE_INTEGER + 1]) {
+test("case5 has no case deadline unless a positive budget is explicitly supplied", () => {
+  assert.equal(normalizeManualCase5Options(RAW).observationTimeoutMs, undefined);
+  assert.equal(normalizeManualCase5Options({ ...RAW, observation_timeout_ms: 43_200_000 }).observationTimeoutMs, 43_200_000);
+  for (const value of [0, -1, 1.5, "7200000", null, true, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => normalizeManualCase5Options({ ...RAW, observation_timeout_ms: value }), /observation_timeout_ms/);
   }
 });
@@ -63,7 +63,7 @@ test("case5 reuses physical clean-seed copy while excluding secrets/cache and pr
   assert.equal(legacy.files.some(row => row.path === "backend/.env.production"), true);
   await mkdir(path.join(source, "frontend"), { recursive: true });
   let defaultCase5Config = null;
-  for (const [name, expected] of [["case5", 60 * 60 * 1000], ["case5-custom", 120 * 60 * 1000], ["case6", 30 * 60 * 1000]]) {
+  for (const [name, expected] of [["case5", null], ["case5-custom", 12 * 60 * 60 * 1000], ["case6", null]]) {
     const fixture = path.join(root, name);
     await mkdir(fixture);
     const paths = Object.fromEntries(["workspace", "config", "data", "prefs", "webview", "logs"].map(key => [key, path.join(fixture, key)]));

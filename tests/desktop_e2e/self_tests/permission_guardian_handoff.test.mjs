@@ -36,7 +36,7 @@ test("handoff uses isolated receipt effects and fresh common-lifecycle scenarios
   assert.match(value.command, /AppendAllText/);
   assert.ok(value.receiptPath.startsWith(path.resolve("fixture workspace")));
   assert.notEqual(createGuardianHandoffScenario(), createGuardianHandoffScenario());
-  for (const decision of ["approve", "abort"]) {
+  for (const decision of ["approve", "abort", "stop"]) {
     const scenario = createGuardianHandoffScenario(decision);
     assert.equal(scenario.id, `permission.guardian-handoff-${decision}`);
     for (const method of ["prepare", "execute", "quiesce", "cleanup", "requestGracefulExit"]) assert.equal(typeof scenario[method], "function");
@@ -69,7 +69,7 @@ test("handoff pending oracle requires actual user controls, exact request chain,
 });
 
 test("terminal oracle rejects duplicate effects, cancellation execution, and model bypass after abort", () => {
-  for (const decision of ["approve", "abort"]) {
+  for (const decision of ["approve", "abort", "stop"]) {
     const value = plan(decision), approved = decision === "approve";
     const sample = { receipt: approved ? value.receiptText : null, ledger: ledger(approved ? 4 : 3),
       surface: { errors: 0, dialog: { count: 0 }, projection: { confirmation_visible: false, confirmation_id: null,
@@ -89,4 +89,16 @@ test("long approval footer oracle requires both actual buttons inside the viewpo
   assert.ok(guardianHandoffFooterFailures(value).includes("button-not-reachable:approve-permission"));
   value.footer.bottom = 900;
   assert.ok(guardianHandoffFooterFailures(value).includes("footer-outside-viewport"));
+});
+
+test("Stop handoff requires the dialog's reachable Stop alongside the existing decisions", () => {
+  const value = { viewport: { height: 800, width: 1200 }, footer: { top: 650, bottom: 760 },
+    buttons: ["approve-permission", "abort-permission", "cancel-run"].map(action => ({ action,
+      rect: { top: 700, bottom: 740 }, reachable: true, enabled: true })) };
+  assert.deepEqual(guardianHandoffFooterFailures(value, { decision: "stop" }), []);
+  value.buttons[2].reachable = false;
+  assert.ok(guardianHandoffFooterFailures(value, { decision: "stop" }).includes("button-not-reachable:cancel-run"));
+  assert.deepEqual(guardianHandoffFooterFailures(value, { decision: "abort" }), []);
+  value.buttons.pop();
+  assert.ok(guardianHandoffFooterFailures(value, { decision: "stop" }).includes("button-not-reachable:cancel-run"));
 });

@@ -194,7 +194,6 @@ export function createManualCase7Scenario(raw = {}) {
   const options = normalizeManualCase7Options(raw);
   let sources = [];
   return createManualTextCase({ id: "manual.case7", options, specPath: SPEC,
-    observationTimeoutMs: 30 * 60 * 1000,
     stages: spec => [{ name: "stage1", prompt: manualLivePrompt(spec) }], outputs: ["docs.md"], fixtureConfig: manualCase7FixtureConfig(options),
     prepareWorkspace: async input => { sources = await prepareManualCase7Workspace(input); }, beforeStages: acquireManualCase7Readiness,
     async checkStage({ context, sink, stem, baseline, generated, row }) {

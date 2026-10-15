@@ -61,7 +61,7 @@ function sample(mode, phase = "held") {
 function pending(mode) {
   const call = shellProjectionAccuracyCall(context, mode), p = sample(mode).surface.projection;
   Object.assign(p, { confirmation_visible: true, confirmation_id: "41", confirmation: {
-    outside_workspace: false, risks: ["unclassified dynamic/indirect shell construct"],
+    outside_workspace: false, risks: ["external connection/setup", "unclassified dynamic/indirect shell construct"], targets: [context.paths.workspace, "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"],
     details: [`Command: ${call.arguments.command}`] } });
   return { ledger: ledger(true).slice(0, 1), surface: { projection: p, errors: 0,
     dialog: { count: 1, id: "41", visible: true, busy: false, command: call.arguments.command,
@@ -89,14 +89,15 @@ function display(mode) {
 
 function markdown(mode) {
   const call = shellProjectionAccuracyCall(context, mode), d = display(mode);
-  return `# Transcript\n\n> ${call.prompt}\n\n${d.summary.text}\n\n${call.responseText}\n\n<details><summary>実行情報</summary>\n\n- Session: \`${SESSION}\`\n\n</details>\n`;
+  return `# Transcript\n\n> ${call.prompt.replaceAll("\n", "\n> ")}\n\n<details><summary>1 previous messages</summary>\n\n<details><summary>Tool Result</summary>\n\n${d.summary.text}\n\n</details>\n\n</details>\n\n${call.responseText}\n\n<details><summary>実行情報</summary>\n\n- Session: \`${SESSION}\`\n\n</details>\n`;
 }
 
 test("the two scripted fixtures retain exact ranges and quoted Move data without elevation or dependencies", () => {
   assert.equal(SHELL_PROJECTION_FIXTURE_NAME, "shell_sgr_fixture.py");
   for (const mode of modes) {
     const call = shellProjectionAccuracyCall(context, mode), success = mode === "success";
-    assert.equal(call.arguments.command, `1..${success ? 5 : 10}|Out-Null; python -c "'g2.move_player'"; python -B -m shell_sgr_fixture`);
+    assert.equal(call.arguments.command, `1..${success ? 5 : 10}|Out-Null; Test-Path 'HKLM:\\SOFTWARE'|Out-Null; uv run --offline --no-project python -Bc "'g2.move_player';import shell_sgr_fixture"`);
+    assert.ok(call.prompt.includes("\n\n"));
     assert.equal(call.arguments.workdir, context.paths.workspace);
     assert.equal(call.outputMaxBytes, 2048);
     assert.equal(shellProjectionHasSgr(call.arguments.command), false);
@@ -121,7 +122,7 @@ test("the two scripted fixtures retain exact ranges and quoted Move data without
   assert.throws(() => createShellProjectionAccuracyScenario("unknown"));
 });
 
-test("public permission intent drops false outside and Move risks while retaining the dynamic review boundary", () => {
+test("public permission intent drops false outside and Move risks while retaining uv and dynamic review risks", () => {
   for (const mode of modes) {
     const call = shellProjectionAccuracyCall(context, mode);
     assert.deepEqual(shellProjectionPermissionFailures(pending(mode), call), []);
@@ -129,6 +130,10 @@ test("public permission intent drops false outside and Move risks while retainin
       value => { value.surface.projection.confirmation.outside_workspace = true; },
       value => { value.surface.projection.confirmation.risks.push("move"); },
       value => { value.surface.projection.confirmation.risks = []; },
+      value => { value.surface.projection.confirmation.risks.shift(); },
+      value => { value.surface.projection.confirmation.risks.pop(); },
+      value => { value.surface.projection.confirmation.targets.push("M:\\SOFTWARE"); },
+      value => { value.surface.projection.confirmation.targets = []; },
       value => { value.surface.projection.confirmation.details = ["Command: some other operation"]; },
       value => { value.surface.dialog.id = "42"; },
       value => { value.surface.dialog.buttons[0].enabled = false; },
@@ -158,6 +163,7 @@ test("valid Rust permission waits for same-ID DOM settlement without hiding bad 
     for (const mutate of [
       value => { value.surface.projection.confirmation.outside_workspace = true; },
       value => { value.surface.projection.confirmation.risks.push("move"); },
+      value => { value.surface.projection.confirmation.targets.push("M:\\SOFTWARE"); },
       value => { value.surface.projection.confirmation.details = ["Command: other operation"]; },
       value => { value.surface.projection.run_target.expectedState.admissionRevision = "invalid"; },
       value => { value.ledger.push(ledger(true)[1]); },
@@ -305,9 +311,24 @@ test("visible disclosure and export status require actual visible body, not hidd
 
 test("fresh and cold visible exports preserve session, prompt, clean result and exact bytes", () => {
   for (const mode of modes) {
-    const call = shellProjectionAccuracyCall(context, mode), text = markdown(mode), options = { sessionId: SESSION, call, mode };
+    const call = shellProjectionAccuracyCall(context, mode), text = markdown(mode), options = { sessionId: SESSION, call, mode,
+      terminalProjection: sample(mode, "terminal").surface.projection };
     assert.deepEqual(shellProjectionExportFailures(text, options), []);
     assert.ok(shellProjectionExportFailures(text.replace(SESSION, TURN), options).length);
+    assert.deepEqual(shellProjectionExportFailures(text.replaceAll("\n", "\r\n"), options), []);
+    assert.ok(shellProjectionExportFailures(text.replace(`> ${call.prompt.replaceAll("\n", "\n> ")}`, "> a different user input"), options)
+      .includes("case52-export-mismatch"));
+    const assistantOnly = structuredClone(options);
+    assistantOnly.terminalProjection.transcript_rows = [{ row_kind: "assistant", body: call.prompt }];
+    assert.ok(shellProjectionExportFailures(text, assistantOnly).includes("case52-export-mismatch"));
+    const quoted = `> ${call.prompt.replaceAll("\n", "\n> ")}`;
+    const quotingOptions = structuredClone(options), quotingAssistant = `${call.responseText}\n\n${quoted}`;
+    quotingOptions.terminalProjection.transcript_rows.find(row => row.row_kind === "assistant").body = quotingAssistant;
+    const quotingExport = text.replace(`\n\n${call.responseText}\n\n<details><summary>実行情報`,
+      `\n\n${quotingAssistant}\n\n<details><summary>実行情報`);
+    assert.deepEqual(shellProjectionExportFailures(quotingExport, quotingOptions), []);
+    assert.ok(shellProjectionExportFailures(quotingExport.replace(`# Transcript\n\n${quoted}\n\n`, "# Transcript\n\n"), quotingOptions)
+      .includes("case52-export-mismatch"));
     assert.ok(shellProjectionExportFailures(text + "\u001b[0m", options).includes("export-result-mismatch"));
     const before = { fixture: { path: "C:/fixture/workspace/shell_sgr_fixture.py", sha256: sha256(shellProjectionAccuracyFixture(mode)), size_bytes: Buffer.byteLength(shellProjectionAccuracyFixture(mode)) },
       export: { source_path: "C:/fixture/export.md", sha256: sha256(text), size_bytes: Buffer.byteLength(text) } };

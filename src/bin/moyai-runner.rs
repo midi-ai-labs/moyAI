@@ -131,6 +131,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             shared_settings, ..
         } => {
             let listener = windows::LocalListener::bind()?;
+            let _sandbox_broker = moyai::sandbox_broker::start()?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;

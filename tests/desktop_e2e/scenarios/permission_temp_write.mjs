@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import path from "node:path";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 
 import { waitForObservation } from "../core/deadline.mjs";
@@ -12,9 +12,9 @@ import {
   assertExactDesktopCommandSequence,
 } from "../drivers/desktop_command_probe.mjs";
 import {
-  SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES,
-  createPermissionTempEscalationProviderScript,
-  permissionGuardianShellPayloadContract,
+  SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES,
+  createPermissionTempWriteProviderScript,
+  permissionTempWriteOutputContract,
   startScriptedProvider,
 } from "../drivers/scripted_provider.mjs";
 import {
@@ -31,50 +31,63 @@ import {
 import { captureScenarioScreenshot } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 
-const OWNER = "scenario:permission.temp-escalation";
-const FIXTURE_SENTINEL = "E2E_PERMISSION_TEMP_ESCALATION.txt";
+const OWNER = "scenario:permission.temp-write";
+const FIXTURE_SENTINEL = "E2E_PERMISSION_TEMP_WRITE.txt";
 const PYTEST_FIXTURE = "test_e2e_owner_only_temp.py";
-const PYTEST_FIXTURE_TEXT = `def test_cpython_owner_only_temp(tmp_path):
-    assert tmp_path.is_dir()
+const PYTEST_FIXTURE_TEXT = `import os
+import tempfile
+from pathlib import Path
+
+def _check_rw(directory):
+    assert directory.is_dir()
+    target = directory / "rw.txt"
+    target.write_text("temp write", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "temp write"
+    assert "rw.txt" in os.listdir(directory)
+    target.unlink()
+
+def test_cpython_private_and_inherited_temp(tmp_path):
+    _check_rw(tmp_path)
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    _check_rw(private)
+    nested = private / "nested"
+    nested.mkdir(mode=0o700)
+    _check_rw(nested)
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir(mode=0o777)
+    _check_rw(ordinary)
+    with tempfile.TemporaryDirectory() as name:
+        _check_rw(Path(name))
 `;
 const LIVE_REQUEST_TIMEOUT_MS = 180_000;
 const LIVE_TURN_TIMEOUT_MS = 720_000;
 const LIVE_CAPTURE_DIRECTORY = "request-capture";
 const RESPONSES_API_MODE = "responses";
 const CHAT_COMPLETIONS_API_MODE = "chat_completions";
-const LIVE_LM_STUDIO_SCENARIO_ID = "manual.permission-temp-escalation-lm-studio";
+const LIVE_LM_STUDIO_SCENARIO_ID = "manual.permission-temp-write-lm-studio";
 const LIVE_OPENAI_COMPATIBLE_SCENARIO_ID =
-  "manual.permission-guardian-openai-compatible";
-const LIVE_OPENAI_COMPATIBLE_SECRET_ENV = "MOYAI_E2E_PERMISSION_GUARDIAN_SECRET";
-export const PERMISSION_GUARDIAN_SECRET_CANARY =
-  "moyai-e2e-permission-guardian-secret-canary-7e5b3d9f";
-export const PERMISSION_TEMP_ESCALATION_TERMINAL_TIMEOUT_MS = 150_000;
+  "manual.permission-temp-write-openai-compatible";
+const LIVE_OPENAI_COMPATIBLE_SECRET_ENV = "MOYAI_E2E_PERMISSION_TEMP_WRITE_SECRET";
+export const PERMISSION_TEMP_WRITE_SECRET_CANARY = "moyai-e2e-permission-temp-write-secret-canary-7e5b3d9f";
+export const PERMISSION_TEMP_WRITE_TERMINAL_TIMEOUT_MS = 150_000;
 
-export const PERMISSION_TEMP_ESCALATION_PROMPT = "run the owner only temp regression";
-export const PERMISSION_TEMP_ESCALATION_COMMAND =
-  "python -B -X utf8 -m pytest -p no:cacheprovider -q --tb=short test_e2e_owner_only_temp.py";
-export const PERMISSION_TEMP_ESCALATION_JUSTIFICATION =
-  "retry the exact trusted pytest command outside the workspace-write sandbox";
-export const PERMISSION_TEMP_ESCALATION_RESPONSE = "PERMISSION_TEMP_ESCALATION_OK";
-export const PERMISSION_TEMP_ESCALATION_REQUEST_TIMEOUT_MS = 120_000;
-export const PERMISSION_TEMP_ESCALATION_GUARDIAN_DELAY_MS = 95_000;
-export const PERMISSION_TEMP_ESCALATION_TERMINAL_CONFIRMATION_MS = 500;
-export const PERMISSION_TEMP_ESCALATION_LIVE_RESPONSE = "PERMISSION_TEMP_ESCALATION_LIVE_OK";
-export const PERMISSION_TEMP_ESCALATION_LIVE_PROMPT = [
-  "Perform this exact bounded permission regression using shell only.",
-  `First call shell with exactly ${JSON.stringify(PERMISSION_TEMP_ESCALATION_COMMAND)} and sandbox_permissions=use_default.`,
-  "Do not set TMP, TEMP, or TMPDIR; do not use --basetemp; do not change project files or use another tool to bypass the sandbox.",
-  "Only if the host result contains kind workspace_write_effect_temp_access_denied and explicitly instructs a new elevated call, call shell a second time with the exact same command, sandbox_permissions=require_escalated, and the exact justification below.",
-  `Justification: ${PERMISSION_TEMP_ESCALATION_JUSTIFICATION}`,
-  `After the elevated command reports one passing test, reply only ${PERMISSION_TEMP_ESCALATION_LIVE_RESPONSE}.`,
+export const PERMISSION_TEMP_WRITE_PROMPT = "run the owner only temp regression";
+// A separate no:cacheprovider operand is an unresolved PowerShell provider path.
+// Pytest accepts the same plugin value attached to its short -p option.
+export const PERMISSION_TEMP_WRITE_COMMAND =
+  "python -B -X utf8 -m pytest -pno:cacheprovider -q --tb=short test_e2e_owner_only_temp.py";
+export const PERMISSION_TEMP_WRITE_RESPONSE = "PERMISSION_TEMP_WRITE_OK";
+export const PERMISSION_TEMP_WRITE_REQUEST_TIMEOUT_MS = 120_000;
+export const PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS = 500;
+export const PERMISSION_TEMP_WRITE_LIVE_RESPONSE = "PERMISSION_TEMP_WRITE_LIVE_OK";
+export const PERMISSION_TEMP_WRITE_LIVE_PROMPT = [
+  "Perform this exact bounded TEMP write regression using shell only.",
+  `Call shell exactly once with ${JSON.stringify(PERMISSION_TEMP_WRITE_COMMAND)} and sandbox_permissions=use_default.`,
+  "Do not set TMP, TEMP, or TMPDIR; do not use --basetemp; do not change project files or request elevation.",
+  `After the command reports one passing test, reply only ${PERMISSION_TEMP_WRITE_LIVE_RESPONSE}.`,
 ].join("\n");
-
-const PERMISSION_TEMP_ESCALATION_ROLES = Object.freeze([
-  "temp_initial",
-  "temp_escalation",
-  "temp_guardian",
-  "temp_continuation",
-]);
+const PERMISSION_TEMP_WRITE_ROLES = Object.freeze(["temp_initial", "temp_continuation"]);
 const PROMPT = Object.freeze({
   selector: "section.composer textarea#prompt",
   identity: { tag: "TEXTAREA", id: "prompt" },
@@ -107,13 +120,59 @@ function renderedDomTextMatchesAuthority(observed, authority) {
   return normalize(observed) === normalize(authority);
 }
 
-export function permissionTempEscalationFixtureConfig(baseUrl) {
+export function permissionTempWritePythonPreflightFailures(resolvedPython, observed) {
+  const failures = [];
+  const identity = value => path.resolve(value).replaceAll("\\", "/").toLowerCase();
+  if (typeof resolvedPython !== "string" || !path.isAbsolute(resolvedPython)
+    || typeof observed?.executable !== "string" || !path.isAbsolute(observed.executable)) {
+    return ["python-preflight-identity-malformed"];
+  }
+  if (identity(resolvedPython) !== identity(observed.executable)) failures.push("python-preflight-path-mismatch");
+  if (!Array.isArray(observed.version) || observed.version.length !== 3
+    || observed.version[0] !== 3 || observed.version[1] !== 13
+    || !Number.isInteger(observed.version[2])) failures.push("python-preflight-version-mismatch");
+  if (typeof observed.pytest_version !== "string" || !observed.pytest_version.trim()) {
+    failures.push("python-preflight-pytest-missing");
+  }
+  return failures;
+}
+
+async function preparePermissionTempWritePython(sink, phase, owner) {
+  const run = promisify(execFile);
+  try {
+    // The launcher's child environment selects Python. Do not mutate PATH here:
+    // the bare command keeps the ordinary shell classification under test.
+    const resolved = await run("uv", ["python", "find", "--offline", "--system", "3.13"],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 65_536, encoding: "utf8" });
+    const resolvedPython = resolved.stdout.trim();
+    const probe = await run("python", ["-B", "-X", "utf8", "-c",
+      "import json,sys,pytest; print(json.dumps({'executable':sys.executable,'version':list(sys.version_info[:3]),'pytest_version':pytest.__version__}))"],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 65_536, encoding: "utf8" });
+    const observed = JSON.parse(probe.stdout.trim());
+    const failures = permissionTempWritePythonPreflightFailures(resolvedPython, observed);
+    if (resolved.stderr.trim() || probe.stderr.trim()) failures.push("python-preflight-stderr");
+    if (failures.length > 0) throw harnessFailure("permission-temp-python-preflight",
+      "the launcher's bare Python must match the existing uv offline Python 3.13 and import pytest",
+      { resolved_python: resolvedPython, observed, failures });
+    const bytes = await readFile(resolvedPython);
+    await sink.record("permission-temp-python-preflight", { resolved_python: resolvedPython,
+      ...observed, executable_sha256: sha256(bytes), executable_bytes: bytes.byteLength,
+      resolver_arguments: ["python", "find", "--offline", "--system", "3.13"],
+      dependencies_installed: false, environment_changed: false }, { phase, owner });
+  } catch (error) {
+    if (error instanceof DesktopE2eError) throw error;
+    throw harnessFailure("permission-temp-python-preflight", "existing uv/Python/pytest preflight failed",
+      { cause: errorObservation(error) });
+  }
+}
+
+export function permissionTempWriteFixtureConfig(baseUrl) {
   return `[model]
 base_url = ${JSON.stringify(baseUrl)}
 model = "e2e/scripted-responses"
 provider_profile = "lm_studio"
 connect_timeout_ms = 1000
-request_timeout_ms = ${PERMISSION_TEMP_ESCALATION_REQUEST_TIMEOUT_MS}
+request_timeout_ms = ${PERMISSION_TEMP_WRITE_REQUEST_TIMEOUT_MS}
 max_retries = 0
 context_window = 65536
 supports_tools = true
@@ -196,18 +255,18 @@ function normalizePermissionExternalProviderOptions(options, scenarioId) {
   });
 }
 
-export function normalizePermissionTempEscalationLmStudioOptions(options) {
+export function normalizePermissionTempWriteLmStudioOptions(options) {
   return normalizePermissionExternalProviderOptions(options, LIVE_LM_STUDIO_SCENARIO_ID);
 }
 
-export function normalizePermissionGuardianOpenAiCompatibleOptions(options) {
+export function normalizePermissionTempWriteOpenAiCompatibleOptions(options) {
   return normalizePermissionExternalProviderOptions(
     options,
     LIVE_OPENAI_COMPATIBLE_SCENARIO_ID,
   );
 }
 
-export function permissionTempEscalationLmStudioFixtureConfig(options) {
+export function permissionTempWriteLmStudioFixtureConfig(options) {
   return `[model]
 base_url = ${JSON.stringify(options.providerBaseUrl)}
 model = ${JSON.stringify(options.model)}
@@ -240,7 +299,7 @@ enabled = false
 `;
 }
 
-export function permissionGuardianOpenAiCompatibleFixtureConfig(options) {
+export function permissionTempWriteOpenAiCompatibleFixtureConfig(options) {
   return `[model]
 base_url = ${JSON.stringify(options.providerBaseUrl)}
 model = ${JSON.stringify(options.model)}
@@ -292,37 +351,18 @@ function acceptedResponseRow(row, role, phase) {
     && row.response_status === (phase === "completed" ? 200 : null);
 }
 
-export function exactPermissionTempEscalationLedger(ledger, expectedRoles, {
-  heldRole = null,
-  guardianDelayMs = null,
-} = {}) {
+export function exactPermissionTempWriteLedger(ledger, expectedRoles, { heldRole = null } = {}) {
   if (!Array.isArray(ledger) || !Array.isArray(expectedRoles)) return false;
-  if (ledger.some((row) => row?.route !== "responses" && !acceptedMetadataRow(row))) return false;
+  if (ledger.some(row => row?.route !== "responses" && !acceptedMetadataRow(row))) return false;
   const rows = responseRows(ledger);
-  return rows.length === expectedRoles.length
-    && rows.every((row, index) => acceptedResponseRow(
-      row,
-      expectedRoles[index],
-      expectedRoles[index] === heldRole ? "held" : "completed",
-    ))
-    && (guardianDelayMs === null || rows.some((row) => (
-      row?.contract?.role === "temp_guardian"
-      && row?.response_delay?.schema_version
-        === "desktop-e2e.scripted-provider-guardian-delay.v1"
-      && row.response_delay.configured_delay_ms === guardianDelayMs
-      && row.response_delay.delay_completed === true
-      && row.response_delay.peer_close_observed === false
-      && Number.isSafeInteger(row.response_delay.delay_elapsed_ms)
-      && row.response_delay.delay_elapsed_ms >= guardianDelayMs
-      && Number.isSafeInteger(row.response_delay.headers_sent_elapsed_ms)
-      && row.response_delay.headers_sent_elapsed_ms >= row.response_delay.delay_elapsed_ms
-    )));
+  return rows.length === expectedRoles.length && rows.every((row,index) => acceptedResponseRow(
+    row, expectedRoles[index], expectedRoles[index] === heldRole ? "held" : "completed"));
 }
 
 function providerOrSurfaceFailed(surface, ledger) {
   const rows = responseRows(ledger);
   return !Array.isArray(ledger)
-    || rows.length > SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES
+    || rows.length > SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES
     || ledger.some((row) => row?.route !== "responses" && !acceptedMetadataRow(row))
     || rows.some((row) => row?.contract?.pass === false
       || row?.response_phase === "rejected"
@@ -357,24 +397,13 @@ function exactOwner(projection, kind) {
     : null;
 }
 
-function exactRestrictedHintEvidence(ledger) {
-  const row = responseRows(ledger).find((candidate) => candidate?.contract?.role === "temp_escalation");
-  const evidence = row?.contract?.role_evidence?.restricted_output;
-  return evidence?.pass === true
-    && evidence.command_matches === true
-    && evidence.host_non_success === true
-    && evidence.shell_tool === true
-    && evidence.completed_lifecycle === true
-    && evidence.hint_kind === true
-    && evidence.automatic_retry_false === true
-    && evidence.exit_code_one === true
-    && evidence.guidance_present === true
-    && evidence.exact_escalation_hint === true
-    && evidence.no_project_workaround_hint === true
-    && evidence.single_note === true
-    && evidence.same_line_windows_signature === true
-    && Number.isSafeInteger(evidence.output_size_bytes)
-    && evidence.output_size_bytes > 0
+function exactRestrictedSuccessEvidence(ledger) {
+  const evidence = responseRows(ledger).find(row => row?.contract?.role === "temp_continuation")
+    ?.contract?.role_evidence?.restricted_output;
+  return evidence?.pass === true && evidence.command_matches === true
+    && evidence.exit_code_zero === true && evidence.pytest_passed === true
+    && evidence.sandbox_note_absent === true && evidence.non_success_absent === true
+    && Number.isSafeInteger(evidence.output_size_bytes) && evidence.output_size_bytes > 0
     && /^[a-f0-9]{64}$/u.test(evidence.output_sha256 ?? "");
 }
 
@@ -446,7 +475,7 @@ export function runReadOnlySqlite(
   });
 }
 
-export function permissionTempEscalationPersistenceFailures(evidence, owner) {
+export function permissionTempWritePersistenceFailures(evidence, owner) {
   const failures = [];
   const rows = evidence?.rows;
   if (evidence?.schema_version !== "desktop-e2e.permission-temp-persistence.v1"
@@ -457,7 +486,7 @@ export function permissionTempEscalationPersistenceFailures(evidence, owner) {
   if (!canonicalUlid(owner?.sessionId) || !canonicalUlid(owner?.turnId)) {
     return ["persistence-owner-malformed"];
   }
-  if (rows.length !== 2) return ["persistence-tool-output-cardinality-mismatch"];
+  if (rows.length !== 1) return ["persistence-tool-output-cardinality-mismatch"];
   const expectedKeys = [
     "history_item_id",
     "session_id",
@@ -484,25 +513,14 @@ export function permissionTempEscalationPersistenceFailures(evidence, owner) {
       failures.push(`persistence-tool-output-${index}-identity-mismatch`);
     }
   }
-  if (!(rows[0].success === 0
-    && rows[0].metadata_success === 0
-    && rows[0].tool_metadata_success === 0
-    && rows[0].sandbox_failure_hint === "workspace_write_effect_temp_access_denied")) {
+  if (!(rows[0].success === 1 && rows[0].metadata_success === 1
+    && rows[0].tool_metadata_success === 1 && rows[0].sandbox_failure_hint === null)) {
     failures.push("persistence-restricted-success-projection-mismatch");
-  }
-  if (!(rows[1].success === 1
-    && rows[1].metadata_success === 1
-    && rows[1].tool_metadata_success === 1
-    && rows[1].sandbox_failure_hint === null)) {
-    failures.push("persistence-elevated-success-projection-mismatch");
-  }
-  if (!(rows[0].sequence_no < rows[1].sequence_no)) {
-    failures.push("persistence-tool-output-order-mismatch");
   }
   return [...new Set(failures)];
 }
 
-export async function readPermissionTempEscalationPersistence({ database, owner }) {
+export async function readPermissionTempWritePersistence({ database, owner }) {
   if (typeof database !== "string" || !path.isAbsolute(database)) {
     throw new TypeError("permission TEMP persistence database must be an absolute path");
   }
@@ -546,7 +564,7 @@ ORDER BY sequence_no ASC;
   };
 }
 
-export function permissionTempEscalationHeldFailures(sample) {
+export function permissionTempWriteHeldFailures(sample) {
   const surface = sample?.surface;
   const projection = surface?.projection;
   const users = rowsOfKind(projection, "user");
@@ -555,18 +573,17 @@ export function permissionTempEscalationHeldFailures(sample) {
   const running = rowsOfKind(projection, "work_summary_running");
   const completed = rowsOfKind(projection, "work_summary_completed");
   const failures = [];
-  if (!exactPermissionTempEscalationLedger(
+  if (!exactPermissionTempWriteLedger(
     sample?.ledger,
-    ["temp_initial", "temp_escalation"],
-    { heldRole: "temp_escalation" },
-  )) failures.push("restricted-escalation-request-not-exactly-held");
-  if (!exactRestrictedHintEvidence(sample?.ledger)) failures.push("restricted-host-hint-not-exact");
+    ["temp_initial", "temp_continuation"], { heldRole: "temp_continuation" },
+  )) failures.push("restricted-success-request-not-exactly-held");
+  if (!exactRestrictedSuccessEvidence(sample?.ledger)) failures.push("restricted-pytest-success-not-exact");
   if (projection?.run_status_key !== "running"
     || projection?.task_activity_state !== "running"
     || projection?.busy !== true
     || projection?.agent_tree_active !== false
     || exactOwner(projection, "turn") === null) failures.push("held-run-owner-not-active");
-  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_PROMPT])) {
+  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_WRITE_PROMPT])) {
     failures.push("held-user-authority-mismatch");
   }
   if (assistants.length !== 0 || errors.length !== 0) failures.push("held-primary-error-or-answer-present");
@@ -575,15 +592,15 @@ export function permissionTempEscalationHeldFailures(sample) {
   }
   if (surface?.users?.length !== 1
     || surface.users[0].visible !== true
-    || surface.users[0].text !== PERMISSION_TEMP_ESCALATION_PROMPT
+    || surface.users[0].text !== PERMISSION_TEMP_WRITE_PROMPT
     || surface?.assistants?.length !== 0) failures.push("held-dom-conversation-mismatch");
   if (providerOrSurfaceFailed(surface, sample?.ledger)) failures.push("held-surface-or-provider-failed");
   return [...new Set(failures)];
 }
 
-export function permissionTempEscalationHeldDecision(sample) {
+export function permissionTempWriteHeldDecision(sample) {
   if (providerOrSurfaceFailed(sample?.surface, sample?.ledger)) return "fail";
-  return permissionTempEscalationHeldFailures(sample).length === 0 ? "pass" : "pending";
+  return permissionTempWriteHeldFailures(sample).length === 0 ? "pass" : "pending";
 }
 
 function terminalSettled(surface) {
@@ -619,24 +636,13 @@ function terminalSettled(surface) {
     && surface?.visible_modal_backdrop_count === 0;
 }
 
-function exactRestrictedRetryHistory(projection, completedSummary) {
+function exactRestrictedHistory(projection, completedSummary) {
   const body = completedSummary?.body ?? "";
-  const lifecycle = [...body.matchAll(
-    /^- \[(待機|実行中|完了|拒否|キャンセル|失敗)\] /gmu,
-  )].map(match => match[1]);
-  const errors = rowsOfKind(projection, "error");
-  const output = errors[0]?.body ?? "";
-  // Completed + success=false is durable tool evidence, but its canonical
-  // history presentation is Failed and includes the shell error row. Live
-  // detail counters are a separate projection, not this history's authority.
-  return body.includes("- コマンド/ツール: 4件")
-    && isDeepStrictEqual(lifecycle, ["待機", "失敗", "待機", "完了"])
-    && (body.match(/^- \[待機\] shell$/gmu) ?? []).length === 2
-    && errors.length === 1
-    && errors[0].title === "エラー - Tool shell"
-    && output.split(/\r?\n/u).includes(`Command: ${PERMISSION_TEMP_ESCALATION_COMMAND}`)
-    && output.split(/\r?\n/u).includes("Exit code: 1")
-    && /^.*permissionerror: \[winerror 5\].*moyai-sandbox-effect-.*$/imu.test(output);
+  const lifecycle = [...body.matchAll(/^- \[(待機|実行中|完了|拒否|キャンセル|失敗)\] /gmu)].map(match => match[1]);
+  return body.includes("- コマンド/ツール: 1件")
+    && isDeepStrictEqual(lifecycle, ["待機", "完了"])
+    && (body.match(/^- \[待機\] shell$/gmu) ?? []).length === 1
+    && rowsOfKind(projection, "error").length === 0;
 }
 
 export async function observePermissionTempTerminalDetail(terminal, sample, {
@@ -677,7 +683,7 @@ export async function observePermissionTempTerminalDetail(terminal, sample, {
     attempts: result.attempts, elapsed_ms: result.elapsed_ms, error: result.error ?? null };
 }
 
-export function permissionTempEscalationTerminalFailures(sample) {
+export function permissionTempWriteTerminalFailures(sample) {
   const surface = sample?.surface;
   const projection = surface?.projection;
   const users = rowsOfKind(projection, "user");
@@ -686,40 +692,29 @@ export function permissionTempEscalationTerminalFailures(sample) {
   const running = rowsOfKind(projection, "work_summary_running");
   const completed = rowsOfKind(projection, "work_summary_completed");
   const failures = [];
-  if (!exactPermissionTempEscalationLedger(sample?.ledger, PERMISSION_TEMP_ESCALATION_ROLES, {
-    guardianDelayMs: PERMISSION_TEMP_ESCALATION_GUARDIAN_DELAY_MS,
-  })) {
+  if (!exactPermissionTempWriteLedger(sample?.ledger, PERMISSION_TEMP_WRITE_ROLES)) {
     failures.push("provider-role-ledger-mismatch");
   }
-  if (!exactRestrictedHintEvidence(sample?.ledger)) failures.push("restricted-host-hint-not-exact");
-  const success = responseRows(sample?.ledger).find(
-    (row) => row?.contract?.role === "temp_continuation",
-  )?.contract?.role_evidence?.elevated_output;
-  if (success?.pass !== true
-    || success.command_matches !== true
-    || success.exit_code_zero !== true
-    || success.pytest_passed !== true
-    || success.effect_temp_absent !== true
-    || success.sandbox_note_absent !== true) failures.push("elevated-pytest-success-not-exact");
+  if (!exactRestrictedSuccessEvidence(sample?.ledger)) failures.push("restricted-pytest-success-not-exact");
   if (!terminalSettled(surface)) failures.push("terminal-surface-not-settled");
-  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_PROMPT])) {
+  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_WRITE_PROMPT])) {
     failures.push("terminal-user-authority-mismatch");
   }
-  if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_RESPONSE])) {
+  if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_WRITE_RESPONSE])) {
     failures.push("terminal-assistant-response-mismatch");
   }
-  if (errors.length !== 1 || running.length !== 0 || completed.length !== 1) {
+  if (errors.length !== 0 || running.length !== 0 || completed.length !== 1) {
     failures.push("terminal-history-cardinality-mismatch");
   }
-  if (completed.length === 1 && !exactRestrictedRetryHistory(projection, completed[0])) {
+  if (completed.length === 1 && !exactRestrictedHistory(projection, completed[0])) {
     failures.push("terminal-tool-history-mismatch");
   }
   if (surface?.users?.length !== 1
     || surface.users[0].visible !== true
-    || surface.users[0].text !== PERMISSION_TEMP_ESCALATION_PROMPT
+    || surface.users[0].text !== PERMISSION_TEMP_WRITE_PROMPT
     || surface?.assistants?.length !== 1
     || surface.assistants[0].visible !== true
-    || surface.assistants[0].text !== PERMISSION_TEMP_ESCALATION_RESPONSE
+    || surface.assistants[0].text !== PERMISSION_TEMP_WRITE_RESPONSE
     || surface?.completed_summaries?.length !== 1
     || surface.completed_summaries[0].visible !== true) failures.push("terminal-dom-conversation-mismatch");
   if (providerOrSurfaceFailed(surface, sample?.ledger)) failures.push("terminal-surface-or-provider-failed");
@@ -770,8 +765,8 @@ function createConfirmedTerminalDecision({
   };
 }
 
-export function createPermissionTempEscalationTerminalDecision({
-  confirmationMs = PERMISSION_TEMP_ESCALATION_TERMINAL_CONFIRMATION_MS,
+export function createPermissionTempWriteTerminalDecision({
+  confirmationMs = PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS,
   now = () => Date.now(),
 } = {}) {
   if (!Number.isSafeInteger(confirmationMs) || confirmationMs <= 0) {
@@ -779,7 +774,7 @@ export function createPermissionTempEscalationTerminalDecision({
   }
   if (typeof now !== "function") throw new TypeError("permission TEMP terminal clock must be a function");
   return createConfirmedTerminalDecision({
-    failuresOf: permissionTempEscalationTerminalFailures,
+    failuresOf: permissionTempWriteTerminalFailures,
     surfaceOf: (sample) => sample?.surface,
     providerFailed: (sample) => providerOrSurfaceFailed(sample?.surface, sample?.ledger),
     domOnlyFailures: new Set(["terminal-dom-conversation-mismatch"]),
@@ -788,10 +783,10 @@ export function createPermissionTempEscalationTerminalDecision({
   });
 }
 
-export function permissionTempEscalationTerminalFailureEvidence(sample) {
+export function permissionTempWriteTerminalFailureEvidence(sample) {
   return {
     ...sample,
-    terminal_oracle_failures: permissionTempEscalationTerminalFailures(sample),
+    terminal_oracle_failures: permissionTempWriteTerminalFailures(sample),
   };
 }
 
@@ -849,46 +844,10 @@ function exactLiveShellArgumentKeys(args, requiredKeys) {
 function exactLiveRestrictedArguments(call) {
   return call !== null
     && exactLiveShellArgumentKeys(call.args, ["command", "sandbox_permissions"])
-    && call.args.command === PERMISSION_TEMP_ESCALATION_COMMAND
+    && call.args.command === PERMISSION_TEMP_WRITE_COMMAND
     && call.args.sandbox_permissions === "use_default";
 }
 
-function exactLiveElevatedArguments(call) {
-  return call !== null
-    && exactLiveShellArgumentKeys(
-      call.args,
-      ["command", "justification", "sandbox_permissions"],
-    )
-    && call.args.command === PERMISSION_TEMP_ESCALATION_COMMAND
-    && call.args.sandbox_permissions === "require_escalated"
-    && call.args.justification === PERMISSION_TEMP_ESCALATION_JUSTIFICATION;
-}
-
-function liveRestrictedOutputPass(output) {
-  if (typeof output !== "string") return false;
-  const lines = output.split(/\r?\n/u);
-  return lines.includes(`Command: ${PERMISSION_TEMP_ESCALATION_COMMAND}`)
-    && output.includes("Tool outcome (host projection): non-success")
-    && output.includes('tool: "shell"')
-    && output.includes("lifecycle_status: completed")
-    && output.includes("kind: workspace_write_effect_temp_access_denied")
-    && output.includes("automatic_retry: false")
-    && output.includes("exit_code: 1")
-    && output.includes("guidance: Sandbox note:")
-    && output.includes("sandbox_permissions=require_escalated")
-    && output.includes("do not change project files solely to bypass this sandbox restriction")
-    && output.split("Sandbox note:").length - 1 === 1
-    && /^.*permissionerror: \[winerror 5\].*moyai-sandbox-effect-.*$/imu.test(output);
-}
-
-function liveElevatedOutputPass(output) {
-  if (typeof output !== "string") return false;
-  return output.split(/\r?\n/u).includes(`Command: ${PERMISSION_TEMP_ESCALATION_COMMAND}`)
-    && output.includes("Exit code: 0")
-    && /(?:^|\n)1 passed(?:\s|$)/u.test(output)
-    && !output.includes("moyai-sandbox-effect-")
-    && !output.includes("Sandbox note:");
-}
 
 const LIVE_FORBIDDEN_WIRE_KEYS = Object.freeze([
   "extra_body_json",
@@ -918,106 +877,27 @@ const LIVE_TASK_KEYS = Object.freeze([
   "tool_choice",
   "tools",
 ]);
-const LIVE_GUARDIAN_KEYS = Object.freeze([
-  "input",
-  "instructions",
-  "model",
-  "store",
-  "stream",
-]);
-
-function liveGuardianPayloadPass(body, elevatedCall) {
-  const input = Array.isArray(body?.input) ? body.input : [];
-  const inputText = input.length === 1 ? responsesInputText(input[0]) : null;
-  let payload = null;
-  try {
-    payload = JSON.parse(inputText);
-  } catch {
-    return false;
-  }
-  return permissionGuardianShellPayloadContract(payload, elevatedCall.argumentsJson).pass;
-}
-
-export function permissionTempEscalationLiveCaptureContract(captures, options) {
+export function permissionTempWriteLiveCaptureContract(captures, options) {
+  if (!Array.isArray(captures) || captures.length !== 2) return { roles: [], failures: ["live-request-count-mismatch"] };
   const failures = [];
-  if (!Array.isArray(captures) || captures.length !== 4) {
-    return { roles: [], failures: ["live-request-count-mismatch"] };
+  for (const {body} of captures) {
+    if (!exactObjectKeys(body, LIVE_TASK_KEYS) || body?.model !== options.model
+      || typeof body.instructions !== "string" || !body.instructions.trim()
+      || body.store !== false || body.stream !== true || body.tool_choice !== "auto"
+      || body.parallel_tool_calls !== false || !Array.isArray(body.tools)
+      || body.tools.filter(tool => tool?.name === "shell").length !== 1
+      || LIVE_FORBIDDEN_WIRE_KEYS.some(key => Object.hasOwn(body ?? {},key))) failures.push("live-request-common-contract-mismatch");
   }
-  for (const capture of captures) {
-    const body = capture.body;
-    if (body?.model !== options.model
-      || typeof body?.instructions !== "string"
-      || body.instructions.trim().length === 0
-      || body.store !== false
-      || body.stream !== true
-      || LIVE_FORBIDDEN_WIRE_KEYS.some((key) => Object.hasOwn(body ?? {}, key))) {
-      failures.push("live-request-common-contract-mismatch");
-    }
-  }
-  const [initial, escalation, guardian, continuation] = captures.map((capture) => capture.body);
-  const initialInput = Array.isArray(initial?.input) ? initial.input : [];
-  const escalationInput = Array.isArray(escalation?.input) ? escalation.input : [];
-  const continuationInput = Array.isArray(continuation?.input) ? continuation.input : [];
-  if (!exactObjectKeys(initial, LIVE_TASK_KEYS)
-    || initial.tool_choice !== "auto"
-    || initial.parallel_tool_calls !== false
-    || !Array.isArray(initial.tools)
-    || initial.tools.filter((tool) => tool?.name === "shell").length !== 1
-    || initialInput.length !== 1
-    || responsesInputText(initialInput[0]) !== PERMISSION_TEMP_ESCALATION_LIVE_PROMPT) {
+  const [initial, continuation] = captures.map(capture => capture.body?.input ?? []);
+  if (initial.length !== 1 || responsesInputText(initial[0]) !== PERMISSION_TEMP_WRITE_LIVE_PROMPT)
     failures.push("live-initial-request-mismatch");
-  }
-  const restrictedCall = liveShellArguments(escalationInput[1]);
-  const restrictedOutput = restrictedCall === null
-    ? null
-    : liveToolOutput(escalationInput[2], restrictedCall.callId);
-  if (!exactObjectKeys(escalation, LIVE_TASK_KEYS)
-    || escalationInput.length !== 3
-    || responsesInputText(escalationInput[0]) !== PERMISSION_TEMP_ESCALATION_LIVE_PROMPT
-    || !exactLiveRestrictedArguments(restrictedCall)
-    || !liveRestrictedOutputPass(restrictedOutput)) {
-    failures.push("live-restricted-projection-mismatch");
-  }
-  const elevatedCall = liveShellArguments(continuationInput[3]);
-  const elevatedOutput = elevatedCall === null
-    ? null
-    : liveToolOutput(continuationInput[4], elevatedCall.callId);
-  const replayedRestrictedCall = liveShellArguments(
-    continuationInput[1],
-    restrictedCall?.callId ?? "",
-  );
-  const replayedRestrictedOutput = restrictedCall === null
-    ? null
-    : liveToolOutput(continuationInput[2], restrictedCall.callId);
-  if (!exactObjectKeys(continuation, LIVE_TASK_KEYS)
-    || continuationInput.length !== 5
-    || responsesInputText(continuationInput[0]) !== PERMISSION_TEMP_ESCALATION_LIVE_PROMPT
-    || !exactLiveRestrictedArguments(replayedRestrictedCall)
-    || replayedRestrictedCall?.argumentsJson !== restrictedCall?.argumentsJson
-    || !liveRestrictedOutputPass(replayedRestrictedOutput)
-    || replayedRestrictedOutput !== restrictedOutput
-    || !exactLiveElevatedArguments(elevatedCall)
-    || elevatedCall?.callId === restrictedCall?.callId
-    || !liveElevatedOutputPass(elevatedOutput)) {
-    failures.push("live-elevated-continuation-mismatch");
-  }
-  if (!exactObjectKeys(guardian, LIVE_GUARDIAN_KEYS)
-    || typeof guardian.instructions !== "string"
-    || !guardian.instructions.includes("independent permission guardian")
-    || elevatedCall === null
-    || !liveGuardianPayloadPass(guardian, elevatedCall)) {
-    failures.push("live-guardian-request-mismatch");
-  }
-  return {
-    roles: ["live_initial", "live_escalation", "live_guardian", "live_continuation"],
-    failures: [...new Set(failures)],
-    restricted_output_sha256: restrictedOutput === null
-      ? null
-      : sha256(Buffer.from(restrictedOutput, "utf8")),
-    elevated_output_sha256: elevatedOutput === null
-      ? null
-      : sha256(Buffer.from(elevatedOutput, "utf8")),
-  };
+  const call = liveShellArguments(continuation[1]);
+  const output = call === null ? null : liveToolOutput(continuation[2],call.callId);
+  if (continuation.length !== 3 || responsesInputText(continuation[0]) !== PERMISSION_TEMP_WRITE_LIVE_PROMPT
+    || !exactLiveRestrictedArguments(call) || !permissionTempWriteOutputContract(output,{command:PERMISSION_TEMP_WRITE_COMMAND}).pass)
+    failures.push("live-restricted-continuation-mismatch");
+  return { roles: ["live_initial", "live_continuation"], failures: [...new Set(failures)],
+    restricted_output_sha256: output === null ? null : sha256(Buffer.from(output,"utf8")) };
 }
 
 const LIVE_CHAT_TASK_KEYS = Object.freeze([
@@ -1028,13 +908,6 @@ const LIVE_CHAT_TASK_KEYS = Object.freeze([
   "stream",
   "stream_options",
   "tools",
-]);
-const LIVE_CHAT_GUARDIAN_KEYS = Object.freeze([
-  "messages",
-  "model",
-  "n",
-  "stream",
-  "stream_options",
 ]);
 const LIVE_CHAT_SECRET_KEYS = Object.freeze([
   "api_key",
@@ -1107,123 +980,33 @@ function liveChatToolsPass(tools) {
       && !Array.isArray(tool.function.parameters));
 }
 
-export function permissionGuardianOpenAiCompatibleLiveCaptureContract(captures, options) {
+export function permissionTempWriteOpenAiCompatibleLiveCaptureContract(captures, options) {
+  if (!Array.isArray(captures) || captures.length !== 2) return { roles: [], failures: ["live-request-count-mismatch"] };
   const failures = [];
-  if (!Array.isArray(captures) || captures.length !== 4) {
-    return { roles: [], failures: ["live-chat-request-count-mismatch"] };
+  const secretBodyFieldsAbsent = captures.every(({body}) => LIVE_CHAT_SECRET_KEYS.every(key => !Object.hasOwn(body ?? {},key)));
+  const secretCanaryAbsent = !JSON.stringify(captures.map(capture => capture.body)).includes(PERMISSION_TEMP_WRITE_SECRET_CANARY);
+  for (const {body} of captures) {
+    if (!exactObjectKeys(body,LIVE_CHAT_TASK_KEYS) || body?.model !== options.model
+      || !liveChatStreamContract(body) || body.parallel_tool_calls !== false || !liveChatToolsPass(body.tools)
+      || LIVE_FORBIDDEN_WIRE_KEYS.some(key => Object.hasOwn(body ?? {},key))) failures.push("live-chat-common-contract-mismatch");
   }
-  for (const capture of captures) {
-    const body = capture.body;
-    if (body?.model !== options.model
-      || !liveChatStreamContract(body)
-      || LIVE_FORBIDDEN_WIRE_KEYS.some((key) => Object.hasOwn(body ?? {}, key))
-      || LIVE_CHAT_SECRET_KEYS.some((key) => Object.hasOwn(body ?? {}, key))
-      || JSON.stringify(body).includes(PERMISSION_GUARDIAN_SECRET_CANARY)) {
-      failures.push("live-chat-request-common-contract-mismatch");
-    }
-  }
-  const [initial, escalation, guardian, continuation] = captures.map((capture) => capture.body);
-  const initialMessages = Array.isArray(initial?.messages) ? initial.messages : [];
-  const escalationMessages = Array.isArray(escalation?.messages) ? escalation.messages : [];
-  const guardianMessages = Array.isArray(guardian?.messages) ? guardian.messages : [];
-  const continuationMessages = Array.isArray(continuation?.messages)
-    ? continuation.messages
-    : [];
-  const initialSystem = liveChatText(initialMessages[0], "system");
-  const escalationSystem = liveChatText(escalationMessages[0], "system");
-  const continuationSystem = liveChatText(continuationMessages[0], "system");
-  if (!exactObjectKeys(initial, LIVE_CHAT_TASK_KEYS)
-    || initial.parallel_tool_calls !== false
-    || !liveChatToolsPass(initial.tools)
-    || initialMessages.length !== 2
-    || initialSystem === null
-    || initialSystem.trim().length === 0
-    || liveChatText(initialMessages[1], "user") !== PERMISSION_TEMP_ESCALATION_LIVE_PROMPT) {
+  const [initial, continuation] = captures.map(capture => capture.body?.messages ?? []);
+  const system = liveChatText(initial[0],"system");
+  if (initial.length !== 2 || !system?.trim() || liveChatText(initial[1],"user") !== PERMISSION_TEMP_WRITE_LIVE_PROMPT)
     failures.push("live-chat-initial-request-mismatch");
-  }
-  const restrictedCall = liveChatShellArguments(escalationMessages[2]);
-  const restrictedOutput = restrictedCall === null
-    ? null
-    : liveChatToolOutput(escalationMessages[3], restrictedCall.callId);
-  if (!exactObjectKeys(escalation, LIVE_CHAT_TASK_KEYS)
-    || escalation.parallel_tool_calls !== false
-    || !liveChatToolsPass(escalation.tools)
-    || escalationMessages.length !== 4
-    || escalationSystem === null
-    || escalationSystem.trim().length === 0
-    || liveChatText(escalationMessages[1], "user") !== PERMISSION_TEMP_ESCALATION_LIVE_PROMPT
-    || !exactLiveRestrictedArguments(restrictedCall)
-    || !liveRestrictedOutputPass(restrictedOutput)) {
-    failures.push("live-chat-restricted-projection-mismatch");
-  }
-  const replayedRestrictedCall = liveChatShellArguments(
-    continuationMessages[2],
-    restrictedCall?.callId ?? "",
-  );
-  const replayedRestrictedOutput = restrictedCall === null
-    ? null
-    : liveChatToolOutput(continuationMessages[3], restrictedCall.callId);
-  const elevatedCall = liveChatShellArguments(continuationMessages[4]);
-  const elevatedOutput = elevatedCall === null
-    ? null
-    : liveChatToolOutput(continuationMessages[5], elevatedCall.callId);
-  if (!exactObjectKeys(continuation, LIVE_CHAT_TASK_KEYS)
-    || continuation.parallel_tool_calls !== false
-    || !liveChatToolsPass(continuation.tools)
-    || continuationMessages.length !== 6
-    || continuationSystem === null
-    || continuationSystem.trim().length === 0
-    || liveChatText(continuationMessages[1], "user")
-      !== PERMISSION_TEMP_ESCALATION_LIVE_PROMPT
-    || !exactLiveRestrictedArguments(replayedRestrictedCall)
-    || replayedRestrictedCall?.argumentsJson !== restrictedCall?.argumentsJson
-    || !liveRestrictedOutputPass(replayedRestrictedOutput)
-    || replayedRestrictedOutput !== restrictedOutput
-    || !exactLiveElevatedArguments(elevatedCall)
-    || elevatedCall?.callId === restrictedCall?.callId
-    || !liveElevatedOutputPass(elevatedOutput)) {
-    failures.push("live-chat-elevated-continuation-mismatch");
-  }
-  const guardianSystem = liveChatText(guardianMessages[0], "system");
-  const guardianInput = liveChatText(guardianMessages[1], "user");
-  if (!exactObjectKeys(guardian, LIVE_CHAT_GUARDIAN_KEYS)
-    || guardianMessages.length !== 2
-    || guardianSystem === null
-    || !guardianSystem.includes("independent permission guardian")
-    || elevatedCall === null
-    || !liveGuardianPayloadPass({ input: [
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: guardianInput }],
-      },
-    ] }, elevatedCall)) {
-    failures.push("live-chat-guardian-request-mismatch");
-  }
-  return {
-    roles: [
-      "live_chat_initial",
-      "live_chat_escalation",
-      "live_chat_guardian",
-      "live_chat_continuation",
-    ],
-    failures: [...new Set(failures)],
-    restricted_output_sha256: restrictedOutput === null
-      ? null
-      : sha256(Buffer.from(restrictedOutput, "utf8")),
-    elevated_output_sha256: elevatedOutput === null
-      ? null
-      : sha256(Buffer.from(elevatedOutput, "utf8")),
-    guardian_request_count: exactObjectKeys(guardian, LIVE_CHAT_GUARDIAN_KEYS) ? 1 : null,
-    guardian_tool_surface_absent: exactObjectKeys(guardian, LIVE_CHAT_GUARDIAN_KEYS),
-    secret_body_fields_absent: captures.every(({ body }) => LIVE_CHAT_SECRET_KEYS
-      .every((key) => !Object.hasOwn(body ?? {}, key))),
-    secret_canary_absent: captures.every(({ body }) => !JSON.stringify(body)
-      .includes(PERMISSION_GUARDIAN_SECRET_CANARY)),
-  };
+  const call = liveChatShellArguments(continuation[2]);
+  const output = call === null ? null : liveChatToolOutput(continuation[3],call.callId);
+  if (continuation.length !== 4 || liveChatText(continuation[0],"system") !== system
+    || liveChatText(continuation[1],"user") !== PERMISSION_TEMP_WRITE_LIVE_PROMPT
+    || !exactLiveRestrictedArguments(call) || !permissionTempWriteOutputContract(output,{command:PERMISSION_TEMP_WRITE_COMMAND}).pass)
+    failures.push("live-chat-restricted-continuation-mismatch");
+  if (!secretBodyFieldsAbsent || !secretCanaryAbsent) failures.push("live-chat-secret-boundary-mismatch");
+  return { roles: ["live_initial","live_continuation"], failures: [...new Set(failures)],
+    secret_body_fields_absent: secretBodyFieldsAbsent, secret_canary_absent: secretCanaryAbsent,
+    restricted_output_sha256: output === null ? null : sha256(Buffer.from(output,"utf8")) };
 }
 
-export function parsePermissionTempEscalationCaptureJson(bytes, { file, kind }) {
+export function parsePermissionTempWriteCaptureJson(bytes, { file, kind }) {
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch (error) {
@@ -1237,7 +1020,7 @@ export function parsePermissionTempEscalationCaptureJson(bytes, { file, kind }) 
   }
 }
 
-async function readPermissionTempEscalationCaptureBytes(directory, file, kind) {
+async function readPermissionTempWriteCaptureBytes(directory, file, kind) {
   try {
     return await readFile(path.join(directory, file));
   } catch (error) {
@@ -1253,14 +1036,14 @@ function permissionLiveCaptureWire(apiMode) {
   if (apiMode === RESPONSES_API_MODE) {
     return {
       endpointPath: "v1/responses",
-      contract: permissionTempEscalationLiveCaptureContract,
+      contract: permissionTempWriteLiveCaptureContract,
       label: "Responses",
     };
   }
   if (apiMode === CHAT_COMPLETIONS_API_MODE) {
     return {
       endpointPath: "v1/chat/completions",
-      contract: permissionGuardianOpenAiCompatibleLiveCaptureContract,
+      contract: permissionTempWriteOpenAiCompatibleLiveCaptureContract,
       label: "Chat Completions",
     };
   }
@@ -1304,11 +1087,11 @@ function permissionLiveCaptureMetadataFailures(metadata, apiMode) {
   return [...new Set(failures)];
 }
 
-export function permissionGuardianOpenAiCompatibleCaptureMetadataFailures(metadata) {
+export function permissionTempWriteOpenAiCompatibleCaptureMetadataFailures(metadata) {
   return permissionLiveCaptureMetadataFailures(metadata, CHAT_COMPLETIONS_API_MODE);
 }
 
-async function readLiveRequestCaptures(
+export async function readPermissionTempWriteLiveRequestCaptures(
   directory,
   options,
   { apiMode = RESPONSES_API_MODE } = {},
@@ -1339,8 +1122,8 @@ async function readLiveRequestCaptures(
     .filter((name) => name.endsWith(".request.json")));
   const captures = [];
   for (const metadataFile of metadataFiles) {
-    const metadata = parsePermissionTempEscalationCaptureJson(
-      await readPermissionTempEscalationCaptureBytes(directory, metadataFile, "metadata"),
+    const metadata = parsePermissionTempWriteCaptureJson(
+      await readPermissionTempWriteCaptureBytes(directory, metadataFile, "metadata"),
       { file: metadataFile, kind: "metadata" },
     );
     const metadataFailures = permissionLiveCaptureMetadataFailures(metadata, apiMode);
@@ -1356,7 +1139,7 @@ async function readLiveRequestCaptures(
       "one prepared request capture metadata file did not own its exact request body",
       { metadata_file: metadataFile, request_file: requestFile ?? null, expected },
     );
-    const requestBytes = await readPermissionTempEscalationCaptureBytes(
+    const requestBytes = await readPermissionTempWriteCaptureBytes(
       directory,
       requestFile,
       "request",
@@ -1366,7 +1149,7 @@ async function readLiveRequestCaptures(
       "one prepared request capture byte owner did not match its metadata",
       { metadata_file: metadataFile, metadata_bytes: metadata.request_body_bytes, actual_bytes: requestBytes.byteLength },
     );
-    const body = parsePermissionTempEscalationCaptureJson(
+    const body = parsePermissionTempWriteCaptureJson(
       requestBytes,
       { file: requestFile, kind: "request" },
     );
@@ -1378,27 +1161,18 @@ async function readLiveRequestCaptures(
     { orphan_files: [...requestFiles].sort() },
   );
   const classified = wire.contract(captures, options);
-  const metadataSequencePass = captures.length === 4
+  const metadataSequencePass = captures.length === 2
     && captures.every((capture, index) => index === 0
       || (capture.metadata.process_id === captures[0].metadata.process_id
         && capture.metadata.sequence === captures[index - 1].metadata.sequence + 1
         && capture.metadata.captured_at_unix_ms
           >= captures[index - 1].metadata.captured_at_unix_ms));
   if (!metadataSequencePass) classified.failures.push("live-request-metadata-sequence-mismatch");
-  const guardianStartedAt = captures[2]?.metadata?.captured_at_unix_ms;
-  const continuationStartedAt = captures[3]?.metadata?.captured_at_unix_ms;
-  const guardianToContinuationMs = Number.isInteger(guardianStartedAt)
-    && Number.isInteger(continuationStartedAt)
-    && continuationStartedAt >= guardianStartedAt
-    ? continuationStartedAt - guardianStartedAt
-    : null;
   const evidence = {
     schema_version: "desktop-e2e.permission-temp-live-captures.v1",
     ...(apiMode === CHAT_COMPLETIONS_API_MODE ? {
       api_mode: apiMode,
       endpoint_path: wire.endpointPath,
-      guardian_request_count: classified.guardian_request_count,
-      guardian_tool_surface_absent: classified.guardian_tool_surface_absent,
       secret_body_fields_absent: classified.secret_body_fields_absent,
       secret_canary_absent: classified.secret_canary_absent,
     } : {}),
@@ -1406,21 +1180,19 @@ async function readLiveRequestCaptures(
     roles: classified.roles,
     failures: [...new Set(classified.failures)],
     restricted_output_sha256: classified.restricted_output_sha256,
-    elevated_output_sha256: classified.elevated_output_sha256,
-    guardian_to_continuation_ms: guardianToContinuationMs,
     request_timeout_ms: LIVE_REQUEST_TIMEOUT_MS,
     request_sequences: captures.map((capture) => capture.metadata?.sequence ?? null),
     request_body_hashes: captures.map((capture) => capture.requestBodySha256),
   };
-  if (evidence.failures.length > 0 || guardianToContinuationMs === null) throw productFailure(
+  if (evidence.failures.length > 0) throw productFailure(
     "permission-temp-live-request-contract",
-    `the live ${wire.label} request chain did not match restricted failure, exact elevation, Guardian, and success`,
+    `the live ${wire.label} request chain did not match one restricted pytest success without Guardian or elevation`,
     evidence,
   );
   return evidence;
 }
 
-export function permissionTempEscalationLiveFinalFailures(observation) {
+export function permissionTempWriteLiveFinalFailures(observation) {
   const failures = [];
   if (!Array.isArray(observation?.workspace_failures)
     || observation.workspace_failures.length > 0) {
@@ -1438,7 +1210,7 @@ export function permissionTempEscalationLiveFinalFailures(observation) {
   return failures;
 }
 
-export function permissionTempEscalationLiveCleanupFailures({
+export function permissionTempWriteLiveCleanupFailures({
   quiesceInput,
   quiesceFinalObservation,
   cleanupFinalObservation,
@@ -1453,32 +1225,32 @@ export function permissionTempEscalationLiveCleanupFailures({
   return failures;
 }
 
-export function permissionTempEscalationCaptureFailureObservation(error) {
+export function permissionTempWriteCaptureFailureObservation(error) {
   if (!(error instanceof DesktopE2eError) || error.owner !== "product") throw error;
   return errorObservation(error);
 }
 
-async function observePermissionTempEscalationLiveFinal(
+async function observePermissionTempWriteLiveFinal(
   context,
   state,
   options,
   { apiMode = RESPONSES_API_MODE } = {},
 ) {
   const workspace = await workspaceSnapshot(context.paths.workspace);
-  const workspaceFailures = permissionTempEscalationWorkspaceFailures(
+  const workspaceFailures = permissionTempWriteWorkspaceFailures(
     workspace,
     state.workspaceBaseline,
   );
   let requestCapture = null;
   let requestCaptureFailure = null;
   try {
-    requestCapture = await readLiveRequestCaptures(
+    requestCapture = await readPermissionTempWriteLiveRequestCaptures(
       state.requestCaptureDirectory,
       options,
       { apiMode },
     );
   } catch (error) {
-    requestCaptureFailure = permissionTempEscalationCaptureFailureObservation(error);
+    requestCaptureFailure = permissionTempWriteCaptureFailureObservation(error);
   }
   const observation = {
     workspace,
@@ -1493,11 +1265,11 @@ async function observePermissionTempEscalationLiveFinal(
   };
   return {
     ...observation,
-    failures: permissionTempEscalationLiveFinalFailures(observation),
+    failures: permissionTempWriteLiveFinalFailures(observation),
   };
 }
 
-export function permissionTempEscalationLiveTerminalFailures(surface) {
+export function permissionTempWriteLiveTerminalFailures(surface) {
   const projection = surface?.projection;
   const users = rowsOfKind(projection, "user");
   const assistants = rowsOfKind(projection, "assistant");
@@ -1506,16 +1278,16 @@ export function permissionTempEscalationLiveTerminalFailures(surface) {
   const completed = rowsOfKind(projection, "work_summary_completed");
   const failures = [];
   if (!terminalSettled(surface)) failures.push("live-terminal-surface-not-settled");
-  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_LIVE_PROMPT])) {
+  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_WRITE_LIVE_PROMPT])) {
     failures.push("live-terminal-user-authority-mismatch");
   }
-  if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_ESCALATION_LIVE_RESPONSE])) {
+  if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_WRITE_LIVE_RESPONSE])) {
     failures.push("live-terminal-assistant-response-mismatch");
   }
-  if (errors.length !== 1 || running.length !== 0 || completed.length !== 1) {
+  if (errors.length !== 0 || running.length !== 0 || completed.length !== 1) {
     failures.push("live-terminal-history-cardinality-mismatch");
   }
-  if (completed.length === 1 && !exactRestrictedRetryHistory(projection, completed[0])) {
+  if (completed.length === 1 && !exactRestrictedHistory(projection, completed[0])) {
     failures.push("live-terminal-tool-history-mismatch");
   }
   if (surface?.users?.length !== 1
@@ -1525,18 +1297,18 @@ export function permissionTempEscalationLiveTerminalFailures(surface) {
     // Keep raw canonical authority exact above and normalize only this DOM view.
     || !renderedDomTextMatchesAuthority(
       surface.users[0].text,
-      PERMISSION_TEMP_ESCALATION_LIVE_PROMPT,
+      PERMISSION_TEMP_WRITE_LIVE_PROMPT,
     )
     || surface?.assistants?.length !== 1
     || surface.assistants[0].visible !== true
-    || surface.assistants[0].text !== PERMISSION_TEMP_ESCALATION_LIVE_RESPONSE
+    || surface.assistants[0].text !== PERMISSION_TEMP_WRITE_LIVE_RESPONSE
     || surface?.completed_summaries?.length !== 1
     || surface.completed_summaries[0].visible !== true) failures.push("live-terminal-dom-mismatch");
   return [...new Set(failures)];
 }
 
-export function permissionGuardianOpenAiCompatibleLiveTerminalFailures(surface, options) {
-  const failures = permissionTempEscalationLiveTerminalFailures(surface);
+export function permissionTempWriteOpenAiCompatibleLiveTerminalFailures(surface, options) {
+  const failures = permissionTempWriteLiveTerminalFailures(surface);
   const projection = surface?.projection;
   if (projection?.provider_effective_profile !== "openai_compatible"
     || projection?.provider_effective_base_url !== options?.providerBaseUrl
@@ -1546,14 +1318,14 @@ export function permissionGuardianOpenAiCompatibleLiveTerminalFailures(surface, 
   if (projection?.provider_effective_api_key_env !== "") {
     failures.push("live-chat-secret-boundary-mismatch");
   }
-  if (JSON.stringify(surface).includes(PERMISSION_GUARDIAN_SECRET_CANARY)) {
+  if (JSON.stringify(surface).includes(PERMISSION_TEMP_WRITE_SECRET_CANARY)) {
     failures.push("live-chat-secret-canary-exposed");
   }
   return [...new Set(failures)];
 }
 
-export function createPermissionTempEscalationLiveTerminalDecision({
-  confirmationMs = PERMISSION_TEMP_ESCALATION_TERMINAL_CONFIRMATION_MS,
+export function createPermissionTempWriteLiveTerminalDecision({
+  confirmationMs = PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS,
   now = () => Date.now(),
 } = {}) {
   if (!Number.isSafeInteger(confirmationMs) || confirmationMs <= 0) {
@@ -1563,7 +1335,7 @@ export function createPermissionTempEscalationLiveTerminalDecision({
     throw new TypeError("live permission TEMP terminal clock must be a function");
   }
   return createConfirmedTerminalDecision({
-    failuresOf: permissionTempEscalationLiveTerminalFailures,
+    failuresOf: permissionTempWriteLiveTerminalFailures,
     surfaceOf: (surface) => surface,
     providerFailed: (surface) => surface?.visible_fatal_count > 0
       || surface?.visible_recoverable_error_count > 0
@@ -1579,30 +1351,30 @@ export function createPermissionTempEscalationLiveTerminalDecision({
   });
 }
 
-export function permissionTempEscalationLiveTerminalFailureEvidence(surface) {
+export function permissionTempWriteLiveTerminalFailureEvidence(surface) {
   return {
     surface,
-    terminal_oracle_failures: permissionTempEscalationLiveTerminalFailures(surface),
+    terminal_oracle_failures: permissionTempWriteLiveTerminalFailures(surface),
   };
 }
 
-export function createPermissionGuardianOpenAiCompatibleLiveTerminalDecision(
+export function createPermissionTempWriteOpenAiCompatibleLiveTerminalDecision(
   options,
   {
-    confirmationMs = PERMISSION_TEMP_ESCALATION_TERMINAL_CONFIRMATION_MS,
+    confirmationMs = PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS,
     now = () => Date.now(),
   } = {},
 ) {
   if (!Number.isSafeInteger(confirmationMs) || confirmationMs <= 0) {
     throw new TypeError(
-      "live OpenAI-compatible Guardian terminal confirmation must be a positive safe integer",
+      "live OpenAI-compatible TEMP write terminal confirmation must be a positive safe integer",
     );
   }
   if (typeof now !== "function") {
-    throw new TypeError("live OpenAI-compatible Guardian terminal clock must be a function");
+    throw new TypeError("live OpenAI-compatible TEMP write terminal clock must be a function");
   }
   return createConfirmedTerminalDecision({
-    failuresOf: (surface) => permissionGuardianOpenAiCompatibleLiveTerminalFailures(
+    failuresOf: (surface) => permissionTempWriteOpenAiCompatibleLiveTerminalFailures(
       surface,
       options,
     ),
@@ -1621,13 +1393,13 @@ export function createPermissionGuardianOpenAiCompatibleLiveTerminalDecision(
   });
 }
 
-export function permissionGuardianOpenAiCompatibleLiveTerminalFailureEvidence(
+export function permissionTempWriteOpenAiCompatibleLiveTerminalFailureEvidence(
   surface,
   options,
 ) {
   return {
     surface,
-    terminal_oracle_failures: permissionGuardianOpenAiCompatibleLiveTerminalFailures(
+    terminal_oracle_failures: permissionTempWriteOpenAiCompatibleLiveTerminalFailures(
       surface,
       options,
     ),
@@ -1655,7 +1427,7 @@ async function workspaceSnapshot(workspace) {
   return { schema_version: "desktop-e2e.workspace-snapshot.v1", entries: rows };
 }
 
-export function permissionTempEscalationWorkspaceFailures(snapshot, baseline) {
+export function permissionTempWriteWorkspaceFailures(snapshot, baseline) {
   const failures = [];
   const names = snapshot?.entries?.map((entry) => entry.name) ?? [];
   if (!isDeepStrictEqual(names, [FIXTURE_SENTINEL, PYTEST_FIXTURE].sort())) {
@@ -1671,7 +1443,7 @@ export function permissionTempEscalationWorkspaceFailures(snapshot, baseline) {
 function keyCode(character) {
   if (/^[a-z]$/u.test(character)) return `Key${character.toUpperCase()}`;
   if (character === " ") return "Space";
-  throw new TypeError(`unsupported permission TEMP escalation character: ${character}`);
+  throw new TypeError(`unsupported permission TEMP write character: ${character}`);
 }
 
 function expectedTypedEvents(text) {
@@ -1725,7 +1497,7 @@ async function trustedInsert(input, text) {
 async function waitForReadyComposer(cdp, prompt = "") {
   try {
     return (await waitForObservation({
-      label: "permission TEMP escalation ready composer",
+      label: "permission TEMP write ready composer",
       timeoutMs: 15_000,
       pollMs: 50,
       sample: () => observeProviderTurnSurface(cdp),
@@ -1754,7 +1526,7 @@ async function submitTrustedPrompt({
   cdp,
   input,
   commands,
-  prompt = PERMISSION_TEMP_ESCALATION_PROMPT,
+  prompt = PERMISSION_TEMP_WRITE_PROMPT,
   insertion = false,
 }) {
   await waitForReadyComposer(cdp);
@@ -1771,7 +1543,7 @@ async function submitTrustedPrompt({
   const commandStart = (await commands.snapshot()).sequence;
   const click = await trustedClick(input, SEND);
   const observed = await waitForObservation({
-    label: "permission TEMP escalation submit command",
+    label: "permission TEMP write submit command",
     timeoutMs: 10_000,
     pollMs: 16,
     sample: () => commands.snapshot(commandStart),
@@ -1823,7 +1595,7 @@ async function waitForProductStage({
   return observed.value;
 }
 
-async function requirePermissionTempEscalationPersistence(context, terminal) {
+async function requirePermissionTempWritePersistence(context, terminal) {
   const owner = exactOwner(terminal?.surface?.projection ?? terminal?.projection, "idle");
   if (owner === null) {
     throw productFailure(
@@ -1834,7 +1606,7 @@ async function requirePermissionTempEscalationPersistence(context, terminal) {
   }
   let evidence;
   try {
-    evidence = await readPermissionTempEscalationPersistence({
+    evidence = await readPermissionTempWritePersistence({
       database: context.paths.database,
       owner,
     });
@@ -1845,22 +1617,22 @@ async function requirePermissionTempEscalationPersistence(context, terminal) {
       errorObservation(error),
     );
   }
-  const failures = permissionTempEscalationPersistenceFailures(evidence, owner);
+  const failures = permissionTempWritePersistenceFailures(evidence, owner);
   if (failures.length > 0) {
     throw productFailure(
       "permission-temp-persistence-contract",
-      "canonical permission TEMP history did not persist the exact restricted and elevated success projections",
+      "canonical permission TEMP history did not persist one completed restricted success projection",
       { failures, owner, evidence },
     );
   }
   return { owner, ...evidence, failures };
 }
 
-async function bestEffortPermissionTempEscalationPersistence(context, terminal) {
+async function bestEffortPermissionTempWritePersistence(context, terminal) {
   try {
     return {
       collection: "pass",
-      ...await requirePermissionTempEscalationPersistence(context, terminal),
+      ...await requirePermissionTempWritePersistence(context, terminal),
     };
   } catch (error) {
     return {
@@ -1881,13 +1653,13 @@ async function settleProbes(state, input, commands, primaryError) {
   if (outcome.failures.length > 0 && primaryError === null) {
     throw harnessFailure(
       "permission-temp-probe-cleanup",
-      "permission TEMP escalation input or command probe did not settle",
+      "permission TEMP write input or command probe did not settle",
       outcome,
     );
   }
 }
 
-export function createPermissionTempEscalationScenario() {
+export function createPermissionTempWriteScenario() {
   const state = {
     provider: null,
     acceptedLedger: null,
@@ -1897,19 +1669,18 @@ export function createPermissionTempEscalationScenario() {
     persistenceEvidence: null,
   };
   return Object.freeze({
-    id: "permission.temp-escalation",
+    id: "permission.temp-write",
     productOracle: "pass",
     manualGate: "not_required",
     databaseRequired: true,
     requestGracefulExit,
     async prepare({ context, sink, phase }) {
+      await preparePermissionTempWritePython(sink, phase, OWNER);
       state.provider = await startScriptedProvider({
-        script: createPermissionTempEscalationProviderScript({
-          taskPrompt: PERMISSION_TEMP_ESCALATION_PROMPT,
-          command: PERMISSION_TEMP_ESCALATION_COMMAND,
-          justification: PERMISSION_TEMP_ESCALATION_JUSTIFICATION,
-          responseText: PERMISSION_TEMP_ESCALATION_RESPONSE,
-          guardianDelayMs: PERMISSION_TEMP_ESCALATION_GUARDIAN_DELAY_MS,
+        script: createPermissionTempWriteProviderScript({
+          taskPrompt: PERMISSION_TEMP_WRITE_PROMPT,
+          command: PERMISSION_TEMP_WRITE_COMMAND,
+          responseText: PERMISSION_TEMP_WRITE_RESPONSE,
         }),
         responseBehavior: "hold_until_release",
       });
@@ -1918,9 +1689,9 @@ export function createPermissionTempEscalationScenario() {
         sink,
         phase,
         owner: OWNER,
-        configText: permissionTempEscalationFixtureConfig(state.provider.baseUrl),
+        configText: permissionTempWriteFixtureConfig(state.provider.baseUrl),
         sentinelName: FIXTURE_SENTINEL,
-        sentinelText: "moyAI Desktop E2E permission TEMP escalation fixture.\n",
+        sentinelText: "moyAI Desktop E2E permission TEMP write fixture.\n",
       });
       await writeFile(`${context.paths.workspace}\\${PYTEST_FIXTURE}`, PYTEST_FIXTURE_TEXT, {
         flag: "wx",
@@ -1934,16 +1705,16 @@ export function createPermissionTempEscalationScenario() {
     async execute({ context, driver: cdp, sink }) {
       const provider = state.provider;
       if (provider === null || state.workspaceBaseline === null) {
-        throw new Error("permission TEMP escalation fixture was not prepared");
+        throw new Error("permission TEMP write fixture was not prepared");
       }
       await acquireInteractiveShell({ context, driver: cdp, sink }, {
         evidenceOwner: OWNER,
         screenshotStem: "permission-temp-shell-ready",
       });
-      const input = new WebviewInput(cdp, { probeId: "permission-temp-escalation" });
+      const input = new WebviewInput(cdp, { probeId: "permission-temp-write" });
       const commands = new DesktopCommandProbe(cdp, {
-        probeId: "permission-temp-escalation-commands",
-        commands: ["submit_prompt", "cancel_run"],
+        probeId: "permission-temp-write-commands",
+        commands: ["submit_prompt", "cancel_run", "answer_permission"],
       });
       let primaryError = null;
       let probesSettled = false;
@@ -1952,19 +1723,18 @@ export function createPermissionTempEscalationScenario() {
         await commands.install();
         const submit = await submitTrustedPrompt({ cdp, input, commands });
         const held = await waitForProductStage({
-          label: "permission TEMP exact restricted failure projection",
+          label: "permission TEMP exact restricted pytest success",
           timeoutMs: 30_000,
           sample: async () => ({
             surface: await observeProviderTurnSurface(cdp),
             ledger: provider.requestLedger,
           }),
-          decide: permissionTempEscalationHeldDecision,
+          decide: permissionTempWriteHeldDecision,
           code: "permission-temp-restricted-projection",
-          message: "the restricted pytest failure did not reach the exact host hint and held escalation barrier",
+          message: "the restricted pytest success did not reach the held continuation barrier",
         });
-        const release = provider.releaseScriptRole("temp_escalation");
         const restrictedWorkspace = await workspaceSnapshot(context.paths.workspace);
-        const restrictedWorkspaceFailures = permissionTempEscalationWorkspaceFailures(
+        const restrictedWorkspaceFailures = permissionTempWriteWorkspaceFailures(
           restrictedWorkspace,
           state.workspaceBaseline,
         );
@@ -1976,30 +1746,31 @@ export function createPermissionTempEscalationScenario() {
         const heldScreenshot = await captureScenarioScreenshot({
           cdp,
           sink,
-          name: "permission-temp-escalation-released",
+          name: "permission-temp-write-success-held",
           owner: OWNER,
         });
-        const terminalDecision = createPermissionTempEscalationTerminalDecision();
+        const release = provider.releaseScriptRole("temp_continuation");
+        const terminalDecision = createPermissionTempWriteTerminalDecision();
         let terminal;
         try {
           terminal = await waitForProductStage({
-            label: "permission TEMP elevated pytest terminal",
-            timeoutMs: PERMISSION_TEMP_ESCALATION_TERMINAL_TIMEOUT_MS,
+            label: "permission TEMP restricted pytest terminal",
+            timeoutMs: PERMISSION_TEMP_WRITE_TERMINAL_TIMEOUT_MS,
             sample: async () => ({
               surface: await observeProviderTurnSurface(cdp),
               ledger: provider.requestLedger,
             }),
             decide: terminalDecision,
             code: "permission-temp-terminal",
-            message: "the exact elevated pytest retry did not reach one canonical GUI terminal",
-            failureEvidence: permissionTempEscalationTerminalFailureEvidence,
+            message: "the restricted pytest success did not reach one canonical GUI terminal",
+            failureEvidence: permissionTempWriteTerminalFailureEvidence,
           });
         } catch (error) {
           if (error?.code === "permission-temp-terminal" && state.persistenceEvidence === null) {
             const terminalEvidence = error?.evidence?.surface !== undefined
               ? error.evidence
               : error?.evidence?.observation?.last_value;
-            state.persistenceEvidence = await bestEffortPermissionTempEscalationPersistence(
+            state.persistenceEvidence = await bestEffortPermissionTempWritePersistence(
               context,
               terminalEvidence,
             );
@@ -2012,18 +1783,18 @@ export function createPermissionTempEscalationScenario() {
           name: "permission-temp-terminal",
           owner: OWNER,
         });
-        state.persistenceEvidence = await requirePermissionTempEscalationPersistence(
+        state.persistenceEvidence = await requirePermissionTempWritePersistence(
           context,
           terminal,
         );
         const finalWorkspace = await workspaceSnapshot(context.paths.workspace);
-        const finalWorkspaceFailures = permissionTempEscalationWorkspaceFailures(
+        const finalWorkspaceFailures = permissionTempWriteWorkspaceFailures(
           finalWorkspace,
           state.workspaceBaseline,
         );
         if (finalWorkspaceFailures.length > 0) throw productFailure(
           "permission-temp-final-workspace-drift",
-          "the elevated pytest retry changed the fixture or created a workspace TEMP workaround",
+          "the restricted pytest run changed the fixture or created a workspace TEMP workaround",
           { failures: finalWorkspaceFailures, baseline: state.workspaceBaseline, observed: finalWorkspace },
         );
         const detailObservation = await observePermissionTempTerminalDetail(terminal.surface, async () => {
@@ -2046,7 +1817,7 @@ export function createPermissionTempEscalationScenario() {
           { afterSequence: submit.commandStart, expected: [submit.expected] },
         );
         state.acceptedLedger = structuredClone(provider.requestLedger);
-        await sink.record("permission-temp-escalation-completed", {
+        await sink.record("permission-temp-write-completed", {
           submit,
           command_lifetime: commandLifetime,
           held,
@@ -2086,7 +1857,7 @@ export function createPermissionTempEscalationScenario() {
       return {
         input: pass ? "pass" : "fail",
         resources: [{
-          kind: "permission-temp-escalation-verification",
+          kind: "permission-temp-write-verification",
           quiesce_input: state.quiesceOutcome?.input ?? null,
           canonical_persistence: state.persistenceEvidence,
           probe_outcomes: state.probeOutcomes,
@@ -2096,7 +1867,7 @@ export function createPermissionTempEscalationScenario() {
   });
 }
 
-function createPermissionExternalGuardianScenario(options, spec) {
+function createPermissionExternalTempWriteScenario(options, spec) {
   const owner = spec.owner;
   const state = {
     requestCaptureDirectory: null,
@@ -2123,6 +1894,7 @@ function createPermissionExternalGuardianScenario(options, spec) {
       };
     },
     async prepare({ context, sink, phase }) {
+      await preparePermissionTempWritePython(sink, phase, owner);
       state.requestCaptureDirectory = path.join(context.root, LIVE_CAPTURE_DIRECTORY);
       await prepareDesktopFixture({
         context,
@@ -2146,8 +1918,8 @@ function createPermissionExternalGuardianScenario(options, spec) {
           api_key_env: "",
           secret_canary_environment_key: spec.secretCanaryEnvironmentKey,
         } : {}),
-        prompt_sha256: sha256(Buffer.from(PERMISSION_TEMP_ESCALATION_LIVE_PROMPT, "utf8")),
-        command: PERMISSION_TEMP_ESCALATION_COMMAND,
+        prompt_sha256: sha256(Buffer.from(PERMISSION_TEMP_WRITE_LIVE_PROMPT, "utf8")),
+        command: PERMISSION_TEMP_WRITE_COMMAND,
         request_timeout_ms: LIVE_REQUEST_TIMEOUT_MS,
         turn_timeout_ms: LIVE_TURN_TIMEOUT_MS,
         prepared_request_capture_directory: state.requestCaptureDirectory,
@@ -2157,7 +1929,7 @@ function createPermissionExternalGuardianScenario(options, spec) {
     },
     async execute({ context, driver: cdp, sink }) {
       if (state.workspaceBaseline === null || state.requestCaptureDirectory === null) {
-        throw new Error(`live ${spec.label} permission Guardian fixture was not prepared`);
+        throw new Error(`live ${spec.label} permission TEMP write fixture was not prepared`);
       }
       await acquireInteractiveShell({ context, driver: cdp, sink }, {
         evidenceOwner: owner,
@@ -2166,7 +1938,7 @@ function createPermissionExternalGuardianScenario(options, spec) {
       const input = new WebviewInput(cdp, { probeId: "permission-temp-live" });
       const commands = new DesktopCommandProbe(cdp, {
         probeId: "permission-temp-live-commands",
-        commands: ["submit_prompt", "cancel_run"],
+        commands: ["submit_prompt", "cancel_run", "answer_permission"],
       });
       let primaryError = null;
       let probesSettled = false;
@@ -2177,19 +1949,19 @@ function createPermissionExternalGuardianScenario(options, spec) {
           cdp,
           input,
           commands,
-          prompt: PERMISSION_TEMP_ESCALATION_LIVE_PROMPT,
+          prompt: PERMISSION_TEMP_WRITE_LIVE_PROMPT,
           insertion: true,
         });
         const terminalDecision = spec.createTerminalDecision(options);
         let terminal;
         try {
           terminal = await waitForProductStage({
-            label: `live ${spec.label} permission Guardian terminal`,
+            label: `live ${spec.label} permission TEMP write terminal`,
             timeoutMs: LIVE_TURN_TIMEOUT_MS,
             sample: () => observeProviderTurnSurface(cdp),
             decide: terminalDecision,
             code: "permission-temp-live-terminal",
-            message: `the live ${spec.label} turn did not complete the exact restricted failure, Guardian allow, and elevated retry`,
+            message: `the live ${spec.label} turn did not complete one restricted pytest success without Guardian or elevation`,
             failureEvidence: (surface) => spec.terminalFailureEvidence(surface, options),
           });
         } catch (error) {
@@ -2197,7 +1969,7 @@ function createPermissionExternalGuardianScenario(options, spec) {
             && state.persistenceEvidence === null) {
             const terminalEvidence = error?.evidence?.surface ?? error?.evidence
               ?.observation?.last_value?.surface ?? error?.evidence?.observation?.last_value;
-            state.persistenceEvidence = await bestEffortPermissionTempEscalationPersistence(
+            state.persistenceEvidence = await bestEffortPermissionTempWritePersistence(
               context,
               terminalEvidence,
             );
@@ -2210,17 +1982,17 @@ function createPermissionExternalGuardianScenario(options, spec) {
           name: "permission-temp-live-terminal",
           owner,
         });
-        state.persistenceEvidence = await requirePermissionTempEscalationPersistence(
+        state.persistenceEvidence = await requirePermissionTempWritePersistence(
           context,
           terminal,
         );
-        state.requestCaptureEvidence = await readLiveRequestCaptures(
+        state.requestCaptureEvidence = await readPermissionTempWriteLiveRequestCaptures(
           state.requestCaptureDirectory,
           options,
           { apiMode: spec.apiMode },
         );
         state.terminalWorkspace = await workspaceSnapshot(context.paths.workspace);
-        const workspaceFailures = permissionTempEscalationWorkspaceFailures(
+        const workspaceFailures = permissionTempWriteWorkspaceFailures(
           state.terminalWorkspace,
           state.workspaceBaseline,
         );
@@ -2264,7 +2036,7 @@ function createPermissionExternalGuardianScenario(options, spec) {
     async quiesce({ context, inputs }) {
       if (state.quiesceOutcome !== null) return structuredClone(state.quiesceOutcome);
       const resourcesPass = state.probeOutcomes.every((outcome) => outcome.failures.length === 0);
-      state.quiesceFinalObservation = await observePermissionTempEscalationLiveFinal(
+      state.quiesceFinalObservation = await observePermissionTempWriteLiveFinal(
         context,
         state,
         options,
@@ -2296,13 +2068,13 @@ function createPermissionExternalGuardianScenario(options, spec) {
       return structuredClone(state.quiesceOutcome);
     },
     async cleanup({ context }) {
-      const finalObservation = await observePermissionTempEscalationLiveFinal(
+      const finalObservation = await observePermissionTempWriteLiveFinal(
         context,
         state,
         options,
         { apiMode: spec.apiMode },
       );
-      const cleanupFailures = permissionTempEscalationLiveCleanupFailures({
+      const cleanupFailures = permissionTempWriteLiveCleanupFailures({
         quiesceInput: state.quiesceOutcome?.input ?? null,
         quiesceFinalObservation: state.quiesceFinalObservation,
         cleanupFinalObservation: finalObservation,
@@ -2323,42 +2095,42 @@ function createPermissionExternalGuardianScenario(options, spec) {
   });
 }
 
-export function createPermissionTempEscalationLmStudioScenario(rawOptions = {}) {
-  const options = normalizePermissionTempEscalationLmStudioOptions(rawOptions);
-  return createPermissionExternalGuardianScenario(options, {
+export function createPermissionTempWriteLmStudioScenario(rawOptions = {}) {
+  const options = normalizePermissionTempWriteLmStudioOptions(rawOptions);
+  return createPermissionExternalTempWriteScenario(options, {
     scenarioId: LIVE_LM_STUDIO_SCENARIO_ID,
     owner: OWNER,
     label: "LM Studio",
-    sentinelText: "moyAI Desktop E2E live LM Studio permission TEMP escalation fixture.\n",
+    sentinelText: "moyAI Desktop E2E live LM Studio permission TEMP write fixture.\n",
     providerProfile: "lm_studio",
     apiMode: RESPONSES_API_MODE,
     resourceKind: "external-lm-studio-provider",
-    fixtureConfig: permissionTempEscalationLmStudioFixtureConfig,
-    createTerminalDecision: () => createPermissionTempEscalationLiveTerminalDecision(),
-    terminalFailureEvidence: (surface) => permissionTempEscalationLiveTerminalFailureEvidence(
+    fixtureConfig: permissionTempWriteLmStudioFixtureConfig,
+    createTerminalDecision: () => createPermissionTempWriteLiveTerminalDecision(),
+    terminalFailureEvidence: (surface) => permissionTempWriteLiveTerminalFailureEvidence(
       surface,
     ),
     environment: {},
   });
 }
 
-export function createPermissionGuardianOpenAiCompatibleScenario(rawOptions = {}) {
-  const options = normalizePermissionGuardianOpenAiCompatibleOptions(rawOptions);
-  return createPermissionExternalGuardianScenario(options, {
+export function createPermissionTempWriteOpenAiCompatibleScenario(rawOptions = {}) {
+  const options = normalizePermissionTempWriteOpenAiCompatibleOptions(rawOptions);
+  return createPermissionExternalTempWriteScenario(options, {
     scenarioId: LIVE_OPENAI_COMPATIBLE_SCENARIO_ID,
     owner: `scenario:${LIVE_OPENAI_COMPATIBLE_SCENARIO_ID}`,
     label: "OpenAI-compatible Chat Completions",
-    sentinelText: "moyAI Desktop E2E OpenAI-compatible Chat permission Guardian fixture.\n",
+    sentinelText: "moyAI Desktop E2E OpenAI-compatible Chat permission TEMP write fixture.\n",
     providerProfile: "openai_compatible",
     apiMode: CHAT_COMPLETIONS_API_MODE,
     resourceKind: "external-openai-compatible-provider",
-    fixtureConfig: permissionGuardianOpenAiCompatibleFixtureConfig,
+    fixtureConfig: permissionTempWriteOpenAiCompatibleFixtureConfig,
     createTerminalDecision: (normalized) => (
-      createPermissionGuardianOpenAiCompatibleLiveTerminalDecision(normalized)
+      createPermissionTempWriteOpenAiCompatibleLiveTerminalDecision(normalized)
     ),
-    terminalFailureEvidence: permissionGuardianOpenAiCompatibleLiveTerminalFailureEvidence,
+    terminalFailureEvidence: permissionTempWriteOpenAiCompatibleLiveTerminalFailureEvidence,
     environment: {
-      [LIVE_OPENAI_COMPATIBLE_SECRET_ENV]: PERMISSION_GUARDIAN_SECRET_CANARY,
+      [LIVE_OPENAI_COMPATIBLE_SECRET_ENV]: PERMISSION_TEMP_WRITE_SECRET_CANARY,
     },
     secretCanaryEnvironmentKey: LIVE_OPENAI_COMPATIBLE_SECRET_ENV,
   });

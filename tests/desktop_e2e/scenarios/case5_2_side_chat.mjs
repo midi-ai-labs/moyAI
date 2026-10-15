@@ -573,9 +573,9 @@ function validateArguments(options) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sharedBudget = options.observationBudget !== undefined && options.observationBudget !== null;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < (sharedBudget ? 1 : 1_000)
-    || timeoutMs > (sharedBudget ? 7_200_000 : DEFAULT_TIMEOUT_MS)) {
+    || (!sharedBudget && timeoutMs > DEFAULT_TIMEOUT_MS)) {
     throw new TypeError(sharedBudget
-      ? "case5_2 Stage5 timeoutMs must be a positive remaining case budget up to 7200000"
+      ? "case5_2 Stage5 timeoutMs must be a positive safe integer remaining case budget"
       : "case5_2 Stage5 timeoutMs must be between 1000 and 3600000");
   }
   const evidenceName = options.evidenceName ?? "case5_2-stage5";

@@ -22,6 +22,7 @@ test("Case2 uses the canonical image prompt, explicit source and common manual l
   const scenario = createManualCase2Scenario(RAW);
   assert.equal(scenario.id, "manual.case2"); assert.equal(scenario.manualGate, "pending");
   assert.equal(scenario.databaseRequired, true); assert.deepEqual(scenario.environment, {});
+  assert.equal(scenario.prepareBeforeLaunch, true);
   for (const change of [{ image_source: undefined }, { image_source: "relative.jpg" }, { image_source: process.execPath },
     { supports_images: true }, { vision_capable: true }]) assert.throws(() => normalizeManualCase2Options({ ...RAW, ...change }));
 });
@@ -68,7 +69,7 @@ test("Case2 prepare copies exact inputs and activates task-local capture without
     assert.deepEqual(scenario.environment, { MOYAI_HTTP_REQUEST_CAPTURE_DIR: path.join(paths.logs, "case2-provider-requests") });
     assert.deepEqual(captureCalls, [path.join(paths.logs, "case2-provider-requests")]);
     const evidence = records.find(row => row[0] === "case2-input")[1];
-    assert.equal(evidence.observation_timeout_ms, 30 * 60 * 1000);
+    assert.equal(evidence.observation_timeout_ms, null);
     assert.equal(evidence.image.sha256, expected.sha256); assert.equal(evidence.image.source_filename, "operator image.jpg");
     assert.equal(evidence.model_capability, "unknown_unless_separate_provider_metadata_proves_support");
     assert.equal(evidence.provider_owned, false);

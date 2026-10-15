@@ -185,7 +185,7 @@ impl ToolEffectAdmission {
         &self.sandbox_plan
     }
 
-    /// Settle the approval after a synchronous process attempt returns, or before
+    /// Settle the approval after an admitted effect attempt returns, or before
     /// handing off an observed managed-process startup. No further effect may use
     /// this ticket. Unlike Drop, a tool response must confirm settlement.
     pub(crate) fn finish_started_effect(self) -> Result<(), ToolError> {

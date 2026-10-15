@@ -16,6 +16,8 @@ Device範囲では、本人が選んだprojectに属する現在有効な公開�
 
 非管理者の Windows ユーザーで起動します。Runner は昇格・サービスとして動作せず、同じユーザー・ログオン・有効な権限のクライアントだけを named pipe で受け付けます。通信相手が申告する名前や localhost の token を OS 本人性の証拠には使いません。外部からの共有サーバー公開は行いません。
 
+`serve`を単独で起動するときは、制限付きコマンドを実行する起動補助機能についてWindowsの管理者承認を一度求めます。承認を取り消すと起動を中止します。Desktopが自動起動するRunnerはDesktopで承認済みの補助機能を引き継ぐため、もう一度の承認は求めません。`identity`や`status`など、起動済みRunnerへの操作だけでは管理者承認を求めません。Windowsサインイン時の独立した自動起動も、起動時の承認が必要です。
+
 ```powershell
 moyai-runner serve
 ```
@@ -71,7 +73,7 @@ moyai-runner clear-project --runner <提供RunnerのID>
 
 ## 実プロセス検証
 
-機械単位の製品policyを試験で変更しないため、`tests/runner_host.rs`の6件は専用gateです。current libtest内の`runner::shared::process_fixture::isolated_runner_process`が同じRunnerHost・named pipe・SharedWorkerを起動し、policyの保存先だけを`cfg(test)`で隔離します。IPC consumerはcurrent製品binaryを使います。接続先変更のケースでは、停止済みHubに接続する受付停止中のRunnerに対し、実際のDesktop helperから静止確認のIPCを送り、同じprocess handleの終了待ち・同意保持・再起動後の受付停止も検証します。
+機械単位の製品policyを試験で変更しないため、`tests/runner_host.rs`の6件は専用gateです。current libtest内の`runner::shared::process_fixture::isolated_runner_process`が同じRunnerHost・named pipe・SharedWorkerを起動し、policyの保存先だけを`cfg(test)`で隔離します。製品の`serve`と同じ補助機能の起動処理を通り、shutdown完了まで接続を保持します。[Windows native testhostの手順](testing-windows-sandbox.md)で管理者承認を済ませたtesthostの`MOYAI_SANDBOX_ENDPOINT`を、このgateの試験プロセスへ渡してください。IPC consumerはcurrent製品binaryを使います。接続先変更のケースでは、停止済みHubに接続する受付停止中のRunnerに対し、実際のDesktop helperから静止確認のIPCを送り、同じprocess handleの終了待ち・同意保持・再起動後の受付停止も検証します。
 
 ```powershell
 # 直前に cargo test --lib --no-run で生成されたcurrent libtest.exeを指定する

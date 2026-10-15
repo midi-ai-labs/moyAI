@@ -69,6 +69,15 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         println!("moyAI Desktop is already running; showing the existing window.");
         return Ok(());
     };
+    let _sandbox_broker = moyai::sandbox_broker::start().map_err(|error| {
+        let _ = rfd::MessageDialog::new()
+            .set_title("moyAI")
+            .set_description(&error)
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+        (4, error)
+    })?;
     let command = CliCommand::Desktop(CliDesktopArgs {
         directory: args.directory.clone(),
         session_id,

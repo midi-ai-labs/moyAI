@@ -15,13 +15,13 @@ import { normalizeManualCase7Options } from "../scenarios/manual_case7.mjs";
 
 const RAW = { provider_base_url: "http://provider.invalid/v1", model: "exact-model", python_executable: process.execPath };
 
-test("manual observation option accepts both integer boundaries and rejects invalid or unbounded budgets", () => {
+test("manual observation option accepts explicit budgets beyond 120 minutes and rejects invalid values", () => {
   assert.equal(normalizeManualObservationTimeout(undefined), undefined);
-  for (const value of [1, 7_200_000]) {
+  for (const value of [1, 7_200_000, 7_200_001, 43_200_000, Number.MAX_SAFE_INTEGER]) {
     assert.equal(normalizeManualObservationTimeout(value), value);
     assert.equal(normalizeManualLiveOptions({ ...RAW, observation_timeout_ms: value }).observationTimeoutMs, value);
   }
-  for (const value of [0, -1, 7_200_001, 1.5, "7200000", null, true, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+  for (const value of [0, -1, 1.5, "7200000", null, true, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => normalizeManualLiveOptions({ ...RAW, observation_timeout_ms: value }), /observation_timeout_ms/);
   }
   assert.equal(normalizeManualLiveOptions(RAW).observationTimeoutMs, undefined);
@@ -54,21 +54,21 @@ test("case deadline begins once and bounds later checks without extending the ob
     && error.evidence.started_at_ms === 10_000 && error.evidence.deadline_ms === 11_000);
 });
 
-test("manual fixture input evidence preserves case defaults and uses the explicit 120-minute override", async context => {
+test("manual fixture input evidence defaults to no case deadline and records an explicit longer budget", async context => {
   const parent = fileURLToPath(new URL("../../../../project_sandbox/manual-st-harness-self-tests/", import.meta.url));
   await mkdir(parent, { recursive: true });
   const root = await mkdtemp(path.join(parent, "defaults-"));
   context.after(async () => { assert.equal(path.dirname(root), path.resolve(parent)); await rm(root, { recursive: true }); });
   const image = path.join(root, "reference.png");
   await writeFile(image, "fixture image bytes");
-  for (const [name, create, expected] of [
-    ["case1", createManualCase1Scenario, 15 * 60 * 1000],
-    ["case2", raw => createManualCase2Scenario({ ...raw, image_source: image }, { prepareCapture: async () => {} }), 30 * 60 * 1000],
-    ["case4", createManualCase4Scenario, 60 * 60 * 1000],
-    ["case6", createManualCase6Scenario, 30 * 60 * 1000],
+  for (const [name, create] of [
+    ["case1", createManualCase1Scenario],
+    ["case2", raw => createManualCase2Scenario({ ...raw, image_source: image }, { prepareCapture: async () => {} })],
+    ["case4", createManualCase4Scenario],
+    ["case6", createManualCase6Scenario],
   ]) {
     const configs = [];
-    for (const override of [undefined, 7_200_000]) {
+    for (const override of [undefined, 43_200_000]) {
       const fixture = path.join(root, `${name}-${override ?? "default"}`);
       await mkdir(fixture);
       const paths = Object.fromEntries(["workspace", "config", "data", "prefs", "webview", "logs"].map(key => [key, path.join(fixture, key)]));
@@ -78,7 +78,7 @@ test("manual fixture input evidence preserves case defaults and uses the explici
       const sink = { writeJson: async name => ({ path: name }), writeBytes: async name => ({ path: name }), record: async (name, data) => records.push({ name, data }) };
       const scenario = create({ ...RAW, ...(override === undefined ? {} : { observation_timeout_ms: override }) });
       await scenario.prepare({ context: { root: fixture, paths }, sink, phase: "prepared" });
-      assert.equal(records.find(row => row.name === `${name}-input`).data.observation_timeout_ms, override ?? expected);
+      assert.equal(records.find(row => row.name === `${name}-input`).data.observation_timeout_ms, override ?? null);
       configs.push(await readFile(paths.config_file, "utf8"));
     }
     assert.equal(configs[0], configs[1], `${name}: observation override must not change product configuration`);
@@ -128,12 +128,29 @@ function fakeSession({ clock, workspace = process.cwd(), approval = false, revie
     record: async (name, data) => records.push({ name, data }) };
   const live = new ManualLiveSession({ context: { paths: { workspace } }, sink,
     driver: { evaluate: async () => surface(), screenshot: async () => Buffer.from("test screenshot") },
-    options: { approvalMode: "operator", observationTimeoutMs: budgetMs }, owner: "scenario:manual.case3", stem: "case3", now: () => clock.now,
+    options: { approvalMode: "operator", ...(budgetMs === null ? {} : { observationTimeoutMs: budgetMs }) }, owner: "scenario:manual.case3", stem: "case3", now: () => clock.now,
     operatorReview: review });
   live.input = input;
   live.commands = { snapshot: async (after = 0) => ({ sequence: calls.length, calls: calls.filter(row => row.sequence > after) }), remove: async () => ({}) };
   return { live, records, events, calls, documents };
 }
+
+test("an omitted case deadline preserves continuation after 120 minutes and keeps individual wait limits", async () => {
+  const clock = { now: 5000 };
+  const { live, records, events, documents } = fakeSession({ clock, budgetMs: null });
+  await live.send("first request");
+  clock.now += 24 * 60 * 60 * 1000;
+  await live.send("second request");
+  assert.equal(events.filter(row => row.type === "click" && row.action === "send").length, 2);
+  assert.equal(live.observationBudget.expired, false);
+  assert.equal(live.observationBudget.assertRemaining("individual verification", 120_000), 120_000);
+  assert.equal(live.observationBudget.assertRemaining("operator review", 300_000), 300_000);
+  for (const row of records.filter(row => row.name.endsWith("-prompt-sent"))) {
+    assert.deepEqual(row.data.observation_budget, { timeout_ms: null, started_at_ms: 5000, deadline_ms: null, remaining_ms: null });
+  }
+  await live.close();
+  assert.equal(documents.find(row => row.name.endsWith("observation-budget.json")).data.status, "unbounded");
+});
 
 test("Case3 canonical stages share the first Send budget, including verification between stages", async () => {
   const stages = manualCase3Stages(await readFile(new URL("../../manual_ST/case3/spec.md", import.meta.url), "utf8"));

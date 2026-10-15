@@ -79,7 +79,7 @@ test("Case7 fresh copy records hashes and preserves all 16 original bytes with d
   });
 });
 
-test("Case7 common preparation records a thirty-minute observation bound and explicit Docling config", async () => {
+test("Case7 common preparation records no case deadline and explicit Docling config", async () => {
   await withFixture(async ({ source, workspace, root }) => {
     const paths = { workspace };
     for (const name of ["config", "data", "prefs", "webview"]) {
@@ -93,7 +93,7 @@ test("Case7 common preparation records a thirty-minute observation bound and exp
     const scenario = createManualCase7Scenario({ ...RAW, fixture_source: source });
     await scenario.prepare({ context: { root, paths }, sink, phase: "prepared" });
     const evidence = records.find(row => row[0] === "case7-input")[1];
-    assert.equal(evidence.observation_timeout_ms, 30 * 60 * 1000);
+    assert.equal(evidence.observation_timeout_ms, null);
     assert.equal(evidence.requests.length, 1);
     assert.match(await readFile(paths.config_file, "utf8"), /\[docling\]\nenabled = true\nbase_url = "http:\/\/docling.invalid:8123"/);
     assert.equal((await readdir(workspace)).includes("docs.md"), false);

@@ -1778,6 +1778,250 @@ mod command_projection_owner_tests {
             .expect("preserved session");
         assert_eq!(preserved.cwd, old_cwd);
         assert_eq!(preserved.project_id, controller.app.workspace.project_id);
+
+        controller.refresh_snapshot();
+        for _ in 0..400 {
+            controller.drain_runtime_messages();
+            if !controller.snapshot_requests.is_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.snapshot_requests.is_pending());
+        assert_eq!(controller.state.selected_session_id(), None);
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        let mut late_none_snapshot = controller.state.snapshot.clone();
+        late_none_snapshot.workspace_path = old_cwd.to_string();
+
+        let created = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "Created in selected workspace".into(),
+                cwd: selected_cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
+            })
+            .await
+            .expect("created session");
+        let turn_id = TurnId::new();
+        let prompt = "new workspace transcript";
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: created.id,
+                scope: crate::protocol::HistoryScope::Turn { turn_id },
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: prompt.into(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+            })
+            .expect("created session history");
+        let reply = "new workspace reply";
+        for (index, payload) in [
+            crate::protocol::TurnItemPayload::UserMessage {
+                text: prompt.into(),
+            },
+            crate::protocol::TurnItemPayload::AgentMessage { text: reply.into() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            controller
+                .app
+                .store
+                .protocol_event_store()
+                .seed_turn_item_for_test(&crate::protocol::TurnItem {
+                    id: crate::protocol::TurnItemId::new(),
+                    session_id: created.id,
+                    turn_id,
+                    source_item_id: None,
+                    sequence_no: index as i64 + 2,
+                    payload,
+                })
+                .expect("created session transcript item");
+        }
+        let terminal = crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        controller.run_lifecycle.begin(1, RunControl::new());
+        for event in [
+            RunEvent::SessionStarted {
+                session_id: created.id,
+                title: created.title.clone(),
+            },
+            RunEvent::UserTurnStored {
+                session_id: created.id,
+                turn: Box::new(UserTurn {
+                    turn_id,
+                    items: vec![UserInputItem::Text {
+                        text: prompt.into(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                }),
+            },
+            RunEvent::TurnTerminal {
+                session_id: created.id,
+                terminal: Box::new(terminal.clone()),
+            },
+        ] {
+            controller
+                .runtime_tx
+                .send(RuntimeMessage::RunEvent {
+                    run_generation: 1,
+                    event,
+                })
+                .expect("run event");
+        }
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Ok(RunSummary::from_terminal(created.id, turn_id, terminal)),
+            })
+            .expect("worker finished");
+        for _ in 0..400 {
+            controller.drain_runtime_messages();
+            if !controller.run_lifecycle.root_is_active()
+                && !controller.snapshot_requests.is_pending()
+                && !controller.session_projection_refresh_requests.is_pending()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert!(!controller.snapshot_requests.is_pending());
+        assert!(!controller.session_projection_refresh_requests.is_pending());
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(created.id)
+        );
+        assert_eq!(controller.app.workspace.cwd, selected_cwd);
+
+        // A delayed fresh-draft result must not select the previous chat after admission.
+        let none_target = SnapshotRequestTarget {
+            workspace_root: project_root.clone(),
+            selected_session_id: None,
+        };
+        let none_request = controller.snapshot_requests.begin(none_target.clone());
+        controller.state.begin_snapshot_refresh();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: none_request,
+                target: none_target,
+                result: Ok(late_none_snapshot.clone()),
+            })
+            .expect("late draft snapshot");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            selected_cwd.as_str()
+        );
+
+        let current_target = SnapshotRequestTarget {
+            workspace_root: project_root.clone(),
+            selected_session_id: Some(created.id),
+        };
+        let stale_request = controller.snapshot_requests.begin(current_target.clone());
+        let latest_request = controller.snapshot_requests.begin(current_target.clone());
+        controller.state.begin_snapshot_refresh();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: stale_request,
+                target: current_target.clone(),
+                result: Ok(late_none_snapshot.clone()),
+            })
+            .expect("superseded snapshot");
+        controller.drain_runtime_messages();
+        assert!(
+            controller
+                .snapshot_requests
+                .is_current(latest_request, &current_target)
+        );
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            selected_cwd.as_str()
+        );
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: latest_request,
+                target: current_target,
+                result: Ok(controller.state.snapshot.clone()),
+            })
+            .expect("latest snapshot");
+        controller.drain_runtime_messages();
+
+        let other_workspace_target = SnapshotRequestTarget {
+            workspace_root: project_root.join("another-project"),
+            selected_session_id: Some(created.id),
+        };
+        let other_request = controller
+            .snapshot_requests
+            .begin(other_workspace_target.clone());
+        controller.state.begin_snapshot_refresh();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: other_request,
+                target: other_workspace_target,
+                result: Ok(late_none_snapshot),
+            })
+            .expect("other workspace snapshot");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            selected_cwd.as_str()
+        );
+
+        controller.export_open_transcript_markdown_auto();
+        let export_path = selected_cwd
+            .join(".moyai")
+            .join("transcript-exports")
+            .join(transcript_markdown_file_name(&created.title, created.id));
+        let exported = std::fs::read_to_string(&export_path).expect("new chat transcript export");
+        assert!(
+            exported.contains(prompt),
+            "exported transcript:\n{exported}"
+        );
+        assert!(exported.contains(reply), "exported transcript:\n{exported}");
+        assert!(exported.contains(&created.id.to_string()));
+        assert!(!exported.contains(&session.id.to_string()));
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("old chat retained")
+                .cwd,
+            old_cwd
+        );
     }
 
     #[tokio::test]
@@ -12199,6 +12443,8 @@ impl DesktopController {
                             |route| {
                                 route
                                     .model_system_prompt_reservation()
+                                    // Hub reserves bytes/4; Side budgets UTF-8 bytes.
+                                    .saturating_mul(4)
                                     .min(u32::MAX as usize) as u32
                             },
                         )),
@@ -12272,12 +12518,12 @@ impl DesktopController {
                                         delta,
                                     }
                                 }
-                                SideChatStreamEvent::ProviderPhase(phase) => {
+                                SideChatStreamEvent::ProviderPhase(event) => {
                                     RuntimeMessage::SideChatPhase {
                                         owner_session_id: stream_owner_session_id,
                                         side_chat_id: stream_side_chat_id.clone(),
                                         run_generation,
-                                        phase,
+                                        phase: event.phase.as_str().to_string(),
                                     }
                                 }
                             };

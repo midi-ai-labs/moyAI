@@ -15,7 +15,7 @@ test("manual cases preserve canonical requests/tasks and use common lifecycle co
   assert.deepEqual(stages.map(row => row.name), ["stage1", "stage2", "stage3"]);
   assert.match(stages[0].prompt, /実装コードと test は変更せず/);
   assert.match(stages[1].prompt, /この turn では文書だけ/);
-  assert.match(stages[2].prompt, /calculate\(left, operator, right\)/);
+  assert.match(stages[2].prompt, /既存の callable API/);
   const input = manualCase4Input(await spec("case4"));
   assert.equal(input.prompt, "current directory の `task.md` を読み、記載された Step を順番に完了してください。\n作業対象は current directory 以下のみです。");
   assert.match(input.task, /python -m unittest test_integration -v/);

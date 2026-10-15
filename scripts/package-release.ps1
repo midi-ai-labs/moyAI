@@ -277,7 +277,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
       throw "Desktop web release build failed with exit code $LASTEXITCODE"
     }
-    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-runner --bin moyai-cleanup
+    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-runner --bin moyai-cleanup --bin moyai-sandbox
     if ($LASTEXITCODE -ne 0) {
       throw "Rust release build failed with exit code $LASTEXITCODE"
     }
@@ -313,6 +313,7 @@ try {
   $desktopExe = Join-Path $repoRoot "target\release\moyai-desktop.exe"
   $runnerExe = Join-Path $repoRoot "target\release\moyai-runner.exe"
   $cleanupExe = Join-Path $repoRoot "target\release\moyai-cleanup.exe"
+  $sandboxExe = Join-Path $repoRoot "target\release\moyai-sandbox.exe"
   if (-not (Test-Path -LiteralPath $cliExe -PathType Leaf)) {
     throw "release CLI binary not found: $cliExe"
   }
@@ -324,6 +325,9 @@ try {
   }
   if (-not (Test-Path -LiteralPath $cleanupExe -PathType Leaf)) {
     throw "release cleanup binary not found: $cleanupExe"
+  }
+  if (-not (Test-Path -LiteralPath $sandboxExe -PathType Leaf)) {
+    throw "release sandbox helper binary not found: $sandboxExe"
   }
   if (-not (Test-Path -LiteralPath $desktopDist -PathType Container)) {
     throw "Desktop web asset directory not found: $desktopDist"
@@ -350,6 +354,7 @@ try {
   Copy-RequiredFile $cliExe (Join-Path $releaseRoot "app\bin\moyai.exe")
   Copy-RequiredFile $desktopExe (Join-Path $releaseRoot "app\bin\moyai-desktop.exe")
   Copy-RequiredFile $runnerExe (Join-Path $releaseRoot "app\bin\moyai-runner.exe")
+  Copy-RequiredFile $sandboxExe (Join-Path $releaseRoot "app\bin\moyai-sandbox.exe")
   Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup.exe")
   foreach ($script in @('common.ps1', 'runtime-access.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1')) {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$script") (Join-Path $releaseRoot "scripts\$script")

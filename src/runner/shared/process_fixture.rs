@@ -85,6 +85,7 @@ fn isolated_runner_process() {
     );
     crate::runtime::resource_admission::set_test_registry(directory);
     let listener = windows::LocalListener::bind().expect("fixture listener");
+    let _sandbox_broker = crate::sandbox_broker::start().expect("fixture sandbox broker startup");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

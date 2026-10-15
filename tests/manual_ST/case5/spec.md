@@ -9,7 +9,7 @@
 - operatorが用意した `RippleFish` fixtureを `project_sandbox/<task>/case5/workspace/` にfresh copyし、source path、revisionまたはcontent hash、copy commandを `RESULTS.md` に記録する。clone外の固定pathを前提にしない。
 - workspace には `backend`、`frontend`、`examples`、`data`、tests、config、`task.md` があることを確認する。
 - code/config/tests は変更禁止。成果物は文書だけとする。
-- config/data directory を fresh にし、visible Desktop GUI から実行する。
+- config/data directory は単独実行では fresh にする。suite 実行では [共通 README](../README.md) に従い同じ Desktop/profile を共有し、各 case の workspace と会話を fresh にする。visible Desktop GUI から実行する。
 
 ## Canonical user request
 

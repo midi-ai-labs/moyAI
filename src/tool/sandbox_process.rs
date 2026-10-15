@@ -56,7 +56,7 @@ pub(crate) struct SandboxedProcessRequest {
     pub cancel: CancellationToken,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SandboxedProcessOutput {
     pub exit_code: Option<i32>,
     pub stdout: BoundedPipeOutput,
@@ -74,7 +74,7 @@ impl SandboxedProcessOutput {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum SandboxExecutionError {
     #[cfg(not(windows))]
     #[error("OS sandbox is unavailable on this platform")]
@@ -115,9 +115,11 @@ pub(crate) async fn execute_workspace_write_observed(
     *program = request.executable.path().to_string();
     #[cfg(windows)]
     {
-        return tokio::task::spawn_blocking(move || windows::execute(profile, request, started))
-            .await
-            .map_err(|error| SandboxExecutionError::Worker(error.to_string()))?;
+        return tokio::task::spawn_blocking(move || {
+            crate::sandbox_broker::execute(profile, request, started)
+        })
+        .await
+        .map_err(|error| SandboxExecutionError::Worker(error.to_string()))?;
     }
     #[cfg(not(windows))]
     {
@@ -127,7 +129,18 @@ pub(crate) async fn execute_workspace_write_observed(
 }
 
 #[cfg(windows)]
+pub(crate) fn execute_brokered(
+    profile: WorkspaceWriteSandboxProfile,
+    request: SandboxedProcessRequest,
+    started: Option<ProcessStarted>,
+    caller: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
+    windows::brokered::execute(profile, request, started, caller)
+}
+
+#[cfg(windows)]
 mod windows {
+    pub(super) mod brokered;
     use std::ffi::{OsStr, c_void};
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
@@ -139,8 +152,8 @@ mod windows {
     use sha2::{Digest, Sha256};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-        HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree, SetHandleInformation, WAIT_FAILED,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        HLOCAL, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SET_ACCESS,
@@ -148,14 +161,11 @@ mod windows {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        AclSizeInformation, AdjustTokenPrivileges, CopySid, CreateRestrictedToken,
-        CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor, IsTokenRestricted,
-        IsValidSid, LookupPrivilegeValueW, PROTECTED_DACL_SECURITY_INFORMATION,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetSecurityDescriptorDacl,
-        SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
-        TokenDefaultDacl, TokenGroups, TokenRestrictedSids, TokenUser,
+        AclSizeInformation, CopySid, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid,
+        GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
+        IsValidSid, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        SID_AND_ATTRIBUTES, SetSecurityDescriptorDacl, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
+        TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_APPEND_DATA,
@@ -196,9 +206,6 @@ mod windows {
     };
     use crate::tool::truncate::BoundedPipeOutput;
 
-    const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
-    const LUA_TOKEN: u32 = 0x04;
-    const WRITE_RESTRICTED: u32 = 0x08;
     const WIN_WORLD_SID: i32 = 1;
     const WIN_LOCAL_SYSTEM_SID: i32 = 22;
     const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
@@ -220,11 +227,6 @@ mod windows {
     const WORKER_DRAIN_GRACE: Duration = Duration::from_millis(250);
     const WORKER_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
     const EFFECT_TEMP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
-
-    #[repr(C)]
-    struct TokenDefaultDaclInfo {
-        default_dacl: *mut ACL,
-    }
 
     struct ProcessObjectSecurity {
         descriptor: SECURITY_DESCRIPTOR,
@@ -422,71 +424,6 @@ mod windows {
         }
     }
 
-    pub(super) fn execute(
-        mut profile: WorkspaceWriteSandboxProfile,
-        mut request: SandboxedProcessRequest,
-        started: Option<super::ProcessStarted>,
-    ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
-        if request.argv.is_empty() || request.argv[0].trim().is_empty() {
-            return Err(SandboxExecutionError::InvalidProfile(
-                "sandbox command argv must not be empty".to_string(),
-            ));
-        }
-        if request.cancel.is_cancelled() {
-            return Ok(SandboxedProcessOutput {
-                exit_code: None,
-                stdout: empty_output(),
-                stderr: empty_output(),
-                timed_out: false,
-                cancelled: true,
-                effect_started: false,
-                process_tree_reaped: true,
-                cleanup_errors: Vec::new(),
-            });
-        }
-
-        apply_advisory_offline_environment(&mut request.environment);
-        let effect_temp = create_effect_local_temp(&mut profile, &mut request.environment)?;
-        let (effect_temp, output) = run_with_effect_temp_panic_boundary(effect_temp, move |_| {
-            execute_after_effect_temp(profile, request, started)
-        })?;
-        let finalization = effect_temp_finalization_for_result(&output);
-        let cleanup_errors = finalize_effect_local_temp(effect_temp, finalization);
-        match output {
-            Ok(mut output) => {
-                output.cleanup_errors.extend(cleanup_errors);
-                Ok(output)
-            }
-            Err(error) => Err(with_cleanup_errors(error, cleanup_errors)),
-        }
-    }
-
-    fn execute_after_effect_temp(
-        profile: WorkspaceWriteSandboxProfile,
-        request: SandboxedProcessRequest,
-        started: Option<super::ProcessStarted>,
-    ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
-        if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new(), true));
-        }
-        let prepared = prepare_capabilities_and_acls(
-            &profile,
-            &request.cwd,
-            &request.environment,
-            &request.cancel,
-        )?;
-        if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new(), true));
-        }
-        let token = create_workspace_write_token(&prepared.roots)?;
-        if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new(), true));
-        }
-        let output = spawn_and_capture(token, request, started);
-        drop(prepared);
-        output
-    }
-
     #[derive(Debug)]
     struct EffectLocalTempDirectory {
         path: std::path::PathBuf,
@@ -591,11 +528,25 @@ mod windows {
 
     fn close_effect_local_temp(directory: EffectLocalTempDirectory) -> Vec<String> {
         let path = directory.path().to_path_buf();
+        // An impersonation token is thread-local. Explicitly carry it into the
+        // bounded worker rather than deleting caller paths with broker SYSTEM.
+        let cleanup_token = match open_effective_cleanup_token() {
+            Ok(token) => token,
+            Err(error) => {
+                return vec![format!(
+                    "effect TEMP `{}` retained: {error}",
+                    path.display()
+                )];
+            }
+        };
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         if let Err(error) = std::thread::Builder::new()
             .name("moyai-effect-temp-cleanup".to_string())
             .spawn(move || {
-                let _ = sender.send(directory.remove());
+                let result = crate::sandbox_broker::with_impersonation(cleanup_token.raw(), || {
+                    directory.remove().map_err(|error| error.to_string())
+                });
+                let _ = sender.send(result);
             })
         {
             return vec![format!(
@@ -648,6 +599,7 @@ mod windows {
         }
     }
 
+    #[cfg(test)]
     fn finalize_effect_local_temp(
         directory: EffectLocalTempDirectory,
         finalization: EffectTempFinalization,
@@ -1058,7 +1010,7 @@ mod windows {
         handle: HANDLE,
         path: &camino::Utf8Path,
     ) -> Result<(), SandboxExecutionError> {
-        let token = open_current_process_token()?;
+        let token = open_effective_query_token()?;
         let mut logon = token_logon_sid(token.raw())?;
         let mut world = world_sid()?;
         let shared_restricting_sids = [
@@ -1232,7 +1184,7 @@ mod windows {
         path: &camino::Utf8Path,
         capability_sid: *mut c_void,
     ) -> Result<(), SandboxExecutionError> {
-        let token = open_current_process_token()?;
+        let token = open_effective_query_token()?;
         let mut user_sid = token_user_sid(token.raw())?;
         let mut system_sid = system_sid()?;
         let trustees = [
@@ -1751,96 +1703,13 @@ mod windows {
             .to_lowercase()
     }
 
-    fn create_workspace_write_token(
-        roots: &[RootCapability],
-    ) -> Result<OwnedHandle, SandboxExecutionError> {
-        let base = open_current_process_token()?;
-        let mut user_sid = token_user_sid(base.raw())?;
-        let mut logon_sid = token_logon_sid(base.raw())?;
-        let mut world_sid = world_sid()?;
-        let mut system_sid = system_sid()?;
-        let private_sid = LocalSid::from_string(&sandbox_process_private_sid())?;
-        // The logon and Everyone SIDs are required by native process, desktop,
-        // and CLR initialization. Before this token is created, the sandbox
-        // preflight applies active-capability deny ACEs to detected
-        // Everyone-writable locations outside the configured roots.
-        let mut entries = Vec::with_capacity(roots.len() + 3);
-        for root in roots {
-            entries.push(SID_AND_ATTRIBUTES {
-                Sid: root.sid.raw(),
-                Attributes: 0,
-            });
-        }
-        entries.push(SID_AND_ATTRIBUTES {
-            Sid: logon_sid.as_mut_ptr().cast(),
-            Attributes: 0,
-        });
-        entries.push(SID_AND_ATTRIBUTES {
-            Sid: world_sid.as_mut_ptr().cast(),
-            Attributes: 0,
-        });
-        entries.push(SID_AND_ATTRIBUTES {
-            Sid: private_sid.raw(),
-            Attributes: 0,
-        });
-        let mut restricted = null_mut();
-        if unsafe {
-            CreateRestrictedToken(
-                base.raw(),
-                DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
-                0,
-                null(),
-                0,
-                null(),
-                entries.len() as u32,
-                entries.as_mut_ptr(),
-                &mut restricted,
-            )
-        } == 0
-        {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "CreateRestrictedToken failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let token = OwnedHandle::new(restricted, "CreateRestrictedToken")?;
-        if unsafe { IsTokenRestricted(token.raw()) } == 0 {
-            return Err(SandboxExecutionError::Initialization(
-                "CreateRestrictedToken returned an unrestricted token".to_string(),
-            ));
-        }
-        if !token_has_restricted_sid(token.raw(), private_sid.raw())? {
-            return Err(SandboxExecutionError::Initialization(
-                "restricted token dropped the process-private restricting SID".to_string(),
-            ));
-        }
-        // The token's default DACL becomes the default security descriptor for
-        // process/thread and other kernel objects created by the child. Never
-        // grant it to World, the logon SID, or reusable root/TEMP capabilities:
-        // another restricted child could otherwise open/inject into this one.
-        // The normal access-check pass uses the current user/SYSTEM; the
-        // restricted pass uses a fresh process-private restricting SID.
-        let default_dacl_sids = vec![
-            user_sid.as_mut_ptr().cast(),
-            system_sid.as_mut_ptr().cast(),
-            private_sid.raw(),
-        ];
-        set_token_default_dacl(token.raw(), &default_dacl_sids)?;
-        enable_change_notify_privilege(token.raw())?;
-        Ok(token)
-    }
-
+    #[cfg(test)]
     fn open_current_process_token() -> Result<OwnedHandle, SandboxExecutionError> {
         #[link(name = "advapi32")]
         unsafe extern "system" {
             fn OpenProcessToken(process: HANDLE, desired_access: u32, token: *mut HANDLE) -> i32;
         }
-        let desired = TOKEN_DUPLICATE
-            | TOKEN_QUERY
-            | TOKEN_ASSIGN_PRIMARY
-            | TOKEN_ADJUST_DEFAULT
-            | TOKEN_ADJUST_SESSIONID
-            | TOKEN_ADJUST_PRIVILEGES;
+        let desired = TOKEN_QUERY;
         let mut token = null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), desired, &mut token) } == 0 {
             return Err(SandboxExecutionError::Initialization(format!(
@@ -1849,6 +1718,76 @@ mod windows {
             )));
         }
         OwnedHandle::new(token, "OpenProcessToken")
+    }
+
+    fn open_effective_query_token() -> Result<OwnedHandle, SandboxExecutionError> {
+        let mut raw = null_mut();
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenThreadToken(
+                windows_sys::Win32::System::Threading::GetCurrentThread(),
+                TOKEN_QUERY,
+                1,
+                &mut raw,
+            )
+        } != 0
+        {
+            return OwnedHandle::new(raw, "effective thread token");
+        }
+        if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_NO_TOKEN {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenThreadToken failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY,
+                &mut raw,
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenProcessToken failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        OwnedHandle::new(raw, "effective process token")
+    }
+
+    fn open_effective_cleanup_token() -> Result<OwnedHandle, SandboxExecutionError> {
+        let mut raw = null_mut();
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenThreadToken(
+                windows_sys::Win32::System::Threading::GetCurrentThread(),
+                TOKEN_QUERY | windows_sys::Win32::Security::TOKEN_IMPERSONATE,
+                1,
+                &mut raw,
+            )
+        } != 0
+        {
+            return OwnedHandle::new(raw, "effect TEMP cleanup thread token");
+        }
+        if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_NO_TOKEN {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenThreadToken for TEMP cleanup failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut raw,
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenProcessToken for TEMP cleanup failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        OwnedHandle::new(raw, "effect TEMP cleanup process token")
     }
 
     fn token_logon_sid(token: HANDLE) -> Result<Vec<u8>, SandboxExecutionError> {
@@ -1892,50 +1831,6 @@ mod windows {
         Err(SandboxExecutionError::Initialization(
             "current token has no logon SID".to_string(),
         ))
-    }
-
-    fn token_has_restricted_sid(
-        token: HANDLE,
-        expected: *mut c_void,
-    ) -> Result<bool, SandboxExecutionError> {
-        let mut needed = 0u32;
-        unsafe {
-            GetTokenInformation(token, TokenRestrictedSids, null_mut(), 0, &mut needed);
-        }
-        if needed == 0 {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "failed to size restricted SID list: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let mut buffer = vec![0u8; needed as usize];
-        if unsafe {
-            GetTokenInformation(
-                token,
-                TokenRestrictedSids,
-                buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        } == 0
-        {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "failed to read restricted SID list: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let group_count = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>()) };
-        let after_count = unsafe { buffer.as_ptr().add(size_of::<u32>()) } as usize;
-        let alignment = std::mem::align_of::<SID_AND_ATTRIBUTES>();
-        let groups =
-            ((after_count + alignment - 1) & !(alignment - 1)) as *const SID_AND_ATTRIBUTES;
-        for index in 0..group_count as usize {
-            let entry = unsafe { std::ptr::read_unaligned(groups.add(index)) };
-            if unsafe { EqualSid(entry.Sid, expected) } != 0 {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn token_user_sid(token: HANDLE) -> Result<Vec<u8>, SandboxExecutionError> {
@@ -2027,95 +1922,12 @@ mod windows {
         Ok(bytes)
     }
 
-    fn set_token_default_dacl(
-        token: HANDLE,
-        sids: &[*mut c_void],
-    ) -> Result<(), SandboxExecutionError> {
-        let entries = sids
-            .iter()
-            .map(|sid| EXPLICIT_ACCESS_W {
-                grfAccessPermissions: GENERIC_ALL,
-                grfAccessMode: GRANT_ACCESS,
-                grfInheritance: 0,
-                Trustee: TRUSTEE_W {
-                    pMultipleTrustee: null_mut(),
-                    MultipleTrusteeOperation: 0,
-                    TrusteeForm: TRUSTEE_IS_SID,
-                    TrusteeType: TRUSTEE_IS_UNKNOWN,
-                    ptstrName: (*sid).cast(),
-                },
-            })
-            .collect::<Vec<_>>();
-        let mut dacl = null_mut();
-        let status = unsafe {
-            SetEntriesInAclW(
-                entries.len() as u32,
-                entries.as_ptr(),
-                null_mut(),
-                &mut dacl,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "failed to build restricted-token default DACL with {status}"
-            )));
-        }
-        let dacl = LocalAcl(dacl);
-        let mut info = TokenDefaultDaclInfo {
-            default_dacl: dacl.0,
-        };
-        if unsafe {
-            SetTokenInformation(
-                token,
-                TokenDefaultDacl,
-                (&mut info as *mut TokenDefaultDaclInfo).cast(),
-                size_of::<TokenDefaultDaclInfo>() as u32,
-            )
-        } == 0
-        {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "SetTokenInformation(TokenDefaultDacl) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
-    fn enable_change_notify_privilege(token: HANDLE) -> Result<(), SandboxExecutionError> {
-        let mut luid = LUID {
-            LowPart: 0,
-            HighPart: 0,
-        };
-        let name = to_wide("SeChangeNotifyPrivilege");
-        if unsafe { LookupPrivilegeValueW(null(), name.as_ptr(), &mut luid) } == 0 {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "LookupPrivilegeValueW failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let mut privileges: TOKEN_PRIVILEGES = unsafe { zeroed() };
-        privileges.PrivilegeCount = 1;
-        privileges.Privileges[0].Luid = luid;
-        privileges.Privileges[0].Attributes = 0x0000_0002;
-        if unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, null_mut(), null_mut()) } == 0 {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "AdjustTokenPrivileges failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if unsafe { GetLastError() } != ERROR_SUCCESS {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "restricted token could not enable SeChangeNotifyPrivilege: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
     fn spawn_and_capture(
-        token: OwnedHandle,
+        token: HANDLE,
         request: SandboxedProcessRequest,
         started: Option<super::ProcessStarted>,
+        desktop_name: &str,
+        caller: HANDLE,
     ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
         let (child_stdin, parent_stdin) = create_pipe_pair("stdin")?;
         let (parent_stdout, child_stdout) = create_pipe_pair("stdout")?;
@@ -2135,7 +1947,7 @@ mod windows {
         startup.StartupInfo.hStdInput = child_stdin.raw();
         startup.StartupInfo.hStdOutput = child_stdout.raw();
         startup.StartupInfo.hStdError = child_stderr.raw();
-        let mut desktop = to_wide("Winsta0\\Default");
+        let mut desktop = to_wide(desktop_name);
         startup.StartupInfo.lpDesktop = desktop.as_mut_ptr();
         startup.lpAttributeList = attributes.raw().cast();
 
@@ -2156,14 +1968,16 @@ mod windows {
         if request.cancel.is_cancelled() {
             return Ok(cancelled_before_effect(Vec::new(), true));
         }
-        request.executable.revalidate().map_err(|error| {
-            SandboxExecutionError::Initialization(format!(
-                "sandbox executable identity revalidation failed: {error}"
-            ))
+        brokered::impersonated(caller, || {
+            request.executable.revalidate().map_err(|error| {
+                SandboxExecutionError::Initialization(format!(
+                    "sandbox executable identity revalidation failed: {error}"
+                ))
+            })
         })?;
         let spawned = unsafe {
             CreateProcessAsUserW(
-                token.raw(),
+                token,
                 null(),
                 command_line.as_mut_ptr(),
                 &mut process_security,
@@ -2315,7 +2129,6 @@ mod windows {
         drop(process);
         let process_tree_reaped = wait_for_job_process_tree_exit(&job, &mut cleanup_errors);
         drop(job);
-        drop(token);
 
         match join_worker_bounded(stdin_writer, "stdin writer", &mut cleanup_errors) {
             Some(Ok(())) => {}
@@ -2788,12 +2601,11 @@ mod windows {
         use std::collections::HashMap;
 
         use super::{
-            ACCESS_ALLOWED_ACE_TYPE, CONTAINER_AND_OBJECT_INHERIT, EffectLocalTempDirectory,
-            EffectTempFinalization, GENERIC_ALL, INHERIT_ONLY_ACE, NO_PROPAGATE_INHERIT_ACE,
-            SandboxExecutionError, TokenDefaultDaclInfo, ace_inheritance_is_sufficient,
-            acl_has_entry, apply_advisory_offline_environment, argv_to_command_line,
-            cancelled_before_effect, canonical_windows_path_is_local, capability_sid_for_root,
-            create_workspace_write_token, effect_temp_finalization_for_result, environment_block,
+            CONTAINER_AND_OBJECT_INHERIT, EffectLocalTempDirectory, EffectTempFinalization,
+            GENERIC_ALL, INHERIT_ONLY_ACE, NO_PROPAGATE_INHERIT_ACE, SandboxExecutionError,
+            ace_inheritance_is_sufficient, apply_advisory_offline_environment,
+            argv_to_command_line, cancelled_before_effect, canonical_windows_path_is_local,
+            capability_sid_for_root, effect_temp_finalization_for_result, environment_block,
             finalize_effect_local_temp, normalize_windows_identity, open_current_process_token,
             require_confirmed_world_writable_step, run_with_effect_temp_panic_boundary,
             token_logon_sid, token_user_sid, world_sid,
@@ -3221,62 +3033,6 @@ mod windows {
             assert_eq!(block.matches("HTTPS_PROXY=").count(), 1);
             assert!(block.contains("HTTPS_PROXY=http://127.0.0.1:9\0"));
             assert!(!block.contains("https_proxy="));
-        }
-
-        #[test]
-        fn restricted_token_default_dacl_excludes_shared_restricting_sids() {
-            let base = open_current_process_token().expect("base token");
-            let mut user = token_user_sid(base.raw()).expect("user SID");
-            let mut logon = token_logon_sid(base.raw()).expect("logon SID");
-            let mut world = world_sid().expect("World SID");
-            let token = create_workspace_write_token(&[]).expect("restricted token");
-            let mut needed = 0u32;
-            unsafe {
-                windows_sys::Win32::Security::GetTokenInformation(
-                    token.raw(),
-                    windows_sys::Win32::Security::TokenDefaultDacl,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut needed,
-                );
-            }
-            assert!(needed > 0);
-            let mut buffer = vec![0u8; needed as usize];
-            assert_ne!(
-                unsafe {
-                    windows_sys::Win32::Security::GetTokenInformation(
-                        token.raw(),
-                        windows_sys::Win32::Security::TokenDefaultDacl,
-                        buffer.as_mut_ptr().cast(),
-                        needed,
-                        &mut needed,
-                    )
-                },
-                0
-            );
-            let info =
-                unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TokenDefaultDaclInfo>()) };
-            assert!(acl_has_entry(
-                info.default_dacl,
-                user.as_mut_ptr().cast(),
-                ACCESS_ALLOWED_ACE_TYPE,
-                GENERIC_ALL,
-                0,
-            ));
-            assert!(!acl_has_entry(
-                info.default_dacl,
-                logon.as_mut_ptr().cast(),
-                ACCESS_ALLOWED_ACE_TYPE,
-                GENERIC_ALL,
-                0,
-            ));
-            assert!(!acl_has_entry(
-                info.default_dacl,
-                world.as_mut_ptr().cast(),
-                ACCESS_ALLOWED_ACE_TYPE,
-                GENERIC_ALL,
-                0,
-            ));
         }
     }
 }

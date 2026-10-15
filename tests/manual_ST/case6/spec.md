@@ -7,7 +7,7 @@
 ## Setup
 
 - Windows / PowerShell 環境で実行する。
-- `project_sandbox/<task>/case6/` を fresh config/data/artifact 用に使う。
+- `project_sandbox/<task>/case6/` に case ごとの fresh workspace、会話、artifact を用意する。config/data directory は単独実行では fresh にし、suite 実行では [共通 README](../README.md) に従い同じ Desktop/profile を共有する。
 - helper script や人工的な CPU load fixture を事前投入しない。
 - visible Desktop GUI から request を送る。
 

@@ -84,7 +84,7 @@ impl ProcessSandboxPlan {
 /// What the native restricted-token fallback can truthfully claim about
 /// network isolation. Environment hints can reduce accidental access, but do
 /// not constitute an OS-enforced network boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SandboxNetworkPolicy {
     AdvisoryOfflineEnvironment,
 }
@@ -101,7 +101,8 @@ impl SandboxNetworkPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceWriteSandboxProfile {
     pub(crate) writable_roots: Vec<SandboxPathSnapshot>,
     pub(crate) read_only_roots: Vec<SandboxPathSnapshot>,
@@ -114,7 +115,8 @@ pub(crate) struct WorkspaceWriteSandboxProfile {
     pub(crate) network: SandboxNetworkPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SandboxPathSnapshot {
     /// The normalized path selected when the permission decision was made.
     pub(crate) requested: Utf8PathBuf,
@@ -128,7 +130,7 @@ pub(crate) struct SandboxPathSnapshot {
 }
 
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum WindowsSandboxObjectIdentity {
     Extended {
         volume_serial_number: u64,

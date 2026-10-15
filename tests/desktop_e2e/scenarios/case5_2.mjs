@@ -49,6 +49,7 @@ import {
 } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 import { executeCase52SideChatStage } from "./case5_2_side_chat.mjs";
+import { manualLivePermissionLocator, manualLivePermissionRequest } from "../drivers/manual_live_session.mjs";
 
 const OWNER = "scenario:manual.case5_2";
 const scenarioDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -205,9 +206,20 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function elapsedSince(startedAt) {
+function elapsedSince(startedAt, now = Date.now()) {
   const started = Date.parse(startedAt);
-  return Number.isFinite(started) ? Math.max(0, Date.now() - started) : null;
+  return Number.isFinite(started) ? Math.max(0, now - started) : null;
+}
+
+export function case52InitialReadinessPerformance(context, runtime, now = Date.now()) {
+  if (context?.manualSuite?.shared_profile === true) {
+    return {
+      launch_to_ready_ms: null,
+      case_entry_to_ready_ms: elapsedSince(context.manualSuite.started_at, now),
+      comparability_deviations: ["shared-profile/continuous-desktop"],
+    };
+  }
+  return { launch_to_ready_ms: elapsedSince(runtime?.launch_started_at, now) };
 }
 
 function sha256(bytes) {
@@ -1953,7 +1965,50 @@ async function transcriptExports(workspace) {
   }
 }
 
-async function exportCanonicalTranscript({ context, input, sink, sessionId, prompts }) {
+export function case52TranscriptExportResult(markdown, { sessionId, prompts, terminalProjection }) {
+  const text = markdown.replaceAll("\r\n", "\n");
+  const metadataStart = text.lastIndexOf("<details><summary>実行情報</summary>\n\n");
+  const metadata = metadataStart < 0 ? null
+    : text.slice(metadataStart).match(/^<details><summary>実行情報<\/summary>\n\n([\s\S]*)\n<\/details>\s*$/);
+  const sessions = metadata === null ? [] : [...metadata[1].matchAll(/^- Session: `([^`\n]+)`$/gm)];
+  const exportedSessionId = sessions.length === 1 ? sessions[0][1] : null;
+  const rows = terminalProjection?.transcript_rows ?? [];
+  const user = rows.findLast(row => row.row_kind === "user");
+  const assistant = rows.findLast(row => row.row_kind === "assistant");
+  const normalize = body => typeof body === "string" ? body.replaceAll("\r\n", "\n").trim() : null;
+  const userBody = normalize(user?.body);
+  const assistantBody = normalize(assistant?.body);
+  let quotedUser = null;
+  // The renderer ends the final turn with its plain Assistant body. Remove that
+  // owned suffix before inspecting the preceding User quote and optional details.
+  const body = metadataStart < 0 ? "" : text.slice(0, metadataStart).trimEnd();
+  if (assistantBody && body.endsWith(`\n\n${assistantBody}`)) {
+    const lines = body.slice(0, -assistantBody.length).trimEnd().split("\n");
+    while (lines.at(-1) === "</details>") {
+      let depth = 1, start = lines.length - 2;
+      for (; start >= 0 && depth > 0; start--) {
+        if (lines[start] === "</details>") depth++;
+        else if (/^<details><summary>.*<\/summary>$/.test(lines[start])) depth--;
+      }
+      if (depth !== 0) break;
+      lines.splice(start + 1);
+      while (lines.at(-1) === "") lines.pop();
+    }
+    let start = lines.length;
+    while (start > 0 && lines[start - 1].startsWith("> ")) start--;
+    if (start < lines.length && lines[start - 1] === "") {
+      quotedUser = lines.slice(start).map(line => line.slice(2)).join("\n");
+    }
+  }
+  const sameOwner = exportedSessionId === sessionId && terminalProjection?.run_target?.sessionId === sessionId;
+  const visiblePromptStages = sameOwner && quotedUser !== null && quotedUser === userBody
+    ? Object.entries(prompts).filter(([, prompt]) => normalize(prompt.text) === quotedUser).map(([stage]) => stage) : [];
+  return { pass: sameOwner && visiblePromptStages.includes("stage4"),
+    visible_prompt_stages: visiblePromptStages, visible_prompt_scope: "terminal-final-user",
+    exported_session_id: exportedSessionId };
+}
+
+async function exportCanonicalTranscript({ context, input, sink, sessionId, prompts, terminalProjection }) {
   const before = await transcriptExports(context.paths.workspace);
   if (before.length !== 0) {
     throw productFailure("case5_2-transcript-export-not-fresh", "fresh case5_2 workspace already contained a transcript export", {
@@ -1974,14 +2029,13 @@ async function exportCanonicalTranscript({ context, input, sink, sessionId, prom
     accept: (files) => files.length === 1,
   });
   const [file] = observed.value;
-  const text = file.bytes.toString("utf8").replaceAll("\r\n", "\n");
-  const visiblePromptStages = Object.entries(prompts)
-    .filter(([, prompt]) => text.includes(prompt.text.replaceAll("\r\n", "\n").trim()))
-    .map(([stage]) => stage);
-  if (!text.includes(sessionId) || !visiblePromptStages.includes("stage4")) {
+  const content = case52TranscriptExportResult(file.bytes.toString("utf8"), { sessionId, prompts, terminalProjection });
+  const visiblePromptStages = content.visible_prompt_stages;
+  if (!content.pass) {
     throw productFailure("case5_2-transcript-export-content", "visible transcript export did not preserve the same session and final prompt", {
       session_id: sessionId,
       visible_prompt_stages: visiblePromptStages,
+      visible_prompt_scope: content.visible_prompt_scope,
       export_path: file.path,
     });
   }
@@ -1992,6 +2046,7 @@ async function exportCanonicalTranscript({ context, input, sink, sessionId, prom
     evidence,
     session_id: sessionId,
     visible_prompt_stages: visiblePromptStages,
+    visible_prompt_scope: content.visible_prompt_scope,
     elapsed_ms: observed.elapsed_ms,
   }, { phase: "executing", owner: OWNER });
   return { source_path: file.path, evidence, session_id: sessionId };
@@ -3649,7 +3704,7 @@ async function runWorkspaceStableEvaluator({
   });
 }
 
-async function runFinalEvaluator({
+export async function runFinalEvaluator({
   context,
   sink,
   state,
@@ -3657,15 +3712,17 @@ async function runFinalEvaluator({
   baseline,
   preEvaluationManifest,
   oracleIdentity,
-}) {
-  const publicEvaluation = await runWorkspaceStableEvaluator({
+}, injected = {}) {
+  const io = { runWorkspaceStableEvaluator, runPythonTest, assertOracleIdentity, storeStageManifest,
+    assertEvaluatorWorkspaceStable, ...injected };
+  const publicEvaluation = await io.runWorkspaceStableEvaluator({
     context,
     sink,
     baseline,
     beforeManifest: preEvaluationManifest,
     afterStage: "stage4-post-public-evaluator",
     label: "stage4-public-suite",
-    evaluate: () => runPythonTest({
+    evaluate: () => io.runPythonTest({
       context,
       sink,
       state,
@@ -3679,7 +3736,7 @@ async function runFinalEvaluator({
   const postPublicManifest = publicEvaluation.afterManifest;
   const publicWorkspaceDiff = publicEvaluation.workspaceDiff;
   assertPythonTestWithinBounds("stage4-public-suite", publicSuite);
-  const oracleBefore = await assertOracleIdentity(oracleIdentity, "pre-hidden-evaluator");
+  const oracleBefore = await io.assertOracleIdentity(oracleIdentity, "pre-hidden-evaluator");
   let hiddenOracle = null;
   let oracleAfter = null;
   let finalManifest = null;
@@ -3687,7 +3744,7 @@ async function runFinalEvaluator({
   let primaryHiddenError = null;
   const integrityErrors = [];
   try {
-    hiddenOracle = await runPythonTest({
+    hiddenOracle = await io.runPythonTest({
       context,
       sink,
       state,
@@ -3701,12 +3758,12 @@ async function runFinalEvaluator({
     primaryHiddenError = error;
   }
   try {
-    oracleAfter = await assertOracleIdentity(oracleIdentity, "post-hidden-evaluator");
+    oracleAfter = await io.assertOracleIdentity(oracleIdentity, "post-hidden-evaluator");
   } catch (error) {
     integrityErrors.push({ step: "post-hidden-oracle-identity", error, observation: errorObservation(error) });
   }
   try {
-    finalManifest = await storeStageManifest({
+    finalManifest = await io.storeStageManifest({
       context,
       sink,
       baseline,
@@ -3717,7 +3774,7 @@ async function runFinalEvaluator({
   }
   if (finalManifest !== null) {
     try {
-      hiddenWorkspaceDiff = await assertEvaluatorWorkspaceStable({
+      hiddenWorkspaceDiff = await io.assertEvaluatorWorkspaceStable({
         sink,
         before: postPublicManifest,
         after: finalManifest,
@@ -3774,11 +3831,9 @@ async function runFinalEvaluator({
   };
   const identity = await sink.writeJson("case5_2/evaluation.json", report);
   await sink.record("case5_2-final-evaluation", { identity, report }, { phase: "executing", owner: OWNER });
+  // Defer only the persisted artifact verdict so Stage5 can be observed independently.
   const failures = case52EvaluatorFailures(report);
-  if (failures.length > 0) {
-    throw productFailure("case5_2-final-evaluation", "case5_2 public suite, hidden oracle, or required-document gate failed", { failures, report });
-  }
-  return { report, finalManifest };
+  return { report, finalManifest, failures };
 }
 
 async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeHistory, observationBudget = null }) {
@@ -4219,6 +4274,71 @@ async function cleanupWebviewInput(input, state, label) {
   }
 }
 
+async function verifyCase52Safety({ context, sink, options, state, manifest, name }) {
+  const allPaths = await allWorkspacePaths(context.paths.workspace);
+  const forbidden = case52ForbiddenWorkspacePaths(allPaths);
+  const scopeFailures = finalScopeFailures(manifest, forbidden);
+  const seedFinal = await inventoryCase52CleanSeed(options.fixtureSource);
+  const seedUnchanged = seedFinal.aggregate_sha256 === state.seed.aggregate_sha256 && sameValue(seedFinal.files, state.seed.files);
+  const externalFinal = await externalRootsSnapshot(state.externalRoots);
+  const externalDrift = externalRootDrift(state.externalBaseline, externalFinal);
+  const finalProvider = await providerMustKeepSideUnloaded({ options, sink, state, name: `${name}-terminal` });
+  const safety = {
+    scope_failures: scopeFailures, forbidden_workspace_paths: forbidden, fixture_seed_unchanged: seedUnchanged,
+    fixture_seed_before: { aggregate_sha256: state.seed.aggregate_sha256, file_count: state.seed.file_count, byte_count: state.seed.byte_count },
+    fixture_seed_after: { aggregate_sha256: seedFinal.aggregate_sha256, file_count: seedFinal.file_count, byte_count: seedFinal.byte_count },
+    external_python_environment_drift: externalDrift,
+  };
+  await sink.writeJson(`case5_2/safety-${name}.json`, { safety, external_environment_after: externalFinal });
+  if (scopeFailures.length > 0 || !seedUnchanged || externalDrift.length > 0) {
+    throw productFailure("case5_2-safety-scope", "case5_2 detected forbidden frontend/dependency/workspace-external/fixture mutation", safety);
+  }
+  return { safety, finalProvider };
+}
+
+export async function executeCase52NormalStages({ context, cdp, input, sink, options, state, observationBudget }, injected = {}) {
+  const io = { executeStage, storeStageManifest, configureSideChat, providerMustKeepSideUnloaded,
+    runWorkspaceStableEvaluator, runStage3PublicSuite, ...injected };
+  const stages = [];
+  let referenceManifest = state.baseline;
+  for (const stage of STAGES.slice(0, 3)) {
+    const result = await io.executeStage({ context, cdp, input, sink, baseline: state.baseline, referenceManifest,
+      stage, promptInput: state.promptInputs[stage.id], expectedSessionId: stages[0]?.sessionId ?? null, observationBudget });
+    stages.push(result);
+    if (stage.id === "stage1") {
+      const failures = mainConfigurationFailures(result.terminal, options, { sessionRequired: true });
+      if (failures.length) throw productFailure("case5_2-session-quality-config", "Stage 1 Project Chat did not inherit the exact frozen Main LLM and Quality profile", { failures, session_id: result.sessionId });
+      await io.configureSideChat({ cdp, input, sink, options, sessionId: result.sessionId, observationBudget });
+      await io.providerMustKeepSideUnloaded({ options, sink, state, name: "side-configured-no-request" });
+    }
+    const manifest = await io.storeStageManifest({ context, sink, baseline: state.baseline, stage: stage.id });
+    const failures = stage.id === "stage1" ? case52Stage1ManifestFailures(manifest)
+      : stage.id === "stage2" ? case52Stage2ManifestFailures(referenceManifest, manifest) : [];
+    if (failures.length) throw productFailure(`case5_2-${stage.id}-scope`, `${stage.id} did not preserve its required document scope`, { failures, manifest });
+    referenceManifest = manifest;
+  }
+  const evaluated = await io.runWorkspaceStableEvaluator({ context, sink, baseline: state.baseline,
+    beforeManifest: referenceManifest, afterStage: "stage3-post-evaluator", label: "stage3-public-suite",
+    evaluate: () => io.runStage3PublicSuite({ context, sink, state, python: state.python }) });
+  assertPythonTestWithinBounds("stage3-public-suite", evaluated.result);
+  observationBudget?.assertRemaining("case5_2 Stage3 evaluator settled");
+  if (evaluated.result.exit_code !== 0) throw productFailure("case5_2-stage3-public-suite", "Stage 3 external backend suite failed", evaluated.result);
+  await io.providerMustKeepSideUnloaded({ options, sink, state, name: "stage3-terminal" });
+  return { stage1: stages[0], stage2: stages[1], stage3: stages[2], stage3PostEvaluatorManifest: evaluated.afterManifest };
+}
+
+export function case52RestorationSettings(projection) {
+  const fields = projection?.config_fields;
+  if (!Array.isArray(fields)) throw new TypeError("Stage3 restoration requires its public Settings snapshot");
+  const seen = new Set();
+  return fields.map(row => {
+    if (typeof row?.key !== "string" || typeof row.value !== "string" || seen.has(row.key)
+        || row.sensitive === true && row.value !== "") throw new TypeError("Stage3 restoration Settings must be unique public values with secrets redacted");
+    seen.add(row.key);
+    return { key: row.key, value: row.value, explicit: false };
+  });
+}
+
 export async function settleCase52ObservationTimeout({ cdp, input, sink, observationBudget }, injected = {}) {
   const dependencies = {
     observe: () => desktopProjection(cdp),
@@ -4232,6 +4352,18 @@ export async function settleCase52ObservationTimeout({ cdp, input, sink, observa
   const before = await dependencies.observe();
   const mainActive = before?.busy === true || before?.agent_tree_active === true
     || before?.task_activity_state === "running" || before?.run_status_key === "running";
+  let mainStop = STOP;
+  if (mainActive && before.confirmation_visible === true) {
+    const request = manualLivePermissionRequest(before);
+    if (before.run_target.permissionConfirmationId !== request.confirmation_id
+      || Boolean(request.request.remote)
+      || before.stop_target?.workspacePath !== before.run_target.workspacePath
+      || before.stop_target?.sessionId !== before.run_target.sessionId) {
+      throw new DesktopE2eError("harness", "case5_2-timeout-permission-owner",
+        "visible permission Stop does not address the active Main owner", { run_target: before.run_target, stop_target: before.stop_target, confirmation_id: before.confirmation_id });
+    }
+    mainStop = manualLivePermissionLocator(request, "stop");
+  }
   const side = before?.side_chat;
   const expected = [];
   if (mainActive) expected.push({ command: "cancel_run", args: { expectedTarget: structuredClone(before.stop_target) } });
@@ -4244,7 +4376,7 @@ export async function settleCase52ObservationTimeout({ cdp, input, sink, observa
   let commands;
   try {
     const start = (await probe.snapshot()).sequence;
-    if (mainActive) await dependencies.click(STOP, "observation-timeout-main-stop");
+    if (mainActive) await dependencies.click(mainStop, "observation-timeout-main-stop");
     if (side?.status === "running") await dependencies.click({
       selector: 'aside.side-chat-pane[data-pane-mode="side-chat"] button[data-action="cancel-side-chat"]',
       identity: { tag: "BUTTON", action: "cancel-side-chat" },
@@ -4306,6 +4438,147 @@ export async function settleCase52ObservationTimeout({ cdp, input, sink, observa
   return evidence;
 }
 
+export async function executeCase52FinalStages({
+  context, cdp, input, sink, options, state, stage1, stage2, stage3, stage4,
+  restoredProjection, initialShell, restartShell, restarted, transcript, observationBudget,
+}, injected = {}) {
+  const io = { storeStageManifest, runFinalEvaluator, configureSideChat, providerMustKeepSideUnloaded,
+    executeCase52SideChatStage, assertEvaluatorWorkspaceStable, verifyCase52Safety, ...injected };
+  const stage4Manifest = await io.storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage4" });
+  state.restorationStages.stage4 = "pass";
+  state.restorationStages.hidden_oracle = "running";
+  const evaluated = await io.runFinalEvaluator({
+    context,
+    sink,
+    state,
+    python: state.python,
+    baseline: state.baseline,
+    preEvaluationManifest: stage4Manifest,
+    oracleIdentity: state.oracle,
+  });
+  const evaluation = evaluated.report;
+  const stage4FinalManifest = evaluated.finalManifest;
+  state.restorationStages.hidden_oracle = evaluation.hidden_oracle_pass ? "pass" : "failed";
+  observationBudget?.assertRemaining("case5_2 final evaluators settled");
+
+  await io.verifyCase52Safety({ context, sink, options, state, manifest: stage4FinalManifest, name: "stage4-pre-side-chat" });
+
+  const stage5Options = case52Stage5Options(options);
+  if (stage5Options !== options) {
+    await io.configureSideChat({
+      cdp,
+      input,
+      sink,
+      options: stage5Options,
+      sessionId: stage1.sessionId,
+      evidenceName: "case5_2-side-chat-stage5-reconfigured",
+      observationBudget,
+    });
+  }
+  await io.providerMustKeepSideUnloaded({ options, sink, state, name: "stage5-before-side-send" });
+  state.restorationStages.stage5 = "running";
+  const stage5 = await io.executeCase52SideChatStage({
+    cdp,
+    input,
+    sink,
+    sessionId: stage1.sessionId,
+    providerProfile: stage5Options.providerProfile,
+    providerBaseUrl: stage5Options.providerBaseUrl,
+    model: stage5Options.sideModel,
+    apiKeyEnv: stage5Options.sideApiKeyEnv ?? "",
+    promptInput: state.sidePromptInput,
+    timeoutMs: observationBudget?.assertRemaining("case5_2 Stage5 observation") ?? QUALITY_REQUEST_TIMEOUT_MS,
+    observationBudget,
+  });
+  const stage5Manifest = await io.storeStageManifest({
+    context,
+    sink,
+    baseline: state.baseline,
+    stage: "stage5-post-side-chat",
+  });
+  await io.assertEvaluatorWorkspaceStable({
+    sink,
+    before: stage4FinalManifest,
+    after: stage5Manifest,
+    label: "stage5-side-chat-read-only",
+  });
+  state.restorationStages.stage5 = "pass";
+
+  const { safety, finalProvider } = await io.verifyCase52Safety({ context, sink, options, state, manifest: stage5Manifest, name: "final" });
+
+  const providerEvidence = case52ProviderSummaryEvidence(options, state);
+  const legacySideSummary = case52LegacySideSummaryV1({
+    stage4SideChat: stage4.terminal.side_chat,
+    restoredSideChat: restoredProjection.side_chat,
+    providerSummary: case52SideProviderSummary(options, state.sideProviderSamples),
+  });
+  observationBudget?.assertRemaining("case5_2 final evidence acceptance");
+  const summary = {
+    schema_version: "desktop-e2e.case5_2-summary.v1",
+    options: case52EvidenceOptions(options),
+    observation_budget: observationBudget?.snapshot() ?? null,
+    session_id: stage1.sessionId,
+    stages: [stage1, stage2, stage3, stage4].map((item) => ({
+      stage: item.stage,
+      turn_id: item.turnId,
+      elapsed_ms: item.elapsed_ms,
+    })),
+    stage5: {
+      stage: stage5.stage,
+      elapsed_ms: stage5.elapsed_ms,
+      provider_profile: stage5.binding.provider_profile,
+      model: stage5.binding.model,
+      owner_session_id: stage5.binding.owner_session_id,
+      chat_id: stage5.binding.chat_id,
+      question: stage5.question,
+      answer: stage5.answer,
+      active_context_observation: stage5.active_context_observation,
+      first_progress_latency_ms: stage5.first_progress_latency_ms,
+      command_evidence: stage5.commandEvidence,
+      terminal_screenshot: stage5.terminal_screenshot,
+      terminal_side_chat: stage5.completedSurface.projection.side_chat,
+      request_observation: {
+        trusted_side_send_action_count: 1,
+        trusted_main_submit_action_count: 0,
+        trusted_main_cancel_action_count: 0,
+        trusted_side_cancel_action_count: 0,
+        persisted_message_count: stage5.completedSurface.projection.side_chat.messages.length,
+        provider_generation_request_count: "unverified-no-traffic-ledger",
+      },
+    },
+    restart: restarted.restart,
+    ...legacySideSummary,
+    transcript,
+    evaluation,
+    safety,
+    ...providerEvidence,
+    provider_profile_exact: state.providerProfileExact,
+    provider_profile: options.providerProfile,
+    provider_lifecycle: options.providerLifecycle,
+    provider_extra_body: case52ExtraBodyEvidence(),
+    provider_comparability_deviations: state.providerComparabilityDeviations,
+    provider_effective_load_config: state.acceptedProviderLoad?.response?.value?.load_config ?? null,
+    provider_final: finalProvider.models,
+    quality_adjudication: "manual_rubric_pending",
+    performance: {
+      ...state.performance,
+      initial_shell_observation_ms: initialShell.readiness?.elapsed_ms ?? null,
+      restart_shell_observation_ms: restartShell.readiness?.elapsed_ms ?? null,
+      side_chat_stage5_ms: stage5.elapsed_ms,
+      total_elapsed_ms: elapsedSince(context.manifest.started_at),
+    },
+  };
+  const summaryIdentity = await sink.writeJson("case5_2/summary.json", summary);
+  if (evaluated.failures.length > 0) {
+    throw productFailure("case5_2-final-evaluation", "case5_2 public suite, hidden oracle, or required-document gate failed", {
+      failures: evaluated.failures, report: evaluation, summary: summaryIdentity,
+    });
+  }
+  await sink.record("case5_2-accepted", { summary: summaryIdentity, session_id: stage1.sessionId }, { phase: "executing", owner: OWNER });
+  state.acceptedEnd = true;
+  return { acquisition: "pass", oracle: "pass", manual: "pending" };
+}
+
 export function createCase52Scenario(rawOptions = {}) {
   const options = normalizeCase52Options(rawOptions);
   const state = {
@@ -4343,6 +4616,9 @@ export function createCase52Scenario(rawOptions = {}) {
     scenarioCleanupFailures: [],
     quiesceOutcome: null,
     acceptedEnd: false,
+    checkpoint: null,
+    restorationStarted: false,
+    restorationStages: { restart: "not_run", stage4: "not_run", stage5: "not_run", hidden_oracle: "not_run" },
     performance: {
       launch_to_ready_ms: null,
       reopen_to_ready_ms: null,
@@ -4355,6 +4631,24 @@ export function createCase52Scenario(rawOptions = {}) {
     databaseRequired: true,
     requestGracefulExit,
     environment: {},
+    restorationCheckpoint() {
+      if (state.checkpoint === null) return null;
+      const stage = state.checkpoint.stage3;
+      return { workspace: state.checkpoint.context.paths.workspace, session_id: stage.sessionId, turn_id: stage.turnId,
+        admission_revision: stage.terminal.run_target.expectedState.admissionRevision,
+        turn_page_total: stage.terminal.turn_page_total, turn_page_limit: stage.terminal.turn_page_limit,
+        project_id: selectedNavigationIdentity(stage.terminal).project_id,
+        config_fields: case52RestorationSettings(stage.terminal) };
+    },
+    restorationReadiness() {
+      return { ready: state.checkpoint !== null && !state.restorationStarted && state.observationBudget?.expired !== true,
+        reason: state.checkpoint === null ? "normal-stage3-not-completed" : state.restorationStarted ? "already-attempted"
+          : state.observationBudget?.expired === true ? "observation-timeout" : null,
+        observation_budget: state.observationBudget?.snapshot() ?? null,
+        stages: structuredClone(state.restorationStages) };
+    },
+    async executeNormal(args) { return this.execute({ ...args, executionPhase: "normal" }); },
+    async executeRestoration(args) { return this.execute({ ...args, executionPhase: "restoration" }); },
     async prepare({ context, sink, phase }) {
       const task = await fileIdentity(path.join(caseDirectory, "task.md"), { includeBytes: true });
       const oracleSource = await fileIdentity(path.join(caseDirectory, "oracle", "test_cancel_contract.py"), { includeBytes: true });
@@ -4476,7 +4770,7 @@ export function createCase52Scenario(rawOptions = {}) {
         external_environment: externalIdentity,
       }, { phase, owner: OWNER });
     },
-    async execute({ context, driver: firstCdp, host, runtime: firstRuntime, sink }) {
+    async execute({ context, driver: firstCdp, host, runtime: firstRuntime, sink, executionPhase = "full", restorationDisposition = "after_cases" }) {
       if (state.baseline === null || state.promptInputs === null || state.sidePromptInput === null
         || state.python === null || state.oracle === null) {
         throw new Error("manual.case5_2 was not prepared");
@@ -4485,15 +4779,27 @@ export function createCase52Scenario(rawOptions = {}) {
       let activeCdp = firstCdp;
       let primaryError = null;
       const observationBudget = state.observationBudget;
+      if (!["full", "normal", "restoration"].includes(executionPhase)
+          || executionPhase !== "full" && context.manualSuite?.shared_profile !== true) throw new TypeError("split Case5_2 execution requires its shared suite owner");
+      if (executionPhase === "restoration") {
+        const readiness = this.restorationReadiness();
+        if (!readiness.ready) throw new DesktopE2eError("harness", "case5_2-restoration-not-ready", "saved Stage3 restoration cannot begin", readiness);
+        for (const key of ["workspace", "config_file", "database", "logs"]) {
+          if (context.paths[key] !== state.checkpoint.context.paths[key]) throw new DesktopE2eError("harness", "case5_2-restoration-context", "restoration changed its saved workspace/profile owner", { key });
+        }
+        state.restorationStarted = true;
+        state.quiesceOutcome = null;
+      } else if (state.checkpoint !== null) throw new Error("Case5_2 normal stages cannot run twice");
       try {
-        const initialShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
+        const entryShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
           evidenceOwner: OWNER,
-          screenshotStem: "case5_2-main-shell-ready",
+          screenshotStem: executionPhase === "restoration" ? "case5_2-restoration-shell-ready" : "case5_2-main-shell-ready",
         });
-        state.performance.launch_to_ready_ms = elapsedSince(firstRuntime.launch_started_at);
+        const initialShell = executionPhase === "restoration" ? state.checkpoint.initialShell : entryShell;
+        if (executionPhase !== "restoration") Object.assign(state.performance, case52InitialReadinessPerformance(context, firstRuntime));
         activeInput = new WebviewInput(activeCdp, { probeId: "case5-2-generation-1", maxProbeEvents: 65_536 });
         await activeInput.installProbe();
-        if (options.configureMainViaGui) {
+        if (options.configureMainViaGui && executionPhase !== "restoration") {
           await configureMainConnectionViaGui({
             cdp: activeCdp,
             input: activeInput,
@@ -4510,90 +4816,49 @@ export function createCase52Scenario(rawOptions = {}) {
             projection: initialProjection,
           });
         }
-        if (initialProjection?.side_chat?.configured === true) {
+        if (executionPhase !== "restoration" && initialProjection?.side_chat?.configured === true) {
           throw productFailure("case5_2-side-chat-not-fresh", "fresh case5_2 data unexpectedly contained a Side Chat binding", { side_chat: initialProjection.side_chat });
         }
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "desktop-ready" });
+        await providerMustKeepSideUnloaded({ options, sink, state, name: executionPhase === "restoration" ? "restoration-desktop-ready" : "desktop-ready" });
 
-        const stage1 = await executeStage({
-          context,
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          baseline: state.baseline,
-          referenceManifest: state.baseline,
-          stage: STAGES[0],
-          promptInput: state.promptInputs.stage1,
-          expectedSessionId: null,
-          observationBudget,
-        });
-        const stage1ConfigFailures = mainConfigurationFailures(stage1.terminal, options, { sessionRequired: true });
-        if (stage1ConfigFailures.length > 0) {
-          throw productFailure("case5_2-session-quality-config", "Stage 1 Project Chat did not inherit the exact frozen Main LLM and Quality profile", {
-            failures: stage1ConfigFailures,
-            session_id: stage1.sessionId,
+        let stage1, stage2, stage3, stage3PostEvaluatorManifest;
+        if (executionPhase === "restoration") {
+          ({ stage1, stage2, stage3, stage3PostEvaluatorManifest } = state.checkpoint);
+          const entryManifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "restoration-entry" });
+          await assertEvaluatorWorkspaceStable({ sink, before: stage3PostEvaluatorManifest, after: entryManifest, label: "deferred-restoration-workspace" });
+          await verifyCase52Safety({ context, sink, options, state, manifest: entryManifest, name: "restoration-entry" });
+        } else {
+          ({ stage1, stage2, stage3, stage3PostEvaluatorManifest } = await executeCase52NormalStages({
+            context, cdp: activeCdp, input: activeInput, sink, options, state, observationBudget }));
+        }
+
+        if (executionPhase === "normal") {
+          const { safety } = await verifyCase52Safety({ context, sink, options, state, manifest: stage3PostEvaluatorManifest, name: "normal" });
+          observationBudget?.assertRemaining("case5_2 normal checkpoint acceptance");
+          state.checkpoint = { context: { paths: { ...context.paths } }, stage1, stage2, stage3, stage3PostEvaluatorManifest, initialShell };
+          const checkpointIdentity = await sink.writeJson("case5_2/restoration-checkpoint.json", {
+            schema_version: "desktop-e2e.case5_2-restoration-checkpoint.v1", owner: this.restorationCheckpoint(),
+            stages: [stage1, stage2, stage3], post_evaluator_manifest: stage3PostEvaluatorManifest,
+            profile: { config_file: context.paths.config_file, database: context.paths.database },
+            observation_budget: observationBudget?.snapshot() ?? null,
+            baseline: state.baseline, oracle: state.oracle, python: state.python, prompts: state.promptInputs, side_prompt: state.sidePromptInput,
           });
+          const summary = { schema_version: "desktop-e2e.case5_2-normal-summary.v1", phase: "normal", options: case52EvidenceOptions(options), session_id: stage1.sessionId,
+            stages: [stage1, stage2, stage3].map(item => ({ stage: item.stage, turn_id: item.turnId, elapsed_ms: item.elapsed_ms })),
+            restoration: { status: restorationDisposition === "skip" ? "not_run" : "deferred", reason: restorationDisposition === "skip" ? "explicit-skip" : null,
+              stages: { restart: "not_run", stage4: "not_run", stage5: "not_run", hidden_oracle: "not_run" }, full_case52_pass: false },
+            checkpoint: checkpointIdentity, safety, observation_budget: observationBudget?.snapshot() ?? null,
+            quality_adjudication: "manual_rubric_pending", ...case52ProviderSummaryEvidence(options, state) };
+          const identity = await sink.writeJson("case5_2/normal-summary.json", summary);
+          observationBudget?.assertRemaining("case5_2 normal evidence acceptance");
+          await sink.record("case5_2-normal-accepted", { summary: identity, checkpoint: checkpointIdentity, session_id: stage1.sessionId }, { phase: "executing", owner: OWNER });
+          return { acquisition: "pass", oracle: "pass", manual: "pending" };
         }
-        await configureSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId, observationBudget });
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "side-configured-no-request" });
-        const stage1Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage1" });
-        const stage1Failures = case52Stage1ManifestFailures(stage1Manifest);
-        if (stage1Failures.length > 0) {
-          throw productFailure("case5_2-stage1-scope", "Stage 1 did not produce exactly the required four repository documents", { failures: stage1Failures, manifest: stage1Manifest });
-        }
-
-        const stage2 = await executeStage({
-          context,
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          baseline: state.baseline,
-          referenceManifest: stage1Manifest,
-          stage: STAGES[1],
-          promptInput: state.promptInputs.stage2,
-          expectedSessionId: stage1.sessionId,
-          observationBudget,
-        });
-        const stage2Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage2" });
-        const stage2Failures = case52Stage2ManifestFailures(stage1Manifest, stage2Manifest);
-        if (stage2Failures.length > 0) {
-          throw productFailure("case5_2-stage2-scope", "Stage 2 did not preserve Stage 1 and add only cancel_contract.md", { failures: stage2Failures, manifest: stage2Manifest });
-        }
-
-        const stage3 = await executeStage({
-          context,
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          baseline: state.baseline,
-          referenceManifest: stage2Manifest,
-          stage: STAGES[2],
-          promptInput: state.promptInputs.stage3,
-          expectedSessionId: stage1.sessionId,
-          observationBudget,
-        });
-        const stage3Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage3" });
-        const stage3Evaluation = await runWorkspaceStableEvaluator({
-          context,
-          sink,
-          baseline: state.baseline,
-          beforeManifest: stage3Manifest,
-          afterStage: "stage3-post-evaluator",
-          label: "stage3-public-suite",
-          evaluate: () => runStage3PublicSuite({ context, sink, state, python: state.python }),
-        });
-        const stage3Suite = stage3Evaluation.result;
-        const stage3PostEvaluatorManifest = stage3Evaluation.afterManifest;
-        assertPythonTestWithinBounds("stage3-public-suite", stage3Suite);
-        observationBudget?.assertRemaining("case5_2 Stage3 evaluator settled");
-        if (stage3Suite.exit_code !== 0) {
-          throw productFailure("case5_2-stage3-public-suite", "Stage 3 external backend suite failed", stage3Suite);
-        }
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "stage3-terminal" });
 
         await cleanupWebviewInput(activeInput, state, "generation-1-before-restart");
         activeInput = null;
         observationBudget?.assertRemaining("case5_2 Desktop restart");
+        state.restorationStages.restart = "running";
         const restarted = await host.restart({ context, scenario: this, sink, driver: activeCdp, phase: "executing" });
         activeCdp = restarted.driver;
         observationBudget?.assertRemaining("case5_2 Desktop restarted");
@@ -4666,7 +4931,9 @@ export function createCase52Scenario(rawOptions = {}) {
 
         await verifyRestoredSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId, observationBudget });
         await providerMustKeepSideUnloaded({ options, sink, state, name: "restart-side-restored-no-request" });
+        state.restorationStages.restart = "pass";
 
+        state.restorationStages.stage4 = "running";
         const stage4 = await executeStage({
           context,
           cdp: activeCdp,
@@ -4696,157 +4963,14 @@ export function createCase52Scenario(rawOptions = {}) {
           sink,
           sessionId: stage1.sessionId,
           prompts: state.promptInputs,
+          terminalProjection: stage4.terminal,
         });
-        const stage4Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage4" });
-        const evaluated = await runFinalEvaluator({
-          context,
-          sink,
-          state,
-          python: state.python,
-          baseline: state.baseline,
-          preEvaluationManifest: stage4Manifest,
-          oracleIdentity: state.oracle,
+        return await executeCase52FinalStages({
+          context, cdp: activeCdp, input: activeInput, sink, options, state, stage1, stage2, stage3, stage4,
+          restoredProjection, initialShell, restartShell, restarted, transcript, observationBudget,
         });
-        const evaluation = evaluated.report;
-        const stage4FinalManifest = evaluated.finalManifest;
-        observationBudget?.assertRemaining("case5_2 final evaluators settled");
-
-        const stage5Options = case52Stage5Options(options);
-        if (stage5Options !== options) {
-          await configureSideChat({
-            cdp: activeCdp,
-            input: activeInput,
-            sink,
-            options: stage5Options,
-            sessionId: stage1.sessionId,
-            evidenceName: "case5_2-side-chat-stage5-reconfigured",
-            observationBudget,
-          });
-        }
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "stage5-before-side-send" });
-        const stage5 = await executeCase52SideChatStage({
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          sessionId: stage1.sessionId,
-          providerProfile: stage5Options.providerProfile,
-          providerBaseUrl: stage5Options.providerBaseUrl,
-          model: stage5Options.sideModel,
-          apiKeyEnv: stage5Options.sideApiKeyEnv ?? "",
-          promptInput: state.sidePromptInput,
-          timeoutMs: observationBudget?.assertRemaining("case5_2 Stage5 observation") ?? QUALITY_REQUEST_TIMEOUT_MS,
-          observationBudget,
-        });
-        const stage5Manifest = await storeStageManifest({
-          context,
-          sink,
-          baseline: state.baseline,
-          stage: "stage5-post-side-chat",
-        });
-        await assertEvaluatorWorkspaceStable({
-          sink,
-          before: stage4FinalManifest,
-          after: stage5Manifest,
-          label: "stage5-side-chat-read-only",
-        });
-
-        const allPaths = await allWorkspacePaths(context.paths.workspace);
-        const forbidden = case52ForbiddenWorkspacePaths(allPaths);
-        const scopeFailures = finalScopeFailures(stage5Manifest, forbidden);
-        const seedFinal = await inventoryCase52CleanSeed(options.fixtureSource);
-        const seedUnchanged = seedFinal.aggregate_sha256 === state.seed.aggregate_sha256
-          && sameValue(seedFinal.files, state.seed.files);
-        const externalFinal = await externalRootsSnapshot(state.externalRoots);
-        const externalDrift = externalRootDrift(state.externalBaseline, externalFinal);
-        const finalProvider = await providerMustKeepSideUnloaded({ options, sink, state, name: "final-terminal" });
-        const safety = {
-          scope_failures: scopeFailures,
-          forbidden_workspace_paths: forbidden,
-          fixture_seed_unchanged: seedUnchanged,
-          fixture_seed_before: {
-            aggregate_sha256: state.seed.aggregate_sha256,
-            file_count: state.seed.file_count,
-            byte_count: state.seed.byte_count,
-          },
-          fixture_seed_after: {
-            aggregate_sha256: seedFinal.aggregate_sha256,
-            file_count: seedFinal.file_count,
-            byte_count: seedFinal.byte_count,
-          },
-          external_python_environment_drift: externalDrift,
-        };
-        await sink.writeJson("case5_2/safety-final.json", { safety, external_environment_after: externalFinal });
-        if (scopeFailures.length > 0 || !seedUnchanged || externalDrift.length > 0) {
-          throw productFailure("case5_2-safety-scope", "case5_2 detected forbidden frontend/dependency/workspace-external/fixture mutation", safety);
-        }
-
-        const providerEvidence = case52ProviderSummaryEvidence(options, state);
-        const legacySideSummary = case52LegacySideSummaryV1({
-          stage4SideChat: stage4.terminal.side_chat,
-          restoredSideChat: restoredProjection.side_chat,
-          providerSummary: case52SideProviderSummary(options, state.sideProviderSamples),
-        });
-        observationBudget?.assertRemaining("case5_2 final evidence acceptance");
-        const summary = {
-          schema_version: "desktop-e2e.case5_2-summary.v1",
-          options: case52EvidenceOptions(options),
-          observation_budget: observationBudget?.snapshot() ?? null,
-          session_id: stage1.sessionId,
-          stages: [stage1, stage2, stage3, stage4].map((item) => ({
-            stage: item.stage,
-            turn_id: item.turnId,
-            elapsed_ms: item.elapsed_ms,
-          })),
-          stage5: {
-            stage: stage5.stage,
-            elapsed_ms: stage5.elapsed_ms,
-            provider_profile: stage5.binding.provider_profile,
-            model: stage5.binding.model,
-            owner_session_id: stage5.binding.owner_session_id,
-            chat_id: stage5.binding.chat_id,
-            question: stage5.question,
-            answer: stage5.answer,
-            active_context_observation: stage5.active_context_observation,
-            first_progress_latency_ms: stage5.first_progress_latency_ms,
-            command_evidence: stage5.commandEvidence,
-            terminal_screenshot: stage5.terminal_screenshot,
-            terminal_side_chat: stage5.completedSurface.projection.side_chat,
-            request_observation: {
-              trusted_side_send_action_count: 1,
-              trusted_main_submit_action_count: 0,
-              trusted_main_cancel_action_count: 0,
-              trusted_side_cancel_action_count: 0,
-              persisted_message_count: stage5.completedSurface.projection.side_chat.messages.length,
-              provider_generation_request_count: "unverified-no-traffic-ledger",
-            },
-          },
-          restart: restarted.restart,
-          ...legacySideSummary,
-          transcript,
-          evaluation,
-          safety,
-          ...providerEvidence,
-          provider_profile_exact: state.providerProfileExact,
-          provider_profile: options.providerProfile,
-          provider_lifecycle: options.providerLifecycle,
-          provider_extra_body: case52ExtraBodyEvidence(),
-          provider_comparability_deviations: state.providerComparabilityDeviations,
-          provider_effective_load_config: state.acceptedProviderLoad?.response?.value?.load_config ?? null,
-          provider_final: finalProvider.models,
-          quality_adjudication: "manual_rubric_pending",
-          performance: {
-            ...state.performance,
-            initial_shell_observation_ms: initialShell.readiness?.elapsed_ms ?? null,
-            restart_shell_observation_ms: restartShell.readiness?.elapsed_ms ?? null,
-            side_chat_stage5_ms: stage5.elapsed_ms,
-            total_elapsed_ms: elapsedSince(context.manifest.started_at),
-          },
-        };
-        const summaryIdentity = await sink.writeJson("case5_2/summary.json", summary);
-        await sink.record("case5_2-accepted", { summary: summaryIdentity, session_id: stage1.sessionId }, { phase: "executing", owner: OWNER });
-        state.acceptedEnd = true;
-        return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
+        for (const [stage, status] of Object.entries(state.restorationStages)) if (status === "running") state.restorationStages[stage] = "failed";
         if (observationBudget?.expired === true) {
           const timeout = productFailure("case5_2-observation-timeout", "case5_2 exhausted its shared observation budget", {
             ...observationBudget.snapshot(), cause: errorObservation(error),

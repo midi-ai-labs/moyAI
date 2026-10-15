@@ -27,10 +27,10 @@ import {
 } from "./scenarios/permission_restart_guardian.mjs";
 import { createGuardianHandoffScenario } from "./scenarios/permission_guardian_handoff.mjs";
 import {
-  createPermissionGuardianOpenAiCompatibleScenario,
-  createPermissionTempEscalationLmStudioScenario,
-  createPermissionTempEscalationScenario,
-} from "./scenarios/permission_temp_escalation.mjs";
+  createPermissionTempWriteOpenAiCompatibleScenario,
+  createPermissionTempWriteLmStudioScenario,
+  createPermissionTempWriteScenario,
+} from "./scenarios/permission_temp_write.mjs";
 import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
 import { createToolOperationFailureScenario } from "./scenarios/tool_operation_failure.mjs";
 import { createShellProjectionAccuracyScenario } from "./scenarios/shell_projection_accuracy.mjs";
@@ -66,6 +66,8 @@ import { createManualCase4Scenario } from "./scenarios/manual_case4.mjs";
 import { createManualCase5Scenario } from "./scenarios/manual_case5.mjs";
 import { createManualCase6Scenario } from "./scenarios/manual_case6.mjs";
 import { createManualCase7Scenario } from "./scenarios/manual_case7.mjs";
+import { createManualSuiteScenario } from "./scenarios/manual_suite.mjs";
+import { createManualSuiteControlsScenario } from "./scenarios/manual_suite_controls.mjs";
 import { createHistoryRestartPrependScenario } from "./scenarios/history_restart_prepend.mjs";
 import { createHistoryTerminalReconcileScenario } from "./scenarios/history_terminal_reconcile.mjs";
 
@@ -101,10 +103,12 @@ const factories = new Map([
   ["manual.case6", createManualCase6Scenario],
   ["manual.case7", createManualCase7Scenario],
   ["manual.case5_2", createCase52Scenario],
+  ["manual.suite", options => createManualSuiteScenario(options, { createScenario })],
+  ["manual.suite-controls", createManualSuiteControlsScenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
-  ["manual.permission-guardian-openai-compatible", createPermissionGuardianOpenAiCompatibleScenario],
-  ["manual.permission-temp-escalation-lm-studio", createPermissionTempEscalationLmStudioScenario],
+  ["manual.permission-temp-write-openai-compatible", createPermissionTempWriteOpenAiCompatibleScenario],
+  ["manual.permission-temp-write-lm-studio", createPermissionTempWriteLmStudioScenario],
   ["native-dialog.cancel", createNativeDialogCancelScenario],
   ["navigation.session-management", createSessionManagementScenario],
   ["navigation.workspace-controls", createWorkspaceControlsScenario],
@@ -129,7 +133,8 @@ const factories = new Map([
   ["permission.restart-guardian-chat", createPermissionRestartGuardianChatScenario],
   ["permission.guardian-handoff-approve", () => createGuardianHandoffScenario("approve")],
   ["permission.guardian-handoff-abort", () => createGuardianHandoffScenario("abort")],
-  ["permission.temp-escalation", createPermissionTempEscalationScenario],
+  ["permission.guardian-handoff-stop", () => createGuardianHandoffScenario("stop")],
+  ["permission.temp-write", createPermissionTempWriteScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
   ["history.tool-operation-failure", createToolOperationFailureScenario],
   ["permission.shell-projection-success", () => createShellProjectionAccuracyScenario("success")],
@@ -185,10 +190,11 @@ const configurableScenarios = new Set([
   "manual.case6",
   "manual.case7",
   "manual.case5_2",
+  "manual.suite",
   "manual.provider-openai-compatible",
   "manual.provider-lm-studio-thinking",
-  "manual.permission-guardian-openai-compatible",
-  "manual.permission-temp-escalation-lm-studio",
+  "manual.permission-temp-write-openai-compatible",
+  "manual.permission-temp-write-lm-studio",
 ]);
 
 export const scenarioIds = Object.freeze([...factories.keys()]);

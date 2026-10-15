@@ -15,7 +15,7 @@ image transport または provider metadata を変更した場合は、必要に
 ## Setup
 
 - `project_sandbox/<task>/case2/workspace/` に fresh workspace を作る。
-- config/data directory も fresh にする。
+- config/data directory は単独実行では fresh にする。suite 実行では [共通 README](../README.md) に従い同じ Desktop/profile を共有し、各 case の workspace と会話を fresh にする。
 - `scenario_contract.md` を workspace 直下へコピーし、run 中は変更しない。
 - operatorが用意した Space Invader reference image を Desktop attachment picker から添付し、source path、filename、SHA256を `RESULTS.md` に記録する。clone外の固定pathを前提にしない。
 - model availability で selected model の image support を確認する。

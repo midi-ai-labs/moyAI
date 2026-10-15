@@ -71,6 +71,17 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<HistoryItem>, StorageError>;
+    /// Visits append-only canonical history under one read snapshot. The source
+    /// bound and append-order ownership are checked before any page is decoded.
+    /// Consumers decide which historical evidence to retain; this never changes
+    /// the active model-context view or restores execution authority.
+    fn visit_bounded_canonical_history_pages_for_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+        source_item_limit: usize,
+        visitor: &mut dyn FnMut(ProtocolPage<HistoryItem>) -> Result<(), StorageError>,
+    ) -> Result<CanonicalHistorySnapshot, StorageError>;
     /// Visits the active model-context view in bounded keyset pages under one
     /// immutable storage snapshot. Whole-stream validation and compaction
     /// lineage resolution run once before the first page.
@@ -228,6 +239,13 @@ pub struct ProtocolPage<T> {
     pub total: usize,
     pub items: Vec<T>,
     pub next_cursor: Option<i64>,
+}
+
+/// Immutable source identity shared by all pages of one canonical traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalHistorySnapshot {
+    pub append_fence: Option<i64>,
+    pub canonical_count: usize,
 }
 
 /// One bounded page from a single active-history traversal.
@@ -1490,6 +1508,73 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
             |_| Ok(()),
             || false,
         )
+    }
+
+    fn visit_bounded_canonical_history_pages_for_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+        source_item_limit: usize,
+        visitor: &mut dyn FnMut(ProtocolPage<HistoryItem>) -> Result<(), StorageError>,
+    ) -> Result<CanonicalHistorySnapshot, StorageError> {
+        ProtocolPageRequest::After {
+            append_position: None,
+            limit,
+        }
+        .resolve(0)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let canonical_count = protocol_source_count_bounded(
+            &transaction,
+            session_id,
+            "protocol_history_items",
+            "history_item",
+            source_item_limit,
+        )?;
+        let append_fence = transaction.query_row(
+            "SELECT MAX(append_position)
+             FROM protocol_item_append_order
+             WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        let snapshot = CanonicalHistorySnapshot {
+            append_fence,
+            canonical_count,
+        };
+        let mut offset = 0usize;
+        let mut cursor = None;
+        while offset < canonical_count {
+            let page = canonical_history_keyset_page(
+                &transaction,
+                session_id,
+                snapshot,
+                cursor,
+                offset,
+                limit,
+            )?;
+            let item_count = page.items.len();
+            let Some(next_cursor) = page
+                .next_cursor
+                .filter(|next| cursor.is_none_or(|previous| *next > previous))
+            else {
+                return Err(StorageError::Message(format!(
+                    "canonical history traversal for session {session_id} made no progress at offset {offset} of {canonical_count} items"
+                )));
+            };
+            let next_offset = advance_canonical_fork_page_offset(
+                session_id,
+                "history traversal",
+                offset,
+                item_count,
+                canonical_count,
+            )?;
+            visitor(page)?;
+            offset = next_offset;
+            cursor = Some(next_cursor);
+        }
+        transaction.commit()?;
+        Ok(snapshot)
     }
 
     fn visit_active_history_pages_for_session(
@@ -2998,6 +3083,73 @@ fn protocol_source_count_bounded(
     })
 }
 
+fn canonical_history_keyset_page(
+    connection: &Connection,
+    session_id: SessionId,
+    snapshot: CanonicalHistorySnapshot,
+    after_append_position: Option<i64>,
+    offset: usize,
+    limit: usize,
+) -> Result<ProtocolPage<HistoryItem>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT history.id, history.scope_kind, history.turn_id, history.sequence_no,
+                history.payload_json, history.created_at_ms, append_order.append_position
+         FROM protocol_history_items AS history
+         INNER JOIN protocol_item_append_order AS append_order
+           ON append_order.session_id = history.session_id
+          AND append_order.source_kind = 'history_item'
+          AND append_order.source_id = history.id
+         WHERE history.session_id = ?1
+           AND (?2 IS NULL OR append_order.append_position > ?2)
+           AND append_order.append_position <= ?3
+         ORDER BY append_order.append_position ASC
+         LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![
+            session_id.to_string(),
+            after_append_position,
+            snapshot.append_fence,
+            sqlite_page_value(limit),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+    let mut items = Vec::with_capacity(limit.min(snapshot.canonical_count - offset));
+    let mut next_cursor = None;
+    for row in rows {
+        let (id, scope_kind, turn_id, sequence_no, payload_json, created_at_ms, append_position) =
+            row?;
+        items.push(decode_history_item(
+            session_id,
+            id,
+            scope_kind,
+            turn_id,
+            sequence_no,
+            payload_json,
+            created_at_ms,
+            "canonical history traversal",
+        )?);
+        next_cursor = Some(append_position);
+    }
+    Ok(ProtocolPage {
+        offset,
+        limit,
+        total: snapshot.canonical_count,
+        items,
+        next_cursor,
+    })
+}
+
 fn history_item_page_from_connection(
     connection: &Connection,
     session_id: SessionId,
@@ -3360,6 +3512,8 @@ fn prepare_active_history_snapshot(
         params![session_id.to_string()],
         |row| row.get::<_, Option<i64>>(0),
     )?;
+    // Resolve replacement membership once per session, not by rescanning JSON for each row.
+    // Exclude NULL members so hidden historical payloads cannot suppress unrelated active rows.
     let active_count = connection.execute(
         "WITH RECURSIVE fenced_scope(
              root_session_id,
@@ -3446,16 +3600,16 @@ fn prepare_active_history_snapshot(
                              fence.after_append_position
                    )
                )
-               AND NOT EXISTS (
-                   SELECT 1
+               AND history.id NOT IN (
+                   SELECT CAST(replacement.value AS TEXT)
                    FROM protocol_history_items AS compaction
                    JOIN json_each(
                        compaction.payload_json,
                        '$.replacement_item_ids'
                    ) AS replacement ON TRUE
-                   WHERE compaction.session_id = history.session_id
+                   WHERE compaction.session_id = ?1
                      AND json_extract(compaction.payload_json, '$.kind') = 'compaction'
-                     AND CAST(replacement.value AS TEXT) = history.id
+                     AND replacement.value IS NOT NULL
                )
          )
          INSERT INTO temp.moyai_active_history_traversal
@@ -4905,6 +5059,276 @@ mod tests {
     }
 
     #[test]
+    fn canonical_history_traversal_keeps_compacted_rows_in_append_order_without_writes() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        crate::storage::migration::run(&connection.lock().expect("sqlite mutex"))
+            .expect("migrations");
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let item_count = MAX_PROTOCOL_PAGE_LIMIT * 2 + 17;
+        let mut items = (0..item_count)
+            .map(|index| {
+                history_user_turn(
+                    session_id,
+                    TurnId::new(),
+                    i64::try_from(item_count - index).expect("sequence fits"),
+                    i64::try_from(item_count - index).expect("time fits"),
+                    &format!("stage {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let checkpoint = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn {
+                turn_id: TurnId::new(),
+            },
+            sequence_no: 0,
+            created_at_ms: 0,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
+                preserved_user_messages: vec!["stage 0".to_string()],
+                summary: "current continuation".to_string(),
+                replacement_item_ids: vec![items[0].id],
+            },
+        };
+        items.push(checkpoint);
+        seed_history_batch_for_test(&store, &items);
+        store
+            .seed_history_item_for_test(&history_user_turn(
+                SessionId::new(),
+                TurnId::new(),
+                0,
+                0,
+                "foreign history",
+            ))
+            .expect("foreign history");
+        let expected_ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+        let before = serde_json::to_value(
+            store
+                .list_history_items_for_session(session_id)
+                .expect("canonical history before read"),
+        )
+        .expect("history JSON");
+        let before_changes = {
+            let locked = connection.lock().expect("sqlite mutex");
+            locked
+                .pragma_update(None, "query_only", true)
+                .expect("enforce read-only SQL");
+            locked
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .expect("change count")
+        };
+        let mut expected_fence = None;
+        for limit in [1, 2, MAX_PROTOCOL_PAGE_LIMIT] {
+            let mut selected = Vec::new();
+            let mut previous_cursor = None;
+            let snapshot = store
+                .visit_bounded_canonical_history_pages_for_session(
+                    session_id,
+                    limit,
+                    items.len(),
+                    &mut |page| {
+                        assert_eq!(page.offset, selected.len());
+                        assert_eq!(page.total, items.len());
+                        assert_eq!(page.limit, limit);
+                        assert!(!page.items.is_empty());
+                        assert!(page.items.len() <= limit);
+                        assert!(page.items.iter().all(|item| item.session_id == session_id));
+                        let cursor = page.next_cursor.expect("non-empty page cursor");
+                        assert!(previous_cursor.is_none_or(|previous| cursor > previous));
+                        previous_cursor = Some(cursor);
+                        selected.extend(page.items.into_iter().map(|item| item.id));
+                        Ok(())
+                    },
+                )
+                .expect("canonical read-only traversal");
+            assert_eq!(snapshot.canonical_count, items.len());
+            assert!(snapshot.append_fence.is_some());
+            assert_eq!(
+                *expected_fence.get_or_insert(snapshot.append_fence),
+                snapshot.append_fence,
+            );
+            assert_eq!(selected, expected_ids);
+        }
+        let after = serde_json::to_value(
+            store
+                .list_history_items_for_session(session_id)
+                .expect("canonical history after read"),
+        )
+        .expect("history JSON");
+        assert_eq!(before, after);
+        let after_changes = connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+            .expect("change count after read");
+        assert_eq!(before_changes, after_changes);
+    }
+
+    #[test]
+    fn canonical_history_traversal_rejects_limits_and_append_corruption_before_callback() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        crate::storage::migration::run(&connection.lock().expect("sqlite mutex"))
+            .expect("migrations");
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let items = (0..3)
+            .map(|index| history_user_turn(session_id, turn_id, index, index, "bounded source"))
+            .collect::<Vec<_>>();
+        seed_history_batch_for_test(&store, &items);
+        let mut visited = 0usize;
+        let mut visitor = |page: ProtocolPage<HistoryItem>| {
+            visited += page.items.len();
+            Ok(())
+        };
+        for (limit, source_limit) in [(0, 3), (MAX_PROTOCOL_PAGE_LIMIT + 1, 3), (1, 0)] {
+            assert!(
+                store
+                    .visit_bounded_canonical_history_pages_for_session(
+                        session_id,
+                        limit,
+                        source_limit,
+                        &mut visitor,
+                    )
+                    .is_err(),
+                "invalid page/source limits must fail"
+            );
+        }
+        let overflow = store
+            .visit_bounded_canonical_history_pages_for_session(session_id, 1, 2, &mut visitor)
+            .expect_err("source overflow before first page");
+        assert!(matches!(
+            overflow,
+            StorageError::CanonicalSourceLimitExceeded {
+                source_kind: "history_item",
+                limit: 2,
+            }
+        ));
+        connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute(
+                "DELETE FROM protocol_item_append_order
+                 WHERE session_id = ?1 AND source_kind = 'history_item' AND source_id = ?2",
+                params![session_id.to_string(), items[0].id.to_string()],
+            )
+            .expect("corrupt append ownership");
+        let invariant = store
+            .visit_bounded_canonical_history_pages_for_session(session_id, 1, 3, &mut visitor)
+            .expect_err("append invariant checked before first page");
+        assert!(
+            invariant
+                .to_string()
+                .contains("append-order invariant failed")
+        );
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn canonical_history_traversal_uses_one_fence_when_another_connection_appends() {
+        let temp = tempfile::tempdir().expect("temporary fixture");
+        let database_path = temp.path().join("canonical-history.sqlite3");
+        let reader_connection = Connection::open(&database_path).expect("reader database");
+        reader_connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("concurrent snapshot journal");
+        crate::storage::migration::run(&reader_connection).expect("migrations");
+        let reader = SqliteProtocolEventStore::new(Arc::new(Mutex::new(reader_connection)));
+        let writer = SqliteProtocolEventStore::new(Arc::new(Mutex::new(
+            Connection::open(&database_path).expect("writer database"),
+        )));
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let initial = (0..3)
+            .map(|index| history_user_turn(session_id, turn_id, index, index, "initial"))
+            .collect::<Vec<_>>();
+        seed_history_batch_for_test(&reader, &initial);
+        let late = history_user_turn(session_id, turn_id, 3, 3, "append during read");
+        let mut selected = Vec::new();
+        let snapshot = reader
+            .visit_bounded_canonical_history_pages_for_session(
+                session_id,
+                1,
+                initial.len(),
+                &mut |page| {
+                    if selected.is_empty() {
+                        writer
+                            .seed_history_item_for_test(&late)
+                            .expect("independent writer commits between pages");
+                    }
+                    selected.extend(page.items.into_iter().map(|item| item.id));
+                    Ok(())
+                },
+            )
+            .expect("one immutable read snapshot");
+        assert_eq!(snapshot.canonical_count, initial.len());
+        assert_eq!(
+            selected,
+            initial.iter().map(|item| item.id).collect::<Vec<_>>()
+        );
+        let mut after = Vec::new();
+        let next = reader
+            .visit_bounded_canonical_history_pages_for_session(
+                session_id,
+                2,
+                initial.len() + 1,
+                &mut |page| {
+                    after.extend(page.items.into_iter().map(|item| item.id));
+                    Ok(())
+                },
+            )
+            .expect("next snapshot includes later append");
+        assert_eq!(next.canonical_count, snapshot.canonical_count + 1);
+        assert!(next.append_fence > snapshot.append_fence);
+        selected.push(late.id);
+        assert_eq!(after, selected);
+    }
+
+    #[test]
+    fn canonical_history_traversal_releases_the_reader_after_visitor_error_or_empty_history() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        crate::storage::migration::run(&connection.lock().expect("sqlite mutex"))
+            .expect("migrations");
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let empty = store
+            .visit_bounded_canonical_history_pages_for_session(session_id, 1, 1, &mut |_| {
+                panic!("empty source has no page")
+            })
+            .expect("empty read snapshot");
+        assert_eq!(empty.canonical_count, 0);
+        assert_eq!(empty.append_fence, None);
+        let user = history_user_turn(session_id, TurnId::new(), 0, 1, "source");
+        store
+            .seed_history_item_for_test(&user)
+            .expect("source after empty read");
+        let error = store
+            .visit_bounded_canonical_history_pages_for_session(session_id, 1, 1, &mut |_| {
+                Err(StorageError::Message("visitor stopped".to_string()))
+            })
+            .expect_err("visitor error propagated");
+        assert!(error.to_string().contains("visitor stopped"));
+        let mut selected = Vec::new();
+        store
+            .visit_bounded_canonical_history_pages_for_session(session_id, 1, 1, &mut |page| {
+                selected.extend(page.items.into_iter().map(|item| item.id));
+                Ok(())
+            })
+            .expect("reader reusable after callback failure");
+        assert_eq!(selected, vec![user.id]);
+    }
+
+    #[test]
     fn latest_page_is_an_exact_tail_and_all_page_requests_share_one_limit() {
         for (total, expected_offset) in [
             (99, 0),
@@ -5468,6 +5892,119 @@ mod tests {
             selected.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![tail.id, nested_summary.id],
             "identity reads follow durable append order, independent of model ordering"
+        );
+    }
+
+    #[test]
+    fn active_history_replacement_membership_is_session_local_and_null_safe() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        crate::storage::migration::run(&connection.lock().expect("sqlite mutex"))
+            .expect("migrations");
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let first = history_user_turn(session_id, turn_id, 0, 10, "original request");
+        store
+            .seed_history_item_for_test(&first)
+            .expect("original input");
+        let mode = store
+            .set_collaboration_mode(session_id, ModeKind::Plan)
+            .expect("session-scoped mode")
+            .expect("new mode");
+        let tail = history_user_turn(session_id, turn_id, 1, 20, "retained input");
+        store
+            .seed_history_item_for_test(&tail)
+            .expect("retained input");
+        let checkpoint = |session_id, turn_id, sequence_no, replacement_item_ids| HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no,
+            created_at_ms: sequence_no + 30,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
+                preserved_user_messages: vec!["original request".to_string()],
+                summary: format!("checkpoint {sequence_no}"),
+                replacement_item_ids,
+            },
+        };
+        let hidden = checkpoint(session_id, turn_id, 2, vec![first.id, first.id]);
+        store
+            .seed_history_item_for_test(&hidden)
+            .expect("first checkpoint");
+        let mut historical_payload =
+            serde_json::to_value(&hidden.payload).expect("checkpoint JSON");
+        historical_payload["replacement_item_ids"]
+            .as_array_mut()
+            .expect("replacement list")
+            .push(serde_json::Value::Null);
+        let historical_json = serde_json::to_string(&historical_payload).expect("historical JSON");
+        connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute(
+                "UPDATE protocol_history_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                params![historical_json, hash_text(&historical_json), hidden.id.to_string()],
+            )
+            .expect("seed malformed historical checkpoint");
+        assert!(
+            active_history_pages_for_test(&store, session_id, 1).is_err(),
+            "a malformed checkpoint must still fail decoding while it is active"
+        );
+        let latest = checkpoint(session_id, turn_id, 3, vec![hidden.id]);
+        store
+            .seed_history_item_for_test(&latest)
+            .expect("superseding checkpoint");
+        let foreign = checkpoint(SessionId::new(), TurnId::new(), 0, vec![tail.id, mode.id]);
+        store
+            .seed_history_item_for_test(&foreign)
+            .expect("another session cannot replace this session's items");
+
+        let expected = serde_json::to_value([latest, mode, tail]).expect("expected replay");
+        let reopened = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let mut expected_fence = None;
+        for limit in [1, 2, MAX_PROTOCOL_PAGE_LIMIT] {
+            let mut active = Vec::new();
+            let snapshot = reopened
+                .visit_bounded_active_history_pages_for_session(
+                    session_id,
+                    limit,
+                    5,
+                    3,
+                    &mut |page| {
+                        active.extend(page.items);
+                        Ok(())
+                    },
+                )
+                .expect("hidden malformed payload does not alter the active replay");
+            assert_eq!(snapshot.canonical_count, 5);
+            assert_eq!(snapshot.active_count, 3);
+            assert_eq!(
+                serde_json::to_value(active).expect("active replay"),
+                expected
+            );
+            assert!(snapshot.append_fence.is_some());
+            assert_eq!(
+                *expected_fence.get_or_insert(snapshot.append_fence),
+                snapshot.append_fence
+            );
+        }
+        let saved: (String, String) = connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row(
+                "SELECT payload_json, payload_sha256 FROM protocol_history_items WHERE id = ?1",
+                params![hidden.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("original historical payload");
+        assert_eq!(
+            saved,
+            (historical_json.clone(), hash_text(&historical_json))
         );
     }
 

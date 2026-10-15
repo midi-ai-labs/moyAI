@@ -25,6 +25,8 @@ export const RUN_NEXT_TURN_FIRST_PROMPT = "complete first turn";
 export const RUN_NEXT_TURN_FIRST_RESPONSE = "FIRST_TURN_OK";
 export const RUN_NEXT_TURN_SECOND_PROMPT = "complete second turn";
 export const RUN_NEXT_TURN_SECOND_RESPONSE = "SECOND_TURN_OK";
+export const RUN_NEXT_TURN_THIRD_PROMPT = "complete third turn";
+export const RUN_NEXT_TURN_THIRD_RESPONSE = "THIRD_TURN_OK";
 
 const PROMPT = Object.freeze({
   selector: "section.composer textarea#prompt",
@@ -72,8 +74,11 @@ export function exactRunNextTurnLedger(ledger, phases) {
 
 function exactHistory(projection, turnCount) {
   const history = relevantProviderHistory(projection);
-  const prompts = [RUN_NEXT_TURN_FIRST_PROMPT, RUN_NEXT_TURN_SECOND_PROMPT].slice(0, turnCount);
-  const responses = [RUN_NEXT_TURN_FIRST_RESPONSE, RUN_NEXT_TURN_SECOND_RESPONSE].slice(0, turnCount);
+  const prompts = [RUN_NEXT_TURN_FIRST_PROMPT, RUN_NEXT_TURN_SECOND_PROMPT, RUN_NEXT_TURN_THIRD_PROMPT].slice(0, turnCount);
+  const responses = [RUN_NEXT_TURN_FIRST_RESPONSE, RUN_NEXT_TURN_SECOND_RESPONSE, RUN_NEXT_TURN_THIRD_RESPONSE].slice(0, turnCount);
+  const identities = projection?.transcript_rows?.filter((row) => [
+    "user", "work_summary_completed", "assistant",
+  ].includes(row?.row_kind)).map((row) => row.stable_history_identity) ?? [];
   return history.rows.length === turnCount * 3
     && isDeepStrictEqual(history.rows.map((row) => row.kind), Array.from(
       { length: turnCount },
@@ -81,7 +86,26 @@ function exactHistory(projection, turnCount) {
     ).flat())
     && isDeepStrictEqual(history.users, prompts)
     && isDeepStrictEqual(history.assistants, responses)
-    && history.completed_summaries === turnCount;
+    && history.completed_summaries === turnCount
+    && identities.length === turnCount * 3
+    && identities.every((identity) => typeof identity === "string" && identity.length > 0)
+    && new Set(identities).size === identities.length;
+}
+
+export function firstTerminalSettlementAccepted(sample, pendingProjection) {
+  const projection = sample?.projection;
+  return exactRunNextTurnLedger(sample?.ledger, ["completed"])
+    && projection?.post_run_refresh_pending === false
+    && projection.run_status_key === "completed"
+    && projection.composer_submit_mode === "new_request"
+    && projection.can_submit === true
+    && projection.draft_prompt === ""
+    && exactIdleOwner(projection)
+    && exactHistory(projection, 1)
+    && projection.run_target.sessionId === pendingProjection?.run_target?.sessionId
+    && canonicalU64(projection.projection_revision)
+    && canonicalU64(pendingProjection?.projection_revision)
+    && BigInt(projection.projection_revision) > BigInt(pendingProjection.projection_revision);
 }
 
 function exactIdleOwner(projection) {
@@ -151,9 +175,8 @@ export function pendingOwnerRaceFailures({ pendingProjection, settledProjection,
     || BigInt(settledProjection.projection_revision) <= BigInt(pendingProjection.projection_revision)) {
     failures.push("pending-projection-not-older-than-settled-backend");
   }
-  if (pendingProjection?.run_target?.sessionId !== settledProjection?.run_target?.sessionId
-    || isDeepStrictEqual(pendingProjection?.run_target, settledProjection?.run_target)) {
-    failures.push("pending-and-settled-run-owners-did-not-drift-in-one-session");
+  if (pendingProjection?.run_target?.sessionId !== settledProjection?.run_target?.sessionId) {
+    failures.push("pending-and-settled-session-drift");
   }
   if (dom?.composer?.count !== 1
     || dom.composer.visible !== true
@@ -180,6 +203,38 @@ export function pendingOwnerRaceFailures({ pendingProjection, settledProjection,
   return failures;
 }
 
+export function runningSummaryFailures(surface) {
+  const projection = surface?.projection;
+  const turnId = projection?.run_target?.expectedState?.turnId;
+  const rows = (projection?.transcript_rows ?? []).filter((row) => row?.row_kind === "work_summary_running");
+  const summary = rows[0];
+  const failures = [];
+  if (rows.length !== 1 || !canonicalUlid(turnId)
+    || summary?.stable_history_identity !== "turn:" + turnId + ":work-summary") {
+    failures.push("running-summary-owner-mismatch");
+  }
+  const lines = typeof summary?.body === "string" ? summary.body.replace(/\r\n/g, "\n").split("\n") : [];
+  const modelLines = lines.filter((line) => line.startsWith("- モデル要求:"));
+  if (modelLines.length !== 1 || modelLines[0] !== "- モデル要求: 1") {
+    failures.push("running-summary-model-count-not-one");
+  }
+  if (lines.includes("### ツール")) failures.push("running-summary-unexpected-tools");
+  const expectedMetadata = ["フェーズ", "手順", "モデル要求"].map((label) => {
+    const prefix = "- " + label + ": ";
+    return { label, detail: lines.find((line) => line.startsWith(prefix))?.slice(prefix.length), visible: true };
+  });
+  const dom = surface?.running_summaries;
+  if (!Array.isArray(dom) || dom.length !== 1
+    || dom[0].history_identity !== summary?.stable_history_identity
+    || dom[0].visible !== true || dom[0].body_visible !== true
+    || expectedMetadata.some((item) => typeof item.detail !== "string" || item.detail.length === 0)
+    || !isDeepStrictEqual(dom[0].metadata, expectedMetadata)
+    || dom[0].history_event_count !== 0) {
+    failures.push("running-summary-dom-mismatch");
+  }
+  return failures;
+}
+
 export function firstTurnAcquisitionFailures(sample) {
   const failures = [];
   const projection = sample?.surface?.projection;
@@ -200,54 +255,60 @@ export function firstTurnAcquisitionFailures(sample) {
   if (sample?.surface?.visible_fatal_count > 0 || sample?.surface?.visible_recoverable_error_count > 0) {
     failures.push("first-turn-error-visible");
   }
-  return failures;
+  return [...failures, ...runningSummaryFailures(sample?.surface)];
 }
 
-export function nextTurnAcquisitionFailures(sample, firstTerminal) {
+export function nextTurnAcquisitionFailures(sample, firstTerminal, turnCount = 2) {
   const failures = [];
   const projection = sample?.surface?.projection;
   const expected = projection?.run_target?.expectedState;
   const firstExpected = firstTerminal?.run_target?.expectedState;
-  if (!exactRunNextTurnLedger(sample?.ledger, ["completed", "held"])) {
-    failures.push("provider-second-request-not-held");
+  const ordinal = turnCount === 3 ? "third" : "second";
+  if (!exactRunNextTurnLedger(sample?.ledger, [...Array(turnCount - 1).fill("completed"), "held"])) {
+    failures.push("provider-" + ordinal + "-request-not-held");
   }
   if (projection?.run_status_key !== "running" || projection?.busy !== true) {
-    failures.push("second-turn-not-running");
+    failures.push(ordinal + "-turn-not-running");
   }
   if (expected?.kind !== "turn"
     || !canonicalUlid(expected.turnId)
     || expected.turnId === firstExpected?.latestTurnId
     || !exactNextRevision(firstExpected?.admissionRevision, expected.admissionRevision)) {
-    failures.push("second-turn-owner-not-next-revision");
+    failures.push(ordinal + "-turn-owner-not-next-revision");
+  }
+  if ((firstTerminal?.transcript_rows ?? []).some((row) => row?.row_kind === "work_summary_completed"
+    && row.stable_history_identity === "turn:" + expected?.turnId + ":work-summary")) {
+    failures.push(ordinal + "-turn-reused-history-owner");
   }
   if (projection?.run_target?.sessionId !== firstTerminal?.run_target?.sessionId
     || projection?.draft_target?.sessionId !== firstTerminal?.draft_target?.sessionId) {
-    failures.push("second-turn-session-drift");
+    failures.push(ordinal + "-turn-session-drift");
   }
   if (sample?.surface?.visible_fatal_count > 0 || sample?.surface?.visible_recoverable_error_count > 0) {
-    failures.push("second-turn-error-visible");
+    failures.push(ordinal + "-turn-error-visible");
   }
-  return failures;
+  return [...failures, ...runningSummaryFailures(sample?.surface)];
 }
 
-export function nextTurnTerminalFailures(sample, firstTerminal, secondTurn) {
+export function nextTurnTerminalFailures(sample, firstTerminal, secondTurn, turnCount = 2) {
   const failures = [];
   const projection = sample?.surface?.projection;
   const expected = projection?.run_target?.expectedState;
   const secondExpected = secondTurn?.run_target?.expectedState;
-  if (!exactRunNextTurnLedger(sample?.ledger, ["completed", "completed"])) {
-    failures.push("provider-two-turn-ledger-not-complete");
+  const ordinal = turnCount === 3 ? "third" : "second";
+  if (!exactRunNextTurnLedger(sample?.ledger, Array(turnCount).fill("completed"))) {
+    failures.push("provider-" + turnCount + "-turn-ledger-not-complete");
   }
-  if (!settledComposer(sample?.surface) || !exactHistory(projection, 2)) {
-    failures.push("second-terminal-not-settled");
+  if (!settledComposer(sample?.surface) || !exactHistory(projection, turnCount)) {
+    failures.push(ordinal + "-terminal-not-settled");
   }
   if (projection?.draft_prompt !== "" || sample?.surface?.prompt?.value !== "") {
-    failures.push("second-terminal-draft-not-cleared");
+    failures.push(ordinal + "-terminal-draft-not-cleared");
   }
   if (expected?.latestTurnId !== secondExpected?.turnId
     || expected?.admissionRevision !== secondExpected?.admissionRevision
     || projection?.run_target?.sessionId !== firstTerminal?.run_target?.sessionId) {
-    failures.push("second-terminal-owner-drift");
+    failures.push(ordinal + "-terminal-owner-drift");
   }
   return failures;
 }
@@ -277,6 +338,19 @@ export async function observeRunNextTurnSurface(cdp) {
     const send = composer?.querySelector('button[data-action="send"]') ?? null;
     return {
       projection,
+      running_summaries: Array.from(document.querySelectorAll(
+        'main.conversation #thread article.message.work-summary.work_summary_running'
+      )).map((row) => ({
+        history_identity: row.getAttribute('data-history-identity'),
+        visible: visible(row),
+        body_visible: visible(row.querySelector('.work-summary-body')),
+        metadata: Array.from(row.querySelectorAll('.work-summary-body .work-history-meta > span')).map((item) => ({
+          label: (item.querySelector('strong')?.textContent ?? '').trim(),
+          detail: (item.querySelector('small')?.textContent ?? '').trim(),
+          visible: visible(item),
+        })),
+        history_event_count: row.querySelectorAll('.work-history-event').length,
+      })),
       selected_navigation: Array.from(document.querySelectorAll(
         'button.nav-row[aria-current="page"][data-action="session"], button.nav-row[aria-current="page"][data-action="chat-session"]'
       )).map((row) => ({
@@ -412,10 +486,16 @@ async function trustedType(input, text) {
   });
 }
 
-function firstHeldDecision(sample) {
+export function firstHeldDecision(sample) {
   if (sample?.ledger?.length > 1) return "fail";
   if (sample?.surface?.visible_fatal_count > 0 || sample?.surface?.visible_recoverable_error_count > 0) return "fail";
   return firstTurnAcquisitionFailures(sample).length === 0 ? "pass" : "pending";
+}
+
+export function nextHeldDecision(sample, previousTerminal, turnCount = 2) {
+  if (sample?.ledger?.length > turnCount || sample?.surface?.visible_fatal_count > 0
+    || sample?.surface?.visible_recoverable_error_count > 0) return "fail";
+  return nextTurnAcquisitionFailures(sample, previousTerminal, turnCount).length === 0 ? "pass" : "pending";
 }
 
 async function settleResources(state, input, commands, pollBarrier, primaryError) {
@@ -455,6 +535,7 @@ export function createRunNextTurnScenario() {
         turns: [
           { prompt: RUN_NEXT_TURN_FIRST_PROMPT, responseText: RUN_NEXT_TURN_FIRST_RESPONSE },
           { prompt: RUN_NEXT_TURN_SECOND_PROMPT, responseText: RUN_NEXT_TURN_SECOND_RESPONSE },
+          { prompt: RUN_NEXT_TURN_THIRD_PROMPT, responseText: RUN_NEXT_TURN_THIRD_RESPONSE },
         ],
         orderedConversation: true,
         responseBehavior: "hold_until_release",
@@ -518,22 +599,21 @@ export function createRunNextTurnScenario() {
         const firstRelease = provider.releaseResponse(0);
         const pendingCapture = await pollBarrier.capturePending({ timeoutMs: 15_000, pollMs: 5 });
         const pendingProjection = structuredClone(pendingCapture.projection);
+        await sink.record("run-next-turn-pending-capture", {
+          projection_revision: pendingProjection.projection_revision,
+          run_target: pendingProjection.run_target,
+          post_run_refresh_pending: pendingProjection.post_run_refresh_pending,
+          run_status_key: pendingProjection.run_status_key,
+          composer_submit_mode: pendingProjection.composer_submit_mode,
+          can_submit: pendingProjection.can_submit,
+        }, { phase: "executing", owner: OWNER });
         const backendSettlement = await waitForObservation({
           label: "run.next-turn backend durable owner settlement behind held frontend poll",
           timeoutMs: 30_000,
           pollMs: 10,
           retrySampleErrors: false,
           sample: async () => ({ projection: await pollBarrier.sampleBackend(), ledger: provider.requestLedger }),
-          accept: (sample) => exactRunNextTurnLedger(sample?.ledger, ["completed"])
-            && sample?.projection?.post_run_refresh_pending === false
-            && sample.projection.run_status_key === "completed"
-            && sample.projection.composer_submit_mode === "new_request"
-            && sample.projection.can_submit === true
-            && sample.projection.draft_prompt === ""
-            && exactIdleOwner(sample.projection)
-            && exactHistory(sample.projection, 1)
-            && sample.projection.run_target.sessionId === pendingProjection.run_target?.sessionId
-            && !isDeepStrictEqual(sample.projection.run_target, pendingProjection.run_target),
+          accept: (sample) => firstTerminalSettlementAccepted(sample, pendingProjection),
         });
         const firstProjection = structuredClone(backendSettlement.value.projection);
         const pendingRelease = await pollBarrier.releaseCaptured({ rearm: true });
@@ -643,11 +723,7 @@ export function createRunNextTurnScenario() {
           label: "run.next-turn revision+1 Turn acquisition",
           timeoutMs: 30_000,
           sample: async () => ({ surface: await observeRunNextTurnSurface(cdp), ledger: provider.requestLedger }),
-          decide: (sample) => {
-            if (sample?.ledger?.length > 2 || sample?.surface?.visible_fatal_count > 0
-              || sample?.surface?.visible_recoverable_error_count > 0) return "fail";
-            return nextTurnAcquisitionFailures(sample, firstProjection).length === 0 ? "pass" : "pending";
-          },
+          decide: (sample) => nextHeldDecision(sample, firstProjection),
           code: "run-next-turn-second-acquisition-mismatch",
           message: "the second trusted Send did not acquire one same-session revision+1 Turn",
         });
@@ -683,13 +759,86 @@ export function createRunNextTurnScenario() {
           name: "run-next-turn-second-completed",
           owner: OWNER,
         });
-        state.acceptedLedger = structuredClone(terminal.value.ledger);
+        const thirdTyping = await trustedType(input, RUN_NEXT_TURN_THIRD_PROMPT);
+        const thirdReady = await waitForObservation({
+          label: "run.next-turn third trusted prompt readiness",
+          timeoutMs: 10_000,
+          pollMs: 50,
+          retrySampleErrors: false,
+          sample: () => observeRunNextTurnSurface(cdp),
+          accept: (surface) => settledComposer(surface)
+            && exactHistory(surface.projection, 2)
+            && surface.prompt.value === RUN_NEXT_TURN_THIRD_PROMPT
+            && surface.send.enabled === true
+            && surface.projection.draft_prompt === ""
+            && isDeepStrictEqual(surface.projection.run_target, terminal.value.surface.projection.run_target),
+        });
+        const thirdExpectedCommand = {
+          command: "submit_prompt",
+          args: {
+            text: RUN_NEXT_TURN_THIRD_PROMPT,
+            expectedTarget: structuredClone(thirdReady.value.projection.draft_target),
+            expectedRunTarget: structuredClone(thirdReady.value.projection.run_target),
+          },
+        };
+        const thirdCommandStart = (await commands.snapshot()).sequence;
+        const thirdSend = await trustedClick(input, SEND);
+        const thirdCommandObservation = await waitForObservation({
+          label: "run.next-turn exact third submit command",
+          timeoutMs: 10_000,
+          pollMs: 25,
+          retrySampleErrors: false,
+          sample: () => commands.snapshot(thirdCommandStart),
+          accept: (snapshot) => snapshot.calls.length >= 1,
+        });
+        const thirdCommand = assertExactDesktopCommandSequence(thirdCommandObservation.value, {
+          afterSequence: thirdCommandStart,
+          expected: [thirdExpectedCommand],
+        });
+        const thirdTurn = await waitForProductStage({
+          label: "run.next-turn third revision+1 Turn acquisition",
+          timeoutMs: 30_000,
+          sample: async () => ({ surface: await observeRunNextTurnSurface(cdp), ledger: provider.requestLedger }),
+          decide: (sample) => nextHeldDecision(sample, terminal.value.surface.projection, 3),
+          code: "run-next-turn-third-acquisition-mismatch",
+          message: "the third trusted Send did not acquire a same-session revision+1 Turn with visible model progress",
+        });
+        const thirdProjection = structuredClone(thirdTurn.value.surface.projection);
+        const thirdRunningScreenshot = await captureScenarioScreenshot({
+          cdp, sink, name: "run-next-turn-third-running", owner: OWNER,
+        });
+        const thirdRelease = provider.releaseResponse(2);
+        const thirdTerminal = await waitForProductStage({
+          label: "run.next-turn third normal terminal",
+          timeoutMs: 45_000,
+          sample: async () => ({ surface: await observeRunNextTurnSurface(cdp), ledger: provider.requestLedger }),
+          decide: (sample) => {
+            if (sample?.ledger?.length > 3 || sample?.surface?.visible_fatal_count > 0
+              || sample?.surface?.visible_recoverable_error_count > 0) return "fail";
+            return nextTurnTerminalFailures(sample, firstProjection, thirdProjection, 3).length === 0 ? "pass" : "pending";
+          },
+          code: "run-next-turn-third-terminal-mismatch",
+          message: "the third Turn did not complete with exact three-turn history and a settled owner",
+        });
+        const thirdFinalCommand = assertExactDesktopCommandSequence(await commands.snapshot(commandStart), {
+          afterSequence: commandStart,
+          expected: [expectedCommand, thirdExpectedCommand],
+        });
+        const thirdTerminalScreenshot = await captureScenarioScreenshot({
+          cdp, sink, name: "run-next-turn-third-completed", owner: OWNER,
+        });
+        state.acceptedLedger = structuredClone(thirdTerminal.value.ledger);
         await sink.record("run-next-turn-completed", {
           input_kind: "browser_trusted",
           first: {
             typing: firstTyping,
             send: firstSend,
             running_owner: firstHeld.value.surface.projection.run_target,
+            running_summary: {
+              projection: firstHeld.value.surface.projection.transcript_rows.filter((row) => row.row_kind === "work_summary_running"),
+              dom: firstHeld.value.surface.running_summaries,
+              failures: runningSummaryFailures(firstHeld.value.surface),
+            },
             release: firstRelease,
             terminal_owner: firstProjection.run_target,
             selected_navigation: selectedNavigationIdentity(firstProjection),
@@ -729,10 +878,35 @@ export function createRunNextTurnScenario() {
             command: exactCommand,
             final_command_snapshot: finalCommand,
             running_owner: secondProjection.run_target,
+            running_summary: {
+              projection: secondProjection.transcript_rows.filter((row) => row.row_kind === "work_summary_running"),
+              dom: secondTurn.value.surface.running_summaries,
+              failures: runningSummaryFailures(secondTurn.value.surface),
+            },
             release: secondRelease,
             terminal_owner: terminal.value.surface.projection.run_target,
             running_screenshot: secondRunningScreenshot,
             terminal_screenshot: terminalScreenshot,
+          },
+          third: {
+            typing: thirdTyping,
+            send: thirdSend,
+            expected_command: thirdExpectedCommand,
+            command: thirdCommand,
+            final_command_snapshot: thirdFinalCommand,
+            running_owner: thirdProjection.run_target,
+            running_summary: {
+              projection: thirdProjection.transcript_rows.filter((row) => row.row_kind === "work_summary_running"),
+              dom: thirdTurn.value.surface.running_summaries,
+              failures: runningSummaryFailures(thirdTurn.value.surface),
+            },
+            release: thirdRelease,
+            terminal_owner: thirdTerminal.value.surface.projection.run_target,
+            stable_history_identities: thirdTerminal.value.surface.projection.transcript_rows.map((row) => ({
+              kind: row.row_kind, identity: row.stable_history_identity,
+            })),
+            running_screenshot: thirdRunningScreenshot,
+            terminal_screenshot: thirdTerminalScreenshot,
           },
           provider_ledger: state.acceptedLedger,
           provider_resource: provider.resourceObservation(),
