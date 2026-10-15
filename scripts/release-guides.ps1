@@ -24,6 +24,12 @@ function Update-MoyaiReleaseGuideLinks([string]$PackageRoot, [string]$DesktopSou
     if ($relative -eq 'RELEASE_NOTES.md') {
       $content = $content.Replace('](../', '](docs/')
     }
+    # Native testhost instructions belong to the matching source checkout.
+    foreach ($target in @('docs/testing-windows-sandbox.md', 'testing-windows-sandbox.md')) {
+      $content = $content.Replace(
+        "]($target)",
+        "]($desktopRepository/blob/$DesktopSourceCommit/docs/testing-windows-sandbox.md)")
+    }
     # These design/log files belong to the unversioned development workspace,
     # not either product repository. Retain their labels without dead links.
     $content = [regex]::Replace($content, '\[([^\]]+)\]\(\.\./\.\./(?:docs/design/|project_sandbox/|TODO_RECOMMENDATION\.md)[^)]*\)', '$1 (development workspace reference)')

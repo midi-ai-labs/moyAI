@@ -17,6 +17,7 @@ $fixtureCommon = Join-Path $package 'scripts/common.ps1'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Start-moyAI.cmd') -Destination (Join-Path $package 'Start-moyAI.cmd')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Setup-moyAI.cmd') -Destination (Join-Path $package 'Setup-moyAI.cmd')
 Write-MoyaiUtf8 (Join-Path $package 'app/bin/moyai-runner.exe') 'inert deployment fixture; never execute'
+Write-MoyaiUtf8 (Join-Path $package 'app/bin/moyai-sandbox.exe') 'inert sandbox deployment fixture; never execute'
 Write-MoyaiUtf8 (Join-Path $package 'hub/bin/moyai-hub.exe') 'inert Hub deployment fixture; never execute'
 $compileFixture = Join-Path $EvidenceRoot 'compile-fixture.ps1'
 Write-MoyaiUtf8 $compileFixture @'
@@ -106,7 +107,9 @@ Write-MoyaiUtf8 (Join-Path $package 'README.md') '<img src="logo/preview.png">
 [Notes](docs/release/v1.0.md)
 [Source](src/)
 [Test](tests/manual_ST/README.md)
+[Native sandbox](docs/testing-windows-sandbox.md)
 [Design](docs/design/multi-device-session.md)'
+Write-MoyaiUtf8 (Join-Path $package 'docs/runner-local.md') '[Native sandbox](testing-windows-sandbox.md)'
 New-Item -ItemType Directory -Path (Join-Path $package 'app/logo') -Force | Out-Null
 Write-MoyaiUtf8 (Join-Path $package 'app/logo/preview.png') 'inert image fixture'
 Write-MoyaiUtf8 (Join-Path $package 'RELEASE_NOTES.md') '# Release
@@ -127,6 +130,8 @@ Assert-That ((Get-FileHash -LiteralPath $importedEvidence).Hash -ceq $importedEv
 $readme = Get-Content -LiteralPath (Join-Path $package 'README.md') -Raw -Encoding UTF8
 $notes = Get-Content -LiteralPath (Join-Path $package 'RELEASE_NOTES.md') -Raw -Encoding UTF8
 $integration = Get-Content -LiteralPath (Join-Path $package 'docs/hub-integration.md') -Raw -Encoding UTF8
+$runnerGuide = Get-Content -LiteralPath (Join-Path $package 'docs/runner-local.md') -Raw -Encoding UTF8
+Assert-That ($readme.Contains("/blob/$hubSourceCommit/docs/testing-windows-sandbox.md)") -and $runnerGuide.Contains("/blob/$hubSourceCommit/docs/testing-windows-sandbox.md)")) 'native sandbox test instructions link to the packaged Desktop source identity from README and Runner guides'
 Assert-That ($readme.Contains('src="app/logo/preview.png"') -and $readme.Contains('](RELEASE_NOTES.md)') -and $notes.Contains('](docs/user/getting-started.md)')) 'README images, release-note entry and release-note links follow the package layout'
 Assert-That ($readme.Contains("/moyAI/tree/$hubSourceCommit/src/") -and $readme.Contains("/moyAI/blob/$hubSourceCommit/tests/manual_ST/README.md") -and $integration.Contains("/moyAI/blob/$hubSourceCommit/docs/design/multi-device-session.md")) 'Desktop source, tests and design references use the packaged source commit'
 Assert-That ($integration.Contains('](../hub/docs/firewall.md)') -and $integration.Contains("/moyAI-Hub/blob/$hubSourceCommit/docs/gateway.md") -and -not $integration.Contains('](../../')) 'Hub operation links stay local and development-only references do not escape the package'
