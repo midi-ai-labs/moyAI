@@ -1,3 +1,8 @@
+import type { HubProjection } from "./hub_state.ts";
+import type { DeviceNetworkProjection } from "./device_network_state.ts";
+import type { PublishProjection } from "./mcp_publish_state.ts";
+import type { McpActivityProjection } from "./mcp_activity.ts";
+
 export type RowId = string;
 
 export interface TranscriptRow {
@@ -124,6 +129,7 @@ export interface PermissionProjection {
   risks: string[];
   agent_path?: string | null;
   agent_task_name?: string | null;
+  remote?: { job_id: string; profile_id: string; session_id: string; requester_label: string | null; target_label: string } | null;
 }
 
 export interface StartupCheckProjection {
@@ -140,7 +146,8 @@ export interface StartupProjection {
   detail: string;
   action_overlay: string;
   initial_setup_required: boolean;
-  initial_setup_reason: "config_missing" | "provider_invalid" | "optional_tool_invalid" | null;
+  initial_setup_reason: "config_missing" | "setup_unfinished" | "provider_invalid" | "optional_tool_invalid" | null;
+  onboarding_intent?: "welcome" | "personal" | "execution" | "team" | "hosting" | null;
   global_config_path: string | null;
   setup_target: InitialSetupMutationTarget | null;
   checks: StartupCheckProjection[];
@@ -288,12 +295,14 @@ export interface DoclingReadinessProjection {
 
 export type DesktopStatusCode =
   | "plain"
+  | "goal_control"
   | "provider_transport"
   | "model_unavailable"
   | "image_unsupported"
   | "image_attachment_invalid"
   | "permission_policy_denied"
   | "config_import_failed"
+  | "initial_setup_preferences_save_failed"
   | "approval_aborted"
   | "user_stopped"
   | "agent_interrupted"
@@ -321,6 +330,7 @@ export interface PlanProjection {
 export interface DesktopAboutProjection {
   product_name: string;
   version: string;
+  codename: string;
   license_identifier: string;
   copyright_notice: string;
 }
@@ -365,11 +375,14 @@ export interface SideChatCatalogModel {
 export interface SideChatCatalogResult {
   baseUrl: string;
   providerProfile: ProviderProfile;
+  apiKeyEnv: string;
   configGeneration: string;
   models: SideChatCatalogModel[];
 }
 
 export interface SideChatProjection {
+  api_key_env?: string;
+  direct_provider_capture?: { base_url: string; model: string; provider_profile: string; enabled: boolean; reason: string } | null;
   configured: boolean;
   deleting: boolean;
   chat_id: string | null;
@@ -397,6 +410,10 @@ export type ComposerSubmitMode = "new_request" | "steer" | "blocked";
 export type TaskActivityState = "idle" | "running" | "finalizing" | "attention";
 
 export interface DesktopWebState {
+  hub: HubProjection | null;
+  device_network: DeviceNetworkProjection | null;
+  mcp_publish: PublishProjection | null;
+  mcp_activity?: McpActivityProjection | null;
   projection_revision: string;
   workspace_path: string;
   provider_label: string;
@@ -434,12 +451,14 @@ export interface DesktopWebState {
   draft_prompt: string;
   image_input: string;
   attached_images: string[];
+  retained_image_names?: string[];
   composer_submit_mode: ComposerSubmitMode;
   can_submit: boolean;
   can_cancel_run: boolean;
   run_target: RunMutationTarget;
   stop_target: StopMutationTarget | null;
   busy: boolean;
+  exit_requested?: boolean;
   task_activity_state: TaskActivityState;
   async_polling_required: boolean;
   pending_async_operations: string[];
@@ -449,6 +468,7 @@ export interface DesktopWebState {
   post_run_refresh_pending: boolean;
   background_mutation_pending: boolean;
   overlay: string;
+  hub_project_open?: boolean;
   about: DesktopAboutProjection;
   side_chat: SideChatProjection;
   project_rows: ProjectRow[];
@@ -498,6 +518,7 @@ export interface DesktopWebState {
   provider_apply_enabled: boolean;
   docling_readiness: DoclingReadinessProjection;
   config_fields: ConfigFieldProjection[];
+  approve_model_configured: boolean;
   config_target: ConfigMutationTarget;
   workspace_input: string;
   review_target: PromptReviewMutationTarget | null;

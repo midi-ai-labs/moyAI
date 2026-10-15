@@ -1,12 +1,13 @@
 [package]
 name = "moyai"
-version = "2.1.1"
+version = "3.0.0-rc.1"
 edition = "2024"
 build = "build.rs"
 license = "MIT"
 
 [features]
 default = ["tauri-desktop"]
+desktop-e2e = ["tauri-desktop"]
 tauri-desktop = [
     "dep:tauri",
     "tauri/custom-protocol",
@@ -28,6 +29,7 @@ required-features = ["tauri-desktop"]
 
 [dependencies]
 async-trait = "0.1.89"
+axum = { version = "0.8.6", features = ["multipart"] }
 base64 = "0.22.1"
 bytes = "1.10.1"
 camino = { version = "1.2.1", features = ["serde1"] }
@@ -44,6 +46,7 @@ globset = "0.4.16"
 httpdate = "1.0.3"
 ignore = "0.4.24"
 ratatui = "0.29.0"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 regex = "1.11.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 rfd = { version = "0.15.4", optional = true }
@@ -58,6 +61,7 @@ tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "time", "sync", "io-util"] }
 tokio-util = { version = "0.7.16", features = ["rt"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 toml = "0.8.23"
 tui-textarea = "0.7.0"
 ulid = { version = "1.2.1", features = ["serde"] }
@@ -70,6 +74,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Globalization",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
@@ -80,6 +85,11 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_Console",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]
@@ -87,7 +97,6 @@ libc = "0.2.184"
 
 [dev-dependencies]
 assert_cmd = "2.1.1"
-axum = { version = "0.8.6", features = ["multipart"] }
 
 [build-dependencies]
 tauri-build = { version = "2.5.1", optional = true }

@@ -1,4 +1,5 @@
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import {
   DesktopCommandProbe,
@@ -29,6 +30,7 @@ import {
   quiesceProviderResource,
 } from "./provider_restart.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
+import { trustedFocus } from "./hub_browser_enrollment.mjs";
 
 const OWNER = "scenario:side-chat.quote";
 const SIDE_PROVIDER_PROFILE = "openai_responses";
@@ -211,6 +213,8 @@ export async function observeSideChatQuoteSurface(cdp) {
     const sidePrompt = sidePane?.querySelector('textarea#side-chat-prompt') ?? null;
     const sideSend = sidePane?.querySelector('button[data-action="send-side-chat"]') ?? null;
     const sideStop = sidePane?.querySelector('button[data-action="cancel-side-chat"]') ?? null;
+    const sideStatuses = Array.from(sidePane?.querySelectorAll('.side-chat-meta [role="status"]') ?? []);
+    const sideNotices = Array.from(sidePane?.querySelectorAll('.side-chat-notice[role="status"]') ?? []).filter(visible);
     const pending = sidePane?.querySelector('.side-chat-pending-quote') ?? null;
     const settings = document.querySelector('[role="dialog"][aria-labelledby="config-dialog-title"]');
     const sideSettings = settings?.querySelector('section#settings-side-chat') ?? null;
@@ -266,6 +270,12 @@ export async function observeSideChatQuoteSurface(cdp) {
         send_enabled: enabled(sideSend),
         stop_visible: visible(sideStop),
         stop_enabled: enabled(sideStop),
+        stop_count: sidePane?.querySelectorAll('button[data-action="cancel-side-chat"]').length ?? 0,
+        status_count: sideStatuses.length,
+        status_visible: visible(sideStatuses[0]),
+        status_text: sideStatuses[0]?.textContent?.trim() ?? null,
+        notice_texts: sideNotices.map(node => node.textContent?.trim() ?? ''),
+        error_count: Array.from(sidePane?.querySelectorAll('[role="alert"]') ?? []).filter(visible).length,
         metadata: Array.from(sidePane?.querySelectorAll('.side-chat-context-meta > span') ?? [])
           .map((node) => (node.textContent ?? '').trim()),
         truncated_count: sidePane?.querySelectorAll('.side-chat-context-truncated').length ?? 0,
@@ -309,6 +319,26 @@ export function surfaceHasNoErrors(surface) {
     && surface?.visible_recoverable_error_count === 0;
 }
 
+export function sideChatStoppedSurfaceReady(surface, target) {
+  const side = surface?.projection?.side_chat;
+  const dom = surface?.side;
+  return side?.owner_session_id === target.ownerSessionId
+    && side.chat_id === target.chatId && side.generation === target.expectedGeneration
+    && side.status === "cancelled" && side.deleting === false
+    && side.can_send === true && side.can_cancel === false
+    && side.phase === "" && side.last_error === "run stopped by user"
+    && side.draft_text === "" && side.draft_quote === null
+    && dom?.pane_count === 1 && dom.pane_visible === true && dom.setup_visible === false
+    && dom.owner_session_id === target.ownerSessionId
+    && dom.status_count === 1 && dom.status_visible === true && dom.status_text === "停止済み"
+    && sameValue(dom.notice_texts, ["サイドチャットの実行を停止しました。"])
+    && dom.stop_count === 0 && dom.stop_visible === false && dom.stop_enabled === false
+    && dom.prompt_visible === true && dom.prompt_enabled === true && dom.prompt_value === ""
+    && dom.send_visible === true && dom.send_enabled === false
+    && dom.pending_count === 0 && dom.error_count === 0
+    && surfaceHasNoErrors(surface);
+}
+
 export async function waitForProductStage({ label, timeoutMs = 30_000, sample, accept, code, message }) {
   try {
     return await waitForObservation({
@@ -329,9 +359,9 @@ export async function waitForProductStage({ label, timeoutMs = 30_000, sample, a
   }
 }
 
-export async function trustedClick(input, locator) {
+export async function trustedClick(input, locator, acquisitionOptions) {
   const start = (await input.snapshotProbe()).sequence;
-  const target = await input.click(locator);
+  const target = await input.click(locator, acquisitionOptions);
   const snapshot = await input.snapshotProbe(start);
   return {
     target,
@@ -358,8 +388,63 @@ export async function trustedInsert(input, locator, text) {
   return { focus, insertion, probe };
 }
 
-async function trustedReplace(input, locator, text) {
-  const focus = await trustedClick(input, locator);
+const SETTINGS_SCROLL_BODY = '[role="dialog"][aria-labelledby="config-dialog-title"] .settings-content';
+
+export async function trustedSideSettingsClick(input, cdp, locator, { sink, evidenceOwner = OWNER } = {}) {
+  await trustedFocus(input, cdp, locator);
+  const initial = await input.observeExactTarget(locator);
+  let focusScroll = null;
+  if (initial.observation.center_in_viewport === false || initial.observation.center_in_scroll_clip === false) {
+    let previous = null, stableSamples = 0;
+    const samples = [];
+    const settled = await waitForObservation({
+      label: "Side settings keyboard focus scroll settlement",
+      timeoutMs: 1_500,
+      pollMs: 75,
+      retrySampleErrors: false,
+      sample: () => input.observeScrollContainer(locator, SETTINGS_SCROLL_BODY),
+      accept: value => {
+        const observation = value.observation;
+        const geometry = { scroll_top: observation.scroll_top, scroll_left: observation.scroll_left,
+          center: observation.target.center, rect: observation.target.rect, scroll_clip: observation.target.scroll_clip };
+        stableSamples = previous !== null && sameValue(previous, geometry) ? stableSamples + 1 : 1;
+        previous = geometry;
+        samples.push(geometry);
+        return stableSamples >= 3;
+      },
+    });
+    focusScroll = { ...settled, samples, stable_samples: stableSamples };
+    if (sink) await sink.record("side-chat-settings-focus-scroll-settled", { initial, focus_scroll: focusScroll }, { phase: "executing", owner: evidenceOwner });
+  }
+  const geometry = focusScroll?.value.observation.target ?? initial.observation;
+  let wheel = null;
+  if (geometry.center_in_viewport === false || geometry.center_in_scroll_clip === false) {
+    const clip = geometry.scroll_clip;
+    const bounded = value => Math.sign(value) * Math.min(Math.ceil(Math.abs(value)), 1_000);
+    const start = (await input.snapshotProbe()).sequence;
+    const dispatch = await input.scrollContainer(locator, {
+      containerSelector: SETTINGS_SCROLL_BODY,
+      deltaX: geometry.center.x < clip.left || geometry.center.x >= clip.right
+        ? bounded(geometry.center.x - (clip.left + clip.right) / 2) : 0,
+      deltaY: geometry.center.y < clip.top || geometry.center.y >= clip.bottom
+        ? bounded(geometry.center.y - (clip.top + clip.bottom) / 2) : 0,
+    });
+    wheel = { initial, focus_scroll: focusScroll, dispatch };
+    if (sink) await sink.record("side-chat-settings-wheel-acquisition", wheel, { phase: "executing", owner: evidenceOwner });
+    wheel.probe = await input.waitForTrustedProbeSequence({
+      afterSequence: start,
+      expected: [{ type: "wheel", identity: dispatch.before.observation.container.identity,
+        deltaX: dispatch.parameters.deltaX, deltaY: dispatch.parameters.deltaY, deltaMode: 0 }],
+    });
+    await input.resolveExactTarget(locator, { stableHitSamples: 3 });
+    wheel.settled = await input.observeScrollContainer(locator, SETTINGS_SCROLL_BODY);
+    if (sink) await sink.record("side-chat-settings-wheel-settled", { probe: wheel.probe, geometry: wheel.settled }, { phase: "executing", owner: evidenceOwner });
+  }
+  return { ...await trustedClick(input, locator), wheel_acquisition: wheel };
+}
+
+async function trustedReplace(input, cdp, locator, text, evidence) {
+  const focus = await trustedSideSettingsClick(input, cdp, locator, evidence);
   const clearStart = (await input.snapshotProbe()).sequence;
   await input.keyDown("Control");
   try {
@@ -410,14 +495,6 @@ async function trustedSelectSideProviderProfile(input) {
       expected: [{ type: "change", identity: SIDE_PROVIDER_PROFILE_CONTROL.identity }],
     }),
   };
-}
-
-function globalConfigValues(projection, overrides) {
-  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
-  return fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
 }
 
 function configFieldValue(projection, key) {
@@ -580,6 +657,8 @@ export async function saveGlobalSideChatAndOpen({
   providerBaseUrl,
   ownerSessionId,
   systemPrompt = "",
+  sink,
+  evidenceOwner = OWNER,
 }) {
   const open = await trustedClick(input, SHOW_SETTINGS);
   await waitForProductStage({
@@ -625,9 +704,10 @@ export async function saveGlobalSideChatAndOpen({
   const profile = ready.value.settings.profile_value === SIDE_PROVIDER_PROFILE
     ? null
     : await trustedSelectSideProviderProfile(input);
-  const baseUrl = await trustedReplace(input, SIDE_BASE_URL, providerBaseUrl);
-  const model = await trustedReplace(input, SIDE_MANUAL_MODEL, SCRIPTED_PROVIDER_MODEL_ID);
-  const systemPromptTyping = await trustedReplace(input, SIDE_SYSTEM_PROMPT, systemPrompt);
+  const evidence = { sink, evidenceOwner };
+  const baseUrl = await trustedReplace(input, cdp, SIDE_BASE_URL, providerBaseUrl, evidence);
+  const model = await trustedReplace(input, cdp, SIDE_MANUAL_MODEL, SCRIPTED_PROVIDER_MODEL_ID, evidence);
+  const systemPromptTyping = await trustedReplace(input, cdp, SIDE_SYSTEM_PROMPT, systemPrompt, evidence);
   const committable = await waitForProductStage({
     label: "global Side Chat settings save admission",
     timeoutMs: 10_000,
@@ -646,7 +726,7 @@ export async function saveGlobalSideChatAndOpen({
   const expectedSave = {
     command: "save_global_config",
     args: {
-      values: globalConfigValues(ready.value.projection, {
+      values: expectedConfigCommandValues(ready.value.projection, {
         "side_chat.base_url": providerBaseUrl,
         "side_chat.model": SCRIPTED_PROVIDER_MODEL_ID,
         "side_chat.system_prompt": systemPrompt.trim(),
@@ -788,7 +868,7 @@ export async function inspectGlobalSideChatSettings({
     code: "side-chat-settings-values-not-restored",
     message: "Side Chat Settings did not restore the exact persisted global values",
   });
-  const prompt = await trustedClick(input, SIDE_SYSTEM_PROMPT);
+  const prompt = await trustedSideSettingsClick(input, cdp, SIDE_SYSTEM_PROMPT, { sink, evidenceOwner });
   const screenshot = await captureScenarioScreenshot({
     cdp,
     sink,
@@ -932,6 +1012,7 @@ export function createSideChatQuoteScenario() {
         const configuration = await saveGlobalSideChatAndOpen({
           cdp,
           input,
+          sink,
           providerBaseUrl: provider.baseUrl,
           ownerSessionId: owner.session_id,
         });
@@ -1228,7 +1309,6 @@ export function createSideChatQuoteScenario() {
             provider: provider.resourceObservation(),
           }),
           accept: (sample) => {
-            const side = sample?.surface?.projection?.side_chat;
             const rows = responseRows(sample?.ledger);
             return exactResponseRoles(sample?.ledger, [
               "side_quote_main_initial",
@@ -1237,9 +1317,7 @@ export function createSideChatQuoteScenario() {
               "side_quote_artifact_held",
             ], { finalHeld: true })
               && rows.at(-1)?.response_phase === "peer_closed"
-              && side?.status === "cancelled"
-              && side.can_send === true
-              && side.can_cancel === false
+              && sideChatStoppedSurfaceReady(sample.surface, cancelExpected.args)
               && sample?.surface?.main?.prompt_value === MAIN_DRAFT_SENTINEL
               && sample.surface.main.send_visible === true
               && sample.surface.main.send_enabled === true
@@ -1250,7 +1328,7 @@ export function createSideChatQuoteScenario() {
               && surfaceHasNoErrors(sample.surface);
           },
           code: "side-chat-quote-stop-terminal",
-          message: "trusted Side Stop did not cancel only the Side request and preserve the Main owner",
+          message: "trusted Side Stop did not settle the same Side owner in both Rust and the visible stopped UI while preserving Main",
         });
         const finalCommands = assertExactDesktopCommandSequence(
           await commands.snapshot(),
@@ -1313,6 +1391,7 @@ export function createSideChatQuoteScenario() {
             stop_action: sideStop,
             stop_command: cancelCommand,
             terminal_projection: terminal.value.surface.projection.side_chat,
+            terminal_dom: terminal.value.surface.side,
             final_commands: finalCommands,
             held_screenshot: heldScreenshot,
             terminal_screenshot: finalScreenshot,

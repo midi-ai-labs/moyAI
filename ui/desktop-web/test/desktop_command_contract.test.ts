@@ -132,3 +132,33 @@ test("Desktop command diagnostics cannot block delivery", async () => {
     else delete globals[observerKey];
   }
 });
+
+test("Hub credential reaches native connect but is redacted before command diagnostics", async () => {
+  const globals = globalThis as Record<PropertyKey, unknown>;
+  const observerKey = Symbol.for(DESKTOP_COMMAND_OBSERVER_SYMBOL);
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const previousObserver = Object.getOwnPropertyDescriptor(globalThis, observerKey);
+  const deliveries: unknown[] = [];
+  const observations: unknown[] = [];
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    __TAURI_INTERNALS__: { invoke: (name: string, args: unknown) => {
+      deliveries.push({ name, args }); return Promise.resolve(undefined);
+    } },
+  } });
+  Object.defineProperty(globalThis, observerKey, { configurable: true, value: (entry: unknown) => observations.push(entry) });
+  try {
+    const args = { endpoint: "http://127.0.0.1:9470", token: "private-bootstrap-token", label: "Desktop", expectedSettingsRevision: "0", expectedConnectionGeneration: "0" };
+    await command("hub_connect", args);
+    assert.deepEqual(deliveries, [{ name: "hub_connect", args }]);
+    assert.deepEqual(observations, [{ name: "hub_connect", args: { ...args, token: "[redacted]" } }]);
+    assert.doesNotMatch(JSON.stringify(observations), /private-bootstrap-token/);
+    const sharedArgs = { expectedGeneration: "2", request: { kind: "login", username: "alice", password: "private-human-password" } };
+    await command("shared_work_command", sharedArgs);
+    assert.deepEqual(deliveries[1], { name: "shared_work_command", args: sharedArgs });
+    assert.deepEqual(observations[1], { name: "shared_work_command", args: { ...sharedArgs, request: { ...sharedArgs.request, password: "[redacted]" } } });
+    assert.doesNotMatch(JSON.stringify(observations), /private-human-password/);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else delete globals.window;
+    if (previousObserver) Object.defineProperty(globalThis, observerKey, previousObserver); else delete globals[observerKey];
+  }
+});

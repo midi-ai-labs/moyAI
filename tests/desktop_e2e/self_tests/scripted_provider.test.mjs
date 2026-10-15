@@ -24,6 +24,22 @@ test("scripted provider keeps long deterministic history fixtures explicitly bou
   );
 });
 
+test("scripted image turns reject dropped or replaced snapshots and ledger only their digest", async context => {
+  const imageDataUrl = "data:image/png;base64,aW1hZ2U=";
+  const provider = await startScriptedProvider({ turns: [{ prompt: "image edit", responseText: "OK", imageDataUrl }] });
+  context.after(() => provider.close());
+  for (const image of [null, "data:image/png;base64,b3RoZXI=", imageDataUrl]) {
+    const body = responsesRequest("image edit");
+    if (image) body.input[0].content.push({ type: "input_image", image_url: image });
+    const response = await fetch(`${provider.baseUrl}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(response.status, image === imageDataUrl ? 200 : 422);
+    await response.text();
+  }
+  assert.equal(provider.requestLedger.at(-1).contract.image_sha256, sha256(imageDataUrl));
+  assert.equal(JSON.stringify(provider.requestLedger).includes(imageDataUrl), false);
+  await assert.rejects(startScriptedProvider({ turns: [{ prompt: "p", responseText: "r", imageDataUrl: "https://example.com/image.png" }] }), /bounded PNG/);
+});
+
 test("scripted provider validates one exact ordered same-session conversation", async (context) => {
   const turns = [
     { prompt: "first prompt", responseText: "FIRST_RESPONSE" },
@@ -137,7 +153,7 @@ async function waitFor(predicate, timeoutMs = 2_000) {
 }
 
 test("scripted provider never publishes a Fetch-forbidden loopback port", async (context) => {
-  for (const port of [1, 21, 2_049, 5_060, 6_000, 6_665, 6_669, 10_080]) {
+  for (const port of [1, 21, 2_049, 4_190, 5_060, 6_000, 6_665, 6_669, 6_679, 10_080]) {
     assert.equal(scriptedProviderPortIsFetchSafe(port), false, `port ${port}`);
   }
   for (const port of [80, 1_024, 10_081, 49_152, 65_535]) {

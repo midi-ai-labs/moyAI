@@ -254,7 +254,7 @@ pub(crate) async fn wait_for_agent_activity_or_steer_with_poll_interval(
             steer.map_err(|error| ToolError::Message(error.to_string()))?;
             steered_wait_result()
         }
-        durable_steer = wait_for_durable_turn_steer(agent, durable_poll_interval) => {
+        durable_steer = wait_for_durable_turn_steer(|| agent.has_pending_turn_steer_input(), durable_poll_interval) => {
             durable_steer.map_err(ToolError::Message)?;
             steered_wait_result()
         }
@@ -280,13 +280,13 @@ fn steered_wait_result() -> crate::app::AgentWaitResult {
     }
 }
 
-async fn wait_for_durable_turn_steer(
-    agent: &AgentRunContext,
+pub(crate) async fn wait_for_durable_turn_steer(
+    mut has_pending: impl FnMut() -> Result<bool, String>,
     durable_poll_interval: Duration,
 ) -> Result<(), String> {
     loop {
         tokio::time::sleep(durable_poll_interval).await;
-        if agent.has_pending_turn_steer_input()? {
+        if has_pending()? {
             return Ok(());
         }
     }

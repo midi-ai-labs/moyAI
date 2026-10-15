@@ -1,4 +1,5 @@
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import {
   DesktopCommandProbe,
@@ -11,7 +12,6 @@ import {
 import {
   WebviewInput,
   assertTrustedProbeSequence,
-  assertTrustedTextInsertion,
 } from "../drivers/webview_input.mjs";
 import {
   TAURI_MAIN_WINDOW_CLASS,
@@ -28,11 +28,14 @@ import {
 import { quiesceProviderResource } from "./provider_restart.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 
-const OWNER = "scenario:settings.preferences";
 export const SETTINGS_RESTORE_STABILITY_MS = 500;
 export const PROVIDER_CONTEXT_BEFORE = "65536";
 export const PROVIDER_CONTEXT_AFTER = "65537";
-export const MAIN_SYSTEM_PROMPT_MARKER = "E2E_MAIN_SYSTEM_PROMPT_MARKER";
+export const PROVIDER_CONTEXT_AFTER_APPROVE = "65538";
+export const APPROVE_MODEL_AFTER = "e2e-approve-independent";
+export const APPROVE_KEYS = Object.freeze(["base_url", "model", "provider_profile", "api_key_env",
+  "context_window", "request_timeout_ms", "connect_timeout_ms", "max_retries"].map(key => `approve.${key}`));
+export const MAIN_SYSTEM_PROMPT_MARKER = "e2e-main-system-prompt-marker";
 export const SETTINGS_PROVIDER_PROFILE = "openai_responses";
 export const SETTINGS_PROVIDER_API_KEY_ENV = "";
 export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
@@ -42,10 +45,6 @@ export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
   "lm_studio_chat_completions",
 ]);
 
-const SHOW_CONNECTION_SETTINGS = Object.freeze({
-  selector: 'aside.sidebar button.rail-item[data-action="show-config"][title="Settingsでglobal既定値を確認・変更"]',
-  identity: { tag: "BUTTON", action: "show-config" },
-});
 const PROVIDER_CONTEXT = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.context_window"]',
   identity: { tag: "INPUT", configKey: "model.context_window" },
@@ -70,10 +69,21 @@ const SETTINGS_MODEL = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-model"]',
   identity: { tag: "A", href: "#settings-model" },
 });
+const SETTINGS_APPROVE = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-approve"]',
+  identity: { tag: "A", href: "#settings-approve" },
+});
+const APPROVE_MODEL = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="approve.model"]',
+  identity: { tag: "INPUT", configKey: "approve.model" },
+});
+const DOCLING_CHECKBOX = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[type="checkbox"][data-config-key="docling.enabled"]',
+  identity: { tag: "INPUT", configKey: "docling.enabled" },
+});
 const DOCLING_TOGGLE = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] label.settings-toggle[data-config-key="docling.enabled"]',
   identity: { tag: "LABEL", configKey: "docling.enabled" },
-  forwardedClickIdentity: { tag: "INPUT", configKey: "docling.enabled" },
 });
 const CLOSE_SETTINGS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]',
@@ -214,6 +224,8 @@ export async function observeSettingsPreferencesSurface(cdp) {
         count: found.count,
         visible: found.visible,
         enabled: found.node instanceof HTMLInputElement && !found.node.disabled && !found.node.readOnly,
+        config_key: found.node instanceof HTMLInputElement ? found.node.dataset.configKey ?? null : null,
+        type: found.node instanceof HTMLInputElement ? found.node.type : null,
         value: found.node instanceof HTMLInputElement ? found.node.value : null,
         checked: found.node instanceof HTMLInputElement && found.node.type === 'checkbox' ? found.node.checked : null,
       };
@@ -249,15 +261,19 @@ export async function observeSettingsPreferencesSurface(cdp) {
     };
     const providerDialog = one('[role="dialog"][aria-labelledby="provider-dialog-title"]');
     const settingsDialog = one('[role="dialog"][aria-labelledby="config-dialog-title"]');
-    const connectionShortcut = one('aside.sidebar button.rail-item[data-action="show-config"]');
+    const settingsEntry = one('aside.sidebar button.settings[data-action="show-config"]');
     const settingsProviderLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-provider"]');
     const settingsSideChatLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]');
+    const settingsApproveLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-approve"]');
+    const approveInheritance = one('[role="dialog"][aria-labelledby="config-dialog-title"] [data-settings-passive="approve-config-inheritance"]');
+    const approveControls = rows('[role="dialog"][aria-labelledby="config-dialog-title"] #settings-approve .settings-control[data-config-key^="approve."]');
     const settingsToolsLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-tools"]');
     const settingsNavigationGroups = rows('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav > .settings-nav-group[role="heading"][aria-level="3"]');
     const settingsSessionOverridesLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-session-scope"]');
     const settingsWindowLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-desktop"]');
     const closeConfirmation = one('[role="alertdialog"][aria-labelledby="settings-close-confirm-title"]');
-    const doclingLabel = one('label.settings-toggle[data-config-key="docling.enabled"]');
+    const doclingLabel = one('[role="dialog"][aria-labelledby="config-dialog-title"] label.settings-toggle[data-config-key="docling.enabled"]');
+    const doclingInput = one('[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[type="checkbox"][data-config-key="docling.enabled"]');
     const doclingReadinessStatus = one('[role="dialog"][aria-labelledby="config-dialog-title"] #docling-readiness-status[data-settings-live-region="docling-readiness"]');
     const titlebarDrag = one('.app-titlebar .titlebar-drag[data-drag-region]');
     const dragRect = titlebarDrag.node instanceof HTMLElement ? titlebarDrag.node.getBoundingClientRect() : null;
@@ -267,12 +283,12 @@ export async function observeSettingsPreferencesSurface(cdp) {
         const selected = rows('button.nav-row[aria-current="page"][data-action="session"], button.nav-row[aria-current="page"][data-action="chat-session"]');
         return selected.map(identity);
       })(),
-      connection_shortcut: {
-        count: connectionShortcut.count,
-        visible: connectionShortcut.visible,
-        enabled: connectionShortcut.node instanceof HTMLButtonElement && !connectionShortcut.node.disabled,
-        text: connectionShortcut.node instanceof HTMLElement ? connectionShortcut.node.innerText.trim() : null,
-        title: connectionShortcut.node instanceof HTMLElement ? connectionShortcut.node.getAttribute('title') : null,
+      settings_entry: {
+        count: settingsEntry.count,
+        visible: settingsEntry.visible,
+        enabled: settingsEntry.node instanceof HTMLButtonElement && !settingsEntry.node.disabled,
+        text: settingsEntry.node instanceof HTMLElement ? settingsEntry.node.innerText.trim() : null,
+        title: settingsEntry.node instanceof HTMLElement ? settingsEntry.node.getAttribute('title') : null,
       },
       provider: {
         dialog_count: providerDialog.count,
@@ -291,6 +307,8 @@ export async function observeSettingsPreferencesSurface(cdp) {
         dialog_inert: settingsDialog.node instanceof HTMLElement && settingsDialog.node.closest('[inert]') !== null,
         profile: select('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.provider_profile"]'),
         api_key_env: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.api_key_env"]'),
+        connection_fields: ["model.base_url", "model.api_key_env", "side_chat.base_url", "side_chat.api_key_env"].map(key => ({ key,
+          ...input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="' + key + '"]') })),
         context: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.context_window"]'),
         system_prompt: textarea('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.system_prompt"]'),
         max_output_tokens: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.max_output_tokens"]'),
@@ -298,6 +316,9 @@ export async function observeSettingsPreferencesSurface(cdp) {
         docling_label: {
           count: doclingLabel.count,
           visible: doclingLabel.visible,
+          config_key: doclingLabel.node instanceof HTMLLabelElement ? doclingLabel.node.dataset.configKey ?? null : null,
+          associated_input: doclingInput.count === 1 && doclingInput.node instanceof HTMLInputElement
+            && doclingLabel.node instanceof HTMLLabelElement && doclingLabel.node.control === doclingInput.node,
           text: doclingLabel.node instanceof HTMLElement ? doclingLabel.node.innerText.trim() : null,
         },
         docling_readiness: {
@@ -316,6 +337,12 @@ export async function observeSettingsPreferencesSurface(cdp) {
         save: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]'),
         discard: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="discard-config-draft"]:not([hidden])'),
         close: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]'),
+        approve: {
+          fields: approveControls.map(node => ({ key: node.dataset.configKey, value: node.value,
+            enabled: !node.disabled && !node.readOnly, tag: node.tagName })),
+          inheritance: { count: approveInheritance.count,
+            text: approveInheritance.node instanceof HTMLElement ? approveInheritance.node.innerText.trim() : null },
+        },
         navigation: {
           groups: {
             count: settingsNavigationGroups.length,
@@ -324,6 +351,7 @@ export async function observeSettingsPreferencesSurface(cdp) {
           },
           provider: { count: settingsProviderLink.count, visible: settingsProviderLink.visible, text: settingsProviderLink.node instanceof HTMLElement ? settingsProviderLink.node.innerText.trim() : null },
           side_chat: { count: settingsSideChatLink.count, visible: settingsSideChatLink.visible, text: settingsSideChatLink.node instanceof HTMLElement ? settingsSideChatLink.node.innerText.trim() : null },
+          approve: { count: settingsApproveLink.count, visible: settingsApproveLink.visible, text: settingsApproveLink.node instanceof HTMLElement ? settingsApproveLink.node.innerText.trim() : null },
           tools: { count: settingsToolsLink.count, visible: settingsToolsLink.visible, text: settingsToolsLink.node instanceof HTMLElement ? settingsToolsLink.node.innerText.trim() : null },
           session_overrides: { count: settingsSessionOverridesLink.count, visible: settingsSessionOverridesLink.visible, text: settingsSessionOverridesLink.node instanceof HTMLElement ? settingsSessionOverridesLink.node.innerText.trim() : null },
           window: { count: settingsWindowLink.count, visible: settingsWindowLink.visible, text: settingsWindowLink.node instanceof HTMLElement ? settingsWindowLink.node.innerText.trim() : null },
@@ -365,18 +393,22 @@ export async function observeSettingsPreferencesSurface(cdp) {
   })()`);
 }
 
-export function shellReadyForSettingsDrag(surface, ledger) {
-  const rect = surface?.titlebar?.drag_rect;
+export function shellReadyForPreferences(surface, ledger) {
   return networkStillZero(ledger)
     && errorFree(surface)
     && surface?.projection?.overlay === "none"
     && surface?.visible_dialog_count === 0
     && surface?.visible_backdrop_count === 0
-    && surface?.connection_shortcut?.count === 1
-    && surface.connection_shortcut.visible === true
-    && surface.connection_shortcut.enabled === true
-    && surface.connection_shortcut.text === "接続設定"
-    && surface.connection_shortcut.title === "Settingsでglobal既定値を確認・変更"
+    && surface?.settings_entry?.count === 1
+    && surface.settings_entry.visible === true
+    && surface.settings_entry.enabled === true
+    && surface.settings_entry.text === "設定"
+    && surface.settings_entry.title === "設定";
+}
+
+export function shellReadyForSettingsDrag(surface, ledger) {
+  const rect = surface?.titlebar?.drag_rect;
+  return shellReadyForPreferences(surface, ledger)
     && surface?.titlebar?.drag_count === 1
     && surface?.titlebar?.drag_visible === true
     && Number.isFinite(rect?.left)
@@ -424,7 +456,8 @@ export function providerEditorReady(surface, ledger, expectedContext = PROVIDER_
 export function preferencesReady(
   surface,
   ledger,
-  { contextWindow, doclingEnabled, systemPrompt = MAIN_SYSTEM_PROMPT_MARKER },
+  { contextWindow, doclingEnabled, systemPrompt = MAIN_SYSTEM_PROMPT_MARKER,
+    approveConfigured = false, approveModel = null, approveSnapshot = null },
 ) {
   return networkStillZero(ledger)
     && errorFree(surface)
@@ -458,25 +491,26 @@ export function preferencesReady(
     && surface.settings.navigation?.groups?.count === 3
     && surface.settings.navigation.groups.visible_count === 3
     && sameValue(surface.settings.navigation.groups.texts, [
-      "Global Settings",
-      "Session-scoped Settings",
-      "Desktop Preferences",
+      "共通設定",
+      "チャットごとの設定",
+      "画面設定",
     ])
     && surface.settings.navigation?.provider?.count === 1
     && surface.settings.navigation.provider.visible === true
-    && surface.settings.navigation.provider.text === "Main Chat Settings"
+    && surface.settings.navigation.provider.text === "Main（メイン）"
     && surface.settings.navigation?.side_chat?.count === 1
     && surface.settings.navigation.side_chat.visible === true
-    && surface.settings.navigation.side_chat.text === "Side Chat Settings"
+    && surface.settings.navigation.side_chat.text === "Sub（サイドチャット）"
+    && approvePreferencesReady(surface, { configured: approveConfigured, model: approveModel, snapshot: approveSnapshot })
     && surface.settings.navigation?.tools?.count === 1
     && surface.settings.navigation.tools.visible === true
-    && surface.settings.navigation.tools.text === "Tools"
+    && surface.settings.navigation.tools.text === "ツール"
     && surface.settings.navigation?.session_overrides?.count === 1
     && surface.settings.navigation.session_overrides.visible === true
-    && surface.settings.navigation.session_overrides.text === "Session Overrides"
+    && surface.settings.navigation.session_overrides.text === "現在のチャット"
     && surface.settings.navigation?.window?.count === 1
     && surface.settings.navigation.window.visible === true
-    && surface.settings.navigation.window.text === "Window"
+    && surface.settings.navigation.window.text === "ウィンドウ"
     && surface?.close_confirmation?.count === 0
     && surface?.visible_dialog_count === 1
     && fieldValue(surface.projection, "model.context_window") === contextWindow
@@ -484,6 +518,29 @@ export function preferencesReady(
     && fieldValue(surface.projection, "model.provider_profile") === SETTINGS_PROVIDER_PROFILE
     && fieldValue(surface.projection, "model.api_key_env") === SETTINGS_PROVIDER_API_KEY_ENV
     && fieldValue(surface.projection, "docling.enabled") === String(doclingEnabled);
+}
+
+export function approveFields(projection) {
+  return APPROVE_KEYS.map(key => ({ key, text: fieldValue(projection, key) }));
+}
+
+export function approvePreferencesReady(surface, { configured = false, model = null, snapshot = null } = {}) {
+  const settings = surface?.settings, projection = surface?.projection;
+  const rows = settings?.approve?.fields;
+  return projection?.approve_model_configured === configured
+    && settings?.navigation?.approve?.count === 1 && settings.navigation.approve.visible === true
+    && settings.navigation.approve.text === "Approve（承認）"
+    && Array.isArray(rows) && rows.length === APPROVE_KEYS.length
+    && APPROVE_KEYS.every(key => rows.filter(row => row.key === key).length === 1
+      && rows.find(row => row.key === key).enabled === true
+      && rows.find(row => row.key === key).tag === (key === "approve.provider_profile" ? "SELECT" : "INPUT")
+      && rows.find(row => row.key === key).value === fieldValue(projection, key))
+    && settings.approve.inheritance?.count === 1
+    && (configured ? settings.approve.inheritance.text?.includes("Mainのモデル変更はApproveに反映されません")
+      : settings.approve.inheritance.text?.includes("Approveは未設定のため、実行時のMain"))
+    && (configured || APPROVE_KEYS.every(key => fieldValue(projection, key) === fieldValue(projection, key.replace("approve.", "model."))))
+    && (model === null || fieldValue(projection, "approve.model") === model)
+    && (snapshot === null || sameValue(approveFields(projection), snapshot));
 }
 
 export function dirtyDoclingPreferencesReady(surface, ledger, expectedTarget, expectedPersisted = false) {
@@ -535,6 +592,7 @@ export function savedPreferencesReady(surface, ledger, baselineTarget) {
     && surface?.settings?.docling?.checked === true
     && surface?.settings?.dirty_badge_visible === false
     && surface?.settings?.save?.enabled === false
+    && approvePreferencesReady(surface)
     && surface?.close_confirmation?.count === 0;
 }
 
@@ -542,6 +600,9 @@ export function createStablePreferencesDecision({
   expectedContext = PROVIDER_CONTEXT_AFTER,
   expectedDocling = true,
   expectedSystemPrompt = MAIN_SYSTEM_PROMPT_MARKER,
+  expectedApproveConfigured = false,
+  expectedApproveModel = null,
+  expectedApproveSnapshot = null,
   minimumStableMs = SETTINGS_RESTORE_STABILITY_MS,
   now = () => Date.now(),
 } = {}) {
@@ -552,6 +613,9 @@ export function createStablePreferencesDecision({
       contextWindow: expectedContext,
       doclingEnabled: expectedDocling,
       systemPrompt: expectedSystemPrompt,
+      approveConfigured: expectedApproveConfigured,
+      approveModel: expectedApproveModel,
+      approveSnapshot: expectedApproveSnapshot,
     });
     if (!accepted) {
       acceptedSince = null;
@@ -604,16 +668,37 @@ export function expectedResetThenClose(surface) {
   ];
 }
 
-export function expectedGlobalSave(surface, overrides = { "docling.enabled": "true" }) {
+export function expectedGlobalSave(surface, overrides = { "docling.enabled": "true" }, options = {}) {
   const projection = surface?.projection;
   if (!projection?.config_target) throw new TypeError("global save expectation requires a config target");
   return {
     command: "save_global_config",
     args: {
-      values: configValues(projection, overrides),
+      values: expectedConfigCommandValues(projection, overrides, options),
       expectedTarget: structuredClone(projection.config_target),
     },
   };
+}
+
+export function privateConnectionRegressionStages({ baseUrl, role, originalUrl, originalApi, apiReference }) {
+  return [
+    { name: "seed", url: `${baseUrl}/credential-seed-${role}`, api: apiReference, editApi: true },
+    { name: "explicit-same-reference", url: `${baseUrl}/credential-reuse-${role}`, api: apiReference, editApi: true },
+    { name: "url-only", url: `${baseUrl}/credential-clear-${role}`, api: "", editApi: false },
+    // The preceding URL-only save has already cleared the API field. Backspace
+    // on an empty field emits no input change and cannot declare explicit intent.
+    { name: "restore", url: originalUrl, api: originalApi, editApi: originalApi !== "" },
+  ];
+}
+
+export function savedPrivateConnectionReady(surface, ledger, { role, baseUrl, apiKeyEnv, baselineTarget }) {
+  return networkStillZero(ledger) && errorFree(surface) && surface?.projection?.overlay === "config"
+    && advancedConfigGeneration(surface.projection.config_target, baselineTarget)
+    && surface.settings?.dirty_badge_visible === false && surface.settings.save?.enabled === false
+    && [[`${role}.base_url`, baseUrl], [`${role}.api_key_env`, apiKeyEnv]].every(([key, value]) => {
+      const fields = surface.settings.connection_fields?.filter(field => field.key === key);
+      return fieldValue(surface.projection, key) === value && fields?.length === 1 && fields[0].count === 1 && fields[0].value === value;
+    });
 }
 
 function classifyObservationFailure(error, code, message) {
@@ -652,6 +737,49 @@ function surfaceDecision(predicate) {
   };
 }
 
+export function smallSettingsEditorWithinViewport(target, configKey, visualTag = "INPUT") {
+  const observed = target?.observation;
+  const rect = observed?.rect;
+  const clip = observed?.scroll_clip;
+  const viewport = observed?.viewport;
+  if (observed?.count !== 1 || observed.connected !== true || observed.visible !== true
+    || observed.enabled !== true || !["INPUT", "LABEL"].includes(visualTag) || observed.identity?.tag !== visualTag
+    || observed.identity.configKey !== configKey
+    || ![rect?.left, rect?.top, rect?.right, rect?.bottom, rect?.width, rect?.height,
+      clip?.left, clip?.top, clip?.right, clip?.bottom, viewport?.width, viewport?.height].every(Number.isFinite)) return false;
+  // Compact text inputs and the visible labels of custom switches must fit wholly inside the scroll viewport.
+  // A textarea's center or caret has a different visibility contract.
+  return rect.width > 0 && rect.height > 0
+    && rect.right > rect.left && rect.bottom > rect.top
+    && rect.left >= Math.max(0, clip.left) && rect.top >= Math.max(0, clip.top)
+    && rect.right <= Math.min(viewport.width, clip.right)
+    && rect.bottom <= Math.min(viewport.height, clip.bottom);
+}
+
+export function settingsToggleLabelAssociated(label, input, configKey) {
+  return label?.count === 1 && label.config_key === configKey && label.associated_input === true
+    && input?.count === 1 && input.config_key === configKey && input.type === "checkbox"
+    && input.enabled === true && typeof input.checked === "boolean";
+}
+
+async function waitForSmallSettingsEditor({ input, cdp, provider, locator, visualLocator = locator, label, predicate = () => true }) {
+  return waitForProductStage({
+    label,
+    sample: async () => ({
+      surface: await observeSettingsPreferencesSurface(cdp),
+      ledger: provider.requestLedger,
+      editor: await input.observeExactTarget(visualLocator),
+    }),
+    decide: (sample) => surfaceDecision((surface, ledger) => predicate(surface, ledger)
+      && smallSettingsEditorWithinViewport(sample.editor, locator.identity.configKey, visualLocator.identity.tag)
+      && (visualLocator === locator || settingsToggleLabelAssociated(
+        surface?.settings?.docling_label, surface?.settings?.docling, locator.identity.configKey,
+      )))(sample),
+    code: "settings-category-editor-outside-viewport",
+    message: "Settings category navigation did not expose the complete compact editor before any subsequent keyboard input",
+  });
+}
+
 export function trustedClickProbeEvents(locator) {
   const expected = [
     { type: "pointerdown", identity: locator.identity, button: 0, buttons: 1 },
@@ -688,13 +816,19 @@ function digitEvents(text, identity) {
   ]);
 }
 
-async function trustedReplaceDigits(input, locator, text) {
+function assertFocusedSettingsControl(snapshot, locator) {
+  if (!Object.entries(locator.identity).every(([field, value]) => snapshot.active?.[field] === value)) {
+    throw new DesktopE2eError("harness", "settings-text-focus-owner", "Settings keyboard input requires the exact already-focused control", { locator, active: snapshot.active });
+  }
+}
+
+export async function trustedReplaceFocusedSettingsDigits(input, locator, text) {
   if (!/^\d+$/.test(text)) throw new TypeError("trusted replacement requires decimal digits");
-  const click = await trustedClick(input, locator);
-  const start = click.sequence;
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  const start = before.sequence;
   await input.keyDown("Control");
-  await input.pressKey("a");
-  await input.keyUp("Control");
+  try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
   await input.typeText(text);
   const snapshot = await input.snapshotProbe(start);
   const probe = assertTrustedProbeSequence(snapshot, {
@@ -707,19 +841,89 @@ async function trustedReplaceDigits(input, locator, text) {
       ...digitEvents(text, locator.identity),
     ],
   });
-  return { click, probe, sequence: snapshot.sequence };
+  return { input_kind: "trusted-keyboard", initial_focus: before.active, probe, sequence: snapshot.sequence };
 }
 
-async function trustedInsertText(input, locator, text) {
-  const focus = await trustedClick(input, locator);
-  const start = (await input.snapshotProbe()).sequence;
-  const insertion = await input.insertText(locator, text);
-  const probe = assertTrustedTextInsertion(await input.snapshotProbe(start), {
-    afterSequence: start,
-    identity: locator.identity,
-    text,
+export async function trustedTypeFocusedSettingsText(input, locator, text) {
+  if (!/^[a-z0-9-]+$/.test(text)) throw new TypeError("Settings keyboard fixture requires lowercase ASCII, digits, or hyphens");
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  // Tab already acquired this editor. Keyboard input has no pointer center and must not
+  // force a second click on a partly clipped textarea whose caret is visible.
+  const typing = await input.typeText(text);
+  const probe = assertTrustedProbeSequence(await input.snapshotProbe(before.sequence), {
+    afterSequence: before.sequence,
+    expected: Array.from(text).flatMap((character) => [
+      { type: "keydown", identity: locator.identity, key: character },
+      { type: "input", identity: locator.identity, inputType: "insertText", data: character },
+      { type: "keyup", identity: locator.identity, key: character },
+    ]),
   });
-  return { focus, insertion, probe };
+  return { input_kind: "trusted-keyboard", initial_focus: before.active, typing, probe };
+}
+
+export async function trustedReplaceFocusedSettingsText(input, locator, text) {
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  await input.keyDown("Control");
+  try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
+  const selection = assertTrustedProbeSequence(await input.snapshotProbe(before.sequence), {
+    afterSequence: before.sequence, expected: [
+      { type: "keydown", identity: locator.identity, key: "Control", code: "ControlLeft" },
+      { type: "keydown", identity: locator.identity, key: "a", code: "KeyA" },
+      { type: "keyup", identity: locator.identity, key: "a", code: "KeyA" },
+      { type: "keyup", identity: locator.identity, key: "Control", code: "ControlLeft" },
+    ],
+  });
+  const typing = await trustedTypeFocusedSettingsText(input, locator, text);
+  return { initial_focus: before.active, selection, typing };
+}
+
+export async function trustedToggleFocusedSettingsCheckbox(input, locator) {
+  const before = await input.snapshotProbe();
+  assertFocusedSettingsControl(before, locator);
+  await input.pressKey(" ");
+  const probe = assertTrustedProbeSequence(await input.snapshotProbe(before.sequence), {
+    afterSequence: before.sequence, expected: [
+      { type: "keydown", identity: locator.identity, key: " ", code: "Space" },
+      { type: "keyup", identity: locator.identity, key: " ", code: "Space" },
+      { type: "click", identity: locator.identity },
+      { type: "input", identity: locator.identity },
+      { type: "change", identity: locator.identity },
+    ],
+  });
+  return { input_kind: "trusted-keyboard", initial_focus: before.active, probe };
+}
+
+export async function tabToSettingsControl(input, cdp, locator, { maxSteps = 30 } = {}) {
+  const start = (await input.snapshotProbe()).sequence;
+  const observations = [];
+  for (let steps = 0; steps <= maxSteps; steps += 1) {
+    const observed = await cdp.evaluate(`(() => {
+      const nodes = document.querySelectorAll(${JSON.stringify(locator.selector)});
+      const target = nodes.length === 1 ? nodes[0] : null;
+      const dialog = target?.closest('[role="dialog"][aria-labelledby="config-dialog-title"]');
+      return { count: nodes.length, focused: Boolean(target && document.activeElement === target),
+        available: Boolean(target && !target.disabled && !target.readOnly
+          && !target.closest('[hidden], [inert], details:not([open])')),
+        focus_in_dialog: Boolean(dialog?.contains(document.activeElement)) };
+    })()`);
+    observations.push(observed);
+    if (observed.count !== 1 || !observed.available || !observed.focus_in_dialog) {
+      throw productFailure("settings-tab-target-unavailable", "Settings keyboard navigation lost its available target or modal focus", { locator, steps, observations });
+    }
+    if (observed.focused) {
+      const probe = steps === 0 ? null : assertTrustedProbeSequence(await input.snapshotProbe(start), {
+        afterSequence: start, expected: Array.from({ length: steps }, () => [
+          { type: "keydown", key: "Tab", code: "Tab" },
+          { type: "keyup", key: "Tab", code: "Tab" },
+        ]).flat(),
+      });
+      return { locator, steps, observations, probe };
+    }
+    if (steps < maxSteps) await input.pressKey("Tab");
+  }
+  throw new DesktopE2eError("harness", "settings-tab-target-unreachable", "Settings control was not reached through bounded keyboard navigation", { locator, observations });
 }
 
 async function trustedEscape(input, identity) {
@@ -784,6 +988,23 @@ async function settleGenerationResources(state, input, commandProbe, generation,
 }
 
 export function createSettingsPreferencesScenario() {
+  return createPreferencesScenario({ id: "settings.preferences", nativeTitlebarDrag: true });
+}
+
+export function createSettingsPreferencesConfigScenario() {
+  return createPreferencesScenario({ id: "settings.preferences-config", nativeTitlebarDrag: false });
+}
+
+function createPreferencesScenario({ id, nativeTitlebarDrag }) {
+  const OWNER = `scenario:${id}`;
+  const coverage = Object.freeze({
+    settings_save_and_restart: "required",
+    private_connection_target_changes: nativeTitlebarDrag ? "not_tested" : "required",
+    native_titlebar_drag: nativeTitlebarDrag ? "required" : "not_tested",
+    native_drag_note: nativeTitlebarDrag
+      ? "Exact owned native titlebar drag is required before settings verification."
+      : "native drag未確認（このscenarioの対象外）。settings.preferencesの代替合格にはしません。",
+  });
   const state = {
     provider: null,
     acceptedLedger: null,
@@ -792,12 +1013,14 @@ export function createSettingsPreferencesScenario() {
     drag: null,
   };
   return Object.freeze({
-    id: "settings.preferences",
+    id,
+    coverage,
     productOracle: "pass",
     manualGate: "not_required",
     databaseRequired: true,
     requestGracefulExit,
     async prepare({ context, sink, phase }) {
+      await sink.record("settings-preferences-coverage", coverage, { phase, owner: OWNER });
       state.provider = await startScriptedProvider({ expectedPrompt: "settings-network-must-remain-unused" });
       await prepareDesktopFixture({
         context,
@@ -837,7 +1060,8 @@ export function createSettingsPreferencesScenario() {
         await firstInput.installProbe();
         await firstCommands.install();
         const shellSurface = await observeSettingsPreferencesSurface(firstCdp);
-        if (!shellReadyForSettingsDrag(shellSurface, provider.requestLedger)) {
+        const shellReady = nativeTitlebarDrag ? shellReadyForSettingsDrag : shellReadyForPreferences;
+        if (!shellReady(shellSurface, provider.requestLedger)) {
           throw productFailure("settings-shell-contract-mismatch", "Settings qualification shell was not error-free and idle", {
             surface: shellSurface,
             ledger: provider.requestLedger,
@@ -845,60 +1069,62 @@ export function createSettingsPreferencesScenario() {
         }
         const initialIdentity = selectedNavigationIdentity(shellSurface.projection);
 
-        const nativeOwner = {
-          executionRoot: context.root,
-          ownerPath: runtime.desktop_owner_path,
-          expectedOwner: runtime.desktop_owner,
-        };
-        const nativeSnapshot = await snapshotOwnedTopLevelWindows(nativeOwner);
-        const mainWindow = selectSingleOwnedRootWindow(nativeSnapshot, runtime.desktop_owner, {
-          expectedClassName: TAURI_MAIN_WINDOW_CLASS,
-        });
-        const dragRect = shellSurface.titlebar.drag_rect;
-        const dragDelta = chooseDragDelta(shellSurface.titlebar.screen);
-        const dragCommandStart = (await firstCommands.snapshot()).sequence;
-        const drag = await dragExactOwnedWindow({
-          ...nativeOwner,
-          candidate: mainWindow,
-          clientOffsetX: Math.round(dragRect.left + Math.min(dragRect.width / 2, 160)),
-          clientOffsetY: Math.round(dragRect.top + dragRect.height / 2),
-          deltaX: dragDelta.x,
-          deltaY: dragDelta.y,
-        });
-        state.drag = structuredClone(drag);
-        if (!exactOwnedWindowDragObserved(drag)) {
-          throw productFailure("settings-titlebar-drag-did-not-move-window", "trusted native titlebar drag did not move the exact Desktop window", drag);
+        if (nativeTitlebarDrag) {
+          const nativeOwner = {
+            executionRoot: context.root,
+            ownerPath: runtime.desktop_owner_path,
+            expectedOwner: runtime.desktop_owner,
+          };
+          const nativeSnapshot = await snapshotOwnedTopLevelWindows(nativeOwner);
+          const mainWindow = selectSingleOwnedRootWindow(nativeSnapshot, runtime.desktop_owner, {
+            expectedClassName: TAURI_MAIN_WINDOW_CLASS,
+          });
+          const dragRect = shellSurface.titlebar.drag_rect;
+          const dragDelta = chooseDragDelta(shellSurface.titlebar.screen);
+          const dragCommandStart = (await firstCommands.snapshot()).sequence;
+          const drag = await dragExactOwnedWindow({
+            ...nativeOwner,
+            candidate: mainWindow,
+            clientOffsetX: Math.round(dragRect.left + Math.min(dragRect.width / 2, 160)),
+            clientOffsetY: Math.round(dragRect.top + dragRect.height / 2),
+            deltaX: dragDelta.x,
+            deltaY: dragDelta.y,
+          });
+          state.drag = structuredClone(drag);
+          if (!exactOwnedWindowDragObserved(drag)) {
+            throw productFailure("settings-titlebar-drag-did-not-move-window", "trusted native titlebar drag did not move the exact Desktop window", drag);
+          }
+          const dragCommand = await waitForCommands(
+            firstCommands,
+            dragCommandStart,
+            [{ command: "start_window_drag", args: {} }],
+            "exact titlebar drag command",
+          );
+          const afterDrag = await observeSettingsPreferencesSurface(firstCdp);
+          if (!shellReadyForSettingsDrag(afterDrag, provider.requestLedger)
+            || !sameValue(selectedNavigationIdentity(afterDrag.projection), initialIdentity)) {
+            throw productFailure("settings-titlebar-drag-state-drift", "titlebar drag changed the idle Desktop state", { before: shellSurface, after: afterDrag });
+          }
+          await sink.record("settings-titlebar-drag-acquired", {
+            input_kind: "windows_sendinput_exact_hwnd",
+            native_snapshot: nativeSnapshot,
+            candidate: mainWindow,
+            drag,
+            command: dragCommand,
+          }, { phase: "executing", owner: OWNER });
         }
-        const dragCommand = await waitForCommands(
-          firstCommands,
-          dragCommandStart,
-          [{ command: "start_window_drag", args: {} }],
-          "exact titlebar drag command",
-        );
-        const afterDrag = await observeSettingsPreferencesSurface(firstCdp);
-        if (!shellReadyForSettingsDrag(afterDrag, provider.requestLedger)
-          || !sameValue(selectedNavigationIdentity(afterDrag.projection), initialIdentity)) {
-          throw productFailure("settings-titlebar-drag-state-drift", "titlebar drag changed the idle Desktop state", { before: shellSurface, after: afterDrag });
-        }
-        await sink.record("settings-titlebar-drag-acquired", {
-          input_kind: "windows_sendinput_exact_hwnd",
-          native_snapshot: nativeSnapshot,
-          candidate: mainWindow,
-          drag,
-          command: dragCommand,
-        }, { phase: "executing", owner: OWNER });
 
-        await trustedClick(firstInput, SHOW_CONNECTION_SETTINGS);
+        await trustedClick(firstInput, SHOW_SETTINGS);
         const providerOpened = await waitForProductStage({
-          label: "connection shortcut opened consolidated Preferences",
+          label: "Settings entry opened consolidated Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
           decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
             contextWindow: PROVIDER_CONTEXT_BEFORE,
             doclingEnabled: false,
             systemPrompt: "",
           })),
-          code: "settings-connection-shortcut-not-ready",
-          message: "the connection shortcut did not open consolidated Preferences in its exact offline state",
+          code: "settings-entry-not-ready",
+          message: "the Settings entry did not open consolidated Preferences in its exact offline state",
         });
         await trustedClick(firstInput, SETTINGS_PROVIDER);
         await waitForProductStage({
@@ -919,7 +1145,9 @@ export function createSettingsPreferencesScenario() {
           "model.system_prompt": MAIN_SYSTEM_PROMPT_MARKER,
         });
         const providerCommandStart = (await firstCommands.snapshot()).sequence;
-        const systemPromptTyping = await trustedInsertText(
+        const systemPromptNavigation = await tabToSettingsControl(firstInput, firstCdp, MAIN_SYSTEM_PROMPT);
+        await sink.record("settings-system-prompt-navigation", systemPromptNavigation, { phase: "executing", owner: OWNER });
+        const systemPromptTyping = await trustedTypeFocusedSettingsText(
           firstInput,
           MAIN_SYSTEM_PROMPT,
           MAIN_SYSTEM_PROMPT_MARKER,
@@ -940,7 +1168,13 @@ export function createSettingsPreferencesScenario() {
           code: "settings-model-category-not-focused",
           message: "Settings category navigation did not focus the canonical model editor",
         });
-        const providerTyping = await trustedReplaceDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER);
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: PROVIDER_CONTEXT,
+          label: "model editor fully visible from category navigation before Tab",
+        });
+        const contextNavigation = await tabToSettingsControl(firstInput, firstCdp, PROVIDER_CONTEXT);
+        await sink.record("settings-context-navigation", contextNavigation, { phase: "executing", owner: OWNER });
+        const providerTyping = await trustedReplaceFocusedSettingsDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER);
         const providerDirty = await waitForProductStage({
           label: "provider context edit ready to save",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
@@ -954,6 +1188,30 @@ export function createSettingsPreferencesScenario() {
           code: "settings-provider-edit-not-ready",
           message: "trusted provider context edit did not produce a saveable offline draft",
         });
+        const dirtyNavigationValuesRetained = (surface) => surface?.projection?.overlay === "config"
+          && sameValue(surface.projection.config_target, providerTarget)
+          && fieldValue(surface.projection, "model.context_window") === PROVIDER_CONTEXT_BEFORE
+          && surface.settings.context.value === PROVIDER_CONTEXT_AFTER
+          && surface.settings.system_prompt.value === MAIN_SYSTEM_PROMPT_MARKER
+          && surface.settings.dirty_badge_visible === true && surface.settings.save.enabled === true;
+        await trustedClick(firstInput, SETTINGS_TOOLS);
+        const dirtyToolsVisible = await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: DOCLING_CHECKBOX, visualLocator: DOCLING_TOGGLE,
+          label: "dirty model edit to Tools exposes Docling without Tab scrolling",
+          predicate: dirtyNavigationValuesRetained,
+        });
+        const dirtyToolsScreenshot = await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "settings-dirty-category-tools-visible", owner: OWNER });
+        await trustedClick(firstInput, SETTINGS_MODEL);
+        const dirtyModelVisible = await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: PROVIDER_CONTEXT,
+          label: "return to Model exposes unchanged dirty context without Tab scrolling",
+          predicate: dirtyNavigationValuesRetained,
+        });
+        await sink.record("settings-dirty-category-navigation", {
+          tools: dirtyToolsVisible.value, model: dirtyModelVisible.value,
+          screenshot: dirtyToolsScreenshot,
+          observation: "category clicks alone exposed the complete compact editors; no Tab or editor input intervened",
+        }, { phase: "executing", owner: OWNER });
         await trustedClick(firstInput, SAVE_GLOBAL_CONFIG);
         const providerSaved = await waitForProductStage({
           label: "consolidated provider global save settled",
@@ -1009,8 +1267,14 @@ export function createSettingsPreferencesScenario() {
           code: "settings-docling-toggle-not-visible",
           message: "trusted Settings navigation did not expose the stable Docling toggle",
         });
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: DOCLING_CHECKBOX, visualLocator: DOCLING_TOGGLE,
+          label: "Docling editor fully visible from category navigation before Tab",
+        });
         const dirtyTarget = structuredClone(preferencesOpened.value.surface.projection.config_target);
-        await trustedClick(firstInput, DOCLING_TOGGLE);
+        const doclingDraftNavigation = await tabToSettingsControl(firstInput, firstCdp, DOCLING_CHECKBOX);
+        const doclingDraftToggle = await trustedToggleFocusedSettingsCheckbox(firstInput, DOCLING_CHECKBOX);
+        await sink.record("settings-docling-draft-toggle", { navigation: doclingDraftNavigation, toggle: doclingDraftToggle }, { phase: "executing", owner: OWNER });
         const dirty = await waitForProductStage({
           label: "dirty Docling Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
@@ -1081,8 +1345,14 @@ export function createSettingsPreferencesScenario() {
           code: "settings-docling-toggle-not-visible-after-reopen",
           message: "Docling toggle was not actionable after reopening Preferences",
         });
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: DOCLING_CHECKBOX, visualLocator: DOCLING_TOGGLE,
+          label: "reopened Docling editor fully visible before Tab",
+        });
         const globalSaveTarget = structuredClone(reopenedClean.value.surface.projection.config_target);
-        await trustedClick(firstInput, DOCLING_TOGGLE);
+        const doclingSaveNavigation = await tabToSettingsControl(firstInput, firstCdp, DOCLING_CHECKBOX);
+        const doclingSaveToggle = await trustedToggleFocusedSettingsCheckbox(firstInput, DOCLING_CHECKBOX);
+        await sink.record("settings-docling-save-toggle", { navigation: doclingSaveNavigation, toggle: doclingSaveToggle }, { phase: "executing", owner: OWNER });
         const saveable = await waitForProductStage({
           label: "saveable Docling Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
@@ -1102,6 +1372,79 @@ export function createSettingsPreferencesScenario() {
           message: "global Save did not persist Docling while preserving the provider edit",
         });
         const globalCommand = await waitForCommands(firstCommands, globalCommandStart, [globalExpected], "global Preferences save command");
+        await trustedClick(firstInput, SETTINGS_APPROVE);
+        await waitForSmallSettingsEditor({
+          input: firstInput, cdp: firstCdp, provider, locator: APPROVE_MODEL,
+          label: "Approve category exposes its model editor before keyboard input",
+        });
+        const approveBefore = await observeSettingsPreferencesSurface(firstCdp);
+        if (!approvePreferencesReady(approveBefore)) throw productFailure(
+          "settings-approve-inheritance-mismatch", "Main and Docling saves implicitly configured Approve", approveBefore);
+        const otherConnections = configValues(approveBefore.projection).filter(row => /^(model|side_chat)\./.test(row.key));
+        const approveExpected = expectedGlobalSave(approveBefore, { "approve.model": APPROVE_MODEL_AFTER });
+        const approveCommandStart = (await firstCommands.snapshot()).sequence;
+        const approveNavigation = await tabToSettingsControl(firstInput, firstCdp, APPROVE_MODEL);
+        const approveTyping = await trustedReplaceFocusedSettingsText(firstInput, APPROVE_MODEL, APPROVE_MODEL_AFTER);
+        await waitForProductStage({
+          label: "Approve independent model draft is ready",
+          sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
+          decide: surfaceDecision(surface => surface.settings.approve.fields.find(row => row.key === "approve.model")?.value === APPROVE_MODEL_AFTER
+            && surface.settings.save.enabled && surface.settings.dirty_badge_visible
+            && sameValue(surface.projection.config_target, approveBefore.projection.config_target)
+            && surface.projection.approve_model_configured === false),
+          code: "settings-approve-draft-not-ready", message: "Approve model input did not create the independent draft",
+        });
+        await trustedClick(firstInput, SAVE_GLOBAL_CONFIG);
+        const approveSaved = await waitForProductStage({
+          label: "Approve independent model save",
+          timeoutMs: 30_000,
+          sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
+          decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
+            contextWindow: PROVIDER_CONTEXT_AFTER, doclingEnabled: true,
+            approveConfigured: true, approveModel: APPROVE_MODEL_AFTER,
+          }) && advancedConfigGeneration(surface.projection.config_target, approveBefore.projection.config_target)
+            && sameValue(configValues(surface.projection).filter(row => /^(model|side_chat)\./.test(row.key)), otherConnections)),
+          code: "settings-approve-save-mismatch", message: "Approve save changed Main/Sub or failed to create the independent settings",
+        });
+        const approveCommand = await waitForCommands(firstCommands, approveCommandStart, [approveExpected], "independent Approve save command");
+        const approveSnapshot = approveFields(approveSaved.value.surface.projection);
+        await trustedClick(firstInput, SETTINGS_APPROVE);
+        await waitForSmallSettingsEditor({ input: firstInput, cdp: firstCdp, provider, locator: APPROVE_MODEL,
+          label: "Saved Approve model is visible for its screenshot" });
+        const approveScreenshot = await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "settings-approve-saved", owner: OWNER });
+        await sink.record("settings-approve-save-acquired", { before: approveBefore, saved: approveSaved.value.surface,
+          navigation: approveNavigation, typing: approveTyping, command: approveCommand, screenshot: approveScreenshot,
+        }, { phase: "executing", owner: OWNER });
+
+        await trustedClick(firstInput, SETTINGS_MODEL);
+        await waitForSmallSettingsEditor({ input: firstInput, cdp: firstCdp, provider, locator: PROVIDER_CONTEXT,
+          label: "Main context editor available for independence check" });
+        await tabToSettingsControl(firstInput, firstCdp, PROVIDER_CONTEXT);
+        const mainChangeStart = (await firstCommands.snapshot()).sequence;
+        const mainChangeExpected = expectedGlobalSave(approveSaved.value.surface, { "model.context_window": PROVIDER_CONTEXT_AFTER_APPROVE });
+        const mainTyping = await trustedReplaceFocusedSettingsDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER_APPROVE);
+        await waitForProductStage({
+          label: "Main context draft after independent Approve save",
+          sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
+          decide: surfaceDecision(surface => surface.settings.context.value === PROVIDER_CONTEXT_AFTER_APPROVE
+            && surface.settings.save.enabled && sameValue(approveFields(surface.projection), approveSnapshot)),
+          code: "settings-main-independence-draft-mismatch", message: "Main edit changed the saved Approve snapshot",
+        });
+        await trustedClick(firstInput, SAVE_GLOBAL_CONFIG);
+        const independentSaved = await waitForProductStage({
+          label: "Main save preserves independent Approve snapshot",
+          timeoutMs: 30_000,
+          sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
+          decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
+            contextWindow: PROVIDER_CONTEXT_AFTER_APPROVE, doclingEnabled: true, approveConfigured: true,
+            approveModel: APPROVE_MODEL_AFTER, approveSnapshot,
+          }) && advancedConfigGeneration(surface.projection.config_target, approveSaved.value.surface.projection.config_target)),
+          code: "settings-main-save-changed-approve", message: "Main save did not retain the independent Approve settings",
+        });
+        const mainChangeCommand = await waitForCommands(firstCommands, mainChangeStart, [mainChangeExpected], "Main save after Approve configuration");
+        await sink.record("settings-main-approve-independence", { saved: independentSaved.value.surface,
+          typing: mainTyping, command: mainChangeCommand, approve_snapshot: approveSnapshot,
+        }, { phase: "executing", owner: OWNER });
         const savedScreenshot = await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "settings-preferences-saved", owner: OWNER });
         const cleanCloseStart = (await firstCommands.snapshot()).sequence;
         await trustedClick(firstInput, CLOSE_SETTINGS);
@@ -1142,12 +1485,13 @@ export function createSettingsPreferencesScenario() {
         secondInput = new WebviewInput(restarted.driver, { probeId: "settings-preferences-g2" });
         secondCommands = new DesktopCommandProbe(restarted.driver, {
           probeId: "settings-preferences-g2",
-          commands: ["close_overlay"],
+          commands: ["close_overlay", "save_global_config"],
         });
         await secondInput.installProbe();
         await secondCommands.install();
         await trustedClick(secondInput, SHOW_SETTINGS);
-        const stableDecision = createStablePreferencesDecision();
+        const stableDecision = createStablePreferencesDecision({ expectedContext: PROVIDER_CONTEXT_AFTER_APPROVE,
+          expectedApproveConfigured: true, expectedApproveModel: APPROVE_MODEL_AFTER, expectedApproveSnapshot: approveSnapshot });
         const restored = await waitForProductStage({
           label: "persisted Preferences after exact Desktop restart",
           timeoutMs: 30_000,
@@ -1156,6 +1500,9 @@ export function createSettingsPreferencesScenario() {
           code: "settings-restart-persistence-mismatch",
           message: "restart did not stably restore provider and Docling settings without network activity",
         });
+        await trustedClick(secondInput, SETTINGS_APPROVE);
+        await waitForSmallSettingsEditor({ input: secondInput, cdp: restarted.driver, provider, locator: APPROVE_MODEL,
+          label: "Restored Approve model is visible for its screenshot" });
         const restoredScreenshot = await captureScenarioScreenshot({ cdp: restarted.driver, sink, name: "settings-preferences-restored", owner: OWNER });
         const restoredCloseStart = (await secondCommands.snapshot()).sequence;
         await trustedClick(secondInput, CLOSE_SETTINGS);
@@ -1167,8 +1514,65 @@ export function createSettingsPreferencesScenario() {
           message: "restored clean Preferences did not close exactly",
         });
         const restoredCloseCommand = await waitForCommands(secondCommands, restoredCloseStart, [{ command: "close_overlay", args: {} }], "restored Preferences close command");
+        if (!nativeTitlebarDrag) {
+          await trustedClick(secondInput, SHOW_SETTINGS);
+          await waitForProductStage({ label: "Preferences reopens for private connection changes",
+            sample: async () => ({ surface: await observeSettingsPreferencesSurface(restarted.driver), ledger: provider.requestLedger }),
+            decide: surfaceDecision(surface => surface.projection.overlay === "config" && !surface.settings.dirty_badge_visible),
+            code: "settings-private-connection-not-open", message: "Preferences did not reopen for the connection regression" });
+          const privateBaseline = await observeSettingsPreferencesSurface(restarted.driver);
+          const apiReference = "MOYAI_E2E_UNUSED_API_KEY";
+          const privateProof = [];
+          for (const role of ["model", "side_chat"]) {
+            const baseKey = `${role}.base_url`, apiKey = `${role}.api_key_env`;
+            const originalUrl = fieldValue(privateBaseline.projection, baseKey), originalApi = fieldValue(privateBaseline.projection, apiKey);
+            const category = role === "model" ? SETTINGS_PROVIDER : { selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]',
+              identity: { tag: "A", href: "#settings-side-chat" } };
+            for (const stage of privateConnectionRegressionStages({ baseUrl: provider.baseUrl, role, originalUrl, originalApi, apiReference })) {
+              const before = await observeSettingsPreferencesSurface(restarted.driver);
+              const overrides = { [baseKey]: stage.url, ...(stage.editApi ? { [apiKey]: stage.api } : {}) };
+              const expected = expectedGlobalSave(before, overrides, { editedKeys: stage.editApi ? [apiKey] : [] });
+              const commandStart = (await secondCommands.snapshot()).sequence;
+              await trustedClick(secondInput, category);
+              const edits = [];
+              for (const [key, value] of [[baseKey, stage.url], ...(stage.editApi ? [[apiKey, stage.api]] : [])]) {
+                const locator = { selector: `[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key=${JSON.stringify(key)}]`,
+                  identity: { tag: "INPUT", configKey: key } };
+                const navigation = await tabToSettingsControl(secondInput, restarted.driver, locator);
+                const probeStart = (await secondInput.snapshotProbe()).sequence;
+                await secondInput.keyDown("Control"); try { await secondInput.pressKey("a"); } finally { await secondInput.keyUp("Control"); }
+                const typing = value === "" ? await secondInput.pressKey("Backspace") : await secondInput.insertText(locator, value);
+                edits.push({ key, navigation, typing, probe: await secondInput.snapshotProbe(probeStart) });
+              }
+              await waitForProductStage({ label: `${role} ${stage.name} connection draft is saveable`,
+                sample: async () => ({ surface: await observeSettingsPreferencesSurface(restarted.driver), ledger: provider.requestLedger }),
+                decide: surfaceDecision(surface => surface.settings.save.enabled && surface.settings.dirty_badge_visible
+                  && sameValue(surface.projection.config_target, before.projection.config_target)
+                  && surface.settings.connection_fields.find(field => field.key === baseKey)?.value === stage.url),
+                code: "settings-private-connection-draft-mismatch", message: "Trusted connection edits did not create the expected saveable draft" });
+              await trustedClick(secondInput, SAVE_GLOBAL_CONFIG);
+              const saved = await waitForProductStage({ label: `${role} ${stage.name} credential boundary persisted`, timeoutMs: 30_000,
+                sample: async () => ({ surface: await observeSettingsPreferencesSurface(restarted.driver), ledger: provider.requestLedger }),
+                decide: surfaceDecision((surface, ledger) => savedPrivateConnectionReady(surface, ledger, { role, baseUrl: stage.url, apiKeyEnv: stage.api,
+                  baselineTarget: before.projection.config_target })),
+                code: "settings-private-connection-save-mismatch", message: "Saved connection reused an unedited credential or dropped the explicit reference" });
+              const command = await waitForCommands(secondCommands, commandStart, [expected], `${role} ${stage.name} exact sparse config command`);
+              privateProof.push({ role, stage: stage.name, edits, command, saved_generation: saved.value.surface.projection.config_target.configGeneration,
+                api_reference_present: fieldValue(saved.value.surface.projection, apiKey) === apiReference });
+            }
+          }
+          const privateRestored = await observeSettingsPreferencesSurface(restarted.driver);
+          if (!sameValue(configValues(privateRestored.projection), configValues(privateBaseline.projection)))
+            throw productFailure("settings-private-connection-restore-mismatch", "Private connection regression did not restore the original saved settings", { before: privateBaseline, after: privateRestored });
+          await sink.record("settings-private-connection-boundaries", { stages: privateProof, provider_ledger: provider.requestLedger,
+            scope: "Actual Main/Sub Settings input and exact sparse Save commands, same-value explicit API reference reuse, URL-only credential clearing, and public GUI restoration; no model/catalog requests." }, { phase: "executing", owner: OWNER });
+          const privateCloseStart = (await secondCommands.snapshot()).sequence;
+          await trustedClick(secondInput, CLOSE_SETTINGS);
+          await waitForCommands(secondCommands, privateCloseStart, [{ command: "close_overlay", args: {} }], "private connection regression clean close");
+        }
         state.acceptedLedger = structuredClone(provider.requestLedger);
         await sink.record("settings-preferences-restored", {
+          coverage,
           restart: restarted.restart,
           surface: restored.value.surface,
           stable_for_ms: SETTINGS_RESTORE_STABILITY_MS,
@@ -1213,6 +1617,7 @@ export function createSettingsPreferencesScenario() {
         input: resourcesPass && dragPass && quiescePass ? "pass" : "fail",
         resources: [{
           kind: "settings-preferences-verification",
+          coverage,
           generation_resources: state.generationResources,
           native_drag_release_verified: state.drag?.button_release_verified ?? null,
           native_cursor_restore_succeeded: state.drag?.cursor_restore_succeeded ?? null,

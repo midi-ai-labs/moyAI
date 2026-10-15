@@ -3,6 +3,7 @@ import path from "node:path";
 import { readFile, readdir } from "node:fs/promises";
 
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import {
   DesktopCommandProbe,
@@ -240,14 +241,6 @@ function fieldValue(projection, key) {
   return matches.length === 1 ? matches[0].value : null;
 }
 
-function configValues(projection, overrides = {}) {
-  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
-  return fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
-}
-
 function projectedHostOwnedGenerationKeys(projection) {
   const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
   return [...new Set(fields
@@ -267,7 +260,7 @@ export function expectedLmStudioThinkingGlobalSave(surface, options) {
   return {
     command: "save_global_config",
     args: {
-      values: configValues(projection, {
+      values: expectedConfigCommandValues(projection, {
         "model.base_url": desired.baseUrl,
         "model.model": desired.model,
         "model.provider_profile": desired.providerProfile,

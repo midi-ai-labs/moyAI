@@ -66,7 +66,10 @@ impl DoclingClient {
     pub fn new(config: DoclingConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Docling HTTP client"),
         }
     }
 
@@ -597,6 +600,89 @@ mod tests {
         assert!(matches!(error, ToolError::RunInterrupted));
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn docling_does_not_follow_redirects_outside_the_approved_endpoint() {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unrelated origin");
+        let target_address = target_listener.local_addr().unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let target_observed = observed.clone();
+        let target =
+            Router::new().fallback(any(move |headers: axum::http::HeaderMap, body: Bytes| {
+                let observed = target_observed.clone();
+                async move {
+                    observed.lock().unwrap().push((
+                        headers.get("X-Api-Key").is_some(),
+                        body.windows(b"private-document.pdf".len())
+                            .any(|bytes| bytes == b"private-document.pdf"),
+                    ));
+                    axum::Json(json!({"document":{"md_content":"converted"},"status":"success"}))
+                }
+            }));
+        let target_server = tokio::spawn(async move {
+            axum::serve(target_listener, target).await.unwrap();
+        });
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind approved origin");
+        let source_address = source_listener.local_addr().unwrap();
+        let source = Router::new().fallback(any(move || async move {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(
+                    axum::http::header::LOCATION,
+                    format!("http://{target_address}/receive"),
+                )],
+            )
+        }));
+        let source_server = tokio::spawn(async move {
+            axum::serve(source_listener, source).await.unwrap();
+        });
+        let client = DoclingClient::new(DoclingConfig {
+            enabled: true,
+            base_url: format!("http://{source_address}"),
+            timeout_ms: 2_000,
+            api_key_env: None,
+            headers: BTreeMap::from([("X-Api-Key".into(), "fixture-only-key".into())]),
+        });
+        let mut admissions = 0;
+        let conversion = client
+            .convert(
+                DoclingConvertRequest {
+                    local_input: None,
+                    source_url: Some("https://example.test/private-document.pdf".into()),
+                    from_formats: Vec::new(),
+                    to_formats: vec!["md".into()],
+                    do_ocr: None,
+                    include_images: Some(false),
+                    page_range: None,
+                },
+                || {
+                    admissions += 1;
+                    Ok(())
+                },
+            )
+            .await;
+        let readiness = client.check_readiness().await;
+        source_server.abort();
+        target_server.abort();
+        let _ = source_server.await;
+        let _ = target_server.await;
+
+        assert_eq!(admissions, 1);
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed.is_empty(),
+            "unapproved origin received requests (credential header, source body): {observed:?}"
+        );
+        let error = conversion.expect_err("a redirect is not an approved conversion target");
+        assert!(error.to_string().contains("HTTP 307"));
+        let readiness = readiness.expect("redirect is a typed readiness response");
+        assert_eq!(readiness.http_status, 307);
+        assert!(!readiness.ready);
     }
 
     #[tokio::test]

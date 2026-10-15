@@ -1,70 +1,200 @@
 import { scenario as shellBaseline } from "./scenarios/shell_baseline.mjs";
+import { createShellAboutScenario } from "./scenarios/shell_about.mjs";
+import { createShellSingleInstanceScenario } from "./scenarios/shell_single_instance.mjs";
+import { createColdJoinConfigScenario, createWarmJoinConfigScenario } from "./scenarios/hub_join_config.mjs";
+import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
+import { createShellManagedLifecycleScenario } from "./scenarios/shell_managed_lifecycle.mjs";
+import { createHubOfflineResetScenario } from "./scenarios/hub_offline_reset.mjs";
+import { createHubBrowserEnrollmentScenario } from "./scenarios/hub_browser_enrollment.mjs";
+import { createHubJoinRetryControlsScenario } from "./scenarios/hub_join_retry_controls.mjs";
+import { createOutputHistoryNavigationScenario } from "./scenarios/output_history_navigation.mjs";
+import { createReviewControlsScenario } from "./scenarios/review_controls.mjs";
 import { createNativeDialogCancelScenario } from "./scenarios/native_dialog_cancel.mjs";
+import { createSessionManagementScenario } from "./scenarios/session_management.mjs";
+import { createWorkspaceControlsScenario } from "./scenarios/workspace_controls.mjs";
+import { createModalKeyboardControlsScenario } from "./scenarios/modal_keyboard_controls.mjs";
+import { createRunningNavigationScenario } from "./scenarios/running_navigation_controls.mjs";
+import { createMainSteerControlsScenario, createHistoryRailControlsScenario, createMainGoalQueryScenario, createShortcutRowControlsScenario, createPaletteRunControlsScenario } from "./scenarios/main_runtime_controls.mjs";
 import { createPointerKeyboardScenario } from "./scenarios/pointer_keyboard.mjs";
+import { createCommandPaletteInsertionScenario } from "./scenarios/command_palette_insertion.mjs";
 import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_cancel.mjs";
+import { createPromptReviewSubmitScenario, createPromptReviewRawInteractionScenario } from "./scenarios/prompt_review_submit.mjs";
 import { createProviderConnectionLiveScenario } from "./scenarios/provider_connection_live.mjs";
 import { createLmStudioThinkingScenario } from "./scenarios/provider_lm_studio_thinking.mjs";
 import {
   createPermissionRestartGuardianChatScenario,
   createPermissionRestartGuardianScenario,
 } from "./scenarios/permission_restart_guardian.mjs";
+import { createGuardianHandoffScenario } from "./scenarios/permission_guardian_handoff.mjs";
 import {
-  createPermissionGuardianOpenAiCompatibleScenario,
-  createPermissionTempEscalationLmStudioScenario,
-  createPermissionTempEscalationScenario,
-} from "./scenarios/permission_temp_escalation.mjs";
+  createPermissionTempWriteOpenAiCompatibleScenario,
+  createPermissionTempWriteLmStudioScenario,
+  createPermissionTempWriteScenario,
+} from "./scenarios/permission_temp_write.mjs";
 import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
+import { createToolOperationFailureScenario } from "./scenarios/tool_operation_failure.mjs";
+import { createShellProjectionAccuracyScenario } from "./scenarios/shell_projection_accuracy.mjs";
 import { createProviderResponsesCompactionRetryScenario } from "./scenarios/provider_responses_compaction_retry.mjs";
 import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunNextTurnScenario } from "./scenarios/run_next_turn.mjs";
+import { createLocalLatestMessageEditScenario } from "./scenarios/local_latest_message_edit.mjs";
 import { createRunStopScenario } from "./scenarios/run_stop.mjs";
 import { createSideChatQuoteScenario } from "./scenarios/side_chat_quote.mjs";
 import { createSideChatSessionScenario } from "./scenarios/side_chat_session.mjs";
 import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_docling_readiness.mjs";
 import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial_setup.mjs";
-import { createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
+import { createInitialSetupHubScenario, createInitialSetupHubPreferencesFailureScenario } from "./scenarios/settings_initial_setup_hub.mjs";
+import { createSharedWorkEntryScenario } from "./scenarios/shared_work_entry.mjs";
+import { createSharedWorkIsolationScenario } from "./scenarios/shared_work_isolation.mjs";
+import { createSharedWorkContinuationScenario, createProjectFolderRecoveryScenario } from "./scenarios/shared_work_continuation.mjs";
+import { createDeviceExecutionScenario } from "./scenarios/device_execution.mjs";
+import { createOnboardingWinAbScenario } from "./scenarios/onboarding_winab.mjs";
+import { createFourDeviceAcceptanceScenario } from "./scenarios/four_device_acceptance.mjs";
+import { createSettingsPreferencesConfigScenario, createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
+import { createMenuEntryControlsScenario, createPaletteEntryControlsScenario } from "./scenarios/shell_entry_controls.mjs";
+import { createSettingsFieldControlsScenario, createInitialSettingsFieldControlsScenario, createSessionSettingsFieldControlsScenario } from "./scenarios/settings_field_controls.mjs";
+import { createGlobalAdditionalControlsScenario, createInitialAdditionalControlsScenario, createSessionDiscardCloseScenario, createTemporaryApplyControlsScenario } from "./scenarios/settings_additional_controls.mjs";
 import { createAgentInterruptScenario } from "./scenarios/agent_interrupt.mjs";
+import { createExternalRejoinScenario, createExternalSidebarStopScenario, createExternalPaletteRejoinScenario } from "./scenarios/external_navigation_controls.mjs";
 import { createCase52Scenario } from "./scenarios/case5_2.mjs";
+import { createManualCase1Scenario } from "./scenarios/manual_case1.mjs";
+import { createManualCase2Scenario } from "./scenarios/manual_case2.mjs";
+import { createManualCase3Scenario } from "./scenarios/manual_case3.mjs";
+import { createManualCase4Scenario } from "./scenarios/manual_case4.mjs";
+import { createManualCase5Scenario } from "./scenarios/manual_case5.mjs";
+import { createManualCase6Scenario } from "./scenarios/manual_case6.mjs";
+import { createManualCase7Scenario } from "./scenarios/manual_case7.mjs";
+import { createManualSuiteScenario } from "./scenarios/manual_suite.mjs";
+import { createManualSuiteControlsScenario } from "./scenarios/manual_suite_controls.mjs";
 import { createHistoryRestartPrependScenario } from "./scenarios/history_restart_prepend.mjs";
 import { createHistoryTerminalReconcileScenario } from "./scenarios/history_terminal_reconcile.mjs";
 
 const factories = new Map([
   [shellBaseline.id, () => shellBaseline],
+  ["shell.about", createShellAboutScenario],
+  ["shell.single-instance", createShellSingleInstanceScenario],
+  ["hub.join-config-cold", createColdJoinConfigScenario],
+  ["hub.join-config-warm", createWarmJoinConfigScenario],
+  ["shell.lynx", createShellLynxScenario],
+  ["shell.managed-lifecycle", createShellManagedLifecycleScenario],
+  ["hub.browser-enrollment", createHubBrowserEnrollmentScenario],
+  ["hub.offline-reset", createHubOfflineResetScenario],
+  ["settings.shared-work", createSharedWorkEntryScenario],
+  ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
+  ["settings.shared-work-continuation", createSharedWorkContinuationScenario],
+  ["settings.project-folder-recovery", createProjectFolderRecoveryScenario],
+  ["run.latest-message-edit", createLocalLatestMessageEditScenario],
+  ["settings.device-execution", createDeviceExecutionScenario],
+  ["onboarding.win-a-to-win-b", createOnboardingWinAbScenario],
+  ["project.four-device-acceptance", createFourDeviceAcceptanceScenario],
+  ["hub.join-retry-controls", createHubJoinRetryControlsScenario],
   ["agent.interrupt", createAgentInterruptScenario],
   ["history.restart-prepend", createHistoryRestartPrependScenario],
   ["history.terminal-reconcile", createHistoryTerminalReconcileScenario],
   ["input.pointer-keyboard", createPointerKeyboardScenario],
+  ["input.command-palette-insertion", createCommandPaletteInsertionScenario],
+  ["manual.case1", createManualCase1Scenario],
+  ["manual.case2", createManualCase2Scenario],
+  ["manual.case3", createManualCase3Scenario],
+  ["manual.case4", createManualCase4Scenario],
+  ["manual.case5", createManualCase5Scenario],
+  ["manual.case6", createManualCase6Scenario],
+  ["manual.case7", createManualCase7Scenario],
   ["manual.case5_2", createCase52Scenario],
+  ["manual.suite", options => createManualSuiteScenario(options, { createScenario })],
+  ["manual.suite-controls", createManualSuiteControlsScenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
-  ["manual.permission-guardian-openai-compatible", createPermissionGuardianOpenAiCompatibleScenario],
-  ["manual.permission-temp-escalation-lm-studio", createPermissionTempEscalationLmStudioScenario],
+  ["manual.permission-temp-write-openai-compatible", createPermissionTempWriteOpenAiCompatibleScenario],
+  ["manual.permission-temp-write-lm-studio", createPermissionTempWriteLmStudioScenario],
   ["native-dialog.cancel", createNativeDialogCancelScenario],
+  ["navigation.session-management", createSessionManagementScenario],
+  ["navigation.workspace-controls", createWorkspaceControlsScenario],
+  ["navigation.modal-keyboard-controls", createModalKeyboardControlsScenario],
+  ["navigation.running-controls", createRunningNavigationScenario],
+  ["navigation.external-rejoin", createExternalRejoinScenario],
+  ["navigation.external-sidebar-stop", createExternalSidebarStopScenario],
+  ["navigation.external-palette-rejoin", createExternalPaletteRejoinScenario],
+  ["main.steer-controls", createMainSteerControlsScenario],
+  ["history.rail-controls", createHistoryRailControlsScenario],
+  ["main.goal-query", createMainGoalQueryScenario],
+  ["prompt-review.entries-enhanced", () => createPromptReviewSubmitScenario({ choice: "enhanced", enhanceEntries: "menu-palette" })],
+  ["navigation.shortcut-row-controls", createShortcutRowControlsScenario],
+  ["main.palette-run-controls", createPaletteRunControlsScenario],
+  ["output.history-navigation", createOutputHistoryNavigationScenario],
   ["prompt-review.cancel", createPromptReviewCancelScenario],
+  ["prompt-review.raw-interaction", createPromptReviewRawInteractionScenario],
+  ["review.uncommitted-controls", createReviewControlsScenario],
+  ["prompt-review.submit-raw", () => createPromptReviewSubmitScenario({ choice: "raw" })],
+  ["prompt-review.submit-enhanced", () => createPromptReviewSubmitScenario({ choice: "enhanced" })],
   ["permission.restart-guardian", createPermissionRestartGuardianScenario],
   ["permission.restart-guardian-chat", createPermissionRestartGuardianChatScenario],
-  ["permission.temp-escalation", createPermissionTempEscalationScenario],
+  ["permission.guardian-handoff-approve", () => createGuardianHandoffScenario("approve")],
+  ["permission.guardian-handoff-abort", () => createGuardianHandoffScenario("abort")],
+  ["permission.guardian-handoff-stop", () => createGuardianHandoffScenario("stop")],
+  ["permission.temp-write", createPermissionTempWriteScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
+  ["history.tool-operation-failure", createToolOperationFailureScenario],
+  ["permission.shell-projection-success", () => createShellProjectionAccuracyScenario("success")],
+  ["permission.shell-projection-failure", () => createShellProjectionAccuracyScenario("failure")],
   ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],
   ["provider.responses-progress", createProviderResponsesProgressScenario],
   ["provider.restart", createProviderRestartScenario],
   ["settings.docling-readiness", createSettingsDoclingReadinessScenario],
   ["settings.initial-setup", createSettingsInitialSetupScenario],
+  ["settings.initial-setup-hub", createInitialSetupHubScenario],
+  ["settings.initial-setup-hub-preferences-failure", createInitialSetupHubPreferencesFailureScenario],
   ["settings.preferences", createSettingsPreferencesScenario],
+  ["settings.preferences-config", createSettingsPreferencesConfigScenario],
   ["settings.session", createSettingsSessionScenario],
+  ["settings.field-controls", createSettingsFieldControlsScenario],
+  ["settings.additional-controls", createGlobalAdditionalControlsScenario],
+  ["settings.initial-additional-controls", createInitialAdditionalControlsScenario],
+  ["settings.session-discard-close", createSessionDiscardCloseScenario],
+  ["settings.temporary-apply-controls", createTemporaryApplyControlsScenario],
+  ["settings.initial-field-controls", createInitialSettingsFieldControlsScenario],
+  ["settings.session-field-controls", createSessionSettingsFieldControlsScenario],
+  ["navigation.menu-entry-controls", createMenuEntryControlsScenario],
+  ["navigation.palette-entry-controls", createPaletteEntryControlsScenario],
   ["run.next-turn", createRunNextTurnScenario],
   ["run.stop", createRunStopScenario],
   ["side-chat.quote", createSideChatQuoteScenario],
   ["side-chat.session", createSideChatSessionScenario],
 ]);
 const configurableScenarios = new Set([
+  "hub.join-config-cold",
+  "hub.join-config-warm",
+  "settings.initial-setup-hub",
+  "settings.initial-setup-hub-preferences-failure",
+  "settings.shared-work",
+  "settings.shared-work-isolation",
+  "settings.shared-work-continuation",
+  "settings.project-folder-recovery",
+  "settings.device-execution",
+  "onboarding.win-a-to-win-b",
+  "project.four-device-acceptance",
+  "agent.interrupt",
+  "navigation.external-rejoin",
+  "navigation.external-sidebar-stop",
+  "navigation.external-palette-rejoin",
+  "hub.browser-enrollment",
+  "hub.offline-reset",
+  "hub.join-retry-controls",
+  "manual.case1",
+  "manual.case2",
+  "manual.case3",
+  "manual.case4",
+  "manual.case5",
+  "manual.case6",
+  "manual.case7",
   "manual.case5_2",
+  "manual.suite",
   "manual.provider-openai-compatible",
   "manual.provider-lm-studio-thinking",
-  "manual.permission-guardian-openai-compatible",
-  "manual.permission-temp-escalation-lm-studio",
+  "manual.permission-temp-write-openai-compatible",
+  "manual.permission-temp-write-lm-studio",
 ]);
 
 export const scenarioIds = Object.freeze([...factories.keys()]);

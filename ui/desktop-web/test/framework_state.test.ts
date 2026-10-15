@@ -48,6 +48,7 @@ import {
 import {
   renderArtifactPane,
   renderComposer,
+  renderDesktopMarkup,
   renderLocalConfirmation,
   renderOverlay,
   renderSidebar,
@@ -154,7 +155,34 @@ test("Initial Setup projects imported sensitive configured metadata without expo
   assert.equal(projectViewState(drifted, ui).config_fields[0]?.configured, false);
 });
 
-test("Initial Setup catalog evidence is invalidated by A to B to A config-draft edits", () => {
+test("config catalog requests exclude old connection credentials unless explicitly re-entered", () => {
+  for (const change of [null, ["model.base_url", "https://new.example.test/v1"],
+    ["model.provider_profile", "lm_studio"]] as const) {
+    for (const reenter of [false, true]) {
+      const fields: ConfigFieldProjection[] = [
+        { key: "model.base_url", value: "https://old.example.test/v1" },
+        { key: "model.provider_profile", value: "openai_compatible" },
+        { key: "model.api_key_env", value: "OLD_KEY" },
+      ].map(field => ({ ...field, env_override: null, value_type: "string", required: false,
+        min_value: null, max_value: null, options: [] }));
+      const state = projection({ overlay: "config", config_fields: fields,
+        provider_base_url: fields[0].value, provider_effective_base_url: fields[0].value,
+        provider_profile: "openai_compatible", provider_effective_profile: "openai_compatible",
+        provider_api_key_env: "OLD_KEY" });
+      const ui = createUiLocalState();
+      reconcileUiDrafts(ui, null, state);
+      const baseline = fields.map(field => ({ key: field.key, text: field.value }));
+      if (change) updateConfigDraftValue(ui, state.config_target, baseline, change[0], change[1]);
+      if (reenter) updateConfigDraftValue(ui, state.config_target, baseline, "model.api_key_env", "OLD_KEY");
+      synchronizeInitialSetupProviderDraft(state, ui);
+      const request = beginProviderCatalogRequest(ui, state);
+      assert.equal(request?.apiKeyEnv, change && !reenter ? null : "OLD_KEY");
+    }
+  }
+});
+
+for (const overlay of ["initial_setup", "config"] as const) {
+test(`${overlay} catalog evidence is invalidated by A to B to A config-draft edits`, () => {
   const providerFields: ConfigFieldProjection[] = [
     {
       key: "model.base_url",
@@ -219,7 +247,7 @@ test("Initial Setup catalog evidence is invalidated by A to B to A config-draft 
   ];
   const state = projection({
     confirmation_visible: false,
-    overlay: "initial_setup",
+    overlay,
     startup: {
       status: "requires_config",
       title: "Initial Setup",
@@ -301,6 +329,8 @@ test("Initial Setup catalog evidence is invalidated by A to B to A config-draft 
     "the old A catalog cannot become current evidence after an ABA draft edit",
   );
 });
+
+}
 
 function actionTestModel(
   state: DesktopViewState,
@@ -393,7 +423,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       max_output_tokens_inherited: true,
       provider_mutation_enabled: false,
       access_mutation_enabled: false,
-      unavailable_reason: "root sessionを選択すると変更できます。",
+      unavailable_reason: "メインチャットを開くと変更できます。",
       target: null,
     },
     config_draft_capabilities: {
@@ -451,6 +481,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     about: {
       product_name: "moyAI",
       version: "test-version",
+      codename: "test-codename",
       license_identifier: "test-license",
       copyright_notice: "Copyright test notice",
     },
@@ -669,7 +700,7 @@ test("child-only activity preserves the authoritative Rust new-request gate", ()
   for (const [label, pattern] of [
     ["session search", /<input id="session-search"[^>]*>/],
     ["new root chat", /<button class="row-action add-session" data-action="new-project-session"[^>]*>/],
-    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat" data-focus-key="quick-chat:new-session"[^>]*>/],
+    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat" data-value="local" data-focus-key="quick-chat:new-session"[^>]*>/],
     ["open session", /<button class="nav-row" data-action="session" data-index="1"[^>]*>/],
     ["rejoin session", /<button class="row-action row-rejoin" data-action="rejoin-session" data-index="1"[^>]*>/],
   ] as const) {
@@ -713,7 +744,7 @@ test("active root steering keeps an enabled send control labeled as additional i
       /data-action="send" title="実行中のタスクへ追加指示を送信" aria-label="実行中のタスクへ追加指示を送信"/,
       agentTreeActive ? "active child retention" : "active root",
     );
-    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+    assert.doesNotMatch(rendered, /実行中は送信できません|サブエージェントの完了または停止後に送信できます/);
   }
 });
 
@@ -735,7 +766,7 @@ test("active root steering with an empty draft asks for input instead of claimin
       /data-action="send" title="依頼文を入力してください" aria-label="依頼文を入力してください"[^>]*disabled/,
       agentTreeActive ? "active child retention" : "active root",
     );
-    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+    assert.doesNotMatch(rendered, /実行中は送信できません|サブエージェントの完了または停止後に送信できます/);
   }
 });
 
@@ -2148,6 +2179,9 @@ class FakeInteractionDocument extends FakeInteractionEventTarget {
 
 class FakeInteractionElement extends FakeInteractionEventTarget {
   disabled = false;
+  action = false;
+  modal = false;
+  readonly capturedPointers: number[] = [];
   projection = "revision-1";
   replacements = 0;
   readonly kind: "html" | "body" | "div" | "input";
@@ -2172,18 +2206,23 @@ class FakeInteractionElement extends FakeInteractionEventTarget {
   }
 
   closest<E extends Element = Element>(selectors: string): E | null {
-    if (selectors === ":disabled") {
-      return (this.disabled ? this : null) as unknown as E | null;
+    let candidate: FakeInteractionElement | null = this;
+    while (candidate) {
+      const matches = selectors === ":disabled" ? candidate.disabled
+        : selectors === "[data-action]" ? candidate.action
+        : selectors === "[data-modal]" ? candidate.modal
+        : candidate.kind === "input";
+      if (matches) return candidate as unknown as E;
+      candidate = candidate.parentElement;
     }
-    if (selectors === "[data-action]") return null;
-    return (this.kind === "input" ? this : null) as unknown as E | null;
+    return null;
   }
 
   matches(selectors: string): boolean {
     return selectors === ":disabled" && this.disabled;
   }
 
-  setPointerCapture(_pointerId: number): void {}
+  setPointerCapture(pointerId: number): void { this.capturedPointers.push(pointerId); }
 
   applyProjection(revision: number): void {
     this.projection = `revision-${revision}`;
@@ -2349,6 +2388,46 @@ function createFastCommandPaletteActivation(
     },
   };
 }
+
+test("selecting dialog text keeps pointer events inside the dialog while projections wait for release", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, lifecycle, queueProjection, applied }) => {
+    const backdrop = new FakeInteractionElement("div", appRoot);
+    backdrop.action = true;
+    const dialog = new FakeInteractionElement("div", backdrop);
+    dialog.modal = true;
+    const text = new FakeInteractionElement("div", dialog);
+
+    documentTarget.dispatch("pointerdown", { target: text, button: 0, pointerId: 21 });
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(backdrop.capturedPointers, [], "dialog text must not redirect pointerup/click to the dismiss action");
+    queueProjection(2);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("pointerup", { target: text, pointerId: 21 });
+    windowTarget.advanceBy(0);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
+test("dialog buttons, text inputs, and genuine backdrop clicks retain their pointer capture owner", () => {
+  withInteractionGate(({ documentTarget, appRoot }) => {
+    const backdrop = new FakeInteractionElement("div", appRoot);
+    backdrop.action = true;
+    const dialog = new FakeInteractionElement("div", backdrop);
+    dialog.modal = true;
+    const button = new FakeInteractionElement("div", dialog);
+    button.action = true;
+    const icon = new FakeInteractionElement("div", button);
+    const input = new FakeInteractionElement("input", dialog);
+    documentTarget.dispatch("pointerdown", { target: icon, button: 0, pointerId: 22 });
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 23 });
+    documentTarget.dispatch("pointerdown", { target: backdrop, button: 0, pointerId: 24 });
+    button.disabled = true;
+    documentTarget.dispatch("pointerdown", { target: icon, button: 0, pointerId: 25 });
+    assert.deepEqual(button.capturedPointers, [22]);
+    assert.deepEqual(input.capturedPointers, [23]);
+    assert.deepEqual(backdrop.capturedPointers, [24]);
+  });
+});
 
 test("pointer activation starts one command before the deferred release and settles a fast response once", async () => {
   await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
@@ -2622,6 +2701,111 @@ test("a stationary pointer keeps the DOM stable until lost capture releases only
     assert.deepEqual(applied, [4]);
     windowTarget.advanceBy(60_000);
     assert.deepEqual(applied, [4]);
+  });
+});
+
+for (const altCode of ["AltLeft", "AltRight"]) {
+  for (const menuCode of [null, "Space", "F4"]) {
+    test(`native system menu leaves projections live when ${altCode} keyup is consumed (chord delivered: ${menuCode})`, () => {
+      withInteractionGate(({ documentTarget, windowTarget, input, lifecycle, applied, queueProjection }) => {
+        documentTarget.dispatch("keydown", { target: input, code: altCode, altKey: true, isComposing: false });
+        if (menuCode) {
+          documentTarget.dispatch("keydown", { target: input, code: menuCode, altKey: true, isComposing: false });
+        }
+        // The native menu consumes the corresponding keyups and Escape. No blur,
+        // web event, manual refresh, or inactivity recovery follows its dismissal.
+        windowTarget.advanceBy(0);
+        queueProjection(2);
+        assert.equal(lifecycle.active, false);
+        assert.deepEqual(applied, [2], "a new approval/progress projection must not remain hidden");
+        queueProjection(3);
+        assert.deepEqual(applied, [2, 3]);
+      });
+    });
+  }
+}
+
+for (const key of ["Alt", " ", "F4"]) {
+  test(`native system key without a physical code keeps projections live: ${JSON.stringify(key)}`, () => {
+    withInteractionGate(({ documentTarget, windowTarget, body, lifecycle, applied, queueProjection }) => {
+      // Actual WebView observation: trusted keydown Alt, code="", altKey=true,
+      // target BODY; the native menu consumes every following key and keyup.
+      documentTarget.dispatch("keydown", { target: body, key, code: "", altKey: true, isComposing: false });
+      windowTarget.advanceBy(0);
+      queueProjection(2);
+      queueProjection(3);
+      assert.equal(lifecycle.active, false);
+      assert.deepEqual(applied, [2, 3], "pending approvals/progress remain visible without blur recovery");
+    });
+  });
+}
+
+for (const key of [" ", "a", "AltGraph"]) {
+  test(`ordinary key without a physical code retains its existing hold: ${JSON.stringify(key)}`, () => {
+    withInteractionGate(({ documentTarget, windowTarget, input, body, lifecycle, applied, queueProjection }) => {
+      documentTarget.dispatch("keydown", { target: input, key, code: "", altKey: false, isComposing: false });
+      queueProjection(2);
+      assert.equal(lifecycle.active, true);
+      assert.deepEqual(applied, []);
+      documentTarget.dispatch("keyup", { target: body, key, code: "", altKey: false });
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, false);
+      assert.deepEqual(applied, [2]);
+    });
+  });
+}
+
+test("native Alt without a physical code does not end unrelated pointer or composition owners", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, body, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 47 });
+    documentTarget.dispatch("compositionstart");
+    documentTarget.dispatch("keydown", { target: body, key: "Alt", code: "", altKey: true, isComposing: false });
+    queueProjection(2);
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 47 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    documentTarget.dispatch("compositionend");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
+test("native menu keys do not release a separate pointer or IME interaction", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 31 });
+    documentTarget.dispatch("compositionstart");
+    documentTarget.dispatch("keydown", { target: input, code: "AltLeft", altKey: true, isComposing: false });
+    documentTarget.dispatch("keydown", { target: input, code: "Space", altKey: true, isComposing: false });
+    queueProjection(2);
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 31 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true, "composition still owns its draft");
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("compositionend");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [2]);
+  });
+});
+
+test("Alt-modified text keys retain their own interaction through keyup across focus", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, body, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("keydown", { target: input, code: "AltRight", altKey: true, isComposing: false });
+    documentTarget.dispatch("keydown", { target: input, code: "KeyE", altKey: true, isComposing: false });
+    queueProjection(2);
+    assert.equal(lifecycle.active, true);
+    assert.deepEqual(applied, []);
+    documentTarget.dispatch("keyup", { target: body, code: "KeyE", altKey: false });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [2]);
   });
 });
 
@@ -2931,7 +3115,7 @@ test("frontend provider URL validation mirrors the Rust ProviderEndpoint boundar
   }
 });
 
-test("Docling base URL validation follows the enabled value in the same complete draft", () => {
+test("Doclingの接続先URL validation follows the enabled value in the same complete draft", () => {
   const field = (
     key: string,
     value: string,
@@ -3092,7 +3276,7 @@ test("global action shortcuts ignore key-repeat activation", () => {
 test("every visible new-chat route exposes one exact typed focus identity", () => {
   assert.match(
     renderSidebar(projection()),
-    /data-action="new-chat" data-focus-key="quick-chat:new-session"/,
+    /data-action="new-chat" data-value="local" data-focus-key="quick-chat:new-session"/,
   );
   assert.match(
     renderOverlay(projection({ overlay: "file_menu" })),
@@ -3130,6 +3314,21 @@ test("run admission polls for the Rust owner before the start command responds",
   assert.equal(runtimePollingRequired(false, false), false);
   assert.equal(runtimePollingRequired(true, false), true);
   assert.equal(runtimePollingRequired(false, true), true);
+});
+
+test("a Hub command starts ordinary polling before the Desktop snapshot advertises its connection", () => {
+  const idle = { status: "disconnected" as const, active_main: null, active_side_chat: null, active_approve: null };
+  assert.equal(runtimePollingRequired(false, false, idle), false);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connecting" }), true);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connected" }), true);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "stale" }), false);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "error" }), false);
+  assert.equal(runtimePollingRequired(false, false, {
+    ...idle, active_side_chat: { turn_id: "side-turn", phase: "running", logical_model_id: "model" },
+  }), true);
+  assert.equal(runtimePollingRequired(false, false, {
+    ...idle, active_approve: { turn_id: "approval-turn", phase: "waiting", logical_model_id: null },
+  }), true);
 });
 
 test("workspace browser submits its local draft with the authoritative draft owner", async () => {
@@ -3350,9 +3549,19 @@ test("project and quick-chat rows expose selected and background task activity",
   }));
   const selectedQuickChat = buttonFor(quickSidebar, `chat-session:${SESSION_A}`);
   assert.match(selectedQuickChat, /data-task-activity="running"/);
-  assert.match(selectedQuickChat, /<small>実行中 · active turn<\/small>/);
+  assert.match(selectedQuickChat, /<small>実行中 · 現在の依頼<\/small>/);
   assert.match(buttonFor(quickSidebar, "chat-session:session-c"), /data-task-activity="attention"/);
   assert.doesNotMatch(buttonFor(quickSidebar, "chat-session:session-d"), /task-activity-indicator/);
+});
+
+test("sidebar distinguishes a failed run from unavailable session state", () => {
+  for (const status of ["failed", "completed"] as const) {
+    const base = projection();
+    const row = { ...base.session_rows[0]!, status, loaded_status: "system_error" as const };
+    const html = renderSidebar(projection({ session_rows: [row], chat_session_rows: [row] }));
+    assert.match(html, status === "failed" ? /実行に失敗しました · 会話を開いて確認/ : /状態を確認できません · 会話を開いて確認/);
+    assert.doesNotMatch(html, /状態取得エラー/);
+  }
 });
 
 test("access-mode control consumes the Rust mutation capability", () => {
@@ -4217,7 +4426,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
   const rejectedHtml = renderOverlay(view);
   assert.match(
     rejectedHtml,
-    /data-action="apply-provider-session" >UIセッションに適用/,
+    /data-action="apply-provider-session" >設定ファイルに保存せず適用/,
   );
   assert.match(
     rejectedHtml,
@@ -4265,7 +4474,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
   const reloadedHtml = renderOverlay(reloadedView);
   assert.match(
     reloadedHtml,
-    /data-action="apply-provider-session" >UIセッションに適用/,
+    /data-action="apply-provider-session" >設定ファイルに保存せず適用/,
   );
   assert.match(
     reloadedHtml,
@@ -4559,7 +4768,7 @@ test("initial setup renders typed config import failures inside the active modal
     assert.match(html, /role="alert" aria-live="assertive"/);
     assert.match(html, /設定ファイルをImportできませんでした。/);
     assert.match(html, /invalid &lt;model\.request_timeout_ms&gt;/);
-    assert.match(html, /TOML設定をImport/);
+    assert.match(html, /TOML設定を読み込む/);
     assert.doesNotMatch(html, /invalid <model\.request_timeout_ms>/);
   }
 
@@ -4569,6 +4778,20 @@ test("initial setup renders typed config import failures inside the active modal
     status_message: "stale import failure",
   });
   assert.doesNotMatch(renderOverlay(preferences), /role="alert"/);
+});
+
+test("initial setup shows a saved-connection completion warning inside the current dialog", () => {
+  const state = projection({
+    overlay: "initial_setup",
+    status_code: "initial_setup_preferences_save_failed",
+    status_message: "接続情報は保存済みです。初回設定の完了状態を保存できませんでした。",
+    status_detail: "",
+  });
+  state.startup = { ...state.startup, initial_setup_required: true, action_overlay: "initial_setup" };
+  const html = renderDesktopMarkup(createDesktopRenderModel(state, renderLocal()), { backgroundInert: false, taskActivityDelay: "" });
+  assert.match(html, /class="initial-setup-status"[\s\S]*role="alert"/);
+  assert.match(html, /接続情報は保存済みです。初回設定の完了状態を保存できませんでした。/);
+  assert.doesNotMatch(html, /設定ファイルをImportできませんでした/);
 });
 
 test("initial setup makes durable save primary and explains its blocking alternatives", () => {
@@ -4592,21 +4815,21 @@ test("initial setup makes durable save primary and explains its blocking alterna
     );
     assert.match(
       html,
-      new RegExp(`class="setup-secondary-action" data-action="${applyAction}"[^>]*>この起動中だけ適用</button>`),
+      new RegExp(`class="setup-secondary-action" data-action="${applyAction}"[^>]*>設定ファイルに保存せず適用</button>`),
     );
     assert.match(html, /role="group" aria-label="初期設定の完了方法" aria-describedby="initial-setup-action-help"/);
     assert.match(html, /TOMLのファイル選択をキャンセルしても設定は変わりません。/);
-    assert.match(html, /保存または一時適用が完了するまで閉じません。/);
+    assert.match(html, /保存または適用が完了するまで閉じません。/);
     assert.doesNotMatch(html, /data-action="close-overlay"/);
   }
 
   const preferences = renderOverlay(projection({ overlay: "config" }), local);
-  assert.match(preferences, /data-action="apply-session-config"[^>]*>UIセッションに適用</);
+  assert.match(preferences, /data-action="apply-session-config"[^>]*>設定ファイルに保存せず適用</);
   assert.match(preferences, /data-action="save-global-config"[^>]*>設定ファイルに保存</);
   assert.doesNotMatch(preferences, /setup-primary-action/);
 
   const provider = renderOverlay(projection({ overlay: "provider" }), local);
-  assert.match(provider, /data-action="apply-provider-session"[^>]*>UIセッションに適用</);
+  assert.match(provider, /data-action="apply-provider-session"[^>]*>設定ファイルに保存せず適用</);
   assert.match(provider, /data-action="save-provider-global"[^>]*>設定ファイルに保存</);
   assert.doesNotMatch(provider, /setup-primary-action/);
 
@@ -4621,6 +4844,39 @@ test("initial setup makes durable save primary and explains its blocking alterna
     renderOverlay(blocked, local),
     /class="setup-primary-action" data-action="save-global-config" disabled aria-disabled="true">設定を保存して開始</,
   );
+});
+
+test("Settings renders independent Approve connection fields and shows Main inheritance from the Rust owner", () => {
+  const entries: [string, string, ConfigFieldProjection["value_type"], boolean][] = [
+    ["approve.base_url", "http://approve.test/v1", "string", true],
+    ["approve.model", "fast-reviewer", "string", true],
+    ["approve.provider_profile", "openai_compatible", "enum", true],
+    ["approve.api_key_env", "APPROVE_API_KEY", "string", false],
+    ["approve.context_window", "32768", "integer", true],
+    ["approve.request_timeout_ms", "30000", "integer", true],
+    ["approve.connect_timeout_ms", "5000", "integer", true],
+    ["approve.max_retries", "2", "integer", true],
+  ];
+  const fields = entries.map(([key, value, value_type, required]) => ({ key, value, value_type, required,
+    env_override: null, min_value: value_type === "integer" ? key.endsWith("max_retries") ? 0 : 1 : null,
+    max_value: null, options: value_type === "enum" ? ["openai_compatible", "openai_responses"] : [] }));
+  const inherited = renderOverlay(projection({ overlay: "config", config_fields: fields, approve_model_configured: false }), renderLocal());
+  assert.match(inherited, /href="#settings-approve"/);
+  assert.match(inherited, /<h3 id="settings-approve-title">Approve（承認）<\/h3>/);
+  assert.match(inherited, /Approveは未設定のため、実行時のMainのモデルを使います/);
+  assert.match(inherited, /id="approve-model"[^>]*value="fast-reviewer"/);
+  assert.match(inherited, /id="approve-api-key-env"[^>]*value="APPROVE_API_KEY"/);
+  assert.match(inherited, /id="approve-provider-profile"/);
+  assert.match(inherited, /href="#settings-provider">Main（メイン）/);
+  assert.match(inherited, /href="#settings-side-chat">Sub（サイドチャット）/);
+  for (let index = 0; index < fields.length; index++) {
+    assert.equal((inherited.match(new RegExp(`data-config-index="${index}"`, "g")) ?? []).length, 1,
+      "the dedicated section owns each Approve field once");
+  }
+  const independent = renderOverlay(projection({ overlay: "config", config_fields: fields, approve_model_configured: true }), renderLocal());
+  assert.match(independent, /Mainのモデル変更はApproveに反映されません/);
+  assert.doesNotMatch(independent, /Approveは未設定/);
+  assert.doesNotMatch(independent, /approve\.system_prompt/);
 });
 
 test("initial setup replaces an old import failure with current mutation progress", () => {
@@ -4753,6 +5009,7 @@ test("Help exposes a Rust-owned accessible About dialog", () => {
     about: {
       product_name: "moyAI Next",
       version: "9.8.7-test",
+      codename: "Test Codename",
       license_identifier: "License-ID",
       copyright_notice: "Copyright notice from the bundled license",
     },
@@ -4786,8 +5043,8 @@ test("settings renders one typed LLM response inactivity timeout with host-neutr
     }],
   }));
 
-  assert.match(html, /LLM応答無進捗タイムアウト/);
-  assert.match(html, /応答headerまでの待機と、応答中のSSE event間の最大無進捗時間です（ms）。進捗中の総所要時間は制限せず、hostへも送信しません。/);
+  assert.match(html, /応答の進捗を待つ時間（ms）/);
+  assert.match(html, /応答開始までと、受信中に進捗が止まった場合の待ち時間です。応答が続いている間の総時間は制限せず、モデル側の設定も変えません。/);
   assert.match(html, /data-config-key="model\.request_timeout_ms"[^>]+value="3600000"/);
   assert.doesNotMatch(html, /model\.stream_idle_timeout_ms/);
   assert.doesNotMatch(html, /settings-raw-value[^>]+model\.request_timeout_ms/);
@@ -4827,7 +5084,7 @@ test("Docling dependencies expose one visible toggle owner and disable connectio
   for (const key of ["docling.base_url", "docling.timeout_ms", "docling.api_key_env", "docling.headers_json"]) {
     assert.match(off, new RegExp(`data-config-key="${key.replace(".", "\\.")}"[^>]*aria-describedby="[^"]*docling-disabled-help[^"]*"[^>]*disabled`));
   }
-  assert.match(off, /<summary>Docling 接続ヘッダー（Advanced）<\/summary>/);
+  assert.match(off, /<summary>Doclingの接続ヘッダー（詳細）<\/summary>/);
 
   const on = renderOverlay(projection({ overlay: "config", config_fields: fields(true) }));
   assert.match(on, /id="docling-disabled-help"[^>]*hidden/);
@@ -4924,7 +5181,7 @@ test("Docling readiness stays an explicit clean-config action with typed section
   );
   const dirtyHtml = renderOverlay(dirty, renderLocal());
   assert.match(dirtyHtml, /未保存の設定があります/);
-  assert.match(dirtyHtml, /保存してから Test Docling/);
+  assert.match(dirtyHtml, /保存してから「Doclingへの接続を試す」/);
 });
 
 test("dirty Settings close confirmation is modal, target-scoped, and has no backdrop action", () => {
@@ -5336,7 +5593,7 @@ test("every Settings field has unique connected help, validation, and explicit l
     html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*settings-control[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 23, "fourteen existing controls plus nine controls for eight Side fields");
+  assert.equal(controls.length, 24, "all current Settings controls retain connected help and labels");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];
@@ -5364,10 +5621,15 @@ test("every Settings field has unique connected help, validation, and explicit l
     .find((id) => id.startsWith("settings-config-help-"))!;
   const contextHelp = new RegExp(`<small id="${escapeRegExp(contextHelpId)}"[^>]*>([^<]+)</small>`)
     .exec(html)?.[1] ?? "";
-  assert.match(contextHelp, /設定キー: model\.context_window/);
-  assert.match(contextHelp, /形式: 整数/);
   assert.match(contextHelp, /範囲: 0以上4294967295以下/);
-  assert.match(contextHelp, /環境変数: MOYAI_CONTEXT_WINDOW/);
+  assert.doesNotMatch(contextHelp, /設定キー:|形式:|環境変数:/);
+  const technicalDetails = Array.from(html.matchAll(/(<details\b[^>]*class="settings-field-technical"[^>]*>)([\s\S]*?)<\/details>/g))
+    .find((match) => match[2].includes("設定キー: model.context_window。"));
+  assert.ok(technicalDetails, "technical metadata remains available without expanding the primary field help");
+  assert.doesNotMatch(technicalDetails[1], /\sopen(?:\s|>)/, "technical metadata is collapsed initially");
+  assert.match(technicalDetails[2], /形式: 整数/);
+  assert.match(technicalDetails[2], /環境変数: MOYAI_CONTEXT_WINDOW/);
+  assert.doesNotMatch(technicalDetails[2], /<(?:input|select|textarea)\b/, "collapsing metadata must not hide an editor");
   for (const key of [
     "model.temperature",
     "model.top_p",
@@ -5403,13 +5665,13 @@ test("every Settings field has unique connected help, validation, and explicit l
   ]) {
     assert.match(html, new RegExp(`data-config-key="${escapeRegExp(key)}"`));
   }
-  assert.match(html, /id="config-dialog-title">Settings</);
-  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Global Settings</);
-  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Session-scoped Settings</);
-  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">Desktop Preferences</);
-  assert.match(html, /Side Chatを開くと、この時点のモデルとプロンプトを専用snapshotとして保持します。/);
+  assert.match(html, /id="config-dialog-title">設定</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">共通設定</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">チャットごとの設定</);
+  assert.match(html, /class="settings-nav-group" role="heading" aria-level="3">画面設定</);
+  assert.match(html, /サイドチャットは、開いた時点のモデルとプロンプトを保持します。/);
   assert.doesNotMatch(html, /data-action="configure-side-chat"/);
-  assert.match(html, /moyAI内の入力整理とAPI機能を設定します。sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
+  assert.match(html, /入力の整理と利用する機能を設定します。回答の長さや思考設定はモデルのホスト側で管理します。/);
   assert.match(html, /id="settings-validation"[^>]*role="status"[^>]*aria-live="polite"/);
   for (const section of ["provider", "side-chat", "permissions", "agents", "tools", "files", "advanced"]) {
     assert.match(
@@ -5673,7 +5935,7 @@ test("durable Sub Agent events stay inside their turn history and the root final
       row_kind: "user" as const,
       step: "01",
       title: "ユーザー依頼",
-      body: "2つのSub Agentで確認してください",
+      body: "2つのサブエージェントで確認してください",
       file_changes: [],
     },
     {
@@ -5762,7 +6024,7 @@ test("durable Sub Agent events stay inside their turn history and the root final
   assert.match(firstSummaryHtml, /&lt;script&gt;alert\(&#0?39;x&#0?39;\)&lt;\/script&gt;/);
   assert.doesNotMatch(firstSummaryHtml, /https:\/\/secret\.invalid|<script>/);
   assert.match(html, /<strong><code>navigation_review<\/code> の最終結果<\/strong>/);
-  assert.match(html, /class="work-history-event"[\s\S]*Sub Agentの完了を待ちました/);
+  assert.match(html, /class="work-history-event"[\s\S]*サブエージェントの完了を待ちました/);
   assert.doesNotMatch(html, /出力: 2件完了/);
   assert.doesNotMatch(html, /RAW CHILD REPORT|example\.invalid|message sub_agent_|agent-inline-activity/);
   assert.equal(html.match(/data-action="jump-history-anchor"/g)?.length, 6);
@@ -6054,4 +6316,43 @@ test("incomplete canonical turn is rendered as nonterminal evidence", () => {
   assert.match(html, /message work-summary work_summary_incomplete/);
   assert.match(html, /状態未確定/);
   assert.match(html, /<details[^>]+open>/);
+});
+
+test("Settings Main and Provider present typed model-load failure and recover on retry", () => {
+  const failure = { kind: "error" as const, title: "AIのモデル一覧を読み込めません", hint: "接続先を確認して再試行してください。", details: "connection refused <diagnostic>" };
+  for (const overlay of ["config", "provider"] as const) {
+    const current = projection({ overlay, provider_status: failure, provider_catalog_base_url: null, provider_catalog_profile: null });
+    const id = overlay === "config" ? "main-provider-model-catalog-status" : "provider-status";
+    const html = renderOverlay(current);
+    assert.match(html, new RegExp(`id="${id}" class="provider-status error"[^>]*data-settings-passive="${id}"[^>]*data-settings-preserve-focused-region`));
+    assert.match(html, /<strong data-provider-status-title>AIのモデル一覧を読み込めません<\/strong>/);
+    assert.match(html, /<p data-provider-status-hint>接続先を確認して再試行してください。<\/p>/);
+    assert.match(html, /<pre data-provider-status-details>connection refused &lt;diagnostic&gt;<\/pre>/);
+    assert.doesNotMatch(html, new RegExp(`data-details-key="${id}-details"[^>]*\\bopen`));
+    assert.doesNotMatch(renderOverlay({ ...current, provider_loading: true, provider_status: { kind: "loading", title: "読込中", hint: "", details: "" } }), /connection refused|AIのモデル一覧を読み込めません/);
+    assert.doesNotMatch(renderOverlay({ ...current, provider_status: { kind: "success", title: "読み込みました", hint: "選択できます", details: "" } }), /connection refused|AIのモデル一覧を読み込めません/);
+  }
+});
+
+test("a completed provider failure cannot describe a subsequently edited connection target", () => {
+  const initial = projection({ overlay: "provider", provider_catalog_base_url: null, provider_catalog_profile: null });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  beginProviderCatalogRequest(ui, initial);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({ ...initial, projection_revision: "2", provider_loading: true,
+    provider_status: { kind: "loading", title: "Loading", hint: "", details: "" } });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+  const failed = projection({ ...initial, projection_revision: "3", provider_loading: false,
+    provider_status: { kind: "error", title: "読み込めません", hint: "接続先を確認", details: "old connection failure" } });
+  reconcileUiDrafts(ui, loading, failed, null);
+  assert.equal(projectViewState(failed, ui).provider_status.kind, "error");
+  ui.drafts.provider.baseUrl = "http://127.0.0.1:45678";
+  ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
+  const changed = projectViewState(failed, ui);
+  assert.equal(changed.provider_status.kind, "warning");
+  assert.equal(changed.provider_status.title, "モデル一覧の対象が変更されました");
+  assert.doesNotMatch(changed.provider_status.details, /old connection failure/);
 });

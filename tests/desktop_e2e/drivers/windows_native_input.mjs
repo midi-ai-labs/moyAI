@@ -485,6 +485,39 @@ export async function closeOwnedNativeDialog(
   return result;
 }
 
+/** Standard OK/Cancel buttons, scoped to the exact dialog and displayed review text. */
+export async function invokeOwnedNativeDialogButton(
+  { executionRoot, ownerPath, candidate, buttonId, expectedTitle, expectedText },
+  { invoke = invokeWindowsNativeInput } = {},
+) {
+  const fingerprint = requireInteractiveCandidate(candidate);
+  if (![1, 2].includes(buttonId)) throw new TypeError("buttonId must be standard IDOK or IDCANCEL");
+  if (typeof expectedTitle !== "string" || !expectedTitle || expectedTitle.length > 256 || expectedTitle.includes("\0")) {
+    throw new TypeError("expectedTitle must be bounded dialog text");
+  }
+  if (!Array.isArray(expectedText) || expectedText.length < 1 || expectedText.length > 8
+    || expectedText.some(text => typeof text !== "string" || !text || text.length > 4096 || text.includes("\0"))) {
+    throw new TypeError("expectedText must contain bounded nonempty review text");
+  }
+  const result = await invoke("InvokeDialogButton", {
+    ExecutionRoot: executionRoot, OwnerPath: ownerPath, WindowHandle: fingerprint.hwnd,
+    ExpectedThreadId: fingerprint.threadId, ExpectedClassName: fingerprint.className,
+    DialogButtonId: buttonId, ExpectedDialogTitle: expectedTitle, ExpectedDialogTextJson: JSON.stringify(expectedText),
+  });
+  const button = result?.button;
+  if (result?.attempt_count !== 1 || result?.call_returned !== true || result?.native_control_verified !== true
+    || result?.representative_input !== true || result?.cleanup_only !== false || result?.fallback_used !== false
+    || result?.window?.process_id !== candidate.process_id || result.window.hwnd?.toLowerCase() !== fingerprint.hwnd.toLowerCase()
+    || result?.dialog_title !== expectedTitle || !expectedText.every(text => result?.dialog_text?.includes(text))
+    || button?.process_id !== candidate.process_id || button?.control_id !== buttonId
+    || button?.class_name !== "Button" || button?.enabled !== true || button?.visible !== true
+    || button?.thread_id !== candidate.thread_id || button?.parent_hwnd?.toLowerCase() !== fingerprint.hwnd.toLowerCase()
+    || button?.root_hwnd?.toLowerCase() !== fingerprint.hwnd.toLowerCase()) {
+    throw new NativeInputError("native-dialog-button-invalid", "The exact native review dialog button was not invoked once", result);
+  }
+  return result;
+}
+
 export async function selectFileInOwnedNativeDialog(
   { executionRoot, ownerPath, candidate, selectedPath },
   { invoke = invokeWindowsNativeInput } = {},
@@ -534,6 +567,68 @@ export async function selectFileInOwnedNativeDialog(
       "Windows UI Automation did not satisfy the exact native file selection contract",
       result,
     );
+  }
+  return result;
+}
+
+/** Exact native-control input. This does not establish physical keyboard or IME behavior. */
+export async function openFilePathInOwnedNativeDialog(
+  { executionRoot, ownerPath, candidate, selectedPath, intent = "open" },
+  { invoke = invokeWindowsNativeInput } = {},
+) {
+  const fingerprint = requireInteractiveCandidate(candidate);
+  if (!["open", "save_new", "directory"].includes(intent)) throw new TypeError("Native file path intent must be open, save_new or directory");
+  if (fingerprint.className !== "#32770") throw new TypeError("An exact native file dialog is required");
+  if (typeof selectedPath !== "string" || !path.win32.isAbsolute(selectedPath)
+    || selectedPath.includes("\0") || selectedPath.length >= 32768) {
+    throw new TypeError("selectedPath must be a bounded absolute Windows path without NUL bytes");
+  }
+  const result = await invoke("OpenFilePath", {
+    ExecutionRoot: executionRoot, OwnerPath: ownerPath, WindowHandle: fingerprint.hwnd,
+    ExpectedThreadId: fingerprint.threadId, ExpectedClassName: fingerprint.className, SelectedPath: selectedPath,
+    ...(intent === "open" ? {} : { SelectedPathIntent: intent }),
+  });
+  const hwnd = value => typeof value === "string" && /^0x[0-9a-f]+$/i.test(value) && BigInt(value) !== 0n
+    ? BigInt(value).toString(16) : null;
+  const dialogHwnd = hwnd(fingerprint.hwnd);
+  const identities = intent === "directory" ? [
+    ["edit", dialogHwnd, "Edit", 1152],
+    ["button", dialogHwnd, "Button", 1],
+  ] : intent === "save_new" ? [
+    ["view", dialogHwnd, "DUIViewWndClassName", 0],
+    ["direct", hwnd(result?.controls?.view?.hwnd), "DirectUIHWND", 0],
+    ["sink", hwnd(result?.controls?.direct?.hwnd), "FloatNotifySink", 0],
+    ["combo", hwnd(result?.controls?.sink?.hwnd), "ComboBox", 0],
+    ["edit", hwnd(result?.controls?.combo?.hwnd), "Edit", 1001],
+    ["button", dialogHwnd, "Button", 1],
+  ] : [
+    ["combo_ex", dialogHwnd, "ComboBoxEx32", 1148],
+    ["combo", hwnd(result?.controls?.combo_ex?.hwnd), "ComboBox", 1148],
+    ["edit", hwnd(result?.controls?.combo?.hwnd), "Edit", 1148],
+    ["button", dialogHwnd, "Button", 1],
+  ];
+  const exactControls = identities.every(([name, parent, className, id]) => {
+    const control = result?.controls?.[name];
+    return parent !== null && hwnd(control?.hwnd) !== null && hwnd(control?.hwnd) !== dialogHwnd && hwnd(control?.parent_hwnd) === parent
+      && hwnd(control?.root_hwnd) === dialogHwnd && control?.process_id === candidate.process_id
+      && control?.thread_id === candidate.thread_id && control?.class_name === className
+      && control?.control_id === id && control?.visible === true && control?.enabled === true;
+  }) && new Set(identities.map(([name]) => hwnd(result?.controls?.[name]?.hwnd))).size === identities.length;
+  if ((result?.selected_path_intent ?? "open") !== intent || !exactControls || hwnd(result?.window?.hwnd) !== dialogHwnd
+    || hwnd(result?.window?.root_hwnd) !== dialogHwnd || result?.window?.is_root !== true
+    || result?.window?.visible !== true || result?.window?.enabled !== true
+    || result?.window?.process_id !== candidate.process_id || result?.window?.thread_id !== candidate.thread_id
+    || result?.window?.class_name !== fingerprint.className
+    || path.win32.normalize(String(result?.selected_path ?? "")).toLowerCase() !== path.win32.normalize(selectedPath).toLowerCase()
+    || result?.delivery_verified !== true || result?.filename_set_count !== 1
+    || result?.filename_readback_verified !== true || result?.open_click_count !== 1
+    || result?.open_call_returned !== true || result?.retry_count !== 0
+    || result?.foreground_required !== false
+    || result?.cleanup_only !== false || result?.representative_input !== true
+    || result?.os_keyboard_ime_evidence !== false
+    || result?.input !== "native-control: WM_SETTEXT -> WM_GETTEXT exact readback -> BM_CLICK") {
+    throw new NativeInputError("native-dialog-path-open-invalid",
+      "Native file-dialog input did not satisfy exact control identity, readback, and single-delivery requirements", result);
   }
   return result;
 }

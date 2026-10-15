@@ -13,6 +13,14 @@ export interface TranscriptAnchorOptions {
   stableLatestAssistant?: boolean;
 }
 
+/** Reveal the existing history disclosure and make the destination observable even at the scroll limit. */
+export function revealHistoryAnchor(target: HTMLElement): void {
+  const details = target.querySelector<HTMLDetailsElement>(".message-body > details");
+  if (details) details.open = true;
+  const focusTarget = details?.querySelector<HTMLElement>(":scope > summary") ?? target;
+  focusTarget.focus({ preventScroll: true });
+}
+
 export interface ViewportAnchorCandidate {
   id: string;
   offsetTop: number;

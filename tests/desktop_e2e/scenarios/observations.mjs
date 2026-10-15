@@ -58,6 +58,18 @@ export async function invokeDesktopCommand(cdp, command, args = undefined) {
   return outcome.value;
 }
 
+export async function observePermissionSurface(cdp) {
+  const projection = await invokeDesktopCommand(cdp, "desktop_state");
+  return { projection, ...await cdp.evaluate(`(() => {
+    const visible=n=>{if(!(n instanceof HTMLElement))return false;const r=n.getBoundingClientRect(),s=getComputedStyle(n);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0;};
+    const dialogs=Array.from(document.querySelectorAll('[role="alertdialog"][data-permission-id]')),d=dialogs.length===1?dialogs[0]:null;
+    return {errors:Array.from(document.querySelectorAll('.fatal,.ui-error-notice')).filter(visible).length,
+      dialog:{count:dialogs.length,id:d?.dataset.permissionId??null,visible:visible(d),busy:d?.getAttribute('aria-busy')==='true',
+        command:d?.querySelector('.confirm-command')?.textContent??null,text:d?.textContent??null,
+        buttons:Array.from(d?.querySelectorAll('button[data-action]')??[]).map(n=>({action:n.dataset.action,label:n.textContent.trim(),visible:visible(n),enabled:!n.disabled&&n.getAttribute('aria-disabled')!=='true'}))}};
+  })()`) };
+}
+
 export function selectedNavigationIdentity(projection) {
   const project = projection?.selected_project_index >= 0
     ? projection?.project_rows?.[projection.selected_project_index] ?? null

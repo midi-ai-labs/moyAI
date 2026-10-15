@@ -48,9 +48,10 @@ use crate::session::markdown::{
 use crate::session::{
     ActiveTurnExpectation, EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent,
     RunEventDurability, RunSummary, SessionId, SessionRecord, SessionSettingsPatch, SessionStatus,
+    ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult,
     canonical_session_read_to_markdown, history_markdown_file_name,
 };
-use crate::storage::{SideChatBinding, SideChatId, SideChatProviderTarget};
+use crate::storage::{SideChatBinding, SideChatId, SideChatProviderTarget, SideChatRouteKind};
 use crate::tool::PermissionRequest;
 use crate::tui::config_editor::{ConfigEditorState, GlobalConfigAdoptionPolicy};
 use crate::workspace::project::normalize_path;
@@ -66,7 +67,7 @@ use super::async_ops::{
 use super::models::{DesktopSnapshot, DesktopTranscriptRow, DesktopTranscriptRowKind};
 use super::navigation::NavigationRequestId;
 use super::open_session::OpenSessionView;
-use super::preferences::DesktopPreferences;
+use super::preferences::{DesktopOnboardingIntent, DesktopPreferences};
 use super::query::{
     DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, LoadedSessionDetail,
     load_latest_session_detail, load_session_detail, load_snapshot, load_snapshot_continue_last,
@@ -108,6 +109,10 @@ enum RuntimeMessage {
     Finished {
         run_generation: u64,
         result: Result<RunSummary, String>,
+    },
+    ControlFinished {
+        run_generation: u64,
+        result: DesktopControlResult,
     },
     Permission {
         confirmation_id: u64,
@@ -206,6 +211,7 @@ enum RuntimeMessage {
     },
     WorkspaceSwitchedForNewProjectSession {
         request_id: NavigationRequestId,
+        requested: Utf8PathBuf,
         result: Result<WorkspaceLoadResult, String>,
     },
     AccessModePersisted {
@@ -650,7 +656,9 @@ impl RuntimeMessage {
             RuntimeMessage::RunEvent { .. } | RuntimeMessage::CanonicalSessionEvent { .. } => {
                 RuntimeMessageAsyncContract::RunStream
             }
-            RuntimeMessage::Finished { .. } => RuntimeMessageAsyncContract::TerminalRun,
+            RuntimeMessage::Finished { .. } | RuntimeMessage::ControlFinished { .. } => {
+                RuntimeMessageAsyncContract::TerminalRun
+            }
             RuntimeMessage::Permission { .. } | RuntimeMessage::PermissionCancelled { .. } => {
                 RuntimeMessageAsyncContract::ModalDecision
             }
@@ -718,6 +726,7 @@ impl RuntimeMessage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionLoadReason {
     UserSelection,
+    CreatedEditFork,
     RunningRejoin,
 }
 
@@ -740,6 +749,7 @@ struct LoadedSession {
 
 struct SessionNavigationLoadResult {
     workspace: Option<WorkspaceLoadResult>,
+    snapshot: Option<DesktopSnapshot>,
     loaded: LoadedSession,
 }
 
@@ -1327,6 +1337,160 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn startup_preferences_restore_the_same_conversation_after_nested_git_init() {
+        use crate::session::{NewSession, SessionRepository as _};
+        let (_temp, root, controller) = empty_access_test_controller().await;
+        let nested = root.join("nested");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "ongoing work".into(),
+                cwd: nested.clone(),
+                model: "test".into(),
+                base_url: "http://127.0.0.1:9".into(),
+                access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let discovered = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &nested,
+            controller.app.process_runtime.clone(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(discovered.workspace.project_id, session.project_id);
+        let preferences = DesktopPreferences {
+            last_workspace: Some(nested.clone()),
+            last_session_id: Some(session.id),
+            ..Default::default()
+        };
+        let args = DesktopArgs {
+            directory: None,
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let restored = DesktopController::new_with_preferences_and_persistence(
+            discovered.clone(),
+            args.clone(),
+            preferences.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.app.workspace.project_id, session.project_id);
+        assert_eq!(restored.app.workspace.cwd, nested);
+        assert_eq!(
+            restored.state.app_state.current_session_id,
+            Some(session.id)
+        );
+        assert_eq!(restored.preferences.last_session_id, Some(session.id));
+        let selected =
+            &restored.state.snapshot.project_rows[restored.state.snapshot.selected_project_index];
+        assert_eq!(selected.path, root.as_str());
+
+        // A deliberate directory choice or --continue-last follows its own
+        // current workspace, even when saved preferences point elsewhere.
+        for explicit in [
+            DesktopArgs {
+                directory: Some(nested.clone()),
+                ..args.clone()
+            },
+            DesktopArgs {
+                continue_last: true,
+                ..args
+            },
+        ] {
+            let launched = DesktopController::new_with_preferences_and_persistence(
+                discovered.clone(),
+                explicit,
+                preferences.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                launched.app.workspace.project_id,
+                discovered.workspace.project_id
+            );
+            assert_ne!(
+                launched.state.app_state.current_session_id,
+                Some(session.id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_preferences_restore_legacy_workspace_and_report_missing_folders() {
+        let (_temp, root, controller) = empty_access_test_controller().await;
+        let saved = root.join("saved");
+        std::fs::create_dir_all(&saved).unwrap();
+        let args = DesktopArgs {
+            directory: None,
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let prefs = DesktopPreferences {
+            last_workspace: Some(saved.clone()),
+            ..Default::default()
+        };
+        let restored = DesktopController::new_with_preferences_and_persistence(
+            controller.app.clone(),
+            args.clone(),
+            prefs.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.app.workspace.cwd, saved);
+        assert_eq!(restored.preferences.last_session_id, None);
+        let missing = DesktopPreferences {
+            last_workspace: Some(root.join("missing")),
+            ..prefs.clone()
+        };
+        let restored = DesktopController::new_with_preferences_and_persistence(
+            controller.app.clone(),
+            args.clone(),
+            missing,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.app.workspace.cwd, root);
+        assert!(
+            restored
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("前回の作業フォルダーを開けませんでした")
+        );
+        assert!(!root.join("missing").exists());
+        let deleted = DesktopPreferences {
+            deleted_project_roots: vec![saved],
+            ..prefs
+        };
+        let restored = DesktopController::new_with_preferences_and_persistence(
+            controller.app.clone(),
+            args,
+            deleted,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.app.workspace.cwd, root);
+    }
+
+    #[tokio::test]
     async fn startup_restores_nested_workspace_and_exports_history_inside_its_authority() {
         use crate::session::{NewSession, SessionRepository as _};
 
@@ -1556,6 +1720,372 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn picked_project_directory_starts_new_chat_without_restoring_another_cwd() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        let old_cwd = project_root.join("old-workspace");
+        let selected_cwd = project_root.join("selected-workspace");
+        std::fs::create_dir_all(&old_cwd).expect("old workspace");
+        std::fs::create_dir_all(&selected_cwd).expect("selected workspace");
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "Existing nested chat".to_string(),
+                cwd: old_cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
+            })
+            .await
+            .expect("old session");
+        // The old directory need not still exist when a user selects a new one.
+        std::fs::remove_dir(&old_cwd).expect("remove unused old workspace");
+
+        controller.open_picked_project_directory(selected_cwd.clone());
+        for _ in 0..400 {
+            controller.drain_runtime_messages();
+            if !controller.state.navigation_loading() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.navigation_loading());
+        assert_eq!(controller.app.workspace.root, project_root);
+        assert_eq!(controller.app.workspace.cwd, selected_cwd);
+        assert_eq!(controller.app.workspace.authority_root(), selected_cwd);
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(controller.state.selected_session_id(), None);
+        assert!(
+            controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == session.id)
+        );
+        let preserved = controller
+            .app
+            .session_service
+            .get_session(session.id)
+            .await
+            .expect("preserved session");
+        assert_eq!(preserved.cwd, old_cwd);
+        assert_eq!(preserved.project_id, controller.app.workspace.project_id);
+
+        controller.refresh_snapshot();
+        for _ in 0..400 {
+            controller.drain_runtime_messages();
+            if !controller.snapshot_requests.is_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.snapshot_requests.is_pending());
+        assert_eq!(controller.state.selected_session_id(), None);
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        let mut late_none_snapshot = controller.state.snapshot.clone();
+        late_none_snapshot.workspace_path = old_cwd.to_string();
+
+        let created = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "Created in selected workspace".into(),
+                cwd: selected_cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
+            })
+            .await
+            .expect("created session");
+        let turn_id = TurnId::new();
+        let prompt = "new workspace transcript";
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: created.id,
+                scope: crate::protocol::HistoryScope::Turn { turn_id },
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: prompt.into(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+            })
+            .expect("created session history");
+        let reply = "new workspace reply";
+        for (index, payload) in [
+            crate::protocol::TurnItemPayload::UserMessage {
+                text: prompt.into(),
+            },
+            crate::protocol::TurnItemPayload::AgentMessage { text: reply.into() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            controller
+                .app
+                .store
+                .protocol_event_store()
+                .seed_turn_item_for_test(&crate::protocol::TurnItem {
+                    id: crate::protocol::TurnItemId::new(),
+                    session_id: created.id,
+                    turn_id,
+                    source_item_id: None,
+                    sequence_no: index as i64 + 2,
+                    payload,
+                })
+                .expect("created session transcript item");
+        }
+        let terminal = crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        controller.run_lifecycle.begin(1, RunControl::new());
+        for event in [
+            RunEvent::SessionStarted {
+                session_id: created.id,
+                title: created.title.clone(),
+            },
+            RunEvent::UserTurnStored {
+                session_id: created.id,
+                turn: Box::new(UserTurn {
+                    turn_id,
+                    items: vec![UserInputItem::Text {
+                        text: prompt.into(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                }),
+            },
+            RunEvent::TurnTerminal {
+                session_id: created.id,
+                terminal: Box::new(terminal.clone()),
+            },
+        ] {
+            controller
+                .runtime_tx
+                .send(RuntimeMessage::RunEvent {
+                    run_generation: 1,
+                    event,
+                })
+                .expect("run event");
+        }
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Ok(RunSummary::from_terminal(created.id, turn_id, terminal)),
+            })
+            .expect("worker finished");
+        for _ in 0..400 {
+            controller.drain_runtime_messages();
+            if !controller.run_lifecycle.root_is_active()
+                && !controller.snapshot_requests.is_pending()
+                && !controller.session_projection_refresh_requests.is_pending()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert!(!controller.snapshot_requests.is_pending());
+        assert!(!controller.session_projection_refresh_requests.is_pending());
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(created.id)
+        );
+        assert_eq!(controller.app.workspace.cwd, selected_cwd);
+
+        // A delayed fresh-draft result must not select the previous chat after admission.
+        let none_target = SnapshotRequestTarget {
+            workspace_root: project_root.clone(),
+            selected_session_id: None,
+        };
+        let none_request = controller.snapshot_requests.begin(none_target.clone());
+        controller.state.begin_snapshot_refresh();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: none_request,
+                target: none_target,
+                result: Ok(late_none_snapshot.clone()),
+            })
+            .expect("late draft snapshot");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            selected_cwd.as_str()
+        );
+
+        let current_target = SnapshotRequestTarget {
+            workspace_root: project_root.clone(),
+            selected_session_id: Some(created.id),
+        };
+        let stale_request = controller.snapshot_requests.begin(current_target.clone());
+        let latest_request = controller.snapshot_requests.begin(current_target.clone());
+        controller.state.begin_snapshot_refresh();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: stale_request,
+                target: current_target.clone(),
+                result: Ok(late_none_snapshot.clone()),
+            })
+            .expect("superseded snapshot");
+        controller.drain_runtime_messages();
+        assert!(
+            controller
+                .snapshot_requests
+                .is_current(latest_request, &current_target)
+        );
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            selected_cwd.as_str()
+        );
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: latest_request,
+                target: current_target,
+                result: Ok(controller.state.snapshot.clone()),
+            })
+            .expect("latest snapshot");
+        controller.drain_runtime_messages();
+
+        let other_workspace_target = SnapshotRequestTarget {
+            workspace_root: project_root.join("another-project"),
+            selected_session_id: Some(created.id),
+        };
+        let other_request = controller
+            .snapshot_requests
+            .begin(other_workspace_target.clone());
+        controller.state.begin_snapshot_refresh();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: other_request,
+                target: other_workspace_target,
+                result: Ok(late_none_snapshot),
+            })
+            .expect("other workspace snapshot");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.state.selected_session_id(), Some(created.id));
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            selected_cwd.as_str()
+        );
+
+        controller.export_open_transcript_markdown_auto();
+        let export_path = selected_cwd
+            .join(".moyai")
+            .join("transcript-exports")
+            .join(transcript_markdown_file_name(&created.title, created.id));
+        let exported = std::fs::read_to_string(&export_path).expect("new chat transcript export");
+        assert!(
+            exported.contains(prompt),
+            "exported transcript:\n{exported}"
+        );
+        assert!(exported.contains(reply), "exported transcript:\n{exported}");
+        assert!(exported.contains(&created.id.to_string()));
+        assert!(!exported.contains(&session.id.to_string()));
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("old chat retained")
+                .cwd,
+            old_cwd
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_picked_project_completion_cannot_replace_a_newer_directory_selection() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        let stale_cwd = project_root.join("stale");
+        let latest_cwd = project_root.join("latest");
+        std::fs::create_dir_all(&stale_cwd).expect("stale directory");
+        std::fs::create_dir_all(&latest_cwd).expect("latest directory");
+        let stale_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &stale_cwd,
+            controller.app.process_runtime.clone(),
+        )
+        .await
+        .expect("stale app");
+        let stale_snapshot = load_snapshot_for_selection(&stale_app, None)
+            .await
+            .expect("snapshot");
+        let stale_request = controller
+            .state
+            .begin_new_project_session_workspace_load(stale_cwd.clone());
+        // Replacing DesktopState resets the navigation sequence. A pending
+        // completion from its previous owner can then have the same request ID.
+        controller.state.navigation = Default::default();
+        let latest_request = controller
+            .state
+            .begin_new_project_session_workspace_load(latest_cwd);
+        assert_eq!(stale_request, latest_request);
+
+        controller.apply_new_project_workspace_switched_message(
+            stale_request,
+            stale_cwd.clone(),
+            Ok(WorkspaceLoadResult {
+                app: stale_app,
+                snapshot: stale_snapshot,
+            }),
+        );
+
+        assert_eq!(controller.app.workspace.cwd, project_root);
+        assert!(controller.state.is_current_navigation(latest_request));
+        assert!(controller.state.navigation_loading());
+        controller.apply_new_project_workspace_switched_message(
+            stale_request,
+            stale_cwd.clone(),
+            Err("old directory load failed".to_string()),
+        );
+        assert!(controller.state.is_current_navigation(latest_request));
+        assert!(controller.state.navigation_loading());
+
+        controller.state.navigation = Default::default();
+        let ordinary_request = controller
+            .state
+            .begin_workspace_load(stale_cwd.clone(), None);
+        assert_eq!(ordinary_request, stale_request);
+        controller.apply_new_project_workspace_switched_message(
+            stale_request,
+            stale_cwd,
+            Err("old new-chat load failed".to_string()),
+        );
+        assert!(controller.state.is_current_navigation(ordinary_request));
+        assert!(controller.state.navigation_loading());
+    }
+
+    #[tokio::test]
     async fn nested_first_session_submission_adopts_the_authority_owned_composer() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root =
@@ -1616,7 +2146,7 @@ mod command_projection_owner_tests {
             controller.root_submission_owner_workspace_path(),
             selected_directory
         );
-        assert!(controller.commit_pending_root_submission(run_generation));
+        assert!(controller.commit_pending_root_submission(run_generation, None));
         assert_eq!(
             controller.state.composer.image_attachment_paths,
             vec![next_image]
@@ -1683,8 +2213,104 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn workspace_replacement_keeps_the_process_publish_owner_and_fixed_target() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (temp, project_root, mut controller) = empty_access_test_controller().await;
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "Published main".to_string(),
+                cwd: controller.app.workspace.cwd.clone(),
+                model: "unused-by-MCP".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        let target = crate::mcp_publish::PublishTarget::Project {
+            project_id: session.project_id,
+            workspace_root: session.cwd,
+        };
+        let publish = crate::mcp_publish::PublishService::new(
+            Utf8PathBuf::from_path_buf(temp.path().join("application-config/mcp-publish.json"))
+                .unwrap(),
+            controller.app.store.clone(),
+            controller.app.config.clone(),
+        );
+        let initial = publish.refresh().await.unwrap();
+        let saved = publish
+            .save(
+                None,
+                crate::mcp_publish::PublishDraft {
+                    label: "Fixed workspace read".to_string(),
+                    mode: crate::mcp_publish::PublishMode::ReadTools {},
+                    tls: None,
+                    bind: "127.0.0.1:7332".parse().unwrap(),
+                    target: target.clone(),
+                    tools: vec![crate::tool::ToolName::Read],
+                    max_concurrent_calls: 1,
+                    background: crate::mcp_publish::PublishBackgroundPolicy::StopWhenWindowCloses,
+                },
+                &initial.revision,
+                &initial.generation,
+            )
+            .await
+            .unwrap();
+        let profile_id = saved.profiles[0].profile.id;
+        controller.state.mcp_publish = Some(publish.clone());
+        assert!(controller.next_web_state().unwrap().mcp_publish.is_some());
+
+        let replacement_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("different-workspace")).unwrap();
+        std::fs::create_dir(&replacement_root).unwrap();
+        let replacement_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &replacement_root,
+            controller.app.process_runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let snapshot = load_snapshot_for_selection(&replacement_app, None)
+            .await
+            .unwrap();
+        assert!(controller.replace_workspace_from_load(WorkspaceLoadResult {
+            app: replacement_app,
+            snapshot
+        }));
+        assert_ne!(controller.app.workspace.root, project_root);
+        let projected = controller
+            .next_web_state()
+            .unwrap()
+            .mcp_publish
+            .expect("process publication remains visible after project switch");
+        assert_eq!(projected.profiles[0].profile.id, profile_id);
+        assert_eq!(projected.profiles[0].profile.target, target);
+
+        // A command on the original managed service must still update the current
+        // Desktop projection: copying configuration into a new owner is insufficient.
+        let receipt = publish
+            .issue_token(profile_id, &projected.revision, &projected.generation)
+            .await
+            .unwrap();
+        let current = controller.next_web_state().unwrap().mcp_publish.unwrap();
+        assert_eq!(current.revision, receipt.projection.revision);
+        assert!(current.profiles[0].credential_configured);
+        assert_eq!(current.profiles[0].profile.target, target);
+        assert!(publish.shutdown().await);
+    }
+
+    #[tokio::test]
     async fn stale_session_navigation_cannot_replace_a_newer_workspace_with_reused_request_id() {
-        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        let (temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller.state.hub_connection = Some(crate::hub::HubConnection::new(
+            crate::hub::HubSettingsStore::new(
+                Utf8PathBuf::from_path_buf(temp.path().join("hub-settings.json")).unwrap(),
+            ),
+        ));
         let session_id = SessionId::new();
         let stale_request_id = controller.state.begin_session_load(session_id);
         let stale_target = SessionLoadRequestTarget {
@@ -1726,6 +2352,7 @@ mod command_projection_owner_tests {
             SessionLoadReason::UserSelection,
             Ok(SessionNavigationLoadResult {
                 workspace: None,
+                snapshot: None,
                 loaded: stale_loaded,
             }),
         );
@@ -1733,6 +2360,251 @@ mod command_projection_owner_tests {
         assert_eq!(controller.app.workspace.cwd, newer_cwd);
         assert!(controller.state.navigation_loading());
         assert_eq!(controller.state.app_state.current_session_id, None);
+        assert!(controller.next_web_state().unwrap().hub.is_some());
+    }
+
+    #[tokio::test]
+    async fn initial_setup_purpose_restores_team_without_replacing_direct_config() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &project_root);
+        let before = serde_json::to_value(controller.state.global_config()).unwrap();
+        controller
+            .choose_initial_setup_purpose(DesktopOnboardingIntent::Team)
+            .unwrap();
+        assert!(controller.state.view.hub_project_open);
+        assert_eq!(
+            serde_json::to_value(controller.state.global_config()).unwrap(),
+            before
+        );
+        let preferences = controller.preferences.clone();
+        let app = build_test_app(&project_root, controller.app.store.clone()).await;
+        let args = DesktopArgs {
+            directory: Some(project_root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let restarted =
+            DesktopController::new_with_preferences_and_persistence(app, args, preferences, false)
+                .await
+                .unwrap();
+        assert!(restarted.state.view.hub_project_open);
+        assert_eq!(
+            restarted.state.view.overlay,
+            super::super::state::DesktopOverlay::None
+        );
+        assert_eq!(
+            restarted.preferences.onboarding_intent,
+            Some(DesktopOnboardingIntent::Team)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_setup_opens_and_restores_hub_before_manual_ai_configuration() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &project_root);
+        let before = serde_json::to_value(controller.state.global_config()).unwrap();
+        controller
+            .choose_initial_setup_purpose(DesktopOnboardingIntent::Execution)
+            .unwrap();
+        controller.state.apply_startup_overlay();
+        let chosen = controller.next_web_state().unwrap();
+        assert_eq!(chosen.overlay, "hub");
+        assert!(chosen.hub_project_open);
+        assert!(
+            chosen.startup.initial_setup_required,
+            "choosing execution must not pretend the Hub config was saved"
+        );
+        assert_eq!(
+            serde_json::to_value(controller.state.global_config()).unwrap(),
+            before
+        );
+        let preferences = controller.preferences.clone();
+        let app = build_test_app(&project_root, controller.app.store.clone()).await;
+        let mut restarted = DesktopController::new_with_preferences_and_persistence(
+            app,
+            DesktopArgs {
+                directory: Some(project_root),
+                session_id: None,
+                continue_last: false,
+                global_config_existed_at_launch: true,
+            },
+            preferences,
+            false,
+        )
+        .await
+        .unwrap();
+        restarted.state.apply_startup_overlay();
+        let restored = restarted.next_web_state().unwrap();
+        assert_eq!(restored.overlay, "hub");
+        assert!(restored.hub_project_open && restored.startup.initial_setup_required);
+        assert_eq!(
+            restarted.preferences.onboarding_intent,
+            Some(DesktopOnboardingIntent::Execution)
+        );
+        assert_eq!(
+            serde_json::to_value(restarted.state.global_config()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn initial_setup_saved_connection_survives_preferences_failure() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../project_sandbox/desktop-preferences-persistence-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::tempdir_in(base).unwrap();
+        let config = temp.path().join("config.toml");
+        let blocked_preferences = temp.path().join("preferences-file-is-a-directory");
+        std::fs::write(&config, "").unwrap();
+        std::fs::create_dir(&blocked_preferences).unwrap();
+        // Use a dedicated child so process-wide config/preferences paths never
+        // alter another test or the real Windows user's profile.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "desktop::app::command_projection_owner_tests::initial_setup_saved_connection_preferences_failure_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOYAI_CONFIG_PATH", &config)
+            .env("MOYAI_DESKTOP_PREFS_PATH", &blocked_preferences)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Dedicated child process for isolated config/preferences persistence failure"]
+    async fn initial_setup_saved_connection_preferences_failure_fixture() {
+        let config = Utf8PathBuf::from(std::env::var("MOYAI_CONFIG_PATH").unwrap());
+        let preferences = Utf8PathBuf::from(std::env::var("MOYAI_DESKTOP_PREFS_PATH").unwrap());
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../project_sandbox/desktop-preferences-persistence-tests")
+            .canonicalize()
+            .unwrap();
+        assert!(
+            config
+                .as_std_path()
+                .canonicalize()
+                .unwrap()
+                .starts_with(&base)
+        );
+        assert_eq!(
+            preferences,
+            config.with_file_name("preferences-file-is-a-directory")
+        );
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        controller.preferences.onboarding_intent = Some(DesktopOnboardingIntent::Personal);
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &root);
+        controller.persist_preferences_to_disk = true;
+        let service = crate::device_network::DeviceNetworkService::for_workspace(
+            root.join("device-network"),
+            root.clone(),
+            controller.app.store.clone(),
+            controller.state.global_config().clone(),
+        )
+        .await
+        .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let shared = crate::device_network::SharedHubConfig {
+            hub_url: "https://127.0.0.1:19471".into(),
+            ca_certificate_pem: params.self_signed(&key).unwrap().pem(),
+        };
+        let before = service.projection_now();
+        let prepared = service
+            .prepare_configuration(shared.clone(), &before.revision, &before.generation)
+            .await
+            .unwrap();
+        let result = service
+            .commit_configuration(prepared, |saved| {
+                controller
+                    .save_device_network_config(saved, true)
+                    .map_err(|_| crate::device_network::DeviceError::Storage)
+            })
+            .await;
+        let persisted: toml::Value =
+            toml::from_str(&std::fs::read_to_string(global_config_path().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted["device_network"]["hub_url"].as_str(),
+            Some(shared.hub_url.as_str())
+        );
+        assert_eq!(controller.state.global_config().device_network, shared);
+        assert!(
+            result.is_ok(),
+            "the connection is already persisted; preferences failure cannot turn its commit into an error: {result:?}"
+        );
+        assert_eq!(service.projection_now().hub_url, shared.hub_url);
+        assert!(
+            controller
+                .finish_initial_setup_after_device_network_persist()
+                .is_err()
+        );
+        assert_eq!(
+            controller.preferences.onboarding_intent,
+            Some(DesktopOnboardingIntent::Personal)
+        );
+        assert!(controller.state.startup.requires_initial_setup());
+        assert_eq!(service.projection_now().hub_url, shared.hub_url);
+        // The failed completion is retryable without rolling back or importing
+        // the already committed connection again.
+        std::fs::remove_dir(&preferences).unwrap();
+        controller
+            .finish_initial_setup_after_device_network_persist()
+            .unwrap();
+        assert!(!controller.state.startup.requires_initial_setup());
+        assert_eq!(controller.preferences.onboarding_intent, None);
+        assert_eq!(service.projection_now().hub_url, shared.hub_url);
+    }
+
+    #[tokio::test]
+    async fn initial_setup_purpose_restores_personal_review_after_config_creation() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_startup(false, global_config_path().ok(), &project_root);
+        controller
+            .choose_initial_setup_purpose(DesktopOnboardingIntent::Personal)
+            .unwrap();
+        let app = build_test_app(&project_root, controller.app.store.clone()).await;
+        let args = DesktopArgs {
+            directory: Some(project_root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let restarted = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            controller.preferences.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(restarted.state.startup.requires_initial_setup());
+        assert_eq!(
+            restarted.state.view.overlay,
+            super::super::state::DesktopOverlay::InitialSetup
+        );
+        assert_eq!(
+            restarted.state.startup.onboarding_intent,
+            Some(DesktopOnboardingIntent::Personal)
+        );
     }
 
     #[tokio::test]
@@ -2399,9 +3271,19 @@ mod command_projection_owner_tests {
             .model
             .extra_headers
             .insert("X-Import-Secret".to_string(), second_secret.to_string());
+        second.approve = Some(crate::config::ApproveConfig::from_model(&second.model));
         let (second_generation, _) = controller
             .stage_initial_setup_config_import(second)
             .expect("stage replacement import");
+        assert!(
+            controller
+                .pending_initial_setup_config_import
+                .as_ref()
+                .unwrap()
+                .config
+                .approve
+                .is_some()
+        );
         let redacted_values = ConfigField::ALL
             .into_iter()
             .filter(|field| !field.is_host_owned_generation())
@@ -2421,6 +3303,67 @@ mod command_projection_owner_tests {
                 .is_err(),
             "a second import must invalidate the first raw owner"
         );
+        let sparse_commit_values = redacted_values
+            .iter()
+            .filter(|(key, _)| {
+                !ConfigField::ALL.into_iter().any(|field| {
+                    field.label() == key
+                        && (field.is_connection_private_value()
+                            || field.label().starts_with("approve."))
+                })
+            })
+            .cloned()
+            .collect();
+        let sparse_hydrated = controller
+            .hydrate_initial_setup_import_sensitive_values(
+                sparse_commit_values,
+                Some(second_generation),
+            )
+            .expect("current imported snapshot with unchanged private fields omitted");
+        assert!(
+            sparse_hydrated.iter().any(|(key, value)| {
+                key == ConfigField::ExtraHeadersJson.label() && value.contains(second_secret)
+            }),
+            "same-target Finish must retain the imported header when the Web commit omits its redacted field"
+        );
+        for (field, value) in [
+            (ConfigField::BaseUrl, "http://changed-import-target.test"),
+            (ConfigField::ProviderProfile, "openai"),
+        ] {
+            for omit_private in [false, true] {
+                let changed_target_values = redacted_values
+                    .iter()
+                    .filter(|(key, _)| {
+                        !omit_private
+                            || !ConfigField::ALL.into_iter().any(|field| {
+                                field.label() == key && field.is_connection_private_value()
+                            })
+                    })
+                    .map(|(key, text)| {
+                        (
+                            key.clone(),
+                            if key == field.label() {
+                                value.to_string()
+                            } else {
+                                text.clone()
+                            },
+                        )
+                    })
+                    .collect();
+                let hydrated = controller
+                    .hydrate_initial_setup_import_sensitive_values(
+                        changed_target_values,
+                        Some(second_generation),
+                    )
+                    .expect("changed imported connection target");
+                assert!(
+                    !hydrated.iter().any(|(key, text)| {
+                        key == ConfigField::ExtraHeadersJson.label() && text.contains(second_secret)
+                    }),
+                    "an omitted or redacted header must not authorize the changed imported target"
+                );
+            }
+        }
         let hydrated = controller
             .hydrate_initial_setup_import_sensitive_values(
                 redacted_values.clone(),
@@ -2465,6 +3408,12 @@ mod command_projection_owner_tests {
         assert!(
             controller.pending_initial_setup_config_import.is_none(),
             "raw imported secrets must be dropped as soon as their exact config owner drifts"
+        );
+        assert!(
+            controller
+                .hydrate_initial_setup_import_sensitive_values(Vec::new(), Some(second_generation),)
+                .is_err(),
+            "another settings owner cannot reuse the imported approval snapshot"
         );
     }
 
@@ -3413,6 +4362,169 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn desktop_goal_query_completes_without_a_turn_or_failed_history() {
+        use crate::session::{NewSession, SessionRepository as _};
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "Goal control".to_string(),
+                cwd: root.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
+            })
+            .await
+            .expect("session");
+        let before = load_latest_session_detail(&controller.app, session.id)
+            .await
+            .expect("before");
+        controller.state.load_open_session(&before.read);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Completed;
+        let generation = controller.composer_commit_generation;
+        let retained_image = root.join("next-turn.png");
+        controller
+            .state
+            .composer
+            .image_attachment_paths
+            .push(retained_image.clone());
+        assert!(controller.start_run("/goal".to_string()));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.run_lifecycle.root_is_active() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert!(controller.pending_root_submission.is_none());
+        assert_eq!(controller.state.status_code, DesktopStatusCode::GoalControl);
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Completed
+        );
+        assert_eq!(controller.composer_commit_generation, generation + 1);
+        assert!(!controller.state.post_run_refresh_pending());
+        assert!(
+            controller.state.app_state.transcript_entries.is_empty(),
+            "control completion must not fabricate a User or failure entry"
+        );
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![retained_image]
+        );
+        assert!(
+            controller
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("Goal が設定されていません")
+        );
+        let after = load_latest_session_detail(&controller.app, session.id)
+            .await
+            .expect("after");
+        assert_eq!(
+            serde_json::to_value(&after.read).unwrap(),
+            serde_json::to_value(&before.read).unwrap(),
+            "Goal query must not create or rewrite a durable Turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_goal_stale_completion_cannot_consume_a_newer_pending_input() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller.run_lifecycle.begin(42, RunControl::new());
+        controller.state.begin_agent_run();
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation: 42,
+            owner_workspace_path: controller.root_submission_owner_workspace_path(),
+            owner_session_id: None,
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("newer request"),
+            image_paths: Vec::new(),
+            prompt_review_to_cancel: None,
+        });
+        let generation = controller.composer_commit_generation;
+        controller.settle_control_finished(
+            41,
+            DesktopControlResult::GoalGet(ThreadGoalGetResult { goal: None }),
+        );
+        assert!(controller.run_lifecycle.owns(42));
+        assert_eq!(
+            controller
+                .pending_root_submission
+                .as_ref()
+                .unwrap()
+                .run_generation,
+            42
+        );
+        assert_eq!(controller.composer_commit_generation, generation);
+        assert_ne!(controller.state.status_code, DesktopStatusCode::GoalControl);
+    }
+
+    #[test]
+    fn desktop_goal_renderer_returns_query_and_mutation_results_without_run_events() {
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::channel();
+        let mut renderer = DesktopRenderer {
+            runtime_tx,
+            bootstrap_control: DesktopControlPlaneSender { tx },
+            run_generation: 1,
+            notification_title: "Goal".to_string(),
+            notified_terminal: false,
+            control_result: None,
+        };
+        renderer
+            .render_thread_goal_get(&ThreadGoalGetResult { goal: None })
+            .unwrap();
+        assert!(
+            renderer
+                .control_result
+                .as_ref()
+                .unwrap()
+                .description()
+                .contains("設定されていません")
+        );
+        let goal = crate::session::ThreadGoal {
+            thread_id: SessionId::new(),
+            objective: "first line\nsecond line".to_string(),
+            status: crate::session::ThreadGoalStatus::Paused,
+            token_budget: Some(100),
+            tokens_used: 7,
+            time_used_seconds: 3,
+            created_at: 1,
+            updated_at: 2,
+        };
+        renderer
+            .render_thread_goal_set(&ThreadGoalSetResult { goal: goal.clone() })
+            .unwrap();
+        let description = renderer.control_result.as_ref().unwrap().description();
+        assert!(description.contains("一時停止\nfirst line\nsecond line"));
+        assert!(description.contains("7 / 100"));
+        renderer
+            .render_thread_goal_clear(&ThreadGoalClearResult {
+                thread_id: goal.thread_id,
+                cleared: true,
+            })
+            .unwrap();
+        assert!(
+            renderer
+                .control_result
+                .as_ref()
+                .unwrap()
+                .description()
+                .contains("削除しました")
+        );
+        assert!(runtime_rx.try_recv().is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn session_settings_cas_loser_returns_canonical_record_for_conflict_rebase() {
         use crate::session::{NewSession, SessionRepository as _};
 
@@ -3653,6 +4765,7 @@ mod command_projection_owner_tests {
             defaults.model = "first-side-model".to_string();
             defaults.system_prompt = "FIRST_SIDE_PROMPT".to_string();
             defaults.provider_profile = ProviderProfile::OpenAiCompatible;
+            defaults.api_key_env = Some("FIRST_SIDE_KEY".to_string());
             defaults.context_window = 65_536;
         }
 
@@ -3669,6 +4782,7 @@ mod command_projection_owner_tests {
         assert_eq!(first.model, "first-side-model");
         assert_eq!(first.system_prompt, "FIRST_SIDE_PROMPT");
         assert_eq!(first.context_window, 65_536);
+        assert_eq!(first.api_key_env.as_deref(), Some("FIRST_SIDE_KEY"));
 
         controller
             .state
@@ -3683,6 +4797,12 @@ mod command_projection_owner_tests {
             .side_chat
             .system_prompt = "SECOND_SIDE_PROMPT".to_string();
         controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .api_key_env = Some("SECOND_SIDE_KEY".to_string());
+        controller
             .ensure_side_chat(owner_session_id)
             .expect("existing Side Chat remains stable");
         let unchanged = controller
@@ -3695,6 +4815,15 @@ mod command_projection_owner_tests {
         assert_eq!(unchanged.id, first.id);
         assert_eq!(unchanged.model, "first-side-model");
         assert_eq!(unchanged.system_prompt, "FIRST_SIDE_PROMPT");
+        assert_eq!(unchanged.api_key_env, first.api_key_env);
+        assert_eq!(
+            controller.side_chat_projection().api_key_env,
+            "FIRST_SIDE_KEY"
+        );
+        let request = side_chat_request_profile(&unchanged);
+        assert_eq!(request.api_key_env, first.api_key_env);
+        assert_eq!(request.base_url, first.base_url);
+        assert!(request.extra_headers.is_empty());
 
         controller
             .delete_side_chat(owner_session_id, first.id, first.request_generation)
@@ -3721,6 +4850,167 @@ mod command_projection_owner_tests {
         assert_ne!(replacement.id, first.id);
         assert_eq!(replacement.model, "second-side-model");
         assert_eq!(replacement.system_prompt, "SECOND_SIDE_PROMPT");
+        assert_eq!(replacement.api_key_env.as_deref(), Some("SECOND_SIDE_KEY"));
+        assert_eq!(
+            controller.side_chat_projection().api_key_env,
+            "SECOND_SIDE_KEY"
+        );
+    }
+
+    #[tokio::test]
+    async fn side_chat_authentication_requires_an_explicit_independent_reference() {
+        let (_temp, _root, mut controller, owner) = side_chat_test_controller().await;
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .api_key_env = Some("SHARED_PROVIDER_KEY".to_string());
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .extra_headers
+            .insert("X-Main-Secret".to_string(), "main-only-header".to_string());
+        controller
+            .ensure_side_chat(owner)
+            .expect("anonymous Side default");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.api_key_env, None);
+        assert_eq!(side_chat_request_profile(&binding).api_key_env, None);
+        assert!(side_chat_request_profile(&binding).extra_headers.is_empty());
+        controller
+            .delete_side_chat(owner, binding.id, binding.request_generation)
+            .unwrap();
+
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .api_key_env = Some("SHARED_PROVIDER_KEY".to_string());
+        controller
+            .ensure_side_chat(owner)
+            .expect("explicit same reference");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            side_chat_request_profile(&binding).api_key_env.as_deref(),
+            Some("SHARED_PROVIDER_KEY")
+        );
+        assert!(side_chat_request_profile(&binding).extra_headers.is_empty());
+        assert_eq!(
+            controller.side_chat_projection().api_key_env,
+            "SHARED_PROVIDER_KEY"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_origin_side_chat_requires_explicit_direct_capture_before_admission() {
+        let (_temp, _root, mut controller, owner) = side_chat_test_controller().await;
+        let mut hub_target = SideChatProviderTarget::try_from(
+            &controller.state.provider_config.effective_config.side_chat,
+        )
+        .expect("Side policy");
+        hub_target.route_kind = SideChatRouteKind::Hub;
+        hub_target.model = "logical-hub-model".into();
+        hub_target.base_url = "https://hub.test:9471".into();
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .ensure(owner, hub_target)
+            .unwrap();
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .base_url
+            .clear();
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .model
+            .clear();
+        controller
+            .ensure_side_chat(owner)
+            .expect("reopen needs no unrelated Direct settings");
+        let projection = controller.side_chat_projection();
+        assert!(!projection.can_send);
+        assert!(!projection.direct_provider_capture.unwrap().enabled);
+        let error = controller
+            .start_side_chat(
+                owner,
+                binding.id,
+                0,
+                0,
+                None,
+                None,
+                "must not call the management URL".into(),
+            )
+            .expect_err("Direct capture required");
+        assert!(error.contains("Direct設定"), "{error}");
+        assert_eq!(
+            controller
+                .app
+                .store
+                .side_chat_repo()
+                .get_by_owner(owner)
+                .unwrap(),
+            Some(binding.clone())
+        );
+        assert!(
+            controller
+                .app
+                .store
+                .side_chat_repo()
+                .conversation_projection(owner)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .base_url = "http://direct.test:1234/v1".into();
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .model = "direct-model".into();
+        assert!(
+            controller
+                .side_chat_projection()
+                .direct_provider_capture
+                .unwrap()
+                .enabled
+        );
+        controller
+            .capture_side_chat_direct_provider(owner, binding.id, 0, 0)
+            .expect("first Direct capture");
+        let applied = controller.side_chat_projection();
+        assert!(applied.direct_provider_capture.is_none());
+        assert!(applied.can_send);
+        assert_eq!(applied.model, "direct-model");
     }
 
     #[tokio::test]
@@ -4217,7 +5507,19 @@ mod command_projection_owner_tests {
         );
         let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        let (temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller.state.hub_connection = Some(crate::hub::HubConnection::new(
+            crate::hub::HubSettingsStore::new(
+                Utf8PathBuf::from_path_buf(temp.path().join("hub-settings.json")).unwrap(),
+            ),
+        ));
+        let idle = controller
+            .next_web_state()
+            .expect("idle route availability");
+        let idle_hub = idle.hub.expect("Hub route settings");
+        assert_eq!(idle_hub.side_chat_mode, crate::hub::HubRouteMode::Direct);
+        assert!(idle_hub.can_change_side_chat_mode);
+        assert!(!controller.hub_context_active(crate::hub::HubReviewContext::SideChat));
         controller
             .configure_side_chat(
                 owner_session_id,
@@ -4300,6 +5602,20 @@ mod command_projection_owner_tests {
         controller.state.app_state.current_session_id = Some(other.id);
         controller.state.app_state.current_session_title = other.title;
 
+        let background = controller
+            .next_web_state()
+            .expect("background Side route availability");
+        assert_ne!(background.side_chat.status, "running");
+        let background_hub = background.hub.expect("Hub route settings");
+        assert!(controller.hub_context_active(crate::hub::HubReviewContext::SideChat));
+        assert_eq!(
+            background_hub.can_change_side_chat_mode,
+            !controller.hub_context_active(crate::hub::HubReviewContext::SideChat),
+            "a background Direct Side run closes the same mode gate used by the command"
+        );
+        assert!(background_hub.can_change_main_mode);
+        assert!(!controller.hub_context_active(crate::hub::HubReviewContext::Main));
+
         let cancel_error = controller
             .cancel_side_chat(owner_session_id, admitted.id, admitted.request_generation)
             .expect_err("stale owner must not stop an active side chat");
@@ -4368,6 +5684,16 @@ mod command_projection_owner_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let settled = controller
+            .next_web_state()
+            .expect("settled Side route availability");
+        assert!(!controller.hub_context_active(crate::hub::HubReviewContext::SideChat));
+        assert!(
+            settled
+                .hub
+                .expect("Hub route settings")
+                .can_change_side_chat_mode
+        );
         assert!(
             controller
                 .app
@@ -5005,6 +6331,12 @@ mod command_projection_owner_tests {
         controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
         controller.state.begin_agent_run();
         controller.run_lifecycle.begin(17, RunControl::new());
+        controller.state.apply_run_event(&RunEvent::ToolCallFailed {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            error: "shell invocation failed before the interruption".to_string(),
+            metadata: serde_json::json!({}),
+        });
         let summary = RunSummary::from_terminal(
             session_id,
             crate::protocol::TurnId::new(),
@@ -5050,10 +6382,182 @@ mod command_projection_owner_tests {
         assert_eq!(controller.state.app_state.progress.tool_calls_failed, 1);
     }
 
+    async fn background_session_stop_fixture() -> (
+        tempfile::TempDir,
+        DesktopController,
+        SessionId,
+        TurnId,
+        crate::storage::session_repo::AdmittedTurnSnapshot,
+    ) {
+        use crate::session::{NewSession, SessionRepository as _};
+        let (temp, root, controller) = empty_access_test_controller().await;
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "external Stop target".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
+            })
+            .await
+            .expect("session");
+        let turn_id = TurnId::new();
+        let admission = controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_turn(session.id, turn_id)
+            .await
+            .expect("admission")
+            .expect("admitted");
+        (temp, controller, session.id, turn_id, admission)
+    }
+
+    async fn finish_background_session_stop(
+        app: &App,
+        session_id: SessionId,
+        turn_id: TurnId,
+        admission: &crate::storage::session_repo::AdmittedTurnSnapshot,
+    ) {
+        app.store
+            .session_repo()
+            .terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                admission.admission_id,
+                &RunEvent::TurnTerminal {
+                    session_id,
+                    terminal: Box::new(crate::session::DurableTurnTerminal {
+                        outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                            cause: crate::protocol::TurnInterruptionCause::UserStop,
+                        },
+                        final_response_id: None,
+                        tool_call_count: 0,
+                        failed_tool_count: 0,
+                        change_count: 0,
+                        metrics: Default::default(),
+                    }),
+                },
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("external terminal");
+    }
+
+    #[tokio::test]
+    async fn background_session_stop_waits_for_durable_terminal_before_snapshot() {
+        let (_temp, controller, session_id, turn_id, admission) =
+            background_session_stop_fixture().await;
+        let expected = ActiveTurnExpectation::Turn {
+            turn_id,
+            revision: admission.admission_revision,
+        };
+        claim_exact_root_execution_stop(&controller.app, session_id, expected)
+            .await
+            .expect("request accepted");
+        let mut confirmation = Box::pin(load_stopped_session_operation_projection(
+            &controller.app,
+            session_id,
+            expected,
+            std::time::Duration::from_secs(2),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), confirmation.as_mut())
+                .await
+                .is_err(),
+            "request acknowledgement must not complete the sidebar operation"
+        );
+        finish_background_session_stop(&controller.app, session_id, turn_id, &admission).await;
+        let applied = confirmation.await.expect("terminal projection");
+        let row = applied
+            .snapshot
+            .session_rows
+            .iter()
+            .find(|row| row.session_id == session_id)
+            .expect("external row");
+        assert_eq!(row.status, SessionStatus::Cancelled);
+        assert_eq!(row.loaded_status, crate::session::LoadedSessionStatus::Idle);
+        assert_eq!(row.active_turn_id, None);
+        assert_eq!(applied.loaded.read.active_turn_id, None);
+        assert!(!applied.message.contains("unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn background_session_stop_timeout_preserves_active_state_and_reports_unconfirmed() {
+        let (_temp, controller, session_id, turn_id, admission) =
+            background_session_stop_fixture().await;
+        let applied = load_stopped_session_operation_projection(
+            &controller.app,
+            session_id,
+            ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: admission.admission_revision,
+            },
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("bounded observation");
+        assert_eq!(applied.loaded.read.active_turn_id, Some(turn_id));
+        assert_eq!(applied.loaded.read.session.status, SessionStatus::Running);
+        assert!(applied.message.contains("completion is unconfirmed"));
+        assert!(applied.message.contains("Refresh"));
+        finish_background_session_stop(&controller.app, session_id, turn_id, &admission).await;
+    }
+
+    #[tokio::test]
+    async fn background_session_stop_does_not_wait_for_or_cancel_a_replacement_admission() {
+        let (_temp, controller, session_id, turn_id, admission) =
+            background_session_stop_fixture().await;
+        finish_background_session_stop(&controller.app, session_id, turn_id, &admission).await;
+        let replacement = TurnId::new();
+        let next = controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_turn(session_id, replacement)
+            .await
+            .expect("replacement admission")
+            .expect("replacement admitted");
+        for expected in [
+            ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: admission.admission_revision,
+            },
+            ActiveTurnExpectation::Turn {
+                turn_id: replacement,
+                revision: admission.admission_revision,
+            },
+        ] {
+            let applied = load_stopped_session_operation_projection(
+                &controller.app,
+                session_id,
+                expected,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .expect("replacement projection");
+            assert_eq!(applied.loaded.read.active_turn_id, Some(replacement));
+            assert_eq!(
+                applied.loaded.read.admission_revision,
+                next.admission_revision
+            );
+            assert!(applied.message.contains("replacement was not stopped"));
+            assert!(!applied.message.contains("unconfirmed"));
+        }
+        finish_background_session_stop(&controller.app, session_id, replacement, &next).await;
+    }
+
     #[tokio::test]
     async fn rejoined_running_session_observes_an_exact_terminal_committed_by_another_store() {
         use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
+        use crate::storage::session_repo::{ModelResponseWrite, PendingToolCallWrite};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
@@ -5197,18 +6701,62 @@ mod command_projection_owner_tests {
         let external_sqlite =
             crate::storage::SqliteStore::open(&paths).expect("external sqlite connection");
         let external_store = crate::storage::StoreBundle::new(external_sqlite);
+        let failed_calls = [
+            crate::session::ToolCallId::new(),
+            crate::session::ToolCallId::new(),
+        ];
+        external_store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session.id,
+                admission.admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: crate::protocol::ModelResponseId::new(),
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: failed_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, id)| PendingToolCallWrite {
+                            id: *id,
+                            model_call_id: format!("external-failed-call-{index}"),
+                            tool_name: "shell".to_string(),
+                            arguments_json: serde_json::json!({"command": "python -m unittest"})
+                                .to_string(),
+                            protocol_sequence_no: None,
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("external pending calls");
+        for call in failed_calls {
+            external_store
+                .session_repo()
+                .fail_tool_call_with_protocol_bundle(
+                    session.id,
+                    admission.admission_id,
+                    call,
+                    crate::tool::ToolName::Shell,
+                    "external shell invocation failed",
+                    serde_json::json!({}),
+                    turn_id,
+                    None,
+                )
+                .await
+                .expect("external tool failure")
+                .expect("external failed call settled");
+        }
         let terminal = crate::session::DurableTurnTerminal {
             outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
                 cause: crate::protocol::TurnInterruptionCause::UserStop,
             },
             final_response_id: None,
-            tool_call_count: 7,
+            tool_call_count: 2,
             failed_tool_count: 2,
-            change_count: 3,
-            metrics: crate::session::RunMetrics {
-                model_request_count: 5,
-                ..Default::default()
-            },
+            change_count: 0,
+            metrics: Default::default(),
         };
         external_store
             .session_repo()
@@ -5246,7 +6794,8 @@ mod command_projection_owner_tests {
             .expect("duplicate live wake is harmless");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while controller.state.app_state.run_status == crate::tui::state::RunStatus::Running
+        while (controller.state.app_state.run_status == crate::tui::state::RunStatus::Running
+            || controller.state.post_run_refresh_pending())
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -5261,8 +6810,9 @@ mod command_projection_owner_tests {
             controller.state.app_state.interruption_cause,
             Some(crate::protocol::TurnInterruptionCause::UserStop)
         );
-        assert_eq!(controller.state.app_state.progress.model_requests, 5);
-        assert_eq!(controller.state.app_state.progress.tool_calls_started, 7);
+        assert!(!controller.state.post_run_refresh_pending());
+        assert_eq!(controller.state.app_state.progress.model_requests, 0);
+        assert_eq!(controller.state.app_state.progress.tool_calls_started, 2);
         assert_eq!(controller.state.app_state.progress.tool_calls_failed, 2);
         assert!(controller.session_runtime_listener.is_none());
         assert_eq!(
@@ -5341,6 +6891,7 @@ mod command_projection_owner_tests {
                 pending_turn_inputs: Vec::new(),
                 turn_elapsed_ms: Default::default(),
                 session_token_usage: Default::default(),
+                turn_progress: None,
                 latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,
@@ -5363,6 +6914,221 @@ mod command_projection_owner_tests {
         loaded.read.active_turn_sequence_no = Some(0);
         loaded.read.admission_revision = 1;
         loaded
+    }
+
+    async fn assert_durable_image_conversation_projection(existing_conversation: bool) {
+        use crate::protocol::{TurnItemPayload, UserInputItem, UserTurn};
+        for image_count in 0..=2 {
+            let (_temp, root, mut controller) = empty_access_test_controller().await;
+            let session_id = SessionId::new();
+            let turn_id = TurnId::new();
+            let mut initial =
+                loaded_test_session(&controller, &root, session_id, SessionStatus::Idle, None);
+            let item = |turn_id, sequence_no, payload| crate::protocol::TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no,
+                payload,
+            };
+            if existing_conversation {
+                let previous = TurnId::new();
+                initial.read.turns.items = vec![
+                    item(
+                        previous,
+                        1,
+                        TurnItemPayload::UserMessage {
+                            text: "previous request".into(),
+                        },
+                    ),
+                    item(
+                        previous,
+                        2,
+                        TurnItemPayload::AgentMessage {
+                            text: "previous answer".into(),
+                        },
+                    ),
+                ];
+                initial.read.turns.total = 2;
+                initial.read.latest_turn_id = Some(previous);
+            }
+            controller.state.load_open_session(&initial.read);
+            let prompt = "inspect the image\nand retain this second line";
+            let images: Vec<_> = (0..image_count)
+                .map(|index| crate::session::ImagePart {
+                    source_path: (index == 0).then(|| root.join("removed-image.png")),
+                    mime_type: "image/png".into(),
+                    data_base64: "aW1hZ2U=".into(),
+                    byte_len: 5,
+                })
+                .collect();
+            if !existing_conversation {
+                controller.state.composer.retained_images = images.clone();
+            }
+            let mut items = vec![UserInputItem::Text {
+                text: prompt.into(),
+            }];
+            items.extend(
+                images
+                    .into_iter()
+                    .map(|image| UserInputItem::Image { image }),
+            );
+            let stored = RunEvent::UserTurnStored {
+                session_id,
+                turn: Box::new(UserTurn {
+                    turn_id,
+                    items,
+                    prompt_dispatch: Some(crate::session::PromptDispatchPart::raw(prompt)),
+                    editor_context: None,
+                }),
+            };
+            let user_item =
+                crate::protocol::project_turn_item_for_run_event(&stored, session_id, turn_id, 1)
+                    .expect("canonical user message");
+            let TurnItemPayload::UserMessage {
+                text: expected_user,
+            } = &user_item.payload
+            else {
+                unreachable!()
+            };
+            let expected_user = expected_user.clone();
+            let generation = 41;
+            controller
+                .run_lifecycle
+                .begin(generation, RunControl::new());
+            controller.state.begin_agent_run();
+            controller.pending_root_submission = Some(PendingRootSubmission {
+                run_generation: generation,
+                owner_workspace_path: root.clone(),
+                owner_session_id: Some(session_id),
+                prompt_dispatch: crate::session::PromptDispatchPart::raw(prompt),
+                image_paths: Vec::new(),
+                prompt_review_to_cancel: None,
+            });
+            controller
+                .runtime_tx
+                .send(RuntimeMessage::RunEvent {
+                    run_generation: generation - 1,
+                    event: stored.clone(),
+                })
+                .unwrap();
+            controller.drain_runtime_messages();
+            assert!(
+                controller.pending_root_submission.is_some(),
+                "a stale run cannot acknowledge this draft"
+            );
+            assert_eq!(controller.composer_commit_generation, 0);
+            controller
+                .runtime_tx
+                .send(RuntimeMessage::RunEvent {
+                    run_generation: generation,
+                    event: stored.clone(),
+                })
+                .unwrap();
+            controller.drain_runtime_messages();
+            controller
+                .runtime_tx
+                .send(RuntimeMessage::RunEvent {
+                    run_generation: generation,
+                    event: stored,
+                })
+                .unwrap();
+            controller.drain_runtime_messages();
+            assert_eq!(
+                controller.composer_commit_generation, 1,
+                "the durable receipt is consumed only once"
+            );
+            assert_eq!(
+                controller
+                    .state
+                    .app_state
+                    .transcript_entries
+                    .iter()
+                    .filter(
+                        |entry| entry.kind == crate::tui::state::TranscriptKind::User
+                            && entry.body == expected_user
+                    )
+                    .count(),
+                1,
+                "duplicate receipts must not append or overwrite another user row"
+            );
+            controller.stop_session_runtime_listener();
+            controller.run_lifecycle.finish_root();
+            let terminal = crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            };
+            controller
+                .state
+                .apply_run_summary(RunSummary::from_terminal(session_id, turn_id, terminal));
+            let mut completed = loaded_test_session(
+                &controller,
+                &root,
+                session_id,
+                SessionStatus::Completed,
+                None,
+            );
+            completed.read.turns.items = initial.read.turns.items;
+            completed.read.turns.items.extend([
+                user_item,
+                item(
+                    turn_id,
+                    2,
+                    TurnItemPayload::AgentMessage {
+                        text: "stored image answer".into(),
+                    },
+                ),
+                item(
+                    turn_id,
+                    3,
+                    TurnItemPayload::Terminal {
+                        outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    },
+                ),
+            ]);
+            completed.read.turns.total = completed.read.turns.items.len();
+            completed.read.latest_turn_id = Some(turn_id);
+            completed.read.admission_revision = 2;
+            assert!(
+                controller
+                    .state
+                    .load_open_session_preserving_history(&completed.read)
+            );
+            let detail = controller.state.selected_detail();
+            assert!(
+                detail
+                    .transcript_rows
+                    .iter()
+                    .any(|row| row.row_kind == DesktopTranscriptRowKind::Assistant
+                        && row.body == "stored image answer"),
+                "terminal canonical answer must be visible with {image_count} images"
+            );
+            assert_eq!(
+                detail
+                    .transcript_rows
+                    .iter()
+                    .filter(|row| row.row_kind == DesktopTranscriptRowKind::User
+                        && row.body == expected_user)
+                    .count(),
+                1,
+                "canonical user body must not be duplicated or dropped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_image_user_projection_retains_answer_in_existing_conversation() {
+        assert_durable_image_conversation_projection(true).await;
+    }
+
+    #[tokio::test]
+    async fn durable_image_user_projection_retains_answer_in_empty_edit_fork() {
+        assert_durable_image_conversation_projection(false).await;
     }
 
     #[tokio::test]
@@ -5635,7 +7401,7 @@ mod command_projection_owner_tests {
                 .finish_prompt_enhance(52, "enhanced B".to_string())
         );
 
-        assert!(controller.commit_pending_root_submission(91));
+        assert!(controller.commit_pending_root_submission(91, None));
         assert_eq!(
             controller
                 .state
@@ -5672,7 +7438,7 @@ mod command_projection_owner_tests {
         let adopted_session_id = SessionId::new();
         controller.state.app_state.current_session_id = Some(adopted_session_id);
 
-        assert!(controller.commit_pending_root_submission(92));
+        assert!(controller.commit_pending_root_submission(92, None));
         assert!(controller.state.app_state.prompt_review.is_none());
         assert!(controller.state.composer.is_owned_by(
             &controller.state.snapshot.workspace_path,
@@ -6402,6 +8168,7 @@ mod command_projection_owner_tests {
                 SessionLoadReason::UserSelection,
                 Ok(SessionNavigationLoadResult {
                     workspace: None,
+                    snapshot: None,
                     loaded,
                 }),
             );
@@ -6417,11 +8184,161 @@ mod command_projection_owner_tests {
                     .app_state
                     .status_message
                     .as_deref()
-                    .is_some_and(|message| message.starts_with("opened session"))
+                    .is_some_and(|message| message == "会話を開きました。")
             );
             let projection = controller.next_web_state().expect("rehydrated projection");
             assert_eq!(projection.status_message, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn created_edit_fork_refreshes_same_workspace_sidebar_and_selects_exact_session() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let create = |title: &str| NewSession {
+            project_id: controller.app.workspace.project_id,
+            title: title.to_string(),
+            cwd: root.clone(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: controller.app.config.permissions.access_mode,
+            provider_connection: None,
+        };
+        let original = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(create("Original"))
+            .await
+            .expect("original session");
+        let old_snapshot = load_snapshot_for_selection(&controller.app, Some(original.id))
+            .await
+            .expect("old sidebar snapshot");
+        controller.state.replace_snapshot(old_snapshot);
+        controller.state.app_state.current_session_id = Some(original.id);
+
+        let fork = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(create("Original (edit)"))
+            .await
+            .expect("new fork session");
+        assert!(
+            !controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == fork.id)
+        );
+        let retained_image = crate::session::ImagePart {
+            source_path: Some(root.join("deleted-original.png")),
+            mime_type: "image/png".into(),
+            data_base64: "saved-image-bytes".into(),
+            byte_len: 1,
+        };
+        controller.edit_image_drafts.insert(
+            fork.id,
+            (controller.app.workspace.project_id, vec![retained_image]),
+        );
+
+        let result = load_session_navigation_result(
+            controller.app.clone(),
+            fork.id,
+            SessionLoadReason::CreatedEditFork,
+        )
+        .await
+        .expect("fork navigation result");
+        assert!(result.workspace.is_none());
+        assert!(result.snapshot.is_some());
+        let request_id = controller.state.begin_session_load(fork.id);
+        let target = SessionLoadRequestTarget {
+            workspace_root: controller.app.workspace.root.clone(),
+            workspace_cwd: controller.app.workspace.cwd.clone(),
+            project_id: controller.app.workspace.project_id,
+            session_id: fork.id,
+        };
+        controller.apply_session_loaded_message(
+            request_id,
+            target,
+            SessionLoadReason::CreatedEditFork,
+            Ok(result),
+        );
+
+        assert_eq!(controller.state.app_state.current_session_id, Some(fork.id));
+        assert_eq!(controller.state.selected_session_id(), Some(fork.id));
+        assert!(
+            controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == original.id)
+        );
+        assert!(
+            controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == fork.id)
+        );
+        assert_eq!(
+            controller
+                .state
+                .open_session
+                .as_ref()
+                .map(|open| open.session_id()),
+            Some(fork.id)
+        );
+        assert_eq!(controller.state.composer.retained_images.len(), 1);
+        for session_id in [original.id, fork.id] {
+            let result = load_session_navigation_result(
+                controller.app.clone(),
+                session_id,
+                SessionLoadReason::UserSelection,
+            )
+            .await
+            .unwrap();
+            let request_id = controller.state.begin_session_load(session_id);
+            controller.apply_session_loaded_message(
+                request_id,
+                SessionLoadRequestTarget {
+                    workspace_root: root.clone(),
+                    workspace_cwd: root.clone(),
+                    project_id: controller.app.workspace.project_id,
+                    session_id,
+                },
+                SessionLoadReason::UserSelection,
+                Ok(result),
+            );
+            assert_eq!(
+                controller.state.composer.retained_images.len(),
+                usize::from(session_id == fork.id),
+                "only the exact edit draft restores its saved image"
+            );
+        }
+        controller.edit_image_drafts.insert(
+            original.id,
+            (controller.app.workspace.project_id, Vec::new()),
+        );
+        assert!(controller.delete_session(fork.id));
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending()
+                && !controller.state.navigation_loading()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!controller.state.background_mutation_pending());
+        assert!(!controller.state.navigation_loading());
+        assert!(!controller.edit_image_drafts.contains_key(&fork.id));
+        assert!(controller.edit_image_drafts.contains_key(&original.id));
+        assert!(controller.state.composer.retained_images.is_empty());
     }
 
     #[tokio::test]
@@ -6587,8 +8504,8 @@ mod command_projection_owner_tests {
             .status_message
             .as_deref()
             .expect("failure status");
-        assert!(status.contains("next permission decision"));
-        assert!(status.contains("already displayed confirmation is unchanged"));
+        assert!(status.contains("次の承認判断から適用されます"));
+        assert!(status.contains("表示中の承認依頼は変更しません"));
     }
 
     #[tokio::test]
@@ -6636,8 +8553,8 @@ mod command_projection_owner_tests {
             .status_message
             .as_deref()
             .expect("failure status");
-        assert!(status.contains("next permission decision"));
-        assert!(status.contains("already displayed confirmation is unchanged"));
+        assert!(status.contains("次の承認判断から適用されます"));
+        assert!(status.contains("表示中の承認依頼は変更しません"));
     }
 
     #[tokio::test]
@@ -6683,6 +8600,162 @@ mod command_projection_owner_tests {
             .expect("permission cancellation event");
         controller.drain_runtime_messages();
         assert!(controller.pending_permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn desktop_exit_waits_for_root_and_side_receipts_and_closes_new_admission() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let release = CancellationToken::new();
+        let root_control = RunControl::new();
+        controller.run_lifecycle.begin(1, root_control.clone());
+        let control = root_control.clone();
+        let root_release = release.clone();
+        let sender = controller.control_tx.clone();
+        let root_worker = controller
+            .root_task_runtime
+            .spawn(1, move || async move {
+                control.token().cancelled().await;
+                root_release.cancelled().await;
+                publish_desktop_run_finished(&sender, 1, Err("stopped by Exit".to_string()));
+            })
+            .expect("root worker");
+        assert!(
+            controller
+                .run_lifecycle
+                .attach_worker(1, root_worker)
+                .is_ok()
+        );
+        let owner = SessionId::new();
+        let side_id = SideChatId::new();
+        let side_cancel = CancellationToken::new();
+        let cancel = side_cancel.clone();
+        let side_release = release.clone();
+        let sender = controller.control_tx.clone();
+        let worker = controller
+            .side_chat_task_runtime
+            .spawn(1, move || async move {
+                cancel.cancelled().await;
+                side_release.cancelled().await;
+                let _ = sender.send(RuntimeMessage::SideChatFinished {
+                    owner_session_id: owner,
+                    side_chat_id: side_id.to_string(),
+                    run_generation: 1,
+                    result: Ok(()),
+                });
+            })
+            .expect("side worker");
+        controller.side_chat_runs.insert(
+            owner,
+            DesktopSideChatRun {
+                side_chat_id: side_id.to_string(),
+                run_generation: 1,
+                cancel: side_cancel.clone(),
+                worker,
+                phase: "running".to_string(),
+                streamed_text: String::new(),
+                delete_after_finish: false,
+            },
+        );
+        let prompt_cancel = CancellationToken::new();
+        controller
+            .state
+            .begin_prompt_enhance(1, "review", prompt_cancel.clone());
+
+        controller.begin_exit().expect("begin Exit");
+        assert!(root_control.is_cancelled());
+        assert!(side_cancel.is_cancelled());
+        assert!(prompt_cancel.is_cancelled());
+        assert!(
+            !controller
+                .local_exit_settled()
+                .expect("receipts still pending")
+        );
+        controller
+            .begin_exit()
+            .expect("duplicate Exit does not replace its drain");
+        assert!(!controller.start_prompt_enhance("new work".to_string()));
+        assert!(
+            controller
+                .start_side_chat(owner, side_id, 1, 0, None, None, "new work".to_string())
+                .is_err()
+        );
+        assert!(!controller.start_run("new work".to_string()));
+
+        release.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !controller
+                .local_exit_settled()
+                .expect("settle local workers")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("local workers settled");
+        assert!(controller.side_chat_runs.is_empty());
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert!(!controller.start_run("work after settlement".to_string()));
+        controller
+            .begin_exit()
+            .expect("Runner retry reuses settled local receipt");
+    }
+
+    #[tokio::test]
+    async fn desktop_exit_keeps_admission_closed_and_retries_a_failed_local_stop() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller.exit_drain = Some(DesktopExitDrain::Completed(Err(
+            "exact Stop failed".to_string()
+        )));
+        assert_eq!(
+            controller.local_exit_settled().unwrap_err(),
+            "exact Stop failed"
+        );
+        assert!(!controller.start_run("new work".to_string()));
+        assert!(!controller.start_prompt_enhance("new review".to_string()));
+        controller
+            .begin_exit()
+            .expect("retry reacquires current stop owners");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !controller.local_exit_settled().expect("successful retry") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retried local stop settled");
+        assert!(!controller.start_run("still closed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn desktop_exit_waits_for_cancelled_prompt_transport_to_finish_its_route() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let cancellation = CancellationToken::new();
+        controller
+            .state
+            .begin_prompt_enhance(4, "review", cancellation.clone());
+        let (release, receiver) = mpsc::channel();
+        controller
+            .prompt_review_workers
+            .push(std::thread::spawn(move || {
+                // Model cancellation can finish before the Hub route's cleanup.
+                receiver.recv().expect("allow route cleanup to finish");
+            }));
+        controller.begin_exit().expect("begin Exit");
+        assert!(cancellation.is_cancelled());
+        assert!(!controller.state.prompt_enhance_pending());
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !controller
+                .local_exit_settled()
+                .expect("route still finishing")
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !controller.local_exit_settled().expect("prompt route ended") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("thread receipt confirmed");
     }
 
     #[tokio::test]
@@ -7485,6 +9558,11 @@ mod command_projection_owner_tests {
         assert_eq!(controller.state.app_state.current_session_id, None);
         assert_eq!(controller.state.selected_session_id(), None);
         assert_eq!(
+            desktop_web_state(&controller.state, &DesktopRuntimeProjection::default())
+                .status_message,
+            "チャットをアーカイブしました。"
+        );
+        assert_eq!(
             controller
                 .state
                 .provider_config
@@ -8216,6 +10294,14 @@ mod command_projection_owner_tests {
                 .iter()
                 .any(|row| row.project_id == project_b)
         );
+        let project_b_draft = SessionId::new();
+        controller
+            .edit_image_drafts
+            .insert(project_b_draft, (project_b, Vec::new()));
+        controller.edit_image_drafts.insert(
+            session_a.id,
+            (controller.app.workspace.project_id, Vec::new()),
+        );
         assert!(controller.delete_project(project_b));
         controller.app.config.model.model = "live-config-after-delete-dispatch".to_string();
         for _ in 0..300 {
@@ -8227,6 +10313,8 @@ mod command_projection_owner_tests {
         }
         assert!(!controller.state.background_mutation_pending());
         assert!(!controller.state.navigation_loading());
+        assert!(!controller.edit_image_drafts.contains_key(&project_b_draft));
+        assert!(controller.edit_image_drafts.contains_key(&session_a.id));
         assert_eq!(controller.app.workspace.root, root);
         assert_eq!(
             controller.app.config.model.model,
@@ -8245,15 +10333,10 @@ mod command_projection_owner_tests {
                 .iter()
                 .any(|row| row.project_id == project_b)
         );
-        assert!(
-            controller
-                .state
-                .app_state
-                .status_message
-                .as_deref()
-                .is_some_and(
-                    |message| message.contains("deleted project") && !message.contains("opening")
-                )
+        assert_eq!(
+            desktop_web_state(&controller.state, &DesktopRuntimeProjection::default())
+                .status_message,
+            "プロジェクトを削除しました。"
         );
 
         let retained_image = root.join("retained.png");
@@ -8467,7 +10550,7 @@ mod command_projection_owner_tests {
             prompt_review_to_cancel: None,
         });
         controller.state.app_state.current_session_id = Some(created_session_id);
-        assert!(controller.commit_pending_root_submission(902));
+        assert!(controller.commit_pending_root_submission(902, None));
         assert_eq!(controller.composer_commit_generation, 2);
         assert_eq!(
             controller.state.composer.image_attachment_paths,
@@ -8807,6 +10890,7 @@ mod command_projection_owner_tests {
             run_generation: 42,
             notification_title: "test".to_string(),
             notified_terminal: false,
+            control_result: None,
         };
         let bootstrap_error = renderer
             .render(&RunEvent::SessionStarted {
@@ -9062,6 +11146,7 @@ mod command_projection_owner_tests {
             run_generation: 77,
             notification_title: "test".to_string(),
             notified_terminal: false,
+            control_result: None,
         };
 
         renderer
@@ -9102,6 +11187,7 @@ mod command_projection_owner_tests {
             run_generation,
             notification_title: "test".to_string(),
             notified_terminal: false,
+            control_result: None,
         };
 
         renderer
@@ -9163,6 +11249,7 @@ mod command_projection_owner_tests {
             run_generation,
             notification_title: "test".to_string(),
             notified_terminal: false,
+            control_result: None,
         };
 
         renderer
@@ -9337,6 +11424,14 @@ struct DesktopSideChatRun {
     delete_after_finish: bool,
 }
 
+enum DesktopExitDrain {
+    Running {
+        worker: OwnedTaskHandle,
+        receiver: mpsc::Receiver<Result<(), String>>,
+    },
+    Completed(Result<(), String>),
+}
+
 struct PendingInitialSetupConfigImport {
     generation: u64,
     workspace_root: Utf8PathBuf,
@@ -9375,6 +11470,7 @@ impl DesktopSideChatRun {
 
 fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfile {
     SideChatRequestProfile {
+        hub_route: None,
         base_url: binding.base_url.clone(),
         model: binding.model.clone(),
         provider_profile: binding.provider_profile,
@@ -9383,10 +11479,8 @@ fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfil
         max_retries: binding.max_retries,
         context_window: binding.context_window,
         system_prompt: side_chat_system_prompt(&binding.system_prompt),
-        // Side-chat provider credentials are deliberately isolated from the main task target.
-        // A future credential surface must persist its own reference rather than inheriting the
-        // main provider's environment variable or request headers.
-        api_key_env: None,
+        // Use the Side binding's explicit reference; Main is a separate authority.
+        api_key_env: binding.api_key_env.clone(),
         extra_headers: Default::default(),
     }
 }
@@ -9405,7 +11499,12 @@ pub(crate) struct DesktopController {
     pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     run_lifecycle: DesktopRunLifecycle,
+    exit_drain: Option<DesktopExitDrain>,
+    prompt_review_workers: Vec<std::thread::JoinHandle<()>>,
     pending_root_submission: Option<PendingRootSubmission>,
+    // Keep text-edit snapshots with their draft session when the user navigates away.
+    // The active composer's copy is a projection of this draft, consumed on durable send.
+    edit_image_drafts: HashMap<SessionId, (ProjectId, Vec<crate::session::ImagePart>)>,
     composer_commit_generation: u64,
     next_root_run_generation: u64,
     side_chat_runs: HashMap<SessionId, DesktopSideChatRun>,
@@ -9446,7 +11545,7 @@ impl DesktopController {
 
     async fn new_with_preferences_and_persistence(
         mut app: App,
-        args: DesktopArgs,
+        mut args: DesktopArgs,
         mut preferences: DesktopPreferences,
         persist_preferences_to_disk: bool,
     ) -> Result<Self, AppRunError> {
@@ -9461,6 +11560,72 @@ impl DesktopController {
             LocalTaskExecutor::new("moyai-desktop-root-runtime").map_err(AppRunError::Message)?;
         let side_chat_task_runtime = LocalTaskExecutor::new("moyai-desktop-side-chat-runtime")
             .map_err(AppRunError::Message)?;
+        let mut restore_notice = None;
+        if args.directory.is_none()
+            && args.session_id.is_none()
+            && !args.continue_last
+            && preferences.onboarding_intent.is_none()
+            && let Some(directory) = preferences.last_workspace.as_ref()
+            && !preferences
+                .deleted_project_roots
+                .iter()
+                .any(|root| directory.starts_with(root))
+        {
+            if !directory.is_dir() {
+                restore_notice = Some(format!(
+                    "前回の作業フォルダーを開けませんでした。プロジェクト一覧から選び直してください: {directory}"
+                ));
+            } else {
+                if let Some(session_id) = preferences.last_session_id {
+                    match app.session_service.get_session(session_id).await {
+                    Ok(session)
+                        if crate::workspace::PathGuard::same_path_identity(
+                            &session.cwd,
+                            directory,
+                        ) =>
+                    {
+                        match AppBootstrap::rebuild_for_session_with_process_runtime(
+                            &session,
+                            app.process_runtime.clone(),
+                        )
+                        .await
+                        {
+                            Ok(restored) => {
+                                app = restored;
+                                args.session_id = Some(session_id);
+                            }
+                            Err(error) => {
+                                restore_notice = Some(format!(
+                                    "前回の会話を開けませんでした。プロジェクトと作業フォルダーを確認してください: {error}"
+                                ))
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        restore_notice = Some(
+                            "前回の会話の作業フォルダーが変わっているため、保存済みのフォルダーを開きます。".to_string(),
+                        )
+                    }
+                    Err(error) => restore_notice = Some(format!("前回の会話を読み込めませんでした。保存済みの作業フォルダーを開きます: {error}")),
+                }
+                }
+                if args.session_id.is_none() {
+                    match AppBootstrap::rebuild_for_directory_with_process_runtime(
+                        directory,
+                        app.process_runtime.clone(),
+                    )
+                    .await
+                    {
+                        Ok(restored) => app = restored,
+                        Err(error) => {
+                            restore_notice = Some(format!(
+                                "前回の作業フォルダーを開けませんでした。プロジェクト一覧から選び直してください: {error}"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
         if args.directory.is_some() {
             preferences.unmark_project_deleted(&app.workspace.root);
         } else {
@@ -9575,6 +11740,10 @@ impl DesktopController {
             global_config_path().ok(),
             &app.workspace.root,
         );
+        if let Some(intent) = preferences.onboarding_intent {
+            state.startup.resume_onboarding(intent);
+            state.apply_startup_overlay();
+        }
         if let Some(opacity) = preferences.window_opacity_percent {
             state.set_window_opacity_percent(opacity);
         }
@@ -9602,7 +11771,10 @@ impl DesktopController {
             pending_permission: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
             run_lifecycle: DesktopRunLifecycle::default(),
+            exit_drain: None,
+            prompt_review_workers: Vec::new(),
             pending_root_submission: None,
+            edit_image_drafts: HashMap::new(),
             composer_commit_generation: 0,
             next_root_run_generation: 1,
             side_chat_runs: HashMap::new(),
@@ -9630,6 +11802,12 @@ impl DesktopController {
             authorized_attachment_assets: BTreeSet::new(),
         };
         controller.reconcile_runtime_listener_with_open_session();
+        if let Some(intent) = controller.preferences.onboarding_intent {
+            controller.show_onboarding_surface(intent);
+        }
+        if let Some(notice) = restore_notice {
+            controller.state.set_status_message(notice);
+        }
         controller.persist_preferences();
         Ok(controller)
     }
@@ -9688,7 +11866,32 @@ impl DesktopController {
                 .map(|pending| (pending.confirmation_id, &pending.request)),
         );
         projection.projection_revision = projection_revision_text(revision);
+        projection.exit_requested = self.exit_drain.is_some();
+        if let Some(network) = &self.state.device_network {
+            let jobs = network.remote_jobs();
+            if !projection.confirmation_visible
+                && let Some(pending) = jobs.pending_approval()
+            {
+                projection.confirmation_visible = true;
+                projection.confirmation_id = Some(pending.confirmation_id.to_string());
+                projection.confirmation_text =
+                    super::web_model::format_permission_confirmation_text(&pending.request);
+                let mut permission =
+                    super::web_model::DesktopPermissionProjection::from(&pending.request);
+                permission.remote = Some(pending.context);
+                projection.confirmation = Some(permission);
+            }
+            if jobs.has_active_jobs() {
+                projection.async_polling_required = true;
+                projection
+                    .pending_async_operations
+                    .push("remote_job".into());
+            }
+        }
         if !self.side_chat_runs.is_empty() {
+            if let Some(hub) = &mut projection.hub {
+                hub.can_change_side_chat_mode = false;
+            }
             projection.async_polling_required = true;
             if !projection
                 .pending_async_operations
@@ -9764,6 +11967,7 @@ impl DesktopController {
             current_owner_append_position.map(|position| position.to_string());
         let context_truncated = false;
         let side_chat_defaults = &self.state.provider_config.effective_config.side_chat;
+        let default_api_key_env = side_chat_defaults.api_key_env.clone().unwrap_or_default();
         let default_base_url = side_chat_defaults.base_url.clone();
         let default_model = side_chat_defaults.model.clone();
         let default_system_prompt = side_chat_defaults.system_prompt.clone();
@@ -9782,6 +11986,7 @@ impl DesktopController {
                     system_prompt: default_system_prompt,
                     base_url: default_base_url,
                     provider_profile: default_profile,
+                    api_key_env: default_api_key_env,
                     status: "failed".to_string(),
                     phase: "storage read failed".to_string(),
                     last_error: error.to_string(),
@@ -9798,6 +12003,7 @@ impl DesktopController {
                 system_prompt: default_system_prompt,
                 base_url: default_base_url,
                 provider_profile: default_profile,
+                api_key_env: default_api_key_env,
                 status: "idle".to_string(),
                 last_error: self
                     .side_chat_errors
@@ -9869,6 +12075,21 @@ impl DesktopController {
             });
         }
         let deleting = binding.delete_requested_at_ms.is_some();
+        let direct_mode = self.state.hub_connection.as_ref().is_none_or(|hub| {
+            hub.projection_now().side_chat_mode == crate::hub::HubRouteMode::Direct
+        });
+        let needs_direct_capture = binding.route_kind == SideChatRouteKind::Hub && direct_mode;
+        let direct_provider_capture = needs_direct_capture.then(|| {
+            let defaults = &self.state.provider_config.effective_config.side_chat;
+            let valid = SideChatProviderTarget::try_from(defaults).is_ok();
+            super::web_model::DesktopSideChatDirectCaptureProjection {
+                base_url: defaults.base_url.clone(), model: defaults.model.clone(),
+                provider_profile: defaults.provider_profile.as_str().to_string(),
+                enabled: valid && !deleting && active.is_none() && durable.status != SessionStatus::Running,
+                reason: if valid { "この会話はHubで作成されました。履歴を保持したまま、下記のDirect設定をこの会話へ一度だけ登録します。" }
+                    else { "サイドチャットの直接接続先とモデルを設定してください。会話履歴はそのまま残ります。" }.to_string(),
+            }
+        });
         DesktopSideChatProjection {
             configured: true,
             deleting,
@@ -9878,6 +12099,7 @@ impl DesktopController {
             system_prompt: binding.system_prompt,
             base_url: binding.base_url,
             provider_profile: binding.provider_profile.as_str().to_string(),
+            api_key_env: binding.api_key_env.unwrap_or_default(),
             status: active
                 .map(|_| "running".to_string())
                 .unwrap_or_else(|| durable.status.key().to_string()),
@@ -9904,10 +12126,12 @@ impl DesktopController {
             context_truncated,
             messages,
             can_send: draft_is_valid
+                && !needs_direct_capture
                 && !deleting
                 && active.is_none()
                 && durable.status != SessionStatus::Running,
             can_cancel: !deleting && active.is_some(),
+            direct_provider_capture,
         }
     }
 
@@ -9948,19 +12172,96 @@ impl DesktopController {
 
     /// Materializes the current Global Side Chat defaults as a stable snapshot
     /// for this owner session. Existing conversations keep their captured
-    /// provider identity until the user explicitly closes them.
+    /// provider identity. A Hub-origin conversation can explicitly capture its
+    /// first Direct provider while idle without replacing its history.
     pub(crate) fn ensure_side_chat(&mut self, owner_session_id: SessionId) -> Result<(), String> {
         self.ensure_current_side_chat_owner(owner_session_id)?;
-        let target = SideChatProviderTarget::try_from(
-            &self.state.provider_config.effective_config.side_chat,
-        )
-        .map_err(|error| error.to_string())?;
+        if let Some(existing) = self
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .map_err(|error| error.to_string())?
+        {
+            if existing.delete_requested_at_ms.is_some() {
+                return Err("サイドチャットの削除が終わるまでお待ちください。".into());
+            }
+            self.side_chat_errors.remove(&owner_session_id);
+            return Ok(());
+        }
+        let mut defaults = self
+            .state
+            .provider_config
+            .effective_config
+            .side_chat
+            .clone();
+        let hub = self
+            .state
+            .hub_connection
+            .as_ref()
+            .map(|hub| hub.projection_now());
+        let hub_origin = hub
+            .as_ref()
+            .is_some_and(|hub| hub.side_chat_mode == crate::hub::HubRouteMode::Hub);
+        if hub_origin {
+            let hub = hub.expect("Hub mode");
+            if !hub.can_enable_side_chat_hub {
+                return Err(
+                    "Hubに接続し、サイドチャットで使うモデルを選んで保存してください。".into(),
+                );
+            }
+            let review = hub
+                .side_chat_review
+                .ok_or_else(|| "サイドチャットで使うHubのモデルを選んでください。".to_string())?;
+            defaults.base_url = hub.endpoint;
+            defaults.model = review.selection.preferred_model_id;
+            defaults.provider_profile = ProviderProfile::OpenAiCompatible;
+            defaults.api_key_env = None;
+        }
+        let mut target =
+            SideChatProviderTarget::try_from(&defaults).map_err(|error| error.to_string())?;
+        if hub_origin {
+            target.route_kind = SideChatRouteKind::Hub;
+        }
         self.app
             .store
             .side_chat_repo()
             .ensure(owner_session_id, target)
             .map_err(|error| error.to_string())?;
         self.side_chat_contexts.remove(&owner_session_id);
+        self.side_chat_errors.remove(&owner_session_id);
+        Ok(())
+    }
+
+    pub(crate) fn capture_side_chat_direct_provider(
+        &mut self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+        expected_draft_revision: u64,
+    ) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        if self.side_chat_runs.contains_key(&owner_session_id)
+            || self.state.hub_connection.as_ref().is_some_and(|hub| {
+                hub.projection_now().side_chat_mode != crate::hub::HubRouteMode::Direct
+            })
+        {
+            return Err(
+                "サイドチャットを直接接続に切り替え、実行が終わってから設定を適用してください。"
+                    .into(),
+            );
+        }
+        self.app
+            .store
+            .side_chat_repo()
+            .capture_direct_provider(
+                owner_session_id,
+                side_chat_id,
+                expected_generation,
+                expected_draft_revision,
+                &self.state.provider_config.effective_config.side_chat,
+            )
+            .map_err(|error| error.to_string())?;
         self.side_chat_errors.remove(&owner_session_id);
         Ok(())
     }
@@ -10022,6 +12323,9 @@ impl DesktopController {
         text: String,
         admission_ack_timeout: std::time::Duration,
     ) -> Result<(), String> {
+        if self.exit_drain.is_some() {
+            return Err("moyAIを終了しています。新しい依頼は送信できません。".to_string());
+        }
         self.ensure_current_side_chat_owner(owner_session_id)?;
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -10065,6 +12369,17 @@ impl DesktopController {
         };
         let run_control = RunControl::new();
         let cancel = run_control.token();
+        let hub_route = self
+            .state
+            .hub_connection
+            .as_ref()
+            .map(|hub| hub.begin_turn(crate::hub::HubReviewContext::SideChat, cancel.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if hub_route.is_none() && binding.route_kind == SideChatRouteKind::Hub {
+            return Err("この会話にDirect設定を適用してから送信してください。Hubの管理URLには送信しません。".into());
+        }
         let worker_cancel = cancel.clone();
         let worker_run_control = run_control.clone();
         let store = self.app.store.clone();
@@ -10123,7 +12438,16 @@ impl DesktopController {
                         quote,
                         &question,
                         preflight_system_prompt,
-                        preflight_context_window,
+                        preflight_context_window.saturating_sub(hub_route.as_ref().map_or(
+                            0,
+                            |route| {
+                                route
+                                    .model_system_prompt_reservation()
+                                    // Hub reserves bytes/4; Side budgets UTF-8 bytes.
+                                    .saturating_mul(4)
+                                    .min(u32::MAX as usize) as u32
+                            },
+                        )),
                     )
                     .await
                     {
@@ -10158,6 +12482,14 @@ impl DesktopController {
                     };
                     let run_generation = admitted.generation;
                     let mut profile = side_chat_request_profile(&admitted.binding);
+                    if let Some(route) = &hub_route {
+                        profile.base_url = route.hub_endpoint().into();
+                        profile.model = route.logical_model().into();
+                        profile.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+                        profile.api_key_env = None;
+                        profile.extra_headers.clear();
+                        profile.hub_route = Some(route.clone());
+                    }
                     profile.system_prompt = prepared.system_prompt.clone();
                     let admission_id = admitted.admission.admission_id;
                     if admission_ack_tx
@@ -10186,12 +12518,12 @@ impl DesktopController {
                                         delta,
                                     }
                                 }
-                                SideChatStreamEvent::ProviderPhase(phase) => {
+                                SideChatStreamEvent::ProviderPhase(event) => {
                                     RuntimeMessage::SideChatPhase {
                                         owner_session_id: stream_owner_session_id,
                                         side_chat_id: stream_side_chat_id.clone(),
                                         run_generation,
-                                        phase,
+                                        phase: event.phase.as_str().to_string(),
                                     }
                                 }
                             };
@@ -10199,6 +12531,9 @@ impl DesktopController {
                         },
                     )
                     .await;
+                    if let Some(route) = &hub_route {
+                        route.finish().await;
+                    }
                     drop(active_run_lease);
                     drop(process_run_lease);
                     let _ = control_tx.send(RuntimeMessage::SideChatFinished {
@@ -10263,6 +12598,20 @@ impl DesktopController {
         );
         self.side_chat_errors.remove(&owner_session_id);
         start_result
+    }
+
+    pub(crate) fn hub_context_active(&self, context: crate::hub::HubReviewContext) -> bool {
+        match context {
+            crate::hub::HubReviewContext::Main => {
+                self.run_lifecycle.root_is_active()
+                    || self.current_agent_tree_active()
+                    || self.state.prompt_enhance_pending()
+            }
+            crate::hub::HubReviewContext::SideChat => !self.side_chat_runs.is_empty(),
+            crate::hub::HubReviewContext::Approve => {
+                self.run_lifecycle.root_is_active() || self.current_agent_tree_active()
+            }
+        }
     }
 
     pub(crate) fn cancel_side_chat(
@@ -10486,14 +12835,32 @@ impl DesktopController {
             .map(|row| row.session_id)
         else {
             self.state
-                .set_status_message("session selection is no longer available");
+                .set_status_message("選択したチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         self.invalidate_session_target_requests();
-        self.state
-            .set_status_message(format!("opening session {session_id}..."));
+        self.state.set_status_message("会話を開いています…");
         let request_id = self.state.begin_session_load(session_id);
         self.spawn_session_load(session_id, SessionLoadReason::UserSelection, request_id);
+        true
+    }
+
+    /// The edit-fork command has just created this exact durable session, so it is
+    /// not yet present in the current sidebar snapshot for indexed selection.
+    pub(crate) fn open_created_edit_fork(
+        &mut self,
+        session_id: SessionId,
+        retained_images: Vec<crate::session::ImagePart>,
+    ) -> bool {
+        if !self.ensure_navigation_admission("edited session") {
+            return false;
+        }
+        self.invalidate_session_target_requests();
+        self.edit_image_drafts
+            .insert(session_id, (self.app.workspace.project_id, retained_images));
+        self.state.set_status_message("編集する会話を開いています…");
+        let request_id = self.state.begin_session_load(session_id);
+        self.spawn_session_load(session_id, SessionLoadReason::CreatedEditFork, request_id);
         true
     }
 
@@ -10508,16 +12875,19 @@ impl DesktopController {
             .get(index)
             .map(|row| Utf8PathBuf::from(&row.path))
         else {
-            self.state
-                .set_status_message("project selection is no longer available");
+            self.state.set_status_message(
+                "選択したプロジェクトが見つかりません。一覧を更新してください。",
+            );
             return false;
         };
         if path == self.app.workspace.root {
+            self.state.view.hub_project_open = false;
+            self.state.hide_overlay();
             return true;
         }
         self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("opening project {}...", path));
+            .set_status_message(format!("プロジェクトを開いています: {}", path));
         let request_id = self.state.begin_workspace_load(path.clone(), None);
         self.spawn_workspace_load(path, request_id);
         true
@@ -10529,18 +12899,19 @@ impl DesktopController {
         }
         let Some(row) = self.state.snapshot.session_rows.get(index) else {
             self.state
-                .set_status_message("session selection is no longer available");
+                .set_status_message("選択したチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         if row.loaded_status != LoadedSessionStatus::Active {
-            self.state
-                .set_status_message("selected session is not an active loaded session");
+            self.state.set_status_message(
+                "選択したチャットでは実行中の処理が見つかりません。一覧を更新してください。",
+            );
             return false;
         }
         let session_id = row.session_id;
         self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("rejoining running session {session_id}..."));
+            .set_status_message("実行中のチャットを開いています…");
         let request_id = self.state.begin_session_load(session_id);
         self.spawn_session_rejoin(session_id, request_id);
         true
@@ -10687,12 +13058,11 @@ impl DesktopController {
             .any(|row| row.session_id == session_id)
         {
             self.state
-                .set_status_message("chat deletion target is no longer available");
+                .set_status_message("削除するチャットが見つかりません。一覧を確認してください。");
             return false;
         }
         self.invalidate_session_target_requests();
-        self.state
-            .set_status_message(format!("deleting chat {}...", session_id));
+        self.state.set_status_message("チャットを削除しています…");
         let operation_id = self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id, operation_id);
         true
@@ -10710,14 +13080,14 @@ impl DesktopController {
             .any(|row| row.session_id == session_id)
         {
             self.state
-                .set_status_message("chat archive target is no longer available");
+                .set_status_message("変更するチャットが見つかりません。一覧を確認してください。");
             return false;
         }
         self.invalidate_session_target_requests();
         self.state.set_status_message(if archived {
-            format!("archiving chat {}...", session_id)
+            "チャットをアーカイブしています…"
         } else {
-            format!("unarchiving chat {}...", session_id)
+            "チャットを復元しています…"
         });
         let operation_id = self.state.begin_session_archive_mutation();
         let target = SessionMutationRequestTarget {
@@ -10747,19 +13117,18 @@ impl DesktopController {
             .find(|row| row.session_id == session_id)
         else {
             self.state
-                .set_status_message("chat rollback target is no longer available");
+                .set_status_message("巻き戻すチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         if row.loaded_status == LoadedSessionStatus::Active {
-            self.state
-                .set_status_message("running sessions cannot be rolled back");
+            self.state.set_status_message(
+                "実行中のチャットは巻き戻せません。停止してから操作してください。",
+            );
             return false;
         }
         self.invalidate_session_target_requests();
-        self.state.set_status_message(format!(
-            "rolling back latest turn in chat {}...",
-            session_id
-        ));
+        self.state
+            .set_status_message("最後の依頼と回答を履歴から削除しています…");
         let operation_id = self.state.begin_session_rollback_mutation();
         let target = SessionMutationRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -10787,13 +13156,13 @@ impl DesktopController {
             .find(|row| row.session_id == session_id)
         else {
             self.state
-                .set_status_message("chat fork target is no longer available");
+                .set_status_message("分岐元のチャットが見つかりません。一覧を更新してください。");
             return false;
         };
         let title = format!("{} fork", row.title);
         self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("forking chat {}...", session_id));
+            .set_status_message("この会話を元に、新しいチャットを作成しています…");
         let operation_id = self.state.begin_session_maintenance_mutation();
         let target = SessionMutationRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -10826,7 +13195,7 @@ impl DesktopController {
             .any(|row| row.session_id == session_id)
         {
             self.state
-                .set_status_message("running chat target is no longer available");
+                .set_status_message("停止するチャットが見つかりません。一覧を更新してください。");
             return false;
         }
         self.invalidate_session_target_requests();
@@ -10835,7 +13204,7 @@ impl DesktopController {
             return true;
         }
         self.state
-            .set_status_message(format!("interrupting running chat {}...", session_id));
+            .set_status_message("選択したチャットの停止を要求しています…");
         let operation_id = self.state.begin_session_maintenance_mutation();
         let target = SessionMutationRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -10897,13 +13266,14 @@ impl DesktopController {
             .find(|row| row.project_id == project_id)
             .map(|row| Utf8PathBuf::from(&row.path))
         else {
-            self.state
-                .set_status_message("project deletion target is no longer available");
+            self.state.set_status_message(
+                "削除するプロジェクトが見つかりません。一覧を確認してください。",
+            );
             return false;
         };
         self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("deleting project {}...", project_id));
+            .set_status_message("プロジェクトを削除しています…");
         let mut hidden_roots = self.preferences.deleted_project_roots.clone();
         hidden_roots.extend(internal_desktop_project_roots(
             self.app.session_service.store.paths().data_dir.as_path(),
@@ -10995,7 +13365,7 @@ impl DesktopController {
         match result {
             Ok(()) => self
                 .state
-                .set_status_message(format!("saved transcript markdown to {}", export_path)),
+                .set_status_message(format!("会話をMarkdownで保存しました: {}", export_path)),
             Err(error) => self
                 .state
                 .set_status_message(format!("transcript markdown export failed: {error}")),
@@ -11024,8 +13394,7 @@ impl DesktopController {
                 .set_status_message("history export target is no longer available");
             return;
         }
-        self.state
-            .set_status_message("exporting history markdown...");
+        self.state.set_status_message("履歴をMarkdownで保存中…");
         let target = HistoryExportRequestTarget {
             workspace_authority_root: self.app.workspace.authority_root().to_path_buf(),
             session_id,
@@ -11651,10 +14020,11 @@ impl DesktopController {
                 if matches!(outcome, ExactRootExecutionStopOutcome::TargetChanged) {
                     return Err("the running chat changed before interrupt was applied".to_string());
                 }
-                load_session_operation_projection(
+                load_stopped_session_operation_projection(
                     &app,
                     session_id,
-                    format!("interrupted running chat {}", session_id),
+                    expected_active_turn,
+                    std::time::Duration::from_secs(30),
                 )
                 .await
             });
@@ -11799,7 +14169,7 @@ impl DesktopController {
         }
         self.state.hide_overlay();
         self.state
-            .set_status_message("opening workspace-free quick chat...");
+            .set_status_message("新しいチャットを準備しています…");
         let request_id = self.state.begin_workspace_load(root.clone(), None);
         self.spawn_fixed_workspace_load(root, request_id);
         true
@@ -11816,8 +14186,9 @@ impl DesktopController {
             .get(index)
             .map(|row| Utf8PathBuf::from(&row.path))
         else {
-            self.state
-                .set_status_message("project selection is no longer available");
+            self.state.set_status_message(
+                "選択したプロジェクトが見つかりません。一覧を更新してください。",
+            );
             return false;
         };
         self.invalidate_session_target_requests();
@@ -11825,12 +14196,13 @@ impl DesktopController {
         if path == self.app.workspace.root {
             self.state.select_project(index);
             self.start_new_chat_with_global_access();
-            self.state.set_status_message("new development chat ready");
+            self.state
+                .set_status_message("新しいチャットを開始できます。");
             self.persist_preferences();
             return true;
         }
         self.state.set_status_message(format!(
-            "opening project {} for a new development chat...",
+            "新しいチャットの作業フォルダーを開いています: {}",
             path
         ));
         let request_id = self
@@ -11872,8 +14244,7 @@ impl DesktopController {
         }
         self.invalidate_session_target_requests();
         self.state.hide_overlay();
-        self.state
-            .set_status_message(format!("opening chat {session_id}..."));
+        self.state.set_status_message("チャットを開いています…");
         let request_id = self
             .state
             .begin_workspace_load(root.clone(), Some(session_id));
@@ -11898,12 +14269,11 @@ impl DesktopController {
             .any(|row| row.session_id == session_id)
         {
             self.state
-                .set_status_message("quick-chat deletion target is no longer available");
+                .set_status_message("削除するチャットが見つかりません。一覧を確認してください。");
             return false;
         }
         self.invalidate_session_target_requests();
-        self.state
-            .set_status_message(format!("deleting chat {}...", session_id));
+        self.state.set_status_message("チャットを削除しています…");
         let operation_id = self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id, operation_id);
         true
@@ -11915,20 +14285,26 @@ impl DesktopController {
         }
         let start_dir = (!self.is_quick_chat_workspace()).then_some(&self.app.workspace.cwd);
         match pick_workspace_directory(start_dir) {
-            Ok(Some(path)) => {
-                self.invalidate_session_target_requests();
-                self.state.hide_overlay();
-                self.state
-                    .set_status_message(format!("opening project workspace {}...", path));
-                let request_id = self.state.begin_workspace_load(path.clone(), None);
-                self.spawn_workspace_load(path, request_id);
-            }
+            Ok(Some(path)) => self.open_picked_project_directory(path),
             Ok(None) => self.state.set_status_message("project creation cancelled"),
             Err(error) => self
                 .state
                 .set_status_message(format!("project creation failed: {error}")),
         }
         true
+    }
+
+    fn open_picked_project_directory(&mut self, path: Utf8PathBuf) {
+        self.invalidate_session_target_requests();
+        self.state.hide_overlay();
+        self.state
+            .set_status_message(format!("作業フォルダーを開いています: {}", path));
+        // A folder selected for a new project owns the new chat's working
+        // directory, even when discovery groups it with an existing Git project.
+        let request_id = self
+            .state
+            .begin_new_project_session_workspace_load(path.clone());
+        self.spawn_workspace_load_for_new_project_session(path, request_id);
     }
 
     pub(crate) fn start_review_uncommitted_at(
@@ -11962,6 +14338,11 @@ impl DesktopController {
         raw_prompt: String,
         expected_active_turn: ActiveTurnExpectation,
     ) -> bool {
+        if self.exit_drain.is_some() {
+            self.state
+                .set_status_message("moyAIを終了しています。新しい依頼は送信できません。");
+            return false;
+        }
         if !self.ensure_unscoped_prompt_review_action("prompt enhancement") {
             return false;
         }
@@ -11996,6 +14377,21 @@ impl DesktopController {
             expected_active_turn,
         };
         let cancellation = CancellationToken::new();
+        let hub_route = match self
+            .state
+            .hub_connection
+            .as_ref()
+            .map(|hub| {
+                hub.begin_preparation(crate::hub::HubReviewContext::Main, cancellation.clone())
+            })
+            .transpose()
+        {
+            Ok(route) => route.flatten(),
+            Err(error) => {
+                self.state.set_status_message(error.to_string());
+                return false;
+            }
+        };
         self.state.begin_prompt_enhance_at(
             request_id,
             &raw_prompt,
@@ -12007,27 +14403,48 @@ impl DesktopController {
         let session_service = self.app.session_service.clone();
         let target_session_id = target.session_id;
         let target_expected_active_turn = target.expected_active_turn;
-        std::thread::spawn(move || {
+        self.prompt_review_workers
+            .retain(|worker| !worker.is_finished());
+        let worker = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build desktop enhance runtime");
             let result = runtime.block_on(async move {
-                crate::tui::prompt_enhance::enhance_prompt_for_captured_idle(
+                let result = crate::tui::prompt_enhance::enhance_prompt_for_captured_idle(
                     &session_service,
                     target_session_id,
                     target_expected_active_turn,
-                    || async move {
-                        crate::tui::prompt_enhance::enhance_prompt(
-                            &config,
-                            &raw_prompt,
-                            cancellation,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
+                    || async {
+                        if let Some(route) = &hub_route {
+                            let turn_config = crate::config::ResolvedTurnConfig::from_effective(
+                                &route.runtime_config(&config),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            crate::tui::prompt_enhance::enhance_prompt_with_client(
+                                &turn_config,
+                                route.client().as_ref(),
+                                &raw_prompt,
+                                cancellation,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                        } else {
+                            crate::tui::prompt_enhance::enhance_prompt(
+                                &config,
+                                &raw_prompt,
+                                cancellation,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                        }
                     },
                 )
-                .await
+                .await;
+                if let Some(route) = hub_route {
+                    route.finish().await;
+                }
+                result
             });
             let _ = runtime_tx.send(RuntimeMessage::EnhanceFinished {
                 request_id,
@@ -12035,6 +14452,7 @@ impl DesktopController {
                 result,
             });
         });
+        self.prompt_review_workers.push(worker);
         true
     }
 
@@ -12297,8 +14715,52 @@ impl DesktopController {
         self.state.refresh_startup_config_status();
     }
 
+    pub(crate) fn save_device_network_config(
+        &mut self,
+        shared: &crate::device_network::SharedHubConfig,
+        validate_initial_setup: bool,
+    ) -> Result<(), String> {
+        let path =
+            crate::config::loader::global_config_path().map_err(|_| "storage_error".to_string())?;
+        let config = crate::tui::config_editor::save_device_network_config(
+            &path,
+            &self.state.global_config().device_network,
+            shared,
+            |candidate| {
+                if validate_initial_setup
+                    && super::startup::DesktopStartupState::begin(
+                        true,
+                        Some(path.clone()),
+                        &self.app.workspace.root,
+                        candidate,
+                    )
+                    .requires_initial_setup()
+                {
+                    return Err("initial_setup_incomplete".into());
+                }
+                Ok(())
+            },
+        )?;
+        self.app.config = config.clone();
+        self.adopt_global_config_without_network(config);
+        Ok(())
+    }
+
+    /// The connection has its own completed commit. Failure here leaves the
+    /// first-use latch pending without reporting that saved connection as lost.
+    pub(crate) fn finish_initial_setup_after_device_network_persist(
+        &mut self,
+    ) -> Result<(), String> {
+        self.persist_onboarding_intent(None)?;
+        self.pending_initial_setup_config_import = None;
+        self.state.complete_initial_setup_after_persist();
+        self.state.show_hub_editor();
+        Ok(())
+    }
+
     fn start_new_chat_with_global_access(&mut self) {
         self.state.start_new_chat();
+        self.state.view.hub_project_open = false;
         if self.state.app_state.current_session_id.is_none() {
             let access_mode = self.app.config.permissions.access_mode;
             self.state.provider_config.update_access_mode(access_mode);
@@ -12317,8 +14779,9 @@ impl DesktopController {
             return false;
         };
         self.reset_effective_config_without_network(config);
-        self.state
-            .set_status_message("applied provider selection to this UI session");
+        self.state.set_status_message(
+            "AIの接続設定を一時的に適用しました。設定ファイルには保存していません。",
+        );
         if !setup_overlay {
             self.state.hide_overlay();
         }
@@ -12367,8 +14830,9 @@ impl DesktopController {
         ) {
             Ok(config) => {
                 self.reset_effective_config_without_network(config);
-                self.state
-                    .set_status_message("applied config to this UI session");
+                self.state.set_status_message(
+                    "設定を一時的に適用しました。設定ファイルには保存していません。",
+                );
                 true
             }
             Err(error) => {
@@ -12386,7 +14850,14 @@ impl DesktopController {
         let saved = result?;
         self.app.config = saved.resolved_config.clone();
         self.adopt_global_config_without_network(saved.resolved_config);
-        Ok(saved.message)
+        Ok(if saved.preserved_unknown_top_level_sections.is_empty() {
+            "共通設定を保存しました。".to_string()
+        } else {
+            format!(
+                "共通設定を保存しました。未対応の設定（{}セクション）はファイルに残し、適用していません。",
+                saved.preserved_unknown_top_level_sections.len()
+            )
+        })
     }
 
     pub(crate) fn root_run_generation(&self) -> Option<u64> {
@@ -12698,9 +15169,8 @@ impl DesktopController {
         self.app.config = global_config.clone();
         self.state.replace_global_config(global_config);
         self.state.set_status_message(format!(
-            "global config access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
-            access_mode_display_label(pending.target.access_mode),
-            pending.remembered_path
+            "共通設定の承認方法を「{}」に保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。",
+            access_mode_display_label(pending.target.access_mode)
         ));
     }
 
@@ -12732,7 +15202,7 @@ impl DesktopController {
             .next();
         let old_global_access_mode = self.app.config.permissions.access_mode;
         let current_root_session_id = self.state.app_state.current_session_id;
-        let remembered_path = match persist_desktop_access_mode_owners(
+        let _remembered_path = match persist_desktop_access_mode_owners(
             old_global_access_mode,
             access_mode,
             current_root_session_id,
@@ -12769,14 +15239,13 @@ impl DesktopController {
             }
         }
         let scope = if current_root_session_id.is_some() {
-            "global config and current root session"
+            "共通設定とこのチャット"
         } else {
-            "global config"
+            "共通設定"
         };
         let config_message = format!(
-            "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
-            access_mode_display_label(access_mode),
-            remembered_path
+            "{scope}の承認方法を「{}」に保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。",
+            access_mode_display_label(access_mode)
         );
         self.state.set_status_message(config_message);
         true
@@ -12835,6 +15304,15 @@ impl DesktopController {
                 return false;
             }
         };
+        let candidate = match expected_import_generation.and_then(|generation| {
+            self.pending_initial_setup_config_import
+                .as_ref()
+                .filter(|import| import.generation == generation)
+                .and_then(|import| import.config.approve.clone())
+        }) {
+            Some(approve) => candidate.with_imported_approve(approve),
+            None => candidate,
+        };
         let save_result = candidate.save_global(
             &self.app.workspace.root,
             GlobalConfigAdoptionPolicy::StrictCurrentSchema,
@@ -12847,6 +15325,11 @@ impl DesktopController {
                 return false;
             }
         };
+        if let Err(error) = self.persist_onboarding_intent(None) {
+            self.state
+                .set_status_message(format!("初回案内を保存できませんでした: {error}"));
+            return false;
+        }
         self.pending_initial_setup_config_import = None;
         self.state.complete_initial_setup_after_persist();
         if self.state.startup.requires_initial_setup() {
@@ -12919,12 +15402,12 @@ impl DesktopController {
         self.state.view.overlay = super::state::DesktopOverlay::SessionSettings;
         self.state.set_status_message(if update.changed {
             if result.access_only {
-                "saved access mode for this root session; it applies to the next permission decision and does not rewrite an already pending request"
+                "承認方法を保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。"
             } else {
-                "saved settings for this root session; provider and model values apply to the next admitted turn"
+                "チャットの設定を保存しました。AIの接続先とモデルは次の依頼から適用されます。"
             }
         } else {
-            "session settings already match the saved root-session values"
+            "チャットの設定は保存済みの内容と同じです。"
         });
         true
     }
@@ -13028,6 +15511,25 @@ impl DesktopController {
             .ok_or_else(|| {
                 "the imported configuration owner changed; import the TOML again".to_string()
             })?;
+        let connection_values = values
+            .iter()
+            .filter_map(|(key, text)| {
+                [ConfigField::BaseUrl, ConfigField::ProviderProfile]
+                    .into_iter()
+                    .find(|field| field.label() == key)
+                    .map(|field| (field, text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let final_config = apply_config_patch(
+            self.state.global_config().clone(),
+            crate::config::field::parse_config_field_patch(&connection_values)?,
+        );
+        let same_imported_connection =
+            crate::config::ProviderEndpoint::parse(&final_config.model.base_url)
+                .map_err(|error| error.to_string())?
+                == crate::config::ProviderEndpoint::parse(&candidate.config.model.base_url)
+                    .map_err(|error| error.to_string())?
+                && final_config.model.provider_profile == candidate.config.model.provider_profile;
         for (key, text) in &mut values {
             let Some(field) = ConfigField::ALL
                 .into_iter()
@@ -13035,9 +15537,22 @@ impl DesktopController {
             else {
                 continue;
             };
-            if field.is_sensitive() && text.trim().is_empty() {
+            if field.is_sensitive()
+                && text.trim().is_empty()
+                && (field != ConfigField::ExtraHeadersJson || same_imported_connection)
+            {
                 *text = field.editor_value(&candidate.config);
             }
+        }
+        if same_imported_connection
+            && !values
+                .iter()
+                .any(|(key, _)| key == ConfigField::ExtraHeadersJson.label())
+        {
+            values.push((
+                ConfigField::ExtraHeadersJson.label().to_string(),
+                ConfigField::ExtraHeadersJson.editor_value(&candidate.config),
+            ));
         }
         Ok(values)
     }
@@ -13133,6 +15648,7 @@ impl DesktopController {
     ) {
         let process_runtime = self.app.process_runtime.clone();
         let runtime_tx = self.runtime_tx.clone();
+        let completion_target = requested.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -13150,8 +15666,11 @@ impl DesktopController {
                     .map_err(|error| error.to_string())?;
                 Ok(WorkspaceLoadResult { app, snapshot })
             });
-            let _ = runtime_tx
-                .send(RuntimeMessage::WorkspaceSwitchedForNewProjectSession { request_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::WorkspaceSwitchedForNewProjectSession {
+                request_id,
+                requested: completion_target,
+                result,
+            });
         });
     }
 
@@ -13252,7 +15771,8 @@ impl DesktopController {
     fn resolve_workspace_input(&mut self) -> Option<camino::Utf8PathBuf> {
         let requested = self.state.workspace_input.trim().to_string();
         if requested.is_empty() {
-            self.state.set_status_message("workspace path is empty");
+            self.state
+                .set_status_message("作業フォルダーを入力してください。");
             return None;
         }
         let requested_input = camino::Utf8PathBuf::from(requested);
@@ -13268,7 +15788,7 @@ impl DesktopController {
             Ok(value) => value,
             Err(error) => {
                 self.state.set_status_message(format!(
-                    "workspace path is not accessible: {} ({error})",
+                    "作業フォルダーを開けません: {} ({error})",
                     requested
                 ));
                 return None;
@@ -13276,7 +15796,7 @@ impl DesktopController {
         };
         if !metadata.is_dir() {
             self.state
-                .set_status_message(format!("workspace path is not a directory: {}", requested));
+                .set_status_message(format!("フォルダーを指定してください: {}", requested));
             return None;
         }
         Some(requested)
@@ -13508,12 +16028,54 @@ impl DesktopController {
         )
     }
 
+    fn persist_onboarding_intent(
+        &mut self,
+        intent: Option<DesktopOnboardingIntent>,
+    ) -> Result<(), String> {
+        let mut candidate = self.preferences.clone();
+        candidate.onboarding_intent = intent;
+        if self.persist_preferences_to_disk {
+            candidate.save()?;
+        }
+        self.preferences = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn choose_initial_setup_purpose(
+        &mut self,
+        intent: DesktopOnboardingIntent,
+    ) -> Result<(), String> {
+        self.persist_onboarding_intent(Some(intent))?;
+        // Choosing a route does not replace the config draft/import owner.
+        self.state.startup.onboarding_intent = Some(intent);
+        self.show_onboarding_surface(intent);
+        Ok(())
+    }
+
+    fn show_onboarding_surface(&mut self, intent: DesktopOnboardingIntent) {
+        if matches!(
+            intent,
+            DesktopOnboardingIntent::Team | DesktopOnboardingIntent::Execution
+        ) && self.state.show_shared_work()
+            && intent == DesktopOnboardingIntent::Execution
+        {
+            // The shared shell can connect before local AI setup is complete. Keep the
+            // unfinished config owner until the Hub file is actually saved.
+            self.state.show_hub_editor();
+        }
+    }
+
     fn persist_preferences(&mut self) {
+        self.preferences.window_opacity_percent = Some(self.state.view.window_opacity_percent);
+        self.preferences.last_workspace = self.workspace_path_for_preferences();
+        self.preferences.last_session_id = self
+            .preferences
+            .last_workspace
+            .as_ref()
+            .and(self.state.app_state.current_session_id);
         if !self.persist_preferences_to_disk {
             return;
         }
-        self.preferences.window_opacity_percent = Some(self.state.view.window_opacity_percent);
-        self.preferences.last_workspace = self.workspace_path_for_preferences();
         if let Err(error) = self.preferences.save() {
             self.state
                 .set_status_message(format!("failed to save desktop preferences: {error}"));
@@ -13666,6 +16228,80 @@ impl DesktopController {
         true
     }
 
+    /// Close local admission once and let the existing Stop owners settle their
+    /// durable turns. Reuse successful drains; retry failed stops at current owners.
+    pub(crate) fn begin_exit(&mut self) -> Result<(), String> {
+        if let Some(drain) = &self.exit_drain {
+            if matches!(
+                drain,
+                DesktopExitDrain::Running { .. } | DesktopExitDrain::Completed(Ok(()))
+            ) {
+                return Ok(());
+            }
+        }
+        // Presence is the admission fence; the receipt below owns the outcome.
+        self.exit_drain = Some(DesktopExitDrain::Completed(Ok(())));
+        self.state.cancel_prompt_review();
+        for run in self.side_chat_runs.values_mut() {
+            run.phase = "stop requested".to_string();
+            run.cancel.cancel();
+        }
+        if let Some(generation) = self.run_lifecycle.root_generation()
+            && !self.run_lifecycle.cancellation_requested()
+            && !self.cancel_root_run_at_generation(generation)
+        {
+            let error = "実行中の依頼に停止を要求できませんでした。".to_string();
+            self.exit_drain = Some(DesktopExitDrain::Completed(Err(error.clone())));
+            return Err(error);
+        }
+        let runtime = self.app.process_runtime.agent_runtime();
+        let (sender, receiver) = mpsc::channel();
+        let worker = self.root_task_runtime.spawn(0, move || async move {
+            let result = runtime.stop_process_trees().await;
+            let _ = sender.send(result);
+        });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.exit_drain = Some(DesktopExitDrain::Completed(Err(error.clone())));
+                return Err(error);
+            }
+        };
+        self.exit_drain = Some(DesktopExitDrain::Running { worker, receiver });
+        Ok(())
+    }
+
+    /// Poll with a short controller lock; the root and side workers publish
+    /// their normal FIFO settlement rather than being abandoned at process exit.
+    pub(crate) fn local_exit_settled(&mut self) -> Result<bool, String> {
+        self.drain_runtime_messages();
+        self.prompt_review_workers
+            .retain(|worker| !worker.is_finished());
+        let drain = self
+            .exit_drain
+            .as_ref()
+            .ok_or_else(|| "このPCの仕事の停止処理を開始できていません。".to_string())?;
+        if let DesktopExitDrain::Running { worker, receiver } = drain {
+            if !worker.is_finished() {
+                return Ok(false);
+            }
+            let result = receiver
+                .try_recv()
+                .unwrap_or_else(|_| Err("このPCの仕事の停止結果を確認できません。".to_string()));
+            if let Some(DesktopExitDrain::Running { worker, .. }) =
+                self.exit_drain.replace(DesktopExitDrain::Completed(result))
+            {
+                worker.detach();
+            }
+        }
+        if let Some(DesktopExitDrain::Completed(Err(error))) = &self.exit_drain {
+            return Err(error.clone());
+        }
+        Ok(!self.run_lifecycle.root_is_active()
+            && self.side_chat_runs.is_empty()
+            && self.prompt_review_workers.is_empty())
+    }
+
     pub(crate) fn cancel_exact_turn_at(
         &mut self,
         expected_turn_id: TurnId,
@@ -13735,7 +16371,11 @@ impl DesktopController {
             .cancel_prompt_review_if_current(target.request_id)
     }
 
-    fn commit_pending_root_submission(&mut self, run_generation: u64) -> bool {
+    fn commit_pending_root_submission(
+        &mut self,
+        run_generation: u64,
+        user_turn: Option<&crate::protocol::UserTurn>,
+    ) -> bool {
         let Some(pending) = self
             .pending_root_submission
             .take_if(|pending| pending.run_generation == run_generation)
@@ -13746,7 +16386,7 @@ impl DesktopController {
             self.cancel_prompt_review_if_current(target);
         }
         self.state
-            .apply_durable_prompt_dispatch(&pending.prompt_dispatch);
+            .apply_durable_prompt_dispatch(&pending.prompt_dispatch, user_turn);
         let current_session_id = self.state.app_state.current_session_id;
         if pending.owner_workspace_path.as_str() == self.state.snapshot.workspace_path
             && pending.owner_session_id.is_none()
@@ -13761,6 +16401,10 @@ impl DesktopController {
             .image_attachment_paths
             .retain(|path| !pending.image_paths.contains(path));
         self.state.composer.image_attachment_input.clear();
+        if let Some(session_id) = pending.owner_session_id {
+            self.edit_image_drafts.remove(&session_id);
+        }
+        self.state.composer.retained_images.clear();
         self.advance_composer_commit_generation();
         true
     }
@@ -13779,6 +16423,11 @@ impl DesktopController {
         prompt_review_to_cancel: Option<PromptReviewTarget>,
         expected_active_turn: ActiveTurnExpectation,
     ) -> bool {
+        if self.exit_drain.is_some() {
+            self.state
+                .set_status_message("moyAIを終了しています。新しい依頼は送信できません。");
+            return false;
+        }
         if self.state.app_state.prompt_review.is_some() && prompt_review_to_cancel.is_none() {
             self.state.set_status_message(
                 "the active Prompt Review must be sent or cancelled through its exact target",
@@ -13826,6 +16475,14 @@ impl DesktopController {
         if prompt.trim().is_empty() && review_request.is_none() {
             return false;
         }
+        if !self.state.composer.retained_images.is_empty()
+            && self.state.app_state.current_session_id.is_none()
+        {
+            self.state.set_status_message(
+                "編集する会話が変わりました。元の発言から編集をやり直してください。",
+            );
+            return false;
+        }
         self.invalidate_session_search_requests();
         let run_generation = self.next_root_run_generation;
         let Some(next_generation) = run_generation.checked_add(1) else {
@@ -13836,6 +16493,19 @@ impl DesktopController {
         self.next_root_run_generation = next_generation;
         let image_paths = self.state.composer.image_attachment_paths.clone();
         let run_control = RunControl::new();
+        let hub_route = match self
+            .state
+            .hub_connection
+            .as_ref()
+            .map(|hub| hub.begin_turn(crate::hub::HubReviewContext::Main, run_control.token()))
+            .transpose()
+        {
+            Ok(route) => route.flatten(),
+            Err(error) => {
+                self.state.set_status_message(error.to_string());
+                return false;
+            }
+        };
         self.state.begin_agent_run();
         let request = RunRequest {
             prompt: prompt.clone(),
@@ -13871,7 +16541,22 @@ impl DesktopController {
             image_paths: self.state.composer.image_attachment_paths.clone(),
             prompt_review_to_cancel,
         });
-        let run_service = self.app.run_service.clone();
+        let run_service = hub_route.as_ref().map_or_else(
+            || self.app.run_service.clone(),
+            |route| Arc::new(self.app.run_service.with_hub_turn(route.clone())),
+        );
+        let run_service =
+            if self.state.composer.retained_images.is_empty() {
+                run_service
+            } else {
+                let session_id = request
+                    .session_id
+                    .expect("retained image session was checked before admission");
+                Arc::new(run_service.with_retained_edit_images(
+                    session_id,
+                    self.state.composer.retained_images.clone(),
+                ))
+            };
         let runtime_tx = self.runtime_tx.clone();
         let control_tx = self.control_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
@@ -13891,6 +16576,7 @@ impl DesktopController {
                     run_generation,
                     notification_title: notification_title.clone(),
                     notified_terminal: false,
+                    control_result: None,
                 };
                 let mut prompt = SharedConfirmationPrompt::new_with_root_control(
                     DesktopConfirmationPrompt {
@@ -13903,15 +16589,12 @@ impl DesktopController {
                 let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|outcome| match outcome {
-                        AppCommandOutcome::Turn(summary) => Ok(summary),
-                        AppCommandOutcome::ControlCompleted => {
-                            Err("run command completed without a terminal turn summary".to_string())
-                        }
-                    });
+                    .map_err(|error| error.to_string());
+                if let Some(route) = &hub_route {
+                    route.finish().await;
+                }
                 match &result {
-                    Ok(summary) if !renderer.notified_terminal => {
+                    Ok(AppCommandOutcome::Turn(summary)) if !renderer.notified_terminal => {
                         let notification_body =
                             run_completion_notification_body(&renderer.notification_title, summary);
                         send_windows_desktop_notification("moyAI", &notification_body);
@@ -13931,7 +16614,29 @@ impl DesktopController {
                     }
                     _ => {}
                 }
-                publish_desktop_run_finished(&control_tx, run_generation, result);
+                match result {
+                    Ok(AppCommandOutcome::Turn(summary)) => {
+                        publish_desktop_run_finished(&control_tx, run_generation, Ok(summary));
+                    }
+                    Ok(AppCommandOutcome::ControlCompleted) => {
+                        if let Some(result) = renderer.control_result.take() {
+                            // This reports the real control result on the same worker-completion FIFO.
+                            let _ = control_tx.send(RuntimeMessage::ControlFinished {
+                                run_generation,
+                                result,
+                            });
+                        } else {
+                            publish_desktop_run_finished(
+                                &control_tx,
+                                run_generation,
+                                Err("the completed control command did not return a displayable result".to_string()),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        publish_desktop_run_finished(&control_tx, run_generation, Err(error));
+                    }
+                }
             });
         let worker = match worker {
             Ok(worker) => worker,
@@ -14091,9 +16796,27 @@ impl DesktopController {
                 {
                     return;
                 }
+                if let Some(snapshot) = result.snapshot
+                    && !self
+                        .state
+                        .replace_snapshot_selecting_session(snapshot, session_id)
+                {
+                    self.state.set_status_message(format!(
+                        "edited session {} is missing from the project list",
+                        session_id
+                    ));
+                    return;
+                }
                 let loaded = result.loaded;
                 let loaded_status = loaded.read.session.status;
                 self.state.load_open_session(&loaded.read);
+                self.state.composer.retained_images = self
+                    .edit_image_drafts
+                    .get(&session_id)
+                    .map(|(_, images)| images.clone())
+                    .unwrap_or_default();
+                self.state.view.hub_project_open = false;
+                self.state.hide_overlay();
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
@@ -14104,14 +16827,15 @@ impl DesktopController {
                 {
                     self.state.set_status_message(match reason {
                         SessionLoadReason::RunningRejoin => {
-                            format!("rejoined running session {}", session_id)
+                            "実行中の会話を開きました。".to_string()
                         }
-                        SessionLoadReason::UserSelection => {
-                            format!("opened session {}", session_id)
+                        SessionLoadReason::UserSelection | SessionLoadReason::CreatedEditFork => {
+                            "会話を開きました。".to_string()
                         }
                     });
                 }
                 self.reconcile_runtime_listener_with_open_session();
+                self.persist_preferences();
             }
             Err(error) => {
                 finish_navigation_failure(&mut self.state, request_id, error);
@@ -14263,8 +16987,7 @@ impl DesktopController {
                     return;
                 }
                 if let Some(session_id) = self.state.selected_session_id() {
-                    self.state
-                        .set_status_message(format!("opening session {session_id}..."));
+                    self.state.set_status_message("会話を開いています…");
                     let request_id = self.state.begin_session_load(session_id);
                     self.spawn_session_load(
                         session_id,
@@ -14273,7 +16996,7 @@ impl DesktopController {
                     );
                 } else {
                     self.state
-                        .set_status_message(format!("workspace set to {}", self.app.workspace.cwd));
+                        .set_status_message(format!("作業フォルダー: {}", self.app.workspace.cwd));
                 }
             }
             Err(error) => {
@@ -14285,18 +17008,31 @@ impl DesktopController {
     fn apply_new_project_workspace_switched_message(
         &mut self,
         request_id: NavigationRequestId,
+        requested: Utf8PathBuf,
         result: Result<WorkspaceLoadResult, String>,
     ) {
+        let target_is_current = self.state.navigation.active().is_some_and(|request| {
+            request.id == request_id
+                && matches!(
+                    &request.target,
+                    super::navigation::NavigationTarget::Workspace {
+                        path,
+                        selected_session_id: None,
+                        starts_new_project_session: true,
+                    } if path == &requested
+                )
+        });
+        if !target_is_current {
+            return;
+        }
         match result {
             Ok(loaded) => {
-                if !self.state.is_current_navigation(request_id) {
-                    return;
-                }
                 if !self.replace_workspace_from_load(loaded) {
                     return;
                 }
                 self.start_new_chat_with_global_access();
-                self.state.set_status_message("new development chat ready");
+                self.state
+                    .set_status_message("新しいチャットを開始できます。");
             }
             Err(error) => {
                 finish_navigation_failure(&mut self.state, request_id, error);
@@ -14320,7 +17056,13 @@ impl DesktopController {
                 .unmark_project_deleted(&self.app.workspace.root);
         }
         self.session_search_requests.clear();
+        let hub_connection = self.state.hub_connection.clone();
+        let mcp_publish = self.state.mcp_publish.clone();
+        let device_network = self.state.device_network.clone();
         self.state = DesktopState::new(loaded.snapshot, self.app.config.clone());
+        self.state.hub_connection = hub_connection;
+        self.state.mcp_publish = mcp_publish;
+        self.state.device_network = device_network;
         self.state.set_file_change_display_roots(
             &self.app.workspace.root,
             self.app.workspace.authority_root(),
@@ -14385,6 +17127,34 @@ impl DesktopController {
         }
     }
 
+    fn settle_control_finished(&mut self, run_generation: u64, result: DesktopControlResult) {
+        if !self.run_lifecycle.owns(run_generation) {
+            return;
+        }
+        let pending = self
+            .pending_root_submission
+            .take_if(|pending| pending.run_generation == run_generation);
+        self.run_lifecycle.finish_root();
+        self.settle_pending_permission_after_root_finish();
+        self.state.finish_agent_run();
+        let Some(pending) = pending else {
+            return;
+        };
+        if pending.owner_workspace_path != self.root_submission_owner_workspace_path()
+            || pending.owner_session_id != self.state.app_state.current_session_id
+        {
+            return;
+        }
+        if let Some(target) = &pending.prompt_review_to_cancel {
+            self.cancel_prompt_review_if_current(target);
+        }
+        // Goal controls do not admit a Turn or consume image attachments. Retain canonical
+        // history and the previous terminal state; acknowledge only the submitted text.
+        self.advance_composer_commit_generation();
+        self.state
+            .set_typed_status_message(DesktopStatusCode::GoalControl, result.description());
+    }
+
     fn settle_root_finished(&mut self, run_generation: u64, result: Result<RunSummary, String>) {
         if !self.run_lifecycle.owns(run_generation) {
             return;
@@ -14394,7 +17164,7 @@ impl DesktopController {
         }
         match result {
             Ok(summary) => {
-                self.commit_pending_root_submission(run_generation);
+                self.commit_pending_root_submission(run_generation, None);
                 self.run_lifecycle.finish_root();
                 self.settle_pending_permission_after_root_finish();
                 self.state.finish_agent_run();
@@ -14494,8 +17264,8 @@ impl DesktopController {
                         }
                         _ => None,
                     };
-                    if matches!(&event, RunEvent::UserTurnStored { .. }) {
-                        self.commit_pending_root_submission(run_generation);
+                    if let RunEvent::UserTurnStored { turn, .. } = &event {
+                        self.commit_pending_root_submission(run_generation, Some(turn));
                     }
                     if self.run_lifecycle.cancellation_requested()
                         && !run_event_is_terminal(&event)
@@ -14531,6 +17301,7 @@ impl DesktopController {
                     }
                     if let RunEvent::SessionStarted { session_id, .. } = &event {
                         self.resume_pending_access_mode_adoption(*session_id);
+                        self.persist_preferences();
                     }
                     if live_event_requires_canonical_refresh(&event)
                         && live_refresh_session_id == self.state.app_state.current_session_id
@@ -14555,6 +17326,10 @@ impl DesktopController {
                 } => {
                     self.settle_root_finished(run_generation, result);
                 }
+                RuntimeMessage::ControlFinished {
+                    run_generation,
+                    result,
+                } => self.settle_control_finished(run_generation, result),
                 RuntimeMessage::Permission {
                     confirmation_id,
                     request,
@@ -14595,7 +17370,7 @@ impl DesktopController {
                     match result {
                         Ok(draft) => {
                             if self.state.finish_prompt_enhance(request_id, draft) {
-                                self.state.set_status_message("review enhanced draft");
+                                self.state.set_status_message("改善案を確認してください。");
                             }
                         }
                         Err(error) => {
@@ -14705,6 +17480,7 @@ impl DesktopController {
                     let session_id = target.session_id;
                     match result {
                         Ok(snapshot) => {
+                            self.edit_image_drafts.remove(&session_id);
                             let deleted_was_current =
                                 self.state.app_state.current_session_id == Some(session_id);
                             if deleted_was_current {
@@ -14715,10 +17491,9 @@ impl DesktopController {
                             }
                             if deleted_was_current {
                                 if let Some(next_session_id) = self.state.selected_session_id() {
-                                    self.state.set_status_message(format!(
-                                        "deleted chat {}; opening {}...",
-                                        session_id, next_session_id
-                                    ));
+                                    self.state.set_status_message(
+                                        "チャットを削除しました。別のチャットを開いています…",
+                                    );
                                     let request_id = self.state.begin_session_load(next_session_id);
                                     self.spawn_session_load(
                                         next_session_id,
@@ -14727,17 +17502,15 @@ impl DesktopController {
                                     );
                                 } else {
                                     self.start_new_chat_with_global_access();
-                                    self.state
-                                        .set_status_message(format!("deleted chat {}", session_id));
+                                    self.state.set_status_message("チャットを削除しました。");
                                 }
                             } else {
-                                self.state
-                                    .set_status_message(format!("deleted chat {}", session_id));
+                                self.state.set_status_message("チャットを削除しました。");
                             }
                         }
                         Err(error) => self
                             .state
-                            .set_status_message(format!("chat delete failed: {error}")),
+                            .set_status_message(format!("チャットを削除できませんでした: {error}")),
                     }
                 }
                 RuntimeMessage::SessionArchived {
@@ -14768,10 +17541,9 @@ impl DesktopController {
                             }
                             if archived_was_current {
                                 if let Some(next_session_id) = self.state.selected_session_id() {
-                                    self.state.set_status_message(format!(
-                                        "archived chat {}; opening {}...",
-                                        session_id, next_session_id
-                                    ));
+                                    self.state.set_status_message(
+                                        "チャットをアーカイブしました。別のチャットを開いています…",
+                                    );
                                     let request_id = self.state.begin_session_load(next_session_id);
                                     self.spawn_session_load(
                                         next_session_id,
@@ -14780,22 +17552,20 @@ impl DesktopController {
                                     );
                                 } else {
                                     self.start_new_chat_with_global_access();
-                                    self.state.set_status_message(format!(
-                                        "archived chat {}",
-                                        session_id
-                                    ));
+                                    self.state
+                                        .set_status_message("チャットをアーカイブしました。");
                                 }
                             } else {
                                 self.state.set_status_message(if archived {
-                                    format!("archived chat {}", session_id)
+                                    "チャットをアーカイブしました。"
                                 } else {
-                                    format!("unarchived chat {}", session_id)
+                                    "チャットを復元しました。"
                                 });
                             }
                         }
-                        Err(error) => self
-                            .state
-                            .set_status_message(format!("chat archive failed: {error}")),
+                        Err(error) => self.state.set_status_message(format!(
+                            "チャットのアーカイブ状態を変更できませんでした: {error}"
+                        )),
                     }
                 }
                 RuntimeMessage::SessionRolledBack { target, result } => {
@@ -14920,7 +17690,7 @@ impl DesktopController {
                                         Some((loaded.read.session.id, records));
                                 }
                                 self.state.set_status_message(format!(
-                                    "loaded earlier history {start}-{end} of {total}"
+                                    "以前の履歴を読み込みました（全{total}件中 {start}〜{end}件）。"
                                 ));
                             } else {
                                 self.state.set_status_message(
@@ -15022,6 +17792,8 @@ impl DesktopController {
                     let project_root = target.project_root;
                     match result {
                         Ok(loaded) => {
+                            self.edit_image_drafts
+                                .retain(|_, (owner, _)| *owner != project_id);
                             let deleted_was_current = self.app.workspace.project_id == project_id;
                             if deleted_was_current
                                 && !self.ensure_initial_setup_owner_replacement_admission(
@@ -15042,10 +17814,9 @@ impl DesktopController {
                             }
                             if deleted_was_current {
                                 if let Some(next_session_id) = self.state.selected_session_id() {
-                                    self.state.set_status_message(format!(
-                                        "deleted project {}; opening {}...",
-                                        project_id, next_session_id
-                                    ));
+                                    self.state.set_status_message(
+                                        "プロジェクトを削除しました。別のチャットを開いています…",
+                                    );
                                     let request_id = self.state.begin_session_load(next_session_id);
                                     self.spawn_session_load(
                                         next_session_id,
@@ -15054,19 +17825,17 @@ impl DesktopController {
                                     );
                                 } else {
                                     self.start_new_chat_with_global_access();
-                                    self.state.set_status_message(format!(
-                                        "deleted project {}",
-                                        project_id
-                                    ));
+                                    self.state
+                                        .set_status_message("プロジェクトを削除しました。");
                                 }
                             } else {
                                 self.state
-                                    .set_status_message(format!("deleted project {}", project_id));
+                                    .set_status_message("プロジェクトを削除しました。");
                             }
                         }
-                        Err(error) => self
-                            .state
-                            .set_status_message(format!("project delete failed: {error}")),
+                        Err(error) => self.state.set_status_message(format!(
+                            "プロジェクトを削除できませんでした: {error}"
+                        )),
                     }
                 }
                 RuntimeMessage::ModelCatalogLoaded {
@@ -15129,7 +17898,7 @@ impl DesktopController {
                     match result {
                         Ok(path) => self
                             .state
-                            .set_status_message(format!("exported history markdown to {}", path)),
+                            .set_status_message(format!("履歴をMarkdownで保存しました: {}", path)),
                         Err(error) => self
                             .state
                             .set_status_message(format!("history markdown export failed: {error}")),
@@ -15234,14 +18003,13 @@ impl DesktopController {
                                 continue;
                             }
                             let scope = if committed_session_id.is_some() {
-                                "global config and current root session"
+                                "共通設定とこのチャット"
                             } else {
-                                "global config"
+                                "共通設定"
                             };
                             let config_message = format!(
-                                "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
-                                access_mode_display_label(target.access_mode),
-                                commit.remembered_path
+                                "{scope}の承認方法を「{}」に保存しました。次の承認判断から適用されます。表示中の承認依頼は変更しません。",
+                                access_mode_display_label(target.access_mode)
                             );
                             self.state.set_status_message(config_message);
                         }
@@ -15261,8 +18029,12 @@ impl DesktopController {
                 RuntimeMessage::WorkspaceSwitched { request_id, result } => {
                     self.apply_workspace_switched_message(request_id, result)
                 }
-                RuntimeMessage::WorkspaceSwitchedForNewProjectSession { request_id, result } => {
-                    self.apply_new_project_workspace_switched_message(request_id, result)
+                RuntimeMessage::WorkspaceSwitchedForNewProjectSession {
+                    request_id,
+                    requested,
+                    result,
+                } => {
+                    self.apply_new_project_workspace_switched_message(request_id, requested, result)
                 }
                 RuntimeMessage::SideChatDelta {
                     owner_session_id,
@@ -15523,7 +18295,7 @@ async fn load_session_navigation_result(
     };
 
     let loaded = match reason {
-        SessionLoadReason::UserSelection => {
+        SessionLoadReason::UserSelection | SessionLoadReason::CreatedEditFork => {
             let detail = load_session_detail(&aligned_app, session_id)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -15560,6 +18332,15 @@ async fn load_session_navigation_result(
         }
     };
 
+    let snapshot = if !workspace_changed && reason == SessionLoadReason::CreatedEditFork {
+        Some(
+            load_snapshot_for_selection(&aligned_app, Some(session_id))
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let workspace = if workspace_changed {
         let snapshot = load_snapshot_for_selection(&aligned_app, Some(session_id))
             .await
@@ -15571,7 +18352,46 @@ async fn load_session_navigation_result(
     } else {
         None
     };
-    Ok(SessionNavigationLoadResult { workspace, loaded })
+    Ok(SessionNavigationLoadResult {
+        workspace,
+        snapshot,
+        loaded,
+    })
+}
+
+async fn load_stopped_session_operation_projection(
+    app: &App,
+    session_id: SessionId,
+    expected_active_turn: ActiveTurnExpectation,
+    confirmation_timeout: std::time::Duration,
+) -> Result<DesktopSessionOperationLoaded, String> {
+    let ActiveTurnExpectation::Turn { turn_id, revision } = expected_active_turn else {
+        return Err("the running chat target is no longer available".to_string());
+    };
+    let deadline = tokio::time::Instant::now() + confirmation_timeout;
+    let message = loop {
+        // Recording UserStop acknowledges a request, not the external owner's terminal.
+        // Retain this operation until that exact admission changes; never resend Stop.
+        let detail = load_session_detail(app, session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let read = &detail.read;
+        if read.active_turn_id != Some(turn_id) || read.admission_revision != revision {
+            break if read.active_turn_id.is_some() {
+                format!("chat {session_id} moved to another turn; the replacement was not stopped")
+            } else {
+                format!("Stop settled for chat {session_id}")
+            };
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break format!(
+                "Stop request accepted for chat {session_id}; completion is unconfirmed. Refresh to check."
+            );
+        }
+        tokio::time::sleep_until(deadline.min(now + DESKTOP_SESSION_RUNTIME_POLL_INTERVAL)).await;
+    };
+    load_session_operation_projection(app, session_id, message).await
 }
 
 async fn load_session_operation_projection(
@@ -15887,7 +18707,7 @@ fn notification_session_title(session_title: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn send_windows_desktop_notification(title: &str, body: &str) {
+pub(super) fn send_windows_desktop_notification(title: &str, body: &str) {
     if show_windows_notify_icon_balloon(title, body) {
         append_notification_debug_log(&format!(
             "native balloon queued title={title:?} body={body:?}"
@@ -15932,7 +18752,7 @@ fn send_windows_desktop_notification(title: &str, body: &str) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn send_windows_desktop_notification(_title: &str, _body: &str) {}
+pub(super) fn send_windows_desktop_notification(_title: &str, _body: &str) {}
 
 #[cfg(target_os = "windows")]
 fn windows_toast_script(title: &str, body: &str) -> String {
@@ -15985,7 +18805,9 @@ fn show_windows_notify_icon_balloon(title: &str, body: &str) -> bool {
         .name("moyai-notification".to_string())
         .spawn(move || unsafe {
             let result = show_windows_notify_icon_balloon_inner(&title, &body);
-            append_notification_debug_log(&format!("native balloon result={result}"));
+            append_notification_debug_log(&format!(
+                "native balloon result={result} title={title:?} body={body:?}"
+            ));
         })
         .is_ok()
 }
@@ -17061,6 +19883,7 @@ mod tests {
             run_generation: 12,
             notification_title: "test".to_string(),
             notified_terminal: false,
+            control_result: None,
         };
         let summary = completed_run_summary(0, 0, 0);
 
@@ -17466,15 +20289,88 @@ fn desktop_run_event_delivery(event: &RunEvent) -> DesktopRunEventDelivery {
     }
 }
 
+#[derive(Debug, Clone)]
+enum DesktopControlResult {
+    GoalGet(ThreadGoalGetResult),
+    GoalSet(ThreadGoalSetResult),
+    GoalClear(ThreadGoalClearResult),
+}
+
+impl DesktopControlResult {
+    fn description(&self) -> String {
+        match self {
+            Self::GoalGet(result) => result
+                .goal
+                .as_ref()
+                .map(goal_control_description)
+                .unwrap_or_else(|| "このセッションには Goal が設定されていません。".to_string()),
+            Self::GoalSet(result) => goal_control_description(&result.goal),
+            Self::GoalClear(result) => {
+                if result.cleared {
+                    "このセッションの Goal を削除しました。".to_string()
+                } else {
+                    "このセッションには Goal が設定されていません。".to_string()
+                }
+            }
+        }
+    }
+}
+
+fn goal_control_description(goal: &crate::session::ThreadGoal) -> String {
+    use crate::session::ThreadGoalStatus;
+    let status = match goal.status {
+        ThreadGoalStatus::Active => "進行中",
+        ThreadGoalStatus::Paused => "一時停止",
+        ThreadGoalStatus::Blocked => "継続待ち",
+        ThreadGoalStatus::UsageLimited => "利用上限に到達",
+        ThreadGoalStatus::BudgetLimited => "予算上限に到達",
+        ThreadGoalStatus::Complete => "完了",
+    };
+    format!(
+        "Goal: {status}\n{}\n\n使用トークン: {} / {}\n経過時間: {} 秒",
+        goal.objective,
+        goal.tokens_used,
+        goal.token_budget
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "上限なし".to_string()),
+        goal.time_used_seconds
+    )
+}
+
 struct DesktopRenderer {
     runtime_tx: mpsc::SyncSender<RuntimeMessage>,
     bootstrap_control: DesktopControlPlaneSender,
     run_generation: u64,
     notification_title: String,
     notified_terminal: bool,
+    control_result: Option<DesktopControlResult>,
 }
 
 impl EventRenderer for DesktopRenderer {
+    fn render_thread_goal_get(
+        &mut self,
+        result: &ThreadGoalGetResult,
+    ) -> Result<(), CliRenderError> {
+        self.control_result = Some(DesktopControlResult::GoalGet(result.clone()));
+        Ok(())
+    }
+
+    fn render_thread_goal_set(
+        &mut self,
+        result: &ThreadGoalSetResult,
+    ) -> Result<(), CliRenderError> {
+        self.control_result = Some(DesktopControlResult::GoalSet(result.clone()));
+        Ok(())
+    }
+
+    fn render_thread_goal_clear(
+        &mut self,
+        result: &ThreadGoalClearResult,
+    ) -> Result<(), CliRenderError> {
+        self.control_result = Some(DesktopControlResult::GoalClear(result.clone()));
+        Ok(())
+    }
+
     fn render(&mut self, event: &RunEvent) -> Result<(), CliRenderError> {
         if let RunEvent::SessionTitleUpdated { title, .. } = event {
             self.notification_title = notification_session_title(title);
@@ -17670,6 +20566,10 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
                 control.fail(error.clone());
                 CliPromptError::Message(error)
             })?;
+        send_windows_desktop_notification(
+            "moyAI — 承認が必要です",
+            "実行する操作の承認を待っています。moyAIでコマンドと対象を確認してください。",
+        );
         loop {
             match response_rx.recv_timeout(std::time::Duration::from_millis(25)) {
                 Ok(_) if control.is_cancelled() => {
@@ -18003,7 +20903,7 @@ fn normalize_markdown_export_path(path: Utf8PathBuf) -> Utf8PathBuf {
     }
 }
 
-fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> Result<(), String> {
+pub(super) fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> Result<(), String> {
     let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) else {
         return Err(format!(
             "markdown export path must have a parent directory: {path}"

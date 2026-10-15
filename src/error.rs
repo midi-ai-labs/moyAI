@@ -57,6 +57,13 @@ pub enum StorageError {
     #[error("storage json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error(
+        "canonical protocol {source_kind} source exceeds the bounded scan limit of {limit} items"
+    )]
+    CanonicalSourceLimitExceeded {
+        source_kind: &'static str,
+        limit: usize,
+    },
+    #[error(
         "canonical history fence changed for session {session_id}: expected append position {expected_append_position:?}, {expected_history_count} history items, and {expected_active_count} active items; observed append position {actual_append_position:?}, {actual_history_count} history items, and {actual_active_count} active items"
     )]
     CanonicalHistoryFenceChanged {
@@ -182,6 +189,8 @@ impl std::fmt::Display for ProviderRequestLimit {
 
 #[derive(Debug, Error)]
 pub enum LlmError {
+    #[error("Hub request failed ({code}): {0}", code = .0.code())]
+    Hub(#[from] crate::hub::HubError),
     #[error("llm http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("llm json error: {0}")]
@@ -286,25 +295,26 @@ impl LlmError {
     /// consumers must use this method instead of persisting `to_string()`.
     pub fn public_message(&self) -> String {
         match self {
+            Self::Hub(error) => format!("{} ({})", error, error.code()),
             Self::ProviderFailure { failure, .. } => failure.public_message(),
             Self::ProviderResponseStartTimeout { .. } | Self::ProviderRequestTimeout { .. } => {
-                "The model provider did not start a response before the request deadline. Check the provider load or increase the response timeout."
+                "AIからの応答開始を待ちましたが、待ち時間の上限に達しました。接続先の動作状況と、設定の「応答の進捗を待つ時間」を確認してください。"
                     .to_string()
             }
             Self::ProviderStreamIdleTimeout { .. } => {
-                "The model provider stopped sending response data. Check the provider load and try again."
+                "AIからの応答が途中で途切れました。接続先の動作状況と通信状態を確認してから、もう一度依頼してください。"
                     .to_string()
             }
             Self::ProviderRequestLimitExceeded { .. } => {
-                "The model request exceeds a configured safety limit. Reduce the request size and try again."
+                "AIに送る内容が、設定された上限を超えています。依頼や添付資料の量を減らして、もう一度依頼してください。"
                     .to_string()
             }
             Self::ProviderRequestImage(_) => {
-                "An image in the model request was rejected. Check its format and size."
+                "AIに送る画像を使用できませんでした。画像の形式と大きさを確認してください。"
                     .to_string()
             }
             Self::ProviderStreamLimitExceeded { .. } => {
-                "The model response exceeded a configured safety limit. Reduce the requested output or adjust the provider limits."
+                "AIからの応答が、設定された上限を超えました。回答を短くするよう依頼するか、設定の応答上限を確認してください。"
                     .to_string()
             }
             Self::ProviderRejected { status, code, .. } => {
@@ -336,22 +346,22 @@ impl LlmError {
                 failure.public_message()
             }
             Self::ToollessTextFinish { .. } | Self::ToollessTextShape { .. } => {
-                "The model returned an invalid response for this operation. No action was taken."
+                "この操作では扱えない形式の応答がAIから返りました。この応答による操作は行っていません。"
                     .to_string()
             }
             Self::IncompleteResponse { .. } => {
-                "The model provider returned an incomplete response. Try again after checking the provider state."
+                "AIからの応答が最後まで届きませんでした。接続先の動作状況を確認してから、もう一度依頼してください。"
                     .to_string()
             }
             Self::Http(_) => {
-                "The model provider request failed. Check the connection and try again.".to_string()
+                "AIへの依頼に失敗しました。接続先の動作状況と接続設定を確認してから、もう一度依頼してください。".to_string()
             }
             Self::Json(_) | Self::Message(_) => {
-                "The model provider returned an unsupported or malformed response. Check the configured connection type."
+                "AIからの応答を読み取れませんでした。設定の接続方式が、そのAIの接続方法に合っているか確認してください。"
                     .to_string()
             }
             Self::Io(_) => {
-                "The model request could not be completed because of a local I/O error."
+                "実行するPCでデータの読み書きに失敗し、AIへの依頼を完了できませんでした。"
                     .to_string()
             }
         }

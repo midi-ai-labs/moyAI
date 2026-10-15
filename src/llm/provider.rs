@@ -133,59 +133,59 @@ impl ProviderFailure {
     pub fn public_message(&self) -> String {
         match self.kind {
             ProviderFailureKind::Connect => {
-                "Could not connect to the model provider. Check that the provider is running and the connection settings are correct."
+                "AIの接続先に接続できませんでした。AIを提供するアプリが起動しているか、接続先URLとポート番号が正しいか、実行するPCから接続できるかを確認してください。ホスト名を使っている場合は、その名前が現在のIPアドレスを指しているか接続先の担当者に確認してください。"
                     .to_string()
             }
             ProviderFailureKind::RequestTimeout | ProviderFailureKind::ResponseStartTimeout => {
-                "The model provider did not start a response before the request deadline. Check the provider load or increase the response timeout."
+                "AIからの応答開始を待ちましたが、待ち時間の上限に達しました。接続先の動作状況と、設定の「応答の進捗を待つ時間」を確認してください。"
                     .to_string()
             }
             ProviderFailureKind::StreamIdleTimeout => {
-                "The model provider stopped sending response data. Check the provider load and try again."
+                "AIからの応答が途中で途切れました。接続先の動作状況と通信状態を確認してから、もう一度依頼してください。"
                     .to_string()
             }
             ProviderFailureKind::HttpStatus => match self.status {
                 Some(401 | 403) => format!(
-                    "The model provider rejected authentication or authorization (HTTP {}). Check the configured credential.",
+                    "AIの接続先で認証または利用権限の確認に失敗しました（HTTP {}）。APIキーなどの認証設定と、その接続先を利用できる権限を確認してください。",
                     self.status.expect("matched status")
                 ),
                 Some(404) => {
-                    "The configured model provider route was not found (HTTP 404). Check the connection type and model endpoint."
+                    "AIの接続先が見つかりませんでした（HTTP 404）。設定の接続方式と接続先URLを確認してください。"
                         .to_string()
                 }
                 Some(429) => {
-                    "The model provider is rate-limiting requests (HTTP 429). Wait briefly and try again."
+                    "AIの接続先で利用回数などの上限に達しています（HTTP 429）。少し待ってからもう一度依頼してください。続く場合は、接続先の利用上限を確認してください。"
                         .to_string()
                 }
                 Some(status) => format!(
-                    "The model provider rejected the request (HTTP {status}). Check the provider and model settings."
+                    "AIの接続先が依頼を受け付けませんでした（HTTP {status}）。接続先の動作状況と、設定したモデル・接続方式を確認してください。"
                 ),
                 None => {
-                    "The model provider rejected the request. Check the provider and model settings."
+                    "AIの接続先が依頼を受け付けませんでした。接続先の動作状況と、設定したモデル・接続方式を確認してください。"
                         .to_string()
                 }
             },
             ProviderFailureKind::Generation
                 if self.code.as_deref() == Some("context_length_exceeded") =>
             {
-                "The request exceeds the model context limit. Reduce the conversation context or select a model with a larger context window."
+                "会話や添付資料の量が、このモデルで一度に扱える上限を超えています。依頼に含める内容を減らすか、より多くの内容を扱えるモデルを選んでください。"
                     .to_string()
             }
             ProviderFailureKind::Generation => {
-                "The model provider could not complete generation. Check the model state and try again."
+                "AIが応答を作成できませんでした。接続先でモデルが正常に動いているか確認してから、もう一度依頼してください。"
                     .to_string()
             }
             ProviderFailureKind::Protocol | ProviderFailureKind::Decode => {
-                "The model provider returned an unsupported or malformed response. Check the configured connection type."
+                "AIからの応答を読み取れませんでした。設定の接続方式が、そのAIの接続方法に合っているか確認してください。"
                     .to_string()
             }
-            ProviderFailureKind::Cancelled => "The model request was cancelled.".to_string(),
+            ProviderFailureKind::Cancelled => "AIへの依頼を中止しました。".to_string(),
             ProviderFailureKind::EventProjection => {
-                "The model response could not be applied to the current task. Reopen the task and try again."
+                "AIからの応答を現在の会話に反映できませんでした。会話を開き直し、残っている内容を確認してから、もう一度依頼してください。"
                     .to_string()
             }
             ProviderFailureKind::Other => {
-                "The model request failed. Check the provider state and try again.".to_string()
+                "AIへの依頼に失敗しました。接続先の動作状況を確認してから、もう一度依頼してください。".to_string()
             }
         }
     }
@@ -237,6 +237,80 @@ mod tests {
         assert!(!public.contains("provider.example"));
         assert!(!public.contains("credential-secret-code"));
         assert!(!public.contains(secret));
+    }
+
+    #[test]
+    fn public_provider_failure_explains_the_failure_and_next_action_in_japanese() {
+        let cases = [
+            (ProviderFailureKind::Connect, None, None, "接続先URL"),
+            (
+                ProviderFailureKind::RequestTimeout,
+                None,
+                None,
+                "応答の進捗を待つ時間",
+            ),
+            (
+                ProviderFailureKind::ResponseStartTimeout,
+                None,
+                None,
+                "応答の進捗を待つ時間",
+            ),
+            (
+                ProviderFailureKind::StreamIdleTimeout,
+                None,
+                None,
+                "通信状態",
+            ),
+            (ProviderFailureKind::HttpStatus, Some(401), None, "認証設定"),
+            (ProviderFailureKind::HttpStatus, Some(403), None, "利用権限"),
+            (
+                ProviderFailureKind::HttpStatus,
+                Some(404),
+                None,
+                "接続先URL",
+            ),
+            (ProviderFailureKind::HttpStatus, Some(429), None, "利用上限"),
+            (ProviderFailureKind::HttpStatus, Some(500), None, "動作状況"),
+            (ProviderFailureKind::HttpStatus, None, None, "接続方式"),
+            (
+                ProviderFailureKind::Generation,
+                None,
+                Some("context_length_exceeded"),
+                "内容を減らす",
+            ),
+            (ProviderFailureKind::Generation, None, None, "モデルが正常"),
+            (ProviderFailureKind::Protocol, None, None, "接続方式"),
+            (ProviderFailureKind::Decode, None, None, "接続方式"),
+            (ProviderFailureKind::Cancelled, None, None, "中止しました"),
+            (
+                ProviderFailureKind::EventProjection,
+                None,
+                None,
+                "会話を開き直し",
+            ),
+            (ProviderFailureKind::Other, None, None, "動作状況"),
+        ];
+        for (kind, status, code, next_action) in cases {
+            let failure = ProviderFailure {
+                request_id: ProviderRequestId::new(),
+                endpoint: "https://private-provider.example/private-route".to_string(),
+                phase: ProviderPhase::ProviderTerminal,
+                attempt: 2,
+                elapsed_ms: 125,
+                kind,
+                status,
+                code: Some(code.unwrap_or("private-error-code").to_string()),
+                message: "private-provider-payload".to_string(),
+            };
+            let public = failure.public_message();
+            assert!(public.contains(next_action), "{kind:?}: {public}");
+            if let Some(status) = status {
+                assert!(public.contains(&format!("HTTP {status}")));
+            }
+            assert!(!public.contains(failure.request_id.as_str()));
+            assert!(!public.contains("private-"));
+            assert!(!public.contains("context_length_exceeded"));
+        }
     }
 
     #[test]

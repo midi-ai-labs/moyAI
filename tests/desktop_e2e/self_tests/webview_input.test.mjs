@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ManualObservationBudget } from "../core/deadline.mjs";
 
 import {
   WebviewInput,
@@ -214,6 +215,189 @@ test("pointer press and release use the exact semantic center and remain separat
   await assert.rejects(input.pointerUp(), (error) => error.code === "pointer-not-pressed");
 });
 
+test("first Send starts its observation budget after stable target acquisition and immediately before native press", async () => {
+  let now = 0;
+  const budget = new ManualObservationBudget({ timeoutMs: 100, now: () => now });
+  const cdp = new FakeCdp([targetObservation(), targetObservation(), targetObservation()]);
+  const input = new WebviewInput(cdp, { targetAcquisitionPollMs: 10, now: () => now,
+    wait: async milliseconds => { now += milliseconds; assert.equal(budget.snapshot().started_at_ms, null); } });
+  let callbacks = 0;
+  await input.click(showShortcuts, { stableHitSamples: 3, beforeDispatch: () => {
+    callbacks += 1;
+    assert.deepEqual(cdp.calls.map(call => call.params.type), ["mouseMoved"]);
+    assert.equal(input.pointerPressed, false);
+    budget.beginOnce();
+    budget.assertRemaining("first Send");
+  } });
+  assert.equal(callbacks, 1);
+  assert.equal(budget.snapshot().started_at_ms, 20);
+  assert.equal(budget.snapshot().deadline_ms, 120);
+  assert.deepEqual(cdp.calls.map(call => call.params.type), ["mouseMoved", "mousePressed", "mouseReleased"]);
+});
+
+test("a later Send that expires during target acquisition never presses or retains cleanup input", async () => {
+  let now = 0;
+  const budget = new ManualObservationBudget({ timeoutMs: 20, now: () => now });
+  budget.beginOnce();
+  const cdp = new FakeCdp([targetObservation(), targetObservation(), targetObservation()]);
+  const input = new WebviewInput(cdp, { targetAcquisitionPollMs: 10, now: () => now,
+    wait: async milliseconds => { now += milliseconds; } });
+  await assert.rejects(input.click(showShortcuts, { stableHitSamples: 3,
+    beforeDispatch: () => budget.assertRemaining("later Send") }), error => error.code === "manual-observation-timeout");
+  assert.equal(input.pointerPressed, false);
+  assert.deepEqual(cdp.calls.map(call => call.params.type), ["mouseMoved"]);
+  assert.deepEqual(await input.releasePressedInputs(), { pointer_released: false, released_keys: [] });
+  assert.equal(cdp.calls.length, 1);
+});
+
+const sidePromptWheelTarget = { selector: 'textarea[data-config-key="side_chat.system_prompt"]',
+  identity: { tag: "TEXTAREA", configKey: "side_chat.system_prompt" } };
+const settingsScrollSelector = '[role="dialog"][aria-labelledby="config-dialog-title"] .settings-content';
+function scrollObservation() {
+  return {
+    target: targetObservation({ identity: sidePromptWheelTarget.identity, center_hit: false,
+      center_in_scroll_clip: false, center: { x: 870, y: 936 } }),
+    container: targetObservation({ identity: { tag: "SECTION" } }),
+    target_contained: true, scrollable: true, scroll_top: 240, scroll_left: 0,
+    client_height: 657, scroll_height: 3000, wheel_point: { x: 442, y: 577.5 },
+    wheel_point_hit: true, active_identity: sidePromptWheelTarget.identity,
+  };
+}
+
+test("one native wheel is bound to the unique visible owning scroll body while its editor remains clipped", async () => {
+  const before = scrollObservation(), after = scrollObservation();
+  after.scroll_top = 599;
+  const cdp = new FakeCdp([before, after]);
+  const input = new WebviewInput(cdp);
+  const result = await input.scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY: 359 });
+  assert.deepEqual(cdp.calls, [{ method: "Input.dispatchMouseEvent", params: {
+    type: "mouseWheel", x: 442, y: 577.5, button: "none", buttons: 0, modifiers: 0, deltaX: 0, deltaY: 359,
+  } }]);
+  assert.equal(result.before.observation.target.center_in_scroll_clip, false);
+  assert.equal(result.after.observation.scroll_top, 599);
+  assert.deepEqual(result.after.observation.active_identity, sidePromptWheelTarget.identity);
+  assert.equal(input.pointerPressed, false);
+});
+
+test("wheel rejects duplicate, hidden, detached, occluded or foreign scroll owners before dispatch", async () => {
+  for (const change of [
+    value => { value.container.count = 2; },
+    value => { value.container.visible = false; },
+    value => { value.container.connected = false; },
+    value => { value.container.enabled = false; },
+    value => { value.target_contained = false; },
+    value => { value.scrollable = false; },
+    value => { value.wheel_point_hit = false; },
+    value => { value.wheel_point.x = NaN; },
+  ]) {
+    const observation = scrollObservation(); change(observation);
+    const cdp = new FakeCdp([observation]), input = new WebviewInput(cdp);
+    await assert.rejects(input.scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY: 359 }),
+      error => error.code === "wheel-scroll-container-unavailable");
+    assert.equal(cdp.calls.length, 0);
+  }
+  const wrong = scrollObservation(); wrong.target.identity = { tag: "TEXTAREA", configKey: "other.system_prompt" };
+  const cdp = new FakeCdp([wrong]);
+  await assert.rejects(new WebviewInput(cdp).scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY: 359 }),
+    error => error.code === "semantic-target-identity");
+  assert.equal(cdp.calls.length, 0);
+});
+
+test("wheel rejects unbounded arguments and held input without acquiring or dispatching", async () => {
+  for (const deltaY of [0, 1001, -1001, Infinity, NaN, "359", undefined]) {
+    const cdp = new FakeCdp(), input = new WebviewInput(cdp);
+    await assert.rejects(input.scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY }), TypeError);
+    assert.equal(cdp.calls.length, 0);
+    assert.equal(cdp.evaluationExpressions.length, 0);
+  }
+  const cdp = new FakeCdp(), input = new WebviewInput(cdp);
+  await input.keyDown("Shift");
+  await assert.rejects(input.scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY: 359 }),
+    error => error.code === "wheel-input-held");
+  assert.equal(cdp.calls.length, 1);
+  assert.equal(cdp.evaluationExpressions.length, 0);
+  await input.keyUp("Shift");
+  const pressedCdp = new FakeCdp([targetObservation()]), pressedInput = new WebviewInput(pressedCdp);
+  await pressedInput.pointerDown(showShortcuts);
+  await assert.rejects(pressedInput.scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY: 359 }),
+    error => error.code === "wheel-input-held");
+  assert.equal(pressedCdp.calls.length, 2);
+  await pressedInput.pointerUp();
+});
+
+test("ambiguous wheel delivery fails without replay or a retained input press", async () => {
+  const cdp = new FakeCdp([scrollObservation()]);
+  cdp.failCall = call => call.params.type === "mouseWheel";
+  const input = new WebviewInput(cdp);
+  await assert.rejects(input.scrollContainer(sidePromptWheelTarget, { containerSelector: settingsScrollSelector, deltaY: 359 }), /injected/);
+  assert.equal(cdp.calls.length, 1);
+  assert.equal(input.pointerPressed, false);
+  assert.deepEqual(input.pressedKeys, []);
+});
+
+test("wheel evidence requires a trusted event with the exact deltas", () => {
+  const expected = [{ type: "wheel", identity: { tag: "SECTION" }, deltaX: 0, deltaY: 359, deltaMode: 0 }];
+  const snapshot = { found: true, sequence: 1, dropped_through: 0,
+    events: [event(1, "wheel", { tag: "SECTION" }, { deltaX: 0, deltaY: 359, deltaMode: 0 })] };
+  assert.equal(assertTrustedProbeSequence(snapshot, { afterSequence: 0, expected }).events.length, 1);
+  const untrusted = structuredClone(snapshot); untrusted.events[0].isTrusted = false;
+  assert.throws(() => assertTrustedProbeSequence(untrusted, { afterSequence: 0, expected }), error => error.code === "event-probe-untrusted");
+  const wrong = structuredClone(snapshot); wrong.events[0].deltaY = -359;
+  assert.throws(() => assertTrustedProbeSequence(wrong, { afterSequence: 0, expected }), error => error.code === "event-probe-detail");
+});
+
+function wheelProbeSnapshot(events = []) {
+  return { found: true, probe_id: "webview-input", sequence: events.at(-1)?.sequence ?? 133,
+    dropped_through: 0, active: sidePromptWheelTarget.identity, events };
+}
+const expectedSettledWheel = [{ type: "wheel", identity: { tag: "SECTION" }, deltaX: 0, deltaY: 361, deltaMode: 0 }];
+const settledWheelEvent = () => event(134, "wheel", { tag: "SECTION" }, { deltaX: 0, deltaY: 361, deltaMode: 0 });
+
+test("native wheel event settlement observes an asynchronous empty snapshot without another input", async () => {
+  let time = 0;
+  const cdp = new FakeCdp([{ installed: true, probe_id: "webview-input", sequence: 0 }, wheelProbeSnapshot(), wheelProbeSnapshot([settledWheelEvent()])]);
+  const input = new WebviewInput(cdp, { targetAcquisitionTimeoutMs: 30, targetAcquisitionPollMs: 10,
+    now: () => time, wait: async milliseconds => { time += milliseconds; } });
+  await input.installProbe();
+  const probe = await input.waitForTrustedProbeSequence({ afterSequence: 133, expected: expectedSettledWheel });
+  assert.equal(probe.attempts, 2);
+  assert.equal(probe.elapsed_ms, 10);
+  assert.equal(probe.events.length, 1);
+  assert.equal(probe.events[0].isTrusted, true);
+  assert.equal(cdp.calls.length, 0, "settlement must only observe, never replay native input");
+});
+
+test("absent native wheel event fails within the unchanged acquisition deadline with last-empty evidence", async () => {
+  let time = 0;
+  const cdp = new FakeCdp([{ installed: true, probe_id: "webview-input", sequence: 0 }, wheelProbeSnapshot(), wheelProbeSnapshot(), wheelProbeSnapshot()]);
+  const input = new WebviewInput(cdp, { targetAcquisitionTimeoutMs: 30, targetAcquisitionPollMs: 10,
+    now: () => time, wait: async milliseconds => { time += milliseconds; } });
+  await input.installProbe();
+  await assert.rejects(input.waitForTrustedProbeSequence({ afterSequence: 133, expected: expectedSettledWheel }),
+    error => error.code === "observation-timeout" && error.evidence.attempts === 3
+      && error.evidence.elapsed_ms === 30 && error.evidence.last_value.events.length === 0);
+  assert.equal(cdp.calls.length, 0);
+});
+
+test("wrong, extra, untrusted or malformed native wheel evidence fails immediately rather than waiting for later correctness", async () => {
+  for (const [change, code] of [
+    [value => { value.events[0].deltaY = -361; }, "event-probe-detail"],
+    [value => { value.events[0].tag = "TEXTAREA"; }, "event-probe-target"],
+    [value => { value.events[0].isTrusted = false; }, "event-probe-untrusted"],
+    [value => { value.events.push({ ...settledWheelEvent(), sequence: 135 }); value.sequence = 135; }, "event-probe-cardinality"],
+    [value => { value.dropped_through = 134; }, "event-probe-overflow"],
+    [value => { value.events[0].sequence = 133; }, "event-probe-order"],
+  ]) {
+    const wrong = wheelProbeSnapshot([settledWheelEvent()]); change(wrong);
+    const cdp = new FakeCdp([{ installed: true, probe_id: "webview-input", sequence: 0 }, wrong, wheelProbeSnapshot([settledWheelEvent()])]);
+    const input = new WebviewInput(cdp);
+    await input.installProbe();
+    await assert.rejects(input.waitForTrustedProbeSequence({ afterSequence: 133, expected: expectedSettledWheel }), error => error.code === code);
+    assert.equal(cdp.evaluationExpressions.length, 2, "a later valid snapshot must not hide the first observed violation");
+    assert.equal(cdp.calls.length, 0);
+  }
+});
+
 test("semantic target acquisition waits without input for the product scroll to make the exact target hit-testable", async () => {
   const offscreen = targetObservation({
     hit_identity: { tag: "", id: null, action: null, focusKey: null, configKey: null, sideSetting: null },
@@ -398,6 +582,46 @@ test("navigation, Escape, Tab, and printable keys expose distinct browser keyDow
   assert.equal(cdp.calls[8].params.unmodifiedText, "a");
   assert.deepEqual(input.pressedKeys, []);
   assert.throws(() => normalizeWebviewKey("A"), /unsupported WebView key/);
+});
+
+test("named function and navigation keys deliver distinct events without text or retained pressed keys", async () => {
+  for (const [key, virtualKey] of [["F8", 119], ["F9", 120], ["End", 35], ["ArrowLeft", 37], ["ArrowRight", 39]]) {
+    const cdp = new FakeCdp();
+    const input = new WebviewInput(cdp);
+    await input.pressKey(key);
+    assert.deepEqual(cdp.calls.map(call => [call.method, call.params.type, call.params.key, call.params.code, call.params.windowsVirtualKeyCode]), [
+      ["Input.dispatchKeyEvent", "keyDown", key, key, virtualKey],
+      ["Input.dispatchKeyEvent", "keyUp", key, key, virtualKey],
+    ]);
+    assert.equal(cdp.calls.some(call => Object.hasOwn(call.params, "text") || Object.hasOwn(call.params, "unmodifiedText")), false);
+    assert.deepEqual(input.pressedKeys, []);
+  }
+});
+
+test("Enter delivers one native activation character and suppresses it for command modifiers", async () => {
+  for (const [modifier, characterExpected] of [[null, true], ["Shift", true], ["Control", false], ["Alt", false], ["Meta", false]]) {
+    const cdp = new FakeCdp();
+    const input = new WebviewInput(cdp);
+    if (modifier) await input.keyDown(modifier);
+    await input.pressKey("Enter");
+    if (modifier) await input.keyUp(modifier);
+    const events = cdp.calls.filter((call) => call.params.code === "Enter");
+    assert.deepEqual(events.map((call) => [call.method, call.params.type]), [
+      ["Input.dispatchKeyEvent", "keyDown"], ["Input.dispatchKeyEvent", "keyUp"],
+    ], `${modifier ?? "plain"} Enter has one delivery and one release`);
+    for (const event of events) {
+      assert.equal(event.params.key, "Enter");
+      assert.equal(event.params.windowsVirtualKeyCode, 13);
+    }
+    assert.equal(Object.hasOwn(events[0].params, "text"), characterExpected, modifier ?? "plain");
+    assert.equal(Object.hasOwn(events[0].params, "unmodifiedText"), characterExpected, modifier ?? "plain");
+    if (characterExpected) {
+      assert.equal(events[0].params.text, "\r", "native summary activation requires the Enter character");
+      assert.equal(events[0].params.unmodifiedText, "\r");
+    }
+    assert.equal(Object.hasOwn(events[1].params, "text"), false, "key release does not deliver another character");
+    assert.deepEqual(input.pressedKeys, []);
+  }
 });
 
 test("exact focused text insertion supports byte-identical Unicode and multiline input without DOM assignment", async () => {

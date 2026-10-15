@@ -116,6 +116,24 @@ test("wizard navigation has six stable steps and only local step validation gate
   assert.equal(state.step, "tools");
 });
 
+test("personal entry resumes its purpose and reaches review without optional configuration steps", () => {
+  const state = createInitialSetupState();
+  reconcileInitialSetupOwner(state, SETUP_TARGET, true);
+  assert.equal(state.step, "provider");
+  assert.equal(state.guided, true);
+  assert.equal(advanceInitialSetupStep(state, FIELDS, values()).ok, true);
+  assert.equal(state.step, "model");
+  assert.equal(advanceInitialSetupStep(state, FIELDS, values()).ok, true);
+  assert.equal(state.step, "finish");
+  assert.equal(retreatInitialSetupStep(state), true);
+  assert.equal(state.step, "model");
+  assert.equal(retreatInitialSetupStep(state), true);
+  assert.equal(state.step, "provider");
+  assert.equal(retreatInitialSetupStep(state), true);
+  assert.equal(state.step, "start");
+  assert.equal(beginInitialSetupFinish(state, SETUP_TARGET, CONFIG_TARGET, 1n, FIELDS, values()), null);
+});
+
 test("finish validates the complete local config without any network diagnostic input", () => {
   assert.deepEqual(
     validateInitialSetupStep(

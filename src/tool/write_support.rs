@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::edit::{ChangeSummary, FileChange, FileContentIdentity, ensure_edit_read_limit};
-use crate::error::EditError;
+use crate::error::{EditError, ToolError};
 use crate::workspace::{GuardedPath, PathGuard};
 
 const MAX_UNIQUE_WRITE_NAMES: usize = 16;
@@ -15,6 +15,158 @@ pub(crate) const MAX_EDIT_RECOVERY_REASON_BYTES: usize = 4 * 1024;
 const PRESERVED_CONFLICT_RESTORE_LABEL: &str = "; restore failed: ";
 const STAGED_CLEANUP_FAILURE_LABEL: &str = "; staged-file cleanup also failed: ";
 const STAGED_IDENTITY_FAILURE_LABEL: &str = "; stable identity verification failed: ";
+
+/// Read-only preflight. The actual commit must still reopen and validate its parent.
+pub(crate) fn validate_write_parent(guarded: &GuardedPath) -> Result<(), EditError> {
+    let path = guarded.absolute.as_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| EditError::Message("file path has no parent".into()))?;
+    path.file_name()
+        .ok_or_else(|| EditError::Message(format!("file path `{path}` has no name")))?;
+    StableWriteParent::open(parent, guarded)?;
+    Ok(())
+}
+
+/// Keep the primary post-commit failure even when conditional recovery also fails.
+pub(crate) fn post_commit_failure(
+    operation: &str,
+    primary: ToolError,
+    rollback: Result<(), ToolError>,
+) -> ToolError {
+    let Err(mut rollback) = rollback else {
+        return primary;
+    };
+    let details = bounded_preserved_failure_reason(
+        &primary.to_string(),
+        "; rollback also failed: ",
+        &rollback.to_string(),
+    );
+    match &mut rollback {
+        ToolError::Edit(
+            EditError::CommitConflictPreserved { reason, .. }
+            | EditError::PartialCommit { reason, .. }
+            | EditError::RollbackConflictPreserved { reason, .. }
+            | EditError::RecoveryFilesPreserved { reason, .. },
+        ) => {
+            *reason = details;
+            rollback
+        }
+        _ => EditError::RollbackFailed {
+            operation: operation.into(),
+            details,
+        }
+        .into(),
+    }
+}
+
+/// Creates an entirely new export tree through pinned directory handles. Every
+/// entry uses create-new semantics; no existing directory or file is adopted.
+pub(crate) fn create_new_text_tree(
+    guarded: &GuardedPath,
+    files: &[(String, String)],
+) -> Result<(), EditError> {
+    create_new_text_tree_with_observer(guarded, files, || {})
+}
+
+fn create_new_text_tree_with_observer(
+    guarded: &GuardedPath,
+    files: &[(String, String)],
+    after_parent_open: impl FnOnce(),
+) -> Result<(), EditError> {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (path.clone(), text.as_bytes().to_vec()))
+        .collect();
+    create_new_bytes_tree_with_observer(guarded, &files, after_parent_open)
+}
+
+pub(crate) fn create_new_bytes_tree(
+    guarded: &GuardedPath,
+    files: &[(String, Vec<u8>)],
+) -> Result<(), EditError> {
+    create_new_bytes_tree_with_observer(guarded, files, || {})
+}
+
+fn create_new_bytes_tree_with_observer(
+    guarded: &GuardedPath,
+    files: &[(String, Vec<u8>)],
+    after_parent_open: impl FnOnce(),
+) -> Result<(), EditError> {
+    let parent_path = guarded
+        .absolute
+        .parent()
+        .ok_or_else(|| EditError::Message("export path has no parent".into()))?;
+    let name = guarded
+        .absolute
+        .file_name()
+        .ok_or_else(|| EditError::Message("export path has no name".into()))?;
+    let parent = StableWriteParent::open(parent_path, guarded)?;
+    after_parent_open();
+    PathGuard::revalidate(guarded).map_err(|error| EditError::Message(error.to_string()))?;
+    PathGuard::validate_open_parent(guarded, &parent.file)
+        .map_err(|error| EditError::Message(error.to_string()))?;
+    let root = create_relative_directory(&parent, name)?;
+    let result = (|| {
+        let mut directories = std::collections::BTreeMap::new();
+        directories.insert(
+            String::new(),
+            StableWriteParent {
+                path: guarded.absolute.clone(),
+                file: root,
+            },
+        );
+        for (path, bytes) in files {
+            let components: Vec<_> = path.split('/').collect();
+            if components.iter().any(|part| {
+                part.is_empty() || matches!(*part, "." | "..") || part.contains(['\\', ':', '\0'])
+            }) {
+                return Err(EditError::Message(
+                    "export entries require relative path components".into(),
+                ));
+            }
+            let mut key = String::new();
+            for component in &components[..components.len() - 1] {
+                let next = if key.is_empty() {
+                    component.to_string()
+                } else {
+                    format!("{key}/{component}")
+                };
+                #[cfg(windows)]
+                let next = next.to_lowercase();
+                if !directories.contains_key(&next) {
+                    let parent = &directories[&key];
+                    let directory = create_relative_directory(parent, component)?;
+                    let path = parent.path.join(component);
+                    directories.insert(
+                        next.clone(),
+                        StableWriteParent {
+                            path,
+                            file: directory,
+                        },
+                    );
+                }
+                key = next;
+            }
+            let mut file = create_relative_file(
+                &directories[&key],
+                components.last().expect("one component"),
+            )?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        Ok::<_, EditError>(())
+    })();
+    result.map_err(|error| EditError::PartialCommit {
+        path: guarded.absolute.clone(),
+        preserved_path: guarded.absolute.clone(),
+        reason: bounded_preserved_failure_reason(
+            "new export directory was created; completed files were retained",
+            ": ",
+            &error.to_string(),
+        ),
+    })
+}
 
 #[cfg(unix)]
 const UNIX_FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
@@ -27,6 +179,20 @@ const _: [u32; 2] = [libc::S_IFMT as u32, libc::S_IFREG as u32];
 pub(crate) fn write_text_file_conditionally(
     guarded: &GuardedPath,
     text: &str,
+    expected_identity: Option<&FileContentIdentity>,
+    validate_temporary_file: impl FnOnce(&File) -> Result<(), EditError>,
+) -> Result<FileContentIdentity, EditError> {
+    write_bytes_file_conditionally(
+        guarded,
+        text.as_bytes(),
+        expected_identity,
+        validate_temporary_file,
+    )
+}
+
+pub(crate) fn write_bytes_file_conditionally(
+    guarded: &GuardedPath,
+    bytes: &[u8],
     expected_identity: Option<&FileContentIdentity>,
     validate_temporary_file: impl FnOnce(&File) -> Result<(), EditError>,
 ) -> Result<FileContentIdentity, EditError> {
@@ -48,11 +214,11 @@ pub(crate) fn write_text_file_conditionally(
         ));
     }
     let prepared = (|| {
-        staged.file.write_all(text.as_bytes())?;
+        staged.file.write_all(bytes)?;
         staged.file.flush()?;
-        written_text_identity(&staged.file, text)
+        written_bytes_identity(&staged.file, bytes)
     })();
-    let committed_identity = match prepared {
+    let written_identity = match prepared {
         Ok(identity) => identity,
         Err(error) => {
             return Err(cleanup_staged_entry_after_failure(
@@ -63,6 +229,8 @@ pub(crate) fn write_text_file_conditionally(
             ));
         }
     };
+    let (mut staged, committed_identity) =
+        finish_staged_write(&stable_parent, staged, path, written_identity)?;
 
     let Some(expected_identity) = expected_identity else {
         if let Err(error) = stable_parent.move_entry_noclobber(&mut staged, target_name) {
@@ -232,7 +400,6 @@ struct StableWriteParent {
 struct StableFileEntry {
     name: String,
     file: File,
-    #[cfg_attr(windows, allow(dead_code))]
     identity: StableFileIdentity,
 }
 
@@ -354,6 +521,119 @@ impl StableWriteParent {
 
 fn unique_write_name(purpose: &str) -> String {
     format!(".moyai-write-{purpose}-{}.tmp", ulid::Ulid::new())
+}
+
+#[cfg(windows)]
+fn finish_staged_write(
+    parent: &StableWriteParent,
+    staged: StableFileEntry,
+    target: &Utf8Path,
+    written: FileContentIdentity,
+) -> Result<(StableFileEntry, FileContentIdentity), EditError> {
+    // Windows (including SMB) finalizes last-write metadata when the writer closes.
+    // Keep a read-only handle alive across that close so the file ID cannot be reused.
+    // This handle does not deny the existing writer's access; the reopened commit
+    // handle below restores the deny-write/delete share mode before validation.
+    let identity_pin = match pin_written_file(&staged.file) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(cleanup_staged_entry_after_failure(
+                parent,
+                &staged,
+                target,
+                EditError::Io(error),
+            ));
+        }
+    };
+    let StableFileEntry {
+        name,
+        file,
+        identity,
+    } = staged;
+    drop(file);
+    let result = reopen_finished_stage(parent, name, identity, target, &written);
+    drop(identity_pin);
+    result
+}
+
+#[cfg(windows)]
+fn reopen_finished_stage(
+    parent: &StableWriteParent,
+    name: String,
+    expected_object: StableFileIdentity,
+    target: &Utf8Path,
+    written: &FileContentIdentity,
+) -> Result<(StableFileEntry, FileContentIdentity), EditError> {
+    let preserved_path = parent.path.join(&name);
+    let result = (|| {
+        // Open relative to the pinned parent, without following a reparse point.
+        let file = open_relative_windows_object(parent, &name, false, false)?;
+        let identity = stable_file_identity(&file)?;
+        if identity != expected_object {
+            return Err(EditError::Message(
+                "staged file was replaced after writing".into(),
+            ));
+        }
+        let current = file_content_identity_from_handle(&file, target, written.size_bytes)?;
+        if current.content_sha256 != written.content_sha256 {
+            return Err(EditError::Message(
+                "staged file contents changed after writing".into(),
+            ));
+        }
+        Ok((
+            StableFileEntry {
+                name,
+                file,
+                identity,
+            },
+            current,
+        ))
+    })();
+    result.map_err(|error| EditError::PartialCommit {
+        path: target.to_path_buf(),
+        preserved_path,
+        reason: bounded_preserved_failure_reason(
+            "the target was not changed; the closed staged file could not be verified and was preserved",
+            STAGED_IDENTITY_FAILURE_LABEL,
+            &error.to_string(),
+        ),
+    })
+}
+
+#[cfg(windows)]
+fn pin_written_file(file: &File) -> std::io::Result<File> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, ReOpenFile,
+    };
+    // SAFETY: the original owned handle stays live; ReOpenFile returns an independent
+    // read-only handle to that same object, not a duplicate of the writing file object.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: the newly returned handle transfers ownership exactly once.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(not(windows))]
+fn finish_staged_write(
+    _parent: &StableWriteParent,
+    staged: StableFileEntry,
+    _target: &Utf8Path,
+    written: FileContentIdentity,
+) -> Result<(StableFileEntry, FileContentIdentity), EditError> {
+    Ok((staged, written))
 }
 
 fn is_noclobber_conflict(error: &std::io::Error) -> bool {
@@ -803,15 +1083,32 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Result<File> {
+    open_relative_windows_object(parent, name, false, true)
+}
+
+#[cfg(windows)]
+fn create_relative_directory(parent: &StableWriteParent, name: &str) -> std::io::Result<File> {
+    open_relative_windows_object(parent, name, true, true)
+}
+
+#[cfg(windows)]
+fn open_relative_windows_object(
+    parent: &StableWriteParent,
+    name: &str,
+    directory: bool,
+    create: bool,
+) -> std::io::Result<File> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     };
 
     const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const FILE_OPEN: u32 = 1;
     const FILE_CREATE: u32 = 2;
     const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
     const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
     if name.is_empty()
@@ -867,19 +1164,25 @@ fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Resu
     };
     let mut handle = std::ptr::null_mut();
     // SAFETY: every native structure and the UTF-16 component remain live for the call. The
-    // stable directory handle is the root owner, FILE_CREATE provides no-clobber semantics, and
-    // FILE_OPEN_REPARSE_POINT prevents the new entry from being followed through a reparse point.
+    // stable directory handle is the root owner, FILE_CREATE provides no-clobber creation, and
+    // FILE_OPEN_REPARSE_POINT prevents an existing entry from being followed through a reparse point.
     let status = unsafe {
         nt_create_file(
             &mut handle,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+            FILE_GENERIC_READ | DELETE | if create { FILE_GENERIC_WRITE } else { 0 },
             &object_attributes,
             &mut io_status,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ,
-            FILE_CREATE,
-            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            if create { FILE_CREATE } else { FILE_OPEN },
+            FILE_SYNCHRONOUS_IO_NONALERT
+                | (if directory {
+                    FILE_DIRECTORY_FILE
+                } else {
+                    FILE_NON_DIRECTORY_FILE
+                })
+                | FILE_OPEN_REPARSE_POINT,
             std::ptr::null(),
             0,
         )
@@ -902,6 +1205,16 @@ fn create_relative_file(parent: &StableWriteParent, name: &str) -> std::io::Resu
     }
     // SAFETY: NtCreateFile returned a unique owned handle and ownership transfers once to File.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(not(windows))]
+fn create_relative_directory(_parent: &StableWriteParent, _name: &str) -> std::io::Result<File> {
+    // mkdirat followed by openat cannot prove that the opened inode is the one
+    // just created. Fail closed rather than adopt a raced replacement directory.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "new directory export currently requires Windows stable directory creation",
+    ))
 }
 
 #[cfg(unix)]
@@ -1378,7 +1691,7 @@ fn windows_delete_by_handle(entry: &File) -> std::io::Result<()> {
     }
 }
 
-fn written_text_identity(file: &File, text: &str) -> Result<FileContentIdentity, EditError> {
+fn written_bytes_identity(file: &File, bytes: &[u8]) -> Result<FileContentIdentity, EditError> {
     use sha2::{Digest as _, Sha256};
 
     let metadata = file.metadata()?;
@@ -1389,7 +1702,7 @@ fn written_text_identity(file: &File, text: &str) -> Result<FileContentIdentity,
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_millis() as i64),
         size_bytes: metadata.len(),
-        content_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+        content_sha256: format!("{:x}", Sha256::digest(bytes)),
     })
 }
 
@@ -1469,6 +1782,266 @@ mod tests {
         )
         .expect("test workspace");
         PathGuard::require_path(&workspace, path, AccessKind::Edit).expect("guarded target")
+    }
+
+    #[test]
+    fn write_parent_preflight_has_no_filesystem_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = WorkspaceDiscovery::discover_fixed_root(
+            &root,
+            &crate::config::ResolvedConfig::default(),
+        )
+        .expect("workspace");
+        for missing in [false, true] {
+            let path = if missing {
+                root.join("missing/new.txt")
+            } else {
+                root.join("new.txt")
+            };
+            let guarded = PathGuard::require_path(&workspace, &path, AccessKind::Edit)
+                .expect("guarded target");
+            let result = super::validate_write_parent(&guarded);
+            if missing {
+                assert!(matches!(result, Err(EditError::MissingParent { .. })));
+            } else {
+                result.expect("existing parent");
+            }
+            assert!(!path.exists());
+        }
+        assert_eq!(std::fs::read_dir(&root).expect("root entries").count(), 0);
+    }
+
+    #[test]
+    fn post_commit_failure_keeps_primary_and_recovery_evidence() {
+        use crate::error::ToolError;
+        let primary =
+            || ToolError::from(EditError::Message("post-commit verification failed".into()));
+        let error = super::post_commit_failure("write atomic commit", primary(), Ok(()));
+        assert!(matches!(error, ToolError::Edit(EditError::Message(_))));
+        let error = super::post_commit_failure(
+            "write atomic commit",
+            primary(),
+            Err(EditError::RollbackConflict {
+                path: "target.txt".into(),
+            }
+            .into()),
+        );
+        let text = error.to_string();
+        assert!(text.contains("post-commit verification failed"));
+        assert!(text.contains("committed filesystem state changed"));
+        let error = super::post_commit_failure(
+            "write atomic commit",
+            primary(),
+            Err(EditError::RollbackConflictPreserved {
+                path: "target.txt".into(),
+                preserved_path: ".backup".into(),
+                reason: "recovery failure ".repeat(2_000),
+            }
+            .into()),
+        );
+        let ToolError::Edit(EditError::RollbackConflictPreserved {
+            preserved_path,
+            reason,
+            ..
+        }) = error
+        else {
+            panic!("recovery path must remain typed");
+        };
+        assert_eq!(preserved_path, ".backup");
+        assert!(reason.contains("post-commit verification failed"));
+        assert!(reason.contains("recovery failure"));
+        assert!(reason.len() <= super::MAX_EDIT_RECOVERY_REASON_BYTES);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finished_stage_rejects_replacement_and_same_object_rewrite() {
+        for replace in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target =
+                Utf8PathBuf::from_path_buf(temp.path().join("target.txt")).expect("utf8 path");
+            let guarded = guarded_path(&target);
+            let parent =
+                super::StableWriteParent::open(target.parent().unwrap(), &guarded).expect("parent");
+            let mut staged = parent.create_entry("stage", &target).expect("stage");
+            staged.file.write_all(b"agent").expect("write stage");
+            let written =
+                super::written_bytes_identity(&staged.file, b"agent").expect("written identity");
+            let pin = super::pin_written_file(&staged.file).expect("identity pin");
+            let super::StableFileEntry {
+                name,
+                file,
+                identity,
+            } = staged;
+            drop(file);
+            let staged_path = parent.path.join(&name);
+            if replace {
+                std::fs::rename(&staged_path, parent.path.join("external-moved.txt"))
+                    .expect("replace stage");
+            }
+            std::fs::write(&staged_path, b"other").expect("external content");
+            let error =
+                match super::reopen_finished_stage(&parent, name, identity, &target, &written) {
+                    Err(error) => error,
+                    Ok(_) => panic!("raced staged content must not be adopted"),
+                };
+            assert!(matches!(error, EditError::PartialCommit { .. }));
+            assert_eq!(
+                std::fs::read(&staged_path).expect("preserved external content"),
+                b"other"
+            );
+            assert!(!target.exists());
+            drop(pin);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finished_stage_pins_final_metadata_and_denies_external_writers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = Utf8PathBuf::from_path_buf(temp.path().join("target.txt")).expect("utf8 path");
+        let guarded = guarded_path(&target);
+        let parent =
+            super::StableWriteParent::open(target.parent().unwrap(), &guarded).expect("parent");
+        let mut staged = parent.create_entry("stage", &target).expect("stage");
+        staged.file.write_all(b"agent").expect("write stage");
+        let written =
+            super::written_bytes_identity(&staged.file, b"agent").expect("written identity");
+        let (mut staged, committed) =
+            super::finish_staged_write(&parent, staged, &target, written).expect("finish stage");
+        let error = std::fs::OpenOptions::new()
+            .write(true)
+            .open(parent.display_entry(&staged))
+            .expect_err("writer denied");
+        assert_eq!(error.raw_os_error(), Some(32));
+        parent
+            .move_entry_noclobber(&mut staged, "target.txt")
+            .expect("commit");
+        drop(staged);
+        let (bytes, actual) = read_file_with_identity(&target, 1_024).expect("committed identity");
+        assert_eq!(bytes, b"agent");
+        assert_eq!(committed, actual);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn new_export_tree_unsupported_platform_has_no_filesystem_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("export")).unwrap();
+        let error =
+            super::create_new_text_tree(&guarded_path(&path), &[("a.txt".into(), "data".into())])
+                .unwrap_err();
+        assert!(
+            matches!(error,EditError::Io(error) if error.kind()==std::io::ErrorKind::Unsupported)
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_tree_never_adopts_existing_files_and_reports_partial_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let target = root.join("export");
+        let guarded = guarded_path(&target);
+        super::create_new_text_tree(&guarded, &[("nested/a.txt".into(), "first".into())]).unwrap();
+        assert!(
+            super::create_new_text_tree(&guarded, &[("nested/a.txt".into(), "overwrite".into())])
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("nested/a.txt")).unwrap(),
+            "first"
+        );
+        let partial = root.join("partial");
+        let error = super::create_new_text_tree(
+            &guarded_path(&partial),
+            &[
+                ("a.txt".into(), "one".into()),
+                ("a.txt".into(), "two".into()),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error,EditError::PartialCommit{preserved_path,..} if preserved_path==partial)
+        );
+        assert_eq!(
+            std::fs::read_to_string(partial.join("a.txt")).unwrap(),
+            "one"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_tree_reuses_case_varying_shared_parent_without_changing_file_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("export")).unwrap();
+        super::create_new_text_tree(
+            &guarded_path(&root),
+            &[
+                ("Dir/a.txt".into(), "first".into()),
+                ("dir/B.txt".into(), "second".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("Dir/a.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/B.txt")).unwrap(),
+            "second"
+        );
+        let names = std::fs::read_dir(root.join("Dir"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["a.txt".to_owned(), "B.txt".to_owned()])
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_tree_pins_parent_before_any_content_is_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("selected")).unwrap();
+        let moved = Utf8PathBuf::from_path_buf(temp.path().join("moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let guarded = guarded_path(&root.join("export"));
+        let result = super::create_new_text_tree_with_observer(
+            &guarded,
+            &[("a.txt".into(), "safe".into())],
+            || {
+                let rename = std::fs::rename(&root, &moved);
+                #[cfg(windows)]
+                assert!(
+                    rename.is_err(),
+                    "open parent disallows namespace replacement"
+                );
+                #[cfg(unix)]
+                {
+                    rename.unwrap();
+                    std::os::unix::fs::symlink(&moved, &root).unwrap();
+                }
+            },
+        );
+        #[cfg(windows)]
+        {
+            result.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("export/a.txt")).unwrap(),
+                "safe"
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert!(result.is_err());
+            assert!(!moved.join("export").exists());
+        }
     }
 
     #[test]

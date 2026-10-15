@@ -203,6 +203,10 @@ impl SqliteStore {
         SqliteSessionRepository::new(self.connection.clone())
     }
 
+    pub fn remote_job_store(&self) -> crate::remote_agent::store::RemoteJobStore {
+        crate::remote_agent::store::RemoteJobStore::new(self.connection.clone())
+    }
+
     pub fn project_repo(&self) -> SqliteProjectRepository {
         SqliteProjectRepository::new(self.connection.clone())
     }
@@ -483,6 +487,7 @@ impl SqliteStore {
                  FROM tool_calls INDEXED BY idx_tool_calls_truncated_output_path
                  WHERE truncated_output_path IS NOT NULL
                    AND truncated_output_path = ?1
+                 UNION ALL SELECT 1 FROM shared_history_files WHERE local_path = ?1
              )",
         )?;
         for entry in entries {

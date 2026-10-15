@@ -1,0 +1,128 @@
+import { command } from "./api.ts";
+import type { ActionContext } from "./actions.ts";
+import { loadDeviceNetwork } from "./device_network_actions.ts";
+import {
+  acceptHubProjection, clearHubError, hubCanSave, hubCanSetRouteMode, hubErrorText, hubSelectionFromDraft,
+  type HubContext, type HubProjection, type HubRouteMode, type HubUiState,
+} from "./hub_state.ts";
+
+function hubSettingsOpen(context: ActionContext): boolean {
+  return ["hub", "config"].includes(context.getViewState()?.overlay ?? "");
+}
+
+async function hubRequest(
+  context: ActionContext,
+  pending: NonNullable<HubUiState["pending"]>,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<void> {
+  const local = context.uiState.hub;
+  if (local.pending || !hubSettingsOpen(context)) return;
+  const serial = ++local.requestSerial;
+  const readStartedFrom = local.projection;
+  const before = local.projection && structuredClone(local.projection);
+  local.pending = pending;
+  clearHubError(local);
+  context.rerender();
+  const channel = pending === "main" || pending === "side_chat" || pending === "approve" ? pending
+    : pending === "main_mode" ? "main" : pending === "side_chat_mode" ? "side_chat"
+      : pending === "approve_mode" ? "approve" : null;
+  try {
+    const result = await command<HubProjection>(name, args);
+    if (serial !== local.requestSerial) return;
+    acceptHubProjection(local, result, {
+      refreshTargets: pending === "refresh",
+      savedContext: channel && !pending.endsWith("_mode") ? channel : undefined,
+      connected: pending === "connect" && result.status === "connected",
+      localSave: before && channel
+        ? { before, context: channel, kind: pending.endsWith("_mode") ? "mode" : "review" }
+        : undefined,
+      readStartedFrom: readStartedFrom && (pending === "load" || pending === "refresh") ? readStartedFrom : undefined,
+    });
+    if (pending === "connect" && result.status === "connected") {
+      const token = document.querySelector<HTMLInputElement>("#hub-token");
+      if (token) token.value = "";
+    }
+  } catch (error) {
+    if (serial !== local.requestSerial || !hubSettingsOpen(context)) return;
+    const message = hubErrorText(typeof error === "string" ? error : null)
+      || "Hubの状態を読み込めませんでした。もう一度お試しください。";
+    if (name !== "hub_projection") {
+      try {
+        // Rejected connection attempts may already have advanced the Rust owner. Keep the
+        // request locked until it is reacquired so an immediate retry uses that fresh owner.
+        const readStartedFrom = local.projection;
+        const projection = await command<HubProjection>("hub_projection");
+        if (serial === local.requestSerial && hubSettingsOpen(context)) {
+          // Failure settlement is not the user's explicit review/rebase action.
+          acceptHubProjection(local, projection, { readStartedFrom: readStartedFrom ?? undefined });
+        }
+      } catch {
+        // A failed local read must not replace the actionable original error or recurse.
+      }
+    }
+    if (serial === local.requestSerial && hubSettingsOpen(context)) {
+      local.error = message;
+      local.errorCode = typeof error === "string" ? error : null;
+      local.errorContext = channel ?? "connection";
+    }
+  } finally {
+    if (serial === local.requestSerial) { local.pending = null; context.rerender(); }
+  }
+}
+export async function openHub(context: ActionContext): Promise<void> {
+  await context.mutate("show_hub_editor");
+  context.uiState.hub.tab = "devices";
+  await loadDeviceNetwork(context);
+}
+export async function selectHubTab(context: ActionContext, tab: "devices" | "models"): Promise<void> {
+  if (context.uiState.hub.pending || context.uiState.deviceNetwork.pending || !hubSettingsOpen(context)) return;
+  if (tab === "models") { await context.mutate("show_config_editor"); return; }
+  context.uiState.hub.tab = tab;
+  context.rerender();
+  await loadDeviceNetwork(context);
+}
+export async function connectHub(context: ActionContext): Promise<void> {
+  const local = context.uiState.hub;
+  const current = local.projection;
+  if (!current) return;
+  const token = document.querySelector<HTMLInputElement>("#hub-token")?.value ?? "";
+  const endpoint = local.endpoint.trim();
+  await hubRequest(context, "connect", "hub_connect", {
+    endpoint: /^https?:\/\//i.test(endpoint) ? endpoint : `http://${endpoint}`,
+    token,
+    label: local.label.trim(),
+    expectedSettingsRevision: current.settings_revision,
+    expectedConnectionGeneration: current.connection_generation,
+  });
+}
+export async function refreshHub(context: ActionContext): Promise<void> {
+  const projection = context.uiState.hub.projection;
+  if (!projection) return hubRequest(context, "load", "hub_projection", {});
+  if (projection.status === "disconnected") return hubRequest(context, "refresh", "hub_projection", {});
+  await hubRequest(context, "refresh", "hub_refresh", { expectedConnectionGeneration: projection.connection_generation });
+}
+export async function disconnectHub(context: ActionContext): Promise<void> {
+  const projection = context.uiState.hub.projection;
+  if (projection) await hubRequest(context, "disconnect", "hub_disconnect", {
+    expectedConnectionGeneration: projection.connection_generation,
+  });
+}
+export async function saveHubReview(context: ActionContext, channel: HubContext): Promise<void> {
+  const local = context.uiState.hub;
+  if (!hubCanSave(local, channel)) return;
+  const selection = hubSelectionFromDraft(local.drafts[channel]);
+  const target = local.drafts[channel].target;
+  if (!selection || !target) return;
+  await hubRequest(context, channel, "hub_save_review", { context: channel, selection, useHubDefault: local.drafts[channel].usesDefault, ...target });
+}
+
+export async function setHubRouteMode(context: ActionContext, channel: HubContext, mode: HubRouteMode): Promise<void> {
+  const local = context.uiState.hub;
+  if (!hubCanSetRouteMode(local, channel, mode) || !local.projection) return;
+  await hubRequest(context, `${channel}_mode`, "hub_set_route_mode", {
+    context: channel, mode,
+    expectedSettingsRevision: local.projection.settings_revision,
+    expectedConnectionGeneration: local.projection.connection_generation,
+  });
+}

@@ -12,20 +12,27 @@
 
 - operatorが用意したRippleFish fixtureから、source/config/tests/examples/sample dataだけを含むimmutable clean seedを作る。`frontend/node_modules`、build/test output、cache、virtualenv、egg-info、backend runtime data、runtime `.env` / `.env.local`、旧`task.md`は含めない。`.env.example` とpublic suiteが参照する `examples/templates` はconfig/test evidenceとして残す。
 - clean seedのsource path、file count、byte count、manifest hash、copy ruleをtask-local `RESULTS.md`へ記録する。
-- versionごとにfresh workspace、config/data、preferences、logs、screenshots directoryを作り、同じseedをcopyする。workspaceをresetして再利用しない。
+- 単独実行ではversionごとにfresh workspace、config/data、preferences、logs、screenshots directoryを作り、同じseedをcopyする。連続suiteでは[共通手順](../README.md)に従い、Desktopとconfig/data/preferencesを共有し、ケースごとにfresh workspaceと証跡を用意する。Stage 1〜3の後も再起動せず、残りの通常ケースを実行する。通常ケース完了後に選択した場合だけ、本ケースの同じworkspace・会話で復元試験を行う。省略時は復元とStage 4・5を未実施とする。共有profileによる比較条件の差を記録し、workspaceをresetして再利用しない。
 - このdirectoryの `task.md` をworkspace rootへ配置する。stage prompt fileのraw path / hash / byte countをsealしたうえで、GUIへ投入するtextはWindows checkoutのCRLFまたはCRをLFへcanonicalizeする。raw identityとGUI投入textのhash / byte countは分離し、canonicalize後のtextをtrusted input event、DOM value、wire promptでexactに照合する。
 - 同一provider/model、host側generation設定、tool設定を全versionで使い、versionが所有するwire behaviorはbackportしない。moyAIからsampling / thinking / output lengthを上書きせず、host側の設定をrun中に変更しない。
 - Quality profileはmoyAI local input budget `context_window = 131072`と`request_timeout_ms = 3600000`を使う。`context_window`はproviderのcontextやmodel loadを変更せず、generation wireにも送らない。host側のcontext/output設定は観測できる範囲で別evidenceとしてsealする。このtimeoutは成功response headerまでは最初のPOST attemptからのdeadline、header後はSSE event間のrolling無進捗上限であり、hostへ送らない。historical版とのpaired比較では各runの実値と当時のtimeout contractを記録する。artifact完成度とhidden contractを主に採点し、compactionは観測項目であって発生しなくてもfailまたはinconclusiveにしない。
-- scenario configは`provider_profile`で接続形式、optional `provider_lifecycle`でprovider資源の所有権を分ける。LM Studioはlifecycle未指定と既存のdiscriminatorなし6fieldを従来どおり`execution-owned`として受理し、Mainをload / unloadする。既にload済みのhostをその設定のまま使う場合は`provider_lifecycle = "external-unmanaged"`を明示し、Main exact 1 loaded、Side unloaded、両variant、reported loaded context 131072以上、観測時刻・elapsedを除いたstable host fingerprintをpreflightの連続2 sample、各checkpoint、final、quiesceでGET観測する。drift時にもload / unloadによる修復を発行しない。optional `configure_main_via_gui = true`は両LM Studio lifecycleでneutral接続値をseedし、同一のsealed execution内でStage 1前にPreferencesのprofile / URL / manual model IDをtrusted GUI inputで設定してexact global Saveとpersisted/effective projectionを確認する。OpenAI-compatibleはcredential-freeな`/v1` base URLとMain modelだけを受理し、lifecycleはexternal-unmanaged以外を拒否する。sampling / thinking / output length / arbitrary extra bodyはhost側設定を使う。
+- scenario configは`provider_profile`で接続形式、optional `provider_lifecycle`でprovider資源の所有権を分ける。LM Studioはlifecycle未指定と既存のdiscriminatorなし6fieldを従来どおり`execution-owned`として受理し、Mainをload / unloadする。既にload済みのhostをその設定のまま使う場合は`provider_lifecycle = "external-unmanaged"`を明示し、Main exact 1 loaded、Side unloaded、両variant、reported loaded context 131072以上、観測時刻・elapsedを除いたstable host fingerprintをpreflightの連続2 sample、各checkpoint、final、quiesceでGET観測する。drift時にもload / unloadによる修復を発行しない。optional `configure_main_via_gui = true`は両LM Studio lifecycleでneutral接続値をseedし、同一のsealed execution内でStage 1前にPreferencesのprofile / URL / manual model ID / 指定されたAPI key環境変数名をtrusted GUI inputで設定してexact global Saveとpersisted/effective projectionを確認する。OpenAI-compatibleはcredentialを埋め込まない`/v1` base URLとMain modelを使い、認証が必要ならoptional `api_key_env`へ環境変数名だけを指定する。実キーはprocess環境へ設定し、Main接続とprovider catalog / lifecycle照会で使う。実キーやsecret本文、client generation override、unknown config keyは拒否し、config・evidenceへsecretを保存しない。lifecycleはexternal-unmanaged以外を拒否する。sampling / thinking / output length / arbitrary extra bodyはhost側設定を使う。
 - moyAI local context budgetとprovider evidenceは別fieldでsealする。execution-owned LM Studioだけがhost contextをrequest / applyし、external-unmanaged routeはrequested / applied host contextを`null`、LM Studio catalogの値を`provider_reported_loaded_context`として記録する。provider metadataにcontext/output capacityがある場合だけreported valueとして記録し、moyAIの設定値やeffective limitへ読み替えない。host側metadataが未報告または比較不能の場合はprofile comparability deviationとしてtask-local `RESULTS.md`へ記録する。
 - Stress profileはmoyAI local input budgetだけを `context_window = 32768` へ変更する。これはlocal compaction/recoveryを確実に観測する意図的overrideであり、providerのcontext、output length、sampling、thinkingを変更しない。Quality profileやrelease smokeの代用にしない。
 - access modeは `auto_review`（現UI: 代理で承認、旧UI: 自動レビュー）を要求する。versionがそのmodeを実装しない場合は暗黙に同等扱いせず、requested/effective modeとhuman approval回数を記録する。
 - multi-agent、MCP、Doclingは無効にする。dependency installとexternal fixture mutationは禁止する。
+- optional `api_key_env`はMain認証用、optional `side_api_key_env`はSide認証用の独立した環境変数名だけを指定する。同じキーを使う場合も両fieldへ同じ名前を明示する。Sideの省略・空欄は認証なしで、Mainの参照名やheadersを継承しない。実キーはprocess環境に用意し、config・evidenceは参照名だけを保持する。Stage 5で使うSide接続の可用性を実行前に確認する。外部evaluatorの子process環境からは両参照先の環境変数を除去する。
 - visible Tauri Desktopを実際に操作し、Stage 1〜4を同じProject Chat sessionのMainへ、Stage 5をそのowner sessionのSide Chatへ送る。Stage 5を5件目のMain turnとして送らない。
-- Stage 1 terminal後に同じProject ChatのSide Chatへ指定provider/modelをSettingsのmanual model ID経路から保存する。OpenAI-compatibleではMainと同じmodel IDを保存する。Stage 1〜4にはSide Chat Sendを含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。LM Studioは元の指定Side modelの時点付きunloaded sampleを残し、external-unmanagedでは同時にMain exact-loaded、reported loaded context、stable host fingerprint、全falseのlifecycle actionsを残す。Stage 5では、設定済みSide modelがMainと異なる場合だけSettingsから既にload済みのMain modelへ明示的に再設定し、再設定前後のmodelを記録する。元の指定Side modelはloadせず、provider lifecycle / fingerprintの既存条件を維持する。OpenAI-compatibleは同じMain modelをそのまま使用し、時点付きexact catalog availability / context metadata sampleを残す。remote traffic ledgerを持たない場合はgeneration request数をmachine証明したとは扱わない。
+- Stage 1 terminal後に同じProject ChatのSide Chatへ指定provider/modelと独立認証参照をSettingsのmanual model ID経路から保存する。OpenAI-compatibleのoptional `side_model`は省略時にMain modelを使い、指定時はそのSide modelをStage 5まで維持する。Stage 1〜4にはSide Chat Sendを含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。LM Studioは元の指定Side modelの時点付きunloaded sampleを残し、external-unmanagedでは同時にMain exact-loaded、reported loaded context、stable host fingerprint、全falseのlifecycle actionsを残す。Stage 5では、LM Studioで設定済みSide modelがMainと異なる場合だけSettingsから既にload済みのMain modelへ明示的に再設定し、再設定前後のmodelを記録する。元の指定Side modelはloadせず、provider lifecycle / fingerprintの既存条件を維持する。OpenAI-compatibleは指定Side modelと独立認証参照を維持し、時点付きexact catalog availability sampleを残す。sampleの`main_context_capacity`はMain由来のmetadataとして扱い、指定Side modelのcapacityとは読み替えない。remote traffic ledgerを持たない場合はgeneration request数をmachine証明したとは扱わない。
 - summary v1のMain `stages`配列とStage 1〜4の証跡を維持し、Side問い合わせ結果はadditiveな`stage5`へ記録する。`selected_model_unloaded_samples`はLM Studioの元の指定Side modelに関する既存意味を維持し、OpenAI-compatibleでは空配列とする。Stage 5の実使用modelは別fieldで記録する。profile横断の時点sampleはadditiveな`selected_model_provider_samples`へ記録する。external LM Studioはさらに`provider_reported_loaded_context`、`provider_lifecycle_actions`、基準`provider_host_fingerprint`と時点別`provider_host_fingerprint_samples`をadditiveに保持する。
 
 ## Execution
+
+suiteでは `case5_2_restoration: "after_cases"`（既定）でStage 1〜3の後に残りの通常ケースを実行し、最後に本ケースの復元・Stage 4・5へ戻る。`"skip"` は通常部分だけを実施し、後段を未実施と記録する。単独 `manual.case5_2` はStage 1〜5を連続して実行する。
+
+ケース全体の期限は既定で設けない。ユーザーが指定する場合だけoptional `observation_timeout_ms`へ正のsafe integerのmsを設定し、120分の最大値は設けない。指定時はStage 1の最初のMain Sendのnative押下直前からStage 5まで、一つのケース期限を使う。stage変更、権限承認、Desktop再起動では期限を更新せず、stage間の設定・復元とexternal evaluatorも残り時間へ含める。期限後は新しい送信を行わず、activeなMain / Sideだけへ同じowner targetのGUI Stop / Cancelを各1回送り、別枠の最大120秒でterminal、最大10秒でcommand evidenceを取得して共通cleanupへ進む。正常完了を待っていたケースが期限を使い切った結果は未完了として記録し、PASSへ読み替えない。省略時は従来のMain各stage最大12時間、Stage 5最大1時間を維持する。providerの`request_timeout_ms = 3600000`は変更しない。
+
+有限のケース期限を指定したsuiteでは、Stage 3から末尾の復元までに挟まる他ケースの時間も同じ期限に含む。復元開始前に期限を再確認し、超過していれば再起動・送信を行わず未完了とする。既定の期限なし運用ではこの制約は発生しない。
 
 Stage 1〜4のmonitorはMain assistant transcript bodyのexact `<|im_start|>` / `<|im_end|>` をprovider control-token leakとして扱う。検出時はconfig fieldを含まない最小projection evidenceとscreenshotを保存し、visible Main Stopをtrusted inputでexact 1回送ったうえで`case5_2-provider-control-token-leak`として即時fail-stopする。検出後のevidence、Stop、terminal acquisitionのいずれかがsettleしない場合は`harness_ng`とし、観測済みleakを`observed_product_failure` evidenceへ保持する。Stage 5はSide assistant本文を対象とする。running中に初めて検出した場合はSide Cancelだけをexact 1回送りterminalまで取得し、既にcompletedで初めて検出した場合は利用不能なCancelを送らずsubmit 1 / cancel 0を記録する。必要な最小projection、screenshot、command evidence、条件付きCancel terminalの取得がsettleしない場合だけ`harness_ng`とし、いずれも共通code `case5_2-provider-control-token-leak`で観測済みproduct failureを保持する。一般の`<|...|>`文字列やtool rowまでは検出しない。
 
@@ -50,11 +57,11 @@ current directory の `task.md` に従って作業してください。
 
 ### Stage 3: implementation
 
-`stage3-implement.txt` を同じsessionへ送る。完了後、modelが実行したtest結果とexternal backend test結果を保存する。
+`stage3-implement.txt` を同じsessionへ送る。完了後、modelが実行したtest結果とexternal backend test結果を保存する。suiteではここで通常部分を区切り、同じDesktopでCase6・7などの後続通常ケースへ進む。復元用にworkspace、session、latest turnとStage 3までの証拠を保持し、新規会話への複製や手動の履歴再投入は行わない。
 
 ### Reopen boundary
 
-Stage 3 terminal completion後に共通actual E2E hostのgraceful exit contractでDesktop appを通常終了し、exact PID / start time / executableとprofile WebViewのzeroを確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使って共通hostがfresh process generationとして再起動し、同じProject Chat session、latest turn、admission revision、canonical turn totalを再開する。再起動直後の表示はStage 3と同じ上限のbounded latest turn pageでよく、offsetが正ならGUIの「以前の履歴」をtrusted操作でoffset 0までprependし、User本文、canonical Errorの順序・本文・利用可能なidentityのexact一致とterminal Assistantのcanonical completionを確認する。runtime-only System notice、work summaryのlive表現、tool detail、file-change rowをraw配列の同一性判定へ混ぜないが、durable Error rowは除外しない。新しいsessionを作らず、履歴を手動要約または再投入しない。
+単独実行ではStage 3 terminal completion後、suiteでは通常ケース完了後に、選択した復元試験を行う。suiteで他ケースへ移動した場合は本ケースの設定・workspace・元の会話へ戻り、保存したStage 3のownerと履歴を照合する。その後、共通actual E2E hostのgraceful exit contractでDesktop appを通常終了し、exact PID / start time / executableとprofile WebViewのzeroを確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使って共通hostがfresh process generationとして再起動し、同じProject Chat session、latest turn、admission revision、canonical turn totalを再開する。再起動直後の表示はStage 3と同じ上限のbounded latest turn pageでよく、offsetが正ならGUIの「以前の履歴」をtrusted操作でoffset 0までprependし、User本文、canonical Errorの順序・本文・利用可能なidentityのexact一致とterminal Assistantのcanonical completionを確認する。runtime-only System notice、work summaryのlive表現、tool detail、file-change rowをraw配列の同一性判定へ混ぜないが、durable Error rowは除外しない。新しいsessionを作らず、履歴を手動要約または再投入しない。
 
 ### Stage 4: regression repair
 
@@ -62,15 +69,19 @@ Stage 3 terminal completion後に共通actual E2E hostのgraceful exit contract�
 
 ### Stage 5: same-session Side Chat inquiry
 
-Stage 4とexternal backend suite / hidden evaluatorが成功してから、同じowner sessionのSide Chatへ [`stage5-side-chat.txt`](stage5-side-chat.txt) を1回だけ送る。新しいMain turn、新session、履歴の手動要約・再投入は行わない。質問は調査目的、設計判断、実変更箇所、最後の回帰条件、確認済み結果と残る限界を尋ねるが、期待する回答や具体的な正解pathを渡さない。外部evaluator結果はowner履歴へ追加されていないため、それを知っていることを回答条件にしない。
+Stage 4が正常終了し、external backend suite / hidden evaluatorの実行・証拠保存と安全確認が完了したら、同じowner sessionのSide Chatへ [`stage5-side-chat.txt`](stage5-side-chat.txt) を1回だけ送る。生成物の評価がNGでも、その結果を保存してStage 5へ進む。Stage 5が成功しても先のNGをPASSや`manual_pending`へ変更しない。実行・証拠取得・同一性・安全性の異常では停止する。
 
-送信前にMainがidleで選択session identityとdraft targetが一致すること、Side owner / chat ID、owner-session scope、保存済みdraft revision、非nullのowner append fence、Side message 0件を確認する。Side modelがMainと異なる場合だけ既存Settings経路でMain modelへ再設定し、初回設定とは異なるevidence名を使う。Sideの質問と同じowner targetを持つ`submit_side_chat` exact 1件をcommand probeで10秒以内に取得し、このstage中の`submit_prompt` / `cancel_run` 0件を要求する。UIが送信時にtrimした実questionをcommand / terminal identityとし、source asset identityは別に保持する。正常完了時には同じSide chat内に質問のUserと非空のAssistantのexact 2件が保存され、同じmessage ID / roleの2件がMarkdown描画後の実画面にも表示され、errorやrunning状態が残らないことを確認する。completedのimmutable terminalがこの条件を満たさない場合は1時間待たず即時failureとする。
+新しいMain turn、新session、履歴の手動要約・再投入は行わない。質問は調査目的、設計判断、実変更箇所、最後の回帰条件、確認済み結果と残る限界を尋ねるが、期待する回答や具体的な正解pathを渡さない。外部evaluator結果はowner履歴へ追加されていないため、それを知っていることを回答条件にしない。
+
+送信前にMainがidleで選択session identityとdraft targetが一致すること、Side owner / chat ID、owner-session scope、保存済みdraft revision、非nullのowner append fence、Side message 0件を確認する。LM StudioでSide modelがMainと異なる場合だけ既存Settings経路でMain modelへ再設定し、初回設定とは異なるevidence名を使う。OpenAI-compatibleは指定Side modelを維持する。両profileでbindingの認証参照が明示したSide参照名と一致することを確認する。Sideの質問と同じowner targetを持つ`submit_side_chat` exact 1件をcommand probeで10秒以内に取得し、このstage中の`submit_prompt` / `cancel_run` 0件を要求する。UIが送信時にtrimした実questionをcommand / terminal identityとし、source asset identityは別に保持する。正常完了時には同じSide chat内に質問のUserと非空のAssistantのexact 2件が保存され、同じmessage ID / roleの2件がMarkdown描画後の実画面にも表示され、errorやrunning状態が残らないことを確認する。completedのimmutable terminalがこの条件を満たさない場合は1時間待たず即時failureとする。
 
 送信前後のMain session / selected session / latest turn / admission revision / 現在のbounded canonical transcript rows / composer draft、owner append fenceとworkspace manifestが不変であることを確認する。append fence不変はSide問い合わせ中にMain canonical itemが追加されていないことを示すが、過去全pageのDB再hashとは扱わない。質問、回答、実使用provider/model、owner / append fence、経過時間、command evidence、実画面を保存する。実行中に取得できた`context_truncated`はactive snapshotとして記録し、取得できなかった場合は不明とする。terminalのfalseを「全履歴が収まった」という証拠にしない。Side Chatはboundedなcanonical evidence / compaction checkpointを使い、巨大履歴全文やlive workspaceを参照する機能ではない。
 
 長い履歴に対する問い合わせ品質の評価には、fresh executionでStage 1〜5を通したlive runと回答の人手採点が必要である。短いscripted-provider / helper qualificationは送信先・隔離・証跡取得の回帰には使えるが、このlong-history quality gateの代用にはしない。
 
 ## Required verification
+
+選択した段階に対して以下を適用する。復元試験を省略した場合はStage 3までの検証を行い、再起動・Stage 4のhidden evaluator・Stage 5は未実施とする。通常部分の成功から、未実施の復元や後段の成功を推定しない。
 
 - Stage 1: `README.md`、`basic_design.md`、`detail_design.md`、25件以上の `evidence_matrix.md` が存在し、source-derived factとpathが整合する。既存source/config/testsは不変。
 - Stage 2: `cancel_contract.md` が存在し、指定したstate/HTTP/persistence/race/test contractを扱う。他fileは不変。
@@ -85,7 +96,7 @@ Stage 4とexternal backend suite / hidden evaluatorが成功してから、同�
 
 ## Quality rubric (100 points)
 
-この100点は比較用のStage 1〜4に適用し、Stage 5追加前の採点条件を維持する。Stage 5は別枠で記録し、Main成果物の点数へ加算・減算しない。
+この100点は比較用のStage 1〜4に適用し、Stage 5追加前の採点条件を維持する。Stage 5は別枠で記録し、Main成果物の点数へ加算・減算しない。復元試験を省略した場合はStage 1〜3の実施範囲だけを評価し、未実施のStage 4・5をPASSや失敗へ換算しない。100点rubricの完全な比較結果とは扱わない。
 
 ### Stage discipline and continuation: 15
 
@@ -139,7 +150,7 @@ hidden evaluatorのrestart/idempotency/error contractが失敗する、full back
 - 要求、modelの報告、記録上の検証結果を区別し、sessionにないexternal evaluator結果や現在のworkspace状態を確認済みとしない。
 - 記録・contextの不足を不明または制約として明示し、根拠のない成功や全履歴参照を主張しない。
 
-query経路のmachine結果、回答品質、context truncationの観測可否は別々に記録する。Stage 1〜5のmachine predicateとcleanupが成立しても、人手採点が終わるまでは`manual_pending`であり、full PASSではない。
+query経路のmachine結果、回答品質、context truncationの観測可否は別々に記録する。Stage 1〜5のmachine predicateとcleanupが成立しても、人手採点が終わるまでは`manual_pending`であり、full PASSではない。生成物の評価NGがある場合は、Stage 5の結果を併記したうえで最終NGを維持する。
 
 ## Performance fields
 

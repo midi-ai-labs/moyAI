@@ -103,11 +103,33 @@ pub enum ToolName {
     ApplyPatch,
     Write,
     Shell,
+    ShellStart,
+    ShellStatus,
+    ShellStop,
     CurrentTime,
     Skill,
     DoclingConvert,
     McpCall,
+    WaitRemoteTasks,
+    TeamPcs,
+    TeamUploadFile,
+    TeamDelegate,
+    TeamRetrySubmission,
+    TeamWait,
+    TeamReadArtifact,
+    TeamSaveArtifact,
+    TeamStopService,
+    TeamStopConversation,
+    SharedServices,
+    SharedStopService,
+    SharedDelegate,
+    SharedUploadFile,
+    SharedJobArtifacts,
+    SharedReadArtifact,
+    SharedSaveArtifact,
+    SharedPublishArtifact,
     UpdatePlan,
+    CompactContext,
     GetGoal,
     CreateGoal,
     UpdateGoal,
@@ -131,11 +153,33 @@ impl std::fmt::Display for ToolName {
             ToolName::ApplyPatch => "apply_patch",
             ToolName::Write => "write",
             ToolName::Shell => "shell",
+            ToolName::ShellStart => "shell_start",
+            ToolName::ShellStatus => "shell_status",
+            ToolName::ShellStop => "shell_stop",
             ToolName::CurrentTime => "current_time",
             ToolName::Skill => "skill",
             ToolName::DoclingConvert => "docling_convert",
             ToolName::McpCall => "mcp_call",
+            ToolName::WaitRemoteTasks => "wait_remote_tasks",
+            ToolName::TeamPcs => "team_pcs",
+            ToolName::TeamUploadFile => "team_upload_file",
+            ToolName::TeamDelegate => "team_delegate",
+            ToolName::TeamRetrySubmission => "team_retry_submission",
+            ToolName::TeamWait => "team_wait",
+            ToolName::TeamReadArtifact => "team_read_artifact",
+            ToolName::TeamSaveArtifact => "team_save_artifact",
+            ToolName::TeamStopService => "team_stop_service",
+            ToolName::TeamStopConversation => "team_stop_conversation",
+            ToolName::SharedServices => "shared_services",
+            ToolName::SharedStopService => "shared_stop_service",
+            ToolName::SharedDelegate => "shared_delegate",
+            ToolName::SharedUploadFile => "shared_upload_file",
+            ToolName::SharedJobArtifacts => "shared_job_artifacts",
+            ToolName::SharedReadArtifact => "shared_read_artifact",
+            ToolName::SharedSaveArtifact => "shared_save_artifact",
+            ToolName::SharedPublishArtifact => "shared_publish_artifact",
             ToolName::UpdatePlan => "update_plan",
+            ToolName::CompactContext => "compact_context",
             ToolName::GetGoal => "get_goal",
             ToolName::CreateGoal => "create_goal",
             ToolName::UpdateGoal => "update_goal",
@@ -162,11 +206,33 @@ impl ToolName {
             "apply_patch" => Self::ApplyPatch,
             "write" => Self::Write,
             "shell" => Self::Shell,
+            "shell_start" => Self::ShellStart,
+            "shell_status" => Self::ShellStatus,
+            "shell_stop" => Self::ShellStop,
             "current_time" => Self::CurrentTime,
             "skill" => Self::Skill,
             "docling_convert" => Self::DoclingConvert,
             "mcp_call" => Self::McpCall,
+            "wait_remote_tasks" => Self::WaitRemoteTasks,
+            "team_pcs" => Self::TeamPcs,
+            "team_upload_file" => Self::TeamUploadFile,
+            "team_delegate" => Self::TeamDelegate,
+            "team_retry_submission" => Self::TeamRetrySubmission,
+            "team_wait" => Self::TeamWait,
+            "team_read_artifact" => Self::TeamReadArtifact,
+            "team_save_artifact" => Self::TeamSaveArtifact,
+            "team_stop_service" => Self::TeamStopService,
+            "team_stop_conversation" => Self::TeamStopConversation,
+            "shared_services" => Self::SharedServices,
+            "shared_stop_service" => Self::SharedStopService,
+            "shared_delegate" => Self::SharedDelegate,
+            "shared_upload_file" => Self::SharedUploadFile,
+            "shared_job_artifacts" => Self::SharedJobArtifacts,
+            "shared_read_artifact" => Self::SharedReadArtifact,
+            "shared_save_artifact" => Self::SharedSaveArtifact,
+            "shared_publish_artifact" => Self::SharedPublishArtifact,
             "update_plan" => Self::UpdatePlan,
+            "compact_context" => Self::CompactContext,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
             "update_goal" => Self::UpdateGoal,
@@ -187,10 +253,41 @@ mod tests {
     use crate::workspace::AccessKind;
 
     #[test]
+    fn wait_remote_tasks_has_one_canonical_tool_name() {
+        assert_eq!(ToolName::WaitRemoteTasks.to_string(), "wait_remote_tasks");
+        assert_eq!(
+            ToolName::parse("wait_remote_tasks"),
+            ToolName::WaitRemoteTasks
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolName::WaitRemoteTasks).unwrap(),
+            "\"wait_remote_tasks\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"wait_remote_tasks\"").unwrap(),
+            ToolName::WaitRemoteTasks
+        );
+    }
+
+    #[test]
     fn update_plan_serializes_canonically() {
         assert_eq!(
             serde_json::to_string(&ToolName::UpdatePlan).expect("serialize"),
             "\"update_plan\""
+        );
+    }
+
+    #[test]
+    fn compact_context_has_one_canonical_tool_name() {
+        assert_eq!(ToolName::CompactContext.to_string(), "compact_context");
+        assert_eq!(ToolName::parse("compact_context"), ToolName::CompactContext);
+        assert_eq!(
+            serde_json::to_string(&ToolName::CompactContext).unwrap(),
+            "\"compact_context\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"compact_context\"").unwrap(),
+            ToolName::CompactContext
         );
     }
 

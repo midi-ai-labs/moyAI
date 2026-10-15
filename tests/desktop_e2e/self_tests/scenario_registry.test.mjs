@@ -12,6 +12,10 @@ const case52Options = Object.freeze({
   expected_main_variant: "example/main@q6",
   expected_side_variant: "example/side@q4",
 });
+test("shared entry accepts the explicit Hub build identity used by the common CLI", () => {
+  const scenario = createScenario("settings.shared-work", { hubBinary: "C:/fixture/moyai-hub.exe", browserChannel: "msedge", headed: true });
+  assert.equal(scenario.id, "settings.shared-work");
+});
 const liveProviderOptions = Object.freeze({
   provider_base_url: "http://192.0.2.10:8119/v1",
   model: "example/Qwen-27B",
@@ -30,43 +34,118 @@ const case52OpenAiOptions = Object.freeze({
 test("one registry binds every reusable scenario to the common runner contract", () => {
   assert.deepEqual(scenarioIds, [
     "shell.baseline",
+    "shell.about",
+    "shell.single-instance",
+    "hub.join-config-cold",
+    "hub.join-config-warm",
+    "shell.lynx",
+    "shell.managed-lifecycle",
+    "hub.browser-enrollment",
+    "hub.offline-reset",
+    "settings.shared-work",
+    "settings.shared-work-isolation",
+    "settings.shared-work-continuation",
+    "settings.project-folder-recovery",
+    "run.latest-message-edit",
+    "settings.device-execution",
+    "onboarding.win-a-to-win-b",
+    "project.four-device-acceptance",
+    "hub.join-retry-controls",
     "agent.interrupt",
     "history.restart-prepend",
     "history.terminal-reconcile",
     "input.pointer-keyboard",
+    "input.command-palette-insertion",
+    "manual.case1",
+    "manual.case2",
+    "manual.case3",
+    "manual.case4",
+    "manual.case5",
+    "manual.case6",
+    "manual.case7",
     "manual.case5_2",
+    "manual.suite",
+    "manual.suite-controls",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
-    "manual.permission-guardian-openai-compatible",
-    "manual.permission-temp-escalation-lm-studio",
+    "manual.permission-temp-write-openai-compatible",
+    "manual.permission-temp-write-lm-studio",
     "native-dialog.cancel",
+    "navigation.session-management",
+    "navigation.workspace-controls",
+    "navigation.modal-keyboard-controls",
+    "navigation.running-controls",
+    "navigation.external-rejoin",
+    "navigation.external-sidebar-stop",
+    "navigation.external-palette-rejoin",
+    "main.steer-controls",
+    "history.rail-controls",
+    "main.goal-query",
+    "prompt-review.entries-enhanced",
+    "navigation.shortcut-row-controls",
+    "main.palette-run-controls",
+    "output.history-navigation",
     "prompt-review.cancel",
+    "prompt-review.raw-interaction",
+    "review.uncommitted-controls",
+    "prompt-review.submit-raw",
+    "prompt-review.submit-enhanced",
     "permission.restart-guardian",
     "permission.restart-guardian-chat",
-    "permission.temp-escalation",
+    "permission.guardian-handoff-approve",
+    "permission.guardian-handoff-abort",
+    "permission.guardian-handoff-stop",
+    "permission.temp-write",
     "provider.chat-tool-continuation",
+    "history.tool-operation-failure",
+    "permission.shell-projection-success",
+    "permission.shell-projection-failure",
     "provider.responses-compaction-retry",
     "provider.responses-progress",
     "provider.restart",
     "settings.docling-readiness",
     "settings.initial-setup",
+    "settings.initial-setup-hub",
+    "settings.initial-setup-hub-preferences-failure",
     "settings.preferences",
+    "settings.preferences-config",
     "settings.session",
+    "settings.field-controls",
+    "settings.additional-controls",
+    "settings.initial-additional-controls",
+    "settings.session-discard-close",
+    "settings.temporary-apply-controls",
+    "settings.initial-field-controls",
+    "settings.session-field-controls",
+    "navigation.menu-entry-controls",
+    "navigation.palette-entry-controls",
     "run.next-turn",
     "run.stop",
     "side-chat.quote",
     "side-chat.session",
   ]);
   for (const id of scenarioIds) {
-    const options = id === "manual.case5_2"
-      ? case52Options
+    const options = id === "manual.suite"
+      ? { cases: [{ scenario: "manual.case1", options: { ...liveProviderOptions, python_executable: "C:/fixture/python.exe" } }] }
+      : id === "manual.case2"
+      ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", image_source: "C:/fixture/reference.jpg" }
+      : id === "manual.case5"
+        ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/repository" }
+      : id === "manual.case7"
+        ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/documents", docling_base_url: "http://docling.invalid:8123" }
+      : id === "manual.case3"
+      ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe", fixture_source: "C:/fixture/case1" }
+      : ["manual.case1", "manual.case4", "manual.case6"].includes(id)
+      ? { ...liveProviderOptions, python_executable: "C:/fixture/python.exe" }
+      : id === "manual.case5_2"
+        ? case52Options
       : id === "manual.provider-openai-compatible"
         ? liveProviderOptions
         : id === "manual.provider-lm-studio-thinking"
           ? lmStudioThinkingOptions
-          : id === "manual.permission-guardian-openai-compatible"
+          : id === "manual.permission-temp-write-openai-compatible"
             ? liveProviderOptions
-            : id === "manual.permission-temp-escalation-lm-studio"
+            : id === "manual.permission-temp-write-lm-studio"
               ? lmStudioThinkingOptions
               : {};
     const scenario = createScenario(id, options);
@@ -81,7 +160,10 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.notEqual(createScenario("settings.docling-readiness"), createScenario("settings.docling-readiness"));
   assert.notEqual(createScenario("settings.initial-setup"), createScenario("settings.initial-setup"));
   assert.notEqual(createScenario("settings.preferences"), createScenario("settings.preferences"));
+  assert.notEqual(createScenario("settings.preferences-config"), createScenario("settings.preferences-config"));
   assert.notEqual(createScenario("settings.session"), createScenario("settings.session"));
+  assert.notEqual(createScenario("navigation.session-management"), createScenario("navigation.session-management"));
+  assert.notEqual(createScenario("input.command-palette-insertion"), createScenario("input.command-palette-insertion"));
   assert.notEqual(createScenario("prompt-review.cancel"), createScenario("prompt-review.cancel"));
   assert.notEqual(
     createScenario("permission.restart-guardian"),
@@ -92,9 +174,13 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("permission.restart-guardian-chat"),
   );
   assert.notEqual(
-    createScenario("permission.temp-escalation"),
-    createScenario("permission.temp-escalation"),
+    createScenario("permission.temp-write"),
+    createScenario("permission.temp-write"),
   );
+  for (const retired of ["permission.temp-escalation", "manual.permission-temp-escalation-lm-studio",
+    "manual.permission-guardian-openai-compatible"]) {
+    assert.throws(() => createScenario(retired), /unknown/u);
+  }
   assert.notEqual(
     createScenario("provider.chat-tool-continuation"),
     createScenario("provider.chat-tool-continuation"),
@@ -126,12 +212,12 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
   );
   assert.notEqual(
-    createScenario("manual.permission-guardian-openai-compatible", liveProviderOptions),
-    createScenario("manual.permission-guardian-openai-compatible", liveProviderOptions),
+    createScenario("manual.permission-temp-write-openai-compatible", liveProviderOptions),
+    createScenario("manual.permission-temp-write-openai-compatible", liveProviderOptions),
   );
   assert.notEqual(
-    createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
-    createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
+    createScenario("manual.permission-temp-write-lm-studio", lmStudioThinkingOptions),
+    createScenario("manual.permission-temp-write-lm-studio", lmStudioThinkingOptions),
   );
   assert.throws(
     () => createScenario("manual.provider-openai-compatible"),
@@ -142,11 +228,11 @@ test("one registry binds every reusable scenario to the common runner contract",
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(
-    () => createScenario("manual.permission-guardian-openai-compatible"),
+    () => createScenario("manual.permission-temp-write-openai-compatible"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(
-    () => createScenario("manual.permission-temp-escalation-lm-studio"),
+    () => createScenario("manual.permission-temp-write-lm-studio"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(() => createScenario("run-95"), /unknown Desktop E2E scenario/);

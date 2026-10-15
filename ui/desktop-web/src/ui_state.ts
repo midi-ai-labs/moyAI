@@ -1,4 +1,9 @@
 import type { LocalConfirmation } from "./render_overlays.ts";
+import { createSharedWorkUiState, type SharedWorkUiState } from "./shared_work_state.ts";
+import { createHubUiState, type HubUiState } from "./hub_state.ts";
+import { createDeviceNetworkUiState, type DeviceNetworkUiState } from "./device_network_state.ts";
+import { createMcpHistoryUiState, type McpHistoryUiState } from "./mcp_history_state.ts";
+import { createMcpPeerState, type McpPeerState } from "./mcp_peer.ts";
 import { agentActivityRowIdentity } from "./agent_activity.ts";
 import {
   asyncTransactionIsCurrent,
@@ -47,6 +52,7 @@ import {
   type SessionSettingsState,
 } from "./session_settings_state.ts";
 import {
+  configCommandValues,
   configDraftAppliesTo,
   sameConfigMutationTarget,
 } from "./config_mutation.ts";
@@ -151,7 +157,7 @@ export interface SideChatLocalDraft {
 }
 
 export interface SideChatMutationState {
-  kind: "ensure" | "send" | "cancel" | "delete";
+  kind: "ensure" | "capture" | "send" | "cancel" | "delete";
   chatId: string | null;
   generation: string;
 }
@@ -163,6 +169,7 @@ export interface SideChatCatalogEntry {
   identityRevision: number;
   baseUrl: string;
   providerProfile: ProviderProfile;
+  apiKeyEnv: string;
   configGeneration: string;
   models: SideChatCatalogModel[];
   status: Exclude<SideChatCatalogStatus, "idle">;
@@ -176,6 +183,7 @@ export interface SideChatCatalogTarget {
   readonly identityRevision: number;
   readonly baseUrl: string;
   readonly providerProfile: ProviderProfile;
+  readonly apiKeyEnv: string;
   readonly configGeneration: string;
 }
 
@@ -229,6 +237,12 @@ export interface AgentExecutionRequest extends AgentExecutionTarget {
 }
 
 export interface UiLocalState {
+  sharedWork: SharedWorkUiState;
+  localMessageEdit: { pending: boolean; error: string; handoff: { forkedSessionId: string; sourceSessionId: string; workspacePath: string; editableText: string } | null };
+  hub: HubUiState;
+  deviceNetwork: DeviceNetworkUiState;
+  mcpHistory: McpHistoryUiState;
+  mcpPeers: McpPeerState;
   drafts: UiDraftState;
   initialSetup: InitialSetupState;
   initialSetupAuxiliary: InitialSetupAuxiliaryState;
@@ -237,12 +251,14 @@ export interface UiLocalState {
   sessionInteractionSnapshots: Map<string, SessionInteractionSnapshot>;
   runStartMutationPending: boolean;
   taskActivityAnimationEpoch: TaskActivityAnimationEpoch | null;
+  mcpActivityAnimationEpoch: TaskActivityAnimationEpoch | null;
   externalConfigMutationPending: boolean;
   activeNewSessionMutation: NewSessionMutationRequest | null;
   pendingLocalConfirmation: LocalConfirmation | null;
   configDirty: boolean;
   configDraftValues: Map<string, string>;
   configDraftBaselineValues: Map<string, string>;
+  configDraftEditedKeys: Set<string>;
   configDraftTarget: ConfigMutationTarget | null;
   configDraftRevision: bigint;
   nextConfigMutationGeneration: bigint;
@@ -291,6 +307,12 @@ export interface UiLocalState {
 
 export function createUiLocalState(): UiLocalState {
   return {
+    localMessageEdit: { pending: false, error: "", handoff: null },
+    hub: createHubUiState(),
+    deviceNetwork: createDeviceNetworkUiState(),
+    sharedWork: createSharedWorkUiState(),
+    mcpHistory: createMcpHistoryUiState(),
+    mcpPeers: createMcpPeerState(),
     drafts: {
       initialized: false,
       composerOwner: "",
@@ -328,12 +350,14 @@ export function createUiLocalState(): UiLocalState {
     sessionInteractionSnapshots: new Map(),
     runStartMutationPending: false,
     taskActivityAnimationEpoch: null,
+    mcpActivityAnimationEpoch: null,
     externalConfigMutationPending: false,
     activeNewSessionMutation: null,
     pendingLocalConfirmation: null,
     configDirty: false,
     configDraftValues: new Map(),
     configDraftBaselineValues: new Map(),
+    configDraftEditedKeys: new Set(),
     configDraftTarget: null,
     configDraftRevision: 0n,
     nextConfigMutationGeneration: 1n,
@@ -574,6 +598,7 @@ export function sideChatCatalogKey(
   target: ConfigMutationTarget,
   baseUrl: string,
   providerProfile: ProviderProfile,
+  apiKeyEnv = "",
 ): string {
   return [
     target.workspacePath,
@@ -581,6 +606,7 @@ export function sideChatCatalogKey(
     target.configGeneration,
     canonicalSideChatCatalogBaseUrl(baseUrl),
     providerProfile,
+    apiKeyEnv.trim(),
   ].join("\u0000");
 }
 
@@ -591,8 +617,8 @@ export function sideChatCatalogViewForState(
   const settings = globalSideChatCatalogSettings(uiState, state);
   if (!settings) return emptySideChatCatalogView();
   const baseUrl = canonicalSideChatCatalogBaseUrl(settings.baseUrl);
-  const { providerProfile } = settings;
-  const key = sideChatCatalogKey(state.config_target, baseUrl, providerProfile);
+  const { providerProfile, apiKeyEnv } = settings;
+  const key = sideChatCatalogKey(state.config_target, baseUrl, providerProfile, apiKeyEnv);
   const local = uiState.sideChatCatalogs.get(key);
   if (
     local
@@ -600,6 +626,7 @@ export function sideChatCatalogViewForState(
     && local.identityRevision === uiState.sideChatCatalogIdentityRevision
     && local.baseUrl === baseUrl
     && local.providerProfile === providerProfile
+    && local.apiKeyEnv === apiKeyEnv
     && local.configGeneration === state.config_target.configGeneration
   ) {
     return {
@@ -610,7 +637,7 @@ export function sideChatCatalogViewForState(
       error: local.error,
     };
   }
-  const seeded = mainProviderCatalogSeed(state, baseUrl, providerProfile);
+  const seeded = mainProviderCatalogSeed(state, baseUrl, providerProfile, apiKeyEnv);
   if (seeded.length > 0) {
     return {
       status: "ready",
@@ -664,7 +691,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged: false,
       accessChanged: false,
-      reason: projection.unavailable_reason || "root sessionを選択すると変更できます。",
+      reason: projection.unavailable_reason || "メインチャットを開くと変更できます。",
     };
   }
   if (!sameSessionSettingsTarget(local.owner, projection.target)) {
@@ -673,7 +700,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: true,
       providerChanged: false,
       accessChanged: false,
-      reason: "保存済みSession Settingsが別の操作で更新されました。変更を破棄するか、panelを開き直してください。",
+      reason: "このチャットの設定が別の操作で更新されました。入力中の変更を破棄するか、設定画面を開き直してください。",
     };
   }
   const providerChanged = draft.baseUrl !== baseline.baseUrl
@@ -688,7 +715,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: "実行中はProvider・Model・moyAI local context budgetを変更できません。Access modeだけを適用できます。",
+      reason: "接続先・モデル・入力整理上限は、実行が終わってから変更してください。実行中は承認方法だけを変更できます。",
     };
   }
   if (accessChanged && !projection.access_mutation_enabled) {
@@ -697,7 +724,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: "現在のruntime ownerではAccess modeを変更できません。",
+      reason: "現在は承認方法を変更できません。実行の状態が更新されるまでお待ちください。",
     };
   }
   if (!local.dirty) {
@@ -724,7 +751,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: local.activeMutation ? "Session Settingsを適用しています…" : "現在は適用できません。",
+      reason: local.activeMutation ? "チャットの設定を適用しています…" : "現在は適用できません。",
     };
   }
   return {
@@ -732,7 +759,7 @@ export function sessionSettingsMutationAvailability(
     staleTarget: false,
     providerChanged,
     accessChanged,
-    reason: "このroot sessionへ適用できます。",
+    reason: "このチャットに適用できます。",
   };
 }
 
@@ -799,13 +826,14 @@ export function beginSideChatCatalogLoad(
   const settings = globalSideChatCatalogSettings(uiState, state);
   if (!settings) return null;
   const baseUrl = canonicalSideChatCatalogBaseUrl(settings.baseUrl);
-  const key = sideChatCatalogKey(state.config_target, baseUrl, settings.providerProfile);
+  const key = sideChatCatalogKey(state.config_target, baseUrl, settings.providerProfile, settings.apiKeyEnv);
   const request = beginAsyncTransaction(uiState.sideChatCatalogTransaction, {
     key,
     configTarget: { ...state.config_target },
     identityRevision: uiState.sideChatCatalogIdentityRevision,
     baseUrl,
     providerProfile: settings.providerProfile,
+    apiKeyEnv: settings.apiKeyEnv,
     configGeneration: state.config_target.configGeneration,
   } satisfies SideChatCatalogTarget, "supersede", (token, target) => ({ token, ...target }));
   const previous = sideChatCatalogViewForState(uiState, state);
@@ -814,6 +842,7 @@ export function beginSideChatCatalogLoad(
     identityRevision: request.identityRevision,
     baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: previous.models,
     status: "loading",
@@ -839,6 +868,7 @@ export function finishSideChatCatalogLoad(
   }
   const responseMatches = canonicalSideChatCatalogBaseUrl(result.baseUrl) === request.baseUrl
     && result.providerProfile === request.providerProfile
+    && result.apiKeyEnv === request.apiKeyEnv
     && result.configGeneration === request.configGeneration;
   if (!responseMatches) {
     uiState.sideChatCatalogs.set(request.key, {
@@ -846,10 +876,11 @@ export function finishSideChatCatalogLoad(
       identityRevision: request.identityRevision,
       baseUrl: request.baseUrl,
       providerProfile: request.providerProfile,
+      apiKeyEnv: request.apiKeyEnv,
       configGeneration: request.configGeneration,
       models: [],
       status: "error",
-      error: "モデル一覧の応答対象が、現在のGlobal Side Chat設定と一致しませんでした。",
+      error: "モデル一覧の応答対象が、現在のサイドチャットの共通設定と一致しませんでした。",
       requestToken: request.token,
     });
     return { catalogAccepted: false, localStateChanged: true };
@@ -859,6 +890,7 @@ export function finishSideChatCatalogLoad(
     identityRevision: request.identityRevision,
     baseUrl: request.baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: result.models,
     status: "ready",
@@ -888,6 +920,7 @@ export function failSideChatCatalogLoad(
     identityRevision: request.identityRevision,
     baseUrl: request.baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: previous?.models ?? [],
     status: "error",
@@ -915,7 +948,8 @@ function sideChatCatalogRequestStillTargets(
     && request.identityRevision === uiState.sideChatCatalogIdentityRevision
     && settings !== null
     && canonicalSideChatCatalogBaseUrl(settings.baseUrl) === request.baseUrl
-    && settings.providerProfile === request.providerProfile;
+    && settings.providerProfile === request.providerProfile
+    && settings.apiKeyEnv === request.apiKeyEnv;
 }
 
 function deleteLoadingSideChatCatalogEntry(
@@ -937,10 +971,11 @@ function rejectStaleSideChatCatalogEntry(
     identityRevision: request.identityRevision,
     baseUrl: request.baseUrl,
     providerProfile: request.providerProfile,
+    apiKeyEnv: request.apiKeyEnv,
     configGeneration: request.configGeneration,
     models: [],
     status: "error",
-    error: "モデル一覧の読込中にGlobal Side Chat設定が変更されました。現在の設定で、もう一度モデル一覧を読み込んでください。",
+    error: "モデル一覧の読込中にサイドチャットの共通設定が変更されました。現在の設定で、もう一度モデル一覧を読み込んでください。",
     requestToken: request.token,
   });
 }
@@ -949,12 +984,14 @@ function mainProviderCatalogSeed(
   state: DesktopWebState,
   baseUrl: string,
   providerProfile: ProviderProfile,
+  apiKeyEnv: string,
 ): SideChatCatalogModel[] {
   if (
     !state.provider_catalog_base_url
     || canonicalSideChatCatalogBaseUrl(state.provider_catalog_base_url) !== baseUrl
     || state.provider_catalog_profile !== providerProfile
     || state.provider_effective_profile !== providerProfile
+    || (state.provider_catalog_api_key_env ?? "").trim() !== apiKeyEnv
   ) return [];
   return state.provider_model_ids.flatMap((id, index) => {
     const modelId = id.trim();
@@ -980,7 +1017,7 @@ function emptySideChatCatalogView(): SideChatCatalogView {
 function globalSideChatCatalogSettings(
   uiState: UiLocalState,
   state: Pick<DesktopWebState, "config_fields" | "config_target">,
-): { baseUrl: string; providerProfile: ProviderProfile; model: string } | null {
+): { baseUrl: string; providerProfile: ProviderProfile; model: string; apiKeyEnv: string } | null {
   const draftApplies = configDraftAppliesTo(uiState, state.config_target);
   const value = (key: string): string | null => {
     const projected = state.config_fields.find((field) => field.key === key)?.value;
@@ -990,8 +1027,20 @@ function globalSideChatCatalogSettings(
   const baseUrl = value("side_chat.base_url");
   const model = value("side_chat.model");
   const providerProfile = value("side_chat.provider_profile");
+  let apiKeyEnv = (value("side_chat.api_key_env") ?? "").trim();
   if (baseUrl === null || model === null || !isProviderProfile(providerProfile)) return null;
-  return { baseUrl, model, providerProfile };
+  if (draftApplies) {
+    const baselineUrl = uiState.configDraftBaselineValues.get("side_chat.base_url")
+      ?? state.config_fields.find(field => field.key === "side_chat.base_url")?.value ?? "";
+    const baselineProfile = uiState.configDraftBaselineValues.get("side_chat.provider_profile")
+      ?? state.config_fields.find(field => field.key === "side_chat.provider_profile")?.value;
+    const connectionChanged = canonicalSideChatCatalogBaseUrl(baseUrl) !== canonicalSideChatCatalogBaseUrl(baselineUrl)
+      || providerProfile !== baselineProfile;
+    const commandValues = configCommandValues(uiState, state.config_target,
+      state.config_fields.map(field => ({ key: field.key, text: value(field.key) ?? field.value })));
+    if (connectionChanged && !commandValues.some(value => value.key === "side_chat.api_key_env")) apiKeyEnv = "";
+  }
+  return { baseUrl, model, providerProfile, apiKeyEnv };
 }
 
 function isProviderProfile(value: string | null): value is ProviderProfile {
@@ -1009,7 +1058,9 @@ export function recordSideChatCatalogConfigEdit(
 ): void {
   const identityChanged = key === "side_chat.base_url"
     ? canonicalSideChatCatalogBaseUrl(previous) !== canonicalSideChatCatalogBaseUrl(next)
-    : key === "side_chat.provider_profile" && previous !== next;
+    : key === "side_chat.api_key_env"
+      ? previous.trim() !== next.trim()
+      : key === "side_chat.provider_profile" && previous !== next;
   if (identityChanged) uiState.sideChatCatalogIdentityRevision += 1;
 }
 
@@ -1212,7 +1263,7 @@ export function finishAgentExecutionLoad(
       generation: request.generation,
       expectedTarget: request.expectedTarget,
       projection: cached?.projection ?? null,
-      error: "読み込み結果の対象が現在のSub Agentと一致しませんでした。",
+      error: "読み込み結果の対象が現在のサブエージェントと一致しませんでした。",
     });
     clearAsyncTransaction(uiState.agentExecutionTransaction, request);
     return true;

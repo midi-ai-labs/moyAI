@@ -5,7 +5,20 @@ use async_trait::async_trait;
 
 use crate::error::ToolError;
 use crate::tool::context::{ToolContext, ToolServices};
+use crate::tool::read_context::ReadToolContext;
 use crate::tool::{ToolEffectClass, ToolResult, ToolSpec};
+
+const LEGACY_LOCAL_TEAM_TOOLS: &[&str] = &[
+    "team_pcs",
+    "team_upload_file",
+    "team_delegate",
+    "team_retry_submission",
+    "team_wait",
+    "team_read_artifact",
+    "team_save_artifact",
+    "team_stop_service",
+    "team_stop_conversation",
+];
 
 #[async_trait(?Send)]
 pub trait Tool: Send + Sync {
@@ -15,6 +28,17 @@ pub trait Tool: Send + Sync {
         raw_arguments: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError>;
+
+    /// Only tools with a shared read implementation opt into session-free execution.
+    async fn execute_read(
+        &self,
+        _raw_arguments: serde_json::Value,
+        _ctx: ReadToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Message(
+            "This tool does not support published reads".into(),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -25,6 +49,92 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub(crate) fn with_shared_environments(
+        mut self,
+        project_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        current_environment_id: &str,
+        environments: &[String],
+        candidates: &[crate::runner::shared::SharedCandidate],
+    ) -> Self {
+        // Hub-project runs own their conversation and child jobs in Hub. The older local
+        // origin tools would create a second, unrelated parent for the same request.
+        self.remove_legacy_local_team_tools();
+        self.tools.insert(
+            "shared_publish_artifact".into(),
+            Arc::new(
+                crate::tool::shared_publish_artifact::SharedPublishArtifactTool {
+                    job_id: job_id.to_owned(),
+                },
+            ),
+        );
+        self.tools.insert(
+            "shared_upload_file".into(),
+            Arc::new(crate::tool::team_work::SharedUploadFileTool {
+                project_id: project_id.to_owned(),
+                job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self.tools.insert(
+            "shared_job_artifacts".into(),
+            Arc::new(crate::tool::team_work::SharedJobArtifactsTool {
+                project_id: project_id.to_owned(),
+                parent_job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self.tools.insert(
+            "shared_read_artifact".into(),
+            Arc::new(crate::tool::team_work::SharedReadArtifactTool {
+                project_id: project_id.to_owned(),
+                parent_job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self.tools.insert(
+            "shared_save_artifact".into(),
+            Arc::new(crate::tool::team_work::SharedSaveArtifactTool {
+                project_id: project_id.to_owned(),
+                parent_job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        if !environments.is_empty() {
+            self.tools.insert(
+                "shared_delegate".into(),
+                Arc::new(crate::tool::shared_delegate::SharedDelegateTool {
+                    environments: environments.to_vec(),
+                    current_environment_id: current_environment_id.to_owned(),
+                    candidates: candidates.to_vec(),
+                }),
+            );
+        }
+        self.tools.insert(
+            "shared_stop_service".into(),
+            Arc::new(crate::tool::shared_stop_service::SharedStopServiceTool {
+                job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+                candidates: candidates.to_vec(),
+            }),
+        );
+        self.tools.insert(
+            "shared_services".into(),
+            Arc::new(crate::tool::shared_stop_service::SharedServicesTool {
+                job_id: job_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                generation,
+            }),
+        );
+        self
+    }
     pub(crate) fn empty() -> Self {
         Self {
             tools: HashMap::new(),
@@ -35,6 +145,12 @@ impl ToolRegistry {
 
     pub(crate) fn retain_tools(&mut self, mut predicate: impl FnMut(&str) -> bool) {
         self.tools.retain(|name, _| predicate(name));
+    }
+
+    pub(crate) fn remove_legacy_local_team_tools(&mut self) {
+        for name in LEGACY_LOCAL_TEAM_TOOLS {
+            self.tools.remove(*name);
+        }
     }
 
     pub(crate) fn retain_effect_with_exceptions(
@@ -67,6 +183,7 @@ impl ToolRegistry {
         );
         tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
         tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+        insert_managed_shell_tools(&mut tools);
         tools.insert(
             "current_time".to_string(),
             Arc::new(crate::tool::current_time::CurrentTimeTool),
@@ -83,6 +200,10 @@ impl ToolRegistry {
         tools.insert(
             "update_plan".to_string(),
             Arc::new(crate::tool::update_plan::UpdatePlanTool),
+        );
+        tools.insert(
+            "compact_context".to_string(),
+            Arc::new(crate::tool::compact_context::CompactContextTool),
         );
         insert_goal_tools(&mut tools);
         Self {
@@ -120,6 +241,8 @@ impl ToolRegistry {
                 Arc::new(crate::tool::mcp_call::McpCallTool),
             );
         }
+        synchronize_remote_wait_tool(&mut tools, config);
+        synchronize_team_tools(&mut tools, config);
         Self {
             tools,
             effect_filter: None,
@@ -150,6 +273,8 @@ impl ToolRegistry {
         } else {
             tools.remove("mcp_call");
         }
+        synchronize_remote_wait_tool(&mut tools, config);
+        synchronize_team_tools(&mut tools, config);
         Self {
             tools,
             effect_filter: self.effect_filter,
@@ -221,6 +346,79 @@ impl ToolRegistry {
             .ok_or_else(|| self.unknown_tool_error(name))?;
         tool.execute(raw_arguments, ctx).await
     }
+
+    pub(crate) async fn execute_published_read(
+        &self,
+        name: &str,
+        raw_arguments: serde_json::Value,
+        ctx: ReadToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| self.unknown_tool_error(name))?;
+        if tool.spec().effect != crate::tool::ToolEffectPolicy::read() {
+            return Err(ToolError::Message(
+                "Published tools must be static reads".into(),
+            ));
+        }
+        tool.execute_read(raw_arguments, ctx).await
+    }
+}
+
+fn synchronize_remote_wait_tool(
+    tools: &mut HashMap<String, Arc<dyn Tool>>,
+    config: &crate::config::ResolvedConfig,
+) {
+    if crate::tool::wait_remote_tasks::remote_wait_available(config) {
+        tools.insert(
+            "wait_remote_tasks".to_string(),
+            Arc::new(crate::tool::wait_remote_tasks::WaitRemoteTasksTool),
+        );
+    } else {
+        tools.remove("wait_remote_tasks");
+    }
+}
+
+fn synchronize_team_tools(
+    tools: &mut HashMap<String, Arc<dyn Tool>>,
+    config: &crate::config::ResolvedConfig,
+) {
+    if config.device_network.configured() {
+        // Existing local-origin jobs still need their saved receipt and result tools.
+        // A new local chat creates shared work only by joining a Hub project.
+        for name in ["team_pcs", "team_upload_file", "team_delegate"] {
+            tools.remove(name);
+        }
+        tools.insert(
+            "team_retry_submission".into(),
+            Arc::new(crate::tool::team_work::TeamRetrySubmissionTool),
+        );
+        tools.insert(
+            "team_wait".into(),
+            Arc::new(crate::tool::team_work::TeamWaitTool),
+        );
+        tools.insert(
+            "team_read_artifact".into(),
+            Arc::new(crate::tool::team_work::TeamReadArtifactTool),
+        );
+        tools.insert(
+            "team_save_artifact".into(),
+            Arc::new(crate::tool::team_work::TeamSaveArtifactTool),
+        );
+        tools.insert(
+            "team_stop_service".into(),
+            Arc::new(crate::tool::team_work::TeamStopServiceTool),
+        );
+        tools.insert(
+            "team_stop_conversation".into(),
+            Arc::new(crate::tool::team_work::TeamStopConversationTool),
+        );
+    } else {
+        for name in LEGACY_LOCAL_TEAM_TOOLS {
+            tools.remove(*name);
+        }
+    }
 }
 
 fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
@@ -241,11 +439,31 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
         "update_plan".to_string(),
         Arc::new(crate::tool::update_plan::UpdatePlanTool),
     );
+    tools.insert(
+        "compact_context".to_string(),
+        Arc::new(crate::tool::compact_context::CompactContextTool),
+    );
     tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+    insert_managed_shell_tools(tools);
     tools.insert(
         "current_time".to_string(),
         Arc::new(crate::tool::current_time::CurrentTimeTool),
+    );
+}
+
+fn insert_managed_shell_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    tools.insert(
+        "shell_start".into(),
+        Arc::new(crate::tool::shell::ShellStartTool),
+    );
+    tools.insert(
+        "shell_status".into(),
+        Arc::new(crate::tool::shell::ShellStatusTool),
+    );
+    tools.insert(
+        "shell_stop".into(),
+        Arc::new(crate::tool::shell::ShellStopTool),
     );
 }
 
@@ -307,11 +525,127 @@ fn remove_multi_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ordinary_team_tools_follow_hub_configuration_without_multi_agent_mode() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+        assert!(!names.iter().any(|name| name.starts_with("team_")));
+        config.device_network.hub_url = "https://hub.example/".into();
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+        for name in [
+            "team_retry_submission",
+            "team_wait",
+            "team_read_artifact",
+            "team_save_artifact",
+            "team_stop_service",
+            "team_stop_conversation",
+        ] {
+            assert!(names.contains(&name.to_string()), "missing {name}");
+        }
+        for name in ["team_pcs", "team_upload_file", "team_delegate"] {
+            assert!(
+                !names.contains(&name.to_string()),
+                "new local chat exposed {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_project_agent_uses_one_child_job_path() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.device_network.hub_url = "https://hub.example/".into();
+        let registry = super::ToolRegistry::core_agent_for_config(&config)
+            .with_shared_environments(
+                "project-a",
+                "job-a",
+                "attempt-a",
+                1,
+                "env-a",
+                &["env-b".into()],
+                &[],
+            );
+        let names = registry.available_tool_names();
+        assert!(names.contains(&"shared_delegate".into()));
+        assert!(names.contains(&"shared_upload_file".into()));
+        assert!(names.contains(&"shared_job_artifacts".into()));
+        assert!(names.contains(&"shared_read_artifact".into()));
+        assert!(names.contains(&"shared_save_artifact".into()));
+        assert!(names.contains(&"shared_publish_artifact".into()));
+        assert!(
+            super::LEGACY_LOCAL_TEAM_TOOLS
+                .iter()
+                .all(|name| !names.contains(&name.to_string()))
+        );
+        let mut per_step = registry.with_config_overlays(&config);
+        per_step.remove_legacy_local_team_tools();
+        let names = per_step.available_tool_names();
+        assert!(names.contains(&"shared_delegate".into()));
+        assert!(
+            super::LEGACY_LOCAL_TEAM_TOOLS
+                .iter()
+                .all(|name| !names.contains(&name.to_string()))
+        );
+    }
+
+    #[test]
+    fn remote_wait_registration_requires_enabled_hub_agent_but_not_local_multi_agent() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        for (mcp_enabled, server_enabled, remote_agent, server_id, expected) in [
+            (true, true, true, "hub-device-peer", true),
+            (false, true, true, "hub-device-peer", false),
+            (true, false, true, "hub-device-peer", false),
+            (true, true, false, "hub-device-peer", false),
+            (true, true, true, "manual-device", false),
+        ] {
+            config.mcp.enabled = mcp_enabled;
+            config.mcp.servers[0].enabled = server_enabled;
+            config.mcp.servers[0].remote_agent = remote_agent;
+            config.mcp.servers[0].id = server_id.into();
+            let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+            assert_eq!(
+                names.contains(&"wait_remote_tasks".into()),
+                expected,
+                "MCP={mcp_enabled} server={server_enabled} agent={remote_agent} id={server_id}"
+            );
+            assert!(!names.contains(&"wait_agent".into()));
+        }
+    }
+
+    #[test]
+    fn remote_wait_config_overlays_add_and_remove_stale_registration() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        config.mcp.servers[0].id = "hub-device-peer".into();
+        let active = super::ToolRegistry::core_agent().with_config_overlays(&config);
+        assert!(
+            active
+                .available_tool_names()
+                .contains(&"wait_remote_tasks".into())
+        );
+        config.mcp.servers.clear();
+        let removed = active.with_config_overlays(&config);
+        assert!(
+            !removed
+                .available_tool_names()
+                .contains(&"wait_remote_tasks".into())
+        );
+        assert!(
+            active
+                .available_tool_names()
+                .contains(&"wait_remote_tasks".into())
+        );
+    }
+
+    #[test]
     fn core_agent_registry_exposes_only_minimal_live_smoke_tools() {
         assert_eq!(
             super::ToolRegistry::core_agent().available_tool_names(),
             vec![
                 "apply_patch",
+                "compact_context",
                 "create_goal",
                 "current_time",
                 "get_goal",
@@ -321,6 +655,9 @@ mod tests {
                 "list",
                 "read",
                 "shell",
+                "shell_start",
+                "shell_status",
+                "shell_stop",
                 "update_goal",
                 "update_plan",
                 "write"
@@ -348,6 +685,37 @@ mod tests {
     fn core_agent_registry_exposes_only_the_canonical_update_plan_surface() {
         let names = super::ToolRegistry::core_agent().available_tool_names();
         assert!(names.contains(&"update_plan".to_string()));
+    }
+
+    #[test]
+    fn compact_context_is_available_as_an_internal_read_in_all_agent_configs() {
+        let mut config = crate::config::ResolvedConfig::default();
+        for enabled in [false, true] {
+            config.multi_agent.enabled = enabled;
+            config.docling.enabled = enabled;
+            config.mcp.enabled = enabled;
+            let mut registry = super::ToolRegistry::core_agent_for_config(&config);
+            registry.retain_effect_with_exceptions(
+                crate::tool::ToolEffectClass::Read,
+                Some(&config.mcp),
+                &[],
+            );
+            assert!(
+                registry
+                    .available_tool_names()
+                    .contains(&"compact_context".to_string())
+            );
+            assert_eq!(
+                registry
+                    .validate_call_effect(
+                        "compact_context",
+                        &serde_json::json!({ "summary": "Continue verifying" }),
+                        &config.mcp,
+                    )
+                    .expect("internal read"),
+                crate::tool::ToolEffectClass::Read
+            );
+        }
     }
 
     #[test]

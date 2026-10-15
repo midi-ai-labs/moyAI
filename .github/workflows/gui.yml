@@ -1,0 +1,119 @@
+name: Desktop GUI automation
+
+on:
+  pull_request:
+    # Keep runtime, config, prompts, migrations, build and harness changes covered.
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
+  push:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: GUI automation suite (visual and native manual review remains separate)
+        type: choice
+        required: true
+        default: smoke
+        options:
+          - smoke
+          - regression
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-gui-${{ github.workflow }}-${{ github.ref }}
+  # Allow the current execution to complete its exact process cleanup.
+  cancel-in-progress: false
+
+jobs:
+  gui:
+    name: Desktop automated GUI checks
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GUI_SUITE: ${{ inputs.suite || 'smoke' }}
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Locate isolated CI evidence
+        id: evidence
+        run: |
+          $artifactParent = [IO.Path]::GetFullPath((Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'project_sandbox/gui-ci'))
+          "artifact_parent=$artifactParent" >> $env:GITHUB_OUTPUT
+
+      - name: Check Windows GUI dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Command pwsh.exe -ErrorAction Stop | Out-Null
+          # Microsoft documents these per-machine/per-user Evergreen registrations.
+          # https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution
+          $runtimeKeys = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          $runtimeVersions = @($runtimeKeys | ForEach-Object {
+            $value = Get-ItemPropertyValue -LiteralPath $_ -Name pv -ErrorAction SilentlyContinue
+            if ($value -and $value -ne '0.0.0.0') { $value }
+          })
+          if ($runtimeVersions.Count -eq 0) {
+            throw 'WebView2 Evergreen Runtime is missing; this Windows runner cannot qualify the actual Desktop.'
+          }
+          Write-Output "WebView2 Runtime: $($runtimeVersions -join ', ')"
+          if (-not (Get-Command sqlite3.exe -ErrorAction SilentlyContinue)) {
+            choco install sqlite --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'SQLite CI dependency installation failed.' }
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+            $sqliteDirectory = Split-Path (Get-Command sqlite3.exe -ErrorAction Stop).Source -Parent
+            $sqliteDirectory >> $env:GITHUB_PATH
+          }
+          sqlite3.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'SQLite CI dependency did not start.' }
+
+      - name: Select stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+
+      - name: Verify unit tests, build and actual Desktop automation
+        env:
+          GUI_ARTIFACT_PARENT: ${{ steps.evidence.outputs.artifact_parent }}
+        run: |
+          # CI certifies the automated stage only. The public summary retains
+          # review_required/manual_pending; this does not approve visual review.
+          npm run verify:gui -- --suite $env:GUI_SUITE --artifact-parent $env:GUI_ARTIFACT_PARENT --automation-only
+          exit $LASTEXITCODE
+
+      - name: Upload public summaries only
+        if: ${{ always() && steps.evidence.outputs.artifact_parent != '' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: desktop-gui-public-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          # Never include raw result/events/logs, config, SQLite, or WebView profiles.
+          path: ${{ steps.evidence.outputs.artifact_parent }}/**/public-summary.json
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: false

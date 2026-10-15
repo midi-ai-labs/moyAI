@@ -2,17 +2,65 @@ function defaultSleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+export function normalizeManualObservationTimeout(value) {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError("observation_timeout_ms must be a positive safe integer");
+  }
+  return value;
+}
+
+export class ManualObservationBudget {
+  constructor({ timeoutMs, now = () => Date.now() }) {
+    normalizeManualObservationTimeout(timeoutMs);
+    if (typeof now !== "function") throw new TypeError("manual observation clock is required");
+    this.timeoutMs = timeoutMs ?? null;
+    this.now = now;
+    this.startedAt = null;
+  }
+  beginOnce() {
+    this.startedAt ??= this.now();
+    return this.snapshot();
+  }
+  remainingMs(ceiling = Infinity) {
+    if (this.timeoutMs === null) return ceiling;
+    const remaining = this.startedAt === null ? this.timeoutMs : Math.max(0, this.startedAt + this.timeoutMs - this.now());
+    return Math.min(ceiling, remaining);
+  }
+  get expired() { return this.startedAt !== null && this.remainingMs() <= 0; }
+  assertRemaining(label, ceiling = Infinity) {
+    const remaining = this.remainingMs(ceiling);
+    if (remaining > 0) return remaining;
+    const error = new Error(`${label} exhausted the case observation budget`);
+    error.code = "manual-observation-timeout";
+    error.evidence = { label, ...this.snapshot() };
+    throw error;
+  }
+  snapshot() {
+    return { timeout_ms: this.timeoutMs, started_at_ms: this.startedAt,
+      deadline_ms: this.timeoutMs === null || this.startedAt === null ? null : this.startedAt + this.timeoutMs,
+      remaining_ms: this.timeoutMs === null ? null : this.remainingMs() };
+  }
+}
+
 async function beforeHardDeadline(operation, milliseconds, label) {
+  if (milliseconds === Infinity) return operation();
   let timer;
   try {
     return await Promise.race([
       Promise.resolve().then(operation),
       new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          const error = new Error(`${label} attempt exceeded its remaining deadline`);
-          error.code = "observation-attempt-timeout";
-          reject(error);
-        }, milliseconds);
+        const deadline = Date.now() + milliseconds;
+        const schedule = () => {
+          // Node timers overflow beyond a signed 32-bit delay; keep the absolute deadline.
+          timer = setTimeout(() => {
+            if (Date.now() < deadline) { schedule(); return; }
+            const error = new Error(`${label} attempt exceeded its remaining deadline`);
+            error.code = "observation-attempt-timeout";
+            reject(error);
+          }, Math.min(2_147_483_647, Math.max(1, deadline - Date.now())));
+        };
+        schedule();
       }),
     ]);
   } finally {
@@ -32,7 +80,7 @@ export async function waitForObservation({
 }) {
   if (typeof label !== "string" || label.length === 0) throw new TypeError("wait label is required");
   if (typeof sample !== "function" || typeof accept !== "function") throw new TypeError("wait sample and accept functions are required");
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("wait timeout must be positive");
+  if ((timeoutMs !== Infinity && !Number.isFinite(timeoutMs)) || timeoutMs <= 0) throw new TypeError("wait timeout must be positive");
   if (!Number.isFinite(pollMs) || pollMs <= 0) throw new TypeError("wait poll interval must be positive");
   const started = now();
   const deadline = started + timeoutMs;

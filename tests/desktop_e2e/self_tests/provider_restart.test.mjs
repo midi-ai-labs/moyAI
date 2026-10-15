@@ -11,6 +11,7 @@ import {
   exactProviderCatalogLedger,
   exactProviderTurnLedger,
   providerRestartFixtureConfig,
+  providerRenderedTerminalFailures,
   providerTurnDomAccepted,
   quiesceProviderResource,
   relevantProviderHistory,
@@ -107,6 +108,42 @@ test("fresh provider terminal requires exact transcript, idle projection, and re
   assert.equal(exactFreshProviderHistory(relevantProviderHistory(reordered)), false);
   assert.equal(settledCompletedProviderTurn(projection({ overlay: "shortcuts" })), false);
   assert.equal(providerTurnDomAccepted(surface({ prompt: { count: 1, value: "stale", visible: true, enabled: true } }), history, identity), false);
+});
+
+test("rendered terminal metadata matches the full run owner and the visible usage label, title, and state", () => {
+  const p = projection({ run_target: { workspacePath: "C:/fixture", sessionId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    runtimeOwnerToken: null, expectedState: { kind: "idle", latestTurnId: "01ARZ3NDEKTSV4RRFFQ69G5FAW", admissionRevision: "1" } },
+  session_usage_label: "  累計 276k tokens  ", session_usage_title: "記録済みの使用量", session_usage_state: "complete" });
+  const value = surface({ projection: p, composer: { count: 1, visible: true, run_target: structuredClone(p.run_target) },
+    session_usage: { count: 1, visible: true, text: "累計 276k tokens", title: p.session_usage_title, state: "complete" } });
+  assert.deepEqual(providerRenderedTerminalFailures(value), []);
+  for (const [field, mutate] of [
+    ["composer.count", changed => changed.composer.count = 2],
+    ["composer.visible", changed => changed.composer.visible = false],
+    ["composer.run_target", changed => changed.composer.run_target.sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FAX"],
+    ["composer.run_target", changed => changed.composer.run_target.workspacePath = "C:/other"],
+    ["composer.run_target", changed => changed.composer.run_target.expectedState.admissionRevision = "2"],
+    ["composer.run_target", changed => changed.composer.run_target.expectedState.latestTurnId = "01ARZ3NDEKTSV4RRFFQ69G5FAX"],
+    ["composer.run_target", changed => changed.composer.run_target.runtimeOwnerToken = "stale-owner"],
+    ["composer.run_target", changed => changed.composer.run_target = { parse_error: true }],
+    ["session_usage.count", changed => changed.session_usage.count = 0],
+    ["session_usage.count", changed => changed.session_usage.count = 2],
+    ["session_usage.visible", changed => changed.session_usage.visible = false],
+    ["session_usage.text", changed => changed.session_usage.text = "未計測"],
+    ["session_usage.text", changed => changed.session_usage.text = "Σ 累計 276k tokens"],
+    ["session_usage.title", changed => changed.session_usage.title = "未計測の説明"],
+    ["session_usage.state", changed => changed.session_usage.state = "missing"],
+  ]) {
+    const changed = structuredClone(value);
+    mutate(changed);
+    assert.deepEqual(providerRenderedTerminalFailures(changed).map(failure => failure.field), [field]);
+  }
+  const empty = structuredClone(value);
+  empty.projection.session_usage_label = " ";
+  empty.session_usage = { count: 0, visible: false, text: null, title: null, state: null };
+  assert.deepEqual(providerRenderedTerminalFailures(empty), []);
+  empty.session_usage.count = 1;
+  assert.deepEqual(providerRenderedTerminalFailures(empty).map(failure => failure.field), ["session_usage.count"]);
 });
 
 test("restart restore must remain continuously accepted across a later observation window", () => {

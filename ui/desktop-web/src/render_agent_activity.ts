@@ -21,13 +21,13 @@ export function renderInlineAgentActivity(
   const rows = orderedAgentActivityRows(state.agent_activity_rows ?? []);
   if (!state.agent_tree_active && rows.length === 0) return "";
   const counts = agentActivityCounts(rows);
-  const updateText = counts.updated > 0 ? `${counts.updated}件のSub Agentが更新しました` : "";
+  const updateText = counts.updated > 0 ? `${counts.updated}件のサブエージェントが更新しました` : "";
   const groupPhase = state.agent_tree_active ? "active" : "terminal";
   return `
-    <section class="agent-inline-activity" aria-label="Sub Agentの活動">
+    <section class="agent-inline-activity" aria-label="サブエージェントの活動">
       <details class="agent-job-group" data-details-key="sub-agent-inline-group:${groupPhase}" ${state.agent_tree_active ? "open" : ""}>
         <summary>
-          <span class="agent-inline-heading"><strong>Sub Agent</strong><small>${escapeHtml(agentActivitySummary(rows, state.agent_tree_active))}</small></span>
+          <span class="agent-inline-heading"><strong>サブエージェント</strong><small>${escapeHtml(agentActivitySummary(rows, state.agent_tree_active))}</small></span>
           ${updateText ? `<span class="agent-update-summary" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(updateText)}</span>` : ""}
         </summary>
         ${rows.length > 0
@@ -42,12 +42,12 @@ export function renderSubAgentSummaryTrigger(state: DesktopWebState): string {
   const rows = orderedAgentActivityRows(state.agent_activity_rows ?? []);
   if (!state.agent_tree_active && rows.length === 0) return "";
   return `
-    <section class="output-agent-section" aria-label="Sub Agent">
+    <section class="output-agent-section" aria-label="サブエージェント">
       ${rows.length > 0
         ? `<button type="button" class="output-agent-trigger" data-action="show-agent-pane" data-focus-key="output-agent-trigger"
              aria-controls="sub-agent-inspector" aria-expanded="false">
             <span class="output-agent-symbols" aria-hidden="true">${rows.slice(0, 4).map(renderSummarySymbol).join("")}</span>
-            <span class="output-agent-trigger-label"><strong>Sub Agent</strong><small>${escapeHtml(agentActivitySummary(rows, state.agent_tree_active))}</small></span>
+            <span class="output-agent-trigger-label"><strong>サブエージェント</strong><small>${escapeHtml(agentActivitySummary(rows, state.agent_tree_active))}</small></span>
             <span aria-hidden="true">›</span>
           </button>`
         : renderAgentTreePending()}
@@ -85,7 +85,7 @@ export function renderAgentInspector(
 
 export function renderPermissionAgentIdentity(agentPath: string, taskName: string): string {
   const visual = stableAgentVisual(agentPath);
-  const label = taskName.trim() || agentPath.split("/").filter(Boolean).pop() || "Sub Agent";
+  const label = taskName.trim() || agentPath.split("/").filter(Boolean).pop() || "サブエージェント";
   return `
     <span class="permission-agent agent-tone-${visual.tone}">
       <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
@@ -104,7 +104,7 @@ function renderAgentJobCard(row: AgentActivityRow, selectedAgentPath: string | n
     <button type="button" class="agent-job-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
       data-focus-key="agent-job:${escapeHtml(row.agent_path)}" title="${escapeHtml(`${row.agent_path} · ${status}`)}"
-      aria-label="${escapeHtml(`${label}のSub Agent履歴を表示 · ${status}`)}"
+      aria-label="${escapeHtml(`${label}のサブエージェント履歴を表示 · ${status}`)}"
       aria-controls="sub-agent-inspector" aria-expanded="${selected ? "true" : "false"}">
       <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
       <span class="agent-job-copy"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(preview)}</small></span>
@@ -123,7 +123,7 @@ function renderInspectorListCard(row: AgentActivityRow): string {
     <button type="button" class="sub-agent-list-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
       data-focus-key="sub-agent-card:${escapeHtml(row.agent_path)}"
-      title="${escapeHtml(label)}" aria-label="${escapeHtml(`${label}のSub Agent履歴を表示`)}"
+      title="${escapeHtml(label)}" aria-label="${escapeHtml(`${label}のサブエージェント履歴を表示`)}"
       aria-controls="sub-agent-inspector">
       <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
       <span class="agent-job-copy"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(preview)}</small></span>
@@ -186,7 +186,7 @@ function renderSummarySymbol(row: AgentActivityRow): string {
 }
 
 function renderAgentTreePending(): string {
-  return '<div class="sub-agent-pending"><span class="busy-spinner small" title="準備中"></span><span>Sub Agentを準備しています</span></div>';
+  return '<div class="sub-agent-pending"><span class="busy-spinner small" title="準備中"></span><span>サブエージェントを準備しています</span></div>';
 }
 
 function activityPreview(row: AgentActivityRow): string {

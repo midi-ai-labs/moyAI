@@ -9,7 +9,7 @@
 - operatorが用意した structured-document fixtureを `project_sandbox/<task>/case7/workspace/` にfresh copyし、source path、file inventoryとhash、copy commandを `RESULTS.md` に記録する。clone外の固定pathを前提にしない。
 - workspace 直下に対象 DOCX / XLSX があり、`docs.md` は無い状態で開始する。
 - Docling Serve config と readiness を記録する。
-- config/data directory を fresh にし、visible Desktop GUI から実行する。
+- config/data directory は単独実行では fresh にする。suite 実行では [共通 README](../README.md) に従い同じ Desktop/profile を共有し、各 case の workspace と会話を fresh にする。visible Desktop GUI から実行する。
 
 ## Canonical user request
 

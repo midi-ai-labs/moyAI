@@ -521,6 +521,7 @@ pub struct AgentRuntime {
     trees: Mutex<HashMap<SessionId, Arc<AgentTreeRuntime>>>,
     worker_runtime: LocalTaskExecutor,
     workers: Mutex<AgentWorkerRegistry>,
+    resource_drains: Mutex<Vec<OwnedTaskHandle>>,
     #[cfg(test)]
     test_run_service: Mutex<Option<Weak<RunService>>>,
 }
@@ -531,6 +532,90 @@ struct AgentTreeRuntime {
     limits: AgentTreeLimits,
     model_request_gate: Arc<tokio::sync::Semaphore>,
     metadata: Mutex<HashMap<AgentPath, AgentNodeMetadata>>,
+}
+
+impl AgentRuntime {
+    pub(crate) fn retain_resource_drain<F, Fut>(&self, factory: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let mut drains = self
+            .resource_drains
+            .lock()
+            .map_err(|_| "resource drain registry lock was poisoned".to_string())?;
+        drains.retain(|task| !task.is_finished());
+        drains.push(self.worker_runtime.spawn(0, factory)?);
+        Ok(())
+    }
+
+    /// Called after the host closes admission and its root workers finish.
+    /// Managed processes must drain first: resource receipts wait for their exit.
+    pub(crate) async fn wait_for_resource_drains(&self) -> Result<(), String> {
+        loop {
+            let finished = {
+                let mut drains = self
+                    .resource_drains
+                    .lock()
+                    .map_err(|_| "resource drain registry lock was poisoned".to_string())?;
+                drains.retain(|task| !task.is_finished());
+                drains.is_empty()
+            };
+            if finished {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Application Exit owns every tree in this process, including detached
+    /// children. Ordinary task Stop continues to target just its exact root.
+    pub(crate) async fn stop_process_trees(self: &Arc<Self>) -> Result<(), String> {
+        let trees = self
+            .trees
+            .lock()
+            .map_err(|_| "agent tree registry lock was poisoned".to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for tree in &trees {
+            let expected = self
+                .session_service
+                .active_turn_expectation_for_session(tree.root_session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(expected) = expected else {
+                // Completed trees can outlive an ordinarily deleted chat.
+                // A missing row alone never proves that local work has ended.
+                if tree.control.is_quiescent().map_err(agent_control_error)? {
+                    continue;
+                }
+                return Err("the local task disappeared while stopping moyAI".to_string());
+            };
+            match self
+                .session_service
+                .cancel_running_session_tree_at_expectation(
+                    tree.root_session_id,
+                    expected,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                crate::session::ExactTreeStopOutcome::Applied { .. } => {}
+                crate::session::ExactTreeStopOutcome::TargetChanged => {
+                    return Err("the local task changed while stopping moyAI".to_string());
+                }
+            }
+            self.schedule_cancelled_worker_abort(tree);
+        }
+        for tree in trees {
+            wait_for_control_quiescence(&tree.control)
+                .await
+                .map_err(agent_control_error)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,6 +777,7 @@ impl AgentRuntime {
             worker_runtime: LocalTaskExecutor::new("moyai-agent-runtime")
                 .expect("failed to start agent task runtime"),
             workers: Mutex::new(AgentWorkerRegistry::default()),
+            resource_drains: Mutex::new(Vec::new()),
             #[cfg(test)]
             test_run_service: Mutex::new(None),
         }
@@ -2306,6 +2392,22 @@ impl AgentRuntime {
                 lease,
             });
         };
+        // Claim a separate Hub execution before the parent can finish. The worker guard
+        // closes only this scope on normal completion, early return or task abort.
+        let (run_service, hub_execution) = if context.is_sub_agent() {
+            match run_service.with_delegated_hub_execution(lease.run_control().token()) {
+                Ok((service, guard)) => (Arc::new(service), guard),
+                Err(error) => {
+                    return Err(AgentLaunchFailure {
+                        message: error.to_string(),
+                        context,
+                        lease,
+                    });
+                }
+            }
+        } else {
+            (run_service, None)
+        };
         let root_session_id = context.tree.root_session_id;
         let path = context.path.clone();
         let generation = match self.reserve_worker_generation(root_session_id, &path) {
@@ -2514,6 +2616,9 @@ impl AgentRuntime {
                     return;
                 }
             };
+            if let Some(execution) = &hub_execution {
+                execution.finish().await;
+            }
             if !context.has_durable_turn_owner() {
                 let fallback_error = result.as_ref().err().map(ToString::to_string).or_else(|| {
                     Some("sub-agent run returned before binding its durable turn owner".to_string())
@@ -3392,6 +3497,8 @@ fn durable_child_result_from_projection(
         .map(str::to_string);
     if status == SessionStatus::Failed {
         error.or(assistant)
+    } else if status == SessionStatus::Completed {
+        assistant
     } else {
         assistant.or(error)
     }

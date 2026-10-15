@@ -101,12 +101,14 @@ function configField(
 
 function sideChatConfigFields(overrides: {
   baseUrl?: string;
+  apiKeyEnv?: string;
   model?: string;
   systemPrompt?: string;
   providerProfile?: string;
 } = {}): ConfigFieldProjection[] {
   return [
     configField("side_chat.base_url", overrides.baseUrl ?? "http://127.0.0.1:1234/v1"),
+    configField("side_chat.api_key_env", overrides.apiKeyEnv ?? "", "string", { required: false }),
     configField("side_chat.model", overrides.model ?? "gemma-test"),
     configField(
       "side_chat.provider_profile",
@@ -155,6 +157,7 @@ function state(
     provider_catalog_api_key_env: null,
     provider_model_ids: [],
     provider_models: [],
+    provider_status: { kind: "idle", title: "", hint: "", details: "" },
     config_target: {
       workspacePath: "C:/workspace",
       sessionId: ownerSessionId,
@@ -227,6 +230,7 @@ function useSidePane(overrides: {
   draft?: string;
   baseUrl?: string;
   providerProfile?: "lm_studio" | "openai_compatible" | "openai_responses" | "lm_studio_chat_completions";
+  apiKeyEnv?: string;
   model?: string;
   systemPrompt?: string;
   pending?: boolean;
@@ -267,12 +271,14 @@ function useSidePane(overrides: {
   const withGlobalSideConfig = (view: DesktopViewState): DesktopViewState => {
     if (
       overrides.baseUrl === undefined
+      && overrides.apiKeyEnv === undefined
       && overrides.model === undefined
       && overrides.systemPrompt === undefined
       && overrides.providerProfile === undefined
     ) return view;
     const replacements = new Map(sideChatConfigFields({
       baseUrl: overrides.baseUrl,
+      apiKeyEnv: overrides.apiKeyEnv,
       model: overrides.model,
       systemPrompt: overrides.systemPrompt,
       providerProfile: overrides.providerProfile,
@@ -317,6 +323,7 @@ test("unconfigured right side chat only links to Settings and owns no provider i
 test("Settings owns the global Side Chat defaults and lifecycle explanation", () => {
   const renderer = useSidePane({
     baseUrl: "http://side.test/v1/path",
+    apiKeyEnv: "SIDE_TEST_KEY",
     model: "gemma-settings",
     systemPrompt: "  concise answers  ",
   });
@@ -325,18 +332,20 @@ test("Settings owns the global Side Chat defaults and lifecycle explanation", ()
   assert.match(html, /href="#settings-side-chat"/);
   assert.match(html, /id="settings-side-chat"[^>]*aria-labelledby="settings-side-chat-title"/);
   assert.match(html, /id="side-chat-base-url"[^>]*value="http:\/\/side\.test\/v1\/path"/);
-  assert.match(html, /<label for="side-chat-model">Model<\/label>/);
+  assert.match(html, /id="side-chat-api-key-env"[^>]*data-config-key="side_chat\.api_key_env"[^>]*value="SIDE_TEST_KEY"/);
+  assert.match(html, /メインチャットと同じ環境変数名を入力してください/);
+  assert.match(html, /<label for="side-chat-model">モデル<\/label>/);
   assert.match(html, /id="side-chat-model"[^>]*data-config-key="side_chat\.model"[^>]*aria-describedby="[^"]*side-chat-settings-help[^"]*settings-validation[^"]*side-chat-model-catalog-status[^"]*"/);
   assert.match(html, /<option value="gemma-settings" selected>gemma-settings（現在の設定）<\/option>/);
   assert.match(html, /一覧にないモデルIDを入力/);
   assert.match(html, /id="side-chat-model-manual"[^>]*value="gemma-settings"/);
   assert.match(html, /id="side-chat-system-prompt"[^>]*data-config-key="side_chat\.system_prompt"[^>]*>  concise answers  <\/textarea>/);
-  assert.match(html, /moyAI組み込みのSide Chatプロンプトは保持され、その後に追加されます/);
+  assert.match(html, /組み込みの指示に追加します/);
   assert.match(html, /16,384文字以内/);
   assert.match(html, /data-action="load-side-chat-models"[^>]*aria-controls="side-chat-model side-chat-model-catalog-status"/);
-  assert.match(html, /新しく作成するtext-only・tool-less Side Chatのglobal既定値/);
-  assert.match(html, /既存のSide Chatには後からのglobal変更を混ぜず/);
-  assert.match(html, /明示的に閉じると履歴・下書き・snapshotだけを削除/);
+  assert.match(html, /新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません/);
+  assert.match(html, /既存の会話の設定は変わりません/);
+  assert.match(html, /削除すると、その会話の履歴と下書きも失われます/);
 });
 
 test("Settings validates global Side Chat provider fields before save or catalog commands", () => {
@@ -450,21 +459,21 @@ test("Settings presents Main and Side LLM URL and native model selection consist
   const main = html.slice(mainStart, mainEnd);
   const side = html.slice(sideStart, sideEnd);
 
-  assert.match(main, /<h3 id="settings-provider-title">Main Chat Settings<\/h3>/);
-  assert.ok(main.indexOf("LLM URL") < main.indexOf('for="main-provider-model">Model'));
+  assert.match(main, /<h3 id="settings-provider-title">Main（メイン）<\/h3>/);
+  assert.ok(main.indexOf("接続先URL") < main.indexOf('for="main-provider-model">モデル'));
   assert.match(main, /<select id="main-provider-model"[^>]*data-config-key="model\.model"/);
   assert.match(main, /<option value="qwen-main" selected>Qwen Main（ロード済み）<\/option>/);
   assert.match(main, /<option value="qwen-main-alt" >Qwen Main Alt（未ロード）<\/option>/);
-  assert.match(main, /data-action="show-provider"[^>]*aria-controls="main-provider-model main-provider-model-catalog-status"/);
-  assert.match(main, /Main Chatのglobal既定値/);
+  assert.match(main, /data-action="load-provider-models"[^>]*aria-controls="main-provider-model main-provider-model-catalog-status"/);
+  assert.match(main, /メインチャットの共通の既定値/);
   assert.match(main, /data-config-key="model\.system_prompt"[^>]*>Main instructions<\/textarea>/);
   assert.doesNotMatch(main, /Side instructions/);
   assert.doesNotMatch(main, /data-side-chat-setting/);
 
-  assert.match(side, /<h3 id="settings-side-chat-title">Side Chat Settings<\/h3>/);
-  assert.ok(side.indexOf("LLM URL") < side.indexOf('<label for="side-chat-model">Model'));
+  assert.match(side, /<h3 id="settings-side-chat-title">Sub（サイドチャット）<\/h3>/);
+  assert.ok(side.indexOf("接続先URL") < side.indexOf('<label for="side-chat-model">モデル'));
   assert.match(side, /<select id="side-chat-model"/);
-  assert.match(side, /新しく作成するtext-only・tool-less Side Chatのglobal既定値/);
+  assert.match(side, /新しく開くサイドチャットの既定値です。文字のみの会話で、ツールは使用しません/);
   assert.match(side, /data-config-key="side_chat\.system_prompt"[^>]*>Side instructions<\/textarea>/);
   assert.doesNotMatch(side, /Main instructions/);
   assert.doesNotMatch(side, /data-config-key="model\./);
@@ -528,9 +537,10 @@ test("Main Settings never offers model rows from a catalog owned by another URL"
     html.indexOf('<section id="settings-model"'),
   );
 
-  assert.match(main, /<option value="current-model" selected>current-model（現在の設定）<\/option>/);
+  assert.doesNotMatch(main, /<option value="current-model"/);
+  assert.match(main, /id="main-provider-model-manual"[^>]*value="current-model"/);
   assert.doesNotMatch(main, /stale-model|Stale model/);
-  assert.match(main, /現在のLLM URLとConnection typeに対応する候補を取得/);
+  assert.match(main, /モデルIDを手入力/);
 });
 
 test("Settings model dropdown exposes loaded options and retains a current model outside the catalog", () => {
@@ -629,11 +639,23 @@ test("Global Side Chat model catalog load is explicit and canonical", async () =
   const current = state();
   current.overlay = "config";
   updateConfigDraftValue(
+    ui, current.config_target,
+    current.config_fields.map((field) => ({ key: field.key, text: field.value })),
+    "side_chat.api_key_env", "SHARED_TEST_KEY",
+  );
+  updateConfigDraftValue(
     ui,
     current.config_target,
     current.config_fields.map((field) => ({ key: field.key, text: field.value })),
     "side_chat.base_url",
     "http://side.test/v1/",
+  );
+  assert.equal(ui.configDraftValues.get("side_chat.api_key_env"), "",
+    "a credential entered for the old URL cannot authorize the new catalog target");
+  updateConfigDraftValue(
+    ui, current.config_target,
+    current.config_fields.map((field) => ({ key: field.key, text: field.value })),
+    "side_chat.api_key_env", "SHARED_TEST_KEY",
   );
   updateConfigDraftValue(
     ui,
@@ -653,6 +675,7 @@ test("Global Side Chat model catalog load is explicit and canonical", async () =
       return {
         baseUrl: "http://side.test",
         providerProfile: "openai_compatible" as const,
+        apiKeyEnv: "SHARED_TEST_KEY",
         configGeneration: "7",
         models: [{
           id: "google/gemma-4-12b-qat",
@@ -672,6 +695,7 @@ test("Global Side Chat model catalog load is explicit and canonical", async () =
   assert.deepEqual(args, {
     baseUrl: "http://side.test",
     providerProfile: "openai_compatible",
+    apiKeyEnv: "SHARED_TEST_KEY",
     expectedConfigGeneration: "7",
   });
   assert.equal(rerenders, 2);
@@ -682,6 +706,32 @@ test("Global Side Chat model catalog load is explicit and canonical", async () =
     sideChatModelOptions(catalog, "google/gemma-4-12b-qat").map((model) => model.id),
     ["google/gemma-4-12b-qat"],
   );
+});
+
+test("Side catalog target changes require a new explicit credential reference", () => {
+  for (const [key, text] of [["side_chat.base_url", "http://other.test/v1"],
+    ["side_chat.provider_profile", "openai_responses"]]) {
+    const ui = createUiLocalState();
+    const current = state();
+    current.overlay = "config";
+    current.config_fields = sideChatConfigFields({ baseUrl: "http://old.test/v1", apiKeyEnv: "OLD_KEY" });
+    const values = current.config_fields.map(field => ({ key: field.key, text: field.value }));
+    updateConfigDraftValue(ui, current.config_target, values, key, text);
+    const request = beginSideChatCatalogLoad(ui, current);
+    assert.ok(request);
+    assert.equal(request.apiKeyEnv, "", "a new catalog target cannot use an untouched API prefill");
+    updateConfigDraftValue(ui, current.config_target, values, "side_chat.api_key_env", "OLD_KEY");
+    const explicit = beginSideChatCatalogLoad(ui, current);
+    assert.ok(explicit);
+    assert.equal(explicit.apiKeyEnv, "OLD_KEY");
+  }
+  const ui = createUiLocalState();
+  const current = state();
+  current.overlay = "config";
+  current.config_fields = sideChatConfigFields({ apiKeyEnv: "OLD_KEY" });
+  updateConfigDraftValue(ui, current.config_target, current.config_fields.map(field => ({ key: field.key, text: field.value })),
+    "side_chat.model", "another-model");
+  assert.equal(beginSideChatCatalogLoad(ui, current)?.apiKeyEnv, "OLD_KEY");
 });
 
 test("a changed Global Side Chat draft rejects a stale catalog settlement without touching conversation draft", async () => {
@@ -715,6 +765,7 @@ test("a changed Global Side Chat draft rejects a stale catalog settlement withou
   release({
     baseUrl: "http://first.test",
     providerProfile: "openai_compatible",
+    apiKeyEnv: "",
     configGeneration: "7",
     models: [{ id: "stale-model", label: "Stale", loadState: "loaded" }],
   });
@@ -753,6 +804,7 @@ test("Side Chat catalog rejects an ABA connection edit by browser-owned identity
   const settlement = finishSideChatCatalogLoad(ui, current, request, {
     baseUrl: "http://side.test",
     providerProfile: "openai_compatible",
+    apiKeyEnv: "",
     configGeneration: "7",
     models: [{ id: "stale-model", label: "Stale", loadState: "loaded" }],
   });
@@ -829,6 +881,7 @@ test("Side Chat catalog loading keeps native Select All owned by the connected S
     assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
       baseUrl: request.baseUrl,
       providerProfile: "openai_compatible",
+      apiKeyEnv: "",
       configGeneration: "7",
       models: [{ id: "model-ready", label: "Ready", loadState: "loaded" }],
     }), { catalogAccepted: true, localStateChanged: true });
@@ -898,12 +951,14 @@ test("Side Chat catalog drops stale URL completions and never borrows a mismatch
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, firstRequest, {
     baseUrl: "http://first.test",
     providerProfile: "openai_compatible",
+    apiKeyEnv: "",
     configGeneration: "7",
     models: [{ id: "stale-model", label: "Stale", loadState: "unknown" }],
   }), { catalogAccepted: false, localStateChanged: false });
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, latestRequest, {
     baseUrl: "http://second.test",
     providerProfile: "openai_compatible",
+    apiKeyEnv: "",
     configGeneration: "7",
     models: [{ id: "latest-model", label: "Latest", loadState: "loaded" }],
   }), { catalogAccepted: true, localStateChanged: true });
@@ -937,6 +992,7 @@ test("an admitted Side Chat catalog result is dropped when Main Settings settlem
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
     baseUrl: "http://side.test",
     providerProfile: "openai_compatible",
+    apiKeyEnv: "",
     configGeneration: "7",
     models: [{ id: "must-not-settle", label: "Stale", loadState: "loaded" }],
   }), { catalogAccepted: false, localStateChanged: true });
@@ -944,11 +1000,12 @@ test("an admitted Side Chat catalog result is dropped when Main Settings settlem
   assert.deepEqual(sideChatCatalogViewForState(ui, current).models, []);
 });
 
-test("Side Chat catalog response must match the admitted URL, profile, and config generation", () => {
+test("Side Chat catalog response must match the admitted URL, profile, credential reference, and config generation", () => {
   for (const mismatch of [
     { baseUrl: "http://other.test", providerProfile: "openai_compatible" as const, configGeneration: "7" },
     { baseUrl: "http://side.test", providerProfile: "lm_studio" as const, configGeneration: "7" },
     { baseUrl: "http://side.test", providerProfile: "openai_compatible" as const, configGeneration: "8" },
+    { baseUrl: "http://side.test", providerProfile: "openai_compatible" as const, apiKeyEnv: "OTHER_KEY", configGeneration: "7" },
   ]) {
     const ui = createUiLocalState();
     const current = state();
@@ -960,6 +1017,7 @@ test("Side Chat catalog response must match the admitted URL, profile, and confi
     assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
       baseUrl: mismatch.baseUrl,
       providerProfile: mismatch.providerProfile,
+      apiKeyEnv: mismatch.apiKeyEnv ?? "",
       configGeneration: mismatch.configGeneration,
       models: [{ id: "wrong-target", label: "Wrong target", loadState: "loaded" }],
     }), { catalogAccepted: false, localStateChanged: true });
@@ -969,6 +1027,36 @@ test("Side Chat catalog response must match the admitted URL, profile, and confi
     assert.equal(sideChatCatalogLoadOpen(ui, current), true);
     assert.equal(ui.sideChatCatalogTransaction.active, null);
   }
+});
+
+test("Side catalog credentials are explicit and never borrow a Main catalog with a different reference", () => {
+  const ui = createUiLocalState();
+  const current = state();
+  current.overlay = "config";
+  current.config_fields = sideChatConfigFields({ baseUrl: "http://shared.test/v1" });
+  current.provider_catalog_base_url = "http://shared.test";
+  current.provider_catalog_profile = "openai_compatible";
+  current.provider_catalog_api_key_env = "MAIN_KEY";
+  current.provider_model_ids = ["gemma"];
+  current.provider_models = ["Gemma"];
+  assert.equal(sideChatCatalogViewForState(ui, current).source, "none");
+
+  const values = current.config_fields.map(field => ({ key: field.key, text: field.value }));
+  updateConfigDraftValue(ui, current.config_target, values, "side_chat.api_key_env", " MAIN_KEY ");
+  assert.equal(sideChatCatalogViewForState(ui, current).source, "main");
+  const request = beginSideChatCatalogLoad(ui, current);
+  assert.ok(request);
+  assert.equal(request.apiKeyEnv, "MAIN_KEY");
+
+  recordSideChatCatalogConfigEdit(ui, "side_chat.api_key_env", "MAIN_KEY", "OTHER_KEY");
+  updateConfigDraftValue(ui, current.config_target, values, "side_chat.api_key_env", "OTHER_KEY");
+  recordSideChatCatalogConfigEdit(ui, "side_chat.api_key_env", "OTHER_KEY", "MAIN_KEY");
+  updateConfigDraftValue(ui, current.config_target, values, "side_chat.api_key_env", "MAIN_KEY");
+  assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
+    baseUrl: request.baseUrl, providerProfile: request.providerProfile, apiKeyEnv: request.apiKeyEnv,
+    configGeneration: request.configGeneration, models: [{ id: "stale", label: "Stale", loadState: "loaded" }],
+  }), { catalogAccepted: false, localStateChanged: true });
+  assert.deepEqual(sideChatCatalogViewForState(ui, current).models.map(model => model.id), ["gemma"]);
 });
 
 test("Global Side Chat Settings stay editable while an existing snapshot is running or deleting", () => {
@@ -1106,7 +1194,7 @@ test("an unrelated invalid Main field does not replace the Global Side Chat cata
 
 test("Global Settings settlement blocks Side conversation controls without replacing Settings editors", () => {
   const renderer = useSidePane({
-    draft: "wait for Global Settings",
+    draft: "wait for 共通設定",
     baseUrl: "http://replacement.test/v1/",
     model: "gemma-replacement",
     catalogLoadEnabled: true,
@@ -1123,11 +1211,13 @@ test("Global Settings settlement blocks Side conversation controls without repla
   const pane = renderer.artifactPane(current);
   assert.match(pane, /data-action="request-delete-side-chat"[^>]*disabled/);
   assert.match(pane, /id="side-chat-prompt"[^>]*disabled/);
-  assert.match(pane, /data-action="cancel-side-chat"[^>]*disabled/);
+  assert.doesNotMatch(pane, /data-action="cancel-side-chat"/);
   assert.match(pane, /data-action="send-side-chat"[^>]*disabled/);
+  const runningPane = renderer.artifactPane(state({ status: "running", can_send: false, can_cancel: true }));
+  assert.match(runningPane, /data-action="cancel-side-chat"[^>]*disabled/);
 
   const confirmationRenderer = useSidePane({
-    draft: "wait for Global Settings",
+    draft: "wait for 共通設定",
     configPending: true,
     configDraftEditOpen: false,
     confirmingDelete: true,
@@ -1145,12 +1235,53 @@ test("an unrelated Rust config-edit capability does not block independent Side C
   const pane = renderer.artifactPane(state({ can_send: true, can_cancel: true }));
   const prompt = pane.match(/<textarea id="side-chat-prompt"[^>]*>/)?.[0] ?? "";
   const send = pane.match(/<button class="send" data-action="send-side-chat"[^>]*>/)?.[0] ?? "";
-  const stop = pane.match(/<button data-action="cancel-side-chat"[^>]*>/)?.[0] ?? "";
   const remove = pane.match(/<button class="pin danger-pin"[^>]*>/)?.[0] ?? "";
-  for (const control of [prompt, send, stop, remove]) {
+  for (const control of [prompt, send, remove]) {
     assert.ok(control);
     assert.doesNotMatch(control, /disabled/);
   }
+  assert.doesNotMatch(pane, /data-action="cancel-side-chat"/);
+  const runningPane = renderer.artifactPane(state({ status: "running", can_send: false, can_cancel: true }));
+  const stop = runningPane.match(/<button\b[^>]*data-action="cancel-side-chat"[^>]*>/)?.[0] ?? "";
+  assert.ok(stop, "an active Side turn retains its Stop control independently of config-edit capability");
+  assert.doesNotMatch(stop, /disabled/);
+});
+
+test("Side stop feedback uses a neutral Japanese notice only for the typed canonical user stop", () => {
+  const renderer = useSidePane({ draft: "次の質問" });
+  for (const configured of [true, false]) {
+    const html = renderer.artifactPane(state({
+      configured, status: "cancelled", phase: "", last_error: "run stopped by user", can_cancel: false,
+    }));
+    const notice = html.match(/<p class="side-chat-notice"[^>]*>[^<]*<\/p>/)?.[0] ?? "";
+    assert.match(notice, /role="status">サイドチャットの実行を停止しました。<\/p>/);
+    assert.doesNotMatch(html, /run stopped by user|class="side-chat-error"|data-action="cancel-side-chat"/);
+  }
+});
+
+test("Side stop feedback preserves real errors and does not classify an error string alone as cancellation", () => {
+  const renderer = useSidePane();
+  for (const error of [
+    { status: "failed" as const, last_error: "run stopped by user" },
+    { status: "cancelled" as const, last_error: "draft save failed <storage>" },
+    { status: "cancelled" as const, deleting: true, last_error: "deletion failed <storage>" },
+  ]) {
+    const html = renderer.artifactPane(state(error));
+    assert.match(html, /class="side-chat-error" role="alert"/);
+    assert.doesNotMatch(html, /class="side-chat-notice"|サイドチャットの実行を停止しました/);
+    if (error.last_error.includes("<storage>")) assert.match(html, /&lt;storage&gt;/);
+  }
+});
+
+test("Side stop feedback gives pending deletion priority and adds no notice without a terminal error", () => {
+  const renderer = useSidePane();
+  const deleting = renderer.artifactPane(state({
+    deleting: true, status: "cancelled", last_error: "run stopped by user",
+  }));
+  assert.match(deleting, /サイドチャットを削除しています/);
+  assert.doesNotMatch(deleting, /class="side-chat-notice"|class="side-chat-error"|run stopped by user/);
+  const empty = renderer.artifactPane(state({ status: "cancelled", last_error: "" }));
+  assert.doesNotMatch(empty, /class="side-chat-notice"|class="side-chat-error"/);
 });
 
 test("configured side chat renders its transcript and exposes the modal delete owner", () => {
@@ -1218,7 +1349,7 @@ test("durable deletion pending is explicit and disables every side-chat mutation
   assert.match(html, /削除処理中/);
   assert.match(html, /data-action="request-delete-side-chat"[^>]*disabled/);
   assert.match(html, /id="side-chat-prompt"[^>]*disabled/);
-  assert.match(html, /data-action="cancel-side-chat"[^>]*disabled/);
+  assert.doesNotMatch(html, /data-action="cancel-side-chat"/);
   assert.match(html, /data-action="send-side-chat"[^>]*disabled/);
   assert.doesNotMatch(html, /role="alertdialog"/);
   assert.doesNotMatch(html, /data-action="confirm-delete-side-chat"/);
@@ -1314,6 +1445,7 @@ test("side draft persistence uses exact owner, chat, and draft revision", async 
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       current = state({ draft_text: "new durable draft", draft_revision: "8" });
@@ -1350,6 +1482,7 @@ test("a stale durable draft CAS never replaces the losing local text", async () 
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async () => {
       current = state({ draft_text: "other process", draft_revision: "8" });
     },
@@ -1388,6 +1521,7 @@ test("draft CAS settlement compares typed quote authority even when display text
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       current = state({
@@ -1491,6 +1625,40 @@ test("Ctrl+Enter targets the focused side composer without changing other global
   );
 });
 
+test("Hub-origin Side Chat captures Direct only on an explicit targeted action and keeps drafts", async () => {
+  const ui = createUiLocalState();
+  ui.drafts.prompt = "keep main draft";
+  const initial = state({ can_send: false, direct_provider_capture: {
+    base_url: "http://direct.test/v1", model: "direct-model", provider_profile: "openai_compatible",
+    enabled: true, reason: "この会話と履歴を保持して、最初のDirect設定を適用します。",
+  } });
+  const html = useSidePane().artifactPane(initial);
+  assert.match(html, /この会話に直接接続の設定を適用/);
+  assert.match(html, /http:\/\/direct.test\/v1/);
+  assert.match(html, /direct-model/);
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  let release!: () => void;
+  const completion = new Promise<void>((resolve) => { release = resolve; });
+  const context = { uiState: ui, rerender: () => undefined,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args }); await completion;
+    },
+  } as unknown as ActionContext;
+  const action = actionById("capture-side-chat-direct-provider")!;
+  const first = action.run(initial, context, { index: -1, value: "" });
+  await action.run(initial, context, { index: -1, value: "" });
+  assert.equal(ui.sideChatMutations.get("session-a")?.kind, "capture");
+  assert.deepEqual(calls, [{ name: "capture_side_chat_direct_provider", args: {
+    ownerSessionId: "session-a", sideChatId: "side-a", expectedGeneration: "4",
+    expectedDraftRevision: "0", expectedConfigGeneration: "7",
+  } }]);
+  release(); await first;
+  assert.equal(ui.sideChatMutations.size, 0);
+  assert.equal(ui.drafts.prompt, "keep main draft");
+  await action.run(state({ direct_provider_capture: null }), context, { index: -1, value: "" });
+  assert.equal(calls.length, 1);
+});
+
 test("settled canonical transcript and artifact rows expose one native quote action", () => {
   const html = renderTranscriptRows([
     {
@@ -1530,7 +1698,7 @@ test("settled canonical transcript and artifact rows expose one native quote act
   assert.equal((html.match(/data-action="quote-selection-to-side-chat"/g) ?? []).length, 3);
   assert.match(html, /data-history-identity="01J00000000000000000000001"[\s\S]*data-side-chat-quote-source-kind="transcript"/);
   assert.match(html, /data-history-identity="01J00000000000000000000003"[\s\S]*data-side-chat-quote-source-kind="artifact"/);
-  assert.match(html, /<button type="button" class="message-quote-action"[\s\S]*>Side Chatで引用<\/button>/);
+  assert.match(html, /<button type="button" class="message-quote-action"[\s\S]*>サイドチャットで引用<\/button>/);
   assert.doesNotMatch(html, /data-source-history-item-id="turn:synthetic:work-summary"/);
 });
 
@@ -1593,6 +1761,7 @@ test("quote selection creates a first Side Chat, then opens and persists the exa
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       if (name === "ensure_side_chat") {
@@ -1721,6 +1890,7 @@ test("quote action appends to only the Side draft, never auto-sends, and manual 
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       if (name === "save_side_chat_draft") {
@@ -1811,6 +1981,7 @@ test("a second typed quote replaces and persists without orphaning the first aut
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       current = state({
@@ -2070,6 +2241,7 @@ test("side Send waits for queued autosaves and submits the settled draft revisio
     uiState: ui,
     getProjection: () => current,
     getViewState: () => current,
+    waitForInteractionIdle: async () => {},
     mutate: async (name: string, args?: Record<string, unknown>) => {
       calls.push({ name, args });
       if (name === "save_side_chat_draft") {

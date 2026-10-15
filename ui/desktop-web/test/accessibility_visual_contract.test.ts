@@ -6,7 +6,7 @@ import { renderComposer, renderOverlay, renderTitlebar, synchronizeTitlebarMenuS
 import type { DesktopViewState } from "../src/types.ts";
 
 function viewState(fields: Record<string, unknown>): DesktopViewState {
-  return fields as unknown as DesktopViewState;
+  return { status_message: "", config_draft: { external_owner_mutation_open: true }, ...fields } as unknown as DesktopViewState;
 }
 
 function elementWith(html: string, attribute: string, value: string): string {
@@ -83,8 +83,12 @@ test("the mixed-widget View popover is a dialog with ordinary actions and a nati
   assert.match(html, /<button data-action="refresh" data-titlebar-menu-action>/);
   assert.match(html, /<button data-action="show-provider" data-titlebar-menu-action>/);
   assert.match(html, /<button data-action="show-config" data-titlebar-menu-action>/);
+  assert.match(html, /<button data-action="show-hub" data-titlebar-menu-action>/);
+  assert.match(html, /<button data-action="show-mcp-history" data-titlebar-menu-action>/);
+  assert.doesNotMatch(html, /data-action="show-mcp-publish"/);
   const viewActions = Array.from(html.matchAll(/<button[^>]*data-titlebar-menu-action[^>]*>/g), (match) => match[0]);
-  assert.equal(viewActions.length, 3);
+  assert.match(html, /<button data-action="show-shared-work" data-titlebar-menu-action>/);
+  assert.equal(viewActions.length, 6);
   for (const action of viewActions) assert.doesNotMatch(action, /tabindex=/);
   assert.match(html, /<input id="opacity-input" type="range"[^>]*aria-valuetext="85%"/);
   const tabOrder = ["data-action=\"refresh\"", "data-action=\"show-provider\"", "data-action=\"show-config\"", "id=\"opacity-input\""]
@@ -142,9 +146,9 @@ test("provider connection profile and prompt review controls expose accessible f
     send_enhanced_enabled: true,
   }));
 
-  assert.match(provider, /<label class="field-label" for="provider-profile">Connection type<\/label>/);
+  assert.match(provider, /<label class="field-label" for="provider-profile">接続方式<\/label>/);
   assert.match(provider, /<select id="provider-profile" aria-describedby="provider-profile-help">/);
-  assert.match(provider, /<label class="field-label" for="provider-api-key-env">API key environment variable \(optional\)<\/label>/);
+  assert.match(provider, /<label class="field-label" for="provider-api-key-env">APIキーの環境変数名（任意）<\/label>/);
   assert.match(review, /<label class="sr-only" for="review-draft">推敲文<\/label>/);
   assert.match(review, /<textarea id="review-draft">推敲文<\/textarea>/);
 });
@@ -198,8 +202,31 @@ test("composer and overlay text entry controls have stable explicit labels", () 
   assert.match(workspace, /<input id="workspace-input"/);
   assert.match(review, /<label class="sr-only" for="review-draft">推敲文<\/label>/);
   assert.match(review, /<textarea id="review-draft"/);
-  assert.match(palette, /<label class="sr-only" for="local-search">アクション、セッション、コマンドを検索<\/label>/);
+  assert.match(palette, /<label class="sr-only" for="local-search">操作、チャット、コマンドを検索<\/label>/);
   assert.match(palette, /<input id="local-search"/);
+});
+
+test("palette command candidates match the query and retain their original mutation indices", () => {
+  const rows = [
+    { name: "build-local", path: "C:/fixture/commands/build.md" },
+    { name: "review-local", path: "C:/fixture/資料/review.md" },
+  ];
+  const palette = (query: string) => renderOverlay(viewState({
+    overlay: "command_palette", local_search_text: query, local_search_results_text: "",
+    command_rows: rows, session_rows: [], config_draft: { dirty: false },
+  }));
+  const byName = palette(" REVIEW-LOCAL ");
+  assert.doesNotMatch(byName, /<span>\/build-local<\/span>/);
+  assert.match(byName, /data-action="insert-command" data-index="1"/);
+  assert.match(byName, /<span>\/review-local<\/span>/);
+  assert.doesNotMatch(byName, /実行できる操作はありません/);
+  const byPath = palette("資料");
+  assert.doesNotMatch(byPath, /<span>\/build-local<\/span>/);
+  assert.match(byPath, /data-action="insert-command" data-index="1"/);
+  const noMatch = palette("no-matching-command-99283");
+  assert.doesNotMatch(noMatch, /data-action="insert-command"/);
+  assert.match(noMatch, /実行できる操作はありません/);
+  assert.deepEqual(rows.map(row => row.name), ["build-local", "review-local"]);
 });
 
 test("quiet text meets normal-text contrast and reduced-motion disables continuous effects", () => {
@@ -398,10 +425,10 @@ test("agent pane header keeps both action groups inside a narrow drawer", () => 
   );
 });
 
-test("responsive output drawer leaves the main composer controls pointer-visible", () => {
+test("responsive output and Side drawers reserve space for the main composer controls", () => {
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   const composerRule = css.match(
-    /\.app-frame:not\(\.artifact-collapsed\):not\(\.side-chat-open\) \.composer\s*\{([^}]*)\}/,
+    /\.app-frame:not\(\.artifact-collapsed\) \.composer\s*\{([^}]*)\}/,
   )?.[1];
 
   assert.match(css, /--responsive-pane-width:\s*min\(352px, calc\(100vw - 24px\)\)/);
@@ -413,7 +440,7 @@ test("responsive output drawer leaves the main composer controls pointer-visible
   );
   assert.match(
     css,
-    /\.app-frame:not\(\.artifact-collapsed\):not\(\.side-chat-open\) \.run-strip\s*\{[^}]*padding-right:\s*calc\(var\(--responsive-pane-width\) \+ 28px\)/,
+    /\.app-frame:not\(\.artifact-collapsed\) \.run-strip\s*\{[^}]*padding-right:\s*calc\(var\(--responsive-pane-width\) \+ 28px\)/,
   );
 });
 

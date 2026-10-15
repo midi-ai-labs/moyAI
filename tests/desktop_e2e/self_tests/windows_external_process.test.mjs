@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 
 import {
@@ -145,6 +146,48 @@ windowsTest("Windows external runner owns a normal root-to-grandchild tree until
   assert.equal(pidExists(owners.grandchild_pid), false);
   assert.equal(await readFile(stdout, "utf8"), "root-started\n");
   assert.equal(await readFile(stderr, "utf8"), "root-stderr\n");
+});
+
+windowsTest("interactive external process exposes its exact Job owner before completion", async (context) => {
+  const execution = await temporaryExecution(context);
+  const marker = path.join(execution.logs, "interactive-owner.json");
+  let observed = null;
+  const result = await runWindowsExternalProcess({
+    executionRoot: execution.root, executable: process.execPath,
+    args: ["--input-type=module", "--eval", "import { existsSync } from 'node:fs'; const timer=setInterval(() => { if (existsSync(process.argv[1])) { clearInterval(timer); } }, 25);", marker],
+    cwd: execution.root, env: process.env,
+    stdoutPath: path.join(execution.logs, "interactive.stdout.log"),
+    stderrPath: path.join(execution.logs, "interactive.stderr.log"),
+    timeoutMs: 10_000, label: "self-test-interactive-owner",
+    onOwner(envelope) {
+      assert.equal(observed, null);
+      assert.equal(pidExists(envelope.owner.process_id), true);
+      observed = envelope;
+      writeFileSync(marker, JSON.stringify(envelope.owner), { flag: "wx" });
+    },
+  });
+  assert.deepEqual(result.owner, observed.owner);
+  assert.equal(result.outcome.timed_out, false);
+  assert.equal(result.outcome.root_exit_code, 0);
+  assert.equal(result.job.descendant_zero, true);
+});
+
+windowsTest("an owner observer failure closes the creation-time Job without orphaning its process", async (context) => {
+  const execution = await temporaryExecution(context);
+  let owner = null;
+  await assert.rejects(runWindowsExternalProcess({
+    executionRoot: execution.root, executable: process.execPath,
+    args: ["--eval", "setInterval(() => {}, 1000)"],
+    cwd: execution.root, env: process.env,
+    stdoutPath: path.join(execution.logs, "observer-failure.stdout.log"),
+    stderrPath: path.join(execution.logs, "observer-failure.stderr.log"),
+    timeoutMs: 60_000, label: "self-test-owner-observer-failure",
+    onOwner(envelope) { owner = envelope.owner; throw new Error("owner record failed"); },
+  }), (error) => error instanceof WindowsExternalProcessError
+    && error.code === "external-owner-observer"
+    && error.evidence.root_absent_after_wrapper_exit === true);
+  assert.notEqual(owner, null);
+  assert.equal(await waitForPidsAbsent([owner.process_id]), true);
 });
 
 windowsTest("Windows external runner times out and terminates the exact root-to-grandchild Job tree", async (context) => {

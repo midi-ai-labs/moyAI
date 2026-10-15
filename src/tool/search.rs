@@ -14,6 +14,7 @@ use crate::config::model::FileGuardConfig;
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
 use crate::tool::internal_output::ResolvedSearchPath;
+use crate::tool::read_context::ReadToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
@@ -239,11 +240,20 @@ impl Tool for ListTool {
     async fn execute(
         &self,
         raw_arguments: serde_json::Value,
-        mut ctx: ToolContext<'_>,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_read(raw_arguments, ReadToolContext::agent(ctx))
+            .await
+    }
+
+    async fn execute_read(
+        &self,
+        raw_arguments: serde_json::Value,
+        mut ctx: ReadToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ListInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::List)?;
+        let guarded = PathGuard::require_path(ctx.workspace(), &requested, AccessKind::List)?;
         ctx.confirm_if_needed(
             AccessKind::List,
             format!("List {}", guarded.absolute),
@@ -253,10 +263,10 @@ impl Tool for ListTool {
         )
         .await?
         .admit()?;
-        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
+        let limit = bounded_result_limit(input.limit, ctx.config().tool_output.max_results);
         let page = walk_guarded_page(
             &guarded,
-            ctx.workspace,
+            ctx.workspace(),
             input.cursor.as_deref(),
             TraversalOptions {
                 include_hidden: input.include_hidden.unwrap_or(false),
@@ -269,8 +279,8 @@ impl Tool for ListTool {
         )?;
         let rendered = render_entries_bounded(
             &page.entries,
-            ctx.config.tool_output.max_lines,
-            ctx.config.tool_output.max_bytes,
+            ctx.config().tool_output.max_lines,
+            ctx.config().tool_output.max_bytes,
             |entry| {
                 let mut label = entry.relative_path.as_str().replace('\\', "/");
                 if entry.is_directory {
@@ -322,11 +332,20 @@ impl Tool for GlobTool {
     async fn execute(
         &self,
         raw_arguments: serde_json::Value,
-        mut ctx: ToolContext<'_>,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_read(raw_arguments, ReadToolContext::agent(ctx))
+            .await
+    }
+
+    async fn execute_read(
+        &self,
+        raw_arguments: serde_json::Value,
+        mut ctx: ReadToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<GlobInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::Search)?;
+        let guarded = PathGuard::require_path(ctx.workspace(), &requested, AccessKind::Search)?;
         ctx.confirm_if_needed(
             AccessKind::Search,
             format!("Glob {}", guarded.absolute),
@@ -346,11 +365,11 @@ impl Tool for GlobTool {
         })?;
         let query_digest = search_query_digest("glob-v1", &[input.pattern.as_str()]);
         let walk_cursor = decode_glob_cursor(input.cursor.as_deref(), &query_digest)?;
-        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
+        let limit = bounded_result_limit(input.limit, ctx.config().tool_output.max_results);
         let candidate_limit = discovery_candidate_limit(limit);
         let page = walk_guarded_page(
             &guarded,
-            ctx.workspace,
+            ctx.workspace(),
             walk_cursor.as_deref(),
             TraversalOptions {
                 include_hidden: false,
@@ -371,7 +390,7 @@ impl Tool for GlobTool {
                     &matcher,
                     &entry.path,
                     &entry.relative_path,
-                    ctx.workspace.authority_root(),
+                    ctx.workspace().authority_root(),
                     projected_workspace_relative.as_deref(),
                 )
             })
@@ -381,14 +400,14 @@ impl Tool for GlobTool {
         let visible = matching.iter().take(limit).cloned().collect::<Vec<_>>();
         let rendered = render_entries_bounded(
             &visible,
-            ctx.config.tool_output.max_lines,
-            ctx.config.tool_output.max_bytes,
+            ctx.config().tool_output.max_lines,
+            ctx.config().tool_output.max_bytes,
             |entry| {
                 let projected_workspace_relative =
                     glob_workspace_relative_path(&guarded, &entry.relative_path);
                 glob_output_label(
                     &entry.path,
-                    ctx.workspace.authority_root(),
+                    ctx.workspace().authority_root(),
                     projected_workspace_relative.as_deref(),
                 )
             },
@@ -485,13 +504,20 @@ impl Tool for GrepTool {
     async fn execute(
         &self,
         raw_arguments: serde_json::Value,
-        mut ctx: ToolContext<'_>,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_read(raw_arguments, ReadToolContext::agent(ctx))
+            .await
+    }
+
+    async fn execute_read(
+        &self,
+        raw_arguments: serde_json::Value,
+        mut ctx: ReadToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<GrepInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let resolved =
-            crate::tool::internal_output::resolve_path(&ctx, &requested, AccessKind::Search)
-                .await?;
+        let resolved = ctx.resolve_path(&requested, AccessKind::Search).await?;
         let permission = resolved.permission();
         ctx.confirm_if_needed(
             AccessKind::Search,
@@ -547,13 +573,13 @@ impl Tool for GrepTool {
         let cursor_position = decode_grep_cursor(
             input.cursor.as_deref(),
             &query_digest,
-            &ctx.workspace.traversal_registry,
+            &ctx.workspace().traversal_registry,
         )?;
         let walk_cursor = cursor_position
             .as_ref()
             .map(GrepCursorPosition::traversal_cursor);
-        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results)
-            .min(ctx.config.tool_output.max_lines.max(1));
+        let limit = bounded_result_limit(input.limit, ctx.config().tool_output.max_results)
+            .min(ctx.config().tool_output.max_lines.max(1));
         let candidate_limit = discovery_candidate_limit(limit);
 
         let page = if internal_file.is_some() || search_root.absolute().is_file() {
@@ -566,7 +592,7 @@ impl Tool for GrepTool {
             })?;
             walk_guarded_page(
                 guarded,
-                ctx.workspace,
+                ctx.workspace(),
                 walk_cursor,
                 TraversalOptions {
                     include_hidden: false,
@@ -593,7 +619,7 @@ impl Tool for GrepTool {
         let mut skipped = GrepSkipSummary::default();
         let mut continuation = None;
         let mut scanned_files = 0usize;
-        let output_byte_limit = ctx.config.tool_output.max_bytes.max(1);
+        let output_byte_limit = ctx.config().tool_output.max_bytes.max(1);
 
         'files: for (file_index, entry) in page.entries.iter().enumerate() {
             let resumed_in_file = (file_index == 0).then_some(in_file_fence).flatten();
@@ -620,10 +646,10 @@ impl Tool for GrepTool {
                 None
             };
             match read_grep_candidate(
-                ctx.workspace,
+                ctx.workspace(),
                 search_root.normal_guard(),
                 &entry.path,
-                &ctx.config.file_guard,
+                &ctx.config().file_guard,
                 opened_internal_file,
             )? {
                 Ok(candidate) => {
@@ -657,7 +683,7 @@ impl Tool for GrepTool {
                                     content_sha256: candidate.content_sha256,
                                 },
                                 &query_digest,
-                                &ctx.workspace.traversal_registry,
+                                &ctx.workspace().traversal_registry,
                             )?);
                             break 'files;
                         }
@@ -674,7 +700,7 @@ impl Tool for GrepTool {
                                     content_sha256: candidate.content_sha256,
                                 },
                                 &query_digest,
-                                &ctx.workspace.traversal_registry,
+                                &ctx.workspace().traversal_registry,
                             )?);
                             break 'files;
                         }
@@ -702,7 +728,7 @@ impl Tool for GrepTool {
                             traversal_cursor: cursor.to_string(),
                         },
                         &query_digest,
-                        &ctx.workspace.traversal_registry,
+                        &ctx.workspace().traversal_registry,
                     )
                 })
                 .transpose()?;

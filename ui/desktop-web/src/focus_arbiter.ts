@@ -11,6 +11,7 @@ export type FocusIntentSource =
   | "new-session"
   | "command-palette"
   | "settings-action"
+  | "shared-editor"
   | "titlebar-menu"
   | "modal-return"
   | "focus-snapshot"
@@ -152,6 +153,14 @@ export class PostRenderFocusArbiter<Handle> {
 
   cancel(): void {
     this.cancelPending("superseded");
+  }
+
+  /** Restore focus before the next snapshot; DOM moves can leave temporary BODY focus. */
+  settleBeforeRender(): void {
+    const pending = this.pending;
+    if (!pending) return;
+    if (pending.handle !== null) this.scheduler.cancel(pending.handle);
+    this.execute(pending);
   }
 
   private execute(pending: PendingFocusCommit<Handle>): void {

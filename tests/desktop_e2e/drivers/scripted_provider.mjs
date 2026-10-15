@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
+import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export const SCRIPTED_PROVIDER_MODEL_ID = "e2e/scripted-responses";
 export const SCRIPTED_PROVIDER_PROMPT = "return only MAIN_OK";
@@ -20,15 +22,18 @@ export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_API_MODES = Object.fr
   "responses",
   "chat_completions",
 ]);
-export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND = "permission_temp_escalation";
-export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES = 4;
-export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS = 300_000;
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND = "permission_temp_write";
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND = "chat_tool_continuation";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
   "Use current_time exactly once with {}. After the tool result, reply only CHAT_TOOL_CONTINUATION_OK.";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE = "CHAT_TOOL_CONTINUATION_OK";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID = "call_chat_current_time";
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_KIND = "managed_shell_lifecycle";
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_RESPONSES = 2;
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID = "call_managed_shell_start";
+export const SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_OUTPUT_BYTES = 16 * 1024;
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND = "side_chat_quote";
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAX_RESPONSES = 4;
 export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT =
@@ -119,8 +124,8 @@ const FETCH_FORBIDDEN_PORTS = new Set([
   87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137,
   139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540,
   548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1_719, 1_720, 1_723,
-  2_049, 3_659, 4_045, 5_060, 5_061, 6_000, 6_566, 6_665, 6_666, 6_667, 6_668,
-  6_669, 6_697, 10_080,
+  2_049, 3_659, 4_045, 4_190, 5_060, 5_061, 6_000, 6_566, 6_665, 6_666, 6_667, 6_668,
+  6_669, 6_679, 6_697, 10_080,
 ]);
 const MAX_FETCH_SAFE_BIND_ATTEMPTS = 16;
 
@@ -168,12 +173,18 @@ function scriptedTurns(value, fallbackPrompt, fallbackResponseText) {
     throw new TypeError(`scripted provider turns must contain 1 through ${SCRIPTED_PROVIDER_MAX_TURNS} entries`);
   }
   return Object.freeze(value.map((turn, index) => {
-    if (!exactKeys(turn, ["prompt", "responseText"])) {
+    const keys = Object.hasOwn(turn ?? {}, "imageDataUrl") ? ["prompt", "responseText", "imageDataUrl"] : ["prompt", "responseText"];
+    if (!exactKeys(turn, keys)) {
       throw new TypeError(`scripted provider turn ${index} must use its exact schema`);
+    }
+    if (turn.imageDataUrl !== undefined && (typeof turn.imageDataUrl !== "string"
+      || turn.imageDataUrl.length > 16_384 || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(turn.imageDataUrl))) {
+      throw new TypeError("scripted imageDataUrl must be a bounded PNG data URL");
     }
     return Object.freeze({
       prompt: nonEmptyString(turn.prompt, `turns[${index}].prompt`),
       responseText: nonEmptyString(turn.responseText, `turns[${index}].responseText`),
+      ...(turn.imageDataUrl === undefined ? {} : { imageDataUrl: turn.imageDataUrl }),
     });
   }));
 }
@@ -226,6 +237,9 @@ function exactKeys(value, expected) {
 function agentInterruptScript(value) {
   if (value === null || value === undefined) return null;
   const expectedKeys = ["childMessage", "childTaskName", "kind", "rootResponseText"];
+  const childToolCalls = Object.hasOwn(value, "childToolCalls") ? value.childToolCalls : 0;
+  if (Object.hasOwn(value, "childToolCalls")) expectedKeys.push("childToolCalls");
+  if (!Number.isInteger(childToolCalls) || childToolCalls < 0 || childToolCalls > 64) throw new TypeError("childToolCalls must be an integer from 0 through 64");
   if (!exactKeys(value, expectedKeys) || value.kind !== SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND) {
     throw new TypeError("agent interrupt scripted provider mode must use its exact schema");
   }
@@ -237,6 +251,7 @@ function agentInterruptScript(value) {
     kind: value.kind,
     childTaskName,
     childMessage: nonEmptyString(value.childMessage, "script.childMessage"),
+    ...(childToolCalls ? { childToolCalls } : {}),
     rootResponseText: nonEmptyString(value.rootResponseText, "script.rootResponseText"),
   });
 }
@@ -286,12 +301,23 @@ function permissionRestartGuardianScript(value) {
     "seedResponseText",
     "taskPrompt",
   ];
+  if (Object.hasOwn(value, "guardianDecision")) expectedKeys.push("guardianDecision");
+  if (Object.hasOwn(value, "expectedPermissionRisks")) expectedKeys.push("expectedPermissionRisks");
   if (!exactKeys(value, expectedKeys)
     || value.kind !== SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     throw new TypeError("permission restart Guardian scripted provider mode must use its exact schema");
   }
   if (!SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_API_MODES.includes(value.apiMode)) {
     throw new TypeError("permission restart Guardian script.apiMode must use a supported wire mode");
+  }
+  if (value.guardianDecision !== undefined && !["allow", "ask_user", "deny"].includes(value.guardianDecision)) {
+    throw new TypeError("script.guardianDecision must be allow, ask_user, or deny");
+  }
+  if (value.expectedPermissionRisks !== undefined && (!Array.isArray(value.expectedPermissionRisks)
+    || value.expectedPermissionRisks.some(risk => !["destructive_delete", "move_or_rename", "network", "external_connection",
+      "configured_local_service", "protected_workspace_authority", "external_mutation", "external_destructive_operation", "unclassified_shell"].includes(risk))
+    || new Set(value.expectedPermissionRisks).size !== value.expectedPermissionRisks.length)) {
+    throw new TypeError("script.expectedPermissionRisks must be an exact unique list of permission risk codes");
   }
   return Object.freeze({
     kind: value.kind,
@@ -302,48 +328,61 @@ function permissionRestartGuardianScript(value) {
     command: nonEmptyString(value.command, "script.command"),
     justification: nonEmptyString(value.justification, "script.justification"),
     responseText: nonEmptyString(value.responseText, "script.responseText"),
+    ...(value.guardianDecision === undefined ? {} : { guardianDecision: value.guardianDecision }),
+    ...(value.expectedPermissionRisks === undefined ? {} : { expectedPermissionRisks: Object.freeze([...value.expectedPermissionRisks]) }),
   });
 }
 
-function permissionTempEscalationScript(value) {
-  const expectedKeys = [
-    "command",
-    "guardianDelayMs",
-    "justification",
-    "kind",
-    "responseText",
-    "taskPrompt",
-  ];
-  if (!exactKeys(value, expectedKeys)
-    || value.kind !== SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-    throw new TypeError("permission TEMP escalation scripted provider mode must use its exact schema");
+function permissionTempWriteScript(value) {
+  if (!exactKeys(value, ["command", "kind", "responseText", "taskPrompt"])
+    || value.kind !== SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+    throw new TypeError("permission TEMP write scripted provider mode must use its exact schema");
   }
-  const guardianDelayMs = nonNegativeInteger(
-    value.guardianDelayMs,
-    "script.guardianDelayMs",
-  );
-  if (guardianDelayMs > SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS) {
-    throw new TypeError(
-      `script.guardianDelayMs must not exceed ${SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS}`,
-    );
+  return Object.freeze({ kind: value.kind,
+    taskPrompt: nonEmptyString(value.taskPrompt, "script.taskPrompt"),
+    command: nonEmptyString(value.command, "script.command"),
+    responseText: nonEmptyString(value.responseText, "script.responseText") });
+}
+
+function chatToolContinuationScript(value) {
+  const expectedKeys = Object.hasOwn(value ?? {}, "call") ? ["kind", "call"] : ["kind"];
+  if (!exactKeys(value, expectedKeys)
+    || value.kind !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
+    throw new TypeError("Chat tool continuation scripted provider mode must use its exact schema");
+  }
+  if (!Object.hasOwn(value, "call")) return Object.freeze({ kind: value.kind });
+  const call = value.call;
+  const callKeys = ["prompt", "name", "arguments", "outputMarker", "responseText"];
+  if (Object.hasOwn(call ?? {}, "outputMaxBytes")) callKeys.push("outputMaxBytes");
+  if (!exactKeys(call, callKeys)
+    || !/^[a-z][a-z0-9_]{1,63}$/.test(call.name ?? "")
+    || call.arguments === null || typeof call.arguments !== "object" || Array.isArray(call.arguments)
+    || Buffer.byteLength(JSON.stringify(call.arguments), "utf8") > 32768
+    || (Object.hasOwn(call, "outputMaxBytes") && (!Number.isSafeInteger(call.outputMaxBytes)
+      || call.outputMaxBytes < 1 || call.outputMaxBytes > 2048))) {
+    throw new TypeError("Chat continuation call requires one bounded tool and exact arguments");
+  }
+  return Object.freeze({ kind: value.kind, call: Object.freeze({
+    prompt: nonEmptyString(call.prompt, "call.prompt"), name: call.name,
+    arguments: structuredClone(call.arguments), outputMarker: nonEmptyString(call.outputMarker, "call.outputMarker"),
+    responseText: nonEmptyString(call.responseText, "call.responseText"),
+    ...(Object.hasOwn(call, "outputMaxBytes") ? { outputMaxBytes: call.outputMaxBytes } : {}),
+  }) });
+}
+
+function managedShellScript(value) {
+  if (!exactKeys(value, ["kind", "taskPrompt", "command", "workdir", "responseText", "timeoutMs"])
+    || value.kind !== SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+    throw new TypeError("managed shell scripted provider mode must use its exact schema");
   }
   return Object.freeze({
     kind: value.kind,
     taskPrompt: nonEmptyString(value.taskPrompt, "script.taskPrompt"),
     command: nonEmptyString(value.command, "script.command"),
-    justification: nonEmptyString(value.justification, "script.justification"),
+    workdir: nonEmptyString(value.workdir, "script.workdir"),
     responseText: nonEmptyString(value.responseText, "script.responseText"),
-    guardianDelayMs,
+    timeoutMs: positiveInteger(value.timeoutMs, "script.timeoutMs"),
   });
-}
-
-function chatToolContinuationScript(value) {
-  const expectedKeys = ["kind"];
-  if (!exactKeys(value, expectedKeys)
-    || value.kind !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
-    throw new TypeError("Chat tool continuation scripted provider mode must use its exact schema");
-  }
-  return Object.freeze({ kind: value.kind });
 }
 
 function sideChatQuoteScript(value) {
@@ -410,12 +449,13 @@ function providerScript(value) {
   if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return permissionRestartGuardianScript(value);
   }
-  if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-    return permissionTempEscalationScript(value);
+  if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+    return permissionTempWriteScript(value);
   }
   if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return chatToolContinuationScript(value);
   }
+  if (value?.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) return managedShellScript(value);
   if (value?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
     return sideChatQuoteScript(value);
   }
@@ -435,11 +475,14 @@ function scriptedResponseMaximum(script) {
   if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES;
   }
-  if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-    return SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES;
+  if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+    return SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES;
   }
   if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
+  }
+  if (script?.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+    return SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_RESPONSES;
   }
   if (script?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
     return SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAX_RESPONSES;
@@ -450,19 +493,21 @@ function scriptedResponseMaximum(script) {
   if (script?.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
     return script.toolCallCount + 3;
   }
-  return SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES;
+  return SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES + (script?.childToolCalls ?? 0);
 }
 
 export function createAgentInterruptProviderScript({
   childTaskName = SCRIPTED_PROVIDER_AGENT_INTERRUPT_TASK_NAME,
   childMessage = SCRIPTED_PROVIDER_AGENT_INTERRUPT_MESSAGE,
   rootResponseText = SCRIPTED_PROVIDER_AGENT_INTERRUPT_ROOT_RESPONSE,
+  childToolCalls = 0,
 } = {}) {
   return agentInterruptScript({
     kind: SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND,
     childTaskName,
     childMessage,
     rootResponseText,
+    childToolCalls,
   });
 }
 
@@ -487,6 +532,8 @@ export function createPermissionRestartGuardianProviderScript({
   command,
   justification,
   responseText,
+  guardianDecision,
+  expectedPermissionRisks,
 } = {}) {
   return permissionRestartGuardianScript({
     kind: SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND,
@@ -497,29 +544,29 @@ export function createPermissionRestartGuardianProviderScript({
     command,
     justification,
     responseText,
+    ...(guardianDecision === undefined ? {} : { guardianDecision }),
+    ...(expectedPermissionRisks === undefined ? {} : { expectedPermissionRisks }),
   });
 }
 
-export function createPermissionTempEscalationProviderScript({
-  taskPrompt,
-  command,
-  justification,
-  responseText,
-  guardianDelayMs = 0,
-} = {}) {
-  return permissionTempEscalationScript({
-    kind: SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND,
-    taskPrompt,
-    command,
-    justification,
-    responseText,
-    guardianDelayMs,
-  });
+export function createPermissionTempWriteProviderScript({ taskPrompt, command, responseText } = {}) {
+  return permissionTempWriteScript({ kind: SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND,
+    taskPrompt, command, responseText });
 }
 
-export function createChatToolContinuationProviderScript() {
+export function createChatToolContinuationProviderScript({ call } = {}) {
   return chatToolContinuationScript({
     kind: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND,
+    ...(call === undefined ? {} : { call }),
+  });
+}
+
+export function createManagedShellProviderScript({
+  taskPrompt, command, workdir, responseText, timeoutMs = 60_000,
+} = {}) {
+  return managedShellScript({
+    kind: SCRIPTED_PROVIDER_MANAGED_SHELL_KIND,
+    taskPrompt, command, workdir, responseText, timeoutMs,
   });
 }
 
@@ -630,11 +677,13 @@ function decodeJsonBody(body) {
   }
 }
 
-function exactUserInput(body) {
+function exactUserInput(body, imageDataUrl = undefined) {
   if (!Array.isArray(body?.input) || body.input.length !== 1) return null;
   const [message] = body.input;
   if (message?.type !== "message" || message?.role !== "user") return null;
-  if (!Array.isArray(message.content) || message.content.length !== 1) return null;
+  if (!Array.isArray(message.content) || message.content.length !== (imageDataUrl === undefined ? 1 : 2)) return null;
+  if (imageDataUrl !== undefined && (!exactKeys(message.content[1], ["type", "image_url"])
+    || message.content[1].type !== "input_image" || message.content[1].image_url !== imageDataUrl)) return null;
   const [content] = message.content;
   if (content?.type !== "input_text" || typeof content.text !== "string") return null;
   return content.text;
@@ -694,16 +743,10 @@ const SIDE_CHAT_QUOTE_WRITE_CALL_ID = "call_side_chat_quote_write";
 const SIDE_CHAT_QUOTE_WRITE_ITEM_ID = "fc_side_chat_quote_write";
 const PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID = "call_permission_restart_guardian_shell";
 const PERMISSION_RESTART_GUARDIAN_SHELL_ITEM_ID = "fc_permission_restart_guardian_shell";
-const PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID =
-  "call_permission_temp_escalation_restricted";
-const PERMISSION_TEMP_ESCALATION_RESTRICTED_ITEM_ID =
-  "fc_permission_temp_escalation_restricted";
-const PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID =
-  "call_permission_temp_escalation_elevated";
-const PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID =
-  "fc_permission_temp_escalation_elevated";
+const PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID = "call_permission_temp_write_restricted";
+const PERMISSION_TEMP_WRITE_RESTRICTED_ITEM_ID = "fc_permission_temp_write_restricted";
 const PERMISSION_RESTART_GUARDIAN_ALLOW = Object.freeze({
-  decision: "allow",
+  risk_level: "low",
   rationale: "bounded deterministic fixture command",
 });
 const GUARDIAN_RESPONSES_KEYS = Object.freeze([
@@ -757,9 +800,9 @@ function clientGenerationContract(body) {
   };
 }
 
-function requestContract(body, modelId, expectedPrompt) {
+function requestContract(body, modelId, expectedPrompt, imageDataUrl = undefined) {
   const model = typeof body?.model === "string" ? body.model : null;
-  const inputText = exactUserInput(body);
+  const inputText = exactUserInput(body, imageDataUrl);
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
   const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
     ? Object.keys(body).sort()
@@ -780,6 +823,10 @@ function requestContract(body, modelId, expectedPrompt) {
     max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     stream_true: body?.stream === true,
     store_false: body?.store === false,
+    ...(imageDataUrl === undefined ? {} : {
+      image_sha256: typeof body?.input?.[0]?.content?.[1]?.image_url === "string"
+        ? sha256(Buffer.from(body.input[0].content[1].image_url, "utf8")) : null,
+    }),
   };
   return {
     ...contract,
@@ -1203,7 +1250,13 @@ function currentTimeToolOutputShape(value) {
   return /^local: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\r?\nutc: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\r?\ntimezone: [+-]\d{2}:\d{2}\r?\nunix_ms: \d{10,16}$/.test(value);
 }
 
-function chatToolContinuationRole(body) {
+function chatToolContinuationRole(body, script) {
+  const expectedPrompt = script.call?.prompt ?? SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
+  const expectedName = script.call?.name ?? "current_time";
+  const expectedArguments = JSON.stringify(script.call?.arguments ?? {});
+  const outputMatches = value => script.call
+    ? typeof value === "string" && Buffer.byteLength(value, "utf8") <= (script.call.outputMaxBytes ?? CHAT_TOOL_OUTPUT_MAX_BYTES) && value.includes(script.call.outputMarker)
+    : currentTimeToolOutputShape(value);
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const systemText = exactChatTextMessage(messages[0], "system");
   const userText = exactChatTextMessage(messages[1], "user");
@@ -1219,8 +1272,8 @@ function chatToolContinuationRole(body) {
     && toolCall.id === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID
     && toolCall.type === "function"
     && exactKeys(toolCall.function, ["arguments", "name"])
-    && toolCall.function.name === "current_time"
-    && toolCall.function.arguments === "{}";
+    && toolCall.function.name === expectedName
+    && toolCall.function.arguments === expectedArguments;
   const toolOutput = exactKeys(tool, ["content", "role", "tool_call_id"])
     && tool.role === "tool"
     && tool.tool_call_id === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID
@@ -1230,13 +1283,13 @@ function chatToolContinuationRole(body) {
   const initial = messages.length === 2
     && systemText !== null
     && systemText.trim().length > 0
-    && userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
+    && userText === expectedPrompt;
   const continuation = messages.length === 4
     && systemText !== null
     && systemText.trim().length > 0
-    && userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT
+    && userText === expectedPrompt
     && callMatches
-    && currentTimeToolOutputShape(toolOutput);
+    && outputMatches(toolOutput);
   return {
     role: initial ? "chat_tool_initial" : continuation ? "chat_continuation" : null,
     evidence: {
@@ -1245,13 +1298,13 @@ function chatToolContinuationRole(body) {
       system_content_sha256: systemText === null ? null : sha256(Buffer.from(systemText, "utf8")),
       system_content_non_empty: systemText !== null && systemText.trim().length > 0,
       user_content_sha256: userText === null ? null : sha256(Buffer.from(userText, "utf8")),
-      user_prompt_matches: userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT,
+      user_prompt_matches: userText === expectedPrompt,
       assistant_content_absent: assistant !== null
         && typeof assistant === "object"
         && !Array.isArray(assistant)
         && !Object.hasOwn(assistant, "content"),
       current_time_call_matches: callMatches,
-      tool_output_shape_matches: currentTimeToolOutputShape(toolOutput),
+      tool_output_shape_matches: outputMatches(toolOutput),
       tool_output_size_bytes: toolOutput === null ? null : Buffer.byteLength(toolOutput, "utf8"),
       tool_output_sha256: toolOutput === null ? null : sha256(Buffer.from(toolOutput, "utf8")),
     },
@@ -1263,7 +1316,7 @@ function chatToolContinuationRequestContract(body, modelId, script) {
   const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
     ? Object.keys(body).sort()
     : [];
-  const classified = chatToolContinuationRole(body);
+  const classified = chatToolContinuationRole(body, script);
   const tools = chatToolsContract(body?.tools);
   const generation = clientGenerationContract(body);
   const contract = {
@@ -1294,8 +1347,80 @@ function chatToolContinuationRequestContract(body, modelId, script) {
       && contract.n_one
       && contract.max_tokens_absent
       && contract.parallel_tool_calls_false
-      && contract.tools.pass,
+      && contract.tools.pass
+      && (!script.call || body.tools.some(tool => tool.function.name === script.call.name)),
   };
+}
+
+function managedShellArguments(script) {
+  return JSON.stringify({
+    command: script.command,
+    sandbox_permissions: "use_default",
+    timeout_ms: script.timeoutMs,
+    workdir: script.workdir,
+  });
+}
+
+function managedShellRequestContract(body, modelId, script) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const system = exactChatTextMessage(messages[0], "system");
+  const promptMatches = exactChatTextMessage(messages[1], "user") === script.taskPrompt;
+  const assistant = messages[2];
+  const call = Array.isArray(assistant?.tool_calls) && assistant.tool_calls.length === 1
+    ? assistant.tool_calls[0] : null;
+  const callMatches = exactKeys(assistant, ["role", "tool_calls"])
+    && assistant.role === "assistant"
+    && exactKeys(call, ["id", "type", "function"])
+    && call.id === SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID && call.type === "function"
+    && exactKeys(call.function, ["name", "arguments"])
+    && call.function.name === "shell_start"
+    && call.function.arguments === managedShellArguments(script);
+  const tool = messages[3];
+  const output = exactKeys(tool, ["role", "content", "tool_call_id"])
+    && tool.role === "tool" && tool.tool_call_id === SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID
+    && typeof tool.content === "string" ? tool.content : null;
+  let observed = null;
+  if (output !== null && Buffer.byteLength(output, "utf8") <= SCRIPTED_PROVIDER_MANAGED_SHELL_MAX_OUTPUT_BYTES) {
+    try { observed = JSON.parse(output); } catch { /* Non-JSON failures are not an observed start. */ }
+  }
+  const observedStart = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(observed?.process_id ?? "")
+    && ["starting", "running"].includes(observed?.state)
+    && observed?.timeout_ms === script.timeoutMs && observed?.readiness === "not_checked"
+    && observed?.success === null && observed?.result === null && observed?.error === null
+    && observed?.output_available === false;
+  const role = system?.trim() && promptMatches
+    ? messages.length === 2 ? "managed_shell_initial"
+      : messages.length === 4 && callMatches && observedStart ? "managed_shell_continuation" : null
+    : null;
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  const starts = tools.filter((entry) => entry?.type === "function"
+    && entry.function?.name === "shell_start");
+  const schema = starts[0]?.function?.parameters;
+  const toolsMatch = starts.length === 1 && tools.every((entry) => entry?.type === "function"
+    && typeof entry.function?.name === "string")
+    && new Set(tools.map((entry) => entry.function.name)).size === tools.length
+    && schema?.type === "object" && Array.isArray(schema?.required) && schema.required.includes("command")
+    && schema?.properties?.command?.type === "string"
+    && schema?.properties?.workdir?.type === "string"
+    && schema?.properties?.timeout_ms?.type === "integer"
+    && Array.isArray(schema?.properties?.sandbox_permissions?.enum)
+    && schema.properties.sandbox_permissions.enum.includes("use_default");
+  const contract = {
+    script_kind: script.kind, role,
+    model_matches: body?.model === modelId, stream_true: body?.stream === true,
+    include_usage_true: body?.stream_options?.include_usage === true,
+    n_one: body?.n === 1, parallel_tool_calls_false: body?.parallel_tool_calls === false,
+    tools: { shell_start_schema_matches: toolsMatch },
+    role_evidence: {
+      user_prompt_matches: promptMatches, shell_start_call_matches: callMatches,
+      observed_start_matches: observedStart,
+      tool_output_sha256: output === null ? null : sha256(output),
+      process_id: observedStart ? observed.process_id : null,
+      state: observedStart ? observed.state : null,
+    },
+  };
+  return { ...contract, pass: role !== null && contract.model_matches && contract.stream_true
+    && contract.include_usage_true && contract.n_one && contract.parallel_tool_calls_false && toolsMatch };
 }
 
 function agentInterruptExpected(script) {
@@ -1321,7 +1446,18 @@ function agentInterruptRole(body, expectedPrompt, script) {
   const call = input[1];
   const output = input[2];
   const rootInitial = input.length === 1 && firstInputText === expectedPrompt;
-  const child = input.length === 1 && firstInputText === expected.childEnvelope;
+  const childCount = (input.length - 1) / 2;
+  const childLimit = script.childToolCalls ?? 0;
+  const child = firstInputText === expected.childEnvelope && Number.isInteger(childCount)
+    && childCount >= 0 && childCount <= childLimit
+    && Array.from({ length: childCount }, (_, index) => {
+      const call = input[index * 2 + 1], output = input[index * 2 + 2];
+      const callId = "call_agent_history_" + index;
+      return exactKeys(call, ["type", "call_id", "name", "arguments"])
+        && call.type === "function_call" && call.call_id === callId && call.name === "current_time" && call.arguments === "{}"
+        && exactKeys(output, ["type", "call_id", "output"]) && output.type === "function_call_output"
+        && output.call_id === callId && currentTimeToolOutputShape(output.output);
+    }).every(Boolean);
   const rootContinuation = input.length === 3
     && firstInputText === expectedPrompt
     && exactKeys(call, ["arguments", "call_id", "name", "type"])
@@ -1336,7 +1472,7 @@ function agentInterruptRole(body, expectedPrompt, script) {
   const role = rootInitial
     ? "root_initial"
     : child
-      ? "child_held"
+      ? (childCount === childLimit ? "child_held" : `child_tool_${childCount}`)
       : rootContinuation
         ? "root_continuation"
         : null;
@@ -1350,6 +1486,7 @@ function agentInterruptRole(body, expectedPrompt, script) {
         : sha256(Buffer.from(firstInputText, "utf8")),
       expected_prompt_matches: firstInputText === expectedPrompt,
       child_envelope_matches: firstInputText === expected.childEnvelope,
+      child_completed_tool_count: child ? childCount : null,
       spawn_call_matches: rootContinuation,
     },
   };
@@ -1369,6 +1506,7 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, script) {
     script_kind: script.kind,
     role: classified.role,
     role_evidence: classified.evidence,
+    child_tool_present: !(script.childToolCalls > 0) || body.tools?.filter(tool => tool?.name === "current_time").length === 1,
     model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
     instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
     top_level_keys: topLevelKeys,
@@ -1386,6 +1524,7 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, script) {
     ...contract,
     pass: contract.client_generation_fields_absent
       && contract.role !== null
+      && contract.child_tool_present
       && contract.model_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
@@ -2201,111 +2340,97 @@ function permissionRestartGuardianMainRole(body, script) {
   };
 }
 
-function permissionGuardianPayloadContract(inputText, script) {
-  let payload = null;
-  let taskContext = null;
+export function permissionGuardianShellPayloadContract(payload, argumentsJson, expectedRisks = []) {
+  let expectedArguments = null;
   try {
-    payload = JSON.parse(inputText);
-    taskContext = typeof payload?.task_context === "string"
-      ? JSON.parse(payload.task_context)
-      : null;
+    expectedArguments = JSON.parse(argumentsJson);
+    delete expectedArguments.description;
+    delete expectedArguments.justification;
   } catch {
-    // Invalid or wrapped evidence fails the exact Guardian request contract below.
+    // Invalid committed arguments cannot establish an exact audited action.
   }
-  const payloadKeysMatch = exactKeys(payload, [
-    "action_evidence",
-    "permission_request",
-    "recent_committed_response",
-    "task_context",
-    "trusted_world_state",
-  ]);
-  const authority = Array.isArray(taskContext?.canonical_user_authority)
-    ? taskContext.canonical_user_authority
-    : [];
-  const authorityTexts = authority.map((item) => typeof item?.text === "string" ? item.text : null);
-  const authorityIds = authority.map((item) => typeof item?.history_item_id === "string"
-    ? item.history_item_id
-    : null);
-  const authorityMatches = exactKeys(taskContext, ["authority_session_id", "canonical_user_authority"])
-    && typeof taskContext.authority_session_id === "string"
-    && taskContext.authority_session_id.length > 0
-    && authority.length === 2
-    && authority.every((item) => exactKeys(item, ["history_item_id", "kind", "text"])
-      && item.kind === "user_turn"
-      && typeof item.history_item_id === "string"
-      && item.history_item_id.length > 0)
-    && authorityTexts[0] === script.seedPrompt
-    && authorityTexts[1] === script.taskPrompt
-    && new Set(authorityIds).size === authorityIds.length;
-  const recent = payload?.recent_committed_response;
-  const toolRequest = recent?.tool_request;
-  const expected = permissionRestartGuardianExpected(script);
-  const recentMatches = exactKeys(recent, [
-    "assistant_text",
-    "prior_committed_tool_results",
-    "response_id",
-    "tool_request",
-  ])
-    && typeof recent.response_id === "string"
-    && recent.response_id.length > 0
-    && typeof recent.assistant_text === "string"
-    && Array.isArray(recent.prior_committed_tool_results)
-    && recent.prior_committed_tool_results.length === 0
-    && exactKeys(toolRequest, ["arguments_json", "call_id", "tool_name"])
-    && toolRequest.call_id === PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID
-    && toolRequest.tool_name === "shell"
-    && toolRequest.arguments_json === expected.shellArguments;
-  const permission = payload?.permission_request;
-  const permissionMatches = exactKeys(permission, [
-    "access",
-    "details",
-    "outside_workspace",
-    "risks",
-    "summary",
-    "targets",
-  ])
-    && permission.access === "shell"
-    && typeof permission.summary === "string"
-    && permission.summary.trim().length > 0
-    && Array.isArray(permission.details)
-    && permission.details.some((detail) => detail === `Requested sandbox elevation: ${script.justification}`)
-    && Array.isArray(permission.targets)
-    && permission.targets.length > 0
-    && permission.targets.every((target) => typeof target === "string" && target.length > 0)
-    && permission.outside_workspace === true
-    && Array.isArray(permission.risks)
-    && permission.risks.length === 0;
-  const evidenceMatches = exactKeys(payload?.action_evidence, ["kind"])
-    && payload.action_evidence.kind === "permission_request";
-  const worldStateMatches = payload?.trusted_world_state !== null
-    && typeof payload?.trusted_world_state === "object"
-    && !Array.isArray(payload.trusted_world_state)
-    && Object.keys(payload.trusted_world_state).length > 0;
+  const payloadKeysMatch = exactKeys(payload, ["action_evidence", "execution_facts", "tool_request"]);
+  const historyAbsent = ["task_context", "canonical_user_authority", "recent_committed_response",
+    "trusted_world_state", "descriptive_world_state", "permission_request"]
+    .every((key) => !Object.hasOwn(payload ?? {}, key));
+  const request = payload?.tool_request;
+  const actionMatches = expectedArguments !== null
+    && exactKeys(request, ["arguments", "tool_name"])
+    && request.tool_name === "shell"
+    && isDeepStrictEqual(request.arguments, expectedArguments);
+  const explanationsAbsent = request?.arguments !== null
+    && typeof request?.arguments === "object"
+    && !Object.hasOwn(request.arguments, "description")
+    && !Object.hasOwn(request.arguments, "justification");
+  const absolutePath = (value) => typeof value === "string"
+    && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/u.test(value);
+  const pathIdentity = (value) => {
+    if (!absolutePath(value)) return null;
+    if (/^(?:[A-Za-z]:[\\/]|\\\\)/u.test(value)) {
+      const withoutNamespace = value.replaceAll("/", "\\")
+        .replace(/^\\\\\?\\UNC\\/iu, "\\\\").replace(/^\\\\\?\\/u, "");
+      return path.win32.normalize(withoutNamespace).replace(/\\+$/u, "").toLowerCase();
+    }
+    return path.posix.normalize(value).replace(/\/+$/u, "") || "/";
+  };
+  const facts = payload?.execution_facts;
+  const factsMatch = exactKeys(facts, ["access", "outside_workspace", "process_sandbox_after_approval",
+    "risks", "targets", "workspace_root"])
+    && facts.access === "shell"
+    && facts.outside_workspace === true
+    && facts.process_sandbox_after_approval === "unrestricted"
+    && absolutePath(facts.workspace_root)
+    && Array.isArray(facts.targets)
+    && facts.targets.length > 0
+    && facts.targets.every(absolutePath)
+    && isDeepStrictEqual(facts.risks, expectedRisks);
+  const evidence = payload?.action_evidence;
+  const shellArguments = evidence?.shell_family === "power_shell"
+    ? ["-NoProfile", "-Command", expectedArguments?.command]
+    : evidence?.shell_family === "bash" ? ["-lc", expectedArguments?.command] : null;
+  const candidates = evidence?.executable_candidates;
+  const actionEvidenceChecks = {
+    keys_match: exactKeys(evidence, ["arguments", "cwd", "executable_candidates", "kind", "shell_family"]),
+    kind_matches: evidence?.kind === "shell_execution",
+    family_supported: shellArguments !== null,
+    cwd_absolute: absolutePath(evidence?.cwd),
+    // PathGuard normalizes the workdir before capturing the executable action.
+    cwd_matches: pathIdentity(evidence?.cwd) !== null
+      && pathIdentity(evidence?.cwd) === pathIdentity(expectedArguments?.workdir ?? facts?.workspace_root),
+    cwd_in_targets: facts?.targets?.includes(evidence?.cwd) === true,
+    candidates_non_empty: Array.isArray(candidates) && candidates.length > 0,
+    candidates_absolute: Array.isArray(candidates) && candidates.every(absolutePath),
+    candidates_unique: Array.isArray(candidates) && new Set(candidates).size === candidates.length,
+    arguments_match: shellArguments !== null && isDeepStrictEqual(evidence?.arguments, shellArguments),
+  };
+  const evidenceMatches = Object.values(actionEvidenceChecks).every((matches) => matches);
   return {
     json_valid: payload !== null,
     payload_keys_match: payloadKeysMatch,
-    authority_count: authority.length,
-    authority_kind_hashes: authority.map((item) => typeof item?.kind === "string"
-      ? sha256(Buffer.from(item.kind, "utf8"))
-      : null),
-    authority_text_hashes: authorityTexts.map((text) => text === null
-      ? null
-      : sha256(Buffer.from(text, "utf8"))),
-    authority_identity_hashes: authorityIds.map((id) => id === null
-      ? null
-      : sha256(Buffer.from(id, "utf8"))),
-    authority_matches: authorityMatches,
-    recent_committed_response_matches: recentMatches,
-    permission_request_matches: permissionMatches,
+    history_absent: historyAbsent,
+    explanations_absent: explanationsAbsent,
+    tool_request_matches: actionMatches,
+    execution_facts_match: factsMatch,
     action_evidence_matches: evidenceMatches,
-    trusted_world_state_matches: worldStateMatches,
-    pass: payloadKeysMatch
-      && authorityMatches
-      && recentMatches
-      && permissionMatches
-      && evidenceMatches
-      && worldStateMatches,
+    action_evidence_checks: actionEvidenceChecks,
+    action_scope: {
+      cwd: typeof evidence?.cwd === "string" ? evidence.cwd : null,
+      workspace_root: typeof facts?.workspace_root === "string" ? facts.workspace_root : null,
+      requested_workdir: typeof expectedArguments?.workdir === "string" ? expectedArguments.workdir : null,
+    },
+    pass: payloadKeysMatch && historyAbsent && explanationsAbsent && actionMatches && factsMatch && evidenceMatches,
   };
+}
+
+function permissionGuardianPayloadContract(inputText, script) {
+  let payload = null;
+  try {
+    payload = JSON.parse(inputText);
+  } catch {
+    // Invalid or wrapped evidence fails the exact Guardian request contract below.
+  }
+  return permissionGuardianShellPayloadContract(payload,
+    permissionRestartGuardianExpected(script).shellArguments, script.expectedPermissionRisks ?? []);
 }
 
 function permissionRestartGuardianReviewRole(body, script) {
@@ -2596,342 +2721,76 @@ function permissionRestartGuardianChatRequestContract(body, modelId, script) {
   };
 }
 
-function permissionTempEscalationExpected(script) {
-  return {
-    restrictedArguments: JSON.stringify({
-      command: script.command,
-      sandbox_permissions: "use_default",
-    }),
-    elevatedArguments: JSON.stringify({
-      command: script.command,
-      sandbox_permissions: "require_escalated",
-      justification: script.justification,
-    }),
-  };
+function permissionTempWriteExpected(script) {
+  return { restrictedArguments: JSON.stringify({ command: script.command, sandbox_permissions: "use_default" }) };
 }
 
-function permissionTempEscalationCallMatches(item, callId, argumentsJson) {
+function permissionTempWriteCallMatches(item, callId, argumentsJson) {
   return exactKeys(item, ["arguments", "call_id", "name", "type"])
-    && item.type === "function_call"
-    && item.call_id === callId
-    && item.name === "shell"
-    && item.arguments === argumentsJson;
+    && item.type === "function_call" && item.call_id === callId
+    && item.name === "shell" && item.arguments === argumentsJson;
 }
 
-function permissionTempEscalationOutput(item, callId) {
+function permissionTempWriteOutput(item, callId) {
   return exactKeys(item, ["call_id", "output", "type"])
-    && item.type === "function_call_output"
-    && item.call_id === callId
-    && typeof item.output === "string"
-    && item.output.trim().length > 0
-    ? item.output
-    : null;
+    && item.type === "function_call_output" && item.call_id === callId
+    && typeof item.output === "string" && item.output.trim().length > 0 ? item.output : null;
 }
 
-function permissionTempFailureOutputContract(output, script) {
+export function permissionTempWriteOutputContract(output, script) {
   const text = typeof output === "string" ? output : "";
-  const lines = text.split(/\r?\n/u);
-  const noteCount = text.split("Sandbox note:").length - 1;
   const contract = {
     output_non_empty: text.trim().length > 0,
-    command_matches: lines.includes(`Command: ${script.command}`),
-    host_non_success: text.includes("Tool outcome (host projection): non-success"),
-    shell_tool: text.includes('tool: "shell"'),
-    completed_lifecycle: text.includes("lifecycle_status: completed"),
-    hint_kind: text.includes("kind: workspace_write_effect_temp_access_denied"),
-    automatic_retry_false: text.includes("automatic_retry: false"),
-    exit_code_one: text.includes("exit_code: 1"),
-    guidance_present: text.includes("guidance: Sandbox note:"),
-    exact_escalation_hint: text.includes("sandbox_permissions=require_escalated"),
-    no_project_workaround_hint: text.includes(
-      "do not change project files solely to bypass this sandbox restriction",
-    ),
-    single_note: noteCount === 1,
-    same_line_windows_signature: /^.*permissionerror: \[winerror 5\].*moyai-sandbox-effect-.*$/imu
-      .test(text),
-  };
-  return {
-    ...contract,
-    output_size_bytes: output === null ? null : Buffer.byteLength(text, "utf8"),
-    output_sha256: output === null ? null : sha256(Buffer.from(text, "utf8")),
-    pass: Object.values(contract).every((value) => value === true),
-  };
-}
-
-function permissionTempSuccessOutputContract(output, script) {
-  const text = typeof output === "string" ? output : "";
-  const lines = text.split(/\r?\n/u);
-  const contract = {
-    output_non_empty: text.trim().length > 0,
-    command_matches: lines.includes(`Command: ${script.command}`),
-    exit_code_zero: text.includes("Exit code: 0"),
+    command_matches: text.split(/\r?\n/u).includes(`Command: ${script.command}`),
+    exit_code_zero: text.split(/\r?\n/u).includes("Exit code: 0"),
     pytest_passed: /(?:^|\n)1 passed(?:\s|$)/u.test(text),
-    effect_temp_absent: !text.includes("moyai-sandbox-effect-"),
     sandbox_note_absent: !text.includes("Sandbox note:"),
+    non_success_absent: !text.includes("Tool outcome (host projection): non-success"),
   };
-  return {
-    ...contract,
+  return { ...contract,
     output_size_bytes: output === null ? null : Buffer.byteLength(text, "utf8"),
     output_sha256: output === null ? null : sha256(Buffer.from(text, "utf8")),
-    pass: Object.values(contract).every((value) => value === true),
-  };
+    pass: Object.values(contract).every(value => value === true) };
 }
 
-function permissionTempEscalationMainRole(body, script) {
+function permissionTempWriteMainRole(body, script) {
   const input = Array.isArray(body?.input) ? body.input : [];
-  const expected = permissionTempEscalationExpected(script);
   const taskUser = exactInputText(input[0]);
-  const restrictedCall = input[1];
-  const restrictedOutputItem = input[2];
-  const elevatedCall = input[3];
-  const elevatedOutputItem = input[4];
-  const restrictedCallMatches = permissionTempEscalationCallMatches(
-    restrictedCall,
-    PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
-    expected.restrictedArguments,
-  );
-  const restrictedOutput = permissionTempEscalationOutput(
-    restrictedOutputItem,
-    PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
-  );
-  const restrictedOutputContract = permissionTempFailureOutputContract(restrictedOutput, script);
-  const elevatedCallMatches = permissionTempEscalationCallMatches(
-    elevatedCall,
-    PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID,
-    expected.elevatedArguments,
-  );
-  const elevatedOutput = permissionTempEscalationOutput(
-    elevatedOutputItem,
-    PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID,
-  );
-  const elevatedOutputContract = permissionTempSuccessOutputContract(elevatedOutput, script);
+  const callMatches = permissionTempWriteCallMatches(input[1],
+    PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID, permissionTempWriteExpected(script).restrictedArguments);
+  const output = permissionTempWriteOutput(input[2], PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID);
+  const restrictedOutput = permissionTempWriteOutputContract(output, script);
   const initial = input.length === 1 && taskUser === script.taskPrompt;
-  const escalation = input.length === 3
-    && taskUser === script.taskPrompt
-    && restrictedCallMatches
-    && restrictedOutputContract.pass;
-  const continuation = input.length === 5
-    && taskUser === script.taskPrompt
-    && restrictedCallMatches
-    && restrictedOutputContract.pass
-    && elevatedCallMatches
-    && elevatedOutputContract.pass;
-  const role = initial
-    ? "temp_initial"
-    : escalation
-      ? "temp_escalation"
-      : continuation
-        ? "temp_continuation"
-        : null;
-  return {
-    role,
-    evidence: {
-      input_count: input.length,
-      input_item_types: input.map((item) => typeof item?.type === "string" ? item.type : null),
+  const continuation = input.length === 3 && taskUser === script.taskPrompt
+    && callMatches && restrictedOutput.pass;
+  return { role: initial ? "temp_initial" : continuation ? "temp_continuation" : null,
+    evidence: { input_count: input.length,
+      input_item_types: input.map(item => typeof item?.type === "string" ? item.type : null),
       task_prompt_sha256: taskUser === null ? null : sha256(Buffer.from(taskUser, "utf8")),
       task_prompt_matches: taskUser === script.taskPrompt,
-      restricted_call_matches: restrictedCallMatches,
-      restricted_output: restrictedOutputContract,
-      elevated_call_matches: elevatedCallMatches,
-      elevated_output: elevatedOutputContract,
-    },
-  };
+      restricted_call_matches: callMatches, restricted_output: restrictedOutput } };
 }
 
-function permissionTempGuardianPayloadContract(inputText, script) {
-  let payload = null;
-  let taskContext = null;
-  try {
-    payload = JSON.parse(inputText);
-    taskContext = typeof payload?.task_context === "string"
-      ? JSON.parse(payload.task_context)
-      : null;
-  } catch {
-    // Invalid or wrapped evidence fails the exact Guardian request contract below.
-  }
-  const payloadKeysMatch = exactKeys(payload, [
-    "action_evidence",
-    "permission_request",
-    "recent_committed_response",
-    "task_context",
-    "trusted_world_state",
-  ]);
-  const authority = Array.isArray(taskContext?.canonical_user_authority)
-    ? taskContext.canonical_user_authority
-    : [];
-  const authorityTexts = authority.map((item) => typeof item?.text === "string" ? item.text : null);
-  const authorityIds = authority.map((item) => typeof item?.history_item_id === "string"
-    ? item.history_item_id
-    : null);
-  const authorityMatches = exactKeys(taskContext, ["authority_session_id", "canonical_user_authority"])
-    && typeof taskContext.authority_session_id === "string"
-    && taskContext.authority_session_id.length > 0
-    && authority.length === 1
-    && authority.every((item) => exactKeys(item, ["history_item_id", "kind", "text"])
-      && item.kind === "user_turn"
-      && typeof item.history_item_id === "string"
-      && item.history_item_id.length > 0)
-    && authorityTexts[0] === script.taskPrompt
-    && new Set(authorityIds).size === authorityIds.length;
-  const recent = payload?.recent_committed_response;
-  const toolRequest = recent?.tool_request;
-  const expected = permissionTempEscalationExpected(script);
-  const recentMatches = exactKeys(recent, [
-    "assistant_text",
-    "prior_committed_tool_results",
-    "response_id",
-    "tool_request",
-  ])
-    && typeof recent.response_id === "string"
-    && recent.response_id.length > 0
-    && typeof recent.assistant_text === "string"
-    && Array.isArray(recent.prior_committed_tool_results)
-    && recent.prior_committed_tool_results.length === 0
-    && exactKeys(toolRequest, ["arguments_json", "call_id", "tool_name"])
-    && toolRequest.call_id === PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID
-    && toolRequest.tool_name === "shell"
-    && toolRequest.arguments_json === expected.elevatedArguments;
-  const permission = payload?.permission_request;
-  const permissionMatches = exactKeys(permission, [
-    "access",
-    "details",
-    "outside_workspace",
-    "risks",
-    "summary",
-    "targets",
-  ])
-    && permission.access === "shell"
-    && typeof permission.summary === "string"
-    && permission.summary.trim().length > 0
-    && Array.isArray(permission.details)
-    && permission.details.some((detail) => (
-      detail === `Requested sandbox elevation: ${script.justification}`
-    ))
-    && Array.isArray(permission.targets)
-    && permission.targets.length > 0
-    && permission.targets.every((target) => typeof target === "string" && target.length > 0)
-    && permission.outside_workspace === true
-    && Array.isArray(permission.risks)
-    && permission.risks.length === 0;
-  const evidenceMatches = exactKeys(payload?.action_evidence, ["kind"])
-    && payload.action_evidence.kind === "permission_request";
-  const worldStateMatches = payload?.trusted_world_state !== null
-    && typeof payload?.trusted_world_state === "object"
-    && !Array.isArray(payload.trusted_world_state)
-    && Object.keys(payload.trusted_world_state).length > 0;
-  return {
-    json_valid: payload !== null,
-    payload_keys_match: payloadKeysMatch,
-    authority_count: authority.length,
-    authority_text_hashes: authorityTexts.map((text) => text === null
-      ? null
-      : sha256(Buffer.from(text, "utf8"))),
-    authority_identity_hashes: authorityIds.map((id) => id === null
-      ? null
-      : sha256(Buffer.from(id, "utf8"))),
-    authority_matches: authorityMatches,
-    recent_committed_response_matches: recentMatches,
-    permission_request_matches: permissionMatches,
-    action_evidence_matches: evidenceMatches,
-    trusted_world_state_matches: worldStateMatches,
-    pass: payloadKeysMatch
-      && authorityMatches
-      && recentMatches
-      && permissionMatches
-      && evidenceMatches
-      && worldStateMatches,
-  };
-}
-
-function permissionTempEscalationGuardianRole(body, script) {
-  const input = Array.isArray(body?.input) ? body.input : [];
-  const inputText = input.length === 1 ? exactInputText(input[0]) : null;
-  const payload = permissionTempGuardianPayloadContract(inputText ?? "", script);
-  return {
-    role: input.length === 1 && payload.pass ? "temp_guardian" : null,
-    evidence: {
-      input_count: input.length,
-      input_text_size_bytes: inputText === null ? null : Buffer.byteLength(inputText, "utf8"),
-      input_text_sha256: inputText === null ? null : sha256(Buffer.from(inputText, "utf8")),
-      payload,
-    },
-  };
-}
-
-function permissionTempEscalationRequestContract(body, modelId, script) {
-  const guardianShape = Object.hasOwn(body ?? {}, "reasoning")
-    || !Object.hasOwn(body ?? {}, "tools");
-  const classified = guardianShape
-    ? permissionTempEscalationGuardianRole(body, script)
-    : permissionTempEscalationMainRole(body, script);
+function permissionTempWriteRequestContract(body, modelId, script) {
+  const classified = permissionTempWriteMainRole(body, script);
   const model = typeof body?.model === "string" ? body.model : null;
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
-  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
-    ? Object.keys(body).sort()
-    : [];
-  const expectedKeys = guardianShape ? GUARDIAN_RESPONSES_KEYS : TOOL_RESPONSES_KEYS;
-  const tools = guardianShape ? null : shellToolsContract(body?.tools);
-  const generation = clientGenerationContract(body);
-  const common = {
-    ...generation,
-    script_kind: script.kind,
-    role: classified.role,
-    role_evidence: classified.evidence,
+  const tools = shellToolsContract(body?.tools);
+  const task = { ...clientGenerationContract(body), script_kind: script.kind,
+    role: classified.role, role_evidence: classified.evidence,
     model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
     instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
-    top_level_keys: topLevelKeys,
-    model_matches: model === modelId,
-    instructions_non_empty: instructions !== null && instructions.trim().length > 0,
-    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(expectedKeys),
-    stream_true: body?.stream === true,
-    store_false: body?.store === false,
-  };
-  if (guardianShape) {
-    const guardian = {
-      ...common,
-      guardian_instructions_match: instructions?.includes("independent permission guardian") === true,
-      max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
-      reasoning_absent: !Object.hasOwn(body ?? {}, "reasoning"),
-      tools_absent: !Object.hasOwn(body ?? {}, "tools")
-        && !Object.hasOwn(body ?? {}, "tool_choice")
-        && !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
-    };
-    return {
-      ...guardian,
-      pass: guardian.client_generation_fields_absent
-        && guardian.role === "temp_guardian"
-        && guardian.model_matches
-        && guardian.instructions_non_empty
-        && guardian.guardian_instructions_match
-        && guardian.top_level_keys_match
-        && guardian.max_output_tokens_absent
-        && guardian.reasoning_absent
-        && guardian.tools_absent
-        && guardian.stream_true
-        && guardian.store_false,
-    };
-  }
-  const task = {
-    ...common,
+    top_level_keys: body && typeof body === "object" ? Object.keys(body).sort() : [],
+    model_matches: model === modelId, instructions_non_empty: !!instructions?.trim(),
+    top_level_keys_match: exactKeys(body, TOOL_RESPONSES_KEYS),
+    stream_true: body?.stream === true, store_false: body?.store === false,
     max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     tool_choice_auto: body?.tool_choice === "auto",
-    parallel_tool_calls_false: body?.parallel_tool_calls === false,
-    tools,
-  };
-  return {
-    ...task,
-    pass: task.client_generation_fields_absent
-      && task.role !== null
-      && task.model_matches
-      && task.instructions_non_empty
-      && task.top_level_keys_match
-      && task.max_output_tokens_absent
-      && task.tool_choice_auto
-      && task.parallel_tool_calls_false
-      && task.tools.pass
-      && task.stream_true
-      && task.store_false,
-  };
+    parallel_tool_calls_false: body?.parallel_tool_calls === false, tools };
+  return { ...task, pass: task.client_generation_fields_absent && task.role !== null
+    && task.model_matches && task.instructions_non_empty && task.top_level_keys_match
+    && task.max_output_tokens_absent && task.tool_choice_auto && task.parallel_tool_calls_false
+    && tools.pass && task.stream_true && task.store_false };
 }
 
 function catalog(modelId, supportsTools = false) {
@@ -3044,43 +2903,6 @@ function waitForPacingIntervalOrClose(milliseconds, closePromise) {
   });
 }
 
-async function waitForGuardianResponseDelay(response, row, configuredDelayMs) {
-  const startedAt = process.hrtime.bigint();
-  const observation = {
-    schema_version: "desktop-e2e.scripted-provider-guardian-delay.v1",
-    configured_delay_ms: configuredDelayMs,
-    delay_elapsed_ms: null,
-    delay_completed: false,
-    peer_close_observed: false,
-    headers_sent_elapsed_ms: null,
-  };
-  row.response_delay = observation;
-  let resolveClose;
-  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
-  const markPeerClose = () => {
-    observation.peer_close_observed = true;
-    resolveClose();
-  };
-  response.once("close", markPeerClose);
-  response.once("error", markPeerClose);
-  row.response_phase = "delaying";
-  let outcome = "elapsed";
-  while (outcome === "elapsed") {
-    const remainingMs = configuredDelayMs - elapsedMonotonicMs(startedAt);
-    if (remainingMs <= 0) break;
-    outcome = await waitForPacingIntervalOrClose(remainingMs, closePromise);
-  }
-  observation.delay_elapsed_ms = elapsedMonotonicMs(startedAt);
-  response.off("close", markPeerClose);
-  response.off("error", markPeerClose);
-  if (outcome !== "elapsed" || response.destroyed || response.socket?.destroyed === true) {
-    observation.peer_close_observed = true;
-    row.response_phase = "peer_closed";
-    return null;
-  }
-  observation.delay_completed = true;
-  return { observation, startedAt };
-}
 
 async function writePacedResponses(response, row, responseText, pacing, options = {}) {
   const startedAt = process.hrtime.bigint();
@@ -3180,6 +3002,19 @@ function chatCompletionSse(chunks) {
   return chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
 }
 
+function managedShellSse(modelId, script, initial) {
+  const common = { id: initial ? "chatcmpl_managed_shell_start" : "chatcmpl_managed_shell_done",
+    object: "chat.completion.chunk", model: modelId };
+  const delta = initial ? { tool_calls: [{
+    index: 0, id: SCRIPTED_PROVIDER_MANAGED_SHELL_CALL_ID, type: "function",
+    function: { name: "shell_start", arguments: managedShellArguments(script) },
+  }] } : { content: script.responseText };
+  return chatCompletionSse([
+    { ...common, choices: [{ index: 0, delta, finish_reason: initial ? "tool_calls" : "stop" }] },
+    { ...common, choices: [], usage: { prompt_tokens: 24, completion_tokens: 8, total_tokens: 32 } },
+  ]);
+}
+
 function permissionRestartGuardianChatTextSse(modelId, id, text, {
   promptTokens,
   completionTokens,
@@ -3242,7 +3077,7 @@ function permissionRestartGuardianChatShellSse(modelId, script) {
   ]);
 }
 
-function chatToolContinuationCallSse(modelId) {
+function chatToolContinuationCallSse(modelId, script) {
   const common = {
     id: "chatcmpl_chat_tool_initial",
     object: "chat.completion.chunk",
@@ -3267,7 +3102,7 @@ function chatToolContinuationCallSse(modelId) {
             index: 0,
             id: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID,
             type: "function",
-            function: { name: "current_time", arguments: "{}" },
+            function: { name: script.call?.name ?? "current_time", arguments: JSON.stringify(script.call?.arguments ?? {}) },
           }],
         },
         finish_reason: "tool_calls",
@@ -3278,10 +3113,10 @@ function chatToolContinuationCallSse(modelId) {
       choices: [],
       usage: { prompt_tokens: 8, completion_tokens: 6, total_tokens: 14 },
     },
-  ]);
+  ]) + "data: [DONE]\n\n";
 }
 
-function chatToolContinuationFinalSse(modelId) {
+function chatToolContinuationFinalSse(modelId, script) {
   return chatCompletionSse([
     {
       id: "chatcmpl_chat_continuation",
@@ -3289,7 +3124,7 @@ function chatToolContinuationFinalSse(modelId) {
       model: modelId,
       choices: [{
         index: 0,
-        delta: { content: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE },
+        delta: { content: script.call?.responseText ?? SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE },
         finish_reason: "stop",
       }],
     },
@@ -3300,7 +3135,16 @@ function chatToolContinuationFinalSse(modelId) {
       choices: [],
       usage: { prompt_tokens: 16, completion_tokens: 4, total_tokens: 20 },
     },
-  ]);
+  ]) + "data: [DONE]\n\n";
+}
+
+function agentInterruptChildToolSse(index) {
+  const item = { type: "function_call", id: "fc_agent_history_" + index,
+    call_id: "call_agent_history_" + index, name: "current_time", arguments: "{}" };
+  return [{ type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_agent_history_" + index, output: [item],
+      usage: { input_tokens: 8, output_tokens: 6, total_tokens: 14, output_tokens_details: { reasoning_tokens: 0 } } } }]
+    .map(event => "data: " + JSON.stringify(event) + "\n\n").join("");
 }
 
 function agentInterruptSpawnSse(script) {
@@ -3565,37 +3409,15 @@ function permissionRestartGuardianShellSse(script) {
   return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
 }
 
-function permissionTempEscalationShellSse(script, elevated) {
-  const expected = permissionTempEscalationExpected(script);
-  const item = {
-    type: "function_call",
-    id: elevated
-      ? PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID
-      : PERMISSION_TEMP_ESCALATION_RESTRICTED_ITEM_ID,
-    call_id: elevated
-      ? PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID
-      : PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
-    name: "shell",
-    arguments: elevated ? expected.elevatedArguments : expected.restrictedArguments,
-  };
-  const responseStem = elevated ? "elevated" : "restricted";
-  const events = [
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: `resp_permission_temp_escalation_${responseStem}`,
-        output: [item],
-        usage: {
-          input_tokens: 8,
-          output_tokens: 6,
-          total_tokens: 14,
-          output_tokens_details: { reasoning_tokens: 0 },
-        },
-      },
-    },
-  ];
-  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+function permissionTempWriteShellSse(script) {
+  const item = { type: "function_call", id: PERMISSION_TEMP_WRITE_RESTRICTED_ITEM_ID,
+    call_id: PERMISSION_TEMP_WRITE_RESTRICTED_CALL_ID, name: "shell",
+    arguments: permissionTempWriteExpected(script).restrictedArguments };
+  return [ { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_permission_temp_write_restricted",
+      output: [item], usage: { input_tokens: 8, output_tokens: 6, total_tokens: 14,
+        output_tokens_details: { reasoning_tokens: 0 } } } } ]
+    .map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
 }
 
 function parsedTarget(request) {
@@ -3763,8 +3585,8 @@ export class ScriptedProvider {
     const releaseHeldGuardianToolInitial = this.script?.kind
       === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
       && this.responseBehavior === "hold_until_release";
-    const releaseHeldTempEscalation = this.script?.kind
-      === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND
+    const releaseHeldTempWrite = this.script?.kind
+      === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND
       && this.responseBehavior === "hold_until_release";
     const releaseHeldChatContinuation = this.script?.kind
       === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
@@ -3780,7 +3602,7 @@ export class ScriptedProvider {
       && this.responseBehavior !== "complete"
       && !releaseHeldToolErrorInitial
       && !releaseHeldGuardianToolInitial
-      && !releaseHeldTempEscalation
+      && !releaseHeldTempWrite
       && !releaseHeldChatContinuation
       && !releaseHeldResponsesCompaction) {
       throw new TypeError("scripted provider mode owns its response lifecycle");
@@ -3790,7 +3612,7 @@ export class ScriptedProvider {
     }
     if (this.responseBehavior === "hold_until_release") {
       if (releaseHeldGuardianToolInitial
-        || releaseHeldTempEscalation
+        || releaseHeldTempWrite
         || releaseHeldChatContinuation
         || releaseHeldResponsesCompaction) {
         let release;
@@ -3798,8 +3620,8 @@ export class ScriptedProvider {
         this.#scriptRoleRelease = {
           role: releaseHeldGuardianToolInitial
             ? "guardian_tool_initial"
-            : releaseHeldTempEscalation
-              ? "temp_escalation"
+            : releaseHeldTempWrite
+              ? "temp_continuation"
               : releaseHeldChatContinuation ? "chat_continuation" : "compaction_empty",
           promise,
           release,
@@ -4052,6 +3874,7 @@ export class ScriptedProvider {
     }
     const chatCompletionsScriptMode = this.script?.kind
       === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
+      || this.script?.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND
       || (this.script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
         && this.script.apiMode === "chat_completions");
     if ((route === "chat_completions" && !chatCompletionsScriptMode)
@@ -4172,6 +3995,8 @@ export class ScriptedProvider {
           this.modelId,
           this.script,
         );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+        row.contract = managedShellRequestContract(decoded.value, this.modelId, this.script);
       } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
         row.contract = sideChatQuoteRequestContract(
           decoded.value,
@@ -4191,8 +4016,8 @@ export class ScriptedProvider {
           this.expectedPrompt,
           this.script,
         );
-      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-        row.contract = permissionTempEscalationRequestContract(
+      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+        row.contract = permissionTempWriteRequestContract(
           decoded.value,
           this.modelId,
           this.script,
@@ -4222,14 +4047,16 @@ export class ScriptedProvider {
         await this.#handleToolErrorRecoveryResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
         await this.#handleChatToolContinuationResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_MANAGED_SHELL_KIND) {
+        this.#handleManagedShellResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
         await this.#handleSideChatQuoteResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
         await this.#handleSideChatSessionResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
         await this.#handleResponsesCompactionResponse(response, row);
-      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
-        await this.#handlePermissionTempEscalationResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_KIND) {
+        await this.#handlePermissionTempWriteResponse(response, row);
       } else {
         await this.#handlePermissionRestartGuardianResponse(response, row);
       }
@@ -4250,7 +4077,7 @@ export class ScriptedProvider {
         this.turns,
         this.#acceptedResponseCount,
       )
-      : requestContract(decoded.value, this.modelId, turn.prompt);
+      : requestContract(decoded.value, this.modelId, turn.prompt, turn.imageDataUrl);
     if (!row.contract.pass) {
       row.response_phase = "rejected";
       row.response_status = 422;
@@ -4316,6 +4143,12 @@ export class ScriptedProvider {
       return;
     }
 
+    const childIndex = role.startsWith("child_tool_") ? Number(role.slice("child_tool_".length))
+      : role === "child_held" ? (this.script.childToolCalls ?? 0) : 0;
+    if (childIndex > 0 && !this.#acceptedRoles.has("child_tool_" + (childIndex - 1))) {
+      row.response_phase = "rejected"; row.response_status = 409;
+      fixedError(response, 409, "child_tool_prerequisite_missing"); return;
+    }
     this.#acceptedRoles.add(role);
     this.#acceptedResponseCount += 1;
     if (role === "child_held") {
@@ -4328,7 +4161,9 @@ export class ScriptedProvider {
     this.#successfulResponseCount += 1;
     row.response_phase = "completed";
     row.response_status = 200;
-    const payload = role === "root_initial"
+    const payload = role.startsWith("child_tool_")
+      ? agentInterruptChildToolSse(childIndex)
+      : role === "root_initial"
       ? agentInterruptSpawnSse(this.script)
       : responsesSse(this.script.rootResponseText, {
         itemId: "msg_agent_interrupt_root_done",
@@ -4508,9 +4343,31 @@ export class ScriptedProvider {
     row.response_phase = "completed";
     row.response_status = 200;
     const payload = role === "chat_tool_initial"
-      ? chatToolContinuationCallSse(this.modelId)
-      : chatToolContinuationFinalSse(this.modelId);
+      ? chatToolContinuationCallSse(this.modelId, this.script)
+      : chatToolContinuationFinalSse(this.modelId, this.script);
     writeResponse(response, 200, "text/event-stream", payload);
+  }
+
+  #handleManagedShellResponse(response, row) {
+    const role = row.contract.role;
+    const error = !row.contract.pass ? "request_contract_mismatch"
+      : this.#acceptedRoles.has(role) ? "script_role_already_consumed"
+        : role === "managed_shell_continuation" && !this.#acceptedRoles.has("managed_shell_initial")
+          ? "script_role_prerequisite_missing" : null;
+    if (error !== null) {
+      row.response_phase = "rejected";
+      row.response_status = row.contract.pass ? 409 : 422;
+      fixedError(response, row.response_status, error);
+      return;
+    }
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    writeResponse(response, 200, "text/event-stream", managedShellSse(
+      this.modelId, this.script, role === "managed_shell_initial",
+    ));
   }
 
   async #handleResponsesCompactionResponse(response, row) {
@@ -4627,71 +4484,30 @@ export class ScriptedProvider {
     writeResponse(response, 200, "text/event-stream", payload);
   }
 
-  async #handlePermissionTempEscalationResponse(response, row) {
+  async #handlePermissionTempWriteResponse(response, row) {
     if (!row.contract.pass) {
-      row.response_phase = "rejected";
-      row.response_status = 422;
-      fixedError(response, 422, "request_contract_mismatch");
-      return;
+      row.response_phase = "rejected"; row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch"); return;
     }
     const role = row.contract.role;
     if (this.#acceptedRoles.has(role)) {
-      row.response_phase = "rejected";
-      row.response_status = 409;
-      fixedError(response, 409, "script_role_already_consumed");
-      return;
+      row.response_phase = "rejected"; row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed"); return;
     }
-    const prerequisites = {
-      temp_initial: [],
-      temp_escalation: ["temp_initial"],
-      temp_guardian: ["temp_initial", "temp_escalation"],
-      temp_continuation: ["temp_initial", "temp_escalation", "temp_guardian"],
-    };
-    if (!Array.isArray(prerequisites[role])
-      || prerequisites[role].some((required) => !this.#acceptedRoles.has(required))) {
-      row.response_phase = "rejected";
-      row.response_status = 409;
-      fixedError(response, 409, "script_role_prerequisite_missing");
-      return;
+    if (role === "temp_continuation" && !this.#acceptedRoles.has("temp_initial")) {
+      row.response_phase = "rejected"; row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing"); return;
     }
-
-    this.#acceptedRoles.add(role);
-    this.#acceptedResponseCount += 1;
-    if (role === "temp_escalation" && this.responseBehavior === "hold_until_release") {
-      if (this.#scriptRoleRelease?.role !== role) {
-        throw new Error("permission TEMP escalation release owner is missing");
-      }
-      row.response_phase = "held";
-      await this.#scriptRoleRelease.promise;
+    this.#acceptedRoles.add(role); this.#acceptedResponseCount += 1;
+    if (role === "temp_continuation" && this.responseBehavior === "hold_until_release") {
+      if (this.#scriptRoleRelease?.role !== role) throw new Error("permission TEMP write release owner is missing");
+      row.response_phase = "held"; await this.#scriptRoleRelease.promise;
     }
-    const guardianDelay = role === "temp_guardian"
-      ? await waitForGuardianResponseDelay(response, row, this.script.guardianDelayMs)
-      : null;
-    if (role === "temp_guardian" && guardianDelay === null) return;
     this.#successfulResponseCount += 1;
-    row.response_phase = "completed";
-    row.response_status = 200;
-    let payload;
-    if (role === "temp_initial") {
-      payload = permissionTempEscalationShellSse(this.script, false);
-    } else if (role === "temp_escalation") {
-      payload = permissionTempEscalationShellSse(this.script, true);
-    } else if (role === "temp_guardian") {
-      payload = responsesSse(JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW), {
-        itemId: "msg_permission_temp_escalation_allow",
-        responseId: "resp_permission_temp_escalation_allow",
-      });
-    } else {
-      payload = responsesSse(this.script.responseText, {
-        itemId: "msg_permission_temp_escalation_done",
-        responseId: "resp_permission_temp_escalation_done",
-      });
-    }
-    if (guardianDelay !== null) {
-      guardianDelay.observation.headers_sent_elapsed_ms = elapsedMonotonicMs(
-        guardianDelay.startedAt,
-      );
-    }
+    row.response_phase = "completed"; row.response_status = 200;
+    const payload = role === "temp_initial" ? permissionTempWriteShellSse(this.script)
+      : responsesSse(this.script.responseText, { itemId: "msg_permission_temp_write_done",
+        responseId: "resp_permission_temp_write_done" });
     writeResponse(response, 200, "text/event-stream", payload);
   }
 
@@ -4736,6 +4552,8 @@ export class ScriptedProvider {
     row.response_phase = "completed";
     row.response_status = 200;
     let payload;
+    const guardianDecision = { ...PERMISSION_RESTART_GUARDIAN_ALLOW,
+      risk_level: { allow: "low", ask_user: "high", deny: "critical" }[this.script.guardianDecision ?? "allow"] };
     if (this.script.apiMode === "chat_completions" && role === "guardian_seed") {
       payload = permissionRestartGuardianChatTextSse(
         this.modelId,
@@ -4749,7 +4567,7 @@ export class ScriptedProvider {
       payload = permissionRestartGuardianChatTextSse(
         this.modelId,
         "chatcmpl_permission_restart_guardian_allow",
-        JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW),
+        JSON.stringify(guardianDecision),
         { promptTokens: 40, completionTokens: 8 },
       );
     } else if (this.script.apiMode === "chat_completions") {
@@ -4767,7 +4585,7 @@ export class ScriptedProvider {
     } else if (role === "guardian_tool_initial") {
       payload = permissionRestartGuardianShellSse(this.script);
     } else if (role === "guardian_review") {
-      payload = responsesSse(JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW), {
+      payload = responsesSse(JSON.stringify(guardianDecision), {
         itemId: "msg_permission_restart_guardian_allow",
         responseId: "resp_permission_restart_guardian_allow",
       });

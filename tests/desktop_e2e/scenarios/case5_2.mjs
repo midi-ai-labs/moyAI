@@ -24,7 +24,8 @@ import {
   classifyCase52RestartTurnPage,
 } from "../case5_2_predicates.mjs";
 import { inventoryCase52CleanSeed, copyCase52CleanSeed } from "../core/clean_seed.mjs";
-import { waitForObservation } from "../core/deadline.mjs";
+import { ManualObservationBudget, normalizeManualObservationTimeout, waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { waitForSemanticTargetSettlement } from "../core/semantic_target_settlement.mjs";
 import {
@@ -48,6 +49,7 @@ import {
 } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 import { executeCase52SideChatStage } from "./case5_2_side_chat.mjs";
+import { manualLivePermissionLocator, manualLivePermissionRequest } from "../drivers/manual_live_session.mjs";
 
 const OWNER = "scenario:manual.case5_2";
 const scenarioDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -72,6 +74,18 @@ const GUI_CONNECTION_BASELINE_BASE_URL = "http://127.0.0.1:9";
 const GUI_CONNECTION_BASELINE_MODEL = "moyai-case5-2-before-gui-save";
 const MAIN_API_KEY_ENV = "";
 
+function case52ObservationTimeout(budget, label, ceiling) {
+  return budget?.assertRemaining(label, ceiling) ?? ceiling;
+}
+
+async function case52WaitForObservation(options, budget) {
+  const result = await waitForObservation({ ...options,
+    timeoutMs: case52ObservationTimeout(budget, options.label, options.timeoutMs),
+  });
+  budget?.assertRemaining(options.label);
+  return result;
+}
+
 const PROMPT = Object.freeze({
   selector: "section.composer textarea#prompt",
   identity: { tag: "TEXTAREA", id: "prompt" },
@@ -85,7 +99,7 @@ const EXPORT_TRANSCRIPT = Object.freeze({
   identity: { tag: "BUTTON", action: "export-transcript" },
 });
 const STOP = Object.freeze({
-  selector: 'section.run-strip button[data-action="cancel-run"][aria-label="実行停止"]',
+  selector: 'section.run-strip button[data-action="cancel-run"][aria-label="メインチャットを停止"]',
   identity: { tag: "BUTTON", action: "cancel-run" },
 });
 const SHOW_SETTINGS = Object.freeze({
@@ -135,6 +149,10 @@ const SIDE_SETTINGS_NAV = Object.freeze({
 const SIDE_BASE_URL = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-base-url[data-config-key="side_chat.base_url"]',
   identity: { tag: "INPUT", id: "side-chat-base-url", configKey: "side_chat.base_url" },
+});
+const SIDE_API_KEY = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-api-key-env[data-config-key="side_chat.api_key_env"]',
+  identity: { tag: "INPUT", id: "side-chat-api-key-env", configKey: "side_chat.api_key_env" },
 });
 const SIDE_PROVIDER_PROFILE = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]',
@@ -188,9 +206,20 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function elapsedSince(startedAt) {
+function elapsedSince(startedAt, now = Date.now()) {
   const started = Date.parse(startedAt);
-  return Number.isFinite(started) ? Math.max(0, Date.now() - started) : null;
+  return Number.isFinite(started) ? Math.max(0, now - started) : null;
+}
+
+export function case52InitialReadinessPerformance(context, runtime, now = Date.now()) {
+  if (context?.manualSuite?.shared_profile === true) {
+    return {
+      launch_to_ready_ms: null,
+      case_entry_to_ready_ms: elapsedSince(context.manualSuite.started_at, now),
+      comparability_deviations: ["shared-profile/continuous-desktop"],
+    };
+  }
+  return { launch_to_ready_ms: elapsedSince(runtime?.launch_started_at, now) };
 }
 
 function sha256(bytes) {
@@ -395,14 +424,35 @@ export function normalizeCase52Options(options) {
     "provider_base_url",
     "provider_profile",
     "provider_lifecycle",
+    "api_key_env",
+    "side_api_key_env",
+    "approve_api_key_env",
     "configure_main_via_gui",
     "main_model",
     "side_model",
+    "approve_model",
     "expected_main_variant",
     "expected_side_variant",
+    "observation_timeout_ms",
   ]);
   const unknown = Object.keys(options).filter((key) => !allowed.has(key));
   if (unknown.length > 0) throw new TypeError(`unknown manual.case5_2 option: ${unknown.join(",")}`);
+  const apiKeyEnv = options.api_key_env === undefined ? "" : options.api_key_env;
+  if (typeof apiKeyEnv !== "string" || (apiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(apiKeyEnv))) {
+    throw new TypeError("manual.case5_2 api_key_env must be an environment variable name or empty string");
+  }
+  const sideApiKeyEnv = options.side_api_key_env === undefined ? "" : options.side_api_key_env;
+  if (typeof sideApiKeyEnv !== "string" || (sideApiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(sideApiKeyEnv))) {
+    throw new TypeError("manual.case5_2 side_api_key_env must be an environment variable name or empty string");
+  }
+  const approveApiKeyEnv = options.approve_api_key_env === undefined ? "" : options.approve_api_key_env;
+  if (typeof approveApiKeyEnv !== "string" || (approveApiKeyEnv !== "" && !/^[A-Za-z0-9_]+$/.test(approveApiKeyEnv))) {
+    throw new TypeError("manual.case5_2 approve_api_key_env must be an environment variable name or empty string");
+  }
+  const approve = options.approve_model === undefined && options.approve_api_key_env === undefined ? {} : {
+    approveModel: modelIdentity(options.approve_model === undefined ? options.main_model : options.approve_model, "approve_model"),
+    approveApiKeyEnv,
+  };
   if (typeof options.fixture_source !== "string" || !path.isAbsolute(options.fixture_source)) {
     throw new TypeError("manual.case5_2 fixture_source must be an absolute path");
   }
@@ -424,14 +474,20 @@ export function normalizeCase52Options(options) {
     throw new TypeError("manual.case5_2 configure_main_via_gui is supported only by lm_studio");
   }
   const common = {
+    ...(options.observation_timeout_ms === undefined ? {} : {
+      observationTimeoutMs: normalizeManualObservationTimeout(options.observation_timeout_ms),
+    }),
     fixtureSource: path.resolve(options.fixture_source),
     providerBaseUrl: canonicalProviderBaseUrl(options.provider_base_url, providerProfile),
     providerProfile,
     mainModel: modelIdentity(options.main_model, "main_model"),
     configureMainViaGui: options.configure_main_via_gui ?? false,
+    ...(apiKeyEnv === "" ? {} : { apiKeyEnv }),
+    ...(sideApiKeyEnv === "" ? {} : { sideApiKeyEnv }),
+    ...approve,
   };
   if (providerProfile === OPENAI_COMPATIBLE_PROFILE) {
-    const legacyFields = ["side_model", "expected_main_variant", "expected_side_variant"]
+    const legacyFields = ["expected_main_variant", "expected_side_variant"]
       .filter((key) => Object.hasOwn(options, key));
     if (legacyFields.length > 0) {
       throw new TypeError(`manual.case5_2 openai_compatible does not accept LM Studio fields: ${legacyFields.join(",")}`);
@@ -442,7 +498,7 @@ export function normalizeCase52Options(options) {
     }
     return Object.freeze({
       ...common,
-      sideModel: common.mainModel,
+      sideModel: options.side_model === undefined ? common.mainModel : modelIdentity(options.side_model, "side_model"),
       expectedMainVariant: null,
       expectedSideVariant: null,
       providerLifecycle: EXTERNAL_UNMANAGED_LIFECYCLE,
@@ -474,10 +530,11 @@ export function case52FixtureConfig(options) {
     ? `provider_profile = "openai_compatible"`
     : `provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"`;
+  const approveConnection = options.approveModel === undefined ? "" : `\n[approve]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.approveModel)}\nprovider_profile = ${JSON.stringify(options.providerProfile)}\napi_key_env = ${JSON.stringify(options.approveApiKeyEnv)}\n`;
   return `[model]
 base_url = ${JSON.stringify(initialBaseUrl)}
 model = ${JSON.stringify(initialModel)}
-${providerConnection}
+${!options.configureMainViaGui && options.apiKeyEnv ? `api_key_env = ${JSON.stringify(options.apiKeyEnv)}\n` : ""}${providerConnection}
 connect_timeout_ms = 10000
 request_timeout_ms = ${QUALITY_REQUEST_TIMEOUT_MS}
 max_retries = 0
@@ -486,6 +543,7 @@ supports_tools = true
 supports_images = true
 parallel_tool_calls = false
 max_parallel_predictions = 1
+${approveConnection}
 [permissions]
 access_mode = "auto_review"
 
@@ -501,6 +559,12 @@ enabled = false
 [mcp]
 enabled = false
 `;
+}
+
+export function case52Stage5Options(options) {
+  return options.providerProfile === OPENAI_COMPATIBLE_PROFILE || options.sideModel === options.mainModel
+    ? options
+    : Object.freeze({ ...options, sideModel: options.mainModel });
 }
 
 async function fileIdentity(candidate, { includeBytes = false } = {}) {
@@ -607,14 +671,28 @@ function providerEndpoint(baseUrl, pathname) {
   return new URL(pathname.replace(/^\/+/, ""), `${baseUrl}/`).toString();
 }
 
-async function providerJson(baseUrl, pathname, { method = "GET", body = undefined, timeoutMs = 300_000 } = {}) {
+export function case52ProviderHeaders(apiKeyEnv = "", environment = process.env) {
+  if (apiKeyEnv === "") return {};
+  if (typeof apiKeyEnv !== "string" || !/^[A-Za-z0-9_]+$/.test(apiKeyEnv)) throw new TypeError("invalid provider API key environment variable name");
+  const value = environment[apiKeyEnv];
+  if (typeof value !== "string" || value.trim() === "") throw new DesktopE2eError("environment", "case5_2-api-key-missing", `provider API key environment variable is unavailable: ${apiKeyEnv}`, { api_key_env: apiKeyEnv });
+  return { authorization: `Bearer ${value.trim()}` };
+}
+
+export function case52ExternalEnvironment(apiKeyEnv = "", environment = process.env) {
+  const references = new Set((Array.isArray(apiKeyEnv) ? apiKeyEnv : [apiKeyEnv])
+    .filter(name => name !== "").map(name => name.toLowerCase()));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !references.has(key.toLowerCase())));
+}
+
+async function providerJson(baseUrl, pathname, { method = "GET", body = undefined, timeoutMs = 300_000, apiKeyEnv = "" } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
   try {
     const response = await fetch(providerEndpoint(baseUrl, pathname), {
       method,
-      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      headers: { ...case52ProviderHeaders(apiKeyEnv), ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: controller.signal,
     });
@@ -623,7 +701,7 @@ async function providerJson(baseUrl, pathname, { method = "GET", body = undefine
     try { value = text.length === 0 ? null : JSON.parse(text); }
     catch { throw new Error(`provider returned non-JSON HTTP ${response.status}`); }
     if (!response.ok) {
-      throw new Error(`provider returned HTTP ${response.status}: ${text.slice(0, 1000)}`);
+      throw new Error(`provider returned HTTP ${response.status}${apiKeyEnv === "" ? `: ${text.slice(0, 1000)}` : ""}`);
     }
     return { endpoint: response.url, status: response.status, elapsed_ms: Date.now() - started, value };
   } finally {
@@ -639,9 +717,12 @@ function exactCatalogRow(snapshot, key) {
   return matches[0];
 }
 
-async function providerSnapshot(options) {
+async function providerSnapshot(options, observationBudget = null) {
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
-    const models = await providerJson(options.providerBaseUrl, "/models");
+    const models = await providerJson(options.providerBaseUrl, "/models", {
+      apiKeyEnv: options.apiKeyEnv,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 provider checkpoint", 300_000),
+    });
     return {
       captured_at: new Date().toISOString(),
       provider_profile: options.providerProfile,
@@ -649,8 +730,10 @@ async function providerSnapshot(options) {
     };
   }
   const [v1, v0] = await Promise.all([
-    providerJson(options.providerBaseUrl, "/api/v1/models"),
-    providerJson(options.providerBaseUrl, "/api/v0/models"),
+    providerJson(options.providerBaseUrl, "/api/v1/models", { apiKeyEnv: options.apiKeyEnv,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 provider checkpoint", 300_000) }),
+    providerJson(options.providerBaseUrl, "/api/v0/models", { apiKeyEnv: options.apiKeyEnv,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 provider checkpoint", 300_000) }),
   ]);
   return { captured_at: new Date().toISOString(), v1, v0 };
 }
@@ -678,10 +761,12 @@ export function case52ProviderModelState(snapshot, options) {
     if (!Array.isArray(rows)) throw new Error("OpenAI-compatible /v1/models catalog is invalid");
     const matches = rows.filter((row) => row?.id === options.mainModel);
     const main = matches.length === 1 ? matches[0] : null;
+    const sideMatches = rows.filter((row) => row?.id === (options.sideModel ?? options.mainModel));
     return {
       main,
-      side: main,
+      side: sideMatches.length === 1 ? sideMatches[0] : null,
       main_match_count: matches.length,
+      side_match_count: sideMatches.length,
       context_capacity: openAiContextCapacity(main),
     };
   }
@@ -816,6 +901,9 @@ function providerCatalogFailures(state, options, { mainLoaded, expectedLoadedCon
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
     if (state.main_match_count !== 1 || state.main?.id !== options.mainModel) {
       failures.push("main-model-exact-catalog-mismatch");
+    }
+    if (state.side_match_count !== 1 || state.side?.id !== (options.sideModel ?? options.mainModel)) {
+      failures.push("side-model-exact-catalog-mismatch");
     }
     if (state.context_capacity?.conflict === true) failures.push("main-context-capacity-conflict");
     if (Number.isInteger(state.context_capacity?.effective)
@@ -990,6 +1078,7 @@ export async function loadMainProvider({ options, sink, state, phase, providerIo
   const issueLoad = providerIo.load ?? ((body) => providerJson(options.providerBaseUrl, "/api/v1/models/load", {
     method: "POST",
     body,
+    apiKeyEnv: options.apiKeyEnv,
   }));
   const response = await issueLoad(request);
   state.providerLoadResponseObserved = true;
@@ -1117,6 +1206,7 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
   const unloadInstance = providerIo.unload ?? ((instanceId) => providerJson(options.providerBaseUrl, "/api/v1/models/unload", {
     method: "POST",
     body: { instance_id: instanceId },
+    apiKeyEnv: options.apiKeyEnv,
   }));
   const wait = providerIo.delay ?? delay;
   const now = providerIo.now ?? (() => Date.now());
@@ -1267,6 +1357,7 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
 }
 
 async function runOwnedExternalProcess({ context, executable, args, cwd, env, timeoutMs, state, label }) {
+  timeoutMs = case52ObservationTimeout(state.observationBudget, label, timeoutMs);
   const outputRoot = path.join(context.paths.logs, "external-process-output");
   await mkdir(outputRoot, { recursive: true });
   const stdoutPath = path.join(outputRoot, `${label}.stdout.raw`);
@@ -1401,7 +1492,7 @@ export async function readCase52ExternalOutput(candidate, expected) {
   }
 }
 
-async function ownedProcessEnvironment(context, label, extra = {}) {
+async function ownedProcessEnvironment(context, label, extra = {}, apiKeyEnv = "") {
   if (typeof label !== "string" || !/^[a-z0-9][a-z0-9._-]{1,95}$/.test(label)) {
     throw new TypeError(`invalid external process label: ${label}`);
   }
@@ -1423,7 +1514,7 @@ async function ownedProcessEnvironment(context, label, extra = {}) {
     throw new TypeError(`external process caller cannot override execution-owned ${override}`);
   }
   return {
-    ...process.env,
+    ...case52ExternalEnvironment(apiKeyEnv),
     ...extra,
     TEMP: temporary,
     TMP: temporary,
@@ -1457,7 +1548,7 @@ async function resolveExecutable(name, state, context) {
     executable: where,
     args: [name],
     cwd: context.root,
-    env: await ownedProcessEnvironment(context, `resolve-${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`),
+    env: await ownedProcessEnvironment(context, `resolve-${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`, {}, state.credentialEnvNames),
     timeoutMs: 10_000,
     state,
     label: `resolve-${name}`,
@@ -1715,7 +1806,7 @@ async function pythonSiteRoots(python, context, state) {
     env: await ownedProcessEnvironment(context, "python-site-roots", {
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONPYCACHEPREFIX: path.join(context.paths.logs, "python-site-probe-cache"),
-    }),
+    }, state.credentialEnvNames),
     timeoutMs: 30_000,
     state,
     label: "python-site-roots",
@@ -1755,9 +1846,9 @@ async function desktopProjection(cdp) {
   return invokeDesktopCommand(cdp, "desktop_state");
 }
 
-async function trustedClick(input, locator, { stableHitSamples = 1 } = {}) {
+async function trustedClick(input, locator, { stableHitSamples = 1, beforeDispatch } = {}) {
   const start = (await input.snapshotProbe()).sequence;
-  const target = await input.click(locator, { stableHitSamples });
+  const target = await input.click(locator, { stableHitSamples, beforeDispatch });
   const snapshot = await input.snapshotProbe(start);
   const probe = assertTrustedProbeSequence(snapshot, {
     afterSequence: start,
@@ -1770,8 +1861,8 @@ async function trustedClick(input, locator, { stableHitSamples = 1 } = {}) {
   return { target, probe };
 }
 
-async function recordTrustedClick({ input, locator, action, sink, stableHitSamples = 1 }) {
-  const acquisition = await trustedClick(input, locator, { stableHitSamples });
+async function recordTrustedClick({ input, locator, action, sink, stableHitSamples = 1, beforeDispatch }) {
+  const acquisition = await trustedClick(input, locator, { stableHitSamples, beforeDispatch });
   await sink.record("case5_2-trusted-action", { action, input_kind: "browser_trusted", ...acquisition }, {
     phase: "executing",
     owner: OWNER,
@@ -1874,7 +1965,50 @@ async function transcriptExports(workspace) {
   }
 }
 
-async function exportCanonicalTranscript({ context, input, sink, sessionId, prompts }) {
+export function case52TranscriptExportResult(markdown, { sessionId, prompts, terminalProjection }) {
+  const text = markdown.replaceAll("\r\n", "\n");
+  const metadataStart = text.lastIndexOf("<details><summary>実行情報</summary>\n\n");
+  const metadata = metadataStart < 0 ? null
+    : text.slice(metadataStart).match(/^<details><summary>実行情報<\/summary>\n\n([\s\S]*)\n<\/details>\s*$/);
+  const sessions = metadata === null ? [] : [...metadata[1].matchAll(/^- Session: `([^`\n]+)`$/gm)];
+  const exportedSessionId = sessions.length === 1 ? sessions[0][1] : null;
+  const rows = terminalProjection?.transcript_rows ?? [];
+  const user = rows.findLast(row => row.row_kind === "user");
+  const assistant = rows.findLast(row => row.row_kind === "assistant");
+  const normalize = body => typeof body === "string" ? body.replaceAll("\r\n", "\n").trim() : null;
+  const userBody = normalize(user?.body);
+  const assistantBody = normalize(assistant?.body);
+  let quotedUser = null;
+  // The renderer ends the final turn with its plain Assistant body. Remove that
+  // owned suffix before inspecting the preceding User quote and optional details.
+  const body = metadataStart < 0 ? "" : text.slice(0, metadataStart).trimEnd();
+  if (assistantBody && body.endsWith(`\n\n${assistantBody}`)) {
+    const lines = body.slice(0, -assistantBody.length).trimEnd().split("\n");
+    while (lines.at(-1) === "</details>") {
+      let depth = 1, start = lines.length - 2;
+      for (; start >= 0 && depth > 0; start--) {
+        if (lines[start] === "</details>") depth++;
+        else if (/^<details><summary>.*<\/summary>$/.test(lines[start])) depth--;
+      }
+      if (depth !== 0) break;
+      lines.splice(start + 1);
+      while (lines.at(-1) === "") lines.pop();
+    }
+    let start = lines.length;
+    while (start > 0 && lines[start - 1].startsWith("> ")) start--;
+    if (start < lines.length && lines[start - 1] === "") {
+      quotedUser = lines.slice(start).map(line => line.slice(2)).join("\n");
+    }
+  }
+  const sameOwner = exportedSessionId === sessionId && terminalProjection?.run_target?.sessionId === sessionId;
+  const visiblePromptStages = sameOwner && quotedUser !== null && quotedUser === userBody
+    ? Object.entries(prompts).filter(([, prompt]) => normalize(prompt.text) === quotedUser).map(([stage]) => stage) : [];
+  return { pass: sameOwner && visiblePromptStages.includes("stage4"),
+    visible_prompt_stages: visiblePromptStages, visible_prompt_scope: "terminal-final-user",
+    exported_session_id: exportedSessionId };
+}
+
+async function exportCanonicalTranscript({ context, input, sink, sessionId, prompts, terminalProjection }) {
   const before = await transcriptExports(context.paths.workspace);
   if (before.length !== 0) {
     throw productFailure("case5_2-transcript-export-not-fresh", "fresh case5_2 workspace already contained a transcript export", {
@@ -1895,14 +2029,13 @@ async function exportCanonicalTranscript({ context, input, sink, sessionId, prom
     accept: (files) => files.length === 1,
   });
   const [file] = observed.value;
-  const text = file.bytes.toString("utf8").replaceAll("\r\n", "\n");
-  const visiblePromptStages = Object.entries(prompts)
-    .filter(([, prompt]) => text.includes(prompt.text.replaceAll("\r\n", "\n").trim()))
-    .map(([stage]) => stage);
-  if (!text.includes(sessionId) || !visiblePromptStages.includes("stage4")) {
+  const content = case52TranscriptExportResult(file.bytes.toString("utf8"), { sessionId, prompts, terminalProjection });
+  const visiblePromptStages = content.visible_prompt_stages;
+  if (!content.pass) {
     throw productFailure("case5_2-transcript-export-content", "visible transcript export did not preserve the same session and final prompt", {
       session_id: sessionId,
       visible_prompt_stages: visiblePromptStages,
+      visible_prompt_scope: content.visible_prompt_scope,
       export_path: file.path,
     });
   }
@@ -1913,6 +2046,7 @@ async function exportCanonicalTranscript({ context, input, sink, sessionId, prom
     evidence,
     session_id: sessionId,
     visible_prompt_stages: visiblePromptStages,
+    visible_prompt_scope: content.visible_prompt_scope,
     elapsed_ms: observed.elapsed_ms,
   }, { phase: "executing", owner: OWNER });
   return { source_path: file.path, evidence, session_id: sessionId };
@@ -1977,16 +2111,8 @@ function mainConnectionDesired(options) {
     baseUrl: options.providerBaseUrl,
     model: options.mainModel,
     providerProfile: options.providerProfile,
-    apiKeyEnv: MAIN_API_KEY_ENV,
+    apiKeyEnv: options.apiKeyEnv ?? MAIN_API_KEY_ENV,
   };
-}
-
-function configValues(projection, overrides = {}) {
-  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
-  return fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
 }
 
 export function case52ExpectedMainGlobalSave(surface, options) {
@@ -1998,12 +2124,12 @@ export function case52ExpectedMainGlobalSave(surface, options) {
   return {
     command: "save_global_config",
     args: {
-      values: configValues(surface.projection, {
+      values: expectedConfigCommandValues(surface.projection, {
         "model.base_url": desired.baseUrl,
         "model.model": desired.model,
         "model.provider_profile": desired.providerProfile,
         "model.api_key_env": desired.apiKeyEnv,
-      }),
+      }, { editedKeys: desired.apiKeyEnv ? ["model.api_key_env"] : [] }),
       expectedTarget: structuredClone(target),
     },
   };
@@ -2017,11 +2143,12 @@ export function case52ExpectedSideGlobalSave(surface, options) {
   return {
     command: "save_global_config",
     args: {
-      values: configValues(surface.projection, {
+      values: expectedConfigCommandValues(surface.projection, {
         "side_chat.base_url": options.providerBaseUrl,
         "side_chat.model": options.sideModel,
         "side_chat.provider_profile": options.providerProfile,
-      }),
+        "side_chat.api_key_env": options.sideApiKeyEnv ?? "",
+      }, { editedKeys: options.sideApiKeyEnv ? ["side_chat.api_key_env"] : [] }),
       expectedTarget: structuredClone(target),
     },
   };
@@ -2329,6 +2456,9 @@ async function configureMainConnectionViaGui({ cdp, input, sink, options, state 
       action: "main-provider-model",
       sink,
     });
+    if (desired.apiKeyEnv !== MAIN_API_KEY_ENV) await replaceExactText({
+      cdp, input, locator: MAIN_API_KEY, text: desired.apiKeyEnv, action: "main-provider-api-key-env", sink,
+    });
     const dirty = await waitForMainPreferencesObservation({
       action: "editing the Main connection draft",
       label: "case5_2 exact dirty Main Preferences",
@@ -2355,7 +2485,7 @@ async function configureMainConnectionViaGui({ cdp, input, sink, options, state 
       accept: (value) => exactMainSettingsControls(value, desired, { dirty: false })
         && advancedConfigTarget(value?.projection?.config_target, baselineTarget)
         && mainConfigurationFailures(value.projection, options).length === 0
-        && configField(value.projection, "model.api_key_env") === MAIN_API_KEY_ENV,
+        && configField(value.projection, "model.api_key_env") === desired.apiKeyEnv,
     });
     const commandSnapshot = await waitForMainPreferencesObservation({
       action: "saving the Main connection command",
@@ -2440,6 +2570,7 @@ async function observeSideSettings(cdp) {
     const section = one('[role="dialog"][aria-labelledby="config-dialog-title"] section#settings-side-chat');
     const profile = one('select#side-chat-provider-profile[data-config-key="side_chat.provider_profile"]');
     const base = one('input#side-chat-base-url[data-config-key="side_chat.base_url"]');
+    const apiKey = one('input#side-chat-api-key-env[data-config-key="side_chat.api_key_env"]');
     const manual = one('input#side-chat-model-manual[data-config-key="side_chat.model"]');
     const details = one('details[data-details-key="side-chat-manual-model"]');
     const save = one('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]');
@@ -2453,6 +2584,7 @@ async function observeSideSettings(cdp) {
       section: { count: section.count, visible: visible(section.node), viewport_visible: viewportVisible(section.node) },
       profile: { count: profile.count, visible: visible(profile.node), viewport_visible: viewportVisible(profile.node), value: profile.node instanceof HTMLSelectElement ? profile.node.value : null, enabled: profile.node instanceof HTMLSelectElement && !profile.node.disabled, options: profile.node instanceof HTMLSelectElement ? Array.from(profile.node.options).map((option) => option.value) : [] },
       base: { count: base.count, visible: visible(base.node), viewport_visible: viewportVisible(base.node), value: base.node instanceof HTMLInputElement ? base.node.value : null, enabled: base.node instanceof HTMLInputElement && !base.node.disabled && !base.node.readOnly },
+      api_key: { count: apiKey.count, visible: visible(apiKey.node), viewport_visible: viewportVisible(apiKey.node), value: apiKey.node instanceof HTMLInputElement ? apiKey.node.value : null, enabled: apiKey.node instanceof HTMLInputElement && !apiKey.node.disabled && !apiKey.node.readOnly },
       manual: { count: manual.count, visible: visible(manual.node), viewport_visible: viewportVisible(manual.node), value: manual.node instanceof HTMLInputElement ? manual.node.value : null, enabled: manual.node instanceof HTMLInputElement && !manual.node.disabled && !manual.node.readOnly },
       details: { count: details.count, visible: visible(details.node), viewport_visible: viewportVisible(details.node), open: details.node instanceof HTMLDetailsElement ? details.node.open : null },
       dirty: Array.from(document.querySelectorAll('[role="dialog"][aria-labelledby="config-dialog-title"] .dirty-badge.visible')).filter(visible).length === 1,
@@ -2478,6 +2610,7 @@ function exactSideChatProjection(projection, options, sessionId) {
     && side.base_url === options.providerBaseUrl
     && side.model === options.sideModel
     && side.provider_profile === options.providerProfile
+    && (side.api_key_env ?? "") === (options.sideApiKeyEnv ?? "")
     && side.status === "idle"
     && side.phase === ""
     && side.last_error === ""
@@ -2501,13 +2634,16 @@ export function case52SideScreenshotSurfaceReady(surface, options, sessionId) {
     && surface?.base?.visible === true
     && surface.base.viewport_visible === true
     && surface.base.value === options.providerBaseUrl
+    && surface?.api_key?.visible === true
+    && surface.api_key.viewport_visible === true
+    && surface.api_key.value === (options.sideApiKeyEnv ?? "")
     && surface?.manual?.visible === true
     && surface.manual.viewport_visible === true
     && surface.manual.value === options.sideModel;
 }
 
-async function waitSettingsOverlay(cdp, expected) {
-  return waitForObservation({
+async function waitSettingsOverlay(cdp, expected, observationBudget = null) {
+  return case52WaitForObservation({
     label: `case5_2 Settings overlay ${expected}`,
     timeoutMs: 30_000,
     pollMs: 100,
@@ -2515,17 +2651,18 @@ async function waitSettingsOverlay(cdp, expected) {
     accept: (projection) => projection?.overlay === expected
       && projection?.confirmation_visible === false
       && projection?.confirmation == null,
-  });
+  }, observationBudget);
 }
 
-async function openSideSettings({ cdp, input, sink }) {
+async function openSideSettings({ cdp, input, sink, observationBudget = null }) {
+  observationBudget?.assertRemaining("case5_2 open Side Settings");
   await recordTrustedClick({ input, locator: SHOW_SETTINGS, action: "open-settings", sink });
-  await waitSettingsOverlay(cdp, "config");
+  await waitSettingsOverlay(cdp, "config", observationBudget);
   await recordTrustedClick({ input, locator: SIDE_SETTINGS_NAV, action: "navigate-side-chat-settings", sink });
   return waitForSideScreenshotObservation({
     action: "navigating to Side Chat Settings",
     label: "visible Side Chat Settings section",
-    timeoutMs: 30_000,
+    timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 Side Settings", 30_000),
     pollMs: 100,
     sample: () => observeSideSettings(cdp),
     accept: (surface) => surface.settings.count === 1
@@ -2537,12 +2674,13 @@ async function openSideSettings({ cdp, input, sink }) {
   });
 }
 
-async function closeSettings({ cdp, input, sink }) {
+async function closeSettings({ cdp, input, sink, observationBudget = null }) {
+  observationBudget?.assertRemaining("case5_2 close Settings");
   await recordTrustedClick({ input, locator: CLOSE_SETTINGS, action: "close-settings", sink });
-  await waitSettingsOverlay(cdp, "none");
+  await waitSettingsOverlay(cdp, "none", observationBudget);
 }
 
-async function trustedSelectSideProviderProfile({ cdp, input, sink, options }) {
+async function trustedSelectSideProviderProfile({ cdp, input, sink, options, observationBudget = null }) {
   const initial = await exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector);
   if (initial.count !== 1) throw new Error("Side Chat provider profile target cardinality drifted");
   if (initial.value === options.providerProfile) {
@@ -2566,13 +2704,13 @@ async function trustedSelectSideProviderProfile({ cdp, input, sink, options }) {
       afterSequence: start,
       expected: [{ type: "change", identity: SIDE_PROVIDER_PROFILE.identity }],
     });
-    const settled = await waitForObservation({
+    const settled = await case52WaitForObservation({
       label: `${action} exact value`,
       timeoutMs: 10_000,
       pollMs: 100,
       sample: () => exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector),
       accept: (value) => value.count === 1 && value.value === expected,
-    });
+    }, observationBudget);
     const evidence = { action, expected, probe, final: settled.value };
     selections.push(evidence);
     await sink.record("case5_2-trusted-side-provider-profile", evidence, { phase: "executing", owner: OWNER });
@@ -2601,7 +2739,9 @@ export async function configureSideChat({
   options,
   sessionId,
   evidenceName = "case5_2-side-chat-configured",
+  observationBudget = null,
 }) {
+  observationBudget?.assertRemaining("case5_2 configure Side Chat");
   const before = await desktopProjection(cdp);
   const prior = before?.side_chat?.configured === true ? structuredClone(before.side_chat) : null;
   const replaceBinding = prior !== null && !exactSideChatProjection(before, options, sessionId);
@@ -2613,9 +2753,10 @@ export async function configureSideChat({
   let primaryError = null;
   try {
     await commandProbe.install();
-    const opened = await openSideSettings({ cdp, input, sink });
-    const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
+    const opened = await openSideSettings({ cdp, input, sink, observationBudget });
+    const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options, observationBudget });
     await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
+    await replaceExactText({ cdp, input, locator: SIDE_API_KEY, text: options.sideApiKeyEnv ?? "", action: "side-chat-api-key-env", sink });
     let surface = await observeSideSettings(cdp);
     if (surface.details.open !== true) {
       await recordTrustedClick({
@@ -2625,33 +2766,34 @@ export async function configureSideChat({
         sink,
         stableHitSamples: 3,
       });
-      surface = (await waitForObservation({
+      surface = (await case52WaitForObservation({
         label: "Side Chat manual model input",
         timeoutMs: 10_000,
         pollMs: 100,
         sample: () => observeSideSettings(cdp),
         accept: (value) => value.details.open === true && value.manual.visible === true && value.manual.enabled === true,
-      })).value;
+      }, observationBudget)).value;
     }
     await replaceExactText({ cdp, input, locator: SIDE_MANUAL_MODEL, text: options.sideModel, action: "side-chat-model", sink });
-    const committable = await waitForObservation({
+    const committable = await case52WaitForObservation({
       label: "global Side Chat Settings save admission",
       timeoutMs: 10_000,
       pollMs: 100,
       sample: () => observeSideSettings(cdp),
       accept: (value) => value.profile.value === options.providerProfile
         && value.base.value === options.providerBaseUrl
+        && value.api_key.value === (options.sideApiKeyEnv ?? "")
         && value.manual.value === options.sideModel
         && value.save.count === 1 && value.save.visible === true
         && (value.dirty === false || value.save.enabled === true),
-    });
+    }, observationBudget);
     let saved = committable;
     if (committable.value.dirty) {
       const expectedSave = case52ExpectedSideGlobalSave(committable.value, options);
       expectedCommands.push(expectedSave);
       const baselineTarget = structuredClone(committable.value.projection.config_target);
       await recordTrustedClick({ input, locator: SAVE_GLOBAL_CONFIG, action: "save-global-side-chat-settings", sink });
-      saved = await waitForObservation({
+      saved = await case52WaitForObservation({
         label: "global Side Chat Settings saved",
         timeoutMs: 60_000,
         pollMs: 100,
@@ -2659,30 +2801,32 @@ export async function configureSideChat({
         accept: (value) => value.dirty === false
           && value.profile.value === options.providerProfile
           && value.base.value === options.providerBaseUrl
+          && value.api_key.value === (options.sideApiKeyEnv ?? "")
           && value.manual.value === options.sideModel
           && configField(value.projection, "side_chat.provider_profile") === options.providerProfile
           && configField(value.projection, "side_chat.base_url") === options.providerBaseUrl
           && configField(value.projection, "side_chat.model") === options.sideModel
+          && configField(value.projection, "side_chat.api_key_env") === (options.sideApiKeyEnv ?? "")
           && advancedConfigTarget(value.projection.config_target, baselineTarget)
           && value.fatal_count === 0
           && value.recoverable_error_count === 0
           && value.validation_error_count === 0,
-      });
+      }, observationBudget);
     }
-    await closeSettings({ cdp, input, sink });
+    await closeSettings({ cdp, input, sink, observationBudget });
 
     let deleted = null;
     if (replaceBinding) {
       let deleteSurface = await observeSideSettings(cdp);
       if (!deleteSurface.side_pane.visible) {
         await recordTrustedClick({ input, locator: SHOW_SIDE_CHAT, action: "show-existing-side-chat-for-replacement", sink });
-        deleteSurface = (await waitForObservation({
+        deleteSurface = (await case52WaitForObservation({
           label: "existing Side Chat visible before replacement",
           timeoutMs: 10_000,
           pollMs: 100,
           sample: () => observeSideSettings(cdp),
           accept: (value) => value.side_pane.visible === true && value.delete_trigger.enabled === true,
-        })).value;
+        }, observationBudget)).value;
       }
       const expectedDelete = {
         command: "delete_side_chat",
@@ -2694,15 +2838,15 @@ export async function configureSideChat({
       };
       expectedCommands.push(expectedDelete);
       await recordTrustedClick({ input, locator: REQUEST_DELETE_SIDE_CHAT, action: "request-side-chat-replacement", sink });
-      await waitForObservation({
+      await case52WaitForObservation({
         label: "Side Chat replacement confirmation",
         timeoutMs: 10_000,
         pollMs: 100,
         sample: () => observeSideSettings(cdp),
         accept: (value) => value.delete_dialog.visible === true && value.delete_confirm.enabled === true,
-      });
+      }, observationBudget);
       await recordTrustedClick({ input, locator: CONFIRM_DELETE_SIDE_CHAT, action: "confirm-side-chat-replacement", sink });
-      deleted = await waitForObservation({
+      deleted = await case52WaitForObservation({
         label: "old Side Chat snapshot deleted before replacement",
         timeoutMs: 30_000,
         pollMs: 100,
@@ -2711,7 +2855,7 @@ export async function configureSideChat({
           && projection.side_chat.owner_session_id === sessionId
           && projection.side_chat.chat_id === null
           && projection.side_chat.deleting === false,
-      });
+      }, observationBudget);
     }
 
     let materialized = null;
@@ -2726,7 +2870,7 @@ export async function configureSideChat({
       };
       expectedCommands.push(expectedEnsure);
       await recordTrustedClick({ input, locator: SHOW_SIDE_CHAT, action: "materialize-side-chat-from-global-defaults", sink });
-      materialized = await waitForObservation({
+      materialized = await case52WaitForObservation({
         label: "selected-session Side Chat snapshot materialized from global defaults",
         timeoutMs: 30_000,
         pollMs: 100,
@@ -2735,19 +2879,19 @@ export async function configureSideChat({
           && value.side_pane.visible === true
           && value.fatal_count === 0
           && value.recoverable_error_count === 0,
-      });
+      }, observationBudget);
     }
 
-    const commandObservation = await waitForObservation({
+    const commandObservation = await case52WaitForObservation({
       label: "exact global Side Chat save and snapshot commands",
       timeoutMs: 10_000,
       pollMs: 50,
       sample: () => commandProbe.snapshot(),
       accept: (snapshot) => snapshot.calls.length >= expectedCommands.length,
-    });
+    }, observationBudget);
     const commands = assertExactDesktopCommandSequence(commandObservation.value, { expected: expectedCommands });
 
-    await openSideSettings({ cdp, input, sink });
+    await openSideSettings({ cdp, input, sink, observationBudget });
     surface = await observeSideSettings(cdp);
     if (surface.details.open !== true) {
       await recordTrustedClick({
@@ -2761,7 +2905,7 @@ export async function configureSideChat({
     const screenshotSurface = await waitForSideScreenshotObservation({
       action: "showing the materialized Side Chat global defaults",
       label: "visible global Side Chat Settings and selected-session snapshot",
-      timeoutMs: 10_000,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 Side Settings screenshot", 10_000),
       pollMs: 100,
       sample: () => observeSideSettings(cdp),
       accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
@@ -2772,6 +2916,7 @@ export async function configureSideChat({
       base_url: options.providerBaseUrl,
       model: options.sideModel,
       provider_profile: options.providerProfile,
+      api_key_env: options.sideApiKeyEnv ?? "",
       provider_profile_selection: providerProfile,
       prior_binding: prior,
       replaced_binding: replaceBinding,
@@ -2783,7 +2928,7 @@ export async function configureSideChat({
       screenshot_surface: screenshotSurface.value,
       screenshot,
     }, { phase: "executing", owner: OWNER });
-    await closeSettings({ cdp, input, sink });
+    await closeSettings({ cdp, input, sink, observationBudget });
     const projection = await desktopProjection(cdp);
     if (!exactSideChatProjection(projection, options, sessionId)) {
       throw productFailure("case5_2-side-chat-persistence", "the selected-session Side Chat snapshot did not remain attached after global Settings closed", { projection: projection.side_chat });
@@ -2809,12 +2954,12 @@ export async function configureSideChat({
   }
 }
 
-async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId }) {
+async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId, observationBudget = null }) {
   const initial = await desktopProjection(cdp);
   if (!exactSideChatProjection(initial, options, sessionId)) {
     throw productFailure("case5_2-side-chat-restart", "Side Chat configuration was not restored for the same Project Chat after Desktop restart", { side_chat: initial.side_chat });
   }
-  const visible = await openSideSettings({ cdp, input, sink });
+  const visible = await openSideSettings({ cdp, input, sink, observationBudget });
   if (!exactSideChatProjection(visible.value.projection, options, sessionId)
     || visible.value.base.value !== options.providerBaseUrl
     || visible.value.profile.value !== options.providerProfile) {
@@ -2832,14 +2977,14 @@ async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId }) 
   const exact = await waitForSideScreenshotObservation({
     action: "showing the restored Side Chat model",
     label: "restarted Side Chat Settings exact values",
-    timeoutMs: 10_000,
+    timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 restored Side Settings", 10_000),
     pollMs: 100,
     sample: () => observeSideSettings(cdp),
     accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
   });
   const screenshot = await captureScenarioScreenshot({ cdp, sink, name: "case5_2-side-chat-restored", owner: OWNER });
   await sink.record("case5_2-side-chat-restored", { surface: exact.value, screenshot }, { phase: "executing", owner: OWNER });
-  await closeSettings({ cdp, input, sink });
+  await closeSettings({ cdp, input, sink, observationBudget });
 }
 
 function configField(projection, key) {
@@ -2847,11 +2992,22 @@ function configField(projection, key) {
   return rows.length === 1 ? rows[0].value : null;
 }
 
+export function case52ConfiguredApproveFailures(projection, options) {
+  if (options.approveModel === undefined) return [];
+  return [["approve.base_url", options.providerBaseUrl], ["approve.model", options.approveModel],
+    ["approve.provider_profile", options.providerProfile], ["approve.api_key_env", options.approveApiKeyEnv ?? ""]]
+    .flatMap(([key, expected]) => {
+      const actual = configField(projection, key);
+      return actual === expected ? [] : [{ key, expected, actual }];
+    });
+}
+
 function mainConfigurationFailures(projection, options, { sessionRequired = false } = {}) {
-  const failures = [];
+  const failures = case52ConfiguredApproveFailures(projection, options);
   const expectedFields = new Map([
     ["model.base_url", options.providerBaseUrl],
     ["model.model", options.mainModel],
+    ["model.api_key_env", options.apiKeyEnv ?? MAIN_API_KEY_ENV],
     ["model.provider_profile", options.providerProfile],
     ["model.request_timeout_ms", String(QUALITY_REQUEST_TIMEOUT_MS)],
     ["model.max_retries", "0"],
@@ -2870,6 +3026,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
   for (const [key, expected, actual] of [
     ["provider_effective_base_url", options.providerBaseUrl, projection?.provider_effective_base_url],
     ["provider_effective_model_id", options.mainModel, projection?.provider_effective_model_id],
+    ["provider_effective_api_key_env", options.apiKeyEnv ?? MAIN_API_KEY_ENV, projection?.provider_effective_api_key_env],
     ["provider_effective_context_window", String(QUALITY_CONTEXT_WINDOW), projection?.provider_effective_context_window],
     ["provider_effective_profile", options.providerProfile, projection?.provider_effective_profile],
   ]) {
@@ -2881,6 +3038,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
       ["session_settings.available", true, settings?.available],
       ["session_settings.base_url", options.providerBaseUrl, settings?.base_url],
       ["session_settings.model", options.mainModel, settings?.model],
+      ["session_settings.api_key_env", options.apiKeyEnv ?? MAIN_API_KEY_ENV, settings?.api_key_env],
       ["session_settings.provider_profile", options.providerProfile, settings?.provider_profile],
       ["session_settings.access_mode", "auto_review", settings?.access_mode],
       ["session_settings.context_window", "", settings?.context_window],
@@ -3069,7 +3227,7 @@ async function stopProviderControlTokenLeak({ cdp, input, sink, stage, projectio
   throw case52ProviderControlTokenLeakFailure(stage, evidence);
 }
 
-async function waitForStageTerminal({ context, cdp, input, sink, baseline, referenceManifest, stage, expectedSessionId, expectedTurnId, expectedPrompt }) {
+async function waitForStageTerminal({ context, cdp, input, sink, baseline, referenceManifest, stage, expectedSessionId, expectedTurnId, expectedPrompt, observationBudget = null }) {
   const started = Date.now();
   let nextManifestAt = started;
   let nextProgressAt = started + PROGRESS_EVIDENCE_MS;
@@ -3082,7 +3240,11 @@ async function waitForStageTerminal({ context, cdp, input, sink, baseline, refer
   };
   let lastProjection = null;
   while (Date.now() - started < STAGE_TIMEOUT_MS) {
-    const projection = await desktopProjection(cdp);
+    const projection = observationBudget === null ? await desktopProjection(cdp)
+      : (await case52WaitForObservation({
+        label: `${stage.id} Desktop projection`, timeoutMs: 55_000, pollMs: 100,
+        sample: () => desktopProjection(cdp), accept: () => true, retrySampleErrors: false,
+      }, observationBudget)).value;
     lastProjection = projection;
     const providerControlTokenLeaks = case52ProviderControlTokenLeaks(projection);
     if (providerControlTokenLeaks.length > 0) {
@@ -3143,7 +3305,7 @@ async function waitForStageTerminal({ context, cdp, input, sink, baseline, refer
       }, { phase: "executing", owner: OWNER });
       nextProgressAt = now + PROGRESS_EVIDENCE_MS;
     }
-    await delay(STAGE_POLL_MS);
+    await delay(case52ObservationTimeout(observationBudget, `${stage.id} terminal observation`, STAGE_POLL_MS));
   }
   throw productFailure("case5_2-stage-timeout", `${stage.id} did not reach a normal terminal before the bounded observation ceiling`, {
     elapsed_ms: Date.now() - started,
@@ -3195,8 +3357,8 @@ export function case52NewTurnAcquisitionAccepted(projection, {
     && rowRevision === previousRevision + 1n;
 }
 
-async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState }) {
-  return waitForObservation({
+async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState, observationBudget = null }) {
+  return case52WaitForObservation({
     label: "case5_2 trusted Send turn acquisition",
     timeoutMs: 30_000,
     pollMs: 100,
@@ -3205,10 +3367,11 @@ async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpected
       expectedSessionId,
       previousExpectedState,
     }),
-  });
+  }, observationBudget);
 }
 
-async function executeStage({ context, cdp, input, sink, baseline, referenceManifest, stage, promptInput, expectedSessionId }) {
+async function executeStage({ context, cdp, input, sink, baseline, referenceManifest, stage, promptInput, expectedSessionId, observationBudget = null }) {
+  observationBudget?.assertRemaining(`${stage.id} preparation`);
   const prompt = promptInput.text;
   const wirePrompt = prompt.trim();
   const sourceIdentity = {
@@ -3230,7 +3393,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
   await insertExactText({ cdp, input, locator: PROMPT, text: prompt, action: `${stage.id}-prompt`, sink });
   let consecutiveOwnerMatches = 0;
   let lastMatchingRunTarget = null;
-  const composerSettlement = await waitForObservation({
+  const composerSettlement = await case52WaitForObservation({
     label: `case5_2 ${stage.id} GUI new-request composer settlement`,
     timeoutMs: 30_000,
     pollMs: 100,
@@ -3262,7 +3425,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       lastMatchingRunTarget = structuredClone(expectedRunTarget);
       return consecutiveOwnerMatches >= 2;
     },
-  });
+  }, observationBudget);
   const settledProjection = composerSettlement.value.projection;
   const settledRunTarget = composerSettlement.value.backend_run_target;
   const settledDraftTarget = composerSettlement.value.backend_draft_target;
@@ -3304,14 +3467,18 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       action: `${stage.id}-send`,
       sink,
       stableHitSamples: 3,
+      beforeDispatch: () => {
+        observationBudget?.beginOnce();
+        observationBudget?.assertRemaining(`${stage.id} Main Send`);
+      },
     });
-    const commandObservation = await waitForObservation({
+    const commandObservation = await case52WaitForObservation({
       label: `case5_2 ${stage.id} exact trusted Send command`,
       timeoutMs: 10_000,
       pollMs: 50,
       sample: () => sendCommandProbe.snapshot(commandStart),
       accept: (snapshot) => snapshot.calls.length >= 1,
-    });
+    }, observationBudget);
     sendCommand = assertExactDesktopCommandSequence(commandObservation.value, {
       afterSequence: commandStart,
       expected: [{
@@ -3332,11 +3499,12 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       expected_target: settledDraftTarget,
       expected_run_target: settledRunTarget,
       cancel_run_count: 0,
+      observation_budget: observationBudget?.snapshot() ?? null,
     }, { phase: "executing", owner: OWNER });
   } finally {
     await sendCommandProbe.remove();
   }
-  const acquired = await waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState });
+  const acquired = await waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState, observationBudget });
   const acquiredProjection = acquired.value;
   const row = selectedSessionRow(acquiredProjection);
   const sessionId = row.session_id;
@@ -3358,6 +3526,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     send,
     send_command_sequence: sendCommand?.last_sequence ?? null,
     acquisition_elapsed_ms: acquired.elapsed_ms,
+    observation_budget: observationBudget?.snapshot() ?? null,
   }, { phase: "executing", owner: OWNER });
   const terminal = await waitForStageTerminal({
     context,
@@ -3370,6 +3539,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     expectedSessionId: sessionId,
     expectedTurnId: turnId,
     expectedPrompt: wirePrompt,
+    observationBudget,
   });
   const terminalIdentity = selectedNavigationIdentity(terminal.projection);
   const screenshot = await captureScenarioScreenshot({ cdp, sink, name: `case5_2-${stage.id}-terminal`, owner: OWNER });
@@ -3383,6 +3553,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     monitor: terminal.monitor,
     projection: projectionIdentity,
     screenshot,
+    observation_budget: observationBudget?.snapshot() ?? null,
   }, { phase: "executing", owner: OWNER });
   return {
     stage: stage.id,
@@ -3430,7 +3601,7 @@ async function runPythonTest({ context, sink, state, python, name, cwd, args, ex
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONPYCACHEPREFIX: cacheRoot,
       ...extraEnv,
-    }),
+    }, state.credentialEnvNames),
     timeoutMs: 30 * 60 * 1000,
     state,
     label: name,
@@ -3533,7 +3704,7 @@ async function runWorkspaceStableEvaluator({
   });
 }
 
-async function runFinalEvaluator({
+export async function runFinalEvaluator({
   context,
   sink,
   state,
@@ -3541,15 +3712,17 @@ async function runFinalEvaluator({
   baseline,
   preEvaluationManifest,
   oracleIdentity,
-}) {
-  const publicEvaluation = await runWorkspaceStableEvaluator({
+}, injected = {}) {
+  const io = { runWorkspaceStableEvaluator, runPythonTest, assertOracleIdentity, storeStageManifest,
+    assertEvaluatorWorkspaceStable, ...injected };
+  const publicEvaluation = await io.runWorkspaceStableEvaluator({
     context,
     sink,
     baseline,
     beforeManifest: preEvaluationManifest,
     afterStage: "stage4-post-public-evaluator",
     label: "stage4-public-suite",
-    evaluate: () => runPythonTest({
+    evaluate: () => io.runPythonTest({
       context,
       sink,
       state,
@@ -3563,7 +3736,7 @@ async function runFinalEvaluator({
   const postPublicManifest = publicEvaluation.afterManifest;
   const publicWorkspaceDiff = publicEvaluation.workspaceDiff;
   assertPythonTestWithinBounds("stage4-public-suite", publicSuite);
-  const oracleBefore = await assertOracleIdentity(oracleIdentity, "pre-hidden-evaluator");
+  const oracleBefore = await io.assertOracleIdentity(oracleIdentity, "pre-hidden-evaluator");
   let hiddenOracle = null;
   let oracleAfter = null;
   let finalManifest = null;
@@ -3571,7 +3744,7 @@ async function runFinalEvaluator({
   let primaryHiddenError = null;
   const integrityErrors = [];
   try {
-    hiddenOracle = await runPythonTest({
+    hiddenOracle = await io.runPythonTest({
       context,
       sink,
       state,
@@ -3585,12 +3758,12 @@ async function runFinalEvaluator({
     primaryHiddenError = error;
   }
   try {
-    oracleAfter = await assertOracleIdentity(oracleIdentity, "post-hidden-evaluator");
+    oracleAfter = await io.assertOracleIdentity(oracleIdentity, "post-hidden-evaluator");
   } catch (error) {
     integrityErrors.push({ step: "post-hidden-oracle-identity", error, observation: errorObservation(error) });
   }
   try {
-    finalManifest = await storeStageManifest({
+    finalManifest = await io.storeStageManifest({
       context,
       sink,
       baseline,
@@ -3601,7 +3774,7 @@ async function runFinalEvaluator({
   }
   if (finalManifest !== null) {
     try {
-      hiddenWorkspaceDiff = await assertEvaluatorWorkspaceStable({
+      hiddenWorkspaceDiff = await io.assertEvaluatorWorkspaceStable({
         sink,
         before: postPublicManifest,
         after: finalManifest,
@@ -3658,18 +3831,16 @@ async function runFinalEvaluator({
   };
   const identity = await sink.writeJson("case5_2/evaluation.json", report);
   await sink.record("case5_2-final-evaluation", { identity, report }, { phase: "executing", owner: OWNER });
+  // Defer only the persisted artifact verdict so Stage5 can be observed independently.
   const failures = case52EvaluatorFailures(report);
-  if (failures.length > 0) {
-    throw productFailure("case5_2-final-evaluation", "case5_2 public suite, hidden oracle, or required-document gate failed", { failures, report });
-  }
-  return { report, finalManifest };
+  return { report, finalManifest, failures };
 }
 
-async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeHistory }) {
+async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeHistory, observationBudget = null }) {
   let acceptedSince = null;
   let observed;
   try {
-    observed = await waitForObservation({
+    observed = await case52WaitForObservation({
       label: "case5_2 same-session restart continuity",
       timeoutMs: 60_000,
       pollMs: 100,
@@ -3697,7 +3868,7 @@ async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeH
         return now - acceptedSince >= RESTORE_STABILITY_MS;
       },
       retrySampleErrors: false,
-    });
+    }, observationBudget);
   } catch (error) {
     if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
     throw productFailure(
@@ -3735,10 +3906,11 @@ async function waitForRestartTurnPage({
   requireLatestSuffix,
   previousOffset = null,
   allowCommandPalette = false,
+  observationBudget = null,
 }) {
   let observed;
   try {
-    observed = await waitForObservation({
+    observed = await case52WaitForObservation({
       label: requireLatestSuffix
         ? "case5_2 restarted latest bounded turn page"
         : "case5_2 previous turn page settlement",
@@ -3769,7 +3941,7 @@ async function waitForRestartTurnPage({
         return previousOffset === null || page.metadata.offset !== previousOffset;
       },
       retrySampleErrors: false,
-    });
+    }, observationBudget);
   } catch (error) {
     if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
     throw productFailure(
@@ -3792,7 +3964,7 @@ async function waitForRestartTurnPage({
   return observed;
 }
 
-async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
+async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink, observationBudget = null }) {
   const start = (await input.snapshotProbe()).sequence;
   await input.pressKey("Escape");
   const snapshot = await input.snapshotProbe(start);
@@ -3803,14 +3975,14 @@ async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
       { type: "keyup", key: "Escape", code: "Escape" },
     ],
   });
-  const closed = await waitForObservation({
+  const closed = await case52WaitForObservation({
     label: "case5_2 restart history command palette closed",
     timeoutMs: 10_000,
     pollMs: 100,
     sample: () => desktopProjection(cdp),
     accept: (projection) => projection?.overlay === "none",
     retrySampleErrors: false,
-  });
+  }, observationBudget);
   await sink.record("case5_2-trusted-action", {
     action: "close-restart-history-command-palette",
     input_kind: "browser_trusted",
@@ -3819,14 +3991,14 @@ async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
   }, { phase: "executing", owner: OWNER });
 }
 
-export async function waitForCase52RestartHistoryTarget({ input }) {
+export async function waitForCase52RestartHistoryTarget({ input, observationBudget = null }) {
   let observed;
   try {
     observed = await waitForSemanticTargetSettlement({
       input,
       locator: PREVIOUS_TURN_PAGE,
       label: "case5_2 restart history semantic target",
-      timeoutMs: 10_000,
+      timeoutMs: case52ObservationTimeout(observationBudget, "case5_2 restart history target", 10_000),
       pollMs: 16,
     });
   } catch (error) {
@@ -3856,6 +4028,7 @@ async function expandRestartHistory({
   admissionRevision,
   total,
   limit,
+  observationBudget = null,
 }) {
   const initial = await waitForRestartTurnPage({
     cdp,
@@ -3865,6 +4038,7 @@ async function expandRestartHistory({
     total,
     limit,
     requireLatestSuffix: true,
+    observationBudget,
   });
   if (initial.value.page.decision === "ready") {
     return { projection: initial.value.projection, pages: [], initial: initial.value.page.metadata };
@@ -3876,14 +4050,14 @@ async function expandRestartHistory({
     action: "open-restart-history-command-palette",
     sink,
   });
-  await waitForObservation({
+  await case52WaitForObservation({
     label: "case5_2 restart history command palette",
     timeoutMs: 10_000,
     pollMs: 100,
     sample: () => desktopProjection(cdp),
     accept: (projection) => projection?.overlay === "command_palette",
     retrySampleErrors: false,
-  });
+  }, observationBudget);
   await replaceExactText({
     cdp,
     input,
@@ -3905,7 +4079,7 @@ async function expandRestartHistory({
       );
     }
     const before = current.page.metadata;
-    await waitForCase52RestartHistoryTarget({ input });
+    await waitForCase52RestartHistoryTarget({ input, observationBudget });
     const action = await recordTrustedClick({
       input,
       locator: PREVIOUS_TURN_PAGE,
@@ -3922,6 +4096,7 @@ async function expandRestartHistory({
       requireLatestSuffix: false,
       previousOffset: before.offset,
       allowCommandPalette: true,
+      observationBudget,
     });
     const after = settled.value.page.metadata;
     const failures = case52RestartPreviousPageTransitionFailures({ before, after });
@@ -3946,13 +4121,13 @@ async function expandRestartHistory({
     pages.push({ before, after });
     current = settled.value;
   }
-  await closeCommandPaletteWithTrustedEscape({ cdp, input, sink });
+  await closeCommandPaletteWithTrustedEscape({ cdp, input, sink, observationBudget });
   return { projection: current.projection, pages, initial: initial.value.page.metadata };
 }
 
 export async function providerMustKeepSideUnloaded({ options, sink, state, name, providerIo = {} }) {
   const capture = providerIo.capture ?? (async () => {
-    const snapshot = await providerSnapshot(options);
+    const snapshot = await providerSnapshot(options, state.observationBudget);
     return { snapshot, models: case52ProviderModelState(snapshot, options) };
   });
   const captured = await capture();
@@ -4002,8 +4177,8 @@ export async function providerMustKeepSideUnloaded({ options, sink, state, name,
       captured_at: snapshot.captured_at,
       selected_side_model: options.sideModel,
       same_as_main_model: options.sideModel === options.mainModel,
-      exact_model_present: models.main_match_count === 1,
-      context_capacity: models.context_capacity,
+      exact_model_present: models.side_match_count === 1,
+      main_context_capacity: models.context_capacity,
       provider_load_state: "not-observable-external-unmanaged",
     });
     const failures = providerCatalogFailures(models, options, { mainLoaded: true });
@@ -4099,9 +4274,317 @@ async function cleanupWebviewInput(input, state, label) {
   }
 }
 
+async function verifyCase52Safety({ context, sink, options, state, manifest, name }) {
+  const allPaths = await allWorkspacePaths(context.paths.workspace);
+  const forbidden = case52ForbiddenWorkspacePaths(allPaths);
+  const scopeFailures = finalScopeFailures(manifest, forbidden);
+  const seedFinal = await inventoryCase52CleanSeed(options.fixtureSource);
+  const seedUnchanged = seedFinal.aggregate_sha256 === state.seed.aggregate_sha256 && sameValue(seedFinal.files, state.seed.files);
+  const externalFinal = await externalRootsSnapshot(state.externalRoots);
+  const externalDrift = externalRootDrift(state.externalBaseline, externalFinal);
+  const finalProvider = await providerMustKeepSideUnloaded({ options, sink, state, name: `${name}-terminal` });
+  const safety = {
+    scope_failures: scopeFailures, forbidden_workspace_paths: forbidden, fixture_seed_unchanged: seedUnchanged,
+    fixture_seed_before: { aggregate_sha256: state.seed.aggregate_sha256, file_count: state.seed.file_count, byte_count: state.seed.byte_count },
+    fixture_seed_after: { aggregate_sha256: seedFinal.aggregate_sha256, file_count: seedFinal.file_count, byte_count: seedFinal.byte_count },
+    external_python_environment_drift: externalDrift,
+  };
+  await sink.writeJson(`case5_2/safety-${name}.json`, { safety, external_environment_after: externalFinal });
+  if (scopeFailures.length > 0 || !seedUnchanged || externalDrift.length > 0) {
+    throw productFailure("case5_2-safety-scope", "case5_2 detected forbidden frontend/dependency/workspace-external/fixture mutation", safety);
+  }
+  return { safety, finalProvider };
+}
+
+export async function executeCase52NormalStages({ context, cdp, input, sink, options, state, observationBudget }, injected = {}) {
+  const io = { executeStage, storeStageManifest, configureSideChat, providerMustKeepSideUnloaded,
+    runWorkspaceStableEvaluator, runStage3PublicSuite, ...injected };
+  const stages = [];
+  let referenceManifest = state.baseline;
+  for (const stage of STAGES.slice(0, 3)) {
+    const result = await io.executeStage({ context, cdp, input, sink, baseline: state.baseline, referenceManifest,
+      stage, promptInput: state.promptInputs[stage.id], expectedSessionId: stages[0]?.sessionId ?? null, observationBudget });
+    stages.push(result);
+    if (stage.id === "stage1") {
+      const failures = mainConfigurationFailures(result.terminal, options, { sessionRequired: true });
+      if (failures.length) throw productFailure("case5_2-session-quality-config", "Stage 1 Project Chat did not inherit the exact frozen Main LLM and Quality profile", { failures, session_id: result.sessionId });
+      await io.configureSideChat({ cdp, input, sink, options, sessionId: result.sessionId, observationBudget });
+      await io.providerMustKeepSideUnloaded({ options, sink, state, name: "side-configured-no-request" });
+    }
+    const manifest = await io.storeStageManifest({ context, sink, baseline: state.baseline, stage: stage.id });
+    const failures = stage.id === "stage1" ? case52Stage1ManifestFailures(manifest)
+      : stage.id === "stage2" ? case52Stage2ManifestFailures(referenceManifest, manifest) : [];
+    if (failures.length) throw productFailure(`case5_2-${stage.id}-scope`, `${stage.id} did not preserve its required document scope`, { failures, manifest });
+    referenceManifest = manifest;
+  }
+  const evaluated = await io.runWorkspaceStableEvaluator({ context, sink, baseline: state.baseline,
+    beforeManifest: referenceManifest, afterStage: "stage3-post-evaluator", label: "stage3-public-suite",
+    evaluate: () => io.runStage3PublicSuite({ context, sink, state, python: state.python }) });
+  assertPythonTestWithinBounds("stage3-public-suite", evaluated.result);
+  observationBudget?.assertRemaining("case5_2 Stage3 evaluator settled");
+  if (evaluated.result.exit_code !== 0) throw productFailure("case5_2-stage3-public-suite", "Stage 3 external backend suite failed", evaluated.result);
+  await io.providerMustKeepSideUnloaded({ options, sink, state, name: "stage3-terminal" });
+  return { stage1: stages[0], stage2: stages[1], stage3: stages[2], stage3PostEvaluatorManifest: evaluated.afterManifest };
+}
+
+export function case52RestorationSettings(projection) {
+  const fields = projection?.config_fields;
+  if (!Array.isArray(fields)) throw new TypeError("Stage3 restoration requires its public Settings snapshot");
+  const seen = new Set();
+  return fields.map(row => {
+    if (typeof row?.key !== "string" || typeof row.value !== "string" || seen.has(row.key)
+        || row.sensitive === true && row.value !== "") throw new TypeError("Stage3 restoration Settings must be unique public values with secrets redacted");
+    seen.add(row.key);
+    return { key: row.key, value: row.value, explicit: false };
+  });
+}
+
+export async function settleCase52ObservationTimeout({ cdp, input, sink, observationBudget }, injected = {}) {
+  const dependencies = {
+    observe: () => desktopProjection(cdp),
+    click: (locator, action) => recordTrustedClick({ input, locator, action, sink }),
+    wait: waitForObservation,
+    createProbe: () => new DesktopCommandProbe(cdp, {
+      probeId: "case5-2-observation-stop", commands: ["cancel_run", "cancel_side_chat"],
+    }),
+    ...injected,
+  };
+  const before = await dependencies.observe();
+  const mainActive = before?.busy === true || before?.agent_tree_active === true
+    || before?.task_activity_state === "running" || before?.run_status_key === "running";
+  let mainStop = STOP;
+  if (mainActive && before.confirmation_visible === true) {
+    const request = manualLivePermissionRequest(before);
+    if (before.run_target.permissionConfirmationId !== request.confirmation_id
+      || Boolean(request.request.remote)
+      || before.stop_target?.workspacePath !== before.run_target.workspacePath
+      || before.stop_target?.sessionId !== before.run_target.sessionId) {
+      throw new DesktopE2eError("harness", "case5_2-timeout-permission-owner",
+        "visible permission Stop does not address the active Main owner", { run_target: before.run_target, stop_target: before.stop_target, confirmation_id: before.confirmation_id });
+    }
+    mainStop = manualLivePermissionLocator(request, "stop");
+  }
+  const side = before?.side_chat;
+  const expected = [];
+  if (mainActive) expected.push({ command: "cancel_run", args: { expectedTarget: structuredClone(before.stop_target) } });
+  if (side?.status === "running") expected.push({ command: "cancel_side_chat", args: {
+    ownerSessionId: side.owner_session_id, chatId: side.chat_id, expectedGeneration: side.generation,
+  } });
+  const probe = dependencies.createProbe();
+  await probe.install();
+  let terminal = before;
+  let commands;
+  try {
+    const start = (await probe.snapshot()).sequence;
+    if (mainActive) await dependencies.click(mainStop, "observation-timeout-main-stop");
+    if (side?.status === "running") await dependencies.click({
+      selector: 'aside.side-chat-pane[data-pane-mode="side-chat"] button[data-action="cancel-side-chat"]',
+      identity: { tag: "BUTTON", action: "cancel-side-chat" },
+    }, "observation-timeout-side-cancel");
+    if (expected.length > 0) {
+      terminal = (await dependencies.wait({
+        label: "case5_2 observation timeout Stop settlement", timeoutMs: 120_000, pollMs: 100,
+        retrySampleErrors: false, sample: dependencies.observe,
+        accept: (projection) => {
+          const target = projection?.run_target;
+          const stoppedOwner = before.stop_target;
+          const sameMainOwner = stoppedOwner?.kind === "root"
+            ? target?.workspacePath === stoppedOwner.workspacePath
+                && target.sessionId === stoppedOwner.sessionId
+                && target.expectedState?.kind === "idle"
+                && target.expectedState.latestTurnId === stoppedOwner.latestTurnId
+                && target.expectedState.admissionRevision === stoppedOwner.admissionRevision
+            : stoppedOwner?.kind === "turn"
+              && target?.workspacePath === stoppedOwner.workspacePath
+              && target.sessionId === stoppedOwner.sessionId
+              && target.expectedState?.kind === "idle"
+              && target.expectedState.latestTurnId === stoppedOwner.turnId
+              && target.expectedState.admissionRevision === stoppedOwner.admissionRevision;
+          const mainSettled = !mainActive || (projection?.busy === false
+            && projection.agent_tree_active === false && projection.task_activity_state === "idle"
+            && projection.post_run_refresh_pending === false && projection.background_mutation_pending === false
+            && projection.async_polling_required === false
+            && Array.isArray(projection.pending_async_operations) && projection.pending_async_operations.length === 0
+            && projection.stop_target === null
+            && (stoppedOwner?.kind === "root"
+              || ["cancelled", "completed", "failed"].includes(projection.run_status_key))
+            && sameMainOwner);
+          const currentSide = projection?.side_chat;
+          const sideSettled = side?.status !== "running" || (currentSide?.owner_session_id === side.owner_session_id
+            && currentSide.chat_id === side.chat_id && currentSide.can_cancel === false
+            && ["cancelled", "completed", "failed"].includes(currentSide.status)
+            && (mainActive || isDeepStrictEqual(target, before.run_target)));
+          return mainSettled && sideSettled;
+        },
+      })).value;
+    }
+    const commandSnapshot = await dependencies.wait({
+      label: "case5_2 exact observation timeout commands", timeoutMs: 10_000, pollMs: 50,
+      retrySampleErrors: false, sample: () => probe.snapshot(start),
+      accept: (snapshot) => snapshot.calls.length >= expected.length,
+    });
+    commands = assertExactDesktopCommandSequence(commandSnapshot.value, { afterSequence: start, expected });
+  } finally {
+    await probe.remove();
+  }
+  const evidence = {
+    observation_budget: observationBudget.snapshot(), commands,
+    main_stop_target: mainActive ? before.stop_target : null,
+    side_cancel_target: expected.find((row) => row.command === "cancel_side_chat")?.args ?? null,
+    terminal: { run_target: terminal.run_target, run_status_key: terminal.run_status_key,
+      task_activity_state: terminal.task_activity_state, side_status: terminal.side_chat?.status ?? null },
+  };
+  await sink.record("case5_2-observation-timeout-settled", evidence, { phase: "executing", owner: OWNER });
+  return evidence;
+}
+
+export async function executeCase52FinalStages({
+  context, cdp, input, sink, options, state, stage1, stage2, stage3, stage4,
+  restoredProjection, initialShell, restartShell, restarted, transcript, observationBudget,
+}, injected = {}) {
+  const io = { storeStageManifest, runFinalEvaluator, configureSideChat, providerMustKeepSideUnloaded,
+    executeCase52SideChatStage, assertEvaluatorWorkspaceStable, verifyCase52Safety, ...injected };
+  const stage4Manifest = await io.storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage4" });
+  state.restorationStages.stage4 = "pass";
+  state.restorationStages.hidden_oracle = "running";
+  const evaluated = await io.runFinalEvaluator({
+    context,
+    sink,
+    state,
+    python: state.python,
+    baseline: state.baseline,
+    preEvaluationManifest: stage4Manifest,
+    oracleIdentity: state.oracle,
+  });
+  const evaluation = evaluated.report;
+  const stage4FinalManifest = evaluated.finalManifest;
+  state.restorationStages.hidden_oracle = evaluation.hidden_oracle_pass ? "pass" : "failed";
+  observationBudget?.assertRemaining("case5_2 final evaluators settled");
+
+  await io.verifyCase52Safety({ context, sink, options, state, manifest: stage4FinalManifest, name: "stage4-pre-side-chat" });
+
+  const stage5Options = case52Stage5Options(options);
+  if (stage5Options !== options) {
+    await io.configureSideChat({
+      cdp,
+      input,
+      sink,
+      options: stage5Options,
+      sessionId: stage1.sessionId,
+      evidenceName: "case5_2-side-chat-stage5-reconfigured",
+      observationBudget,
+    });
+  }
+  await io.providerMustKeepSideUnloaded({ options, sink, state, name: "stage5-before-side-send" });
+  state.restorationStages.stage5 = "running";
+  const stage5 = await io.executeCase52SideChatStage({
+    cdp,
+    input,
+    sink,
+    sessionId: stage1.sessionId,
+    providerProfile: stage5Options.providerProfile,
+    providerBaseUrl: stage5Options.providerBaseUrl,
+    model: stage5Options.sideModel,
+    apiKeyEnv: stage5Options.sideApiKeyEnv ?? "",
+    promptInput: state.sidePromptInput,
+    timeoutMs: observationBudget?.assertRemaining("case5_2 Stage5 observation") ?? QUALITY_REQUEST_TIMEOUT_MS,
+    observationBudget,
+  });
+  const stage5Manifest = await io.storeStageManifest({
+    context,
+    sink,
+    baseline: state.baseline,
+    stage: "stage5-post-side-chat",
+  });
+  await io.assertEvaluatorWorkspaceStable({
+    sink,
+    before: stage4FinalManifest,
+    after: stage5Manifest,
+    label: "stage5-side-chat-read-only",
+  });
+  state.restorationStages.stage5 = "pass";
+
+  const { safety, finalProvider } = await io.verifyCase52Safety({ context, sink, options, state, manifest: stage5Manifest, name: "final" });
+
+  const providerEvidence = case52ProviderSummaryEvidence(options, state);
+  const legacySideSummary = case52LegacySideSummaryV1({
+    stage4SideChat: stage4.terminal.side_chat,
+    restoredSideChat: restoredProjection.side_chat,
+    providerSummary: case52SideProviderSummary(options, state.sideProviderSamples),
+  });
+  observationBudget?.assertRemaining("case5_2 final evidence acceptance");
+  const summary = {
+    schema_version: "desktop-e2e.case5_2-summary.v1",
+    options: case52EvidenceOptions(options),
+    observation_budget: observationBudget?.snapshot() ?? null,
+    session_id: stage1.sessionId,
+    stages: [stage1, stage2, stage3, stage4].map((item) => ({
+      stage: item.stage,
+      turn_id: item.turnId,
+      elapsed_ms: item.elapsed_ms,
+    })),
+    stage5: {
+      stage: stage5.stage,
+      elapsed_ms: stage5.elapsed_ms,
+      provider_profile: stage5.binding.provider_profile,
+      model: stage5.binding.model,
+      owner_session_id: stage5.binding.owner_session_id,
+      chat_id: stage5.binding.chat_id,
+      question: stage5.question,
+      answer: stage5.answer,
+      active_context_observation: stage5.active_context_observation,
+      first_progress_latency_ms: stage5.first_progress_latency_ms,
+      command_evidence: stage5.commandEvidence,
+      terminal_screenshot: stage5.terminal_screenshot,
+      terminal_side_chat: stage5.completedSurface.projection.side_chat,
+      request_observation: {
+        trusted_side_send_action_count: 1,
+        trusted_main_submit_action_count: 0,
+        trusted_main_cancel_action_count: 0,
+        trusted_side_cancel_action_count: 0,
+        persisted_message_count: stage5.completedSurface.projection.side_chat.messages.length,
+        provider_generation_request_count: "unverified-no-traffic-ledger",
+      },
+    },
+    restart: restarted.restart,
+    ...legacySideSummary,
+    transcript,
+    evaluation,
+    safety,
+    ...providerEvidence,
+    provider_profile_exact: state.providerProfileExact,
+    provider_profile: options.providerProfile,
+    provider_lifecycle: options.providerLifecycle,
+    provider_extra_body: case52ExtraBodyEvidence(),
+    provider_comparability_deviations: state.providerComparabilityDeviations,
+    provider_effective_load_config: state.acceptedProviderLoad?.response?.value?.load_config ?? null,
+    provider_final: finalProvider.models,
+    quality_adjudication: "manual_rubric_pending",
+    performance: {
+      ...state.performance,
+      initial_shell_observation_ms: initialShell.readiness?.elapsed_ms ?? null,
+      restart_shell_observation_ms: restartShell.readiness?.elapsed_ms ?? null,
+      side_chat_stage5_ms: stage5.elapsed_ms,
+      total_elapsed_ms: elapsedSince(context.manifest.started_at),
+    },
+  };
+  const summaryIdentity = await sink.writeJson("case5_2/summary.json", summary);
+  if (evaluated.failures.length > 0) {
+    throw productFailure("case5_2-final-evaluation", "case5_2 public suite, hidden oracle, or required-document gate failed", {
+      failures: evaluated.failures, report: evaluation, summary: summaryIdentity,
+    });
+  }
+  await sink.record("case5_2-accepted", { summary: summaryIdentity, session_id: stage1.sessionId }, { phase: "executing", owner: OWNER });
+  state.acceptedEnd = true;
+  return { acquisition: "pass", oracle: "pass", manual: "pending" };
+}
+
 export function createCase52Scenario(rawOptions = {}) {
   const options = normalizeCase52Options(rawOptions);
   const state = {
+    observationBudget: options.observationTimeoutMs === undefined ? null
+      : new ManualObservationBudget({ timeoutMs: options.observationTimeoutMs }),
+    credentialEnvNames: [options.apiKeyEnv ?? "", options.sideApiKeyEnv ?? "", options.approveApiKeyEnv ?? ""],
     baseline: null,
     seed: null,
     promptInputs: null,
@@ -4133,6 +4616,9 @@ export function createCase52Scenario(rawOptions = {}) {
     scenarioCleanupFailures: [],
     quiesceOutcome: null,
     acceptedEnd: false,
+    checkpoint: null,
+    restorationStarted: false,
+    restorationStages: { restart: "not_run", stage4: "not_run", stage5: "not_run", hidden_oracle: "not_run" },
     performance: {
       launch_to_ready_ms: null,
       reopen_to_ready_ms: null,
@@ -4145,6 +4631,24 @@ export function createCase52Scenario(rawOptions = {}) {
     databaseRequired: true,
     requestGracefulExit,
     environment: {},
+    restorationCheckpoint() {
+      if (state.checkpoint === null) return null;
+      const stage = state.checkpoint.stage3;
+      return { workspace: state.checkpoint.context.paths.workspace, session_id: stage.sessionId, turn_id: stage.turnId,
+        admission_revision: stage.terminal.run_target.expectedState.admissionRevision,
+        turn_page_total: stage.terminal.turn_page_total, turn_page_limit: stage.terminal.turn_page_limit,
+        project_id: selectedNavigationIdentity(stage.terminal).project_id,
+        config_fields: case52RestorationSettings(stage.terminal) };
+    },
+    restorationReadiness() {
+      return { ready: state.checkpoint !== null && !state.restorationStarted && state.observationBudget?.expired !== true,
+        reason: state.checkpoint === null ? "normal-stage3-not-completed" : state.restorationStarted ? "already-attempted"
+          : state.observationBudget?.expired === true ? "observation-timeout" : null,
+        observation_budget: state.observationBudget?.snapshot() ?? null,
+        stages: structuredClone(state.restorationStages) };
+    },
+    async executeNormal(args) { return this.execute({ ...args, executionPhase: "normal" }); },
+    async executeRestoration(args) { return this.execute({ ...args, executionPhase: "restoration" }); },
     async prepare({ context, sink, phase }) {
       const task = await fileIdentity(path.join(caseDirectory, "task.md"), { includeBytes: true });
       const oracleSource = await fileIdentity(path.join(caseDirectory, "oracle", "test_cancel_contract.py"), { includeBytes: true });
@@ -4266,7 +4770,7 @@ export function createCase52Scenario(rawOptions = {}) {
         external_environment: externalIdentity,
       }, { phase, owner: OWNER });
     },
-    async execute({ context, driver: firstCdp, host, runtime: firstRuntime, sink }) {
+    async execute({ context, driver: firstCdp, host, runtime: firstRuntime, sink, executionPhase = "full", restorationDisposition = "after_cases" }) {
       if (state.baseline === null || state.promptInputs === null || state.sidePromptInput === null
         || state.python === null || state.oracle === null) {
         throw new Error("manual.case5_2 was not prepared");
@@ -4274,15 +4778,28 @@ export function createCase52Scenario(rawOptions = {}) {
       let activeInput = null;
       let activeCdp = firstCdp;
       let primaryError = null;
+      const observationBudget = state.observationBudget;
+      if (!["full", "normal", "restoration"].includes(executionPhase)
+          || executionPhase !== "full" && context.manualSuite?.shared_profile !== true) throw new TypeError("split Case5_2 execution requires its shared suite owner");
+      if (executionPhase === "restoration") {
+        const readiness = this.restorationReadiness();
+        if (!readiness.ready) throw new DesktopE2eError("harness", "case5_2-restoration-not-ready", "saved Stage3 restoration cannot begin", readiness);
+        for (const key of ["workspace", "config_file", "database", "logs"]) {
+          if (context.paths[key] !== state.checkpoint.context.paths[key]) throw new DesktopE2eError("harness", "case5_2-restoration-context", "restoration changed its saved workspace/profile owner", { key });
+        }
+        state.restorationStarted = true;
+        state.quiesceOutcome = null;
+      } else if (state.checkpoint !== null) throw new Error("Case5_2 normal stages cannot run twice");
       try {
-        const initialShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
+        const entryShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
           evidenceOwner: OWNER,
-          screenshotStem: "case5_2-main-shell-ready",
+          screenshotStem: executionPhase === "restoration" ? "case5_2-restoration-shell-ready" : "case5_2-main-shell-ready",
         });
-        state.performance.launch_to_ready_ms = elapsedSince(firstRuntime.launch_started_at);
+        const initialShell = executionPhase === "restoration" ? state.checkpoint.initialShell : entryShell;
+        if (executionPhase !== "restoration") Object.assign(state.performance, case52InitialReadinessPerformance(context, firstRuntime));
         activeInput = new WebviewInput(activeCdp, { probeId: "case5-2-generation-1", maxProbeEvents: 65_536 });
         await activeInput.installProbe();
-        if (options.configureMainViaGui) {
+        if (options.configureMainViaGui && executionPhase !== "restoration") {
           await configureMainConnectionViaGui({
             cdp: activeCdp,
             input: activeInput,
@@ -4299,87 +4816,52 @@ export function createCase52Scenario(rawOptions = {}) {
             projection: initialProjection,
           });
         }
-        if (initialProjection?.side_chat?.configured === true) {
+        if (executionPhase !== "restoration" && initialProjection?.side_chat?.configured === true) {
           throw productFailure("case5_2-side-chat-not-fresh", "fresh case5_2 data unexpectedly contained a Side Chat binding", { side_chat: initialProjection.side_chat });
         }
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "desktop-ready" });
+        await providerMustKeepSideUnloaded({ options, sink, state, name: executionPhase === "restoration" ? "restoration-desktop-ready" : "desktop-ready" });
 
-        const stage1 = await executeStage({
-          context,
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          baseline: state.baseline,
-          referenceManifest: state.baseline,
-          stage: STAGES[0],
-          promptInput: state.promptInputs.stage1,
-          expectedSessionId: null,
-        });
-        const stage1ConfigFailures = mainConfigurationFailures(stage1.terminal, options, { sessionRequired: true });
-        if (stage1ConfigFailures.length > 0) {
-          throw productFailure("case5_2-session-quality-config", "Stage 1 Project Chat did not inherit the exact frozen Main LLM and Quality profile", {
-            failures: stage1ConfigFailures,
-            session_id: stage1.sessionId,
+        let stage1, stage2, stage3, stage3PostEvaluatorManifest;
+        if (executionPhase === "restoration") {
+          ({ stage1, stage2, stage3, stage3PostEvaluatorManifest } = state.checkpoint);
+          const entryManifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "restoration-entry" });
+          await assertEvaluatorWorkspaceStable({ sink, before: stage3PostEvaluatorManifest, after: entryManifest, label: "deferred-restoration-workspace" });
+          await verifyCase52Safety({ context, sink, options, state, manifest: entryManifest, name: "restoration-entry" });
+        } else {
+          ({ stage1, stage2, stage3, stage3PostEvaluatorManifest } = await executeCase52NormalStages({
+            context, cdp: activeCdp, input: activeInput, sink, options, state, observationBudget }));
+        }
+
+        if (executionPhase === "normal") {
+          const { safety } = await verifyCase52Safety({ context, sink, options, state, manifest: stage3PostEvaluatorManifest, name: "normal" });
+          observationBudget?.assertRemaining("case5_2 normal checkpoint acceptance");
+          state.checkpoint = { context: { paths: { ...context.paths } }, stage1, stage2, stage3, stage3PostEvaluatorManifest, initialShell };
+          const checkpointIdentity = await sink.writeJson("case5_2/restoration-checkpoint.json", {
+            schema_version: "desktop-e2e.case5_2-restoration-checkpoint.v1", owner: this.restorationCheckpoint(),
+            stages: [stage1, stage2, stage3], post_evaluator_manifest: stage3PostEvaluatorManifest,
+            profile: { config_file: context.paths.config_file, database: context.paths.database },
+            observation_budget: observationBudget?.snapshot() ?? null,
+            baseline: state.baseline, oracle: state.oracle, python: state.python, prompts: state.promptInputs, side_prompt: state.sidePromptInput,
           });
+          const summary = { schema_version: "desktop-e2e.case5_2-normal-summary.v1", phase: "normal", options: case52EvidenceOptions(options), session_id: stage1.sessionId,
+            stages: [stage1, stage2, stage3].map(item => ({ stage: item.stage, turn_id: item.turnId, elapsed_ms: item.elapsed_ms })),
+            restoration: { status: restorationDisposition === "skip" ? "not_run" : "deferred", reason: restorationDisposition === "skip" ? "explicit-skip" : null,
+              stages: { restart: "not_run", stage4: "not_run", stage5: "not_run", hidden_oracle: "not_run" }, full_case52_pass: false },
+            checkpoint: checkpointIdentity, safety, observation_budget: observationBudget?.snapshot() ?? null,
+            quality_adjudication: "manual_rubric_pending", ...case52ProviderSummaryEvidence(options, state) };
+          const identity = await sink.writeJson("case5_2/normal-summary.json", summary);
+          observationBudget?.assertRemaining("case5_2 normal evidence acceptance");
+          await sink.record("case5_2-normal-accepted", { summary: identity, checkpoint: checkpointIdentity, session_id: stage1.sessionId }, { phase: "executing", owner: OWNER });
+          return { acquisition: "pass", oracle: "pass", manual: "pending" };
         }
-        await configureSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId });
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "side-configured-no-request" });
-        const stage1Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage1" });
-        const stage1Failures = case52Stage1ManifestFailures(stage1Manifest);
-        if (stage1Failures.length > 0) {
-          throw productFailure("case5_2-stage1-scope", "Stage 1 did not produce exactly the required four repository documents", { failures: stage1Failures, manifest: stage1Manifest });
-        }
-
-        const stage2 = await executeStage({
-          context,
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          baseline: state.baseline,
-          referenceManifest: stage1Manifest,
-          stage: STAGES[1],
-          promptInput: state.promptInputs.stage2,
-          expectedSessionId: stage1.sessionId,
-        });
-        const stage2Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage2" });
-        const stage2Failures = case52Stage2ManifestFailures(stage1Manifest, stage2Manifest);
-        if (stage2Failures.length > 0) {
-          throw productFailure("case5_2-stage2-scope", "Stage 2 did not preserve Stage 1 and add only cancel_contract.md", { failures: stage2Failures, manifest: stage2Manifest });
-        }
-
-        const stage3 = await executeStage({
-          context,
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          baseline: state.baseline,
-          referenceManifest: stage2Manifest,
-          stage: STAGES[2],
-          promptInput: state.promptInputs.stage3,
-          expectedSessionId: stage1.sessionId,
-        });
-        const stage3Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage3" });
-        const stage3Evaluation = await runWorkspaceStableEvaluator({
-          context,
-          sink,
-          baseline: state.baseline,
-          beforeManifest: stage3Manifest,
-          afterStage: "stage3-post-evaluator",
-          label: "stage3-public-suite",
-          evaluate: () => runStage3PublicSuite({ context, sink, state, python: state.python }),
-        });
-        const stage3Suite = stage3Evaluation.result;
-        const stage3PostEvaluatorManifest = stage3Evaluation.afterManifest;
-        assertPythonTestWithinBounds("stage3-public-suite", stage3Suite);
-        if (stage3Suite.exit_code !== 0) {
-          throw productFailure("case5_2-stage3-public-suite", "Stage 3 external backend suite failed", stage3Suite);
-        }
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "stage3-terminal" });
 
         await cleanupWebviewInput(activeInput, state, "generation-1-before-restart");
         activeInput = null;
+        observationBudget?.assertRemaining("case5_2 Desktop restart");
+        state.restorationStages.restart = "running";
         const restarted = await host.restart({ context, scenario: this, sink, driver: activeCdp, phase: "executing" });
         activeCdp = restarted.driver;
+        observationBudget?.assertRemaining("case5_2 Desktop restarted");
         const restartShell = await acquireInteractiveShell({ context, driver: activeCdp, sink }, {
           evidenceOwner: OWNER,
           screenshotStem: "case5_2-restart-shell-ready",
@@ -4413,6 +4895,7 @@ export function createCase52Scenario(rawOptions = {}) {
           admissionRevision: stage3Owner.admissionRevision,
           total: stage3.terminal.turn_page_total,
           limit: stage3.terminal.turn_page_limit,
+          observationBudget,
         });
         const restored = await stableRestartProjection({
           cdp: activeCdp,
@@ -4420,6 +4903,7 @@ export function createCase52Scenario(rawOptions = {}) {
           turnId: stage3.turnId,
           prompt: stage3.wirePrompt,
           beforeHistory: stage3.history,
+          observationBudget,
         });
         const restoredProjection = restored.value;
         const restoreConfigFailures = mainConfigurationFailures(restoredProjection, options, { sessionRequired: true });
@@ -4445,9 +4929,11 @@ export function createCase52Scenario(rawOptions = {}) {
           screenshot: restartScreenshot,
         }, { phase: "executing", owner: OWNER });
 
-        await verifyRestoredSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId });
+        await verifyRestoredSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId, observationBudget });
         await providerMustKeepSideUnloaded({ options, sink, state, name: "restart-side-restored-no-request" });
+        state.restorationStages.restart = "pass";
 
+        state.restorationStages.stage4 = "running";
         const stage4 = await executeStage({
           context,
           cdp: activeCdp,
@@ -4458,6 +4944,7 @@ export function createCase52Scenario(rawOptions = {}) {
           stage: STAGES[3],
           promptInput: state.promptInputs.stage4,
           expectedSessionId: stage1.sessionId,
+          observationBudget,
         });
         if (!exactSideChatProjection(stage4.terminal, options, stage1.sessionId)) {
           throw productFailure("case5_2-side-chat-final-drift", "Side Chat binding or empty persisted state drifted during Stage 4", {
@@ -4476,153 +4963,30 @@ export function createCase52Scenario(rawOptions = {}) {
           sink,
           sessionId: stage1.sessionId,
           prompts: state.promptInputs,
+          terminalProjection: stage4.terminal,
         });
-        const stage4Manifest = await storeStageManifest({ context, sink, baseline: state.baseline, stage: "stage4" });
-        const evaluated = await runFinalEvaluator({
-          context,
-          sink,
-          state,
-          python: state.python,
-          baseline: state.baseline,
-          preEvaluationManifest: stage4Manifest,
-          oracleIdentity: state.oracle,
+        return await executeCase52FinalStages({
+          context, cdp: activeCdp, input: activeInput, sink, options, state, stage1, stage2, stage3, stage4,
+          restoredProjection, initialShell, restartShell, restarted, transcript, observationBudget,
         });
-        const evaluation = evaluated.report;
-        const stage4FinalManifest = evaluated.finalManifest;
-
-        const stage5Options = options.sideModel === options.mainModel
-          ? options
-          : Object.freeze({ ...options, sideModel: options.mainModel });
-        if (stage5Options !== options) {
-          await configureSideChat({
-            cdp: activeCdp,
-            input: activeInput,
-            sink,
-            options: stage5Options,
-            sessionId: stage1.sessionId,
-            evidenceName: "case5_2-side-chat-stage5-reconfigured",
-          });
-        }
-        await providerMustKeepSideUnloaded({ options, sink, state, name: "stage5-before-side-send" });
-        const stage5 = await executeCase52SideChatStage({
-          cdp: activeCdp,
-          input: activeInput,
-          sink,
-          sessionId: stage1.sessionId,
-          providerProfile: stage5Options.providerProfile,
-          providerBaseUrl: stage5Options.providerBaseUrl,
-          model: stage5Options.sideModel,
-          promptInput: state.sidePromptInput,
-          timeoutMs: QUALITY_REQUEST_TIMEOUT_MS,
-        });
-        const stage5Manifest = await storeStageManifest({
-          context,
-          sink,
-          baseline: state.baseline,
-          stage: "stage5-post-side-chat",
-        });
-        await assertEvaluatorWorkspaceStable({
-          sink,
-          before: stage4FinalManifest,
-          after: stage5Manifest,
-          label: "stage5-side-chat-read-only",
-        });
-
-        const allPaths = await allWorkspacePaths(context.paths.workspace);
-        const forbidden = case52ForbiddenWorkspacePaths(allPaths);
-        const scopeFailures = finalScopeFailures(stage5Manifest, forbidden);
-        const seedFinal = await inventoryCase52CleanSeed(options.fixtureSource);
-        const seedUnchanged = seedFinal.aggregate_sha256 === state.seed.aggregate_sha256
-          && sameValue(seedFinal.files, state.seed.files);
-        const externalFinal = await externalRootsSnapshot(state.externalRoots);
-        const externalDrift = externalRootDrift(state.externalBaseline, externalFinal);
-        const finalProvider = await providerMustKeepSideUnloaded({ options, sink, state, name: "final-terminal" });
-        const safety = {
-          scope_failures: scopeFailures,
-          forbidden_workspace_paths: forbidden,
-          fixture_seed_unchanged: seedUnchanged,
-          fixture_seed_before: {
-            aggregate_sha256: state.seed.aggregate_sha256,
-            file_count: state.seed.file_count,
-            byte_count: state.seed.byte_count,
-          },
-          fixture_seed_after: {
-            aggregate_sha256: seedFinal.aggregate_sha256,
-            file_count: seedFinal.file_count,
-            byte_count: seedFinal.byte_count,
-          },
-          external_python_environment_drift: externalDrift,
-        };
-        await sink.writeJson("case5_2/safety-final.json", { safety, external_environment_after: externalFinal });
-        if (scopeFailures.length > 0 || !seedUnchanged || externalDrift.length > 0) {
-          throw productFailure("case5_2-safety-scope", "case5_2 detected forbidden frontend/dependency/workspace-external/fixture mutation", safety);
-        }
-
-        const providerEvidence = case52ProviderSummaryEvidence(options, state);
-        const legacySideSummary = case52LegacySideSummaryV1({
-          stage4SideChat: stage4.terminal.side_chat,
-          restoredSideChat: restoredProjection.side_chat,
-          providerSummary: case52SideProviderSummary(options, state.sideProviderSamples),
-        });
-        const summary = {
-          schema_version: "desktop-e2e.case5_2-summary.v1",
-          options: case52EvidenceOptions(options),
-          session_id: stage1.sessionId,
-          stages: [stage1, stage2, stage3, stage4].map((item) => ({
-            stage: item.stage,
-            turn_id: item.turnId,
-            elapsed_ms: item.elapsed_ms,
-          })),
-          stage5: {
-            stage: stage5.stage,
-            elapsed_ms: stage5.elapsed_ms,
-            provider_profile: stage5.binding.provider_profile,
-            model: stage5.binding.model,
-            owner_session_id: stage5.binding.owner_session_id,
-            chat_id: stage5.binding.chat_id,
-            question: stage5.question,
-            answer: stage5.answer,
-            active_context_observation: stage5.active_context_observation,
-            first_progress_latency_ms: stage5.first_progress_latency_ms,
-            command_evidence: stage5.commandEvidence,
-            terminal_screenshot: stage5.terminal_screenshot,
-            terminal_side_chat: stage5.completedSurface.projection.side_chat,
-            request_observation: {
-              trusted_side_send_action_count: 1,
-              trusted_main_submit_action_count: 0,
-              trusted_main_cancel_action_count: 0,
-              trusted_side_cancel_action_count: 0,
-              persisted_message_count: stage5.completedSurface.projection.side_chat.messages.length,
-              provider_generation_request_count: "unverified-no-traffic-ledger",
-            },
-          },
-          restart: restarted.restart,
-          ...legacySideSummary,
-          transcript,
-          evaluation,
-          safety,
-          ...providerEvidence,
-          provider_profile_exact: state.providerProfileExact,
-          provider_profile: options.providerProfile,
-          provider_lifecycle: options.providerLifecycle,
-          provider_extra_body: case52ExtraBodyEvidence(),
-          provider_comparability_deviations: state.providerComparabilityDeviations,
-          provider_effective_load_config: state.acceptedProviderLoad?.response?.value?.load_config ?? null,
-          provider_final: finalProvider.models,
-          quality_adjudication: "manual_rubric_pending",
-          performance: {
-            ...state.performance,
-            initial_shell_observation_ms: initialShell.readiness?.elapsed_ms ?? null,
-            restart_shell_observation_ms: restartShell.readiness?.elapsed_ms ?? null,
-            side_chat_stage5_ms: stage5.elapsed_ms,
-            total_elapsed_ms: elapsedSince(context.manifest.started_at),
-          },
-        };
-        const summaryIdentity = await sink.writeJson("case5_2/summary.json", summary);
-        await sink.record("case5_2-accepted", { summary: summaryIdentity, session_id: stage1.sessionId }, { phase: "executing", owner: OWNER });
-        state.acceptedEnd = true;
-        return { acquisition: "pass", oracle: "pass", manual: "pending" };
       } catch (error) {
+        for (const [stage, status] of Object.entries(state.restorationStages)) if (status === "running") state.restorationStages[stage] = "failed";
+        if (observationBudget?.expired === true) {
+          const timeout = productFailure("case5_2-observation-timeout", "case5_2 exhausted its shared observation budget", {
+            ...observationBudget.snapshot(), cause: errorObservation(error),
+          });
+          try {
+            timeout.evidence.settlement = await settleCase52ObservationTimeout({
+              cdp: activeCdp, input: activeInput, sink, observationBudget,
+            });
+          } catch (settlementError) {
+            error = new DesktopE2eError("harness", "case5_2-observation-timeout-stop",
+              "case5_2 observation ended, but its exact GUI Stop and terminal settlement failed", {
+                observed_product_failure: errorObservation(timeout), settlement_error: errorObservation(settlementError),
+              });
+          }
+          if (error?.code !== "case5_2-observation-timeout-stop") error = timeout;
+        }
         primaryError = error;
         throw error;
       } finally {

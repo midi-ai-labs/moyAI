@@ -170,7 +170,7 @@ export function providerResponsesProgressDecision(sample) {
     && projection?.run_status_key === "running"
     && projection?.task_activity_state === "running"
     && projection?.busy === true
-    && projection?.run_phase === "Provider応答受信中"
+    && projection?.run_phase === "AIの回答を受信中"
     ? "pass"
     : "pending";
 }

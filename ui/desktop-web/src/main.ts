@@ -1,5 +1,24 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
+import { acceptHubProjection, hubPresentation } from "./hub_state.ts";
+import { acceptDeviceNetworkProjection, deviceNetworkPresentation } from "./device_network_state.ts";
+import { synchronizeDeviceNetworkControls } from "./device_network_dom.ts";
+import { refreshDeviceNetworkJobs } from "./device_network_actions.ts";
+import { refreshSharedWork } from "./shared_work_actions.ts";
+import { refreshReceiverActivity } from "./receiver_activity.ts";
+import { refreshOriginWork } from "./origin_work.ts";
+import { refreshDeviceExecution } from "./device_execution.ts";
+import { sharedEditorFocusIntent, sharedWorkPresentation } from "./shared_work_state.ts";
+import { applyLocalMessageEditHandoff } from "./local_revision_source.ts";
+import { retainSharedWorkSurface } from "./shared_work_render.ts";
+import { shouldRetainSharedWorkMain } from "./shared_work_retention.ts";
+import "./shared_work.css";
+import { refreshMcpHistory } from "./mcp_history_actions.ts";
+import { invalidateMcpHistory, mcpHistoryPresentation } from "./mcp_history_state.ts";
+import { synchronizeMcpHistorySurface } from "./mcp_history_dom.ts";
+import { mcpActivityPresentation } from "./mcp_activity.ts";
+import { clearMcpPeerToken, mcpPeerPresentation, refreshMcpPeers } from "./mcp_peer.ts";
+import { synchronizeHubControlValues } from "./hub_dom.ts";
 import { cancelRunCommand, interruptSessionCommand } from "./stop_contract";
 import { agentActivityRowsChanged, selectedAgentActivityChanged } from "./agent_activity";
 import {
@@ -42,6 +61,7 @@ import {
   syncResolvedInactiveThreadViewport,
   ThreadTailFollowAffinity,
   type PendingHistoryPrepend,
+  revealHistoryAnchor,
 } from "./history_navigation";
 import { commandConflictState, commandInternalState } from "./command_error";
 import type { ActionContext } from "./actions";
@@ -127,7 +147,7 @@ import {
   type DesktopRenderModel,
 } from "./render_projection";
 import { isRegularModalOverlay, localModalIdentity, modalIdentity, modalIsOpen } from "./modal_state";
-import { autoRefreshAllowed, runtimePollingRequired } from "./polling_state";
+import { autoRefreshAllowed, createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation, runtimePollingRequired } from "./polling_state";
 import {
   reconcileTaskActivityAnimationEpoch,
   taskActivityAnimationDelay,
@@ -153,6 +173,7 @@ import {
   type SettledNewSessionFocusContinuation,
 } from "./session_interaction_state";
 import {
+  createRefreshPromptFocusIntent,
   refreshPromptFocusContinuationAccepted,
   retainConnectedMainPrompt,
   takePendingRefreshPromptFocus,
@@ -167,6 +188,8 @@ import {
 import {
   settingsActionFocusCandidates,
   settingsActionFocusStillTargets,
+  restoreSettingsActionViewport,
+  type SettingsActionFocusContinuation,
   settingsCloseTargetStillMatches,
   settingsRecoverableErrorOwnerIdentity,
   sameSettingsSurface,
@@ -185,6 +208,7 @@ import {
 } from "./side_chat_focus_continuation";
 import {
   beginPermissionDecision,
+  permissionDecisionCommandTarget,
   beginPermissionStop,
   failPermissionDecision,
   finishLocalDecision,
@@ -215,13 +239,28 @@ import {
   rejectDraftMutation,
 } from "./view_state";
 import "./styles.css";
+import "./hub_surface.css";
+import "./device_network_surface.css";
+import "./mcp_history_surface.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 const desktopWindow = getCurrentWindow();
 let currentState: DesktopWebState | null = null;
 let lastRenderedState: DesktopViewState | null = null;
 let lastRenderedModel: DesktopRenderModel | null = null;
-let polling = false;
+const refresh = createSnapshotRefresh(async () => {
+  try {
+    acceptState(await command<DesktopWebState>("desktop_state"), false);
+    await refreshDeviceNetworkJobs(eventContext);
+    await refreshSharedWork(eventContext);
+    await refreshDeviceExecution(eventContext);
+    await refreshReceiverActivity(eventContext);
+    await refreshOriginWork(eventContext);
+    await refreshMcpHistory(eventContext);
+  } catch (error) {
+    reportError(error);
+  }
+});
 let previousSessionKey = "";
 let lastRenderedLocalModalIdentity: string | null = null;
 let splashDismissed = false;
@@ -251,6 +290,7 @@ interface StateUpdate {
   sequence: number;
   draftSnapshot: DraftMutationSnapshot | null;
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null;
+  settingsAction: SettingsActionFocusContinuation | null;
 }
 
 const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, candidate) =>
@@ -293,7 +333,7 @@ const eventContext: ActionContext = {
   getRenderModel: () => currentState
     ? buildDesktopRenderModel(projectViewState(currentState, uiState))
     : null,
-  acceptProjection: (state: DesktopWebState, forceRender = true) => acceptState(state, forceRender),
+  acceptProjection: (state: DesktopWebState, forceRender = true, settingsAction) => acceptState(state, forceRender, null, false, null, null, settingsAction ?? null),
   waitForInteractionIdle: () => interactionLifecycle.whenIdle(),
   rerender: () => {
     if (currentState) acceptState(currentState, true);
@@ -324,31 +364,17 @@ installInteractionEventGate({
 installComposerFocusInteractionInvalidation();
 installWindowMaximizedSync();
 void refresh();
-window.setInterval(() => {
-  if (
+void installSnapshotInvalidation(
+  onChanged => desktopWindow.listen("desktop-state-changed", onChanged),
+  refresh,
+).catch(reportError);
+installRuntimePolling(window, document, () => Boolean(
     currentState
-    && runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending)
+    && (currentState.hub_project_open === true || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || Boolean(uiState.sharedWork.projection?.hub_url) || uiState.deviceNetwork.projection?.enrollment === "active" || Boolean(uiState.deviceNetwork.receiverActivity?.attempts.length || uiState.deviceNetwork.receiverActivity?.retained_services.length) || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
     && shouldAutoRefresh(currentState)
-  ) {
-    void refresh();
-  }
-}, 600);
+), refresh);
 
 installGlobalKeyboardShortcuts(eventContext);
-
-async function refresh(): Promise<void> {
-  if (polling) {
-    return;
-  }
-  polling = true;
-  try {
-    acceptState(await command<DesktopWebState>("desktop_state"), false);
-  } catch (error) {
-    reportError(error);
-  } finally {
-    polling = false;
-  }
-}
 
 async function mutate(
   name: string,
@@ -744,6 +770,7 @@ function jumpToHistoryAnchor(anchorId: string): void {
   );
   if (!thread || !target) return;
   noteUserThreadScrollAway();
+  revealHistoryAnchor(target);
   const top = thread.scrollTop
     + target.getBoundingClientRect().top
     - thread.getBoundingClientRect().top
@@ -779,6 +806,7 @@ function acceptState(
   scheduleNavigation = false,
   draftSnapshot: DraftMutationSnapshot | null = null,
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null = null,
+  settingsAction: SettingsActionFocusContinuation | null = null,
 ): void {
   const update: StateUpdate = {
     state,
@@ -788,6 +816,7 @@ function acceptState(
     sequence: nextStateSequence++,
     draftSnapshot,
     refreshPromptFocusContinuation,
+    settingsAction,
   };
   applyStateUpdate(update);
 }
@@ -819,7 +848,21 @@ function applyStateUpdate(update: StateUpdate): void {
     )
   ) return;
   const previousProjection = currentState;
+  if (update.state !== previousProjection && update.state.hub) {
+    acceptHubProjection(uiState.hub, update.state.hub);
+  }
+  if (update.state !== previousProjection && update.state.device_network) {
+    acceptDeviceNetworkProjection(uiState.deviceNetwork, update.state.device_network);
+  }
+  if (previousProjection?.overlay === "hub" && update.state.overlay !== "hub") ++uiState.deviceNetwork.jobsSerial;
+  if (previousProjection?.overlay === "mcp_history" && update.state.overlay !== "mcp_history") invalidateMcpHistory(uiState.mcpHistory);
+  if (previousProjection?.overlay === "config" && update.state.overlay !== "config") {
+    clearMcpPeerToken();
+    ++uiState.mcpPeers.serial;
+    uiState.mcpPeers.pending = null;
+  }
   reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
+  applyLocalMessageEditHandoff(uiState, update.state);
   reconcileSettingsFlowState(update.state);
   reconcileAgentPaneState(uiState, update.state);
   const viewState = projectViewState(update.state, uiState);
@@ -842,11 +885,13 @@ function applyStateUpdate(update: StateUpdate): void {
       update.mutationName,
       update.refreshPromptFocusContinuation,
       attachmentFocusDecision,
+      update.settingsAction,
     );
   }
   if (update.scheduleNavigation) {
     scheduleNavigationRefresh(update.state);
   }
+  if (previousProjection?.overlay !== "config" && update.state.overlay === "config") void refreshMcpPeers(eventContext);
 }
 
 function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
@@ -865,6 +910,12 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     text: uiState.configDraftBaselineValues.get(field.key) ?? field.value,
   }));
   return createDesktopRenderModel(state, {
+    hub: hubPresentation(uiState.hub),
+    deviceNetwork: deviceNetworkPresentation(uiState.deviceNetwork),
+    sharedWork: sharedWorkPresentation(uiState.sharedWork),
+    localMessageEdit: { pending: uiState.localMessageEdit.pending, error: uiState.localMessageEdit.error },
+    mcpHistory: mcpHistoryPresentation(uiState.mcpHistory),
+    mcpPeers: mcpPeerPresentation(uiState.mcpPeers),
     artifactPane: {
       collapsed: uiState.artifactPaneCollapsed,
       mode: uiState.artifactPaneMode,
@@ -881,6 +932,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     doclingReadinessRequestPending: doclingReadinessRequestPending(uiState),
     initialSetup: {
       step: uiState.initialSetup.step,
+      guided: uiState.initialSetup.guided,
       finishPending: initialSetupFinishPending(uiState.initialSetup),
       auxiliaryPendingKind: initialSetupAuxiliaryPendingKind(
         uiState.initialSetupAuxiliary,
@@ -944,7 +996,7 @@ function reconcileSettingsFlowState(state: DesktopWebState): void {
     state.config_target,
   );
   if (state.startup.initial_setup_required && setupTarget !== null) {
-    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget);
+    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget, state.startup.onboarding_intent === "personal");
   }
 
   const sessionProjection = state.session_settings;
@@ -989,8 +1041,10 @@ function renderCommitted(
   mutationName: string | null,
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null,
   attachmentFocusDecision: AttachmentFocusDecision,
+  settingsAction: SettingsActionFocusContinuation | null,
 ): void {
   const state = model.view;
+  postRenderFocusArbiter.settleBeforeRender();
   const revealGeneration = ++threadEndRevealGeneration;
   const postRenderFocusIntents: PostRenderFocusIntent[] = [];
   const postRenderFocusResultHandlers: Array<(result: FocusArbiterResult) => void> = [];
@@ -1026,7 +1080,15 @@ function renderCommitted(
     uiState.taskActivityAnimationEpoch,
     renderNowMs,
   );
+  uiState.mcpActivityAnimationEpoch = reconcileTaskActivityAnimationEpoch(
+    uiState.mcpActivityAnimationEpoch,
+    { activityState: mcpActivityPresentation(state.mcp_activity)?.state ?? "idle",
+      workspacePath: "mcp-receiver", sessionId: null, runtimeOwnerToken: "root:1",
+      runStartMutationPending: false, nowMs: renderNowMs },
+  );
+  const mcpActivityDelay = taskActivityAnimationDelay(uiState.mcpActivityAnimationEpoch, renderNowMs);
   const previous = lastRenderedState;
+  const previousSharedWork = lastRenderedModel?.local.sharedWork ?? null;
   const runFocusDecision = reconcileMainRunFocusContinuation(
     uiState.mainRunFocusContinuation,
     previous,
@@ -1188,6 +1250,9 @@ function renderCommitted(
   const previousPrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   const previousThreadScrollTop = previousThread?.scrollTop ?? 0;
   const previousThreadWasNearEnd = previousThread ? isThreadNearEnd(previousThread) : true;
+  const previousThreadEndGap = previousThread
+    ? Math.max(0, previousThread.scrollHeight - previousThread.clientHeight - previousThreadScrollTop)
+    : 0;
   const previousSessionInteractionOwner = previous ? composerSessionOwner(previous) : null;
   const nextSessionInteractionOwner = composerSessionOwner(state);
   const restorePromptFocusAfterRefresh = refreshPromptFocusContinuationAccepted(
@@ -1286,9 +1351,24 @@ function renderCommitted(
   const renderedMarkup = renderDesktopMarkup(model, {
     backgroundInert,
     taskActivityDelay,
+    mcpActivityDelay,
   });
   let retainedConnectedSettings = false;
   let retainedConnectedPrompt = false;
+  if (shouldRetainSharedWorkMain(lastRenderedState, state, lastRenderedLocalModalIdentity, renderedLocalModalIdentity, backgroundInert)) {
+    const currentShared = appRoot.querySelector<HTMLElement>(".shared-work");
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextShared = template.content.querySelector<HTMLElement>(".shared-work");
+    if (currentShared && nextShared) {
+      retainedConnectedSettings = retainSharedWorkSurface(currentShared, nextShared);
+      if (retainedConnectedSettings) {
+        const sidebar = appRoot.querySelector<HTMLElement>(".sidebar");
+        const nextSidebar = template.content.querySelector<HTMLElement>(".sidebar");
+        if (sidebar && nextSidebar && !sidebar.isEqualNode(nextSidebar)) sidebar.replaceWith(nextSidebar);
+      }
+    }
+  }
   if (currentSettingsModal && retainingInitialSetup) {
     const template = document.createElement("template");
     template.innerHTML = renderedMarkup;
@@ -1325,14 +1405,20 @@ function renderCommitted(
       if (currentStatus && nextStatus && !currentStatus.contains(document.activeElement)) {
         currentStatus.replaceWith(nextStatus);
       }
-      synchronizeRetainedSettingsSurface(
+      if (state.overlay === "mcp_history") synchronizeMcpHistorySurface(currentSettingsModal, nextSettingsModal);
+      else synchronizeRetainedSettingsSurface(
         currentSettingsModal,
         nextSettingsModal,
-        model.local.configMutationPending || model.local.sessionSettings.mutationPending,
-        state.overlay === "session_settings"
+        model.local.configMutationPending || model.local.sessionSettings.mutationPending
+          || ((state.overlay === "hub" || state.overlay === "config") && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null)),
+        state.overlay === "hub" ? false : state.overlay === "session_settings"
           ? !model.local.sessionSettings.dirty
           : !uiState.configDirty,
       );
+      if (state.overlay === "hub" || state.overlay === "config") {
+        synchronizeHubControlValues(currentSettingsModal, nextSettingsModal);
+        synchronizeDeviceNetworkControls(currentSettingsModal, nextSettingsModal);
+      }
       retainedConnectedSettings = true;
     }
   }
@@ -1365,6 +1451,7 @@ function renderCommitted(
   }
   const thread = document.querySelector<HTMLElement>("#thread");
   let sessionThreadInteractionAfterLayout: SessionInteractionSnapshot | null = null;
+  let threadScrollTopAfterLayout: number | null = null;
   let pinnedToEnd = false;
   if (thread && prependViewportAnchor && restoreViewportAnchor(thread, prependViewportAnchor)) {
     // Preserve the visible message while an older bounded history chunk is prepended.
@@ -1377,7 +1464,7 @@ function renderCommitted(
     revealThreadEnd(revealGeneration);
     pinnedToEnd = true;
   } else if (thread && previousThread) {
-    restoreThreadPosition(thread, previousThreadScrollTop);
+    threadScrollTopAfterLayout = previousThreadScrollTop;
   }
   previousSessionKey = nextSessionKey;
   lastRenderedLocalModalIdentity = renderedLocalModalIdentity;
@@ -1388,6 +1475,9 @@ function renderCommitted(
     restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
   }
   restoreScrollSnapshots(scrollSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
+  const acceptedSettingsAction = restoreSettingsActionViewport(
+    settingsAction, previous, state, (selector) => document.querySelector<HTMLElement>(selector),
+  ) ? settingsAction : null;
   if (
     agentExecutionPrependDecision.restoreViewport
     && agentExecutionPrependOwnerMatches(
@@ -1412,7 +1502,7 @@ function renderCommitted(
   );
   const focusSnapshotReserved = focusSnapshotIntent !== null;
   if (focusSnapshotIntent) postRenderFocusIntents.push(focusSnapshotIntent);
-  const settingsActionFocusContinuation = uiState.settingsActionFocusContinuation;
+  const settingsActionFocusContinuation = acceptedSettingsAction ?? uiState.settingsActionFocusContinuation;
   uiState.settingsActionFocusContinuation = null;
   const settingsActionModal = settingsActionFocusContinuation
     && settingsActionFocusStillTargets(settingsActionFocusContinuation, state)
@@ -1524,6 +1614,16 @@ function renderCommitted(
   }
   if (thread && sessionThreadInteractionAfterLayout) {
     restoreSessionThreadInteraction(sessionThreadInteractionAfterLayout, thread);
+  } else if (thread && threadScrollTopAfterLayout !== null) {
+    // Restore after composer layout, before another projection can capture the replacement's
+    // temporary zero offset. A queued frame can otherwise restore an already detached thread.
+    // A pane width change can reflow the same conversation. Keep its near-tail distance so
+    // layout alone does not turn the viewport into an older-history position.
+    const scrollTop = previousThreadWasNearEnd
+      && previousSessionInteractionOwner === nextSessionInteractionOwner
+      ? Math.max(0, thread.scrollHeight - thread.clientHeight - previousThreadEndGap)
+      : threadScrollTopAfterLayout;
+    restoreScrollPosition(thread, thread.scrollLeft, scrollTop);
   }
   if (promptSessionInteraction) {
     const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
@@ -1540,21 +1640,15 @@ function renderCommitted(
     const refreshFocusOwners = Array.from(
       document.querySelectorAll<HTMLElement>('[data-action="refresh"]'),
     );
-    postRenderFocusIntents.push({
-      source: "refresh-prompt",
-      priority: "operation-return",
-      claim: { kind: "yield-from", owners: refreshFocusOwners },
-      candidates: [{
-        resolve: () => {
-          const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
-          return prompt === previousPrompt ? prompt : null;
-        },
-        settle: (target) => {
-          if (promptSessionInteraction && target instanceof HTMLTextAreaElement) {
-            restoreSessionPromptInteraction(promptSessionInteraction, target);
-          }
-        },
-      }],
+    postRenderFocusIntents.push(createRefreshPromptFocusIntent({
+      prompt: previousPrompt,
+      resolvePrompt: () => document.querySelector<HTMLTextAreaElement>("#prompt"),
+      refreshOwners: refreshFocusOwners,
+      settle: (target) => {
+        if (promptSessionInteraction && target instanceof HTMLTextAreaElement) {
+          restoreSessionPromptInteraction(promptSessionInteraction, target);
+        }
+      },
       isCurrent: () => (
         lastRenderedState === settledState
         && uiState.refreshPromptFocusInteractionGeneration === settledContinuation.interactionGeneration
@@ -1562,7 +1656,7 @@ function renderCommitted(
         && previousPrompt.isConnected
         && !previousPrompt.disabled
       ),
-    });
+    }));
   }
   if (quickChatDeleteFocusDecision.focusTarget && !focusSnapshotReserved) {
     const settledState = state;
@@ -1700,6 +1794,13 @@ function renderCommitted(
     pendingNewSessionPromptFocus,
   );
   if (requestedPromptFocus) postRenderFocusIntents.push(requestedPromptFocus);
+  const sharedEditorFocus = state.hub_project_open && state.overlay === "none"
+    ? sharedEditorFocusIntent(previousSharedWork, model.local.sharedWork,
+      () => lastRenderedModel === model && currentState?.hub_project_open && currentState.overlay === "none"
+        ? sharedWorkPresentation(uiState.sharedWork) : null,
+      selector => document.querySelector<HTMLElement>(selector))
+    : null;
+  if (sharedEditorFocus) postRenderFocusIntents.push(sharedEditorFocus);
   if (
     selectedAgentNeedsRefresh
     && uiState.selectedAgentPath
@@ -2282,13 +2383,13 @@ async function submitPermissionDecision(decision: PermissionReviewDecision): Pro
   const confirmationId = currentState?.confirmation_visible
     ? currentState.confirmation_id
     : null;
-  const submission = beginPermissionDecision(uiState, confirmationId, decision);
+  const submission = beginPermissionDecision(uiState, confirmationId, decision, currentState?.confirmation?.remote ?? null);
   if (submission === null) return;
   if (currentState) acceptState(currentState, true);
   try {
     const state = await command<DesktopWebState>("answer_permission", {
       decision,
-      confirmationId: submission.requestId,
+      ...permissionDecisionCommandTarget(submission),
     });
     let settlementApplied = false;
     if (
@@ -2551,13 +2652,6 @@ function wireThreadTailFollowEvents(thread: HTMLElement): void {
       observeUserViewport();
     }
   });
-}
-
-function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {
-  const scroll = () => {
-    thread.scrollTop = Math.min(scrollTop, Math.max(0, thread.scrollHeight - thread.clientHeight));
-  };
-  requestAnimationFrame(scroll);
 }
 
 function shouldAutoRefresh(state: DesktopWebState): boolean {

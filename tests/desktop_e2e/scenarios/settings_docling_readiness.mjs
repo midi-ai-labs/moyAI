@@ -374,6 +374,7 @@ export function createSettingsDoclingReadinessScenario() {
           decide: readinessDecision((surface, ledger) => preferencesReady(surface, ledger, {
             contextWindow: DOCLING_READINESS_CONTEXT_WINDOW,
             doclingEnabled: true,
+            systemPrompt: "",
           })),
           code: "docling-readiness-preferences-not-ready",
           message: "Preferences did not open with the clean enabled Docling fixture",

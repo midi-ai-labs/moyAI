@@ -1,0 +1,178 @@
+//! Hub-managed device identities and explicit peer selection.
+//!
+//! Shared configuration carries public trust only. Private device credentials,
+//! runtime grants and receiver authority are never model configuration.
+
+mod client;
+mod diagnostics;
+mod execution;
+pub use diagnostics::{DeviceDiagnostic, DiagnosticScope};
+pub use execution::{
+    DeviceExecutionCommand, DeviceExecutionProjection, DeviceExecutionState, DeviceProject,
+    ExecutionReview, ReceiverActivityProjection, ReceiverServiceStopTarget, ReceiverStopTarget,
+};
+mod http;
+mod identity;
+mod outgoing;
+mod peer_connections;
+mod receiver;
+pub(crate) mod reset;
+mod service;
+mod shared_work;
+pub use shared_work::{OriginWorkProjection, SharedWorkCommand, SharedWorkProjection};
+pub(crate) use shared_work::{WorkInbox, WorkProject};
+mod settings;
+mod wait;
+pub(crate) use client::{DeviceClient, DeviceGrant, DirectoryPeer};
+pub use client::{GrantClaims, VerifiedGrant};
+pub(crate) use http::ManagedHubHttp;
+pub(crate) use identity::{DeviceIdentity, DeviceIdentityStore};
+pub use outgoing::{DeviceDelegationRow, DeviceNetworkJobs};
+pub(crate) use outgoing::{canonical_key as history_request_key, server_id as history_server_id};
+pub(crate) use service::WeakDeviceNetwork;
+pub use service::{
+    DeviceNetworkProjection, DeviceNetworkService, PreparedDeviceConfiguration, PreparedDeviceReset,
+};
+pub use settings::{
+    DeviceSettings, DeviceSettingsStore, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
+};
+pub(crate) use wait::DeviceWaitResult;
+
+use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+mod config_tests;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedHubConfig {
+    pub hub_url: String,
+    pub ca_certificate_pem: String,
+}
+
+impl SharedHubConfig {
+    pub fn same_ca(&self, other: &Self) -> Result<bool, DeviceError> {
+        let parse = |value: &str| {
+            crate::mcp_publish::tls::public_certificate(value)
+                .map_err(|_| DeviceError::InvalidConfiguration)
+        };
+        Ok(parse(&self.ca_certificate_pem)? == parse(&other.ca_certificate_pem)?)
+    }
+    pub fn configured(&self) -> bool {
+        !self.hub_url.is_empty() || !self.ca_certificate_pem.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<reqwest::Url, DeviceError> {
+        if self.hub_url.len() > 2048 || self.ca_certificate_pem.len() > 65536 {
+            return Err(DeviceError::InvalidConfiguration);
+        }
+        let url =
+            reqwest::Url::parse(&self.hub_url).map_err(|_| DeviceError::InvalidConfiguration)?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(DeviceError::InvalidConfiguration);
+        }
+        crate::mcp_publish::tls::public_certificate(&self.ca_certificate_pem)
+            .map_err(|_| DeviceError::InvalidConfiguration)?;
+        Ok(url)
+    }
+
+    /// Import only public network trust; another machine's model, MCP secrets,
+    /// workspace paths and receiver choices must not be adopted with this file.
+    pub fn import(text: &str) -> Result<Self, DeviceError> {
+        if text.len() > 256 * 1024 {
+            return Err(DeviceError::InvalidConfiguration);
+        }
+        #[derive(Deserialize)]
+        struct Document {
+            device_network: SharedHubConfig,
+        }
+        let document: Document =
+            toml::from_str(text).map_err(|_| DeviceError::InvalidConfiguration)?;
+        document.device_network.validate()?;
+        Ok(document.device_network)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DeviceError {
+    #[error("invalid_configuration")]
+    InvalidConfiguration,
+    #[error("invalid_identity")]
+    InvalidIdentity,
+    #[error("identity_protection_unavailable")]
+    IdentityProtectionUnavailable,
+    #[error("settings_corrupt")]
+    SettingsCorrupt,
+    #[error("settings_changed")]
+    SettingsChanged,
+    #[error("connection_changed")]
+    ConnectionChanged,
+    #[error("different_hub")]
+    DifferentHub,
+    #[error("endpoint_change_busy")]
+    EndpointChangeBusy,
+    #[error("endpoint_change_runner_unconfirmed")]
+    EndpointChangeRunnerUnconfirmed,
+    #[error("store_busy")]
+    StoreBusy,
+    #[error("storage_error")]
+    Storage,
+    #[error("unavailable")]
+    Unavailable,
+    #[error("enrollment_denied")]
+    EnrollmentDenied,
+    #[error("device_revoked")]
+    Revoked,
+    #[error("device_stopped")]
+    Stopped,
+    #[error("device_name_conflict")]
+    DeviceNameConflict,
+    #[error("join_superseded")]
+    JoinSuperseded,
+    #[error("policy_denied")]
+    PolicyDenied,
+    #[error("grant_denied")]
+    GrantDenied,
+    #[error("authority_retired")]
+    AuthorityRetired,
+    #[error("shared_work_required")]
+    SharedWorkRequired,
+    #[error("recovery_required")]
+    RecoveryRequired,
+    #[error("artifacts_unavailable")]
+    ArtifactsUnavailable,
+    #[error("invalid_response")]
+    InvalidResponse,
+    #[error("receiver_busy")]
+    ReceiverBusy,
+    #[error("receiver_port_in_use")]
+    ReceiverPortInUse,
+    #[error("receiver_address_unavailable")]
+    ReceiverAddressUnavailable,
+    #[error("confirmation_required")]
+    ConfirmationRequired,
+    #[error("reset_incomplete")]
+    ResetIncomplete,
+}
+
+pub(crate) fn canonical_revision(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|number| number.to_string() == value)
+}
+
+pub(crate) fn stable_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_:.".contains(&byte))
+}

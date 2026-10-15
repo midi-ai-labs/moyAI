@@ -1,4 +1,5 @@
 pub mod apply_patch;
+pub mod compact_context;
 pub mod context;
 pub mod contract;
 pub mod current_time;
@@ -13,15 +14,21 @@ pub(crate) mod os_sandbox;
 pub(crate) mod permission_guardian;
 pub(crate) mod process;
 pub mod read;
+pub mod read_context;
 pub mod registry;
 pub(crate) mod sandbox_process;
 pub mod search;
+pub(crate) mod shared_delegate;
+pub(crate) mod shared_publish_artifact;
+pub(crate) mod shared_stop_service;
 pub mod shell;
 pub mod skill;
 pub mod spec_plan;
+pub(crate) mod team_work;
 pub(crate) mod text_encoding;
 pub mod truncate;
 pub mod update_plan;
+pub mod wait_remote_tasks;
 pub mod write;
 pub(crate) mod write_support;
 

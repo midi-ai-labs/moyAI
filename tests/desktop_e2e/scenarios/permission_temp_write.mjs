@@ -1,0 +1,2137 @@
+import crypto from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import path from "node:path";
+import { isDeepStrictEqual, promisify } from "node:util";
+import { readdir, readFile, writeFile } from "node:fs/promises";
+
+import { waitForObservation } from "../core/deadline.mjs";
+import { canonicalU64, canonicalUlid } from "../core/canonical_identity.mjs";
+import { DesktopE2eError } from "../core/execution.mjs";
+import {
+  DesktopCommandProbe,
+  assertExactDesktopCommandSequence,
+} from "../drivers/desktop_command_probe.mjs";
+import {
+  SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES,
+  createPermissionTempWriteProviderScript,
+  permissionTempWriteOutputContract,
+  startScriptedProvider,
+} from "../drivers/scripted_provider.mjs";
+import {
+  WebviewInput,
+  assertTrustedProbeSequence,
+  assertTrustedTextInsertion,
+} from "../drivers/webview_input.mjs";
+import { prepareDesktopFixture } from "./fixture.mjs";
+import {
+  classifyAcquiredObservationFailure,
+  observeProviderTurnSurface,
+  quiesceProviderResource,
+} from "./provider_restart.mjs";
+import { captureScenarioScreenshot } from "./observations.mjs";
+import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
+
+const OWNER = "scenario:permission.temp-write";
+const FIXTURE_SENTINEL = "E2E_PERMISSION_TEMP_WRITE.txt";
+const PYTEST_FIXTURE = "test_e2e_owner_only_temp.py";
+const PYTEST_FIXTURE_TEXT = `import os
+import tempfile
+from pathlib import Path
+
+def _check_rw(directory):
+    assert directory.is_dir()
+    target = directory / "rw.txt"
+    target.write_text("temp write", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "temp write"
+    assert "rw.txt" in os.listdir(directory)
+    target.unlink()
+
+def test_cpython_private_and_inherited_temp(tmp_path):
+    _check_rw(tmp_path)
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    _check_rw(private)
+    nested = private / "nested"
+    nested.mkdir(mode=0o700)
+    _check_rw(nested)
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir(mode=0o777)
+    _check_rw(ordinary)
+    with tempfile.TemporaryDirectory() as name:
+        _check_rw(Path(name))
+`;
+const LIVE_REQUEST_TIMEOUT_MS = 180_000;
+const LIVE_TURN_TIMEOUT_MS = 720_000;
+const LIVE_CAPTURE_DIRECTORY = "request-capture";
+const RESPONSES_API_MODE = "responses";
+const CHAT_COMPLETIONS_API_MODE = "chat_completions";
+const LIVE_LM_STUDIO_SCENARIO_ID = "manual.permission-temp-write-lm-studio";
+const LIVE_OPENAI_COMPATIBLE_SCENARIO_ID =
+  "manual.permission-temp-write-openai-compatible";
+const LIVE_OPENAI_COMPATIBLE_SECRET_ENV = "MOYAI_E2E_PERMISSION_TEMP_WRITE_SECRET";
+export const PERMISSION_TEMP_WRITE_SECRET_CANARY = "moyai-e2e-permission-temp-write-secret-canary-7e5b3d9f";
+export const PERMISSION_TEMP_WRITE_TERMINAL_TIMEOUT_MS = 150_000;
+
+export const PERMISSION_TEMP_WRITE_PROMPT = "run the owner only temp regression";
+// A separate no:cacheprovider operand is an unresolved PowerShell provider path.
+// Pytest accepts the same plugin value attached to its short -p option.
+export const PERMISSION_TEMP_WRITE_COMMAND =
+  "python -B -X utf8 -m pytest -pno:cacheprovider -q --tb=short test_e2e_owner_only_temp.py";
+export const PERMISSION_TEMP_WRITE_RESPONSE = "PERMISSION_TEMP_WRITE_OK";
+export const PERMISSION_TEMP_WRITE_REQUEST_TIMEOUT_MS = 120_000;
+export const PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS = 500;
+export const PERMISSION_TEMP_WRITE_LIVE_RESPONSE = "PERMISSION_TEMP_WRITE_LIVE_OK";
+export const PERMISSION_TEMP_WRITE_LIVE_PROMPT = [
+  "Perform this exact bounded TEMP write regression using shell only.",
+  `Call shell exactly once with ${JSON.stringify(PERMISSION_TEMP_WRITE_COMMAND)} and sandbox_permissions=use_default.`,
+  "Do not set TMP, TEMP, or TMPDIR; do not use --basetemp; do not change project files or request elevation.",
+  `After the command reports one passing test, reply only ${PERMISSION_TEMP_WRITE_LIVE_RESPONSE}.`,
+].join("\n");
+const PERMISSION_TEMP_WRITE_ROLES = Object.freeze(["temp_initial", "temp_continuation"]);
+const PROMPT = Object.freeze({
+  selector: "section.composer textarea#prompt",
+  identity: { tag: "TEXTAREA", id: "prompt" },
+});
+const SEND = Object.freeze({
+  selector: 'section.composer button[data-action="send"]',
+  identity: { tag: "BUTTON", action: "send" },
+});
+
+function productFailure(code, message, evidence) {
+  return new DesktopE2eError("product", code, message, evidence);
+}
+
+function harnessFailure(code, message, evidence) {
+  return new DesktopE2eError("harness", code, message, evidence);
+}
+
+function errorObservation(error) {
+  return {
+    name: error?.name ?? "Error",
+    code: error?.code ?? null,
+    message: error?.message ?? String(error),
+    evidence: error?.evidence ?? null,
+  };
+}
+
+function renderedDomTextMatchesAuthority(observed, authority) {
+  if (typeof observed !== "string" || typeof authority !== "string") return false;
+  const normalize = (value) => value.replace(/[\t\n\f\r ]+/gu, " ").trim();
+  return normalize(observed) === normalize(authority);
+}
+
+export function permissionTempWritePythonPreflightFailures(resolvedPython, observed) {
+  const failures = [];
+  const identity = value => path.resolve(value).replaceAll("\\", "/").toLowerCase();
+  if (typeof resolvedPython !== "string" || !path.isAbsolute(resolvedPython)
+    || typeof observed?.executable !== "string" || !path.isAbsolute(observed.executable)) {
+    return ["python-preflight-identity-malformed"];
+  }
+  if (identity(resolvedPython) !== identity(observed.executable)) failures.push("python-preflight-path-mismatch");
+  if (!Array.isArray(observed.version) || observed.version.length !== 3
+    || observed.version[0] !== 3 || observed.version[1] !== 13
+    || !Number.isInteger(observed.version[2])) failures.push("python-preflight-version-mismatch");
+  if (typeof observed.pytest_version !== "string" || !observed.pytest_version.trim()) {
+    failures.push("python-preflight-pytest-missing");
+  }
+  return failures;
+}
+
+async function preparePermissionTempWritePython(sink, phase, owner) {
+  const run = promisify(execFile);
+  try {
+    // The launcher's child environment selects Python. Do not mutate PATH here:
+    // the bare command keeps the ordinary shell classification under test.
+    const resolved = await run("uv", ["python", "find", "--offline", "--system", "3.13"],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 65_536, encoding: "utf8" });
+    const resolvedPython = resolved.stdout.trim();
+    const probe = await run("python", ["-B", "-X", "utf8", "-c",
+      "import json,sys,pytest; print(json.dumps({'executable':sys.executable,'version':list(sys.version_info[:3]),'pytest_version':pytest.__version__}))"],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 65_536, encoding: "utf8" });
+    const observed = JSON.parse(probe.stdout.trim());
+    const failures = permissionTempWritePythonPreflightFailures(resolvedPython, observed);
+    if (resolved.stderr.trim() || probe.stderr.trim()) failures.push("python-preflight-stderr");
+    if (failures.length > 0) throw harnessFailure("permission-temp-python-preflight",
+      "the launcher's bare Python must match the existing uv offline Python 3.13 and import pytest",
+      { resolved_python: resolvedPython, observed, failures });
+    const bytes = await readFile(resolvedPython);
+    await sink.record("permission-temp-python-preflight", { resolved_python: resolvedPython,
+      ...observed, executable_sha256: sha256(bytes), executable_bytes: bytes.byteLength,
+      resolver_arguments: ["python", "find", "--offline", "--system", "3.13"],
+      dependencies_installed: false, environment_changed: false }, { phase, owner });
+  } catch (error) {
+    if (error instanceof DesktopE2eError) throw error;
+    throw harnessFailure("permission-temp-python-preflight", "existing uv/Python/pytest preflight failed",
+      { cause: errorObservation(error) });
+  }
+}
+
+export function permissionTempWriteFixtureConfig(baseUrl) {
+  return `[model]
+base_url = ${JSON.stringify(baseUrl)}
+model = "e2e/scripted-responses"
+provider_profile = "lm_studio"
+connect_timeout_ms = 1000
+request_timeout_ms = ${PERMISSION_TEMP_WRITE_REQUEST_TIMEOUT_MS}
+max_retries = 0
+context_window = 65536
+supports_tools = true
+supports_images = false
+parallel_tool_calls = false
+
+[permissions]
+access_mode = "auto_review"
+
+[multi_agent]
+enabled = false
+mode = "explicit_request_only"
+max_concurrent_agents = 2
+max_concurrent_model_requests = 1
+
+[docling]
+enabled = false
+
+[mcp]
+enabled = false
+`;
+}
+
+function canonicalLiveBaseUrl(value, scenarioId = LIVE_LM_STUDIO_SCENARIO_ID) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError(
+      `${scenarioId} provider_base_url must be a non-empty string`,
+    );
+  }
+  let url;
+  try { url = new URL(value.trim()); }
+  catch (error) {
+    throw new TypeError(
+      `${scenarioId} provider_base_url is invalid: ${error.message}`,
+    );
+  }
+  if (!new Set(["http:", "https:"]).has(url.protocol)
+    || url.username.length > 0
+    || url.password.length > 0
+    || url.search.length > 0
+    || url.hash.length > 0) {
+    throw new TypeError(
+      `${scenarioId} provider_base_url must be one credential-free HTTP(S) endpoint without query or fragment`,
+    );
+  }
+  return url.toString().replace(/\/$/u, "");
+}
+
+function canonicalLiveModel(value, scenarioId = LIVE_LM_STUDIO_SCENARIO_ID) {
+  if (typeof value !== "string") {
+    throw new TypeError(`${scenarioId} model must be a string`);
+  }
+  const normalized = value.trim();
+  if (normalized.length === 0
+    || Buffer.byteLength(normalized, "utf8") > 1024
+    || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new TypeError(
+      `${scenarioId} model must be a non-empty bounded model ID without control characters`,
+    );
+  }
+  return normalized;
+}
+
+function normalizePermissionExternalProviderOptions(options, scenarioId) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError(
+      `${scenarioId} requires one scenario config object`,
+    );
+  }
+  const allowed = new Set(["provider_base_url", "model"]);
+  const unknown = Object.keys(options).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new TypeError(
+      `unknown ${scenarioId} option: ${unknown.join(",")}`,
+    );
+  }
+  return Object.freeze({
+    providerBaseUrl: canonicalLiveBaseUrl(options.provider_base_url, scenarioId),
+    model: canonicalLiveModel(options.model, scenarioId),
+  });
+}
+
+export function normalizePermissionTempWriteLmStudioOptions(options) {
+  return normalizePermissionExternalProviderOptions(options, LIVE_LM_STUDIO_SCENARIO_ID);
+}
+
+export function normalizePermissionTempWriteOpenAiCompatibleOptions(options) {
+  return normalizePermissionExternalProviderOptions(
+    options,
+    LIVE_OPENAI_COMPATIBLE_SCENARIO_ID,
+  );
+}
+
+export function permissionTempWriteLmStudioFixtureConfig(options) {
+  return `[model]
+base_url = ${JSON.stringify(options.providerBaseUrl)}
+model = ${JSON.stringify(options.model)}
+provider_profile = "lm_studio"
+provider_metadata_mode = "lm_studio_native_required"
+provider_api_mode = "responses"
+connect_timeout_ms = 10000
+request_timeout_ms = ${LIVE_REQUEST_TIMEOUT_MS}
+max_retries = 0
+context_window = 32768
+supports_tools = true
+supports_images = false
+parallel_tool_calls = false
+max_parallel_predictions = 1
+
+[permissions]
+access_mode = "auto_review"
+
+[multi_agent]
+enabled = false
+mode = "explicit_request_only"
+max_concurrent_agents = 2
+max_concurrent_model_requests = 1
+
+[docling]
+enabled = false
+
+[mcp]
+enabled = false
+`;
+}
+
+export function permissionTempWriteOpenAiCompatibleFixtureConfig(options) {
+  return `[model]
+base_url = ${JSON.stringify(options.providerBaseUrl)}
+model = ${JSON.stringify(options.model)}
+provider_profile = "openai_compatible"
+connect_timeout_ms = 10000
+request_timeout_ms = ${LIVE_REQUEST_TIMEOUT_MS}
+max_retries = 0
+context_window = 32768
+supports_tools = true
+supports_images = false
+parallel_tool_calls = false
+
+[permissions]
+access_mode = "auto_review"
+
+[multi_agent]
+enabled = false
+mode = "explicit_request_only"
+max_concurrent_agents = 2
+max_concurrent_model_requests = 1
+
+[docling]
+enabled = false
+
+[mcp]
+enabled = false
+`;
+}
+
+function responseRows(ledger) {
+  return Array.isArray(ledger) ? ledger.filter((row) => row?.route === "responses") : [];
+}
+
+function acceptedMetadataRow(row) {
+  return (row?.route === "models" || row?.route === "lm_studio_models")
+    && row.method === "GET"
+    && row.response_phase === "completed"
+    && row.response_status === 200;
+}
+
+function acceptedResponseRow(row, role, phase) {
+  return row?.route === "responses"
+    && row.method === "POST"
+    && row.pathname === "/v1/responses"
+    && row.query_present === false
+    && row.contract?.pass === true
+    && row.contract.role === role
+    && row.response_phase === phase
+    && row.response_status === (phase === "completed" ? 200 : null);
+}
+
+export function exactPermissionTempWriteLedger(ledger, expectedRoles, { heldRole = null } = {}) {
+  if (!Array.isArray(ledger) || !Array.isArray(expectedRoles)) return false;
+  if (ledger.some(row => row?.route !== "responses" && !acceptedMetadataRow(row))) return false;
+  const rows = responseRows(ledger);
+  return rows.length === expectedRoles.length && rows.every((row,index) => acceptedResponseRow(
+    row, expectedRoles[index], expectedRoles[index] === heldRole ? "held" : "completed"));
+}
+
+function providerOrSurfaceFailed(surface, ledger) {
+  const rows = responseRows(ledger);
+  return !Array.isArray(ledger)
+    || rows.length > SCRIPTED_PROVIDER_PERMISSION_TEMP_WRITE_MAX_RESPONSES
+    || ledger.some((row) => row?.route !== "responses" && !acceptedMetadataRow(row))
+    || rows.some((row) => row?.contract?.pass === false
+      || row?.response_phase === "rejected"
+      || row?.response_phase === "peer_closed"
+      || (row?.response_status !== null && row.response_status !== 200))
+    || surface?.visible_fatal_count > 0
+    || surface?.visible_recoverable_error_count > 0
+    || surface?.visible_dialog_count > 0
+    || surface?.visible_modal_backdrop_count > 0
+    || surface?.projection?.startup?.status === "failed"
+    || ["failed", "cancelled", "incomplete"].includes(surface?.projection?.run_status_key);
+}
+
+function rowsOfKind(projection, kind) {
+  const rows = Array.isArray(projection?.transcript_rows) ? projection.transcript_rows : [];
+  return rows.filter((row) => row?.row_kind === kind);
+}
+
+function exactOwner(projection, kind) {
+  const expected = projection?.run_target?.expectedState;
+  if (expected?.kind !== kind
+    || !canonicalUlid(projection?.run_target?.sessionId)
+    || projection.run_target.sessionId !== projection?.draft_target?.sessionId
+    || !canonicalU64(expected.admissionRevision)) return null;
+  const turnId = kind === "turn" ? expected.turnId : expected.latestTurnId;
+  return canonicalUlid(turnId)
+    ? {
+      sessionId: projection.run_target.sessionId,
+      turnId,
+      admissionRevision: expected.admissionRevision,
+    }
+    : null;
+}
+
+function exactRestrictedSuccessEvidence(ledger) {
+  const evidence = responseRows(ledger).find(row => row?.contract?.role === "temp_continuation")
+    ?.contract?.role_evidence?.restricted_output;
+  return evidence?.pass === true && evidence.command_matches === true
+    && evidence.exit_code_zero === true && evidence.pytest_passed === true
+    && evidence.sandbox_note_absent === true && evidence.non_success_absent === true
+    && Number.isSafeInteger(evidence.output_size_bytes) && evidence.output_size_bytes > 0
+    && /^[a-f0-9]{64}$/u.test(evidence.output_sha256 ?? "");
+}
+
+const SQLITE_TERMINATION_TIMEOUT_MS = 5_000;
+
+export function runReadOnlySqlite(
+  database,
+  query,
+  timeoutMs = 10_000,
+  {
+    spawnProcess = spawn,
+    terminationTimeoutMs = SQLITE_TERMINATION_TIMEOUT_MS,
+  } = {},
+) {
+  return new Promise((resolve, reject) => {
+    const child = spawnProcess(
+      "sqlite3.exe",
+      ["-batch", "-bail", "-readonly", "-json", database, query],
+      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    let spawnError = null;
+    let timer = null;
+    let terminationTimer = null;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const finish = (action) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      if (terminationTimer !== null) clearTimeout(terminationTimer);
+      action();
+    };
+    timer = setTimeout(() => {
+      timedOut = true;
+      let killAccepted = false;
+      let killError = null;
+      terminationTimer = setTimeout(() => finish(() => reject(new Error(
+        killError === null && killAccepted
+          ? "read-only permission TEMP SQLite query did not close after termination"
+          : "read-only permission TEMP SQLite query could not be terminated",
+        { cause: killError ?? undefined },
+      ))), terminationTimeoutMs);
+      try {
+        killAccepted = child.kill();
+      } catch (error) {
+        killError = error;
+      }
+    }, timeoutMs);
+    child.once("error", (error) => { spawnError = error; });
+    child.once("close", (exitCode) => finish(() => {
+      if (timedOut) {
+        reject(new Error("read-only permission TEMP SQLite query timed out"));
+      } else if (spawnError !== null) {
+        reject(spawnError);
+      } else {
+        resolve({
+          exit_code: exitCode,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+        });
+      }
+    }));
+  });
+}
+
+export function permissionTempWritePersistenceFailures(evidence, owner) {
+  const failures = [];
+  const rows = evidence?.rows;
+  if (evidence?.schema_version !== "desktop-e2e.permission-temp-persistence.v1"
+    || evidence?.read_only !== true
+    || !Array.isArray(rows)) {
+    return ["persistence-evidence-malformed"];
+  }
+  if (!canonicalUlid(owner?.sessionId) || !canonicalUlid(owner?.turnId)) {
+    return ["persistence-owner-malformed"];
+  }
+  if (rows.length !== 1) return ["persistence-tool-output-cardinality-mismatch"];
+  const expectedKeys = [
+    "history_item_id",
+    "session_id",
+    "turn_id",
+    "sequence_no",
+    "kind",
+    "call_id",
+    "status",
+    "success",
+    "metadata_success",
+    "tool_metadata_success",
+    "sandbox_failure_hint",
+  ];
+  for (const [index, row] of rows.entries()) {
+    if (!exactObjectKeys(row, expectedKeys)
+      || !canonicalUlid(row.history_item_id)
+      || !canonicalUlid(row.call_id)
+      || row.session_id !== owner.sessionId
+      || row.turn_id !== owner.turnId
+      || !Number.isSafeInteger(row.sequence_no)
+      || row.sequence_no < 0
+      || row.kind !== "tool_output"
+      || row.status !== "completed") {
+      failures.push(`persistence-tool-output-${index}-identity-mismatch`);
+    }
+  }
+  if (!(rows[0].success === 1 && rows[0].metadata_success === 1
+    && rows[0].tool_metadata_success === 1 && rows[0].sandbox_failure_hint === null)) {
+    failures.push("persistence-restricted-success-projection-mismatch");
+  }
+  return [...new Set(failures)];
+}
+
+export async function readPermissionTempWritePersistence({ database, owner }) {
+  if (typeof database !== "string" || !path.isAbsolute(database)) {
+    throw new TypeError("permission TEMP persistence database must be an absolute path");
+  }
+  if (!canonicalUlid(owner?.sessionId) || !canonicalUlid(owner?.turnId)) {
+    throw new TypeError("permission TEMP persistence owner must contain canonical session and turn IDs");
+  }
+  const result = await runReadOnlySqlite(database, `
+SELECT
+  id AS history_item_id,
+  session_id,
+  turn_id,
+  sequence_no,
+  json_extract(payload_json, '$.kind') AS kind,
+  json_extract(payload_json, '$.call_id') AS call_id,
+  json_extract(payload_json, '$.status') AS status,
+  json_extract(payload_json, '$.success') AS success,
+  json_extract(payload_json, '$.metadata.success') AS metadata_success,
+  json_extract(payload_json, '$.metadata.tool_metadata.success') AS tool_metadata_success,
+  json_extract(payload_json, '$.metadata.tool_metadata.sandbox_failure_hint') AS sandbox_failure_hint
+FROM protocol_history_items
+WHERE session_id = '${owner.sessionId}'
+  AND turn_id = '${owner.turnId}'
+  AND json_extract(payload_json, '$.kind') = 'tool_output'
+ORDER BY sequence_no ASC;
+`);
+  if (result.exit_code !== 0 || result.stderr.length > 0) {
+    throw new Error(`read-only permission TEMP SQLite query failed: ${result.stderr || result.stdout}`);
+  }
+  let rows;
+  try { rows = JSON.parse(result.stdout.length === 0 ? "[]" : result.stdout); }
+  catch (error) {
+    throw new Error(`read-only permission TEMP SQLite query returned malformed JSON: ${error.message}`);
+  }
+  if (!Array.isArray(rows)) {
+    throw new Error("read-only permission TEMP SQLite query did not return a JSON array");
+  }
+  return {
+    schema_version: "desktop-e2e.permission-temp-persistence.v1",
+    read_only: true,
+    rows,
+  };
+}
+
+export function permissionTempWriteHeldFailures(sample) {
+  const surface = sample?.surface;
+  const projection = surface?.projection;
+  const users = rowsOfKind(projection, "user");
+  const assistants = rowsOfKind(projection, "assistant");
+  const errors = rowsOfKind(projection, "error");
+  const running = rowsOfKind(projection, "work_summary_running");
+  const completed = rowsOfKind(projection, "work_summary_completed");
+  const failures = [];
+  if (!exactPermissionTempWriteLedger(
+    sample?.ledger,
+    ["temp_initial", "temp_continuation"], { heldRole: "temp_continuation" },
+  )) failures.push("restricted-success-request-not-exactly-held");
+  if (!exactRestrictedSuccessEvidence(sample?.ledger)) failures.push("restricted-pytest-success-not-exact");
+  if (projection?.run_status_key !== "running"
+    || projection?.task_activity_state !== "running"
+    || projection?.busy !== true
+    || projection?.agent_tree_active !== false
+    || exactOwner(projection, "turn") === null) failures.push("held-run-owner-not-active");
+  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_WRITE_PROMPT])) {
+    failures.push("held-user-authority-mismatch");
+  }
+  if (assistants.length !== 0 || errors.length !== 0) failures.push("held-primary-error-or-answer-present");
+  if (running.length !== 1 || completed.length !== 0) {
+    failures.push("held-work-summary-not-exact");
+  }
+  if (surface?.users?.length !== 1
+    || surface.users[0].visible !== true
+    || surface.users[0].text !== PERMISSION_TEMP_WRITE_PROMPT
+    || surface?.assistants?.length !== 0) failures.push("held-dom-conversation-mismatch");
+  if (providerOrSurfaceFailed(surface, sample?.ledger)) failures.push("held-surface-or-provider-failed");
+  return [...new Set(failures)];
+}
+
+export function permissionTempWriteHeldDecision(sample) {
+  if (providerOrSurfaceFailed(sample?.surface, sample?.ledger)) return "fail";
+  return permissionTempWriteHeldFailures(sample).length === 0 ? "pass" : "pending";
+}
+
+function terminalSettled(surface) {
+  const projection = surface?.projection;
+  return projection?.run_status_key === "completed"
+    && projection?.task_activity_state === "idle"
+    && projection?.busy === false
+    && projection?.agent_tree_active === false
+    && projection?.post_run_refresh_pending === false
+    && projection?.background_mutation_pending === false
+    && projection?.async_polling_required === false
+    && Array.isArray(projection?.pending_async_operations)
+    && projection.pending_async_operations.length === 0
+    && projection?.navigation_loading === false
+    && projection?.provider_loading === false
+    && projection?.overlay === "none"
+    && projection?.confirmation_visible === false
+    && projection?.confirmation_id === null
+    && projection?.draft_prompt === ""
+    && projection?.composer_submit_mode === "new_request"
+    && projection?.can_submit === true
+    && exactOwner(projection, "idle") !== null
+    && surface?.prompt?.count === 1
+    && surface.prompt.value === ""
+    && surface.prompt.visible === true
+    && surface.prompt.enabled === true
+    && surface?.send?.count === 1
+    && surface.send.visible === true
+    && surface.send.enabled === false
+    && surface?.visible_fatal_count === 0
+    && surface?.visible_recoverable_error_count === 0
+    && surface?.visible_dialog_count === 0
+    && surface?.visible_modal_backdrop_count === 0;
+}
+
+function exactRestrictedHistory(projection, completedSummary) {
+  const body = completedSummary?.body ?? "";
+  const lifecycle = [...body.matchAll(/^- \[(待機|実行中|完了|拒否|キャンセル|失敗)\] /gmu)].map(match => match[1]);
+  return body.includes("- コマンド/ツール: 1件")
+    && isDeepStrictEqual(lifecycle, ["待機", "完了"])
+    && (body.match(/^- \[待機\] shell$/gmu) ?? []).length === 1
+    && rowsOfKind(projection, "error").length === 0;
+}
+
+export async function observePermissionTempTerminalDetail(terminal, sample, {
+  observe = waitForObservation,
+} = {}) {
+  const snapshot = (surface) => ({
+    run_target: surface?.projection?.run_target ?? null,
+    run_status_key: surface?.projection?.run_status_key ?? null,
+    busy: surface?.projection?.busy ?? null,
+    tool_status_text: surface?.projection?.tool_status_text ?? null,
+    progress_text: surface?.projection?.progress_text ?? null,
+    visible_tool_detail: surface?.visible_tool_detail ?? null,
+  });
+  const initial = snapshot(terminal);
+  let last = initial;
+  const active = text => typeof text === "string" && /\[(?:実行中|待機)\]/u.test(text);
+  const sameOwner = value => initial.run_target !== null
+    && isDeepStrictEqual(value.run_target, initial.run_target);
+  let result, status;
+  try {
+    result = await observe({
+      label: "TEMP terminal live detail convergence (diagnostic only)",
+      timeoutMs: 3000, pollMs: 100, retrySampleErrors: false,
+      sample: async () => { last = snapshot(await sample()); return last; },
+      accept: value => !sameOwner(value) || (typeof value.tool_status_text === "string"
+        && !active(value.tool_status_text)
+        && value.visible_tool_detail !== null && !active(value.visible_tool_detail.text)),
+    });
+    status = sameOwner(last) ? "converged" : "owner_changed";
+  } catch (error) {
+    status = error?.code === "observation-timeout" ? "not_converged" : "observation_error";
+    result = { attempts: error?.evidence?.attempts ?? null,
+      elapsed_ms: error?.evidence?.elapsed_ms ?? null, error: errorObservation(error) };
+  }
+  return { diagnostic_only: true, timeout_ms: 3000, status, initial, last,
+    same_owner: sameOwner(last), typed_pending: active(last.tool_status_text),
+    visible_pending: last.visible_tool_detail === null ? null : active(last.visible_tool_detail.text),
+    attempts: result.attempts, elapsed_ms: result.elapsed_ms, error: result.error ?? null };
+}
+
+export function permissionTempWriteTerminalFailures(sample) {
+  const surface = sample?.surface;
+  const projection = surface?.projection;
+  const users = rowsOfKind(projection, "user");
+  const assistants = rowsOfKind(projection, "assistant");
+  const errors = rowsOfKind(projection, "error");
+  const running = rowsOfKind(projection, "work_summary_running");
+  const completed = rowsOfKind(projection, "work_summary_completed");
+  const failures = [];
+  if (!exactPermissionTempWriteLedger(sample?.ledger, PERMISSION_TEMP_WRITE_ROLES)) {
+    failures.push("provider-role-ledger-mismatch");
+  }
+  if (!exactRestrictedSuccessEvidence(sample?.ledger)) failures.push("restricted-pytest-success-not-exact");
+  if (!terminalSettled(surface)) failures.push("terminal-surface-not-settled");
+  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_WRITE_PROMPT])) {
+    failures.push("terminal-user-authority-mismatch");
+  }
+  if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_WRITE_RESPONSE])) {
+    failures.push("terminal-assistant-response-mismatch");
+  }
+  if (errors.length !== 0 || running.length !== 0 || completed.length !== 1) {
+    failures.push("terminal-history-cardinality-mismatch");
+  }
+  if (completed.length === 1 && !exactRestrictedHistory(projection, completed[0])) {
+    failures.push("terminal-tool-history-mismatch");
+  }
+  if (surface?.users?.length !== 1
+    || surface.users[0].visible !== true
+    || surface.users[0].text !== PERMISSION_TEMP_WRITE_PROMPT
+    || surface?.assistants?.length !== 1
+    || surface.assistants[0].visible !== true
+    || surface.assistants[0].text !== PERMISSION_TEMP_WRITE_RESPONSE
+    || surface?.completed_summaries?.length !== 1
+    || surface.completed_summaries[0].visible !== true) failures.push("terminal-dom-conversation-mismatch");
+  if (providerOrSurfaceFailed(surface, sample?.ledger)) failures.push("terminal-surface-or-provider-failed");
+  return [...new Set(failures)];
+}
+
+function createConfirmedTerminalDecision({
+  failuresOf,
+  surfaceOf,
+  providerFailed,
+  domOnlyFailures,
+  confirmationMs,
+  now,
+}) {
+  let confirmedSince = null;
+  let confirmedSignature = null;
+  const reset = () => {
+    confirmedSince = null;
+    confirmedSignature = null;
+  };
+  return (sample) => {
+    if (providerFailed(sample)) {
+      reset();
+      return "fail";
+    }
+    const failures = failuresOf(sample);
+    if (failures.length === 0) {
+      reset();
+      return "pass";
+    }
+    if (!terminalSettled(surfaceOf(sample))) {
+      reset();
+      return "pending";
+    }
+    const confirmedFailures = failures.filter((failure) => !domOnlyFailures.has(failure));
+    if (confirmedFailures.length === 0) {
+      reset();
+      return "pending";
+    }
+    const signature = JSON.stringify([...confirmedFailures].sort());
+    const observedAt = now();
+    if (confirmedSignature !== signature) {
+      confirmedSignature = signature;
+      confirmedSince = observedAt;
+      return "pending";
+    }
+    return observedAt - confirmedSince >= confirmationMs ? "fail" : "pending";
+  };
+}
+
+export function createPermissionTempWriteTerminalDecision({
+  confirmationMs = PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS,
+  now = () => Date.now(),
+} = {}) {
+  if (!Number.isSafeInteger(confirmationMs) || confirmationMs <= 0) {
+    throw new TypeError("permission TEMP terminal confirmation must be a positive safe integer");
+  }
+  if (typeof now !== "function") throw new TypeError("permission TEMP terminal clock must be a function");
+  return createConfirmedTerminalDecision({
+    failuresOf: permissionTempWriteTerminalFailures,
+    surfaceOf: (sample) => sample?.surface,
+    providerFailed: (sample) => providerOrSurfaceFailed(sample?.surface, sample?.ledger),
+    domOnlyFailures: new Set(["terminal-dom-conversation-mismatch"]),
+    confirmationMs,
+    now,
+  });
+}
+
+export function permissionTempWriteTerminalFailureEvidence(sample) {
+  return {
+    ...sample,
+    terminal_oracle_failures: permissionTempWriteTerminalFailures(sample),
+  };
+}
+
+function exactObjectKeys(value, expected) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+}
+
+function responsesInputText(item) {
+  if (!exactObjectKeys(item, ["content", "role", "type"])
+    || item.type !== "message"
+    || item.role !== "user"
+    || !Array.isArray(item.content)
+    || item.content.length !== 1) return null;
+  const content = item.content[0];
+  return exactObjectKeys(content, ["text", "type"])
+    && content.type === "input_text"
+    && typeof content.text === "string"
+    ? content.text
+    : null;
+}
+
+function liveShellArguments(item, expectedCallId = null) {
+  if (!exactObjectKeys(item, ["arguments", "call_id", "name", "type"])
+    || item.type !== "function_call"
+    || item.name !== "shell"
+    || typeof item.call_id !== "string"
+    || item.call_id.length === 0
+    || (expectedCallId !== null && item.call_id !== expectedCallId)
+    || typeof item.arguments !== "string") return null;
+  let args;
+  try { args = JSON.parse(item.arguments); }
+  catch { return null; }
+  return { callId: item.call_id, argumentsJson: item.arguments, args };
+}
+
+function liveToolOutput(item, callId) {
+  return exactObjectKeys(item, ["call_id", "output", "type"])
+    && item.type === "function_call_output"
+    && item.call_id === callId
+    && typeof item.output === "string"
+    && item.output.trim().length > 0
+    ? item.output
+    : null;
+}
+
+function exactLiveShellArgumentKeys(args, requiredKeys) {
+  return exactObjectKeys(args, requiredKeys)
+    || (exactObjectKeys(args, [...requiredKeys, "description"])
+      && typeof args.description === "string");
+}
+
+function exactLiveRestrictedArguments(call) {
+  return call !== null
+    && exactLiveShellArgumentKeys(call.args, ["command", "sandbox_permissions"])
+    && call.args.command === PERMISSION_TEMP_WRITE_COMMAND
+    && call.args.sandbox_permissions === "use_default";
+}
+
+
+const LIVE_FORBIDDEN_WIRE_KEYS = Object.freeze([
+  "extra_body_json",
+  "frequency_penalty",
+  "max_output_tokens",
+  "max_tokens",
+  "min_p",
+  "num_ctx",
+  "presence_penalty",
+  "reasoning",
+  "reasoning_effort",
+  "reasoning_summary",
+  "seed",
+  "stop",
+  "stop_sequences",
+  "temperature",
+  "top_k",
+  "top_p",
+]);
+const LIVE_TASK_KEYS = Object.freeze([
+  "input",
+  "instructions",
+  "model",
+  "parallel_tool_calls",
+  "store",
+  "stream",
+  "tool_choice",
+  "tools",
+]);
+export function permissionTempWriteLiveCaptureContract(captures, options) {
+  if (!Array.isArray(captures) || captures.length !== 2) return { roles: [], failures: ["live-request-count-mismatch"] };
+  const failures = [];
+  for (const {body} of captures) {
+    if (!exactObjectKeys(body, LIVE_TASK_KEYS) || body?.model !== options.model
+      || typeof body.instructions !== "string" || !body.instructions.trim()
+      || body.store !== false || body.stream !== true || body.tool_choice !== "auto"
+      || body.parallel_tool_calls !== false || !Array.isArray(body.tools)
+      || body.tools.filter(tool => tool?.name === "shell").length !== 1
+      || LIVE_FORBIDDEN_WIRE_KEYS.some(key => Object.hasOwn(body ?? {},key))) failures.push("live-request-common-contract-mismatch");
+  }
+  const [initial, continuation] = captures.map(capture => capture.body?.input ?? []);
+  if (initial.length !== 1 || responsesInputText(initial[0]) !== PERMISSION_TEMP_WRITE_LIVE_PROMPT)
+    failures.push("live-initial-request-mismatch");
+  const call = liveShellArguments(continuation[1]);
+  const output = call === null ? null : liveToolOutput(continuation[2],call.callId);
+  if (continuation.length !== 3 || responsesInputText(continuation[0]) !== PERMISSION_TEMP_WRITE_LIVE_PROMPT
+    || !exactLiveRestrictedArguments(call) || !permissionTempWriteOutputContract(output,{command:PERMISSION_TEMP_WRITE_COMMAND}).pass)
+    failures.push("live-restricted-continuation-mismatch");
+  return { roles: ["live_initial", "live_continuation"], failures: [...new Set(failures)],
+    restricted_output_sha256: output === null ? null : sha256(Buffer.from(output,"utf8")) };
+}
+
+const LIVE_CHAT_TASK_KEYS = Object.freeze([
+  "messages",
+  "model",
+  "n",
+  "parallel_tool_calls",
+  "stream",
+  "stream_options",
+  "tools",
+]);
+const LIVE_CHAT_SECRET_KEYS = Object.freeze([
+  "api_key",
+  "api_key_env",
+  "authorization",
+  "extra_headers",
+  "headers",
+]);
+
+function liveChatText(message, role) {
+  return exactObjectKeys(message, ["content", "role"])
+    && message.role === role
+    && typeof message.content === "string"
+    ? message.content
+    : null;
+}
+
+function liveChatShellArguments(message, expectedCallId = null) {
+  if (!exactObjectKeys(message, ["role", "tool_calls"])
+    || message.role !== "assistant"
+    || !Array.isArray(message.tool_calls)
+    || message.tool_calls.length !== 1) return null;
+  const toolCall = message.tool_calls[0];
+  if (!exactObjectKeys(toolCall, ["function", "id", "type"])
+    || toolCall.type !== "function"
+    || typeof toolCall.id !== "string"
+    || toolCall.id.length === 0
+    || (expectedCallId !== null && toolCall.id !== expectedCallId)
+    || !exactObjectKeys(toolCall.function, ["arguments", "name"])
+    || toolCall.function.name !== "shell"
+    || typeof toolCall.function.arguments !== "string") return null;
+  let args;
+  try { args = JSON.parse(toolCall.function.arguments); }
+  catch { return null; }
+  return {
+    callId: toolCall.id,
+    argumentsJson: toolCall.function.arguments,
+    args,
+  };
+}
+
+function liveChatToolOutput(message, callId) {
+  return exactObjectKeys(message, ["content", "role", "tool_call_id"])
+    && message.role === "tool"
+    && message.tool_call_id === callId
+    && typeof message.content === "string"
+    && message.content.trim().length > 0
+    ? message.content
+    : null;
+}
+
+function liveChatStreamContract(body) {
+  return body?.n === 1
+    && body.stream === true
+    && exactObjectKeys(body.stream_options, ["include_usage"])
+    && body.stream_options.include_usage === true;
+}
+
+function liveChatToolsPass(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return false;
+  const shells = tools.filter((tool) => tool?.function?.name === "shell");
+  return shells.length === 1
+    && shells.every((tool) => exactObjectKeys(tool, ["function", "type"])
+      && tool.type === "function"
+      && exactObjectKeys(tool.function, ["description", "name", "parameters"])
+      && typeof tool.function.description === "string"
+      && tool.function.description.length > 0
+      && tool.function.parameters !== null
+      && typeof tool.function.parameters === "object"
+      && !Array.isArray(tool.function.parameters));
+}
+
+export function permissionTempWriteOpenAiCompatibleLiveCaptureContract(captures, options) {
+  if (!Array.isArray(captures) || captures.length !== 2) return { roles: [], failures: ["live-request-count-mismatch"] };
+  const failures = [];
+  const secretBodyFieldsAbsent = captures.every(({body}) => LIVE_CHAT_SECRET_KEYS.every(key => !Object.hasOwn(body ?? {},key)));
+  const secretCanaryAbsent = !JSON.stringify(captures.map(capture => capture.body)).includes(PERMISSION_TEMP_WRITE_SECRET_CANARY);
+  for (const {body} of captures) {
+    if (!exactObjectKeys(body,LIVE_CHAT_TASK_KEYS) || body?.model !== options.model
+      || !liveChatStreamContract(body) || body.parallel_tool_calls !== false || !liveChatToolsPass(body.tools)
+      || LIVE_FORBIDDEN_WIRE_KEYS.some(key => Object.hasOwn(body ?? {},key))) failures.push("live-chat-common-contract-mismatch");
+  }
+  const [initial, continuation] = captures.map(capture => capture.body?.messages ?? []);
+  const system = liveChatText(initial[0],"system");
+  if (initial.length !== 2 || !system?.trim() || liveChatText(initial[1],"user") !== PERMISSION_TEMP_WRITE_LIVE_PROMPT)
+    failures.push("live-chat-initial-request-mismatch");
+  const call = liveChatShellArguments(continuation[2]);
+  const output = call === null ? null : liveChatToolOutput(continuation[3],call.callId);
+  if (continuation.length !== 4 || liveChatText(continuation[0],"system") !== system
+    || liveChatText(continuation[1],"user") !== PERMISSION_TEMP_WRITE_LIVE_PROMPT
+    || !exactLiveRestrictedArguments(call) || !permissionTempWriteOutputContract(output,{command:PERMISSION_TEMP_WRITE_COMMAND}).pass)
+    failures.push("live-chat-restricted-continuation-mismatch");
+  if (!secretBodyFieldsAbsent || !secretCanaryAbsent) failures.push("live-chat-secret-boundary-mismatch");
+  return { roles: ["live_initial","live_continuation"], failures: [...new Set(failures)],
+    secret_body_fields_absent: secretBodyFieldsAbsent, secret_canary_absent: secretCanaryAbsent,
+    restricted_output_sha256: output === null ? null : sha256(Buffer.from(output,"utf8")) };
+}
+
+export function parsePermissionTempWriteCaptureJson(bytes, { file, kind }) {
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch (error) {
+    throw productFailure(
+      "permission-temp-live-request-capture-json",
+      kind === "metadata"
+        ? "one prepared request capture metadata file is not valid UTF-8 JSON"
+        : "one prepared request capture body is not valid UTF-8 JSON",
+      { file, kind, cause: errorObservation(error) },
+    );
+  }
+}
+
+async function readPermissionTempWriteCaptureBytes(directory, file, kind) {
+  try {
+    return await readFile(path.join(directory, file));
+  } catch (error) {
+    throw harnessFailure(
+      "permission-temp-live-request-capture-read",
+      "one prepared request capture file could not be read",
+      { file, kind, cause: errorObservation(error) },
+    );
+  }
+}
+
+function permissionLiveCaptureWire(apiMode) {
+  if (apiMode === RESPONSES_API_MODE) {
+    return {
+      endpointPath: "v1/responses",
+      contract: permissionTempWriteLiveCaptureContract,
+      label: "Responses",
+    };
+  }
+  if (apiMode === CHAT_COMPLETIONS_API_MODE) {
+    return {
+      endpointPath: "v1/chat/completions",
+      contract: permissionTempWriteOpenAiCompatibleLiveCaptureContract,
+      label: "Chat Completions",
+    };
+  }
+  throw new TypeError(`unsupported live permission capture API mode: ${apiMode}`);
+}
+
+const LIVE_CAPTURE_METADATA_KEYS = Object.freeze([
+  "api_mode",
+  "capture_stage",
+  "captured_at_unix_ms",
+  "endpoint_path",
+  "process_id",
+  "request_body_bytes",
+  "request_body_file",
+  "request_id",
+  "schema_version",
+  "sequence",
+  "transport",
+]);
+
+function permissionLiveCaptureMetadataFailures(metadata, apiMode) {
+  const wire = permissionLiveCaptureWire(apiMode);
+  const failures = [];
+  if (!exactObjectKeys(metadata, LIVE_CAPTURE_METADATA_KEYS)) {
+    failures.push("live-request-metadata-shape-mismatch");
+  }
+  if (metadata?.schema_version !== 2
+    || metadata?.transport !== "http"
+    || metadata?.capture_stage !== "prepared"
+    || metadata?.api_mode !== apiMode
+    || metadata?.endpoint_path !== wire.endpointPath) {
+    failures.push("live-request-metadata-route-mismatch");
+  }
+  if (!Number.isInteger(metadata?.captured_at_unix_ms)
+    || !Number.isInteger(metadata?.process_id)
+    || !Number.isInteger(metadata?.sequence)
+    || typeof metadata?.request_id !== "string"
+    || metadata.request_id.length === 0) {
+    failures.push("live-request-metadata-identity-mismatch");
+  }
+  return [...new Set(failures)];
+}
+
+export function permissionTempWriteOpenAiCompatibleCaptureMetadataFailures(metadata) {
+  return permissionLiveCaptureMetadataFailures(metadata, CHAT_COMPLETIONS_API_MODE);
+}
+
+export async function readPermissionTempWriteLiveRequestCaptures(
+  directory,
+  options,
+  { apiMode = RESPONSES_API_MODE } = {},
+) {
+  const wire = permissionLiveCaptureWire(apiMode);
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); }
+  catch (error) {
+    throw productFailure(
+      "permission-temp-live-request-capture-missing",
+      `the live ${wire.label} run did not create its prepared request capture directory`,
+      { directory, cause: errorObservation(error) },
+    );
+  }
+  const invalid = entries.filter((entry) => !entry.isFile()
+    || (!entry.name.endsWith(".metadata.json") && !entry.name.endsWith(".request.json")));
+  if (invalid.length > 0) throw productFailure(
+    "permission-temp-live-request-capture-entry",
+    "the prepared request capture directory contains an unexpected entry",
+    { entries: invalid.map((entry) => entry.name).sort() },
+  );
+  const metadataFiles = entries
+    .map((entry) => entry.name)
+    .filter((name) => name.endsWith(".metadata.json"))
+    .sort();
+  const requestFiles = new Set(entries
+    .map((entry) => entry.name)
+    .filter((name) => name.endsWith(".request.json")));
+  const captures = [];
+  for (const metadataFile of metadataFiles) {
+    const metadata = parsePermissionTempWriteCaptureJson(
+      await readPermissionTempWriteCaptureBytes(directory, metadataFile, "metadata"),
+      { file: metadataFile, kind: "metadata" },
+    );
+    const metadataFailures = permissionLiveCaptureMetadataFailures(metadata, apiMode);
+    if (metadataFailures.length > 0) throw productFailure(
+      "permission-temp-live-request-capture-metadata",
+      `one prepared request capture did not use the exact ${wire.label} metadata contract`,
+      { metadata_file: metadataFile, expected_api_mode: apiMode, failures: metadataFailures },
+    );
+    const requestFile = metadata?.request_body_file;
+    const expected = `${metadataFile.slice(0, -".metadata.json".length)}.request.json`;
+    if (requestFile !== expected || !requestFiles.delete(requestFile)) throw productFailure(
+      "permission-temp-live-request-capture-pair",
+      "one prepared request capture metadata file did not own its exact request body",
+      { metadata_file: metadataFile, request_file: requestFile ?? null, expected },
+    );
+    const requestBytes = await readPermissionTempWriteCaptureBytes(
+      directory,
+      requestFile,
+      "request",
+    );
+    if (metadata.request_body_bytes !== requestBytes.byteLength) throw productFailure(
+      "permission-temp-live-request-capture-size",
+      "one prepared request capture byte owner did not match its metadata",
+      { metadata_file: metadataFile, metadata_bytes: metadata.request_body_bytes, actual_bytes: requestBytes.byteLength },
+    );
+    const body = parsePermissionTempWriteCaptureJson(
+      requestBytes,
+      { file: requestFile, kind: "request" },
+    );
+    captures.push({ metadata, body, requestBodySha256: sha256(requestBytes) });
+  }
+  if (requestFiles.size > 0) throw productFailure(
+    "permission-temp-live-request-capture-orphan",
+    "the prepared request capture directory contains an orphan request body",
+    { orphan_files: [...requestFiles].sort() },
+  );
+  const classified = wire.contract(captures, options);
+  const metadataSequencePass = captures.length === 2
+    && captures.every((capture, index) => index === 0
+      || (capture.metadata.process_id === captures[0].metadata.process_id
+        && capture.metadata.sequence === captures[index - 1].metadata.sequence + 1
+        && capture.metadata.captured_at_unix_ms
+          >= captures[index - 1].metadata.captured_at_unix_ms));
+  if (!metadataSequencePass) classified.failures.push("live-request-metadata-sequence-mismatch");
+  const evidence = {
+    schema_version: "desktop-e2e.permission-temp-live-captures.v1",
+    ...(apiMode === CHAT_COMPLETIONS_API_MODE ? {
+      api_mode: apiMode,
+      endpoint_path: wire.endpointPath,
+      secret_body_fields_absent: classified.secret_body_fields_absent,
+      secret_canary_absent: classified.secret_canary_absent,
+    } : {}),
+    capture_count: captures.length,
+    roles: classified.roles,
+    failures: [...new Set(classified.failures)],
+    restricted_output_sha256: classified.restricted_output_sha256,
+    request_timeout_ms: LIVE_REQUEST_TIMEOUT_MS,
+    request_sequences: captures.map((capture) => capture.metadata?.sequence ?? null),
+    request_body_hashes: captures.map((capture) => capture.requestBodySha256),
+  };
+  if (evidence.failures.length > 0) throw productFailure(
+    "permission-temp-live-request-contract",
+    `the live ${wire.label} request chain did not match one restricted pytest success without Guardian or elevation`,
+    evidence,
+  );
+  return evidence;
+}
+
+export function permissionTempWriteLiveFinalFailures(observation) {
+  const failures = [];
+  if (!Array.isArray(observation?.workspace_failures)
+    || observation.workspace_failures.length > 0) {
+    failures.push("live-final-workspace-drift");
+  }
+  if (observation?.terminal_workspace_matches !== true) {
+    failures.push("live-final-terminal-workspace-mismatch");
+  }
+  if (observation?.prepared_request_capture_failure !== null) {
+    failures.push("live-final-request-capture-read-failed");
+  }
+  if (observation?.prepared_request_capture_matches !== true) {
+    failures.push("live-final-request-capture-drift");
+  }
+  return failures;
+}
+
+export function permissionTempWriteLiveCleanupFailures({
+  quiesceInput,
+  quiesceFinalObservation,
+  cleanupFinalObservation,
+}) {
+  const failures = [];
+  if (quiesceInput !== "pass") failures.push("live-cleanup-quiesce-failed");
+  if (quiesceFinalObservation === null
+    || cleanupFinalObservation === null
+    || !isDeepStrictEqual(cleanupFinalObservation, quiesceFinalObservation)) {
+    failures.push("live-cleanup-final-observation-drift");
+  }
+  return failures;
+}
+
+export function permissionTempWriteCaptureFailureObservation(error) {
+  if (!(error instanceof DesktopE2eError) || error.owner !== "product") throw error;
+  return errorObservation(error);
+}
+
+async function observePermissionTempWriteLiveFinal(
+  context,
+  state,
+  options,
+  { apiMode = RESPONSES_API_MODE } = {},
+) {
+  const workspace = await workspaceSnapshot(context.paths.workspace);
+  const workspaceFailures = permissionTempWriteWorkspaceFailures(
+    workspace,
+    state.workspaceBaseline,
+  );
+  let requestCapture = null;
+  let requestCaptureFailure = null;
+  try {
+    requestCapture = await readPermissionTempWriteLiveRequestCaptures(
+      state.requestCaptureDirectory,
+      options,
+      { apiMode },
+    );
+  } catch (error) {
+    requestCaptureFailure = permissionTempWriteCaptureFailureObservation(error);
+  }
+  const observation = {
+    workspace,
+    workspace_failures: workspaceFailures,
+    terminal_workspace_matches: state.terminalWorkspace !== null
+      && isDeepStrictEqual(workspace, state.terminalWorkspace),
+    prepared_request_capture: requestCapture,
+    prepared_request_capture_failure: requestCaptureFailure,
+    prepared_request_capture_matches: state.requestCaptureEvidence !== null
+      && requestCapture !== null
+      && isDeepStrictEqual(requestCapture, state.requestCaptureEvidence),
+  };
+  return {
+    ...observation,
+    failures: permissionTempWriteLiveFinalFailures(observation),
+  };
+}
+
+export function permissionTempWriteLiveTerminalFailures(surface) {
+  const projection = surface?.projection;
+  const users = rowsOfKind(projection, "user");
+  const assistants = rowsOfKind(projection, "assistant");
+  const errors = rowsOfKind(projection, "error");
+  const running = rowsOfKind(projection, "work_summary_running");
+  const completed = rowsOfKind(projection, "work_summary_completed");
+  const failures = [];
+  if (!terminalSettled(surface)) failures.push("live-terminal-surface-not-settled");
+  if (!isDeepStrictEqual(users.map((row) => row.body), [PERMISSION_TEMP_WRITE_LIVE_PROMPT])) {
+    failures.push("live-terminal-user-authority-mismatch");
+  }
+  if (!isDeepStrictEqual(assistants.map((row) => row.body), [PERMISSION_TEMP_WRITE_LIVE_RESPONSE])) {
+    failures.push("live-terminal-assistant-response-mismatch");
+  }
+  if (errors.length !== 0 || running.length !== 0 || completed.length !== 1) {
+    failures.push("live-terminal-history-cardinality-mismatch");
+  }
+  if (completed.length === 1 && !exactRestrictedHistory(projection, completed[0])) {
+    failures.push("live-terminal-tool-history-mismatch");
+  }
+  if (surface?.users?.length !== 1
+    || surface.users[0].visible !== true
+    // observeProviderTurnSurface reads innerText.trim(): trim only removes the
+    // edges, while innerText reflects CSS whitespace collapse inside the row.
+    // Keep raw canonical authority exact above and normalize only this DOM view.
+    || !renderedDomTextMatchesAuthority(
+      surface.users[0].text,
+      PERMISSION_TEMP_WRITE_LIVE_PROMPT,
+    )
+    || surface?.assistants?.length !== 1
+    || surface.assistants[0].visible !== true
+    || surface.assistants[0].text !== PERMISSION_TEMP_WRITE_LIVE_RESPONSE
+    || surface?.completed_summaries?.length !== 1
+    || surface.completed_summaries[0].visible !== true) failures.push("live-terminal-dom-mismatch");
+  return [...new Set(failures)];
+}
+
+export function permissionTempWriteOpenAiCompatibleLiveTerminalFailures(surface, options) {
+  const failures = permissionTempWriteLiveTerminalFailures(surface);
+  const projection = surface?.projection;
+  if (projection?.provider_effective_profile !== "openai_compatible"
+    || projection?.provider_effective_base_url !== options?.providerBaseUrl
+    || projection?.provider_effective_model_id !== options?.model) {
+    failures.push("live-chat-provider-target-mismatch");
+  }
+  if (projection?.provider_effective_api_key_env !== "") {
+    failures.push("live-chat-secret-boundary-mismatch");
+  }
+  if (JSON.stringify(surface).includes(PERMISSION_TEMP_WRITE_SECRET_CANARY)) {
+    failures.push("live-chat-secret-canary-exposed");
+  }
+  return [...new Set(failures)];
+}
+
+export function createPermissionTempWriteLiveTerminalDecision({
+  confirmationMs = PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS,
+  now = () => Date.now(),
+} = {}) {
+  if (!Number.isSafeInteger(confirmationMs) || confirmationMs <= 0) {
+    throw new TypeError("live permission TEMP terminal confirmation must be a positive safe integer");
+  }
+  if (typeof now !== "function") {
+    throw new TypeError("live permission TEMP terminal clock must be a function");
+  }
+  return createConfirmedTerminalDecision({
+    failuresOf: permissionTempWriteLiveTerminalFailures,
+    surfaceOf: (surface) => surface,
+    providerFailed: (surface) => surface?.visible_fatal_count > 0
+      || surface?.visible_recoverable_error_count > 0
+      || surface?.visible_dialog_count > 0
+      || surface?.visible_modal_backdrop_count > 0
+      || surface?.projection?.startup?.status === "failed"
+      || ["failed", "cancelled", "incomplete"].includes(
+        surface?.projection?.run_status_key,
+      ),
+    domOnlyFailures: new Set(["live-terminal-dom-mismatch"]),
+    confirmationMs,
+    now,
+  });
+}
+
+export function permissionTempWriteLiveTerminalFailureEvidence(surface) {
+  return {
+    surface,
+    terminal_oracle_failures: permissionTempWriteLiveTerminalFailures(surface),
+  };
+}
+
+export function createPermissionTempWriteOpenAiCompatibleLiveTerminalDecision(
+  options,
+  {
+    confirmationMs = PERMISSION_TEMP_WRITE_TERMINAL_CONFIRMATION_MS,
+    now = () => Date.now(),
+  } = {},
+) {
+  if (!Number.isSafeInteger(confirmationMs) || confirmationMs <= 0) {
+    throw new TypeError(
+      "live OpenAI-compatible TEMP write terminal confirmation must be a positive safe integer",
+    );
+  }
+  if (typeof now !== "function") {
+    throw new TypeError("live OpenAI-compatible TEMP write terminal clock must be a function");
+  }
+  return createConfirmedTerminalDecision({
+    failuresOf: (surface) => permissionTempWriteOpenAiCompatibleLiveTerminalFailures(
+      surface,
+      options,
+    ),
+    surfaceOf: (surface) => surface,
+    providerFailed: (surface) => surface?.visible_fatal_count > 0
+      || surface?.visible_recoverable_error_count > 0
+      || surface?.visible_dialog_count > 0
+      || surface?.visible_modal_backdrop_count > 0
+      || surface?.projection?.startup?.status === "failed"
+      || ["failed", "cancelled", "incomplete"].includes(
+        surface?.projection?.run_status_key,
+      ),
+    domOnlyFailures: new Set(["live-terminal-dom-mismatch"]),
+    confirmationMs,
+    now,
+  });
+}
+
+export function permissionTempWriteOpenAiCompatibleLiveTerminalFailureEvidence(
+  surface,
+  options,
+) {
+  return {
+    surface,
+    terminal_oracle_failures: permissionTempWriteOpenAiCompatibleLiveTerminalFailures(
+      surface,
+      options,
+    ),
+  };
+}
+
+function sha256(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+async function workspaceSnapshot(workspace) {
+  const entries = (await readdir(workspace, { withFileTypes: true }))
+    .sort((left, right) => left.name.localeCompare(right.name, "en"));
+  const rows = [];
+  for (const entry of entries) {
+    const kind = entry.isFile() ? "file" : entry.isDirectory() ? "directory" : "other";
+    const bytes = entry.isFile() ? await readFile(`${workspace}\\${entry.name}`) : null;
+    rows.push({
+      name: entry.name,
+      kind,
+      size_bytes: bytes?.byteLength ?? null,
+      sha256: bytes === null ? null : sha256(bytes),
+    });
+  }
+  return { schema_version: "desktop-e2e.workspace-snapshot.v1", entries: rows };
+}
+
+export function permissionTempWriteWorkspaceFailures(snapshot, baseline) {
+  const failures = [];
+  const names = snapshot?.entries?.map((entry) => entry.name) ?? [];
+  if (!isDeepStrictEqual(names, [FIXTURE_SENTINEL, PYTEST_FIXTURE].sort())) {
+    failures.push("workspace-top-level-drift");
+  }
+  if (snapshot?.entries?.some((entry) => entry.kind !== "file")) {
+    failures.push("workspace-temp-workaround-present");
+  }
+  if (!isDeepStrictEqual(snapshot, baseline)) failures.push("workspace-fixture-mutated");
+  return [...new Set(failures)];
+}
+
+function keyCode(character) {
+  if (/^[a-z]$/u.test(character)) return `Key${character.toUpperCase()}`;
+  if (character === " ") return "Space";
+  throw new TypeError(`unsupported permission TEMP write character: ${character}`);
+}
+
+function expectedTypedEvents(text) {
+  return Array.from(text).flatMap((character) => [
+    { type: "keydown", identity: PROMPT.identity, key: character, code: keyCode(character) },
+    { type: "input", identity: PROMPT.identity, inputType: "insertText", data: character },
+    { type: "keyup", identity: PROMPT.identity, key: character, code: keyCode(character) },
+  ]);
+}
+
+async function trustedClick(input, locator) {
+  const start = (await input.snapshotProbe()).sequence;
+  const target = await input.click(locator);
+  const snapshot = await input.snapshotProbe(start);
+  return {
+    target,
+    probe: assertTrustedProbeSequence(snapshot, {
+      afterSequence: start,
+      expected: [
+        { type: "pointerdown", identity: locator.identity, button: 0, buttons: 1 },
+        { type: "pointerup", identity: locator.identity, button: 0, buttons: 0 },
+        { type: "click", identity: locator.identity, button: 0, buttons: 0 },
+      ],
+    }),
+    sequence: snapshot.sequence,
+  };
+}
+
+async function trustedType(input, text) {
+  await trustedClick(input, PROMPT);
+  const start = (await input.snapshotProbe()).sequence;
+  await input.typeText(text);
+  return assertTrustedProbeSequence(await input.snapshotProbe(start), {
+    afterSequence: start,
+    expected: expectedTypedEvents(text),
+  });
+}
+
+async function trustedInsert(input, text) {
+  await trustedClick(input, PROMPT);
+  const start = (await input.snapshotProbe()).sequence;
+  const insertion = await input.insertText(PROMPT, text);
+  const probe = assertTrustedTextInsertion(await input.snapshotProbe(start), {
+    afterSequence: start,
+    identity: PROMPT.identity,
+    text,
+  });
+  return { insertion, probe };
+}
+
+async function waitForReadyComposer(cdp, prompt = "") {
+  try {
+    return (await waitForObservation({
+      label: "permission TEMP write ready composer",
+      timeoutMs: 15_000,
+      pollMs: 50,
+      sample: () => observeProviderTurnSurface(cdp),
+      accept: (surface) => surface?.projection?.can_submit === true
+        && surface?.projection?.composer_submit_mode === "new_request"
+        && surface?.prompt?.count === 1
+        && surface.prompt.visible === true
+        && surface.prompt.enabled === true
+        && surface.prompt.value === prompt
+        && surface?.send?.count === 1
+        && surface.send.visible === true
+        && surface.send.enabled === (prompt.length > 0)
+        && surface?.visible_fatal_count === 0
+        && surface?.visible_recoverable_error_count === 0,
+      retrySampleErrors: false,
+    })).value;
+  } catch (error) {
+    throw classifyAcquiredObservationFailure(error, {
+      code: "permission-temp-composer-not-ready",
+      message: "the acquired Desktop composer did not expose the exact enabled Send state",
+    });
+  }
+}
+
+async function submitTrustedPrompt({
+  cdp,
+  input,
+  commands,
+  prompt = PERMISSION_TEMP_WRITE_PROMPT,
+  insertion = false,
+}) {
+  await waitForReadyComposer(cdp);
+  const typed = insertion ? await trustedInsert(input, prompt) : await trustedType(input, prompt);
+  const ready = await waitForReadyComposer(cdp, prompt);
+  const expected = {
+    command: "submit_prompt",
+    args: {
+      text: prompt,
+      expectedTarget: ready.projection.draft_target,
+      expectedRunTarget: ready.projection.run_target,
+    },
+  };
+  const commandStart = (await commands.snapshot()).sequence;
+  const click = await trustedClick(input, SEND);
+  const observed = await waitForObservation({
+    label: "permission TEMP write submit command",
+    timeoutMs: 10_000,
+    pollMs: 16,
+    sample: () => commands.snapshot(commandStart),
+    accept: (snapshot) => snapshot.calls.length >= 1,
+    retrySampleErrors: false,
+  });
+  const command = assertExactDesktopCommandSequence(observed.value, {
+    afterSequence: commandStart,
+    expected: [expected],
+  });
+  return { typed, click, command, expected, commandStart };
+}
+
+async function waitForProductStage({
+  label,
+  timeoutMs,
+  sample,
+  decide,
+  code,
+  message,
+  failureEvidence = (value) => value,
+}) {
+  let decision = "pending";
+  let observed;
+  try {
+    observed = await waitForObservation({
+      label,
+      timeoutMs,
+      pollMs: 50,
+      sample,
+      accept: (value) => {
+        decision = decide(value);
+        return decision !== "pending";
+      },
+      retrySampleErrors: false,
+    });
+  } catch (error) {
+    if (error?.code === "observation-timeout"
+      && error?.evidence !== null
+      && typeof error?.evidence === "object"
+      && error.evidence.last_value !== null) {
+      error.evidence.last_value = failureEvidence(error.evidence.last_value);
+    }
+    throw classifyAcquiredObservationFailure(error, { code, message });
+  }
+  if (decision === "fail") {
+    throw productFailure(code, message, failureEvidence(observed.value));
+  }
+  return observed.value;
+}
+
+async function requirePermissionTempWritePersistence(context, terminal) {
+  const owner = exactOwner(terminal?.surface?.projection ?? terminal?.projection, "idle");
+  if (owner === null) {
+    throw productFailure(
+      "permission-temp-persistence-owner",
+      "the terminal projection did not retain the canonical session and turn owner for SQLite verification",
+      terminal,
+    );
+  }
+  let evidence;
+  try {
+    evidence = await readPermissionTempWritePersistence({
+      database: context.paths.database,
+      owner,
+    });
+  } catch (error) {
+    throw harnessFailure(
+      "permission-temp-persistence-query",
+      "the read-only SQLite oracle could not inspect canonical permission TEMP history",
+      errorObservation(error),
+    );
+  }
+  const failures = permissionTempWritePersistenceFailures(evidence, owner);
+  if (failures.length > 0) {
+    throw productFailure(
+      "permission-temp-persistence-contract",
+      "canonical permission TEMP history did not persist one completed restricted success projection",
+      { failures, owner, evidence },
+    );
+  }
+  return { owner, ...evidence, failures };
+}
+
+async function bestEffortPermissionTempWritePersistence(context, terminal) {
+  try {
+    return {
+      collection: "pass",
+      ...await requirePermissionTempWritePersistence(context, terminal),
+    };
+  } catch (error) {
+    return {
+      collection: "fail",
+      failures: ["persistence-best-effort-collection-failed"],
+      error: errorObservation(error),
+    };
+  }
+}
+
+async function settleProbes(state, input, commands, primaryError) {
+  const outcome = { input: null, commands: null, failures: [] };
+  try { outcome.input = await input.cleanup(); }
+  catch (error) { outcome.failures.push({ owner: "webview-input", error: errorObservation(error) }); }
+  try { outcome.commands = await commands.remove(); }
+  catch (error) { outcome.failures.push({ owner: "desktop-command-probe", error: errorObservation(error) }); }
+  state.probeOutcomes.push(outcome);
+  if (outcome.failures.length > 0 && primaryError === null) {
+    throw harnessFailure(
+      "permission-temp-probe-cleanup",
+      "permission TEMP write input or command probe did not settle",
+      outcome,
+    );
+  }
+}
+
+export function createPermissionTempWriteScenario() {
+  const state = {
+    provider: null,
+    acceptedLedger: null,
+    quiesceOutcome: null,
+    probeOutcomes: [],
+    workspaceBaseline: null,
+    persistenceEvidence: null,
+  };
+  return Object.freeze({
+    id: "permission.temp-write",
+    productOracle: "pass",
+    manualGate: "not_required",
+    databaseRequired: true,
+    requestGracefulExit,
+    async prepare({ context, sink, phase }) {
+      await preparePermissionTempWritePython(sink, phase, OWNER);
+      state.provider = await startScriptedProvider({
+        script: createPermissionTempWriteProviderScript({
+          taskPrompt: PERMISSION_TEMP_WRITE_PROMPT,
+          command: PERMISSION_TEMP_WRITE_COMMAND,
+          responseText: PERMISSION_TEMP_WRITE_RESPONSE,
+        }),
+        responseBehavior: "hold_until_release",
+      });
+      await prepareDesktopFixture({
+        context,
+        sink,
+        phase,
+        owner: OWNER,
+        configText: permissionTempWriteFixtureConfig(state.provider.baseUrl),
+        sentinelName: FIXTURE_SENTINEL,
+        sentinelText: "moyAI Desktop E2E permission TEMP write fixture.\n",
+      });
+      await writeFile(`${context.paths.workspace}\\${PYTEST_FIXTURE}`, PYTEST_FIXTURE_TEXT, {
+        flag: "wx",
+      });
+      state.workspaceBaseline = await workspaceSnapshot(context.paths.workspace);
+      await sink.record("permission-temp-provider-started", {
+        provider: state.provider.resourceObservation(),
+        workspace: state.workspaceBaseline,
+      }, { phase, owner: OWNER });
+    },
+    async execute({ context, driver: cdp, sink }) {
+      const provider = state.provider;
+      if (provider === null || state.workspaceBaseline === null) {
+        throw new Error("permission TEMP write fixture was not prepared");
+      }
+      await acquireInteractiveShell({ context, driver: cdp, sink }, {
+        evidenceOwner: OWNER,
+        screenshotStem: "permission-temp-shell-ready",
+      });
+      const input = new WebviewInput(cdp, { probeId: "permission-temp-write" });
+      const commands = new DesktopCommandProbe(cdp, {
+        probeId: "permission-temp-write-commands",
+        commands: ["submit_prompt", "cancel_run", "answer_permission"],
+      });
+      let primaryError = null;
+      let probesSettled = false;
+      try {
+        await input.installProbe();
+        await commands.install();
+        const submit = await submitTrustedPrompt({ cdp, input, commands });
+        const held = await waitForProductStage({
+          label: "permission TEMP exact restricted pytest success",
+          timeoutMs: 30_000,
+          sample: async () => ({
+            surface: await observeProviderTurnSurface(cdp),
+            ledger: provider.requestLedger,
+          }),
+          decide: permissionTempWriteHeldDecision,
+          code: "permission-temp-restricted-projection",
+          message: "the restricted pytest success did not reach the held continuation barrier",
+        });
+        const restrictedWorkspace = await workspaceSnapshot(context.paths.workspace);
+        const restrictedWorkspaceFailures = permissionTempWriteWorkspaceFailures(
+          restrictedWorkspace,
+          state.workspaceBaseline,
+        );
+        if (restrictedWorkspaceFailures.length > 0) throw productFailure(
+          "permission-temp-restricted-workspace-drift",
+          "the restricted pytest run changed the fixture or created a workspace TEMP workaround",
+          { failures: restrictedWorkspaceFailures, baseline: state.workspaceBaseline, observed: restrictedWorkspace },
+        );
+        const heldScreenshot = await captureScenarioScreenshot({
+          cdp,
+          sink,
+          name: "permission-temp-write-success-held",
+          owner: OWNER,
+        });
+        const release = provider.releaseScriptRole("temp_continuation");
+        const terminalDecision = createPermissionTempWriteTerminalDecision();
+        let terminal;
+        try {
+          terminal = await waitForProductStage({
+            label: "permission TEMP restricted pytest terminal",
+            timeoutMs: PERMISSION_TEMP_WRITE_TERMINAL_TIMEOUT_MS,
+            sample: async () => ({
+              surface: await observeProviderTurnSurface(cdp),
+              ledger: provider.requestLedger,
+            }),
+            decide: terminalDecision,
+            code: "permission-temp-terminal",
+            message: "the restricted pytest success did not reach one canonical GUI terminal",
+            failureEvidence: permissionTempWriteTerminalFailureEvidence,
+          });
+        } catch (error) {
+          if (error?.code === "permission-temp-terminal" && state.persistenceEvidence === null) {
+            const terminalEvidence = error?.evidence?.surface !== undefined
+              ? error.evidence
+              : error?.evidence?.observation?.last_value;
+            state.persistenceEvidence = await bestEffortPermissionTempWritePersistence(
+              context,
+              terminalEvidence,
+            );
+          }
+          throw error;
+        }
+        const terminalScreenshot = await captureScenarioScreenshot({
+          cdp,
+          sink,
+          name: "permission-temp-terminal",
+          owner: OWNER,
+        });
+        state.persistenceEvidence = await requirePermissionTempWritePersistence(
+          context,
+          terminal,
+        );
+        const finalWorkspace = await workspaceSnapshot(context.paths.workspace);
+        const finalWorkspaceFailures = permissionTempWriteWorkspaceFailures(
+          finalWorkspace,
+          state.workspaceBaseline,
+        );
+        if (finalWorkspaceFailures.length > 0) throw productFailure(
+          "permission-temp-final-workspace-drift",
+          "the restricted pytest run changed the fixture or created a workspace TEMP workaround",
+          { failures: finalWorkspaceFailures, baseline: state.workspaceBaseline, observed: finalWorkspace },
+        );
+        const detailObservation = await observePermissionTempTerminalDetail(terminal.surface, async () => {
+          const surface = await observeProviderTurnSurface(cdp);
+          const visible_tool_detail = await cdp.evaluate(`(() => {
+            const nodes = Array.from(document.querySelectorAll('.output-activity-section .output-activity-group'))
+              .filter(node => node.querySelector('h4')?.textContent.trim() === 'ツール');
+            const visible = nodes.filter(node => {
+              const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+                && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+            });
+            return { present_count: nodes.length, visible_count: visible.length,
+              text: visible.map(node => node.querySelector('pre')?.innerText ?? '').join(String.fromCharCode(10)) };
+          })()`);
+          return { ...surface, visible_tool_detail };
+        });
+        const commandLifetime = assertExactDesktopCommandSequence(
+          await commands.snapshot(submit.commandStart),
+          { afterSequence: submit.commandStart, expected: [submit.expected] },
+        );
+        state.acceptedLedger = structuredClone(provider.requestLedger);
+        await sink.record("permission-temp-write-completed", {
+          submit,
+          command_lifetime: commandLifetime,
+          held,
+          provider_release: release,
+          terminal,
+          terminal_detail_observation: detailObservation,
+          canonical_persistence: state.persistenceEvidence,
+          workspace: finalWorkspace,
+          provider_ledger: state.acceptedLedger,
+          screenshots: { held: heldScreenshot, terminal: terminalScreenshot },
+        }, { phase: "executing", owner: OWNER });
+        probesSettled = true;
+        await settleProbes(state, input, commands, null);
+        return { acquisition: "pass", oracle: "pass", manual: "not_required" };
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        if (!probesSettled) {
+          probesSettled = true;
+          await settleProbes(state, input, commands, primaryError);
+        }
+      }
+    },
+    async quiesce({ inputs }) {
+      if (state.quiesceOutcome !== null) return structuredClone(state.quiesceOutcome);
+      state.quiesceOutcome = await quiesceProviderResource({
+        provider: state.provider,
+        acceptedLedger: state.acceptedLedger,
+        inputs,
+      });
+      return structuredClone(state.quiesceOutcome);
+    },
+    async cleanup() {
+      const pass = state.quiesceOutcome?.input === "pass"
+        && state.probeOutcomes.every((outcome) => outcome.failures.length === 0);
+      return {
+        input: pass ? "pass" : "fail",
+        resources: [{
+          kind: "permission-temp-write-verification",
+          quiesce_input: state.quiesceOutcome?.input ?? null,
+          canonical_persistence: state.persistenceEvidence,
+          probe_outcomes: state.probeOutcomes,
+        }],
+      };
+    },
+  });
+}
+
+function createPermissionExternalTempWriteScenario(options, spec) {
+  const owner = spec.owner;
+  const state = {
+    requestCaptureDirectory: null,
+    requestCaptureEvidence: null,
+    workspaceBaseline: null,
+    terminalWorkspace: null,
+    persistenceEvidence: null,
+    probeOutcomes: [],
+    quiesceOutcome: null,
+    quiesceFinalObservation: null,
+  };
+  return Object.freeze({
+    id: spec.scenarioId,
+    productOracle: "pass",
+    manualGate: "not_required",
+    databaseRequired: true,
+    requestGracefulExit,
+    get environment() {
+      return {
+        ...spec.environment,
+        ...(state.requestCaptureDirectory === null
+          ? {}
+          : { MOYAI_HTTP_REQUEST_CAPTURE_DIR: state.requestCaptureDirectory }),
+      };
+    },
+    async prepare({ context, sink, phase }) {
+      await preparePermissionTempWritePython(sink, phase, owner);
+      state.requestCaptureDirectory = path.join(context.root, LIVE_CAPTURE_DIRECTORY);
+      await prepareDesktopFixture({
+        context,
+        sink,
+        phase,
+        owner,
+        configText: spec.fixtureConfig(options),
+        sentinelName: FIXTURE_SENTINEL,
+        sentinelText: spec.sentinelText,
+      });
+      await writeFile(path.join(context.paths.workspace, PYTEST_FIXTURE), PYTEST_FIXTURE_TEXT, {
+        flag: "wx",
+      });
+      state.workspaceBaseline = await workspaceSnapshot(context.paths.workspace);
+      await sink.record("permission-temp-live-input", {
+        provider_base_url: options.providerBaseUrl,
+        model: options.model,
+        provider_profile: spec.providerProfile,
+        ...(spec.apiMode === CHAT_COMPLETIONS_API_MODE ? {
+          provider_api_mode: spec.apiMode,
+          api_key_env: "",
+          secret_canary_environment_key: spec.secretCanaryEnvironmentKey,
+        } : {}),
+        prompt_sha256: sha256(Buffer.from(PERMISSION_TEMP_WRITE_LIVE_PROMPT, "utf8")),
+        command: PERMISSION_TEMP_WRITE_COMMAND,
+        request_timeout_ms: LIVE_REQUEST_TIMEOUT_MS,
+        turn_timeout_ms: LIVE_TURN_TIMEOUT_MS,
+        prepared_request_capture_directory: state.requestCaptureDirectory,
+        external_provider_owned_by_scenario: false,
+        external_model_lifecycle: "already-loaded-unmanaged",
+      }, { phase, owner });
+    },
+    async execute({ context, driver: cdp, sink }) {
+      if (state.workspaceBaseline === null || state.requestCaptureDirectory === null) {
+        throw new Error(`live ${spec.label} permission TEMP write fixture was not prepared`);
+      }
+      await acquireInteractiveShell({ context, driver: cdp, sink }, {
+        evidenceOwner: owner,
+        screenshotStem: "permission-temp-live-shell-ready",
+      });
+      const input = new WebviewInput(cdp, { probeId: "permission-temp-live" });
+      const commands = new DesktopCommandProbe(cdp, {
+        probeId: "permission-temp-live-commands",
+        commands: ["submit_prompt", "cancel_run", "answer_permission"],
+      });
+      let primaryError = null;
+      let probesSettled = false;
+      try {
+        await input.installProbe();
+        await commands.install();
+        const submit = await submitTrustedPrompt({
+          cdp,
+          input,
+          commands,
+          prompt: PERMISSION_TEMP_WRITE_LIVE_PROMPT,
+          insertion: true,
+        });
+        const terminalDecision = spec.createTerminalDecision(options);
+        let terminal;
+        try {
+          terminal = await waitForProductStage({
+            label: `live ${spec.label} permission TEMP write terminal`,
+            timeoutMs: LIVE_TURN_TIMEOUT_MS,
+            sample: () => observeProviderTurnSurface(cdp),
+            decide: terminalDecision,
+            code: "permission-temp-live-terminal",
+            message: `the live ${spec.label} turn did not complete one restricted pytest success without Guardian or elevation`,
+            failureEvidence: (surface) => spec.terminalFailureEvidence(surface, options),
+          });
+        } catch (error) {
+          if (error?.code === "permission-temp-live-terminal"
+            && state.persistenceEvidence === null) {
+            const terminalEvidence = error?.evidence?.surface ?? error?.evidence
+              ?.observation?.last_value?.surface ?? error?.evidence?.observation?.last_value;
+            state.persistenceEvidence = await bestEffortPermissionTempWritePersistence(
+              context,
+              terminalEvidence,
+            );
+          }
+          throw error;
+        }
+        const screenshot = await captureScenarioScreenshot({
+          cdp,
+          sink,
+          name: "permission-temp-live-terminal",
+          owner,
+        });
+        state.persistenceEvidence = await requirePermissionTempWritePersistence(
+          context,
+          terminal,
+        );
+        state.requestCaptureEvidence = await readPermissionTempWriteLiveRequestCaptures(
+          state.requestCaptureDirectory,
+          options,
+          { apiMode: spec.apiMode },
+        );
+        state.terminalWorkspace = await workspaceSnapshot(context.paths.workspace);
+        const workspaceFailures = permissionTempWriteWorkspaceFailures(
+          state.terminalWorkspace,
+          state.workspaceBaseline,
+        );
+        if (workspaceFailures.length > 0) throw productFailure(
+          "permission-temp-live-workspace-drift",
+          `the live ${spec.label} permission flow changed the fixture or created a workspace TEMP workaround`,
+          { failures: workspaceFailures, baseline: state.workspaceBaseline, observed: state.terminalWorkspace },
+        );
+        const commandLifetime = assertExactDesktopCommandSequence(
+          await commands.snapshot(submit.commandStart),
+          { afterSequence: submit.commandStart, expected: [submit.expected] },
+        );
+        await sink.record("permission-temp-live-completed", {
+          submit,
+          command_lifetime: commandLifetime,
+          terminal,
+          canonical_persistence: state.persistenceEvidence,
+          workspace: state.terminalWorkspace,
+          prepared_request_capture: state.requestCaptureEvidence,
+          screenshot,
+          provider_resource: {
+            kind: spec.resourceKind,
+            owned_by_scenario: false,
+            lifecycle: "already-loaded-unmanaged",
+            cleanup_action: "none",
+          },
+        }, { phase: "executing", owner });
+        probesSettled = true;
+        await settleProbes(state, input, commands, null);
+        return { acquisition: "pass", oracle: "pass", manual: "not_required" };
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        if (!probesSettled) {
+          probesSettled = true;
+          await settleProbes(state, input, commands, primaryError);
+        }
+      }
+    },
+    async quiesce({ context, inputs }) {
+      if (state.quiesceOutcome !== null) return structuredClone(state.quiesceOutcome);
+      const resourcesPass = state.probeOutcomes.every((outcome) => outcome.failures.length === 0);
+      state.quiesceFinalObservation = await observePermissionTempWriteLiveFinal(
+        context,
+        state,
+        options,
+        { apiMode: spec.apiMode },
+      );
+      const postExecutionFailure = inputs.acquisition === "pass"
+        && inputs.oracle !== "fail"
+        && state.quiesceFinalObservation.failures.length > 0
+        ? {
+          code: "permission-temp-live-post-execution-drift",
+          message: `the live ${spec.label} permission flow changed after its terminal evidence was accepted`,
+          evidence: state.quiesceFinalObservation,
+        }
+        : null;
+      state.quiesceOutcome = {
+        input: resourcesPass ? "pass" : "fail",
+        resources: [{
+          kind: spec.resourceKind,
+          provider_base_url: options.providerBaseUrl,
+          model: options.model,
+          owned_by_scenario: false,
+          lifecycle: "already-loaded-unmanaged",
+          cleanup_action: "none",
+          probe_outcomes: structuredClone(state.probeOutcomes),
+          final_observation: state.quiesceFinalObservation,
+        }],
+        productFailure: postExecutionFailure,
+      };
+      return structuredClone(state.quiesceOutcome);
+    },
+    async cleanup({ context }) {
+      const finalObservation = await observePermissionTempWriteLiveFinal(
+        context,
+        state,
+        options,
+        { apiMode: spec.apiMode },
+      );
+      const cleanupFailures = permissionTempWriteLiveCleanupFailures({
+        quiesceInput: state.quiesceOutcome?.input ?? null,
+        quiesceFinalObservation: state.quiesceFinalObservation,
+        cleanupFinalObservation: finalObservation,
+      });
+      return {
+        input: cleanupFailures.length === 0 ? "pass" : "fail",
+        resources: [{
+          kind: "permission-temp-live-verification",
+          prepared_request_capture: state.requestCaptureEvidence,
+          canonical_persistence: state.persistenceEvidence,
+          quiesce_final_observation: state.quiesceFinalObservation,
+          cleanup_final_observation: finalObservation,
+          cleanup_failures: cleanupFailures,
+          quiesce_input: state.quiesceOutcome?.input ?? null,
+        }],
+      };
+    },
+  });
+}
+
+export function createPermissionTempWriteLmStudioScenario(rawOptions = {}) {
+  const options = normalizePermissionTempWriteLmStudioOptions(rawOptions);
+  return createPermissionExternalTempWriteScenario(options, {
+    scenarioId: LIVE_LM_STUDIO_SCENARIO_ID,
+    owner: OWNER,
+    label: "LM Studio",
+    sentinelText: "moyAI Desktop E2E live LM Studio permission TEMP write fixture.\n",
+    providerProfile: "lm_studio",
+    apiMode: RESPONSES_API_MODE,
+    resourceKind: "external-lm-studio-provider",
+    fixtureConfig: permissionTempWriteLmStudioFixtureConfig,
+    createTerminalDecision: () => createPermissionTempWriteLiveTerminalDecision(),
+    terminalFailureEvidence: (surface) => permissionTempWriteLiveTerminalFailureEvidence(
+      surface,
+    ),
+    environment: {},
+  });
+}
+
+export function createPermissionTempWriteOpenAiCompatibleScenario(rawOptions = {}) {
+  const options = normalizePermissionTempWriteOpenAiCompatibleOptions(rawOptions);
+  return createPermissionExternalTempWriteScenario(options, {
+    scenarioId: LIVE_OPENAI_COMPATIBLE_SCENARIO_ID,
+    owner: `scenario:${LIVE_OPENAI_COMPATIBLE_SCENARIO_ID}`,
+    label: "OpenAI-compatible Chat Completions",
+    sentinelText: "moyAI Desktop E2E OpenAI-compatible Chat permission TEMP write fixture.\n",
+    providerProfile: "openai_compatible",
+    apiMode: CHAT_COMPLETIONS_API_MODE,
+    resourceKind: "external-openai-compatible-provider",
+    fixtureConfig: permissionTempWriteOpenAiCompatibleFixtureConfig,
+    createTerminalDecision: (normalized) => (
+      createPermissionTempWriteOpenAiCompatibleLiveTerminalDecision(normalized)
+    ),
+    terminalFailureEvidence: permissionTempWriteOpenAiCompatibleLiveTerminalFailureEvidence,
+    environment: {
+      [LIVE_OPENAI_COMPATIBLE_SECRET_ENV]: PERMISSION_TEMP_WRITE_SECRET_CANARY,
+    },
+    secretCanaryEnvironmentKey: LIVE_OPENAI_COMPATIBLE_SECRET_ENV,
+  });
+}

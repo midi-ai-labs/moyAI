@@ -3,9 +3,37 @@ import test from "node:test";
 
 import {
   normalizeScenarioEnvironment,
+  desktopLaunchArguments,
   releaseResourcesThenAuditClosedStore,
   selectActiveCleanupDriver,
+  WindowsTauriHost,
 } from "../drivers/windows_tauri_host.mjs";
+
+test("restart fixture mutation is rejected before acquiring any process when its callback is invalid", async () => {
+  let invoked = false;
+  const host = new WindowsTauriHost();
+  await assert.rejects(host.restart({ beforeRelaunch: true }), /beforeRelaunch must be a function/);
+  const context = { root: "C:\\execution", binary: "C:\\desktop.exe", desktopIsolation: "fixture",
+    paths: { logs: "C:\\execution\\logs", workspace: "C:\\execution\\workspace", config: "C:\\execution\\config",
+      data: "C:\\execution\\data", prefs: "C:\\execution\\prefs", webview: "C:\\execution\\webview" } };
+  await assert.rejects(host.restart({ context, driver: null, beforeRelaunch: async () => { invoked = true; } }), /attached live generation/);
+  assert.equal(invoked, false);
+});
+
+test("cold and duplicate activation use the same bounded fixture argv without shell quoting", () => {
+  const context = { paths: { workspace: "C:\\fixture\\workspace" } };
+  const config = "C:\\fixture\\workspace\\team config 日本語.toml";
+  assert.deepEqual(desktopLaunchArguments(context), ["--dir", context.paths.workspace]);
+  assert.deepEqual(desktopLaunchArguments(context, config), ["--dir", context.paths.workspace, "--join-config", config]);
+  assert.deepEqual(desktopLaunchArguments(context, null, "preferences"), []);
+  assert.deepEqual(desktopLaunchArguments(context, config, "preferences"), ["--join-config", config]);
+  for (const value of [null, "", "current", ["preferences"], { workspace: false }]) {
+    assert.throws(() => desktopLaunchArguments(context, null, value), /startupTarget/);
+  }
+  for (const value of ["relative.toml", "C:\\fixture\\workspace", "C:\\fixture\\workspace2\\other.toml", "C:\\fixture\\workspace\\..\\other.toml", config + "\0"]) {
+    assert.throws(() => desktopLaunchArguments(context, value), /joinConfigPath/);
+  }
+});
 
 test("scenario environment permits only bounded product config overrides", () => {
   assert.deepEqual(normalizeScenarioEnvironment({

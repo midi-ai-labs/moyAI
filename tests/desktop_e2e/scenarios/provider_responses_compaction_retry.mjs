@@ -514,7 +514,7 @@ export function responsesCompactionReasoningHeldFailures(sample) {
   if (projection?.run_status_key !== "running"
     || projection?.task_activity_state !== "running"
     || projection?.busy !== true
-    || projection?.run_phase !== "Provider応答受信中") failures.push("held-run-not-provider-active");
+    || projection?.run_phase !== "AIの回答を受信中") failures.push("held-run-not-provider-active");
   if (!Array.isArray(projection?.transcript_rows)
     || !Array.isArray(surface?.all_transcript_rows)) failures.push("held-transcript-rows-not-observed");
   if (blockingSurfaceFailure(surface)) failures.push("held-surface-blocking-failure");

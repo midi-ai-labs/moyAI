@@ -1,0 +1,252 @@
+import assert from "node:assert/strict";
+import { renderWorkDetails } from "../src/shared_work_details.ts";
+import { renderSidebar } from "../src/render.ts";
+import test from "node:test";
+import type { ActionContext } from "../src/actions.ts";
+import { refreshSharedWork, sharedWorkAction } from "../src/shared_work_actions.ts";
+import { acceptSharedWork, sharedWorkActionEnabled, sharedWorkPresentation } from "../src/shared_work_state.ts";
+import { renderSharedWork, retainSharedWorkSurface } from "../src/shared_work_render.ts";
+import { sharedProjection, sharedUiFixture } from "./shared_work_fixture.ts";
+
+test("shared entry explains rejected device enrollment using the existing network reason", () => {
+  const local = sharedUiFixture();
+  local.projection = sharedProjection({ connected: false, principal: null, enrollment: "error", enrollment_error: "device_name_conflict" });
+  assert.match(renderSharedWork(sharedWorkPresentation(local)), /同じ端末名が既に登録されています/);
+  local.projection = sharedProjection({ revision: "2", principal: null, enrollment: "active", enrollment_error: null });
+  assert.doesNotMatch(renderSharedWork(sharedWorkPresentation(local)), /同じ端末名が既に登録されています/);
+});
+
+test("a different human generation erases drafts and older snapshots cannot restore them", () => {
+  const local = sharedUiFixture(); local.title = "private"; local.prompt = "private prompt";
+  acceptSharedWork(local, sharedProjection({ generation: "2", revision: "3", principal: null, projects: [], status: null, selected_project_id: null }));
+  assert.equal(local.title + local.prompt, "");
+  assert.equal(acceptSharedWork(local, sharedProjection({ revision: "2" })), false);
+  assert.equal(local.projection?.principal, null);
+});
+test("project role and selected enabled environment govern input while readers retain observation", () => {
+  const local = sharedUiFixture(); local.title = "run"; local.prompt = "solve"; local.environmentId = "env-a";
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "submit", ""), true);
+  local.projection!.projects[0].can_submit = false;
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "submit", ""), false);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "detail", "job-a"), true);
+  assert.doesNotMatch(renderSharedWork(sharedWorkPresentation(local)), /id="shared-prompt"/);
+});
+test("continuation requires the Hub capability and sends the selected job revision with its draft", async () => {
+  const local = sharedUiFixture();
+  local.projection!.selected_job_id = "finished-a";
+  local.projection!.selected_conversation_id = "conversation-a";
+  local.projection!.conversations = [{ id: "conversation-a", title: "Original", latest_job_id: "finished-a", updated_at_ms: 2 }];
+  local.projection!.detail = { id: "finished-a", project_id: "project-a", root_id: "finished-a", parent_id: null, conversation_id: "conversation-a", environment_id: "env-a", title: "Original", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: false };
+  local.draft.followup = "追加の分析";
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "continue", ""), false);
+  local.projection!.detail.can_continue = true;
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "continue", ""), true);
+  local.projection!.conversations[0].latest_job_id = "newer-job";
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "continue", ""), false);
+  local.projection!.conversations[0].latest_job_id = "finished-a";
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let sent: unknown;
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (_name: string, args: unknown) => { sent = args; return { ...local.projection, revision: "2" }; } } } });
+  try {
+    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
+    await sharedWorkAction(context, "continue");
+    assert.deepEqual(sent, { expectedGeneration: "1", request: { kind: "continue", project_id: "project-a", job_id: "finished-a", expected_revision: 7, prompt: "追加の分析", start_before_ms: null } });
+  } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
+});
+test("normal chat submits without a total deadline even when an old draft contains one", async () => {
+  const local = sharedUiFixture();
+  local.title = "Timed work"; local.prompt = "Run when available"; local.environmentId = "env-a";
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const calls: Record<string, unknown>[] = [];
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (_name: string, args: Record<string, unknown>) => {
+    calls.push(args); return { ...local.projection, revision: "2", submission_uncertain: true };
+  } } } });
+  try {
+    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
+    local.draft.startBefore = "2000-01-01T00:00";
+    await sharedWorkAction(context, "submit");
+    assert.equal((calls[0].request as Record<string, unknown>).start_before_ms, null);
+    await sharedWorkAction(context, "retry_submission");
+    assert.deepEqual(calls[1].request, { kind: "retry_submission" });
+  } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
+});
+test("new person and new detail clear continuation drafts", () => {
+  const local = sharedUiFixture(); local.draft.followup = "private continuation";
+  acceptSharedWork(local, sharedProjection({ revision: "2", selected_job_id: "other-job" }));
+  assert.equal(local.draft.followup, "");
+  local.draft.followup = "private again";
+  acceptSharedWork(local, sharedProjection({ revision: "3", generation: "2", principal: null }));
+  assert.equal(Object.values(local.draft).join(""), "");
+});
+test("file controls accept only projected assets and continued receipts block another submission", () => {
+  const local = sharedUiFixture();
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "save-asset", "not-owned"), false);
+  local.projection!.submission_uncertain = true;
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "upload-inputs", ""), false);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "retry-submission", ""), true);
+});
+test("retained metadata shows deleted content and cannot save or import it", () => {
+  const local = sharedUiFixture();
+  local.projection!.assets = [{ id: "expired-artifact", project_id: "project-a", job_id: "job-a", kind: "artifact", name: "result.txt", sha256: "a".repeat(64), byte_length: 42, created_at_ms: 1, version: 1, base_sha256: null, purged_at_ms: 2 }];
+  const view = sharedWorkPresentation(local);
+  assert.equal(sharedWorkActionEnabled(view, "save-asset", "expired-artifact"), false);
+  assert.equal(sharedWorkActionEnabled(view, "import-asset", "expired-artifact"), false);
+  const html = renderWorkDetails(view, "support");
+  assert.match(html, /保持期限により内容は削除済みです/);
+  assert.match(html, /data-action="shared-save-asset"[^>]*disabled/);
+  assert.match(html, /data-action="shared-import-asset"[^>]*disabled/);
+});
+test("shared surface shows restricted occupancy only as a count and escapes returned work text", () => {
+  const local = sharedUiFixture(); local.projection!.status!.environments[0].label = "<script>alert(1)</script>";
+  const html = renderSharedWork(sharedWorkPresentation(local));
+  assert.match(html, /ほかに 1 枠使用中（起動中のアプリを含む）/);
+  assert.doesNotMatch(html, /他のプロジェクトで/);
+  assert.match(html, /&lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
+});
+test("uncertain submission has an independent retry control and blocks a new draft submission", () => {
+  const local = sharedUiFixture(); local.projection!.submission_uncertain = true;
+  local.title = "changed"; local.prompt = "changed"; local.environmentId = "env-a";
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "submit", ""), false);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "retry-submission", ""), true);
+  assert.match(renderSharedWork(sharedWorkPresentation(local)), /data-action="shared-retry-submission"/);
+  local.projection!.submission_storage_error = "保存できません";
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "retry-submission", ""), false);
+});
+
+test("pending approval precedes the conversation with exact decision controls and visible operation scope", () => {
+  const local = sharedUiFixture();
+  local.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a", title: "Long job", input: { prompt: "long conversation".repeat(100) }, result: null, state: "running", awaiting_child_id: null, revision: 1, created_at_ms: 1, updated_at_ms: 1 };
+  local.projection!.approval = { id: "exact-approval", attempt_id: "attempt-a", status: "pending", can_decide: true, decision: null, expires_at_ms: 9999999999999, request: { access: "shell", summary: "Run a command", targets: ["C:/Approved/report.md"], details: ["Command: <write report>", "Workdir: C:/Approved"], outside_workspace: true, risks: ["external_mutation"] } };
+  let html = renderSharedWork(sharedWorkPresentation(local));
+  assert.match(html, /href="#shared-approval-title"/);
+  const start = html.indexOf('data-shared-region="approval"'), record = html.indexOf('data-shared-region="detail"');
+  assert.ok(start >= 0 && start < record);
+  const approval = html.slice(start, record), details = approval.indexOf("<details");
+  assert.ok(approval.indexOf("実行コマンド") < details);
+  assert.ok(approval.indexOf("&lt;write report&gt;") < details);
+  assert.ok(approval.indexOf("C:/Approved/report.md") < details);
+  assert.ok(approval.indexOf("作業フォルダー外") < details);
+  assert.ok(approval.indexOf("外部サービスのデータを変更する操作") < details);
+  for (const kind of ["approve", "deny", "stop"]) assert.match(approval, new RegExp(`data-action="shared-${kind}" data-value="exact-approval"`));
+  assert.equal(sharedWorkActionEnabled(local, "approve", "stale-approval"), false);
+  local.projection!.approval.can_decide = false;
+  html = renderSharedWork(sharedWorkPresentation(local));
+  assert.doesNotMatch(html, /data-action="shared-(?:approve|deny|stop)"/);
+  assert.match(html, /依頼元の承認待ち/);
+});
+test("an actionable child approval is visible from its parent conversation and opens the exact notification", async () => {
+  const local = sharedUiFixture();
+  local.projection!.selected_job_id = "job-a";
+  local.projection!.selected_conversation_id = "job-a";
+  local.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null,
+    conversation_id: "job-a", environment_id: "env-a", title: "Parent", input: { prompt: "Build an app" },
+    result: null, state: "waiting_child", awaiting_child_id: "job-child", revision: 1, created_at_ms: 1, updated_at_ms: 1 };
+  local.projection!.inbox = { items: [
+    { id: "notice-child", job_id: "job-child", project_id: "project-a", kind: "approval", title: "Host <app>",
+      created_at_ms: 2, read_at_ms: null, can_act: true, approval_id: "approval-child" },
+    { id: "notice-other", job_id: "other", project_id: "other-project", kind: "approval", title: "Other project",
+      created_at_ms: 2, read_at_ms: null, can_act: true, approval_id: "other-approval" },
+  ], next_before: null, unread_count: 2 };
+  const html = renderSharedWork(sharedWorkPresentation(local));
+  const banner = html.slice(html.indexOf('data-shared-region="message"'), html.indexOf('data-shared-region="stop-all"'));
+  assert.match(banner, /shared-work-message has-approval/);
+  assert.match(banner, /承認が必要な仕事があります/);
+  assert.match(banner, /data-action="shared-inbox-open" data-value="notice-child"/);
+  assert.match(banner, /Host &lt;app&gt;/);
+  assert.doesNotMatch(banner, /Other project|notice-other|<app>/);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "inbox-open", "notice-child"), true);
+
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let sent: unknown;
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (_name: string, args: unknown) => {
+    sent = args; return { ...local.projection, revision: "2" };
+  } } } });
+  try {
+    const context = { uiState: { sharedWork: local }, getViewState: () => ({ overlay: "none", hub_project_open: true }), rerender: () => {} } as unknown as ActionContext;
+    await sharedWorkAction(context, "inbox_open", "notice-child");
+    assert.deepEqual(sent, { expectedGeneration: "1", request: { kind: "inbox_open", notification_id: "notice-child" } });
+  } finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as Record<string, unknown>).window; }
+});
+test("retaining an active draft synchronizes native and accessible button availability together", () => {
+  const attributes = new Map([["aria-disabled", "true"]]);
+  const button = { dataset: { action: "shared-submit" }, disabled: true, textContent: "送信", setAttribute: (name: string, value: string) => attributes.set(name, value) };
+  const replacement = { dataset: { action: "shared-submit" }, disabled: false, textContent: "送信", getAttribute: () => "false" };
+  const region = { contains: () => true, isEqualNode: () => false, querySelectorAll: (selector: string) => selector.startsWith("button") ? [button] : [] };
+  const nextRegion = { dataset: { sharedRegion: "draft" }, querySelector: () => replacement, querySelectorAll: (selector: string) => selector.startsWith("button") ? [replacement] : [] };
+  const current = { dataset: { sharedOwner: "same-person" }, querySelector: () => region };
+  const next = { dataset: { sharedOwner: "same-person" }, querySelectorAll: () => [nextRegion] };
+  const original = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "document", { configurable: true, value: { activeElement: { matches: () => true } } });
+  try {
+    assert.equal(retainSharedWorkSurface(current as unknown as HTMLElement, next as unknown as HTMLElement), true);
+    assert.equal(button.disabled, false);
+    assert.equal(attributes.get("aria-disabled"), "false");
+  } finally { if (original) Object.defineProperty(globalThis, "document", original); else delete (globalThis as Record<string, unknown>).document; }
+});
+
+test("resolved approvals show only a Japanese result and keep their original scope in closed details", () => {
+  const local = sharedUiFixture();
+  const approval = { id: "approval-a", attempt_id: "attempt-a", status: "pending", can_decide: true, decision: null as string | null, expires_at_ms: 9999999999999, request: { access: "shell", summary: "Original operation", targets: ["C:/Approved/report.md"], details: ["Command: write report"], outside_workspace: true, risks: ["external_mutation"] } };
+  local.projection!.approval = approval;
+  const pendingKey = renderSharedWork(local).match(/<details data-details-key="(shared-approval-[^"]+)"/)?.[1];
+  for (const [status, decision, title] of [
+    ["decided", "approve", "この操作を許可しました"], ["consumed", "approve", "この操作を許可しました"],
+    ["consumed", "deny", "この操作を拒否しました"], ["decided", "stop", "仕事の停止を指示しました"],
+    ["expired", "approve", "承認の有効期限が切れました"], ["cancelled", "approve", "この承認依頼は取り消されました"],
+    ["future-status", "future-decision", "承認の記録"],
+  ]) {
+    approval.status = status; approval.decision = decision;
+    const html = renderSharedWork(local), start = html.indexOf('data-shared-region="approval"');
+    const section = html.slice(start, html.indexOf("</section>", start));
+    assert.match(section, new RegExp(`<summary[^>]*>${title}`));
+    assert.doesNotMatch(section, /<details[^>]*\sopen(?:\s|>)/);
+    const key = section.match(/<details data-details-key="([^"]+)"/)?.[1];
+    assert.notEqual(key, pendingKey, "an expanded pending explanation must not keep the settled record expanded");
+    const summaryEnd = section.indexOf("</summary>");
+    assert.doesNotMatch(section.slice(0, summaryEnd), /Original operation|Command:|C:\/Approved|consumed|approve|expired|cancelled|future-status|future-decision/);
+    for (const original of ["Original operation", "Command: write report", "C:/Approved/report.md", "作業フォルダー外", "外部サービスのデータを変更する操作"]) assert.ok(section.indexOf(original) > summaryEnd, original);
+    assert.doesNotMatch(section, /data-action="shared-(?:approve|deny|stop)"/);
+    assert.doesNotMatch(html, /href="#shared-approval-title"/);
+  }
+});
+
+test("a newer device generation clears drafts and a late poll cannot restore prior project data", () => {
+  const local = sharedUiFixture();
+  local.prompt = "private draft";
+  acceptSharedWork(local, sharedProjection({ generation: "2", revision: "3", principal: null, projects: [], status: null, selected_project_id: null }));
+  assert.equal(local.prompt, "");
+  assert.equal(acceptSharedWork(local, sharedProjection({ revision: "2" })), false);
+  assert.equal(local.projection?.principal, null);
+  assert.doesNotMatch(renderSharedWork(local), /試験の仕事|利用者 A/);
+});
+
+ test("support UI has no transfer controls and rejects retired handover actions", () => {
+  const local = sharedUiFixture();
+  const html = renderWorkDetails(sharedWorkPresentation(local), "support");
+  assert.doesNotMatch(html, /担当の引継ぎ|次の担当者|data-shared-action="handover"/);
+  assert.equal(sharedWorkActionEnabled(sharedWorkPresentation(local), "handover", ""), false);
+});
+
+
+test("expired child reconfirmation sends only the currently projected origin target", async () => {
+  const local = sharedUiFixture();
+  local.projection!.approval = { id:"expired-a",attempt_id:"attempt-a",status:"expired",decision:null,
+    expires_at_ms:1,can_decide:false,can_reconfirm:true,request:{access:"shell",summary:"run",details:[],targets:[],outside_workspace:false,risks:[]},
+    context:{job_id:"child-b",project_id:"project-a",root_id:"job-a",conversation_id:"job-a",job_title:"Child",
+      controller_device_id:"WinA",controller_device_label:"WinA",execution_device_id:"WinB",execution_device_label:"WinB"} };
+  const original = Object.getOwnPropertyDescriptor(globalThis,"window");
+  const calls: Record<string,unknown>[] = [];
+  Object.defineProperty(globalThis,"window",{configurable:true,value:{__TAURI_INTERNALS__:{invoke:async (_name:string,args:Record<string,unknown>) => {
+    calls.push(args);return {...local.projection,revision:"2"};
+  }}}});
+  try {
+    const context = {uiState:{sharedWork:local},getViewState:()=>({overlay:"none",hub_project_open:true}),rerender:()=>{}} as unknown as ActionContext;
+    await sharedWorkAction(context,"reconfirm_approval","stale-id");
+    assert.equal(calls.length,0);
+    await sharedWorkAction(context,"reconfirm_approval","expired-a");
+    assert.deepEqual(calls[0],{expectedGeneration:"1",request:{kind:"reconfirm_approval",project_id:"project-a",job_id:"child-b",approval_id:"expired-a"}});
+    local.projection!.approval!.can_reconfirm = false;
+    await sharedWorkAction(context,"reconfirm_approval","expired-a");
+    assert.equal(calls.length,1);
+  } finally {if(original) Object.defineProperty(globalThis,"window",original);else delete (globalThis as Record<string,unknown>).window;}
+});

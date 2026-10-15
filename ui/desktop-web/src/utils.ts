@@ -104,7 +104,7 @@ export interface ConfigFieldValue {
   text: string;
 }
 
-/** Mirrors Rust's canonical Docling base URL plus its explicit `/ready` route. */
+/** Mirrors Rust's canonical Doclingの接続先URL plus its explicit `/ready` route. */
 export function doclingReadinessEndpoint(rawBaseUrl: string): string | null {
   try {
     const url = new URL(rawBaseUrl.trim());
@@ -261,11 +261,11 @@ export function goalSlashCommandHint(prompt: string): string | null {
   if (!match) return null;
   const arg = prompt.slice(match[0].length).trim();
   const normalized = arg.toLowerCase();
-  if (arg.length === 0) return "現在のgoalを表示します。指定: objective | clear | pause | resume";
-  if (normalized === "clear") return "現在のgoalを削除します。";
-  if (normalized === "pause") return "現在のgoalを一時停止します。";
-  if (normalized === "resume") return "一時停止中のgoalを再開します。";
-  return "このobjectiveをgoalに設定して、そのまま実行します。";
+  if (arg.length === 0) return "現在の目標を表示します。目標の入力、clear（削除）、pause（一時停止）、resume（再開）を指定できます。";
+  if (normalized === "clear") return "現在の目標を削除します。";
+  if (normalized === "pause") return "現在の目標を一時停止します。";
+  if (normalized === "resume") return "一時停止中の目標を再開します。";
+  return "入力内容を目標として設定し、実行を始めます。";
 }
 
 export interface HumanError {
@@ -280,14 +280,14 @@ export function humanizeError(error: unknown): HumanError {
   switch (info.code) {
     case "provider_transport":
       return {
-        title: "LLM provider に接続できません",
-        hint: "Provider が起動しているか、Base URL が到達可能か確認してください。",
+        title: "AIに接続できません",
+        hint: "AIサーバーが起動しているか、設定したURLに接続できるかを確認してください。",
         details,
       };
     case "model_unavailable":
       return {
         title: "指定したモデルが見つかりません",
-        hint: "Provider設定でモデル一覧を読み込み、利用可能なモデルを選択してください。",
+        hint: "AIの接続設定でモデル一覧を読み込み、利用できるモデルを選んでください。",
         details,
       };
     case "image_unsupported":
@@ -300,6 +300,12 @@ export function humanizeError(error: unknown): HumanError {
       return {
         title: "操作が許可されませんでした",
         hint: "アクセスモードと操作対象を確認してください。",
+        details,
+      };
+    case "team_setup_unavailable":
+      return {
+        title: "チーム管理を起動できません",
+        hint: "Hub同梱版を導入するか、既存の管理PCでHubを起動してください。このPCの個人設定やチーム参加は引き続き利用できます。",
         details,
       };
     case "unknown":

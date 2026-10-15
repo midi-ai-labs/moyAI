@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 param(
   [Parameter(Mandatory)]
-  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "SelectFile", "CapturePng", "CloseCleanup")]
+  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "InvokeDialogButton", "OpenFilePath", "SelectFile", "CapturePng", "CloseCleanup")]
   [string]$Action,
   [string]$ExecutionRoot,
   [string]$OwnerPath,
@@ -12,11 +12,17 @@ param(
   [int]$ClientOffsetY = -1,
   [int]$DragDeltaX = 0,
   [int]$DragDeltaY = 0,
-  [string]$SelectedPath
+  [string]$SelectedPath,
+  [int]$DialogButtonId = 0,
+  [string]$ExpectedDialogTitle,
+  [string]$ExpectedDialogTextJson,
+  [ValidateSet("open", "save_new", "directory")]
+  [string]$SelectedPathIntent = "open"
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 Add-Type -TypeDefinition @'
 using System;
@@ -136,6 +142,27 @@ namespace Moyai.DesktopE2e {
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr state);
 
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetParent(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        public static extern int GetDlgCtrlID(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr SendTextTimeout(IntPtr hwnd, uint message, UIntPtr wParam, string text,
+            uint flags, uint timeout, out UIntPtr result);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr ReadTextTimeout(IntPtr hwnd, uint message, UIntPtr wParam, StringBuilder text,
+            uint flags, uint timeout, out UIntPtr result);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", SetLastError = true)]
+        private static extern IntPtr SendControlTimeout(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr value,
+            uint flags, uint timeout, out UIntPtr result);
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 
@@ -247,6 +274,28 @@ namespace Moyai.DesktopE2e {
             }, IntPtr.Zero);
             if (!completed) throw new Win32Exception(Marshal.GetLastWin32Error(), "EnumWindows failed");
             return windows.ToArray();
+        }
+
+        // Exact native control input, not OS physical keyboard/IME evidence. No mutation retry.
+        public static void SetFileNameOnce(IntPtr edit, string path) {
+            UIntPtr result;
+            if (SendTextTimeout(edit, 0x000C, UIntPtr.Zero, path, 0x0002, 5000, out result) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "WM_SETTEXT delivery ambiguous; do not retry");
+            if (result == UIntPtr.Zero) throw new InvalidOperationException("WM_SETTEXT was not accepted");
+        }
+
+        public static string ReadFileName(IntPtr edit) {
+            var text = new StringBuilder(32768);
+            UIntPtr result;
+            if (ReadTextTimeout(edit, 0x000D, (UIntPtr)text.Capacity, text, 0x0002, 5000, out result) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "WM_GETTEXT did not return");
+            return text.ToString();
+        }
+
+        public static void ClickOpenOnce(IntPtr button) {
+            UIntPtr result;
+            if (SendControlTimeout(button, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 0x0002, 5000, out result) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "BM_CLICK delivery ambiguous; do not retry");
         }
 
         public static uint WindowThreadProcessId(IntPtr hwnd, out uint processId) {
@@ -558,6 +607,7 @@ function Get-WindowRow {
       class_name = $className
       title = $title
       visible = $visible
+      minimized = [bool][Moyai.DesktopE2e.NativeWindowInterop]::IsIconic($Handle)
       enabled = [bool][Moyai.DesktopE2e.NativeWindowInterop]::IsWindowEnabled($Handle)
       is_root = $root -eq $Handle
       rect = [ordered]@{
@@ -624,6 +674,94 @@ function Resolve-ExactCandidate {
   return [ordered]@{ handle = $handle; row = $row }
 }
 
+function Resolve-ExactDialogControl {
+  param(
+    [Parameter(Mandatory)][object]$Candidate,
+    [Parameter(Mandatory)][IntPtr]$ParentHandle,
+    [Parameter(Mandatory)][int]$ControlId,
+    [Parameter(Mandatory)][string]$ClassName,
+    [IntPtr]$ExactHandle = [IntPtr]::Zero
+  )
+  $handle = if ($ExactHandle -ne [IntPtr]::Zero) { $ExactHandle } else { [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgItem($ParentHandle, $ControlId) }
+  if ($handle -eq [IntPtr]::Zero) {
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    $dialog = [System.Windows.Automation.AutomationElement]::FromHandle($Candidate.handle)
+    $observed = @($dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object {
+      $_.Current.NativeWindowHandle -ne 0 -and $_.Current.ProcessId -eq $Candidate.row.process_id
+    } | Select-Object -First 80 | ForEach-Object {
+      [long]$nativeValue = $_.Current.NativeWindowHandle
+      if ($nativeValue -lt 0) { $nativeValue += 4294967296 }
+      $native = [IntPtr]::new($nativeValue)
+      [ordered]@{ hwnd = Format-WindowHandle $native; parent = Format-WindowHandle ([Moyai.DesktopE2e.NativeWindowInterop]::GetParent($native)); class_name = $_.Current.ClassName; control_id = [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgCtrlID($native) }
+    })
+    throw "Exact native file control is absent: $ClassName/$ControlId; observed native control identities: $($observed | ConvertTo-Json -Compress)"
+  }
+  $row = Get-WindowRow -Handle $handle -OwnerProcessId ([int]$Candidate.row.process_id)
+  if ($null -eq $row -or -not $row.enabled -or $row.thread_id -ne $Candidate.row.thread_id -or
+      $row.root_hwnd -ne $Candidate.row.hwnd -or $row.class_name -cne $ClassName -or
+      $row.rect.width -le 0 -or $row.rect.height -le 0 -or
+      [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($handle) -ne $ParentHandle -or
+      [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgCtrlID($handle) -ne $ControlId) {
+    throw "Exact native file control identity or interaction state changed: $ClassName/$ControlId"
+  }
+  # Do not retain arbitrary control text in evidence. The readback is compared only to the intended path.
+  $row.Remove('title')
+  $row.parent_hwnd = Format-WindowHandle $ParentHandle
+  $row.control_id = $ControlId
+  return [ordered]@{ handle = $handle; row = $row }
+}
+
+function Resolve-ExactOpenFileControls {
+  param([Parameter(Mandatory)][object]$Candidate)
+  if ($Candidate.row.class_name -cne '#32770') { throw "OpenFilePath requires an exact native file dialog" }
+  if ($SelectedPathIntent -ceq 'directory') {
+    # Live folder-picker fingerprint: an Edit/1152 directly beneath the dialog.
+    $edit = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1152 -ClassName 'Edit'
+    $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1 -ClassName 'Button'
+    return [ordered]@{ edit = $edit; button = $button }
+  }
+  if ($SelectedPathIntent -ceq 'save_new') {
+    # The live save picker uses a DirectUI filename Edit/1001. Identify the
+    # unique native edit first, then verify every native parent in that tree.
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    $dialog = [System.Windows.Automation.AutomationElement]::FromHandle($Candidate.handle)
+    $filenameMatches = @($dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object {
+      if ($_.Current.NativeWindowHandle -eq 0 -or $_.Current.ProcessId -ne $Candidate.row.process_id -or $_.Current.ClassName -cne 'Edit') { return $false }
+      [long]$value = $_.Current.NativeWindowHandle
+      if ($value -lt 0) { $value += 4294967296 }
+      return [Moyai.DesktopE2e.NativeWindowInterop]::GetDlgCtrlID([IntPtr]::new($value)) -eq 1001
+    })
+    if ($filenameMatches.Count -ne 1) { throw "Save filename native Edit/1001 is not unique" }
+    [long]$editValue = $filenameMatches[0].Current.NativeWindowHandle
+    if ($editValue -lt 0) { $editValue += 4294967296 }
+    $editHandle = [IntPtr]::new($editValue)
+    $comboHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($editHandle)
+    $sinkHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($comboHandle)
+    $directHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($sinkHandle)
+    $viewHandle = [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($directHandle)
+    $view = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 0 -ClassName 'DUIViewWndClassName' -ExactHandle $viewHandle
+    $direct = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $viewHandle -ControlId 0 -ClassName 'DirectUIHWND' -ExactHandle $directHandle
+    $sink = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $directHandle -ControlId 0 -ClassName 'FloatNotifySink' -ExactHandle $sinkHandle
+    $combo = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $sinkHandle -ControlId 0 -ClassName 'ComboBox' -ExactHandle $comboHandle
+    $edit = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $comboHandle -ControlId 1001 -ClassName 'Edit' -ExactHandle $editHandle
+    $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1 -ClassName 'Button'
+    return [ordered]@{ view = $view; direct = $direct; sink = $sink; combo = $combo; edit = $edit; button = $button }
+  }
+  # Windows common file-dialog hierarchy observed in the live native picker. A different hierarchy fails closed.
+  $comboEx = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1148 -ClassName 'ComboBoxEx32'
+  $combo = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $comboEx.handle -ControlId 1148 -ClassName 'ComboBox'
+  $edit = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $combo.handle -ControlId 1148 -ClassName 'Edit'
+  $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId 1 -ClassName 'Button'
+  return [ordered]@{ combo_ex = $comboEx; combo = $combo; edit = $edit; button = $button }
+}
+
+function Assert-SameOpenFileControls {
+  param([Parameter(Mandatory)][object]$Before, [Parameter(Mandatory)][object]$After)
+  foreach ($name in $Before.Keys) {
+    if ($Before[$name].handle -ne $After[$name].handle) { throw "Native file-dialog control HWND changed before input: $name" }
+  }
+}
+
 function Resolve-ExactUiaWindowClose {
   param([Parameter(Mandatory)][object]$Candidate)
   Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
@@ -669,6 +807,47 @@ function Resolve-ExactUiaWindowClose {
       }
     }
   }
+}
+
+function Resolve-ExactNativeDialogButton {
+  param([Parameter(Mandatory)][object]$Candidate)
+  if ($DialogButtonId -notin @(1, 2) -or $Candidate.row.class_name -cne '#32770') {
+    throw "Only standard OK/Cancel buttons in an exact native dialog are supported"
+  }
+  if ([string]::IsNullOrWhiteSpace($ExpectedDialogTitle) -or $ExpectedDialogTitle.Length -gt 256) {
+    throw "The expected native dialog title is required"
+  }
+  $expected = @(ConvertFrom-Json -InputObject $ExpectedDialogTextJson)
+  if ($expected.Count -lt 1 -or $expected.Count -gt 8) { throw "Expected dialog text must contain 1 to 8 strings" }
+  $window = Resolve-ExactUiaWindowClose -Candidate $Candidate
+  if ($window.evidence.name -cne $ExpectedDialogTitle) { throw "Native dialog title changed before input" }
+  $descendants = $window.element.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  # This Windows MessageBox exposes Static/Button as UIA Pane. Use the native
+  # handles, classes and parent chain rather than treating that UIA type as authority.
+  $texts = [Collections.Generic.List[string]]::new()
+  foreach ($element in $descendants) {
+    if ($element.Current.NativeWindowHandle -eq 0) { continue }
+    [long]$value = $element.Current.NativeWindowHandle
+    if ($value -lt 0) { $value += 4294967296 }
+    $handle = [IntPtr]::new($value)
+    $row = Get-WindowRow -Handle $handle -OwnerProcessId ([int]$Candidate.row.process_id)
+    if ($null -ne $row -and $row.class_name -ceq 'Static' -and $row.root_hwnd -ceq $Candidate.row.hwnd -and
+      $row.thread_id -eq $Candidate.row.thread_id -and [Moyai.DesktopE2e.NativeWindowInterop]::GetParent($handle) -eq $Candidate.handle) {
+      $texts.Add([Moyai.DesktopE2e.NativeWindowInterop]::WindowText($handle))
+    }
+  }
+  $text = $texts -join "`n"
+  foreach ($part in $expected) {
+    if ($part -isnot [string] -or $part.Length -eq 0 -or $part.Length -gt 4096 -or -not $text.Contains($part)) {
+      $observed = @($descendants | Select-Object -First 20 | ForEach-Object {
+        [ordered]@{ name=[string]$_.Current.Name; control_type=[string]$_.Current.ControlType.ProgrammaticName;
+          process_id=[int]$_.Current.ProcessId; automation_id=[string]$_.Current.AutomationId }
+      }) | ConvertTo-Json -Compress
+      throw "Native dialog review text does not match the intended operation; observed=$observed"
+    }
+  }
+  $button = Resolve-ExactDialogControl -Candidate $Candidate -ParentHandle $Candidate.handle -ControlId $DialogButtonId -ClassName 'Button'
+  return [ordered]@{ handle = $button.handle; text = $text; title = $window.evidence.name; evidence = $button.row }
 }
 
 function Resolve-ExactUiaFileItem {
@@ -1142,6 +1321,78 @@ switch ($Action) {
       input = "Windows UI Automation WindowPattern.Close()"
       cleanup_only = $false
       representative_input = $true
+    })
+  }
+  "InvokeDialogButton" {
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    $observed = Resolve-ExactNativeDialogButton -Candidate $candidate
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $button = Resolve-ExactNativeDialogButton -Candidate $candidate
+    if ($observed.handle -ne $button.handle) {
+      throw "Native dialog button identity changed before input"
+    }
+    # Invoke only once. Never send keys or window messages as a fallback after an uncertain result.
+    $returned = $false
+    $invokeError = $null
+    try { [Moyai.DesktopE2e.NativeWindowInterop]::ClickOpenOnce($button.handle); $returned = $true } catch { $invokeError = $_.Exception.GetType().FullName }
+    Write-Result ([ordered]@{
+      window = $candidate.row; button = $button.evidence; dialog_title = $button.title; dialog_text = $button.text
+      attempt_count = 1; call_returned = $returned; invoke_error = $invokeError; native_control_verified = $true
+      representative_input = $true; cleanup_only = $false; fallback_used = $false
+      input = "native-control: exact standard dialog Button BM_CLICK"; os_keyboard_ime_evidence = $false
+    })
+  }
+  "OpenFilePath" {
+    if ([string]::IsNullOrWhiteSpace($SelectedPath) -or -not [IO.Path]::IsPathFullyQualified($SelectedPath) -or
+        $SelectedPath.IndexOf([char]0) -ge 0 -or $SelectedPath.Length -ge 32768) {
+      throw "OpenFilePath requires a bounded absolute path without NUL"
+    }
+    $resolvedSelectedPath = [IO.Path]::GetFullPath($SelectedPath)
+    if ($SelectedPathIntent -ceq 'open') {
+      if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Leaf)) { throw "OpenFilePath requires an existing file" }
+    } elseif ($SelectedPathIntent -ceq 'directory') {
+      $resolvedSelectedPath = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $resolvedSelectedPath
+      if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Container)) { throw "directory selection requires an existing directory" }
+    } else {
+      $resolvedSelectedPath = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $resolvedSelectedPath
+      if (Test-Path -LiteralPath $resolvedSelectedPath) { throw "save_new requires a new file, without an overwrite confirmation" }
+      if (-not (Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($resolvedSelectedPath)) -PathType Container)) { throw "save_new requires an existing parent directory" }
+    }
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    $controls = Resolve-ExactOpenFileControls -Candidate $candidate
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $beforeSet = Resolve-ExactOpenFileControls -Candidate $candidate
+    Assert-SameOpenFileControls -Before $controls -After $beforeSet
+    [Moyai.DesktopE2e.NativeWindowInterop]::SetFileNameOnce($beforeSet.edit.handle, $resolvedSelectedPath)
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $beforeRead = Resolve-ExactOpenFileControls -Candidate $candidate
+    Assert-SameOpenFileControls -Before $controls -After $beforeRead
+    $readback = [Moyai.DesktopE2e.NativeWindowInterop]::ReadFileName($beforeRead.edit.handle)
+    if (-not $readback.Equals($resolvedSelectedPath, [StringComparison]::Ordinal)) {
+      throw "Native filename input did not match its intended absolute path; Open was not clicked"
+    }
+    $candidate = Resolve-ExactCandidate -Owner (Get-ValidatedOwner)
+    $beforeClick = Resolve-ExactOpenFileControls -Candidate $candidate
+    Assert-SameOpenFileControls -Before $controls -After $beforeClick
+    [Moyai.DesktopE2e.NativeWindowInterop]::ClickOpenOnce($beforeClick.button.handle)
+    $controlEvidence = [ordered]@{}
+    foreach ($name in $controls.Keys) { $controlEvidence[$name] = $controls[$name].row }
+    Write-Result ([ordered]@{
+      window = $candidate.row
+      selected_path = $resolvedSelectedPath
+      selected_path_intent = $SelectedPathIntent
+      delivery_verified = $true
+      filename_set_count = 1
+      filename_readback_verified = $true
+      open_click_count = 1
+      open_call_returned = $true
+      controls = $controlEvidence
+      foreground_required = $false
+      input = 'native-control: WM_SETTEXT -> WM_GETTEXT exact readback -> BM_CLICK'
+      os_keyboard_ime_evidence = $false
+      cleanup_only = $false
+      representative_input = $true
+      retry_count = 0
     })
   }
   "SelectFile" {

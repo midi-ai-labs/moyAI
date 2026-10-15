@@ -7,7 +7,7 @@ empty workspace から Python CLI 電卓を生成し、file creation、test gene
 ## Setup
 
 - `project_sandbox/<task>/case1/workspace/` に empty workspace を作る。
-- config/data directory も fresh にする。
+- config/data directory は単独実行では fresh にする。suite 実行では [共通 README](../README.md) に従い同じ Desktop/profile を共有し、各 case の workspace と会話を fresh にする。
 - visible Desktop GUI から Project Chat を開始する。
 
 ## Canonical user request

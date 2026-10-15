@@ -106,8 +106,18 @@ fn run_desktop_on_current_thread(args: moyai::cli::parse::DesktopArgs) -> Result
     let Some(_desktop_instance) =
         desktop::DesktopInstanceGuard::acquire_or_notify().map_err(|error| (4, error))?
     else {
+        println!("moyAI Desktop is already running; showing the existing window.");
         return Ok(());
     };
+    let _sandbox_broker = moyai::sandbox_broker::start().map_err(|error| {
+        let _ = rfd::MessageDialog::new()
+            .set_title("moyAI")
+            .set_description(&error)
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+        (4, error)
+    })?;
     let command = CliCommand::Desktop(args.clone());
     let global_config_existed_at_launch = moyai::config::loader::global_config_path()
         .map(|path| path.exists())
@@ -170,6 +180,18 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     let app = AppBootstrap::build(&command)
         .await
         .map_err(|error| (3, error.to_string()))?;
+    let _sandbox_broker = if matches!(&command, CliCommand::Run(_) | CliCommand::Tui(_)) {
+        Some(moyai::sandbox_broker::start().map_err(|error| (4, error))?)
+    } else {
+        None
+    };
+    let shutdown_owner = app.clone();
+    let result = run_loaded_command(command, app).await;
+    shutdown_owner.shutdown_managed_shells().await;
+    result
+}
+
+async fn run_loaded_command(command: CliCommand, app: moyai::app::App) -> Result<(), (u8, String)> {
     if let CliCommand::Tui(args) = command.clone() {
         tui::run(app, args)
             .await

@@ -3,7 +3,7 @@ import type {
   ProviderProfile,
   SessionSettingsMutationTarget,
 } from "./types.ts";
-import { validateConfigInput } from "./utils.ts";
+import { validateConfigInput, validateProviderBaseUrl } from "./utils.ts";
 
 export type SessionAccessMode = "default" | "auto_review" | "full_access";
 
@@ -159,7 +159,12 @@ export function updateSessionSettingsDraft<K extends SessionSettingsDraftField>(
 ): boolean {
   if (!sameSessionSettingsTarget(state.owner, target) || state.draft === null) return false;
   if (state.draft[field] === value) return true;
+  const connectionChanged = field === "baseUrl"
+    ? validateProviderBaseUrl(state.draft.baseUrl).canonicalBaseUrl
+      !== validateProviderBaseUrl(value as string).canonicalBaseUrl
+    : field === "providerProfile";
   state.draft = { ...state.draft, [field]: value };
+  if (connectionChanged) state.draft.apiKeyEnv = "";
   state.draftRevision += 1n;
   refreshSessionSettingsDerivedState(state);
   return true;

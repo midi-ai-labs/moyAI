@@ -4,6 +4,7 @@ import { lstat, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promis
 
 import { assertExecutionIdentity } from "./execution.mjs";
 import { EvidenceSink } from "./evidence_sink.mjs";
+import { normalizeDesktopIsolation } from "./desktop_isolation.mjs";
 
 function sha256(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
@@ -42,10 +43,12 @@ export async function createDesktopRunContext({
   executionId,
   scenarioId,
   scenarioConfig = null,
+  desktopIsolation = "user-wide",
   harnessRoot,
   now = () => new Date().toISOString(),
 }) {
   assertExecutionIdentity(executionId, scenarioId);
+  desktopIsolation = normalizeDesktopIsolation(desktopIsolation);
   const exactBinary = path.resolve(binary);
   const binaryItem = await stat(exactBinary);
   if (!binaryItem.isFile()) throw new TypeError(`Desktop binary is not a file: ${exactBinary}`);
@@ -74,6 +77,7 @@ export async function createDesktopRunContext({
     execution_id: executionId,
     scenario_id: scenarioId,
     scenario_config: scenarioConfig === null ? null : structuredClone(scenarioConfig),
+    desktop_isolation: desktopIsolation,
     started_at: now(),
     binary: { path: exactBinary, sha256: sha256(binaryBytes), size_bytes: binaryItem.size },
     harness,
@@ -85,7 +89,18 @@ export async function createDesktopRunContext({
   await writeFile(path.join(root, "execution.json"), manifestBytes, { flag: "wx" });
   const sealedManifest = await sink.writeBytes("execution.json", manifestBytes);
   return {
-    context: { executionId, scenarioId, root, binary: exactBinary, binaryItem, paths, manifest, sealedManifest },
+    context: { executionId, scenarioId, root, binary: exactBinary, binaryItem, paths, manifest, sealedManifest, desktopIsolation },
     sink,
   };
+}
+
+export async function createCompanionContext(parent, name) {
+  if (normalizeDesktopIsolation(parent.desktopIsolation) !== "fixture") throw new TypeError("companion Desktop requires fixture isolation");
+  if (!/^[a-z][a-z0-9-]{1,47}$/.test(name)) throw new TypeError("invalid companion Desktop name");
+  const root = path.join(parent.root, name);
+  await mkdir(root, { recursive: false });
+  const directories = Object.fromEntries(["workspace", "config", "data", "prefs", "webview", "logs"].map(key => [key, path.join(root, key)]));
+  for (const directory of Object.values(directories)) await mkdir(directory, { recursive: false });
+  const paths = { ...directories, config_file: path.join(directories.config, "config.toml"), prefs_file: path.join(directories.prefs, "desktop.toml"), database: path.join(directories.data, "moyai.sqlite3"), stdout: path.join(directories.logs, "desktop.stdout.log"), stderr: path.join(directories.logs, "desktop.stderr.log") };
+  return { ...parent, paths, desktopName: name };
 }

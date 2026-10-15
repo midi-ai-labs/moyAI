@@ -825,12 +825,14 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
     }, {
       context_window_inherited: sessionSettings?.context_window_inherited ?? null,
     }),
+    settingsGate("inheritance-badge", "restart-restored-inheritance-badge-mismatch", panel?.context_inherited_badge?.count === 1
+      && panel.context_inherited_badge.visible === false, { count: 1, visible: false }, panel?.context_inherited_badge ?? null),
     settingsGate("scope", "restart-panel-scope-mismatch", panel?.scope_count === 1
       && panel.scope_visible === true
-      && panel.scope_text === "このセッションだけ", {
+      && panel.scope_text === "このチャットだけ", {
       count: 1,
       visible: true,
-      text: "このセッションだけ",
+      text: "このチャットだけ",
     }, {
       count: panel?.scope_count ?? null,
       visible: panel?.scope_visible ?? null,
@@ -1032,6 +1034,7 @@ export async function observeSessionSettingsSurface(cdp) {
     const panel = one('.session-settings-modal[data-modal="session-settings"][data-surface="session-settings"]');
     const confirmation = one('[data-modal="session-settings-close-confirmation"][role="alertdialog"]');
     const scope = one('[data-modal="session-settings"] [data-session-scope="root-only"]');
+    const inheritedBadge = one('[data-modal="session-settings"] [data-settings-passive="session-context-inherited-badge"]');
     const prompt = one('textarea#prompt');
     return {
       projection,
@@ -1048,6 +1051,7 @@ export async function observeSessionSettingsSurface(cdp) {
         api_key_env: field('api-key-env'),
         access_mode: field('access-mode'),
         context_window: field('context-window'),
+        context_inherited_badge: { count: inheritedBadge.count, visible: inheritedBadge.visible },
         max_output_tokens: field('max-output-tokens'),
         apply: button('[data-modal="session-settings"] button[data-action="apply-session-settings"]'),
         discard: button('[data-modal="session-settings"] button[data-action="discard-session-settings"]:not([hidden])'),
@@ -1106,7 +1110,7 @@ export function sessionSettingsPanelReady(surface, {
     && surface.panel.inert === false
     && surface.panel.scope_count === 1
     && surface.panel.scope_visible === true
-    && surface.panel.scope_text === "このセッションだけ"
+    && surface.panel.scope_text === "このチャットだけ"
     && surface.panel.base_url.count === 1
     && surface.panel.base_url.visible === true
     && surface.panel.base_url.value === projection.base_url
@@ -1130,6 +1134,8 @@ export function sessionSettingsPanelReady(surface, {
     && surface.panel.context_window.count === 1
     && surface.panel.context_window.visible === true
     && surface.panel.context_window.value === contextWindow
+    && surface.panel.context_inherited_badge?.count === 1
+    && surface.panel.context_inherited_badge.visible === projection.context_window_inherited
     && surface.panel.max_output_tokens.count === 0
     && surface.panel.max_output_tokens.visible === false
     && surface.panel.apply.count === 1

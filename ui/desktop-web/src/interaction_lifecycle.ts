@@ -14,8 +14,21 @@ export function shouldBeginKeyboardInteraction(
   code: string,
   withinApp: boolean,
   disabledControl: boolean,
+  altKey = false,
+  key = "",
 ): boolean {
-  return !isComposing && code !== "Unidentified" && withinApp && !disabledControl;
+  // Alt alone owns no DOM edit. Native window menus (Alt+Space / Alt+F4)
+  // can consume keyup without blurring the webview, so they cannot own a
+  // web keyboard hold. Other chord keys still protect their own DOM action.
+  // Native Windows input can identify Alt by key while leaving code empty.
+  // Use that name only for this native-key classification; ordinary key holds
+  // retain their existing identities and release/generation semantics.
+  const nativeWindowKey = code === "AltLeft" || code === "AltRight"
+    || (code === "" && key === "Alt")
+    || (altKey && (code === "Space" || code === "F4"
+      || (code === "" && (key === " " || key === "F4"))));
+  return !isComposing && code !== "Unidentified" && !nativeWindowKey
+    && withinApp && !disabledControl;
 }
 
 export class InteractionLifecycle<T> {
@@ -186,7 +199,12 @@ export function installInteractionEventGate<T>(options: InteractionEventGateOpti
       'input, textarea, select, summary, [contenteditable="true"]',
     );
     const action = target.closest<HTMLElement>("[data-action]");
-    const owner = directOwner ?? action;
+    // Dialog text can have a dismiss action on the enclosing backdrop. Capturing
+    // that ancestor retargets pointerup/click outside the dialog, closing it even
+    // when the user only selects text. Match the delegated click's modal boundary.
+    const modal = target.closest<HTMLElement>("[data-modal]");
+    const actionOwner = action && modal && !modal.contains(action) ? null : action;
+    const owner = directOwner ?? actionOwner;
     lifecycle.beginPointer(event.pointerId);
     if (owner && !owner.matches(":disabled")) {
       try {
@@ -216,6 +234,8 @@ export function installInteractionEventGate<T>(options: InteractionEventGateOpti
       event.code,
       belongsToApp,
       disabledOwner !== null,
+      event.altKey,
+      event.key,
     )) return;
     lifecycle.beginKey(event.code);
   }, true);

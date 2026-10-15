@@ -21,6 +21,7 @@ impl DesktopInstanceGuard {
     /// restore its main window and returns `None` to stop this launch.
     pub fn acquire_or_notify() -> Result<Option<Self>, String> {
         let lock_path = desktop_lock_path()?;
+        let identifier = desktop_identifier()?;
         match Self::try_acquire_at(&lock_path) {
             Ok(guard) => {
                 // The file lease was introduced after the Tauri listener.
@@ -29,13 +30,13 @@ impl DesktopInstanceGuard {
                 // Simultaneous mixed-version cold starts cannot be coordinated
                 // pre-bootstrap by the new binary alone; current builds use the
                 // file lease below as their strict launch boundary.
-                if notify_existing_instance_once() {
+                if notify_existing_instance_once(&identifier) {
                     return Ok(None);
                 }
                 Ok(Some(guard))
             }
             Err(lock_error) => {
-                if notify_existing_instance() {
+                if notify_existing_instance(&identifier) {
                     return Ok(None);
                 }
 
@@ -76,6 +77,14 @@ impl Drop for DesktopInstanceGuard {
 }
 
 fn desktop_lock_path() -> Result<Utf8PathBuf, String> {
+    #[cfg(feature = "desktop-e2e")]
+    if let Some(instance) = crate::desktop_test::current()? {
+        return Ok(instance.lock_path());
+    }
+    #[cfg(not(feature = "desktop-e2e"))]
+    if std::env::var_os("MOYAI_DESKTOP_E2E_ROOT").is_some() {
+        return Err("Isolated Desktop fixtures require a desktop-e2e build".into());
+    }
     let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
         .ok_or_else(|| "failed to resolve the moyAI data directory".to_string())?;
     let data_dir = Utf8PathBuf::from_path_buf(dirs.data_dir().to_path_buf())
@@ -83,23 +92,38 @@ fn desktop_lock_path() -> Result<Utf8PathBuf, String> {
     Ok(data_dir.join(LOCK_FILE_NAME))
 }
 
-#[cfg(target_os = "windows")]
-fn notify_existing_instance() -> bool {
-    windows::notify_existing_instance()
+pub(crate) fn desktop_identifier() -> Result<String, String> {
+    let config: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json"))
+        .map_err(|error| error.to_string())?;
+    let base = config
+        .get("identifier")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("Desktop identifier is missing")?;
+    #[cfg(feature = "desktop-e2e")]
+    if let Some(instance) = crate::desktop_test::current()? {
+        return Ok(instance.identifier(base));
+    }
+    Ok(base.to_owned())
 }
 
 #[cfg(target_os = "windows")]
-fn notify_existing_instance_once() -> bool {
-    windows::notify_existing_instance_once()
+fn notify_existing_instance(identifier: &str) -> bool {
+    windows::notify_existing_instance(identifier)
+}
+
+#[cfg(target_os = "windows")]
+fn notify_existing_instance_once(identifier: &str) -> bool {
+    windows::notify_existing_instance_once(identifier)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn notify_existing_instance() -> bool {
+fn notify_existing_instance(_identifier: &str) -> bool {
     false
 }
 
 #[cfg(not(target_os = "windows"))]
-fn notify_existing_instance_once() -> bool {
+fn notify_existing_instance_once(_identifier: &str) -> bool {
     false
 }
 
@@ -148,10 +172,7 @@ mod windows {
         ) -> isize;
     }
 
-    pub(super) fn notify_existing_instance() -> bool {
-        let Some(identifier) = tauri_identifier() else {
-            return false;
-        };
+    pub(super) fn notify_existing_instance(identifier: &str) -> bool {
         let class_name = encode_wide(format!("{identifier}-sic"));
         let window_name = encode_wide(format!("{identifier}-siw"));
         let deadline = Instant::now() + LISTENER_WAIT;
@@ -167,23 +188,10 @@ mod windows {
         }
     }
 
-    pub(super) fn notify_existing_instance_once() -> bool {
-        let Some(identifier) = tauri_identifier() else {
-            return false;
-        };
+    pub(super) fn notify_existing_instance_once(identifier: &str) -> bool {
         let class_name = encode_wide(format!("{identifier}-sic"));
         let window_name = encode_wide(format!("{identifier}-siw"));
         send_restore_request(&class_name, &window_name)
-    }
-
-    fn tauri_identifier() -> Option<String> {
-        let config: serde_json::Value =
-            serde_json::from_str(include_str!("../../tauri.conf.json")).ok()?;
-        config
-            .get("identifier")?
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
     }
 
     fn send_restore_request(class_name: &[u16], window_name: &[u16]) -> bool {
@@ -254,5 +262,34 @@ mod tests {
         std::fs::write(path.as_std_path(), b"stale metadata").expect("stale lock file");
 
         DesktopInstanceGuard::try_acquire_at(&path).expect("lease over stale file");
+    }
+
+    #[test]
+    fn simultaneous_launches_have_exactly_one_live_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join(LOCK_FILE_NAME)).expect("utf8 lock path");
+        let start = std::sync::Barrier::new(8);
+        let acquired = std::sync::Barrier::new(8);
+        let owners = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let guard = DesktopInstanceGuard::try_acquire_at(&path);
+                        let owns_lease = guard.is_ok();
+                        acquired.wait();
+                        drop(guard);
+                        owns_lease
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().expect("launch thread"))
+                .filter(|owns_lease| *owns_lease)
+                .count()
+        });
+        assert_eq!(owners, 1);
+        DesktopInstanceGuard::try_acquire_at(&path).expect("lease after all launches exit");
     }
 }

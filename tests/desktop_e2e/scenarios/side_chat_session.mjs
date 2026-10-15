@@ -347,6 +347,8 @@ export function createSideChatSessionScenario() {
         const configuration = await saveGlobalSideChatAndOpen({
           cdp,
           input,
+          sink,
+          evidenceOwner: OWNER,
           providerBaseUrl: provider.baseUrl,
           ownerSessionId: alpha.session_id,
           systemPrompt: SIDE_SESSION_SYSTEM_PROMPT_MARKER,

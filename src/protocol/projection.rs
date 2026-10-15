@@ -273,13 +273,16 @@ fn project_history_item(
         },
         RunEvent::CompactionCompleted {
             summarized_messages,
+            layout,
+            clm_checkpoint,
             preserved_user_messages,
             summary,
             replacement_item_ids,
             ..
         } => HistoryItemPayload::Compaction {
             mode: crate::protocol::CompactionMode::Automatic,
-            layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+            layout: *layout,
+            clm_checkpoint: clm_checkpoint.clone(),
             preserved_user_messages: preserved_user_messages.clone(),
             summary: if summary.trim().is_empty() {
                 format!("summarized {summarized_messages} messages")
@@ -382,7 +385,7 @@ pub fn project_turn_item_for_run_event(
                 tool_status(
                     *tool_call_id,
                     *tool,
-                    ToolLifecycleStatus::Completed,
+                    completed_tool_display_status(metadata),
                     title.clone(),
                     summary.clone(),
                 )
@@ -685,6 +688,17 @@ fn metadata_success(metadata: &Value) -> Option<bool> {
         .or_else(|| metadata.get("success").and_then(Value::as_bool))
 }
 
+/// A completed tool invocation can report an unsuccessful operation (for example
+/// a shell process exiting with a nonzero code). Keep transport lifecycle and
+/// durable success evidence unchanged, but present that outcome as a failure.
+pub(crate) fn completed_tool_display_status(metadata: &Value) -> ToolLifecycleStatus {
+    if metadata_success(metadata) == Some(false) {
+        ToolLifecycleStatus::Failed
+    } else {
+        ToolLifecycleStatus::Completed
+    }
+}
+
 fn permission_decision(approved: bool) -> PermissionDecision {
     if approved {
         PermissionDecision::Approved
@@ -713,7 +727,7 @@ fn file_changes_summary(changes: &[crate::edit::ChangeSummary]) -> String {
         .join("; ")
 }
 
-fn user_turn_text(turn: &crate::protocol::UserTurn) -> String {
+pub(crate) fn user_turn_text(turn: &crate::protocol::UserTurn) -> String {
     turn.content_parts()
         .iter()
         .map(|part| match part {
@@ -733,6 +747,59 @@ mod tests {
     use super::*;
     use crate::protocol::{PlanStepStatus, UserInputItem, UserTurn};
     use crate::session::ToolCallId;
+
+    #[test]
+    fn clm_checkpoint_is_canonical_only_and_display_stays_short() {
+        let checkpoint = crate::protocol::ClmCheckpoint::from_messages(
+            &[crate::llm::ModelMessage::User {
+                content: "private replay body".into(),
+            }],
+            1,
+        )
+        .unwrap();
+        let event = RunEvent::CompactionCompleted {
+            summarized_messages: 1,
+            layout: crate::protocol::CompactionLayout::ClmCheckpoint,
+            clm_checkpoint: Some(checkpoint),
+            preserved_user_messages: Vec::new(),
+            summary: "Context updated".into(),
+            replacement_item_ids: vec![HistoryItemId::new()],
+        };
+        let event_json = serde_json::to_string(&event).unwrap();
+        assert!(!event_json.contains("private replay body"));
+        assert!(!event_json.contains("\"clm_checkpoint\":"));
+        let projection =
+            project_protocol_run_event(&event, Some(SessionId::new()), TurnId::new(), 1).unwrap();
+        let canonical = serde_json::to_string(&projection.history_item).unwrap();
+        assert!(canonical.contains("private replay body"));
+        let display = serde_json::to_string(&projection.turn_item).unwrap();
+        assert!(display.contains("Context updated"));
+        assert!(!display.contains("private replay body"));
+        assert!(
+            !serde_json::to_string(&projection.runtime_event)
+                .unwrap()
+                .contains("private replay body")
+        );
+    }
+
+    #[test]
+    fn old_compaction_event_still_projects_as_user_anchored() {
+        let event: RunEvent = serde_json::from_value(serde_json::json!({
+            "kind":"compaction_completed", "summarized_messages":1,
+            "summary":"old summary", "replacement_item_ids":[]
+        }))
+        .unwrap();
+        let projection =
+            project_protocol_run_event(&event, Some(SessionId::new()), TurnId::new(), 1).unwrap();
+        assert!(matches!(
+            projection.history_item.unwrap().payload,
+            HistoryItemPayload::Compaction {
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                clm_checkpoint: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn nested_tool_outcome_overrides_legacy_outer_success() {

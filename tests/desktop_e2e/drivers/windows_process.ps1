@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 param(
   [Parameter(Mandatory)]
-  [ValidateSet("ListDesktop", "Capture", "Profile", "StopOwner", "StopProfile", "MatchProfile")]
+  [ValidateSet("ListDesktop", "Capture", "Profile", "ObserveOwner", "ObserveListeners", "ObserveTreeListeners", "StopOwner", "StopProfile", "MatchProfile")]
   [string]$Action,
   [int]$ProcessId = 0,
   [string]$OwnerPath,
@@ -36,13 +36,29 @@ function Assert-ExactChildPath {
   return $candidatePath
 }
 
+function Get-ObservedProcess {
+  param([Parameter(Mandatory)][int]$Id)
+  try { return Get-Process -Id $Id -ErrorAction Stop }
+  catch {
+    if ($_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId,*') { return $null }
+    throw
+  }
+}
+
 function Get-ExactProcessOwner {
   param([Parameter(Mandatory)][int]$Id, [switch]$AllowExited)
-  $process = Get-Process -Id $Id -ErrorAction SilentlyContinue
-  $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $Id" -ErrorAction SilentlyContinue
+  $process = Get-ObservedProcess -Id $Id
+  $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $Id" -ErrorAction Stop
   if ($null -eq $process -or $null -eq $cim) {
-    if ($AllowExited) { return $null }
-    throw "Process $Id is not live"
+    # A process can exit between the two observations. Only successful repeat
+    # queries that both report absence prove exit; access/query errors propagate.
+    $process = Get-ObservedProcess -Id $Id
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $Id" -ErrorAction Stop
+    if ($null -eq $process -and $null -eq $cim) {
+      if ($AllowExited) { return $null }
+      throw "Process $Id is not live"
+    }
+    if ($null -eq $process -or $null -eq $cim) { throw "Process $Id observation did not settle" }
   }
   $executable = if ([string]::IsNullOrWhiteSpace([string]$cim.ExecutablePath)) { [string]$process.Path } else { [string]$cim.ExecutablePath }
   if ([string]::IsNullOrWhiteSpace($executable)) { throw "Process $Id has no executable identity" }
@@ -125,6 +141,35 @@ switch ($Action) {
     if ([string]::IsNullOrWhiteSpace($ExecutionRoot) -or [string]::IsNullOrWhiteSpace($ProfilePath)) { throw "Profile requires ExecutionRoot and ProfilePath" }
     $profile = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $ProfilePath
     ConvertTo-Json -InputObject @(Get-ProfileRows -Profile $profile) -Compress -Depth 8
+  }
+  "ObserveOwner" {
+    if ([string]::IsNullOrWhiteSpace($ExecutionRoot) -or [string]::IsNullOrWhiteSpace($OwnerPath)) { throw "ObserveOwner requires ExecutionRoot and OwnerPath" }
+    $ownerFile = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $OwnerPath
+    $owner = Get-Content -LiteralPath $ownerFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $live = Get-ValidatedOwner -Owner $owner -AllowExited
+    ConvertTo-Json -InputObject ([ordered]@{ live = ($null -ne $live); process_id = [int]$owner.process_id }) -Compress -Depth 4
+  }
+  { $_ -in @("ObserveListeners", "ObserveTreeListeners") } {
+    if ([string]::IsNullOrWhiteSpace($ExecutionRoot) -or [string]::IsNullOrWhiteSpace($OwnerPath)) { throw "ObserveListeners requires ExecutionRoot and OwnerPath" }
+    $ownerFile = Assert-ExactChildPath -Root $ExecutionRoot -Candidate $OwnerPath
+    $owner = Get-Content -LiteralPath $ownerFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $null = Get-ValidatedOwner -Owner $owner
+    $ownedIds = [Collections.Generic.HashSet[int]]::new()
+    $null = $ownedIds.Add([int]$owner.process_id)
+    if ($Action -eq "ObserveTreeListeners") {
+      $processRows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId)
+      do {
+        $added = $false
+        foreach ($row in $processRows) {
+          if ($ownedIds.Contains([int]$row.ParentProcessId) -and $ownedIds.Add([int]$row.ProcessId)) { $added = $true }
+        }
+      } while ($added)
+    }
+    $listeners = @(Get-NetTCPConnection -State Listen | Where-Object { $ownedIds.Contains([int]$_.OwningProcess) } | ForEach-Object {
+      [ordered]@{ process_id = [int]$_.OwningProcess; address = [string]$_.LocalAddress; port = [int]$_.LocalPort }
+    })
+    $null = Get-ValidatedOwner -Owner $owner
+    ConvertTo-Json -InputObject $listeners -Compress -Depth 4
   }
   "StopOwner" {
     if ([string]::IsNullOrWhiteSpace($ExecutionRoot) -or [string]::IsNullOrWhiteSpace($OwnerPath)) { throw "StopOwner requires ExecutionRoot and OwnerPath" }

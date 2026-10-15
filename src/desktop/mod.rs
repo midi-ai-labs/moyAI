@@ -6,7 +6,13 @@ pub mod artifact_projection;
 #[cfg(feature = "tauri-desktop")]
 pub mod async_ops;
 #[cfg(feature = "tauri-desktop")]
+mod attention;
+#[cfg(feature = "tauri-desktop")]
 pub mod composer_state;
+#[cfg(feature = "tauri-desktop")]
+pub mod join_config;
+#[cfg(feature = "tauri-desktop")]
+pub(crate) mod mcp_peers;
 #[cfg(feature = "tauri-desktop")]
 pub mod models;
 #[cfg(feature = "tauri-desktop")]
@@ -29,6 +35,8 @@ pub mod startup;
 pub mod state;
 #[cfg(feature = "tauri-desktop")]
 pub mod tauri_app;
+#[cfg(feature = "tauri-desktop")]
+pub mod team_setup;
 #[cfg(feature = "tauri-desktop")]
 pub mod view_state;
 #[cfg(feature = "tauri-desktop")]

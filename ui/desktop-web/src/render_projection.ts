@@ -1,4 +1,9 @@
 import type { PermissionDecisionState } from "./decision_state.ts";
+import { createSharedWorkUiState, sharedWorkPresentation, type SharedWorkPresentation } from "./shared_work_state.ts";
+import { createHubUiState, hubPresentation, type HubPresentation } from "./hub_state.ts";
+import { createDeviceNetworkUiState, deviceNetworkPresentation, type DeviceNetworkPresentation } from "./device_network_state.ts";
+import { createMcpHistoryUiState, mcpHistoryPresentation, type McpHistoryPresentation } from "./mcp_history_state.ts";
+import { createMcpPeerState, mcpPeerPresentation, type McpPeerPresentation } from "./mcp_peer.ts";
 import type { LocalConfirmation } from "./render_overlays.ts";
 import type { DesktopViewState } from "./types.ts";
 import type {
@@ -30,6 +35,12 @@ import type { SideChatPendingQuote } from "./types.ts";
  * not belong in the render model.
  */
 export interface DesktopRenderLocalPresentation {
+  readonly sharedWork: SharedWorkPresentation;
+  readonly localMessageEdit: { readonly pending: boolean; readonly error: string };
+  readonly hub: HubPresentation;
+  readonly deviceNetwork: DeviceNetworkPresentation;
+  readonly mcpHistory: McpHistoryPresentation;
+  readonly mcpPeers: McpPeerPresentation;
   readonly artifactPane: {
     readonly collapsed: boolean;
     readonly mode: ArtifactPaneMode;
@@ -41,6 +52,7 @@ export interface DesktopRenderLocalPresentation {
   readonly doclingReadinessRequestPending: boolean;
   readonly initialSetup: {
     readonly step: InitialSetupStep;
+    readonly guided?: boolean;
     readonly finishPending: boolean;
     readonly auxiliaryPendingKind: InitialSetupAuxiliaryKind | null;
     readonly importedSourcePath: string | null;
@@ -89,6 +101,12 @@ export interface DesktopRenderModel {
 
 export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLocalPresentation>
   = snapshotLocalPresentation({
+    hub: hubPresentation(createHubUiState()),
+    deviceNetwork: deviceNetworkPresentation(createDeviceNetworkUiState()),
+    sharedWork: sharedWorkPresentation(createSharedWorkUiState()),
+    localMessageEdit: { pending: false, error: "" },
+    mcpHistory: mcpHistoryPresentation(createMcpHistoryUiState()),
+    mcpPeers: mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
       collapsed: false,
       mode: "output",
@@ -116,7 +134,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
         staleTarget: false,
         providerChanged: false,
         accessChanged: false,
-        reason: "root sessionを選択すると変更できます。",
+        reason: "メインチャットを開くと変更できます。",
       },
     },
     sideChat: {
@@ -192,6 +210,12 @@ function snapshotLocalPresentation(
   const sessionSettings = local.sessionSettings
     ?? DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sessionSettings;
   const snapshot: DesktopRenderLocalPresentation = {
+    hub: local.hub ?? hubPresentation(createHubUiState()),
+    deviceNetwork: local.deviceNetwork ?? deviceNetworkPresentation(createDeviceNetworkUiState()),
+    sharedWork: local.sharedWork ?? sharedWorkPresentation(createSharedWorkUiState()),
+    localMessageEdit: local.localMessageEdit ?? { pending: false, error: "" },
+    mcpHistory: local.mcpHistory ?? mcpHistoryPresentation(createMcpHistoryUiState()),
+    mcpPeers: local.mcpPeers ?? mcpPeerPresentation(createMcpPeerState()),
     artifactPane: {
       collapsed: local.artifactPane.collapsed,
       mode: local.artifactPane.mode,
@@ -203,6 +227,7 @@ function snapshotLocalPresentation(
     doclingReadinessRequestPending: local.doclingReadinessRequestPending ?? false,
     initialSetup: {
       step: initialSetup.step,
+      guided: initialSetup.guided ?? false,
       finishPending: initialSetup.finishPending,
       auxiliaryPendingKind: initialSetup.auxiliaryPendingKind ?? null,
       importedSourcePath: initialSetup.importedSourcePath ?? null,

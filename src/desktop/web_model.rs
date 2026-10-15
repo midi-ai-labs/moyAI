@@ -16,6 +16,7 @@ use crate::tool::PermissionRequest;
 use crate::tui::state::{PromptReviewPhase, RunStatus, ToolStatusView, tool_action_label};
 
 const MOYAI_PRODUCT_NAME: &str = "moyAI";
+const MOYAI_DESKTOP_CODENAME: &str = "LYNX";
 const BUNDLED_LICENSE_TEXT: &str = include_str!("../../LICENSE");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,27 @@ pub struct DesktopPermissionProjection {
     pub agent_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_task_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::remote_agent::approval::RemoteApprovalContext>,
+}
+
+impl From<&PermissionRequest> for DesktopPermissionProjection {
+    fn from(permission: &PermissionRequest) -> Self {
+        Self {
+            summary: permission.summary.clone(),
+            details: permission.details.clone(),
+            targets: permission.targets.iter().map(ToString::to_string).collect(),
+            outside_workspace: permission.outside_workspace,
+            risks: permission
+                .risks
+                .iter()
+                .map(|risk| risk.label().to_string())
+                .collect(),
+            agent_path: permission.agent_path.clone(),
+            agent_task_name: permission.agent_task_name.clone(),
+            remote: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +85,7 @@ pub struct DesktopStartupProjection {
     pub action_overlay: String,
     pub initial_setup_required: bool,
     pub initial_setup_reason: Option<String>,
+    pub onboarding_intent: Option<super::preferences::DesktopOnboardingIntent>,
     pub global_config_path: Option<String>,
     pub setup_target: Option<DesktopInitialSetupMutationTargetProjection>,
     pub checks: Vec<DesktopStartupCheckProjection>,
@@ -225,6 +248,8 @@ pub struct DesktopSideChatProjection {
     pub system_prompt: String,
     pub base_url: String,
     pub provider_profile: String,
+    #[serde(default)]
+    pub api_key_env: String,
     pub status: String,
     pub phase: String,
     pub last_error: String,
@@ -238,6 +263,16 @@ pub struct DesktopSideChatProjection {
     pub messages: Vec<DesktopSideChatMessageProjection>,
     pub can_send: bool,
     pub can_cancel: bool,
+    pub direct_provider_capture: Option<DesktopSideChatDirectCaptureProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopSideChatDirectCaptureProjection {
+    pub base_url: String,
+    pub model: String,
+    pub provider_profile: String,
+    pub enabled: bool,
+    pub reason: String,
 }
 
 impl std::fmt::Debug for DesktopSideChatProjection {
@@ -252,6 +287,7 @@ impl std::fmt::Debug for DesktopSideChatProjection {
             .field("system_prompt_chars", &self.system_prompt.chars().count())
             .field("base_url", &self.base_url)
             .field("provider_profile", &self.provider_profile)
+            .field("api_key_env", &self.api_key_env)
             .field("status", &self.status)
             .field("phase", &self.phase)
             .field("last_error", &self.last_error)
@@ -283,6 +319,7 @@ impl Default for DesktopSideChatProjection {
             system_prompt: String::new(),
             base_url: String::new(),
             provider_profile: String::new(),
+            api_key_env: String::new(),
             status: "idle".to_string(),
             phase: String::new(),
             last_error: String::new(),
@@ -296,6 +333,7 @@ impl Default for DesktopSideChatProjection {
             messages: Vec::new(),
             can_send: false,
             can_cancel: false,
+            direct_provider_capture: None,
         }
     }
 }
@@ -512,6 +550,7 @@ fn task_activity_state(
 pub struct DesktopAboutProjection {
     pub product_name: String,
     pub version: String,
+    pub codename: String,
     pub license_identifier: String,
     pub copyright_notice: String,
 }
@@ -581,6 +620,14 @@ pub struct DesktopRunMutationTargetProjection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
+    #[serde(skip_deserializing)]
+    pub hub: Option<crate::hub::HubConnectionProjection>,
+    #[serde(skip_deserializing)]
+    pub mcp_publish: Option<crate::mcp_publish::PublishProjection>,
+    #[serde(default)]
+    pub mcp_activity: Option<crate::remote_agent::RemoteActivityProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_network: Option<crate::device_network::DeviceNetworkProjection>,
     pub projection_revision: String,
     pub workspace_path: String,
     pub provider_label: String,
@@ -618,12 +665,14 @@ pub struct DesktopWebState {
     pub draft_target: DesktopDraftActionTargetProjection,
     pub image_input: String,
     pub attached_images: Vec<String>,
+    pub retained_image_names: Vec<String>,
     pub composer_submit_mode: DesktopComposerSubmitMode,
     pub can_submit: bool,
     pub can_cancel_run: bool,
     pub run_target: DesktopRunMutationTargetProjection,
     pub stop_target: Option<DesktopStopMutationTarget>,
     pub busy: bool,
+    pub exit_requested: bool,
     pub task_activity_state: DesktopTaskActivityState,
     pub async_polling_required: bool,
     pub pending_async_operations: Vec<String>,
@@ -633,6 +682,7 @@ pub struct DesktopWebState {
     pub post_run_refresh_pending: bool,
     pub background_mutation_pending: bool,
     pub overlay: String,
+    pub hub_project_open: bool,
     pub about: DesktopAboutProjection,
     pub side_chat: DesktopSideChatProjection,
     pub project_rows: Vec<DesktopProjectRow>,
@@ -682,6 +732,7 @@ pub struct DesktopWebState {
     pub provider_apply_enabled: bool,
     pub docling_readiness: DesktopDoclingReadinessState,
     pub config_fields: Vec<DesktopConfigFieldProjection>,
+    pub approve_model_configured: bool,
     pub config_target: DesktopConfigMutationTargetProjection,
     pub workspace_input: String,
     pub review_target: Option<DesktopPromptReviewMutationTargetProjection>,
@@ -765,6 +816,35 @@ pub(crate) fn desktop_web_state_with_permission(
 ) -> DesktopWebState {
     let state_busy = state.is_busy();
     let root_run_active = runtime.root_run_active();
+    let mut hub = state
+        .hub_connection
+        .as_ref()
+        .map(crate::hub::HubConnection::projection_now);
+    if let Some(hub) = &mut hub {
+        hub.can_change_main_mode &=
+            !root_run_active && !runtime.agent_tree_active && !state.prompt_enhance_pending();
+        hub.can_change_side_chat_mode &= runtime.side_chat.status != "running";
+        hub.can_change_approve_mode &= !root_run_active && !runtime.agent_tree_active;
+    }
+    let main_route_ready = hub.as_ref().is_none_or(|hub| {
+        hub.main_mode == crate::hub::HubRouteMode::Direct || hub.can_enable_main_hub
+    });
+    let main_enhance_route_ready =
+        main_route_ready && hub.as_ref().is_none_or(|hub| hub.active_main.is_none());
+    let mut side_chat = runtime.side_chat.clone();
+    if let Some(hub) = &hub {
+        side_chat.can_send &= hub.side_chat_mode == crate::hub::HubRouteMode::Direct
+            || (hub.can_enable_side_chat_hub && hub.active_side_chat.is_none());
+    }
+    let hub_polling = hub.as_ref().is_some_and(|hub| {
+        matches!(
+            hub.status,
+            crate::hub::HubConnectionStatus::Connecting
+                | crate::hub::HubConnectionStatus::Connected
+        ) || hub.active_main.is_some()
+            || hub.active_side_chat.is_some()
+            || hub.active_approve.is_some()
+    });
     let busy = state_busy || root_run_active;
     let task_activity_state = task_activity_state(runtime, busy, pending_permission.is_some());
     let stop_target = stop_mutation_target_projection(
@@ -933,6 +1013,19 @@ pub(crate) fn desktop_web_state_with_permission(
         access_mode_mutation_open,
     );
     DesktopWebState {
+        hub,
+        mcp_publish: state
+            .mcp_publish
+            .as_ref()
+            .map(crate::mcp_publish::PublishService::projection_now),
+        device_network: state
+            .device_network
+            .as_ref()
+            .map(crate::device_network::DeviceNetworkService::projection_now),
+        mcp_activity: state
+            .mcp_publish
+            .as_ref()
+            .and_then(crate::mcp_publish::PublishService::remote_activity_now),
         projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state
@@ -995,7 +1088,7 @@ pub(crate) fn desktop_web_state_with_permission(
             desktop_run_phase_label(state.app_state.progress.current_phase).to_string()
         },
         run_active_step: if pre_admission_active {
-            "durable run admissionを確定しています".to_string()
+            "依頼を保存しています".to_string()
         } else {
             display_run_step(&state.app_state.progress.active_step)
         },
@@ -1009,8 +1102,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 steps: plan.steps.clone(),
             }),
         progress_text: if pre_admission_active {
-            "実行準備中\nフェーズ: 実行準備\n手順: durable run admissionを確定しています"
-                .to_string()
+            "実行準備中\n処理: 依頼の受付\n手順: 依頼を保存しています".to_string()
         } else {
             detail.progress_text
         },
@@ -1024,19 +1116,7 @@ pub(crate) fn desktop_web_state_with_permission(
         confirmation_visible: pending_permission.is_some(),
         confirmation_id: pending_permission.map(|(id, _)| id.to_string()),
         confirmation_text,
-        confirmation: pending_permission.map(|(_, permission)| DesktopPermissionProjection {
-            summary: permission.summary.clone(),
-            details: permission.details.clone(),
-            targets: permission.targets.iter().map(ToString::to_string).collect(),
-            outside_workspace: permission.outside_workspace,
-            risks: permission
-                .risks
-                .iter()
-                .map(|risk| risk.label().to_string())
-                .collect(),
-            agent_path: permission.agent_path.clone(),
-            agent_task_name: permission.agent_task_name.clone(),
-        }),
+        confirmation: pending_permission.map(|(_, permission)| permission.into()),
         startup,
         composer_commit_generation: runtime.composer_commit_generation.to_string(),
         draft_prompt: state.composer.draft_prompt.clone(),
@@ -1055,8 +1135,22 @@ pub(crate) fn desktop_web_state_with_permission(
             .iter()
             .map(|path| path.to_string())
             .collect(),
+        retained_image_names: state
+            .composer
+            .retained_images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                image
+                    .source_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("画像 {}", index + 1))
+            })
+            .collect(),
         composer_submit_mode,
-        can_submit: composer_admission_open,
+        can_submit: composer_admission_open && (root_run_active || main_route_ready),
         can_cancel_run: stop_target.is_some() && (busy || pending_permission.is_some()),
         run_target: DesktopRunMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
@@ -1074,8 +1168,18 @@ pub(crate) fn desktop_web_state_with_permission(
         },
         stop_target,
         busy,
+        exit_requested: false,
         task_activity_state,
         async_polling_required: state.async_polling_required()
+            || hub_polling
+            || state
+                .mcp_publish
+                .as_ref()
+                .is_some_and(crate::mcp_publish::PublishService::polling_required)
+            || state
+                .device_network
+                .as_ref()
+                .is_some_and(crate::device_network::DeviceNetworkService::polling_required)
             || root_run_active
             || runtime.agent_tree_active
             || runtime.root_run_finalizing
@@ -1093,8 +1197,9 @@ pub(crate) fn desktop_web_state_with_permission(
         post_run_refresh_pending: state.post_run_refresh_pending(),
         background_mutation_pending: state.background_mutation_pending(),
         overlay: overlay_key(state.view.overlay).to_string(),
+        hub_project_open: state.view.hub_project_open,
         about: about_projection(),
-        side_chat: runtime.side_chat.clone(),
+        side_chat,
         project_rows: state.snapshot.project_rows.clone(),
         selected_project_index: state.selected_project_index(),
         session_rows,
@@ -1180,6 +1285,7 @@ pub(crate) fn desktop_web_state_with_permission(
             .filter(|field| !field.is_host_owned_generation())
             .map(|field| config_field_projection(field, state.global_config()))
             .collect(),
+        approve_model_configured: state.global_config().approve.is_some(),
         config_target: DesktopConfigMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
             session_id: state
@@ -1214,7 +1320,9 @@ pub(crate) fn desktop_web_state_with_permission(
             && new_request_admission_open
             && prompt_review_owner_is_current,
         history_export_enabled: state.can_export_history() && !root_run_active,
-        enhance_enabled: new_request_admission_open && state.app_state.prompt_review.is_none(),
+        enhance_enabled: main_enhance_route_ready
+            && new_request_admission_open
+            && state.app_state.prompt_review.is_none(),
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
     }
@@ -1294,7 +1402,7 @@ fn agent_status_key(status: &AgentStatus) -> &'static str {
 }
 
 fn desktop_image_input_delegates_capability_to_runtime(state: &DesktopState) -> bool {
-    !state.is_busy() && !state.navigation_loading()
+    !state.is_busy() && !state.navigation_loading() && state.composer.retained_images.is_empty()
 }
 
 fn session_settings_projection(
@@ -1336,8 +1444,8 @@ fn session_settings_projection(
             context_window_inherited: true,
             provider_mutation_enabled: false,
             access_mutation_enabled: false,
-            unavailable_reason:
-                "root sessionを選択すると、このセッションだけの設定を変更できます。".to_string(),
+            unavailable_reason: "メインチャットを開くと、そのチャットだけの設定を変更できます。"
+                .to_string(),
             target: None,
         };
     };
@@ -1424,6 +1532,7 @@ fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
             .unwrap_or("none")
             .to_string(),
         initial_setup_required: state.startup.requires_initial_setup(),
+        onboarding_intent: state.startup.onboarding_intent,
         initial_setup_reason: state
             .startup
             .initial_setup_reason
@@ -1492,6 +1601,8 @@ fn overlay_key(overlay: DesktopOverlay) -> &'static str {
         DesktopOverlay::HelpMenu => "help_menu",
         DesktopOverlay::ProjectMenu => "project_menu",
         DesktopOverlay::ConfigEditor => "config",
+        DesktopOverlay::HubConnection => "hub",
+        DesktopOverlay::McpHistory => "mcp_history",
         DesktopOverlay::SessionSettings => "session_settings",
         DesktopOverlay::ProviderEditor => "provider",
         DesktopOverlay::WorkspacePicker => "workspace",
@@ -1510,6 +1621,7 @@ fn about_projection() -> DesktopAboutProjection {
     DesktopAboutProjection {
         product_name: MOYAI_PRODUCT_NAME.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        codename: MOYAI_DESKTOP_CODENAME.to_string(),
         license_identifier: env!("CARGO_PKG_LICENSE").to_string(),
         copyright_notice: copyright_notice.to_string(),
     }
@@ -1541,17 +1653,13 @@ fn provider_model_labels(state: &DesktopState) -> Vec<String> {
 
 fn provider_status_details(state: &DesktopState) -> String {
     let profile = match state.provider_config.provider_profile_input {
-        ProviderProfile::LmStudio => "Connection type: LM Studio (Responses API).",
-        ProviderProfile::OpenAiCompatible => {
-            "Connection type: OpenAI-compatible (Chat Completions)."
-        }
-        ProviderProfile::OpenAiResponses => "Connection type: OpenAI Responses API.",
-        ProviderProfile::LmStudioChatCompletions => {
-            "Connection type: LM Studio (Chat Completions)."
-        }
+        ProviderProfile::LmStudio => "接続方式: LM Studio (Responses API).",
+        ProviderProfile::OpenAiCompatible => "接続方式: OpenAI-compatible (Chat Completions).",
+        ProviderProfile::OpenAiResponses => "接続方式: OpenAI Responses API.",
+        ProviderProfile::LmStudioChatCompletions => "接続方式: LM Studio (Chat Completions).",
     };
     let limits = format!(
-        "moyAI local context budget: {}. Output length and generation behavior use the Provider host settings.",
+        "moyAIの入力整理上限: {}。回答の長さや生成方法には、AIサーバー側の設定を使います。",
         state.provider_config.provider_context_window_input,
     );
     [
@@ -1567,59 +1675,59 @@ fn provider_status_details(state: &DesktopState) -> String {
 
 fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
     let Some(info) = state.selected_provider_model_info() else {
-        return vec!["選択中のモデル metadata はまだありません。".to_string()];
+        return vec!["選択したモデルの詳細情報はまだ読み込んでいません。".to_string()];
     };
     let mut lines = vec![
-        format!("Model: {}", info.id),
-        format!("Metadata source: {}", info.source),
+        format!("モデル: {}", info.id),
+        format!("情報の取得元: {}", info.source),
         format!(
-            "Load state: {}",
+            "モデルの読み込み: {}",
             match info.load_state {
-                ProviderModelLoadState::Loaded => "loaded",
-                ProviderModelLoadState::NotLoaded => "not loaded",
-                ProviderModelLoadState::Unknown => "unknown",
+                ProviderModelLoadState::Loaded => "読み込み済み",
+                ProviderModelLoadState::NotLoaded => "未読み込み",
+                ProviderModelLoadState::Unknown => "不明",
             }
         ),
         format!(
-            "Context: {}",
+            "入力容量: {}",
             info.context_window
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "Provider metadata max output: {}",
+            "AIサーバーが報告した出力上限: {}",
             info.max_output_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "Metadata images: {}",
+            "画像入力: {}",
             metadata_capability_label(info.supports_images)
         ),
         format!(
-            "Metadata tools: {}",
+            "ツール利用: {}",
             metadata_capability_label(info.supports_tools)
         ),
         format!(
-            "Metadata reasoning: {}",
+            "思考機能: {}",
             metadata_capability_label(info.supports_reasoning)
         ),
     ];
     lines.push(format!(
-        "Parallel prediction: {}",
+        "同時生成数: {}",
         info.max_parallel_predictions
             .filter(|value| *value > 1)
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "none/reported as serial".to_string())
+            .unwrap_or_else(|| "未報告、または逐次実行".to_string())
     ));
     lines
 }
 
 fn metadata_capability_label(value: Option<bool>) -> &'static str {
     match value {
-        Some(true) => "reported supported",
-        Some(false) => "not reported as supported",
-        None => "not reported",
+        Some(true) => "対応との報告あり",
+        Some(false) => "対応なしとの報告あり",
+        None => "未報告",
     }
 }
 
@@ -1654,7 +1762,7 @@ fn token_meter_projection(
             level_label
         ),
         title: format!(
-            "概算 token 使用量: {} / {} ({}%). configured overflow margin: {}、残り推定: {}。出力量はProvider側の設定を使用します。",
+            "入力容量の使用量（概算）: {} / {} トークン（{}%）。設定した余裕枠: {}、残りの目安: {}。出力量にはAIサーバー側の設定を使います。",
             status.active_context_tokens,
             status.full_context_window_limit,
             percent,
@@ -1698,6 +1806,12 @@ fn trim_trailing_decimal(value: String) -> String {
 
 fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String, String) {
     match code {
+        DesktopStatusCode::GoalControl => {
+            return (
+                "Goal の状態を確認しました。".to_string(),
+                message.to_string(),
+            );
+        }
         DesktopStatusCode::ProviderTransport => {
             return (
                 "LLMに接続できません。LLM URL とモデル設定を確認してください。".to_string(),
@@ -1739,6 +1853,7 @@ fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String,
             );
         }
         DesktopStatusCode::Plain
+        | DesktopStatusCode::InitialSetupPreferencesSaveFailed
         | DesktopStatusCode::ApprovalAborted
         | DesktopStatusCode::UserStopped
         | DesktopStatusCode::AgentInterrupted
@@ -1770,7 +1885,7 @@ fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String,
     }
 }
 
-fn format_permission_confirmation_text(permission: &PermissionRequest) -> String {
+pub(crate) fn format_permission_confirmation_text(permission: &PermissionRequest) -> String {
     let targets = if permission.targets.is_empty() {
         "(なし)".to_string()
     } else {
@@ -1969,6 +2084,12 @@ mod tests {
     #[test]
     fn typed_status_code_selects_specialized_guidance_without_message_inference() {
         let message = "opaque diagnostic";
+        let (goal, goal_detail) = display_status_projection(
+            DesktopStatusCode::GoalControl,
+            "Goal: 一時停止\nlong objective",
+        );
+        assert_eq!(goal, "Goal の状態を確認しました。");
+        assert_eq!(goal_detail, "Goal: 一時停止\nlong objective");
         let (provider, provider_detail) =
             display_status_projection(DesktopStatusCode::ProviderTransport, message);
         assert!(provider.contains("LLMに接続できません"));
@@ -2023,8 +2144,8 @@ mod tests {
         let details = provider_status_details(&state);
 
         assert!(details.contains("OpenAI-compatible (Chat Completions)"));
-        assert!(details.contains("moyAI local context budget"));
-        assert!(details.contains("Provider host settings"));
+        assert!(details.contains("moyAIの入力整理上限"));
+        assert!(details.contains("AIサーバー側の設定"));
         assert!(!details.contains("max_output_tokens"));
         assert!(!details.contains("language"));
         assert!(!details.contains("no-thinking"));
@@ -2056,6 +2177,26 @@ mod tests {
         assert_eq!(
             response_timeout.integer_max(),
             Some(MAX_MODEL_REQUEST_TIMEOUT_MS)
+        );
+        let approve_profile = ConfigField::ApproveProviderProfile.descriptor();
+        assert_eq!(approve_profile.value_type().as_str(), "enum");
+        assert_eq!(
+            approve_profile.options(),
+            ConfigField::ProviderProfile.descriptor().options()
+        );
+        assert_eq!(
+            ConfigField::ApproveContextWindow.descriptor().integer_min(),
+            Some(1)
+        );
+        assert_eq!(
+            ConfigField::ApproveRequestTimeoutMs
+                .descriptor()
+                .integer_max(),
+            Some(MAX_MODEL_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            ConfigField::ApproveMaxRetries.descriptor().integer_max(),
+            Some(u8::MAX as u64)
         );
 
         let temperature = ConfigField::Temperature.descriptor();
@@ -2812,6 +2953,9 @@ mod tests {
         let mut root_effective = global.clone();
         root_effective.model.model = "root-model".to_string();
         root_effective.model.context_window = 131_072;
+        root_effective.approve = Some(crate::config::ApproveConfig::from_model(
+            &root_effective.model,
+        ));
         state.reset_effective_config(root_effective);
 
         let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
@@ -2828,6 +2972,31 @@ mod tests {
 
         assert_eq!(model.value, "global-model");
         assert_eq!(context_window.value, "32768");
+        assert!(!projection.approve_model_configured);
+        assert_eq!(
+            projection
+                .config_fields
+                .iter()
+                .find(|field| field.key == "approve.model")
+                .unwrap()
+                .value,
+            "global-model"
+        );
+        let mut approve = crate::config::ApproveConfig::from_model(&global.model);
+        approve.model = "global-approve-model".into();
+        global.approve = Some(approve);
+        state.replace_global_config(global);
+        let independent = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert!(independent.approve_model_configured);
+        assert_eq!(
+            independent
+                .config_fields
+                .iter()
+                .find(|field| field.key == "approve.model")
+                .unwrap()
+                .value,
+            "global-approve-model"
+        );
     }
 
     #[test]
@@ -2872,6 +3041,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: std::collections::HashMap::new(),
             session_token_usage: Default::default(),
+            turn_progress: None,
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -3358,14 +3528,10 @@ mod tests {
         assert!(
             projection
                 .title
-                .contains("出力量はProvider側の設定を使用します")
+                .contains("出力量にはAIサーバー側の設定を使います")
         );
         assert!(!projection.title.contains("設定output上限"));
-        assert!(
-            projection
-                .title
-                .contains("configured overflow margin: 1024")
-        );
+        assert!(projection.title.contains("設定した余裕枠: 1024"));
         assert!(!projection.title.contains("出力予約"));
     }
 
@@ -3390,27 +3556,18 @@ mod tests {
     #[test]
     fn provider_phase_projection_labels_every_current_transport_boundary() {
         let current = [
-            (
-                crate::llm::ProviderPhase::AttemptStarted,
-                "Provider要求開始",
-            ),
-            (
-                crate::llm::ProviderPhase::RequestInFlight,
-                "Provider要求処理中",
-            ),
+            (crate::llm::ProviderPhase::AttemptStarted, "AIへの送信開始"),
+            (crate::llm::ProviderPhase::RequestInFlight, "AIの応答待ち"),
             (
                 crate::llm::ProviderPhase::HeadersReceived,
-                "Provider応答ヘッダー受信",
+                "AIからの応答開始",
             ),
-            (
-                crate::llm::ProviderPhase::FirstProgress,
-                "Provider応答受信中",
-            ),
+            (crate::llm::ProviderPhase::FirstProgress, "AIの回答を受信中"),
             (
                 crate::llm::ProviderPhase::LastProgress,
-                "Provider最終応答受信",
+                "AIの最終応答を受信",
             ),
-            (crate::llm::ProviderPhase::ProviderTerminal, "Provider完了"),
+            (crate::llm::ProviderPhase::ProviderTerminal, "AIの応答完了"),
         ];
 
         for (phase, expected) in current {
@@ -3445,8 +3602,8 @@ mod tests {
 
         let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
 
-        assert_eq!(projection.run_phase, "Provider要求処理中");
-        assert!(projection.progress_text.contains("Provider要求処理中"));
+        assert_eq!(projection.run_phase, "AIの応答待ち");
+        assert!(projection.progress_text.contains("AIの応答待ち"));
         assert!(!projection.run_phase.contains("request_in_flight"));
         assert!(!projection.progress_text.contains("request_in_flight"));
     }

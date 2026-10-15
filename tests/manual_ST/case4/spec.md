@@ -8,7 +8,7 @@
 
 - `project_sandbox/<task>/case4/workspace/` に fresh workspace を作る。
 - workspace 直下には次の `task.md` だけを置く。
-- config/data directory を fresh にし、visible Desktop GUI から実行する。
+- config/data directory は単独実行では fresh にする。suite 実行では [共通 README](../README.md) に従い同じ Desktop/profile を共有し、各 case の workspace と会話を fresh にする。visible Desktop GUI から実行する。
 
 ## Canonical user request
 

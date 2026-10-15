@@ -4,744 +4,134 @@
 
 <h1 align="center">moyAI</h1>
 
-<p align="center">
-  <strong>ローカルLLM と、閉鎖環境専用のコーディングエージェント。</strong>
-</p>
+<p align="center"><strong>ローカルLLMと閉域環境のためのコーディングエージェント。</strong></p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.1.1-6d8cff"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
-  <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
-  <img alt="LLM" src="https://img.shields.io/badge/LLM-OpenAI_compatible-111827">
+  <a href="README.md">English</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">公開済み v2.1.1</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#license">ライセンス</a>
 </p>
 
-<p align="center">
-  <a href="README.md">English README</a>
-  ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">release をダウンロード</a>
-  ·
-  <a href="#quick-start">Quick Start</a>
-  ·
-  <a href="#設定">設定</a>
-</p>
+<p align="center"><img src="logo/moyai-screenshot-sample.png" alt="moyAI Desktop screenshot" width="920"></p>
 
-<p align="center">
-  <img src="logo/moyai-screenshot-sample.png" alt="moyAI Desktop screenshot" width="920">
-</p>
+## moyAI（もやい）とは
 
----
+moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-## moyAI（もやい） とは
-
-moyAI は、ローカル LLM で動かすことを前提にした Rust 製の coding agent です。ローカルのあらゆるリファレンスが結ばれる様子をイメージし、もやい と名付けました。
-
-OpenAI 互換 API を備えた推論サーバーの外部HTTP endpointに接続し、プロジェクト調査、ファイル編集、shell 実行、セッション履歴の記録、検証までを扱います。moyAIはLM Studio等のprovider processを起動・停止・監督しません。CLI、TUI、Tauri Desktop App は、すべて同じ Rust core の上で動作します。
-
-手元の開発作業で日常的に頼れるツールとすることを重視しました。作業証跡は見える形で残します。あとから「何を読んだのか」「何を変えたのか」「何を検証したのか」を追えるようにするためです。
-
-## なぜ作ったか
-
-最近の coding agent は非常に便利ですが、クラウド上のモデル、オンラインサービス、plugin marketplace、常時インターネット接続を前提にしているものも少なくありません。
-
-一方で、機密情報・機密コードを扱う環境、社内ネットワーク、ローカル推論サーバー、再現性を重視する開発現場では、その前提が合わないことがあります。
-
-moyAI は、そうした環境でも使いやすい開発用の相棒を目指しています。
-
-| 方針 | 内容 |
-| --- | --- |
-| ローカル前提 | LM Studio などの OpenAI 互換 endpoint に接続します。 |
-| プロジェクトを見て動く | 検索、読み取り、編集、patch、検証まで扱います。 |
-| 作業内容を追跡できる | transcript、file changes、tool output、session history を残します。 |
-| GUI でも terminal でも使える | Desktop、CLI、TUI を同じ Rust core で動かします。 |
-| 閉域環境へ持ち込みやすい | デプロイで npm、Rust toolchain、internet、dev server を要求しません。 |
-| 暗黙に環境構築しない | dependency install、runtime download、package-manager setup、外部repository取得をmoyAI自身が自動実行しません。ユーザーが依頼したshell commandは、現在のpermission policyで許可または確認された場合にnetworkへ接続できます。 |
+**Desktop 3.0.0-rc.1は、moyAI Hub 0.1.0と組み合わせるリリース候補です。** このRCはWebView2とx64 VC++ runtimeが導入済みのPC向けです。配布物ごとの受入結果を候補版に添付します。公開済みv2.1.1のZIPは従来の配置と機能です。RCの実装内容と検証上の制限は[リリースノート](docs/release/v3.0.0-rc.1.md)を参照してください。
 
 ## できること
 
-- Project Chat / Quick Chat / Transcript / Artifact Pane / Settings と、メインとは別modelで動くtool-lessなsession-scopedサイドチャットを備えた Tauri Desktop App。サイドチャットはprovider POST直前にexact owner sessionのactive canonical historyとappend fenceをcaptureし、任意の引用は一つのstable transcript/artifact rowと同じsnapshotへtypedに結びます。storage workはappend-only source item 65,536件・derived active item 16,384件・eligible semantic unit 8,192件を上限とし、超過時はprovider transport前に拒否します。untrustedな引用・canonical evidence textはowner-context envelopeへ入れる前にXML entity encodeし、evidenceから構造delimiterを偽装できないようにします。引用は自動送信せずSide draftへ追加し、live workspaceとメインcomposerは変更しません
-- Desktop は1ユーザーにつき1 instanceだけ起動し、再起動操作では既存windowを復元
-- Desktop の Stop は表示時のworkspace / root session / run generation / Agent Tree epochを検証し、古い画面操作を別runへ適用しない。Settingsの入力値、baseline、dirty状態、monotonic revisionはfrontend local draftだけが所有し、Rustにmirrorを置かない。Rustはtyped clean/dirty capability variantを投影し、Apply / Save / Reset / 別config owner mutationの前にcomplete draftとdecimal-string config generation targetをstatelessに検証する。commit時は一時的な完全`ResolvedConfig`を一度だけ作り、optionalの空欄を古いglobal/base値から再継承しない。active steerもdurable受理後だけ入力をclearする
-- terminal から利用できる CLI / TUI
-- OpenAI 互換 local LLM への接続と明示model availability diagnostic
-- canonical `update_plan`をexecution gateやtool access gateではなくclient-visibleな進捗投影として使うevidence-firstのtask planning。proactive modeでは、最小限のgrounding後かつ広い調査前に早期planを作るstatic model instructionを使う
-- turn admissionで固定するimmutable `ResolvedTurnConfig` / turn / step context、canonical protocol history、`ModelResponseId`単位のatomic assistant/raw-tool-call commit
-- canonical HTTP input全体の再送とtyped reasoning summaryを持つLM Studio Responses API対応
-- response/call-output semantic unit、provider報告total usageとCodex型UTF-8 bytes/4 local suffix推定、full-request local fallback、full native summary requestとtyped overflow reduction、durable replacement lineageを備えたautomatic LLM semantic compaction
-- `/v1/models` と LM Studio `/api/v1/models` からの model metadata discovery
-- model-visibleなcontinuation cursorを持つbounded workspace search / directory inspection、正確な次offsetを示してread用spool pathを作らないline-awareなguarded file-read page、diff-based edit、shell execution
-- Git project rootの配下にあるdirectoryを選んだ場合も、そのdirectoryをtoolとsandboxのauthority境界として維持し、sessionを開き直したときも同じdirectoryを復元
-- fileのcreate / update / delete / rollbackは、一つのstable-handle・no-clobber条件付きcommitを使う。並行する外部replacementを上書きせず、target名を復元できない場合は保持したbackup pathを明示する。親directoryは暗黙作成しないため、先に作成する
-- Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する
-- **承認を求める**（`default`）、**代理で承認**（`auto_review`）、**フルアクセス**（`full_access`）の3種類のpermission mode。承認を求める/代理で承認は同じdeterministic admission policyとWindows `workspace-write` restricted-token / ACL profileを使い、明示した`sandbox_permissions: "require_escalated"` + `justification`または検出したdestructive/network/external/authority effectを、前者はhumanへ送る。後者はturn-captured canonical API modeから各current connection profileのexact tool-less Responses / Chat Completions AI Guardian requestを選び、future unknown wireはGuardian接触前にhuman/承認を求めるmodeへfallbackせずfail closedする。oMLXの実互換性は別のactual UATで確認する。Windows backendはadmitしたroot、shell/formatter executable、selected existing authority carveoutをidentity-pinし、protected regular fileをcontent-pinし、起動する各process/threadへexplicit system-only descriptorを与え、stdio限定継承、resume前のJob process-tree/UI restrictions、unsandboxed retryなしのfail-closedを実装する。formatterのbare command名はworkspace配下のPATH candidateを除外し、workspace-local formatterはpathを明示した場合だけ選ぶ。ただしこのunelevated profileはfinite existing-object defenseであり、Windows namespace全体やCodex enforcement互換ではない。未作成authority name、別subtreeのnested instruction、先行explicit / inheritance-disabled DACLを持つprotected descendant、確認前の未監査outside path、direct socket、同一userのhost process memory、same-desktop synthetic inputは残余であり、ACL preflightの既存tree伝播は同期処理でchild timeoutの対象外である。フルアクセスと承認済みprocess elevationはcurrent userの`Unrestricted`で動くため、そのchild filesystem mutationはtyped file guardを通らない。一方、typed `write` / `apply_patch`、MCP / Docling、process lifecycleは各guardを維持する。commit済みmode切替は次のdecisionへ反映し、pending requestとadmit済みeffectは元の判断/profileを保持する。native process sandboxは現在Windowsのみで、他platformのworkspace-mode effectはfail closedになる。hard boundaryには将来のelevated dedicated-identity / firewall / private-desktop backendが必要である。
-- vision-capable model での画像添付
-- Docling Serve / HTTP MCP と連携した document workflow
-- `AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、`.moyai/commands/*.md`、local `SKILL.md` の読み込み
-- canonical protocol session history、typed turn terminal、Markdown export、軽量な live-smoke artifact
-- 短いtyped provider/status表示、attention-firstで最大8件の進捗summary、canonical history/exportへの詳細導線、usage計測のmissing/partial/completeを区別するterminal由来session使用量、reopen/export後も同じ内容を保つdurable feedback
-- 全agentが通常toolとcollaboration toolを保持し、descendantごとの独立sessionとDesktop activity表示を持つ再帰的なmulti-agent collaboration
+- ローカルプロジェクトとチャット、ファイル添付、作業内容・成果・保存済み会話の確認。
+- メインの会話や選択内容について質問する、ツールを使わない独立したサイドチャット。
+- 「承認を求める」「代理で承認」「フルアクセス」の操作権限。前二つにはWindowsの作業フォルダー保護が適用されます。
+- 子エージェントとの分担、進捗計画、長い会話の圧縮、Markdownへの会話保存。
+- プロジェクト内の指示・Skills、外部HTTP MCPツール、文書処理用Doclingとの接続。
+- Hubで許可した複数PCを使うプロジェクト。左のプロジェクト一覧に `Hub` 印で表示し、いつもの入力欄から依頼します。AIはプロジェクト内で許可された実行PCを選択できます。
+- Desktop画面と独立して仕事を実行するWindows Runner。共有の会話・入力・公開した成果はHubへ保存します。
 
-## 現在のリリース
-
-現在の release を公開しています。
-
-[**moyAI v2.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1)
-
-v2.1.1はv2系の最終リリースです。MainとSide Chatそれぞれに独立した追加システムプロンプトを
-設定できるようにし、Settingsをglobal、session-scoped、Desktop固有のstateに沿って再編しました。
-Side Chatではownerに紐づくcontext、引用、session navigation、再起動後の継続性を強化しています。
-また、oMLXなどのOpenAI-compatible endpointを含む現行provider profileすべてに、tool-lessな
-AutoReview Guardianのexact transportを拡張し、実行file identity、MCP origin、provider診断、secret、
-Windows sandbox admissionのfail-closed境界を強化しました。
-
-Windows 向け release zip には、次のものが含まれています。
-
-- CLI / TUI 用の `bin/moyai.exe`
-- Desktop App 用の `bin/moyai-desktop.exe`
-- user-wide moyAI AppDataを初回状態へ戻す`bin/moyai-cleanup.exe`
-- bundled `ui/desktop-web/dist/` assets
-- README、LICENSE、release notes、config example、getting-started guide、package内SHA256 checksum
-
-GitHub Releaseでは、zipとあわせて外部manifestとzip SHA256 sidecarも公開します。
-
-利用先の Windows 端末に、npm、Rust toolchain、internet access、local web dev server は不要です。
+文書の作成・編集と説明用コメントには、[yomiyasu](https://github.com/nanaism/yomiyasu)を参考にした文章基準を組み込んでいます。主張や技術条件を保ち、冗長な説明や不自然な言い回しを減らすようAIに指示します。設定やスキルのインストールは不要です。
 
 ## Quick Start
 
-1. LM Studio などで OpenAI 互換の LLM server を起動するか、設定予定のendpointへ接続できる状態にします。
-2. release zip をダウンロードして展開します。
-3. `bin/moyai-desktop.exe` を起動します。
-4. 初回起動ではfullscreenのInitial Setupを進めます。provider、model、permission、optional toolを入力またはTOMLから取り込み、local validationを確認してから **Finish and open moyAI** を選びます。model読込とprovider / Docling diagnosticは明示操作時だけ実行され、endpointへ到達できない場合もwarningとして表示するだけで、localにvalidなsetup完了を妨げません。
-5. まずは Quick Chat を試します。コードを扱わせる場合は、project workspace を選択し、開発チャットを開始します。
+現行開発版のWindows配布物では、次の順に進みます。
 
-CLI から使う場合は、次のように実行します。
+1. ZIP全体を展開して `Setup-moyAI.cmd` を実行し、スタートメニューから **moyAI** を開きます。インストールせず使う場合は `Start-moyAI.cmd` を開きます。新しく起動するたびにWindowsの管理者承認を行います。取り消すと起動を中止します。
+2. 初回画面で目的を選びます。
+
+   | 目的 | 選ぶ項目 |
+   | --- | --- |
+   | 自分のPCで作業する | 自分のPCで使う |
+   | チームへ仕事を依頼する | チームに参加する |
+   | このPCでチームの仕事を実行する | チームの仕事をこのPCで実行する |
+   | Hubを準備する | チーム環境を用意する |
+
+3. 個人利用ではAIの接続先・モデル・承認方式を保存し、プロジェクトのフォルダーを追加するかチャットを始めます。
+4. チーム利用では、管理者から受け取った `hub-config.moyai-join` を開きます。管理者がPCの参加とプロジェクトでの用途を許可します。実行PCでは実行許可とプロジェクトごとの作業フォルダーも設定します。依頼だけをするPCにローカルAIや実行フォルダーは不要です。
+5. プロジェクトを開いて依頼し、必要な操作承認、回答、成果ファイルを確認します。
+
+moyAIのID・パスワード入力は不要です。同じWindowsユーザー名でも各PCは別のIDと鍵を持ちます。Hubへ参加しただけで全プロジェクトが使えるわけではありません。
+
+Desktopの×ボタンを押すとトレイに入り、仕事は続きます。もう一度起動すると同じ画面に戻ります。メニューまたはトレイの **終了** は、このPCのRunnerの仕事と起動中アプリを停止します。Runnerの終了を確認してからDesktopも終了します。Hubは別に管理します。
+
+詳しい手順は[使い始める](docs/user/getting-started.md)、[Windowsへの導入と更新](docs/user/windows-setup.md)、[初回設定と再開](docs/desktop-first-use.md)、[Hubプロジェクトの操作](docs/shared-work-desktop.md)を参照してください。公開済みv2.1.1は `bin/moyai-desktop.exe` から起動します。
+
+## 設定
+
+Windowsの共通設定は `%APPDATA%\midi-ai-labs\moyai\config\config.toml` です。保存済みの利用者設定を製品の初期値で上書きしません。
+
+**設定 → AIの接続** でメインとサイドを設定します。Hub設定がない場合は、接続方式・URL・モデルを入力します。LM Studio Responses、oMLXなどのOpenAI互換Chat Completionsに対応し、モデル一覧の取得とモデルIDの直接入力ができます。API認証が必要な場合は、秘密情報そのものではなく、それを保持する環境変数名を指定します。
+
+Hub設定がある場合は同じ欄にHubの接続情報を表示し、標準モデルまたは登録済みモデルを選びます。メインとサイドは別々に保存し、共有Runnerは実行PCのメインの選択を使います。Hub停止中に手入力の接続先へ自動で切り替わりません。
+
+**接続設定をリセット** はHubが応答しなくても使えます。手入力のAI設定・ローカル会話・成果を保持して、別Hubへ登録し直せます。
+
+共通設定と、選択したローカル会話のメイン用設定は別です。サイドは独立した共通設定を使います。`context_window` はmoyAI内の会話量の計算と圧縮に使います。モデルの読み込み・生成量・サンプリングはAIホストで設定します。[設定例](config.example.toml)と[Hubモデル接続](docs/hub-integration.md)を参照してください。
+
+自動圧縮を始める入力トークン数は、共通設定の `model.compaction_budget_tokens`（環境変数 `MOYAI_COMPACTION_BUDGET_TOKENS`）で指定できます。未指定なら通常の作業用上限を使います。正の値で、`context_window` から求めた実効入力上限以下にしてください。指定値と通常の作業用上限の小さい方で自動圧縮を始めます。`context_window = 131072`、設定値 `98304` の場合、入力の推定値が98,304トークンに達すると自動圧縮します。Hub経由のメインや共有実行にも適用し、生成量はAIホストで設定します。
+
+モデルは `compact_context` へ自分で作った短い作業要約を渡し、文脈を整理することもできます。moyAIは最新の利用者入力と直近の完了済み作業を保持し、文脈が減ることを確かめて既存の会話履歴へ保存します。元の発言やツール結果は残ります。[Context Language Models](https://github.com/facebookresearch/context-language-models)の考え方を参考に、moyAIの履歴・ツール構成に合わせて実装しています。
+
+## CLI・TUI
 
 ```bash
 moyai run --dir /path/to/workspace "このプロジェクトの主要モジュールを調べて要約してください。"
 moyai tui --dir /path/to/workspace
 moyai desktop --dir /path/to/workspace
-moyai-desktop
+moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-開発用 build:
+開発版配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
-```bash
-cargo build
-```
+WindowsのRunとTUIは、起動時に一度の管理者承認が必要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 
-Desktop release build:
+## プロジェクトごとの指示
+
+`AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、`.moyai/commands/*.md`、ローカルの `SKILL.md` を利用できます。ファイルとツールの利用範囲は、選択した作業フォルダーと操作権限に従います。Hubプロジェクトへ再参加するときも、AIが通常の作業として実ファイルから状態を把握し、専用の履歴復元処理は行いません。
+
+外部MCPツールとの接続は引き続き使えます。moyAI同士の旧手動配信は新規導入の入口ではなく、現在はHubプロジェクトを使います。旧記録は[MCP履歴](docs/mcp-history-guide.md)から参照できます。
+
+## 操作権限と利用上の制限
+
+主な導入・検証対象はWindows x64です。WebView2とVisual C++ランタイムは配布物へ同梱するか、組織側で導入します。Setupによるダウンロードはなく、利用先にRust・Node・開発サーバーは不要です。
+
+「承認を求める」と「代理で承認」は同じWindowsの作業フォルダー保護を使い、後者はAIが操作の許可を審査します。「フルアクセス」は現在のWindows利用者の権限で実行します。これはOS全体の完全隔離を保証するものではありません。ネイティブなプロセス保護はWindowsのみで、他OSでは保護が必要なプロセス操作を拒否します。Unixの既存ファイル更新・削除は、バックアップを残した部分完了エラーになる場合があり、表示された保存先の確認が必要です。
+
+起動時の承認で一時SYSTEM sandbox helperを準備します。通常アプリとRunnerは一般ユーザー権限のまま動作し、この承認で個々のtool操作を許可したり、失敗した制限付きcommandをフルアクセスで自動再実行したりしません。現在の起動経路はlocal Windows SAM accountを対象とし、非対応のaccount種別やhelperの準備失敗では起動を中止します。許可済みworkspace / TEMP内での標準Python private directoryとpytest一時directoryの利用は、project fileの変更や制限外実行の依頼なしに動作することが要件です。workspace外や別effectへの制限は別に確認します。
+
+通常の配置フォルダーから起動してください。helperや同梱runtimeまでのpathにjunction・symbolic linkなどのreparse pointがある場合は起動を拒否するため、配布物全体を通常のフォルダーへ移してください。
+
+停止や発言の編集は、作成済みファイルや起動済みアプリを元に戻しません。編集・再送できるのは最新の発言だけです。本文を編集しても元の画像や添付は保持します。添付を変更する場合は、新しい依頼として送ってください。停止要求の受付と、実プロセスの停止確認は別です。
+
+RunnerはWindows利用者のログオン中に動作します。Desktopが起動するRunnerは承認済みhelperへ接続し、二度目のUACなしで独立したlifetime leaseを保持します。最後のownerが終了するとhelperを清算します。Windowsログオン時の自動起動を含め、独立して起動するRunnerは自身の起動時に管理者承認を要求します。一時helperがRunner自体をWindows serviceとして動かすわけではありません。HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
+
+## 開発・検証
 
 ```bash
 npm ci
 npm run build:desktop-web
-cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
+cargo build
 ```
 
-Windows release package:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
-```
-
-packageはそのrelease用のclean source commitから作成します。`v<version>` tagが既に存在する場合、
-publish可能な再buildはそのtagが指すcommitだけを許可し、後続sourceは全version carrierを新しいversionへ
-同期してからpackageします。
-
-既定では、release artifact は repository の外側にある `project_sandbox/releases/` に出力されます。
-
-## 設定
-
-moyAI はuser-wide config fileをbaselineとして読み、必要に応じてenvironment variable、durableなroot-session override、CLI/run overrideを重ねます。左railの **接続設定** shortcutは **Settings** を開きます。navigationは **Global Settings**（**Main Chat Settings** と **Side Chat Settings** を含む）、**Session-scoped Settings**（**Session Overrides** への入口）、**Desktop Preferences** に分かれます。MainとSide Chatのglobal設定はいずれもuser-wide TOMLのImport / Save対象です。Session Overridesから開く小さな **Session Settings** panelはcurrent rootのMain chatだけを編集し、global SaveやSide Chat既定値の変更は行いません。
-
-Windows の既定 config path:
-
-```text
-%APPDATA%\midi-ai-labs\moyai\config\config.toml
-```
-
-Desktop、TUI、CLIは同じuser-wide baselineを参照します。Desktopのroot sessionには完全なprovider接続（接続方式、URL、model、任意のAPI key環境変数名、custom header）、moyAI local context budget、access modeを別途保存でき、sessionを開き直した場合も復元されます。provider / model / local context budgetの変更はApply後にadmitされるturnから反映します。commit済みaccess modeは、既に実行中のroot / childを含む次のpermission decisionから反映しますが、表示中のpending decisionとadmit済みeffectは元のpolicyを維持します。
-
-Initial SetupのTOML ImportはFinishまでread-onlyです。選択したfileをenvironment override適用前の値としてstrictにparseし、wizardのlocal draftへ取り込みますが、source fileとcurrent global configは変更しません。validation済みdraftをFinishで正常に保存した場合だけ、初回setup requirementを解除します。通常stepに出ないtyped fieldはcollapsed Advancedから編集でき、該当fieldの修正が必要な場合はその導線を開きます。
-
-Session Settingsの **moyAI local context budget** を空欄にすると、そのroot-session overrideを解除してglobal値を継承します。この値はmoyAI内のinput accountingとcompactionだけに使い、providerのcontext windowやmodel load設定として送信しません。
-
-provider custom header/body、Docling header、MCP server定義等のsensitive JSON設定は、public projectionへraw値を返さず **設定済み（非表示）** として示します。complete draftでsensitive fieldを空欄または空白だけにした場合は既存値を保持します。置換またはclearする場合は、`{}` / `[]`等の明示的なvalid JSONを入力します。API key環境変数の名前は表示・保存できますが、解決した環境変数値は保存・投影しません。
-
-設定例:
-
-```toml
-[model]
-base_url = "http://127.0.0.1:1234"
-model = "qwen/qwen3.6-27b"
-provider_profile = "lm_studio"
-# system_prompt = """Mainへ追加する任意の指示""" # 任意
-# api_key_env = "OPENAI_API_KEY" # 任意。環境変数の名前を指定
-request_timeout_ms = 3600000
-context_window = 131072
-supports_tools = true
-supports_images = true
-
-[side_chat]
-base_url = "http://127.0.0.1:1234"
-model = "qwen/qwen3.6-27b"
-provider_profile = "lm_studio"
-# system_prompt = """Side Chatへ追加する任意の指示""" # 任意
-request_timeout_ms = 3600000
-connect_timeout_ms = 10000
-max_retries = 2
-context_window = 131072
-
-[permissions]
-access_mode = "default"
-
-[multi_agent]
-enabled = true
-mode = "explicit_request_only"
-max_concurrent_agents = 4
-max_concurrent_model_requests = 1
-
-[docling]
-enabled = false
-base_url = "http://127.0.0.1:8123"
-
-[mcp]
-enabled = false
-```
-
-`model.system_prompt`はMain用の追加指示です。moyAI組み込みのsystem / default profile promptを先に保ち、設定値を`## User-configured system prompt` sectionとして後へ追加します。外側の空白は除去し、未指定または空欄なら何も追加しません。上限は16,384 Unicode文字で、設定変更はApply後にadmitされるturnから反映されます。
-
-`[side_chat]`は独立したglobal config sectionです。既定値が`[model]`と同じ場合でもMainから値を継承せず、user-wide設定のほかの項目と一緒にImport / Saveできます。`side_chat.system_prompt`はSide Chat組み込みpromptの後へ追加され、context preflightにも含まれます。空欄と16,384文字上限の扱いはMainと同じです。
-
-sessionでSide Chatを初めて作成したとき、または明示的に閉じた後で作り直したとき、現在のglobal Side Chat provider / model / prompt / timeout / retry / context設定をその会話へsnapshotします。既存のSide Chatは、ペインを隠す、sessionを移動する、windowを閉じる、appを再起動する操作を越えて、capture済み設定・履歴・draftを維持します。明示的に閉じた場合はそのSide Chat会話・draft・snapshotを削除しますが、globalな`[side_chat]`設定は削除もresetもしません。
-
-`request_timeout_ms`はmoyAI client側の通信生存判定を所有します。最初のPOST attemptから成功response headerまでは、
-connect retry待機、request body送信、header待ちを含む単一deadlineです。成功header後は同じ値をdecoded SSE event間の
-最大無進捗時間として使い、eventを受け取るたびに更新するため、進捗中のgenerationを総所要時間だけで終了しません。
-この値はhostへ送信しません。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値です。Desktop Settings、
-TUI、ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使います。旧`stream_idle_timeout_ms` TOML keyと
-`MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variableは移行入力としてだけ受理します。旧keyだけならrequest timeoutへ
-昇格し、新旧が同値なら受理し、異なる値なら黙って片方を選ばずconfig errorを返します。
-出力量はホスティング側が所有します。moyAIはResponsesの`max_output_tokens`とChat Completionsの`max_tokens`を
-送らないため、通常文、reasoning、tool-call引数のserialized outputはいずれもLM Studio、oMLX等で設定された上限を
-使います。provider側の`response.failed`は安定したtyped public failureへ変換し、不完全なtool callをmoyAIが
-local parse・commit・実行したものとして扱いません。raw provider code/messageはprivate diagnostic evidenceにだけ保持し、
-durable terminal、canonical history、Markdown exportへ書き込みません。
-`max_retries`が適用されるのはHTTP response前のretry可能な接続/transport失敗だけで、retry待機は1回最大30,000msです。
-response-start timeout、HTTP 429/5xxを含むHTTP error response、SSE response開始後の失敗は終端となり、同じ生成requestを自動再送しません。
-別操作であるmodel availability checkは1 requestあたり120,000msの専用probe timeoutを使い、通常turnの
-admissionでは実行しません。
-Desktopのcold startはlocal configだけを検証し、provider catalogの読込、availability diagnostic、
-Docling probeのいずれも実行しません。provider discoveryはユーザーが`モデル読込`を選んだ場合だけ開始し、
-Doclingは明示的に要求された操作が利用するときだけ接続します。
-configは全nested sectionでstrictにparseします。未知keyや`stream_max_retries`などの廃止keyはno-op設定として
-黙って保持せず、修正が必要なconfig errorとして報告します。
-errorにはparseに失敗したconfig fileの正確なpathを含めます。既存のuser-wide configは黙って書き換えないため、
-報告されたfileからretiredな`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`を削除または置換してから再起動します。
-DesktopのGlobal Settingsでは入力途中のcomplete config値、baseline、dirty状態、monotonic revisionをfrontend local draftだけに保ち、
-Rustへfield-value / dirty / revision mirrorを作りません。Global SettingsのApply / Save / Resetはcomplete stable key/value draftと
-config targetを同一commandで送り、remembered Access / Provider Apply・Save / Importも同じglobal-config draftと各owner targetを
-使います。Rustはcurrent global/effective baselineとの比較、draft completeness、target/admissionを副作用前に検証します。
-config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberにしません。Global SettingsのApplyは
-一時的な完全`ResolvedConfig`を作り、global Saveはdirty fieldだけをcurrent TOMLへmergeします。
-
-Session Settingsは完全なprovider接続、access mode、moyAI local context budgetだけの別frontend draftを持ちます。Applyは値と
-workspace、root session ID、durable settings revision、config generation、runtime owner tokenを同一commandで送り、Rustが
-canonical patchを作ってroot-only revision CASします。local context budgetの空欄はroot override解除とglobal継承を意味します。latest local
-revision/targetと一致するcorrelated successだけが各draftをclearし、古いasync応答は別ownerのdraftを収束させません。
-
-MCPを有効にする場合、呼び出し可能なserver toolごとにeffect routeを明示します。未設定routeは
-fail closedとなり、内部Plan modeでは`read`と明示したrouteだけを実行できます。HTTP serverはuserinfo / fragmentを持たない
-一つのcanonical absolute `http` / `https` originを使い、discoveryとcallを同じoriginへ限定し、redirectを拒否します。
-endpoint/body/header/envelope/responseには固定上限があり、一つのabsolute timeoutがdiscoveryとexact-onceのeffectful callを
-覆います。effectful `tools/call`をretryしたり別endpointへfallbackしたりしません。
-
-```toml
-[mcp]
-enabled = true
-
-[[mcp.servers]]
-id = "internal"
-enabled = true
-transport = "http"
-base_url = "http://127.0.0.1:8123/mcp"
-timeout_ms = 120000
-
-[[mcp.servers.tool_routes]]
-name = "inspect"
-effect = "read"
-
-[mcp.servers.headers]
-```
-
-よく使う environment variables:
-
-- `MOYAI_BASE_URL`
-- `MOYAI_MODEL`
-- `MOYAI_PROVIDER_PROFILE`
-- `MOYAI_API_KEY_ENV`
-- `MOYAI_CONFIG_PATH`
-- `MOYAI_DATA_DIR`
-- `MOYAI_ACCESS_MODE`
-- `MOYAI_REQUEST_TIMEOUT_MS`
-- `MOYAI_CONTEXT_WINDOW`
-- `MOYAI_SUPPORTS_IMAGES`
-- `MOYAI_MULTI_AGENT_ENABLED`
-- `MOYAI_MULTI_AGENT_MODE`
-- `MOYAI_MULTI_AGENT_MAX_AGENTS`
-- `MOYAI_MULTI_AGENT_MAX_MODEL_REQUESTS`
-- `MOYAI_DOCLING_ENABLED`
-- `MOYAI_MCP_ENABLED`
-
-`provider_profile`はcatalog取得方式とgeneration transportを一体にした単一の接続契約です。oMLX、vLLM、
-NVIDIA NIMなど、`/v1/models`と`/v1/chat/completions`を提供するserverには`openai_compatible`を使います。
-
-| 値 | catalog | generation |
-| --- | --- | --- |
-| `lm_studio`（既定） | LM Studio native metadata | `/v1/responses` |
-| `openai_compatible` | `/v1/models` | `/v1/chat/completions` |
-| `openai_responses` | `/v1/models` | `/v1/responses` |
-| `lm_studio_chat_completions` | LM Studio native metadata | `/v1/chat/completions` |
-
-`api_key_env`は任意で、secretそのものではなくAPI keyを保持する環境変数名を保存します。値はrequestごとに
-解決するため、configを書き換えずにkeyをrotateできます。旧`provider_metadata_mode` / `provider_api_mode`と
-対応するenvironment variableは互換入力としてだけ受理し、単一profileへ正規化します。新旧指定が矛盾する
-場合はerrorにし、新しい保存結果には`provider_profile`だけを書きます。失敗後に別generation endpointへfallback
-するとgenerationやtool callを重複させ得るため、runtime fallbackは行いません。
-
-同じ接続をrun、model availability、永続session設定の単一CLI override layerとして指定できます。
-
-```text
-moyai run --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible "このprojectを要約して"
-moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
-moyai session settings <SESSION_ID> --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
-```
-
-認証が必要なserverでは、moyAIを起動するprocess environmentへ例えば`OMLX_API_KEY`を設定した上で、同じcommandへ
-`--api-key-env OMLX_API_KEY`を追加します。指定した変数が未設定または空ならfail closedになります。
-
-`--api-key-env`へ渡すのは環境変数名であり、secretそのものではありません。runとavailabilityではURL、profile、
-API key環境変数名を同じprecedence patchとして適用します。URLまたはprofileを変更した場合、そのpatchで指定して
-いないcredentialと、下位layerのcustom header、custom request bodyを新しい接続へ継承・転送せずに削除します。永続
-`session settings`では、`--provider-profile`に`--base-url`が必要で、`--api-key-env`には両方が必要です。
-異なるendpointへの`--base-url`単独変更は現在のprofileを維持しますが、以前のAPI key参照とcustom headerを転送せずに
-保存します。同じendpointの指定はsame-target editとしてそれらを維持します。CLIにはcustom header/bodyの入力を追加して
-いないため、完全なCLI session接続はcustom headerなしで保存されます。`model availability
---openai-compatible-only`はlegacy互換flagとして残りますが、`--provider-profile`とは同時指定できません。
-
-provider profileはmodel名固有のprompt profileを選択せず、hiddenなlanguage / no-thinking prefixも注入しません。
-tool / image / parallel capabilityは`ModelPolicy`だけが所有します。availabilityはmetadata endpointだけを使う
-明示diagnosticであり、tool/visionの試験generationやcapability configのmutationを行いません。
-current provider contractはserver-side strict tool-schema validationを宣言しません。core / MCP tool schemaのRust型にも
-Chat Completions / Responsesの両wireにも`strict` field自体を持たず、raw argumentsをcanonicalにcommitした後、
-advertise済みschema、exact router name、effect、permission境界をlocalに検証してからdispatchします。LM Studioの
-`strict=true`を無視したという警告はmodel load失敗を意味せず、単一generationの長時間継続を直接説明しません。
-moyAIは設定済みURLを外部HTTP serviceとして扱い、LM Studio processを起動・停止・監督しません。
-providerへの到達、catalogへのmodel登録、model instanceのload状態は別の事実です。LM Studio native metadataの
-`loaded_instances`が非空なら`loaded`、明示的な空配列なら`not loaded`、field自体がなければ`unknown`として扱います。
-OpenAI-compatible catalogだけからload状態を推測せず`unknown`とし、catalog登録をon-demand load済みとはみなしません。
-Tauri Desktopのprovider設定では単一の **Connection type**、base URL、任意のAPI key環境変数名、modelを
-まとめて設定します。別のResponses / Chat selectorは表示しません。
-同じoverlayで`context_window`を、moyAI内のinput accountingとcompactionにだけ使うlocal budgetとして管理できます。
-providerのcontext windowやmodel load設定としては送信しません。出力量とすべてのgeneration parameterはhost側が所有します。
-provider metadataがそれらをdiagnostic情報として返すことはありますが、moyAIはclient request overrideへ変換しません。
-
-`lm_studio`と`openai_responses`はResponses transportを、`openai_compatible`と
-`lm_studio_chat_completions`はChat Completionsを使います。HTTP Responses transportはcompaction checkpointを含むcurrent canonical input全体を毎request送信し、
-`previous_response_id`は送りません。raw reasoning textはassistant contextとして再送・保存せず、
-providerがreasoning summaryを返した場合だけ非永続のruntime-only typed reasoning-summary eventを公開します。
-
-private runtime diagnosticsはrequest IDと`attempt_started` / `request_in_flight` / `headers_received` /
-`first_progress` / `last_progress` / `provider_terminal` phase、attempt、elapsed、sanitized endpoint、raw provider failureを保持します。
-providerがusageを返した正常terminalではprovider報告token usageも保持します。public UIは短いtyped phase/failureだけを表示し、
-request ID、endpoint、elapsed、raw provider code/messageを表示しません。prepared-request diagnosticsは
-logical model message数と、exact HTTP wireのinput item数・serialized body byte数を分けて記録し、body自体は保持しません。
-これはmoyAIが観測したclient transport境界であり、LM Studio processの起動、server側のrequest受理、model instanceの
-load開始を推測するものではありません。`request_in_flight`が長い場合に分かるのは、generation operationがまだ
-response headerへ到達していないことまでです。requestはmessage/tool/schema/imageとexact structural wire byteを
-POST前にbounded validationし、stream開始後もraw byte、event、tool call、argumentの固定上限とrolling SSE inactivityを
-制限します。進捗eventを受信し続けているgenerationに総所要時間だけの上限は設けません。
-明示的なtask-local監査では、`MOYAI_HTTP_REQUEST_CAPTURE_DIR`へabsolute directoryを設定できます。
-HTTP transportは各requestのprepared outbound DTOであるexact serialized JSONと、API mode / endpoint /
-byte count / capture stage / provider request ID metadataを保存します。同じrequest IDでruntimeのattempt /
-terminal phaseと対応付けられますが、capture file単独ではnetwork attemptの開始やprovider受領を証明しません。
-通常sessionはredacted diagnosticsだけを保持します。Unixではcapture directory / fileをowner-onlyの
-`0700` / `0600`へ強制します。WindowsではWindows ACLを継承するため、意図したaccountだけがaccessできる
-directoryを選んでください。captureを明示した場合の書込み失敗は証跡を黙って欠損させずrequest preparationを
-失敗させます。
-
-sampling、thinking、出力量はホスティング側が所有します。moyAIはtemperature、top-p、top-k、penalty、seed、
-stop sequence、reasoning effort / summary、`max_output_tokens` / `max_tokens`、provider固有の追加request bodyを
-送信しません。旧TOML/sessionの該当値は読取互換入力として破棄し、旧environment variableも無視するため、runtime
-policy、admission、diagnostics、設定更新、いずれのprovider wireにも影響しません。LM Studio、oMLX等のhost側で設定します。
-`context_window`はmoyAI local input accountingの容量であり、provider modelのloadや再設定には使いません。
-
-canonical contextではSystem / Developer sectionを論理的に区別したまま保持します。OpenAI-compatible wire境界では
-その順序を保って、Responsesはtop-level `instructions`へ、Chat Completionsは先頭の単一`system` messageへfoldし、
-`developer` wire roleを送りません。
-
-## Runtimeと履歴の継続性
-
-各Turnはmodel/provider target、operation deadline、admission時のpermission presetを含む完全な`ResolvedTurnConfig`を固定し、
-turn/admission identity、model/provider policy、durableなcollaboration-mode instructionを
-immutable `TurnContext`の単一ownerへ一度だけ解決します。partial configを後続stageで再mergeしません。加えてturn開始時の
-wall-clock snapshotを固定します。Step/world-stateをrefreshしても同じsnapshotを使うため、clock tickだけでは
-model-visibleな時刻を変更しません。明示的な`current_time` toolは必要時にfreshな時刻を取得します。session/workspaceは
-`SessionContext`、agent-tree roleはroot-scoped agent contextが所有します。model/provider/deadline/multi-agentと
-`RunConfigSnapshot`はTurn中immutableです。permission decisionだけは例外として各判断直前にdurableなroot-session
-access modeを読み、child agentのrequestにも同じroot ownerを使います。commit済みのroot-only切替はactive Turn内でも
-次のpermission requestから適用しますが、すでに表示中のpending requestとadmit済みeffectは書き換えません。各model requestは現在のworld state、Skills、optionalな
-external tool availabilityを`StepContext`へcaptureし、同じStepからmodel-visible tool schemaと実行routerを
-effect classとともに作ります。toolの広告可否、実行可否、安全分類を別contractにはしません。MCP effectは
-serverごとの明示`tool_routes`だけから解決し、未設定routeは拒否します。
-
-`WorldState`自体はtool名やtool inventoryを列挙せず、environment、instructions、時刻だけを保持します。
-tool availabilityの唯一のownerは`ToolSpecPlan`です。Guardianにも同じtool-inventory-freeなsnapshotと空のtool surfaceを渡し、
-exact action evidenceは別のtyped inputとして渡します。
-
-AutoReview Guardianにはboundedなhuman向けpermission previewとは別にcomplete typed action evidenceを渡します。MCPは
-normalized full arguments、configured target、exact tool name、credential presence、Doclingはexact endpoint、local pathまたは
-source URL、effective format/OCR/image/page options、credential presenceを保持し、secret値は渡しません。redactionやinvalid configにより
-実行effectをcompleteに表せない場合はGuardianもhumanも呼ばずdenyします。Guardian inputはcurrent `WorldState`、active canonical
-historyからbounded samplingしたtask context、current exact committed response/call、同じresponse内のbounded prior tool resultsを含みます。
-tool / continuationを持たず、sampling / thinking overrideを送信しません。hostが返すreasoningはnon-authoritativeな
-transport outputとして受信し、turn開始時にcaptureしたclient-side `model.request_timeout_ms`を
-hostへ送信しないabsolute total deadlineとして使います。
-Guardian transport admissionはconnection profile名ではなくturn-captured canonical
-`ProviderTarget.api_mode`から導出します。current 4 profileのうち`lm_studio` / `openai_responses`は
-Responses、`openai_compatible`（oMLXを含む）/ `lm_studio_chat_completions`はChat Completionsの
-exact tool-less wireを使います。両wireともtools、continuation、sampling、reasoning/output override、
-arbitrary extra bodyを送りません。future unknown wireはGuardian provider接触前にfail closedし、human confirmationや
-承認を求めるmodeへfallbackしません。このserializer/admission contractだけでは個別hostの実互換性をclaimせず、
-oMLXは設定したendpoint/modelに対するactual UATで別途qualificationします。
-
-Desktopのaccess更新はcurrent root sessionとexact runtime epochへ束ねます。同じepochのnatural settlementとして
-`root:N`→`tree:N` / `idle:N`と`tree:N`→`root:N` / `idle:N`を受理し、idleからactiveへの遷移、新しいepoch、別session / workspace /
-config ownerは拒否します。TUIの新規root sessionでは`RunSessionAccessModeAdoption`がpre-admission F8の
-最新値をdurable sessionへCASしてから`SessionStarted`とagent loopへ進みます。human promptがすでにpendingならmode切替は
-そのpromptを変更・清算せず、次のpermission decisionだけへ適用します。
-
-配信済みconversationの正本はcanonical protocol historyです。新規user turnは直接受けます。active-turn steerは
-durable turn-input queueへ先に受理し、安全な次model-request境界で同じstable IDのhistory rowへ移します。次requestがない場合も、
-非Interrupted terminalは終了前に受理済みsteerをhistoryへdrainし、Interrupted terminalは中断を記録して未配信steerをdiscardします。
-assistant message、raw tool call/output、
-collaboration-mode instruction、compaction lineageをtyped itemとして保存します。Rust history envelopeのscope ownerは
-`HistoryScope::Turn { turn_id } | Session`だけです。user / steer、assistant / tool、compaction、active turnへ届くmailは
-Turn scope、collaboration modeと移行済みsession stateはSession scopeとします。新たに受理したidle mailはdurable mailboxで
-pendingのまま保持し、admitted turnが配信するまでcanonical historyとexportには現れません。SQLではCHECK付きの
-`scope_kind`とnullable `turn_id`からenumへ一度だけ組み立てます。session stateのためにTurnIdを発行しません。canonical ToolCallはproviderが返した
-`tool_name`と`arguments_json`の原文を保持し、typed name、JSON parse、schema validationは実行時だけのtransient stateです。
-同じprovider responseのassistant本文と全raw tool callは`ModelResponseId`を共有し、tool実行前に単一DB transactionへ
-commitするため、部分responseだけを残したり、parse失敗時に原文を`Invalid` / `null`へ書き換えたりしません。
-tool resultのtitle / metadata / output / errorはcanonical `ToolOutput`だけが所有し、sidecarはlifecycle、truncation path、
-timestampだけを保持します。commit済みeventはstorage transaction後にpublishし、streaming deltaとreasoning summaryは
-別のruntime-only pathに限定してconversation/runtime rowとして永続化しません。typed turn terminalのdiscriminated
-`outcome`だけが`Completed` / `Interrupted { cause }` / `Failed { error }`を所有し、session status、finish reason、cause、
-表示summaryはそこから導出します。final response identity、counts、metricsも同じterminal valueで渡し、`RunSummary`は
-fieldを再所有せずそのvalueをhandoffします。turnではないcontrol commandの成功から偽terminalを合成しません。
-durable runtime feedbackはtyped severity / category / public messageを一つだけ持ち、live表示、canonical history、turn projection、
-reopen、Markdown exportで同じpayloadを使います。transientな`RuntimeNotice`はliveだけです。Desktopのtool進捗summaryは
-failure/declinedを先に、その後に新しい作業を選び、最大8件・全体2,000文字・1行180文字に制限します。完全なevidenceは
-canonical historyへのjumpまたはMarkdown exportから確認できます。session使用量は全canonical `TurnTerminal` runtime eventから
-再計算し、terminal turn数とusage計測済みturn数を分け、usage欠損を0として表示しません。
-protocol writeはatomicなsession/runtime ownerへ限定します。query/fork用のgeneric protocol surfaceから任意event bundleを
-appendできず、runtime recording sinkもmodel/tool/file/terminal ownerと競合しない明示allow-listだけを受理します。
-TUIはsubmit時にuser/steer rowを先行挿入したりcomposerを先行clearしたりしません。root run / steerのsubmission identityを
-追跡し、durable `UserTurnStored`で新規user rowを投影します。active-turn steerの受理後はtranscript rowではなく
-pending入力として別表示し、delivery後に同じstable IDのcanonical user rowへ置き換えます。draftはsubmission時と同じ
-revisionかつtextのままの場合だけclearし、pre-admission / storage failureやsubmit後の編集では保持してphantom rowを作りません。
-新規root sessionのpre-admission中にF8でmodeを変えた場合はその値をdurable sessionへ確定してから`SessionStarted`とagent loopを
-開始します。human permissionがpending中のF8は既存promptを変えず、commit後の次decisionだけに反映します。
-Prompt Enhanceはrequest IDとcancellation tokenでsingle-flight化し、通信中の`Esc`はraw composerを保持してTUIを継続、
-`Ctrl+Q`はprovider requestとpending reviewをcancelしてから終了します。cancel後の遅延completionはreviewを再表示しません。
-
-durable run admissionはrun identity、turn identity、leaseを同じtransactionで確定し、runだけがsessionを所有してactive turnが
-ない永続中間stateを作りません。全reader / mutationはstatus / run / turn / lease quartetを一つのtyped decoderで検証し、
-partial ID、非正lease、不可能なIdle/Running ownerをfail closedにします。同じtyped storage validatorはsingle-session read、
-list/projection、project/tree gateではsession rowとexact-terminalの件数・payloadを一つのSQL statementから受け取り、
-active-admission writeでは同じtransactionの証拠を受け取ってterminal ownerを検証します。`Running` + terminal、またはterminal status +
-missing/duplicate/status-mismatched exact terminalはcorruptionであり、admission / renewal / release / expired replacementがownerを
-clearして正常化することはありません。同一sessionのTurnIdは一回限りで、canonical history、
-turn item、runtime event、append order、sequence allocatorのどれかに痕跡があれば再admissionを拒否します。project / Agent Tree
-gateは最初のblockerを保持しつつ候補runtime rowを最後までtyped decodeして後続corruptionを隠さず、未知のpersisted access modeも
-`default`へfallbackしません。Stop / recoveryは観測したadmission + turnをopaqueなterminal targetとしてcaptureし、同一ownerの
-lease renewal後も有効ですが、replacement run/turnには作用しません。renewalがterminalを観測した場合は同じtransactionから
-requested turnのexact typed terminalを返し、追跡queryで別turnへ接続しません。
-user-turn bundleと`RunSummary` terminalもadmitted session/turn identityとの一致を必須とします。session rollback、filtered fork、
-expired-run recovery、mailとterminalの競合は、それぞれ単一のstorage/admission境界でatomicに確定します。mail受理時はboundedな
-durable mailboxだけへappendし、canonical historyや本文を持つprocess-local copyは作りません。安全なdeliveryはpending rowを
-deliveredへ変え、同じstable IDのTurn scope history、turn item、runtime eventをatomicに作ります。必須のdirect-child resultは
-deliveryまでowner terminalをblockします。visible final後の通常mailは次turn向けpendingとして残せますが、stop fenceは存続させない
-mailをsettleします。capacity rejectionではmailbox row、history、local wakeのいずれも作りません。
-
-Desktop/TUIはlimit付きcanonical snapshotと同一transaction fenceを使い、whole historyを先に読みません。
-明示Markdown exportだけがbounded pageを順に読み、append fenceを検証します。workspace traversalとruntime deliveryは
-boundedです。受理済みで未sampleのactive steer本文はdurable turn-input queueだけが所有してconversation historyへ
-exportせず、atomic delivery後は通常のuser inputとしてcanonical historyから読みます。process-local wake-upは
-本文もitem identityも持たないcoalesced generation signalで、`wait_agent`は別processの入力を取りこぼさないよう
-durable queueも確認します。harness recording failureはrecordingだけをdisableし、
-user-visible run/eventの結果を上書きしません。
-
-v0.8.0に含まれるV33 migrationはlegacy message graphをdrop前にcanonical protocolへlossless・順序安定でbackfillします。
-V37は欠けたprovider response identityを同一turnのcanonical evidenceから一意に復元できる場合だけraw tool-callへ変換し、
-候補が0件または複数ならupgrade transaction全体をrollbackしてdatabaseを不変に保ちます。曖昧なturnを削除したり、
-未解決用のcurrent payload variantを残したりしません。既存dataをupgradeする前に、moyAI data directoryを
-backupしておくことをおすすめします。続くV38は当時retiredだった`auto_review`値を`default`へ一方向に変換し、
-そのschemaのstorage domainを`default` / `full_access`だけで再構築しました。
-V39は旧terminal JSONをdiscriminated outcomeへ変換し、retired durable retry/delta rowを削除します。未知の文字列から
-interruption causeを発明せずfail closedにします。V40はvalidなflat root→direct-child spawn edgeだけを保持し、nested edgeを
-reparentせず破棄しますが、child session row自体は独立sessionとして保持します。V41はlatest collaboration-mode instructionの
-indexed lookupを導入しました。V42はcanonical historyをtyped Turn/Session scopeへ再構築し、旧mode pseudo-turnと
-terminalを持たない既知projectionだけのmail-only pseudo-turnをappend orderどおりSession scopeへ一方向変換します。
-未知projectionではmigration全体をrollbackします。V43はdurableなtruncation path ownerをpartial index化し、maintenanceの
-exact lookupを保持総数から独立させます。各maintenance tickは全owner/全entryをmaterializeせず、store clone間で共有する
-process-local `ReadDir` cursorを進め、live candidateを両namespace合計64件以内、その集合へのquarantine renameも最大64件に
-保ちます。live/quarantine rootはcanonical data root内のstableなnon-link identityを必須とし、Windowsのjunctionを含む
-reparse pointはfail closedにします。orphan harness
-directoryはrun IDとartifact root、truncation fileはindexed exact pathで照合し、producer fence内では両方をsame-volume
-maintenance quarantineへatomic detachします。破壊操作時に列挙済み文字列pathを再解決せず、Windowsは同じopened entry
-handleとstable destination-directory handle、Unixはno-follow stable dirfdと単一componentの相対operationへrename/deleteを
-束ね、直前のidentity不一致を拒否します。fence解放後は共有`ReadDir` frame stackで継続し、filesystem entry確認とmutation試行を
-合計64/tick以内に保ってrecursive bulk deleteを行いません。current schemaの通常openはboundedな
-schema shapeだけを検証し、full payload auditはmigration cutoverで保持します。
-V44は`protocol_runtime_events`のturn terminalをsession / turnごとのpartial unique indexで一件に固定します。既存duplicateがあれば
-markerを残さずmigration全体をrollbackし、current openではtable、key順序、predicateを検証します。terminal readerも二件目を
-検出してfail closedにするため、indexだけを安全性ownerにしません。
-V45はcurrent session access domainを`default` / `auto_review` / `full_access`の3値へ拡張します。V38ですでに
-`default`へcollapseされた値は本来のDefault選択と識別できないため復元せず、upgrade後に代理で承認を明示選択できます。
-V46は保存済みv1 compaction行について、canonical append orderからboundedな実user anchorを復元できる場合は
-`user_anchored_checkpoint` layoutへ移行します。実user textを復元できない行だけはeffective orderを変えず明示的な
-`legacy_prefix` checkpointとして残します。migrationはJSON、hash、同一session内のreplacement lineage、anchor上限を
-検証し、compaction行だけをbounded pageで書き換え、検証に失敗すればmarkerを残さず全transactionをrollbackします。
-V47がcurrentのspawn-edge schemaです。historicalなV40を通過して残ったflat edgeを保持し、各canonical
-`/root/...` pathとimmediate parentの整合を検証しながら再帰的なSub Agent lineageを許可します。descendantを
-orphanにする削除を拒否し、retained tree全体をroot込み256 agentに制限します。V40が破棄したnested edgeは復元しません。
-V48はdurable OwnerResume requestと、早期成功または回復可能なcrash failureのdeferred completion receiptを
-追加しました。既存の早期成功rowはcompatibilityとしてreadできますが、current runtimeが新規作成するdeferred receiptは
-crash recoveryだけです。V49は明示的に停止したsubtree、cause、root境界をrestart後に復活させないdurableな
-tree-stop fenceを追加します。V50は`NEW_TASK` / `MESSAGE` / `FINAL_ANSWER`をbounded durable mailboxへ移します。
-current child completionはexact direct parentへのqueue-onlyでOwnerResumeを作らず、delivery時に同じmailbox identityをTurn scopeの
-canonical historyへ移します。V51はactive-steer FIFO、pending projection、terminal drain / discard規則、および別processの
-`wait_agent`が使うdurable checkとtimeout直前のfinal recheckを追加します。root、別session source、曖昧なstate、
-exactな後続resolverを欠くterminal deferred stateはfail closedにします。
-V52は各native harness runをexactなcanonical session / turnへ結びます。曖昧、欠損、重複、cross-sessionのbackfillは
-markerや部分mutationを残さずatomicに失敗します。V53は各explicit mailbox wakeからrecipient session、admission、turnへの
-immutable claimを追加し、既存OwnerResumeもexactなclaimed turnへ結びます。Completed / Failed settlementは選択済みwakeだけを
-claimed turnへdeliveryし、Interrupted settlementはそのwakeだけをdiscardし、後続triggerは次のadmission用にpendingのまま
-残します。current openはV53 schemaとこれらのidentityを検証します。
-
-通常のtool surfaceでは、非自明な作業向けに`update_plan`を公開します。そのstructured resultはclientへ
-表示するplan projectionであり、moyAIがplan本文を解釈して次tool、turn終了、compactionを決めることはありません。
-tool surfaceの解除にも使いません。durableなPlan modeは内部に存在し、`update_plan`を保持してmutation toolだけを
-隠しますが、現時点でCLI/TUI/Desktopにmode selectorはありません。
-
-非自明な調査・設計では、共通base instructionsがmodel自身に必要最小限のinternal evidence ledgerを求めます。
-material claimをcurrent owner単位にまとめ、direct consumer / verificationと`missing` / `observed` / `conflicting`を
-区別し、独立readをbatchしてrequired rowへ直接証拠が揃った時点で探索を止め、未解決source factを明示します。
-このledgerはmodelの一時的なworking contextであり、moyAIが保存・解釈するcompletion / quality gateではありません。
-別のrequest Framer、state deltaの自動注入、host-owned coverage / convergence scoreも追加しません。
-
-model policyの90% working targetへ達すると、固定item件数ではなくmodel-visibleなsemantic unitを選びます。
-provider報告total usageがある場合はdurable turn terminalから復元し、そのmodel response後に追加されたlocal itemだけをCodexと同じ粗いUTF-8 bytes/4で加算します。usageがないかresponse境界を照合できない場合だけfull prepared requestのlocal推定へfallbackし、request diagnosticsは使用したsourceを区別します。
-同じprovider responseのassistant、call、settled outputは一単位に保ち、tool responseが未完了の間はcompaction自体を
-開始しません。summary生成はbase instructionsとnativeなUser / Assistant / tool構造を保ち、C8のevidence-grounded checkpoint promptを
-最後のUser inputへ追加し、toolsとprovider cursorを送りません。最初にfull native requestを一回送り、typed
-`context_length_exceeded`の場合だけ最古のprovider-native itemと必要なcall/output対応相手を除いて再試行します。
-semantic map/reduce経路は持ちません。
-`assets/prompts/compaction.md`のexact checkpoint textをcurrent source-level contractとします。runtime validationが
-証明するのは6つの必須見出しが一度ずつ正しい順序で現れ、各bodyが非空であることだけです。native inputに対する
-evidence groundingとsemantic completenessはmodel品質に残り、構造acceptanceはそのどちらも保証しません。
-
-生成したcheckpointは、real User / Steer text inputのうち新しいものからoriginal orderのまま保守的な20,000 token
-以内に保持します。境界の一件は丸ごと捨てず中央を切り詰め、prefix付きsummaryを最後のUser inputにします。古いsummaryを
-anchorへ昇格させません。委譲turnを開始したcanonical `NEW_TASK`はanchorとして保持し、通常のagent messageと
-final handoffはsummaryへ残します。正確なreplacement lineageを
-commitし、元historyは保持します。cancel、空summary、tool call混入、provider failureではhistoryを変更しません。
-非空summaryでも、置換後の推定contextが置換前以上、またはcomplete requestが90% working target未満へ
-戻らない場合はcommitしません。同一turnのautomatic compactionは一度だけ試し、hard limit未満なら元の
-canonical historyで続行し、hard limit到達時は明示的に失敗します。working targetはadvertised context
-windowの90%、Codex型effective full input limitは95%です。追加のconfigured overflow marginはhard limitを
-working targetより後に保てる場合だけ適用します。host側が所有するoutput limitはinput tokenを予約したり、
-どちらのlocal context limitも縮めたりしません。
-
-Activeなsession goalは、任意回数のidle continuation後に成功扱いにはしません。goal state、token/elapsed budget、
-cancellation、typed terminalのいずれかがsemanticな終了条件になるまで継続します。
-
-## Multi-Agent Collaboration
-
-multi-agent collaboration は既定で利用可能で、通常はmodelに `spawn_agent`、`send_message`、
-`followup_task`、`wait_agent`、`interrupt_agent`、`list_agents` の 6 tools を公開します。
-無効化する場合は Settings または config file で `[multi_agent].enabled = false` にします。
-
-- `mode = "explicit_request_only"` では、ユーザーが agent、Sub Agent、委譲、並列 agent 作業を
-  明示的に依頼した場合だけ委譲します。`mode = "proactive"` では、品質または待ち時間の改善に有効な
-  boundedな作業をmodelが判断して委譲できます。
-- `assets/prompts/multi_agent_root.md`と`sub_agent.md`は、Codex source-alignedなrole /
-  message-lifecycle fragmentと、明示的にlabelしたmoyAI local-model coordinationを分離します。後者は
-  direct-tool invocationをmoyAIのflatなtool名へ適応し、委譲、evidence handoff、instruction authorityの
-  safeguardを追加するため、asset全体がCodex promptとbyte-identicalという意味ではありません。proactive assetも
-  Codex activation textをそのまま保ち、その後にCodex delegation guidanceのlocal adaptationをlabelします。
-  high-level planでrootがlocalに処理するimmediate blockerと、concrete / self-containedなparallel sidecarを分け、
-  rootとcoding childのwork scopeを重複させず、rootはnon-overlap workを継続し、critical pathがresultを必要とする時だけ
-  waitして返却patchをreview / integrateします。これらのstatic instructionはruntime gate、固定DAG / stage router、動的な
-  behavior-correction layerを作らず、Codex runtime全体とのparityも主張しません。
-- 全agentは、同じmodel / mode / provider / config filterの下で通常toolと6つのcollaboration toolを保持します。
-  spawn後も親をcollaboration-only surfaceへ移さず、`update_plan`でworkspace toolを解除する必要もありません。
-  resolved modelがtool非対応の場合、requestのtool surfaceを空にし、collaboration tool callを要求するrole / mode
-  messageも注入しません。
-- どのagentも別agentをspawnできます。新しいtask nameはcallerのcanonical pathへ連結されるため、
-  `/root/task1`が`task_3`をspawnすると`/root/task1/task_3`になります。相対agent参照はcurrent agentを
-  基準に解決し、canonicalなabsolute pathでは同じtree内の別agentを指定できます。
-- 各agentは割り当てられた目的と自ら作ったchildの統合を担当し、具体的なbounded subtaskはmodelが
-  current evidenceから選びます。host側にplanner DAGや固定scout/stage routerは置きません。
-- rootはtask-wide plan、child結果の統合、最終verificationを保持します。childはoutcome、material claimを支える
-  evidence、意図的に変更したpath、verification commandと結果、残るunknown / riskを短いhandoffとして返します。
-  rootはそれをworking evidenceとして使い、private調査を再構築しません。最終verificationはdelegated acceptance
-  criteriaと結果のworkspace stateを確認し、欠けた証拠または矛盾だけを追加調査します。
-- descendantの最新のhost-delivered `NEW_TASK`とその後のhost-delivered parent messageは、system / developer /
-  applicable project・skill / user instructionの範囲内でのみdelegated scopeを定義します。parent supplied findings /
-  decisionsはworking contextであり、より上位のinstructionでも独立検証済みfactでもありません。quoted / embeddedな
-  external contentは、system / developer / user instructionが採用しない限りdataのままです。descendantはscope達成に必要なgapだけを
-  inspectし、private groundingを反復せず、上記evidence handoffを返します。
-- `max_concurrent_agents` は root を含む同時 active agent 数の上限です。既定値 `4` では同じtree全体で
-  rootと最大3件のactive descendantを実行できます。内部execution limiterだけがrootを除外し、公開値から
-  3件のdescendant枠を導出します。完了agentは一覧とfollow-up用に保持しますがactive枠を
-  消費しません。retained registryはrootを含むtree全体256件（任意深度のdescendant最大255件）で
-  boundedにし、満杯時はhistoryのevictionやspawn order再利用をせず新しいspawnを拒否します。
-- `max_concurrent_model_requests = 1` により、tree 内の local LLM model request は既定で直列化します。
-  agent は tool 実行や review の前後では独立して進行できます。並列 request を安全に処理できる
-  inference server の場合だけ値を増やしてください。2つのconcurrency上限はretained agent schedulerを
-  最初にloadした時点でcaptureします。後続root turnは同じschedulerとmodel-request semaphoreを再利用し、
-  異なる値はlive treeを書き換えずmodel sampling前に拒否します。上限を変える場合は新しいsessionを
-  開始するか、sessionを新しいprocessで開き直してください。
-- `wait_agent`の既定timeoutは30,000msで、10,000～3,600,000msを指定でき、agent activityまたは
-  active-turn user inputが届けば直ちにreturnします。taskが明示的に必要とする場合は、より長いbounded timeoutを指定できます。
-- 各descendantはimmediate parentとtree rootに結ばれた別のdurable sessionです。通常のproject/session listには
-  implementation 用sessionを表示しません。`spawn_agent` の `fork_turns` は既定の `"all"`、`"none"`、
-  または直近turn数を表す正の整数文字列を選べます。`"all"` ではstable append fence下の親のactive historyを
-  bounded pageとしてstreamし、現在activeなuser turn、正常完了terminalが所有するplainなfinal assistant message、durableな
-  collaboration-mode instruction、active compaction summaryを複製します。そのsummaryが置換したraw historyは
-  復活させず、reasoning、tool traffic、retired control state、permission evidenceは含みません。target sessionの存在を同じtransactionで検証し、fence mismatchまたは途中失敗ではcopy全体をrollbackします。Sub Agent
-  activityはownerとなるroot sessionにfreshなactive turnがある間だけ記録します。
-- live agentは、そのagent executionがcaptureしたconfig、workspace、permission brokerを保持します。
-  spawnはcallerのresourceを継承し、follow-upはexact targetが保持するresourceを使うため、新しいroot turnが
-  実行中の旧childを書き換えることはありません。project / session / workspace navigationで置換するのは
-  viewのworkspace-specific run serviceだけです。process scheduler、session event hub、active Agent Treeは
-  同じownerを保ち、admit済みexecutionは自分のexact run serviceを保持します。process restart後のlineage rehydrateはCodexのresume境界に
-  合わせ、child session columnから部分的なconfigを再構築せず、current root resumeのconfig、workspace、
-  permission brokerを全restored descendantへ渡します。
-- spawn、follow-up、通常message、child完了はcanonical history境界ではtyped Agent itemとCodex型の
-  `NEW_TASK`、`MESSAGE`、`FINAL_ANSWER` envelopeとして保持します。Codex固有の`agent_message`を受けない
-  OpenAI-compatible providerへの最終adapterだけは、envelopeを保ったstandard `user` roleへ変換します。
-  同時に渡すlogical Developer instructionが、このcompatibility表現をsystem / developer / project・skill /
-  original user constraints内のdelegated working contextとして扱わせます。childの`FINAL_ANSWER`は
-  immediate parentへ渡り、親が受け取るのはprivateな調査transcriptではなく短いevidence handoffです。child session、recursive edge、
-  指定したhistory fork、initial `NEW_TASK`は一つのtransactionで作ります。admission前のlaunch failureは
-  exact triggerを`Failed`としてsettleし、immediate parentへのterminal handoffを一度だけatomicに作ります。
-  cancellationは`Interrupted`としてsettleし、成功に見えるhandoffを作りません。follow-upは指定したexact targetだけを
-  起動し、inactiveなancestorを先に起こしません。durableな`trigger_turn` intentとstorageが許可する即時実行可否は
-  別の状態です。readyなinactive targetはpending durable mailboxのappend前にdescendant枠を一件予約し、capacity不足なら
-  mailbox row、canonical history、process-local wakeのいずれも追加しません。active targetへのmailは追加枠を
-  消費しません。
-- Codexのthreadと同様に、rootと各descendantはdescendantのlivenessと独立して自分のterminalを所有します。
-  `Completed`、`Failed`、target-onlyの`AgentInterrupted`はdescendantを待たず、停止もしません。回答がchild結果へ
-  依存する場合、modelがfinal responseの前に`wait_agent`を呼びます。permission Abortは要求元executionだけを
-  停止し、通常のUser Stopはexact current root executionだけを停止します。どちらもsibling / descendantへ
-  cascadeしません。retained tree全体を停止できるのは、別名の明示的なtree-stop操作だけです。
-- child terminalはexact immediate parentに`trigger_turn = false`のdurable `FINAL_ANSWER`を一件だけ作り、
-  rootへbubbleせず、terminal parentを自動再開しません。active parentはsafe mailbox boundaryで受け取れます。
-  current-turn deliveryがeligibleな非Interrupted terminalと競合したmailは、terminal writerが同じtransactionで
-  canonical IAC historyへ記録し、modelを再sampleしません。NextTurn phaseのmailはpendingのまま次のexplicit turnへ
-  渡ります。遅いchild resultが既存parent terminalを書き換えることはありません。
-- historical V48の`completed_early` rowはstorage compatibilityのためread / Stop可能なままですが、currentの通常完了は
-  新規作成しません。current deferred completionは`crash_failed` recoveryだけです。
-- OwnerResume turnのcrashはfailureを上流へ漏らさず同じrequestをrependingします。retryの成功／失敗はcrash receiptを
-  supersedeし、interruptionはdiscardし、連続crashはpending receipt一件をroll forwardします。crashしたownerへのexplicit
-  follow-upはschedule-readyなExplicitTaskとなってOwnerResumeより優先し、OwnerResume sourceを持たないorphan crashにも
-  同じ回復を適用します。そのretryのCompleted / Failedは旧crash receiptをsupersedeし、Interruptedはdiscardします。
-  liveなcurrent OwnerResumeの読取とadmission後projectionは同じmail-delivery fenceを共有し、古いlocal R1をdurableな
-  `None`またはR2へauthoritativeに置換します。OwnerResume claimが参照するturnはrollbackできません。共通startup
-  bootstrapはexactなreadinessを復元し、Agent Tree rehydrate前にcrash recoveryを実行します。
-- continuationを含む各turnは新しい実行controlを持ちます。通常のStopはそのexact active continuationだけを
-  対象とし、過去turnのterminalを開き直さず、detached childも停止しません。別の明示的なtree-stop操作だけが
-  retained treeを閉じ、dormant follow-upをsettleし、deferred owner stateをdiscardするため、後のrestartで
-  明示停止済みworkを復活させません。
-- Desktop は active な activity を本文内のクリック可能なAgentチップとして表示し、terminal後は履歴を
-  1件の集約表示へ畳みます。本文またはOutputの集約表示をクリックすると、current root taskに紐づく
-  Sub Agent専用paneが開き、状態別の一覧、task、current work、result、child session IDとread-only transcriptを確認できます。
-  exact active turn IDを持つRunning childだけに停止操作を表示し、workspace/root/path/child/turnのstaleまたはforged targetは拒否します。
-  child sessionへ画面遷移はせず、狭いwindowでは右側drawerとして表示します。permission promptは要求元agentを
-  表示し、順番に処理します。detached childがactiveであることだけを理由に、新規chat、session、project、
-  workspaceへのnavigationを禁止しません。先のroot terminal後もchildを独立して継続したまま、新しいroot
-  requestを開始できます。DesktopのStopはexact selected root executionを対象とし、tree全体の停止は別名の
-  明示的な破壊操作として扱います。
-- Desktopのsession status、transcript row kind、cancel可否はRustのtyped projectionが所有します。frontendは
-  labelから再推論せず、durable terminalのないturnを完了ではなくincompleteとして表示します。
-- Stop commandはprojectionが渡すworkspace、root session、root run generation、Agent Tree epochをRustへ返します。
-  表示後に別run/treeへ切り替わった古いStopはtyped conflictとして拒否し、新しいrunを停止しません。
-
-## 起動時チェック
-
-`moyai-desktop.exe` の cold start では、moyAI splash を最低 5 秒表示し、local値だけを確認します。
-
-- global config file の状態
-- workspace の状態
-- configured provider のbase URLとmodel値
-- Doclingのenabled設定とbase URL
-
-splashはnetwork応答を待ちません。cold startではprovider catalog、availability、Docling healthのrequestを
-1件も送信しません。local設定が不足している場合はInitial SetupまたはSettingsを表示し、左railの **接続設定** と
-topbarの **Session Settings** を通常の修正導線とします。実接続は明示的な
-model load / diagnosticまたは設定済みserviceを利用する操作でだけ確認します。
-
-## プロジェクトごとの指示
-
-moyAI は repository local の instructions を読み込みます。
-
-- `AGENTS.md`
-- `CLAUDE.md`
-- `.moyai/rules`
-- `.moyai/rules-<route>`
-- `.moyai/commands/*.md`
-- `.moyai/skills/**/SKILL.md`
-
-外部 plugin marketplace に依存せず、プロジェクトごとの運用ルールを repository 内で管理できます。
-discoveryと個別Skill loadは従来のfilesystem上限を維持します。model-visible catalogはsort済み結果のdeterministicな
-complete-entry prefixで、最大64件・16KiBです。diagnosticsはincluded/omitted件数を示し、oversized entryを途中で切って
-不完全なinstructionとして渡しません。
-
-## 検証
-
-手元でよく使う check は次のとおりです。
+変更内容に応じて次の検証を選びます。
 
 ```bash
 cargo fmt --all -- --check
 cargo check --all-features
 cargo test -- --test-threads=1
 npm run test:desktop-web
-npm run build:desktop-web
+npm run verify:gui -- --suite smoke
 ```
 
-Desktop interaction を変更した場合は、実際の Tauri window を操作し、screenshot evidence を `../project_sandbox/<task>/` に保存します。build と startup だけでは UI behavior の証明にしません。
+Windowsのnative sandbox試験には、明示的に起動承認したhelper testhostが必要です。対応するlibtestのビルドと実行は[Windows sandbox試験ガイド](docs/testing-windows-sandbox.md)に従ってください。
 
-公開する release package は、upload 前に visible Desktop GUI の manual ST を gate として通します。
-結果は `Manual ST Gate: PASS` を含む UTF-8 Markdown artifact に記録し、
-`scripts/package-release.ps1 -ManualGuiStResultsPath ...` に渡してください。この artifact は
-release zip の `docs/release/manual-gui-st-results.md` に同梱されます。
+[GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-## 開発状況
+RCの元となる実装で、Manual ST Case1〜7と復元試験を実施しました。最新の仮想WinA/WinBでは、固定応答・実LLMの両方で実行・成果受渡し・終了処理の自動確認に通っています。組合せはHub 0.1.0（`f437c4fe0191e69f0ff7f0affa16eb191db305f3`）で、同じWindows PC上の試験です。生成コードの評価NGとSide Chat回答の精度不足は記録を保持しており、試験の実施完了を全回答の合格とは扱いません。配布物の最終受入は各artifactの結果へ記録します。新規PCへの導入、物理別PC・LAN・Firewallの確認は、このRCでは未確認です。
 
-moyAI は現在、主に Windows で開発・検証しています。prompt、compaction、agent loopは、LM Studioで
-ホストした`qwen/qwen3.6-27b`を主な最適化・挙動検証対象としており、配布するdefault / example modelも
-同modelです。既存のuser configは引き続き正となり、製品defaultの変更によって書き換えません。
-
-OpenAI 互換 model であれば他の model も利用できますが、tool-use quality、context length、vision support、応答速度は provider / model によって変わります。
+公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 
 ## License
 
-The moyAI application and source code are licensed under the MIT License.
-
-Copyright (c) 2026 Hideyoshi Takahashi.
-
-`midi-ai-labs` is the GitHub organization / project namespace for this personal project.
-
-See [LICENSE](LICENSE) for the full license text.
+[MIT](LICENSE)。Copyright (c) 2026 Hideyoshi Takahashi。`midi-ai-labs` は本個人プロジェクトのGitHub namespaceです。

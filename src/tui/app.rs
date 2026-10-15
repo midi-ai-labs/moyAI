@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,7 @@ use crate::app::{
     AgentActivityRecord, App, AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest,
     RunConfigInput, RunRequest, RunSessionAccessModeAdoption, SessionSteerRequest,
 };
+use crate::cli::terminal::tool_output_display_text;
 use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
     SharedConfirmationPrompt, TuiArgs,
@@ -3531,7 +3533,16 @@ fn entry_to_lines(entry: &TranscriptEntry) -> Vec<Line<'static>> {
         format!("[{}]", entry.title),
         title_style,
     ))];
-    push_multiline_text(&mut lines, &entry.body);
+    let display_body = if entry.tool_call_id.is_some()
+        && matches!(
+            entry.kind,
+            TranscriptKind::Tool | TranscriptKind::Editing | TranscriptKind::Error
+        ) {
+        tool_output_display_text(&entry.body)
+    } else {
+        Cow::Borrowed(entry.body.as_str())
+    };
+    push_multiline_text(&mut lines, &display_body);
     lines.push(Line::from(""));
     lines
 }
@@ -3568,10 +3579,10 @@ fn pending_turn_input_lines(
 fn tool_to_lines(tool: &super::state::ToolStatusView) -> Vec<Line<'static>> {
     let mut body = vec![Line::from(format!("{} {:?}", tool.title, tool.status))];
     if let Some(summary) = &tool.summary {
-        push_multiline_text(&mut body, summary);
+        push_multiline_text(&mut body, &tool_output_display_text(summary));
     }
     if let Some(error) = &tool.error {
-        push_multiline_text(&mut body, error);
+        push_multiline_text(&mut body, &tool_output_display_text(error));
     }
     body.push(Line::from(""));
     body
@@ -3715,24 +3726,17 @@ fn wrap_textarea_for_display(textarea: &TextArea<'_>, width: usize) -> WrappedTe
         let mut current = String::new();
         let mut current_width = 0usize;
         for (char_idx, ch) in chars.iter().copied().enumerate() {
-            if row_idx == cursor.0 && cursor.1 == char_idx && !cursor_set {
-                cursor_row = lines.len();
-                cursor_col = current_width;
-                cursor_set = true;
-            }
-
             let char_width = display_char_width(ch);
             if current_width > 0 && current_width + char_width > width {
                 lines.push(Line::from(current.clone()));
                 current.clear();
                 current_width = 0;
-                if row_idx == cursor.0 && cursor.1 == char_idx && !cursor_set {
-                    cursor_row = lines.len();
-                    cursor_col = 0;
-                    cursor_set = true;
-                }
             }
-
+            if row_idx == cursor.0 && cursor.1 == char_idx && !cursor_set {
+                cursor_row = lines.len();
+                cursor_col = current_width;
+                cursor_set = true;
+            }
             current.push(ch);
             current_width += char_width;
         }
@@ -3838,6 +3842,56 @@ mod key_tests {
     use camino::Utf8PathBuf;
 
     use super::*;
+
+    #[test]
+    fn tool_output_display_tui_uses_tool_provenance_and_preserves_raw_entries() {
+        use crate::session::{ToolCallId, ToolCallStatus};
+        use crate::tool::ToolName;
+
+        let raw = "\x1b[31;1m日本語の出力\x1b[0m\r\n次の行";
+        for (kind, tool_call_id, stripped) in [
+            (TranscriptKind::Error, Some(ToolCallId::new()), true),
+            (TranscriptKind::Tool, Some(ToolCallId::new()), true),
+            (TranscriptKind::Editing, Some(ToolCallId::new()), true),
+            (TranscriptKind::Error, None, false),
+            (TranscriptKind::Tool, None, false),
+            (TranscriptKind::User, Some(ToolCallId::new()), false),
+            (TranscriptKind::Assistant, Some(ToolCallId::new()), false),
+            (TranscriptKind::Diff, Some(ToolCallId::new()), false),
+        ] {
+            let entry = TranscriptEntry {
+                kind,
+                title: "display".to_string(),
+                body: raw.to_string(),
+                response_id: None,
+                tool_call_id,
+            };
+            let lines = entry_to_lines(&entry);
+            assert_eq!(
+                lines[1].to_string(),
+                if stripped {
+                    "日本語の出力"
+                } else {
+                    "\x1b[31;1m日本語の出力\x1b[0m"
+                }
+            );
+            assert_eq!(lines[2].to_string(), "次の行");
+            assert_eq!(entry.body, raw);
+        }
+        let tool = super::super::state::ToolStatusView {
+            tool_call_id: ToolCallId::new(),
+            tool: ToolName::Shell,
+            title: "inspect".to_string(),
+            status: ToolCallStatus::Failed,
+            summary: Some("\x1b[32mstdout\x1b[0m".to_string()),
+            error: Some(raw.to_string()),
+        };
+        let lines = tool_to_lines(&tool);
+        assert_eq!(lines[1].to_string(), "stdout");
+        assert_eq!(lines[2].to_string(), "日本語の出力");
+        assert_eq!(tool.error.as_deref(), Some(raw));
+        assert_eq!(tool.status, ToolCallStatus::Failed);
+    }
 
     async fn tui_controller_with_session(
         test_name: &str,
@@ -6604,6 +6658,17 @@ mod key_tests {
                 "disable_raw"
             ]
         );
+    }
+
+    #[test]
+    fn wrapped_composer_cursor_follows_the_character_onto_its_display_row() {
+        for (text, column, width) in [("abcdef", 4, 4), ("abc界z", 3, 4)] {
+            let mut textarea = TextArea::from(vec![text.to_string()]);
+            textarea.move_cursor(tui_textarea::CursorMove::Jump(0, column));
+            let wrapped = wrap_textarea_for_display(&textarea, width);
+            assert_eq!((wrapped.cursor_row, wrapped.cursor_col), (1, 0));
+            assert_eq!(wrapped.lines.len(), 2);
+        }
     }
 
     #[test]

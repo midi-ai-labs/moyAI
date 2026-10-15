@@ -398,7 +398,9 @@ fn parse_skill_manifest(path: &Utf8Path, text: &str) -> (String, String) {
 }
 
 fn extract_frontmatter(text: &str) -> Option<&str> {
-    let stripped = text.strip_prefix("---\n")?;
+    let stripped = text
+        .strip_prefix("---\r\n")
+        .or_else(|| text.strip_prefix("---\n"))?;
     let end = stripped.find("\n---")?;
     Some(&stripped[..end])
 }
@@ -450,6 +452,37 @@ fn sample_related_files(base_dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_and_load_preserve_manifest_metadata_with_lf_and_crlf() {
+        for newline in ["\n", "\r\n"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+            let skill_root = root.join("skills");
+            std::fs::create_dir(&skill_root).expect("skill root");
+            let manifest_path = skill_root.join(SKILL_FILE_NAME);
+            let content = "---\nname: declared-name\ndescription: declared description\n---\n# Different heading\nSkill instructions.\n"
+                .replace('\n', newline);
+            std::fs::write(&manifest_path, &content).expect("write manifest");
+            let roots = vec![skill_root];
+            let skills = discover_from_roots(&root, &roots);
+            assert_eq!(skills.len(), 1);
+            assert_eq!(skills[0].name, "declared-name", "newline: {newline:?}");
+            assert_eq!(skills[0].description, "declared description");
+            let loaded = load_from_snapshot(
+                SkillsSnapshot {
+                    workspace_root: root,
+                    roots,
+                    skills,
+                },
+                "declared-name",
+            )
+            .expect("load discovered skill")
+            .expect("skill found by declared name");
+            assert_eq!(loaded.content, content);
+            assert_eq!(loaded.manifest.description, "declared description");
+        }
+    }
 
     fn snapshot_for_manifest(root: &Utf8Path, manifest_path: &Utf8Path) -> SkillsSnapshot {
         SkillsSnapshot {

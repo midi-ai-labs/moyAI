@@ -7,6 +7,30 @@ use crate::tool::executable::ResolvedExecutable;
 use crate::tool::os_sandbox::WorkspaceWriteSandboxProfile;
 use crate::tool::truncate::BoundedPipeOutput;
 
+pub(crate) const WORKSPACE_WRITE_PLATFORM_SUPPORTED: bool = cfg!(windows);
+pub(crate) const ADVISORY_PROXY_VARIABLES: [&str; 3] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+pub(crate) const ADVISORY_OFFLINE_PROXY: &str = "http://127.0.0.1:9";
+pub(crate) const ADVISORY_PROXY_BYPASS: &str = "";
+pub(crate) const EFFECT_TEMP_VARIABLES: [&str; 3] = ["TEMP", "TMP", "TMPDIR"];
+
+#[cfg(any(windows, test))]
+fn apply_advisory_offline_environment(environment: &mut HashMap<String, String>) {
+    for key in ADVISORY_PROXY_VARIABLES {
+        environment.insert(key.to_string(), ADVISORY_OFFLINE_PROXY.to_string());
+    }
+    for (key, value) in [
+        ("SBX_NONET_ACTIVE", "1"),
+        ("NO_PROXY", ADVISORY_PROXY_BYPASS),
+        ("PIP_NO_INDEX", "1"),
+        ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+        ("NPM_CONFIG_OFFLINE", "true"),
+        ("CARGO_NET_OFFLINE", "true"),
+        ("GIT_ALLOW_PROTOCOL", ""),
+    ] {
+        environment.insert(key.to_string(), value.to_string());
+    }
+}
+
 pub(crate) fn captured_process_environment(
     shell: &crate::config::ShellConfig,
 ) -> HashMap<String, String> {
@@ -26,13 +50,13 @@ pub(crate) struct SandboxedProcessRequest {
     pub cwd: Utf8PathBuf,
     pub environment: HashMap<String, String>,
     pub stdin: Vec<u8>,
-    pub timeout_ms: u64,
+    pub timeout_ms: Option<u64>,
     pub max_output_bytes: usize,
     pub hide_window: bool,
     pub cancel: CancellationToken,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SandboxedProcessOutput {
     pub exit_code: Option<i32>,
     pub stdout: BoundedPipeOutput,
@@ -50,7 +74,7 @@ impl SandboxedProcessOutput {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum SandboxExecutionError {
     #[cfg(not(windows))]
     #[error("OS sandbox is unavailable on this platform")]
@@ -71,7 +95,17 @@ pub enum SandboxExecutionError {
 
 pub(crate) async fn execute_workspace_write(
     profile: WorkspaceWriteSandboxProfile,
+    request: SandboxedProcessRequest,
+) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
+    execute_workspace_write_observed(profile, request, None).await
+}
+
+pub(crate) type ProcessStarted = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
+
+pub(crate) async fn execute_workspace_write_observed(
+    profile: WorkspaceWriteSandboxProfile,
     mut request: SandboxedProcessRequest,
+    started: Option<ProcessStarted>,
 ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
     let Some(program) = request.argv.first_mut() else {
         return Err(SandboxExecutionError::InvalidProfile(
@@ -81,19 +115,32 @@ pub(crate) async fn execute_workspace_write(
     *program = request.executable.path().to_string();
     #[cfg(windows)]
     {
-        return tokio::task::spawn_blocking(move || windows::execute(profile, request))
-            .await
-            .map_err(|error| SandboxExecutionError::Worker(error.to_string()))?;
+        return tokio::task::spawn_blocking(move || {
+            crate::sandbox_broker::execute(profile, request, started)
+        })
+        .await
+        .map_err(|error| SandboxExecutionError::Worker(error.to_string()))?;
     }
     #[cfg(not(windows))]
     {
-        let _ = (profile, request);
+        let _ = (profile, request, started);
         Err(SandboxExecutionError::UnsupportedPlatform)
     }
 }
 
 #[cfg(windows)]
+pub(crate) fn execute_brokered(
+    profile: WorkspaceWriteSandboxProfile,
+    request: SandboxedProcessRequest,
+    started: Option<ProcessStarted>,
+    caller: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
+    windows::brokered::execute(profile, request, started, caller)
+}
+
+#[cfg(windows)]
 mod windows {
+    pub(super) mod brokered;
     use std::ffi::{OsStr, c_void};
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
@@ -105,8 +152,8 @@ mod windows {
     use sha2::{Digest, Sha256};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-        HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree, SetHandleInformation, WAIT_FAILED,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        HLOCAL, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SET_ACCESS,
@@ -114,14 +161,11 @@ mod windows {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        AclSizeInformation, AdjustTokenPrivileges, CopySid, CreateRestrictedToken,
-        CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor, IsTokenRestricted,
-        IsValidSid, LookupPrivilegeValueW, PROTECTED_DACL_SECURITY_INFORMATION,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetSecurityDescriptorDacl,
-        SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
-        TokenDefaultDacl, TokenGroups, TokenRestrictedSids, TokenUser,
+        AclSizeInformation, CopySid, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid,
+        GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
+        IsValidSid, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        SID_AND_ATTRIBUTES, SetSecurityDescriptorDacl, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
+        TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_APPEND_DATA,
@@ -154,17 +198,14 @@ mod windows {
     };
 
     use super::{
-        SandboxExecutionError, SandboxedProcessOutput, SandboxedProcessRequest,
-        WorkspaceWriteSandboxProfile,
+        EFFECT_TEMP_VARIABLES, SandboxExecutionError, SandboxedProcessOutput,
+        SandboxedProcessRequest, WorkspaceWriteSandboxProfile, apply_advisory_offline_environment,
     };
     use crate::tool::os_sandbox::{
         MAX_PINNED_PROTECTED_FILE_BYTES, SandboxPathSnapshot, WindowsSandboxObjectIdentity,
     };
     use crate::tool::truncate::BoundedPipeOutput;
 
-    const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
-    const LUA_TOKEN: u32 = 0x04;
-    const WRITE_RESTRICTED: u32 = 0x08;
     const WIN_WORLD_SID: i32 = 1;
     const WIN_LOCAL_SYSTEM_SID: i32 = 22;
     const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
@@ -186,11 +227,6 @@ mod windows {
     const WORKER_DRAIN_GRACE: Duration = Duration::from_millis(250);
     const WORKER_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
     const EFFECT_TEMP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
-
-    #[repr(C)]
-    struct TokenDefaultDaclInfo {
-        default_dacl: *mut ACL,
-    }
 
     struct ProcessObjectSecurity {
         descriptor: SECURITY_DESCRIPTOR,
@@ -388,69 +424,6 @@ mod windows {
         }
     }
 
-    pub(super) fn execute(
-        mut profile: WorkspaceWriteSandboxProfile,
-        mut request: SandboxedProcessRequest,
-    ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
-        if request.argv.is_empty() || request.argv[0].trim().is_empty() {
-            return Err(SandboxExecutionError::InvalidProfile(
-                "sandbox command argv must not be empty".to_string(),
-            ));
-        }
-        if request.cancel.is_cancelled() {
-            return Ok(SandboxedProcessOutput {
-                exit_code: None,
-                stdout: empty_output(),
-                stderr: empty_output(),
-                timed_out: false,
-                cancelled: true,
-                effect_started: false,
-                process_tree_reaped: true,
-                cleanup_errors: Vec::new(),
-            });
-        }
-
-        apply_advisory_offline_environment(&mut request.environment);
-        let effect_temp = create_effect_local_temp(&mut profile, &mut request.environment)?;
-        let (effect_temp, output) = run_with_effect_temp_panic_boundary(effect_temp, move |_| {
-            execute_after_effect_temp(profile, request)
-        })?;
-        let finalization = effect_temp_finalization_for_result(&output);
-        let cleanup_errors = finalize_effect_local_temp(effect_temp, finalization);
-        match output {
-            Ok(mut output) => {
-                output.cleanup_errors.extend(cleanup_errors);
-                Ok(output)
-            }
-            Err(error) => Err(with_cleanup_errors(error, cleanup_errors)),
-        }
-    }
-
-    fn execute_after_effect_temp(
-        profile: WorkspaceWriteSandboxProfile,
-        request: SandboxedProcessRequest,
-    ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
-        if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new(), true));
-        }
-        let prepared = prepare_capabilities_and_acls(
-            &profile,
-            &request.cwd,
-            &request.environment,
-            &request.cancel,
-        )?;
-        if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new(), true));
-        }
-        let token = create_workspace_write_token(&prepared.roots)?;
-        if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new(), true));
-        }
-        let output = spawn_and_capture(token, request);
-        drop(prepared);
-        output
-    }
-
     #[derive(Debug)]
     struct EffectLocalTempDirectory {
         path: std::path::PathBuf,
@@ -534,11 +507,11 @@ mod windows {
                     )));
                 }
                 environment.retain(|key, _| {
-                    !["TEMP", "TMP", "TMPDIR"]
+                    !EFFECT_TEMP_VARIABLES
                         .iter()
                         .any(|candidate| key.eq_ignore_ascii_case(candidate))
                 });
-                for key in ["TEMP", "TMP", "TMPDIR"] {
+                for key in EFFECT_TEMP_VARIABLES {
                     environment.insert(key.to_string(), path.to_string());
                 }
                 Ok(())
@@ -555,11 +528,25 @@ mod windows {
 
     fn close_effect_local_temp(directory: EffectLocalTempDirectory) -> Vec<String> {
         let path = directory.path().to_path_buf();
+        // An impersonation token is thread-local. Explicitly carry it into the
+        // bounded worker rather than deleting caller paths with broker SYSTEM.
+        let cleanup_token = match open_effective_cleanup_token() {
+            Ok(token) => token,
+            Err(error) => {
+                return vec![format!(
+                    "effect TEMP `{}` retained: {error}",
+                    path.display()
+                )];
+            }
+        };
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         if let Err(error) = std::thread::Builder::new()
             .name("moyai-effect-temp-cleanup".to_string())
             .spawn(move || {
-                let _ = sender.send(directory.remove());
+                let result = crate::sandbox_broker::with_impersonation(cleanup_token.raw(), || {
+                    directory.remove().map_err(|error| error.to_string())
+                });
+                let _ = sender.send(result);
             })
         {
             return vec![format!(
@@ -612,6 +599,7 @@ mod windows {
         }
     }
 
+    #[cfg(test)]
     fn finalize_effect_local_temp(
         directory: EffectLocalTempDirectory,
         finalization: EffectTempFinalization,
@@ -1022,7 +1010,7 @@ mod windows {
         handle: HANDLE,
         path: &camino::Utf8Path,
     ) -> Result<(), SandboxExecutionError> {
-        let token = open_current_process_token()?;
+        let token = open_effective_query_token()?;
         let mut logon = token_logon_sid(token.raw())?;
         let mut world = world_sid()?;
         let shared_restricting_sids = [
@@ -1071,9 +1059,9 @@ mod windows {
             )));
         }
 
+        // FILE_GENERIC_WRITE also contains read-only READ_CONTROL/SYNCHRONIZE bits.
         let unsafe_mask = GENERIC_ALL
             | GENERIC_WRITE_MASK
-            | FILE_GENERIC_WRITE
             | FILE_WRITE_DATA
             | FILE_APPEND_DATA
             | FILE_WRITE_EA
@@ -1141,12 +1129,15 @@ mod windows {
         {
             return false;
         }
-        let write_mask = FILE_GENERIC_WRITE
+        // Test only mutating rights, including rights that can widen the DACL.
+        let write_mask = GENERIC_ALL
+            | GENERIC_WRITE_MASK
             | FILE_WRITE_DATA
             | FILE_APPEND_DATA
             | FILE_WRITE_EA
             | FILE_WRITE_ATTRIBUTES
-            | GENERIC_WRITE_MASK
+            | WRITE_DAC
+            | WRITE_OWNER
             | DELETE
             | 0x0000_0040;
         for index in 0..info.AceCount {
@@ -1193,7 +1184,7 @@ mod windows {
         path: &camino::Utf8Path,
         capability_sid: *mut c_void,
     ) -> Result<(), SandboxExecutionError> {
-        let token = open_current_process_token()?;
+        let token = open_effective_query_token()?;
         let mut user_sid = token_user_sid(token.raw())?;
         let mut system_sid = system_sid()?;
         let trustees = [
@@ -1712,96 +1703,13 @@ mod windows {
             .to_lowercase()
     }
 
-    fn create_workspace_write_token(
-        roots: &[RootCapability],
-    ) -> Result<OwnedHandle, SandboxExecutionError> {
-        let base = open_current_process_token()?;
-        let mut user_sid = token_user_sid(base.raw())?;
-        let mut logon_sid = token_logon_sid(base.raw())?;
-        let mut world_sid = world_sid()?;
-        let mut system_sid = system_sid()?;
-        let private_sid = LocalSid::from_string(&sandbox_process_private_sid())?;
-        // The logon and Everyone SIDs are required by native process, desktop,
-        // and CLR initialization. Before this token is created, the sandbox
-        // preflight applies active-capability deny ACEs to detected
-        // Everyone-writable locations outside the configured roots.
-        let mut entries = Vec::with_capacity(roots.len() + 3);
-        for root in roots {
-            entries.push(SID_AND_ATTRIBUTES {
-                Sid: root.sid.raw(),
-                Attributes: 0,
-            });
-        }
-        entries.push(SID_AND_ATTRIBUTES {
-            Sid: logon_sid.as_mut_ptr().cast(),
-            Attributes: 0,
-        });
-        entries.push(SID_AND_ATTRIBUTES {
-            Sid: world_sid.as_mut_ptr().cast(),
-            Attributes: 0,
-        });
-        entries.push(SID_AND_ATTRIBUTES {
-            Sid: private_sid.raw(),
-            Attributes: 0,
-        });
-        let mut restricted = null_mut();
-        if unsafe {
-            CreateRestrictedToken(
-                base.raw(),
-                DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
-                0,
-                null(),
-                0,
-                null(),
-                entries.len() as u32,
-                entries.as_mut_ptr(),
-                &mut restricted,
-            )
-        } == 0
-        {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "CreateRestrictedToken failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let token = OwnedHandle::new(restricted, "CreateRestrictedToken")?;
-        if unsafe { IsTokenRestricted(token.raw()) } == 0 {
-            return Err(SandboxExecutionError::Initialization(
-                "CreateRestrictedToken returned an unrestricted token".to_string(),
-            ));
-        }
-        if !token_has_restricted_sid(token.raw(), private_sid.raw())? {
-            return Err(SandboxExecutionError::Initialization(
-                "restricted token dropped the process-private restricting SID".to_string(),
-            ));
-        }
-        // The token's default DACL becomes the default security descriptor for
-        // process/thread and other kernel objects created by the child. Never
-        // grant it to World, the logon SID, or reusable root/TEMP capabilities:
-        // another restricted child could otherwise open/inject into this one.
-        // The normal access-check pass uses the current user/SYSTEM; the
-        // restricted pass uses a fresh process-private restricting SID.
-        let default_dacl_sids = vec![
-            user_sid.as_mut_ptr().cast(),
-            system_sid.as_mut_ptr().cast(),
-            private_sid.raw(),
-        ];
-        set_token_default_dacl(token.raw(), &default_dacl_sids)?;
-        enable_change_notify_privilege(token.raw())?;
-        Ok(token)
-    }
-
+    #[cfg(test)]
     fn open_current_process_token() -> Result<OwnedHandle, SandboxExecutionError> {
         #[link(name = "advapi32")]
         unsafe extern "system" {
             fn OpenProcessToken(process: HANDLE, desired_access: u32, token: *mut HANDLE) -> i32;
         }
-        let desired = TOKEN_DUPLICATE
-            | TOKEN_QUERY
-            | TOKEN_ASSIGN_PRIMARY
-            | TOKEN_ADJUST_DEFAULT
-            | TOKEN_ADJUST_SESSIONID
-            | TOKEN_ADJUST_PRIVILEGES;
+        let desired = TOKEN_QUERY;
         let mut token = null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), desired, &mut token) } == 0 {
             return Err(SandboxExecutionError::Initialization(format!(
@@ -1810,6 +1718,76 @@ mod windows {
             )));
         }
         OwnedHandle::new(token, "OpenProcessToken")
+    }
+
+    fn open_effective_query_token() -> Result<OwnedHandle, SandboxExecutionError> {
+        let mut raw = null_mut();
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenThreadToken(
+                windows_sys::Win32::System::Threading::GetCurrentThread(),
+                TOKEN_QUERY,
+                1,
+                &mut raw,
+            )
+        } != 0
+        {
+            return OwnedHandle::new(raw, "effective thread token");
+        }
+        if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_NO_TOKEN {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenThreadToken failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY,
+                &mut raw,
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenProcessToken failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        OwnedHandle::new(raw, "effective process token")
+    }
+
+    fn open_effective_cleanup_token() -> Result<OwnedHandle, SandboxExecutionError> {
+        let mut raw = null_mut();
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenThreadToken(
+                windows_sys::Win32::System::Threading::GetCurrentThread(),
+                TOKEN_QUERY | windows_sys::Win32::Security::TOKEN_IMPERSONATE,
+                1,
+                &mut raw,
+            )
+        } != 0
+        {
+            return OwnedHandle::new(raw, "effect TEMP cleanup thread token");
+        }
+        if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_NO_TOKEN {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenThreadToken for TEMP cleanup failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if unsafe {
+            windows_sys::Win32::System::Threading::OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut raw,
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "OpenProcessToken for TEMP cleanup failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        OwnedHandle::new(raw, "effect TEMP cleanup process token")
     }
 
     fn token_logon_sid(token: HANDLE) -> Result<Vec<u8>, SandboxExecutionError> {
@@ -1853,50 +1831,6 @@ mod windows {
         Err(SandboxExecutionError::Initialization(
             "current token has no logon SID".to_string(),
         ))
-    }
-
-    fn token_has_restricted_sid(
-        token: HANDLE,
-        expected: *mut c_void,
-    ) -> Result<bool, SandboxExecutionError> {
-        let mut needed = 0u32;
-        unsafe {
-            GetTokenInformation(token, TokenRestrictedSids, null_mut(), 0, &mut needed);
-        }
-        if needed == 0 {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "failed to size restricted SID list: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let mut buffer = vec![0u8; needed as usize];
-        if unsafe {
-            GetTokenInformation(
-                token,
-                TokenRestrictedSids,
-                buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        } == 0
-        {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "failed to read restricted SID list: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let group_count = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>()) };
-        let after_count = unsafe { buffer.as_ptr().add(size_of::<u32>()) } as usize;
-        let alignment = std::mem::align_of::<SID_AND_ATTRIBUTES>();
-        let groups =
-            ((after_count + alignment - 1) & !(alignment - 1)) as *const SID_AND_ATTRIBUTES;
-        for index in 0..group_count as usize {
-            let entry = unsafe { std::ptr::read_unaligned(groups.add(index)) };
-            if unsafe { EqualSid(entry.Sid, expected) } != 0 {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn token_user_sid(token: HANDLE) -> Result<Vec<u8>, SandboxExecutionError> {
@@ -1988,94 +1922,12 @@ mod windows {
         Ok(bytes)
     }
 
-    fn set_token_default_dacl(
-        token: HANDLE,
-        sids: &[*mut c_void],
-    ) -> Result<(), SandboxExecutionError> {
-        let entries = sids
-            .iter()
-            .map(|sid| EXPLICIT_ACCESS_W {
-                grfAccessPermissions: GENERIC_ALL,
-                grfAccessMode: GRANT_ACCESS,
-                grfInheritance: 0,
-                Trustee: TRUSTEE_W {
-                    pMultipleTrustee: null_mut(),
-                    MultipleTrusteeOperation: 0,
-                    TrusteeForm: TRUSTEE_IS_SID,
-                    TrusteeType: TRUSTEE_IS_UNKNOWN,
-                    ptstrName: (*sid).cast(),
-                },
-            })
-            .collect::<Vec<_>>();
-        let mut dacl = null_mut();
-        let status = unsafe {
-            SetEntriesInAclW(
-                entries.len() as u32,
-                entries.as_ptr(),
-                null_mut(),
-                &mut dacl,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "failed to build restricted-token default DACL with {status}"
-            )));
-        }
-        let dacl = LocalAcl(dacl);
-        let mut info = TokenDefaultDaclInfo {
-            default_dacl: dacl.0,
-        };
-        if unsafe {
-            SetTokenInformation(
-                token,
-                TokenDefaultDacl,
-                (&mut info as *mut TokenDefaultDaclInfo).cast(),
-                size_of::<TokenDefaultDaclInfo>() as u32,
-            )
-        } == 0
-        {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "SetTokenInformation(TokenDefaultDacl) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
-    fn enable_change_notify_privilege(token: HANDLE) -> Result<(), SandboxExecutionError> {
-        let mut luid = LUID {
-            LowPart: 0,
-            HighPart: 0,
-        };
-        let name = to_wide("SeChangeNotifyPrivilege");
-        if unsafe { LookupPrivilegeValueW(null(), name.as_ptr(), &mut luid) } == 0 {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "LookupPrivilegeValueW failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let mut privileges: TOKEN_PRIVILEGES = unsafe { zeroed() };
-        privileges.PrivilegeCount = 1;
-        privileges.Privileges[0].Luid = luid;
-        privileges.Privileges[0].Attributes = 0x0000_0002;
-        if unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, null_mut(), null_mut()) } == 0 {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "AdjustTokenPrivileges failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if unsafe { GetLastError() } != ERROR_SUCCESS {
-            return Err(SandboxExecutionError::Initialization(format!(
-                "restricted token could not enable SeChangeNotifyPrivilege: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
     fn spawn_and_capture(
-        token: OwnedHandle,
+        token: HANDLE,
         request: SandboxedProcessRequest,
+        started: Option<super::ProcessStarted>,
+        desktop_name: &str,
+        caller: HANDLE,
     ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
         let (child_stdin, parent_stdin) = create_pipe_pair("stdin")?;
         let (parent_stdout, child_stdout) = create_pipe_pair("stdout")?;
@@ -2095,7 +1947,7 @@ mod windows {
         startup.StartupInfo.hStdInput = child_stdin.raw();
         startup.StartupInfo.hStdOutput = child_stdout.raw();
         startup.StartupInfo.hStdError = child_stderr.raw();
-        let mut desktop = to_wide("Winsta0\\Default");
+        let mut desktop = to_wide(desktop_name);
         startup.StartupInfo.lpDesktop = desktop.as_mut_ptr();
         startup.lpAttributeList = attributes.raw().cast();
 
@@ -2116,14 +1968,16 @@ mod windows {
         if request.cancel.is_cancelled() {
             return Ok(cancelled_before_effect(Vec::new(), true));
         }
-        request.executable.revalidate().map_err(|error| {
-            SandboxExecutionError::Initialization(format!(
-                "sandbox executable identity revalidation failed: {error}"
-            ))
+        brokered::impersonated(caller, || {
+            request.executable.revalidate().map_err(|error| {
+                SandboxExecutionError::Initialization(format!(
+                    "sandbox executable identity revalidation failed: {error}"
+                ))
+            })
         })?;
         let spawned = unsafe {
             CreateProcessAsUserW(
-                token.raw(),
+                token,
                 null(),
                 command_line.as_mut_ptr(),
                 &mut process_security,
@@ -2219,16 +2073,21 @@ mod windows {
         }
         drop(thread);
 
+        if let Some(started) = started {
+            started(process_info.dwProcessId);
+        }
         let max_output = request.max_output_bytes.max(1);
         let stdout_reader = read_pipe_bounded(parent_stdout, max_output);
         let stderr_reader = read_pipe_bounded(parent_stderr, max_output);
         let stdin_writer = write_pipe(parent_stdin, request.stdin);
-        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms.max(1));
+        let deadline = request
+            .timeout_ms
+            .map(|timeout| Instant::now() + Duration::from_millis(timeout.max(1)));
         let wait_outcome = loop {
             if request.cancel.is_cancelled() {
                 break WaitOutcome::Cancelled;
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break WaitOutcome::TimedOut;
             }
             match unsafe { WaitForSingleObject(process.raw(), 50) } {
@@ -2270,7 +2129,6 @@ mod windows {
         drop(process);
         let process_tree_reaped = wait_for_job_process_tree_exit(&job, &mut cleanup_errors);
         drop(job);
-        drop(token);
 
         match join_worker_bounded(stdin_writer, "stdin writer", &mut cleanup_errors) {
             Some(Ok(())) => {}
@@ -2607,25 +2465,6 @@ mod windows {
         })
     }
 
-    fn apply_advisory_offline_environment(
-        environment: &mut std::collections::HashMap<String, String>,
-    ) {
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-            environment.insert(key.to_string(), "http://127.0.0.1:9".to_string());
-        }
-        for (key, value) in [
-            ("SBX_NONET_ACTIVE", "1"),
-            ("NO_PROXY", ""),
-            ("PIP_NO_INDEX", "1"),
-            ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
-            ("NPM_CONFIG_OFFLINE", "true"),
-            ("CARGO_NET_OFFLINE", "true"),
-            ("GIT_ALLOW_PROTOCOL", ""),
-        ] {
-            environment.insert(key.to_string(), value.to_string());
-        }
-    }
-
     fn environment_block(environment: &std::collections::HashMap<String, String>) -> Vec<u16> {
         let mut entries = environment.iter().collect::<Vec<_>>();
         entries.sort_by(|(left, _), (right, _)| {
@@ -2762,12 +2601,11 @@ mod windows {
         use std::collections::HashMap;
 
         use super::{
-            ACCESS_ALLOWED_ACE_TYPE, CONTAINER_AND_OBJECT_INHERIT, EffectLocalTempDirectory,
-            EffectTempFinalization, GENERIC_ALL, INHERIT_ONLY_ACE, NO_PROPAGATE_INHERIT_ACE,
-            SandboxExecutionError, TokenDefaultDaclInfo, ace_inheritance_is_sufficient,
-            acl_has_entry, apply_advisory_offline_environment, argv_to_command_line,
-            cancelled_before_effect, canonical_windows_path_is_local, capability_sid_for_root,
-            create_workspace_write_token, effect_temp_finalization_for_result, environment_block,
+            CONTAINER_AND_OBJECT_INHERIT, EffectLocalTempDirectory, EffectTempFinalization,
+            GENERIC_ALL, INHERIT_ONLY_ACE, NO_PROPAGATE_INHERIT_ACE, SandboxExecutionError,
+            ace_inheritance_is_sufficient, apply_advisory_offline_environment,
+            argv_to_command_line, cancelled_before_effect, canonical_windows_path_is_local,
+            capability_sid_for_root, effect_temp_finalization_for_result, environment_block,
             finalize_effect_local_temp, normalize_windows_identity, open_current_process_token,
             require_confirmed_world_writable_step, run_with_effect_temp_panic_boundary,
             token_logon_sid, token_user_sid, world_sid,
@@ -2829,6 +2667,200 @@ mod windows {
             assert!(message.contains("Everyone-writable sandbox audit candidate"));
             assert!(message.contains("before spawn"));
             assert!(message.contains("WRITE_DAC failure"));
+        }
+
+        fn shared_acl_fixture() -> tempfile::TempDir {
+            let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../project_sandbox/sandbox-acl-tests");
+            std::fs::create_dir_all(&parent).expect("private ACL fixture parent");
+            tempfile::Builder::new()
+                .prefix("shared-read-")
+                .tempdir_in(parent)
+                .expect("private ACL fixture")
+        }
+
+        fn set_fixture_shared_allow(
+            path: &camino::Utf8Path,
+            shared_sid: *mut std::ffi::c_void,
+            mask: u32,
+        ) {
+            let handle = super::open_audit_candidate(path, super::READ_CONTROL | super::WRITE_DAC)
+                .expect("open private ACL fixture");
+            let token = open_current_process_token().expect("current token");
+            let mut user = token_user_sid(token.raw()).expect("current user SID");
+            let mut system = super::system_sid().expect("SYSTEM SID");
+            let entries = [
+                (user.as_mut_ptr().cast(), GENERIC_ALL),
+                (system.as_mut_ptr().cast(), GENERIC_ALL),
+                (shared_sid, mask),
+            ]
+            .map(|(sid, mask)| super::EXPLICIT_ACCESS_W {
+                grfAccessPermissions: mask,
+                grfAccessMode: super::SET_ACCESS,
+                grfInheritance: CONTAINER_AND_OBJECT_INHERIT,
+                Trustee: super::TRUSTEE_W {
+                    pMultipleTrustee: std::ptr::null_mut(),
+                    MultipleTrusteeOperation: 0,
+                    TrusteeForm: super::TRUSTEE_IS_SID,
+                    TrusteeType: super::TRUSTEE_IS_UNKNOWN,
+                    ptstrName: sid.cast(),
+                },
+            });
+            let mut dacl = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    super::SetEntriesInAclW(
+                        entries.len() as u32,
+                        entries.as_ptr(),
+                        std::ptr::null_mut(),
+                        &mut dacl,
+                    )
+                },
+                super::ERROR_SUCCESS,
+            );
+            let dacl = super::LocalAcl(dacl);
+            assert_eq!(
+                unsafe {
+                    super::SetSecurityInfo(
+                        handle.raw(),
+                        super::SE_FILE_OBJECT,
+                        super::DACL_SECURITY_INFORMATION
+                            | super::PROTECTED_DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        dacl.0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                super::ERROR_SUCCESS,
+            );
+        }
+
+        fn shared_acl_access_cases() -> Vec<(&'static str, u32, bool)> {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+                FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+                SYNCHRONIZE,
+            };
+            vec![
+                ("read", FILE_GENERIC_READ, false),
+                (
+                    "read-execute",
+                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                    false,
+                ),
+                ("read-control", super::READ_CONTROL, false),
+                ("synchronize", SYNCHRONIZE, false),
+                ("write", FILE_GENERIC_WRITE, true),
+                ("write-data", FILE_WRITE_DATA, true),
+                ("append", FILE_APPEND_DATA, true),
+                ("write-ea", FILE_WRITE_EA, true),
+                ("write-attributes", FILE_WRITE_ATTRIBUTES, true),
+                ("delete", DELETE, true),
+                ("delete-child", 0x40, true),
+                ("generic-write", super::GENERIC_WRITE_MASK, true),
+                ("generic-all", GENERIC_ALL, true),
+                ("write-dac", super::WRITE_DAC, true),
+                ("write-owner", super::WRITE_OWNER, true),
+            ]
+        }
+
+        #[test]
+        fn effect_temp_creation_distinguishes_shared_read_from_write_acl() {
+            let fixture = shared_acl_fixture();
+            let root =
+                Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("UTF-8 fixture");
+            let workspace_root = root.join("workspace");
+            std::fs::create_dir(&workspace_root).expect("workspace");
+            let config = crate::config::ResolvedConfig::default();
+            let workspace =
+                crate::workspace::WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+                    .expect("workspace discovery");
+            let token = open_current_process_token().expect("current token");
+            let mut world = world_sid().expect("World SID");
+            let mut logon = token_logon_sid(token.raw()).expect("logon SID");
+            let mut observations = Vec::new();
+            for (label, sid) in [
+                ("World SID", world.as_mut_ptr().cast()),
+                ("current logon SID", logon.as_mut_ptr().cast()),
+            ] {
+                for (access, mask, mutating) in shared_acl_access_cases() {
+                    let base = root.join(format!("{label}-{access}"));
+                    std::fs::create_dir(&base).expect("temp base");
+                    set_fixture_shared_allow(&base, sid, mask);
+                    let mut profile =
+                        super::WorkspaceWriteSandboxProfile::compile(&workspace, [base.clone()])
+                            .expect("sandbox profile");
+                    let mut environment = HashMap::new();
+                    let outcome =
+                        match super::create_effect_local_temp(&mut profile, &mut environment) {
+                            Ok(directory) => {
+                                let effect_path = directory.path().to_path_buf();
+                                assert_eq!(
+                                    environment.get("TEMP").map(String::as_str),
+                                    effect_path.to_str(),
+                                );
+                                assert!(effect_path.is_dir());
+                                assert!(super::close_effect_local_temp(directory).is_empty());
+                                assert!(!effect_path.exists(), "effect temp was not removed");
+                                Ok(())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        };
+                    assert_eq!(
+                        std::fs::read_dir(&base).expect("temp base entries").count(),
+                        0
+                    );
+                    observations.push((label, access, mutating, outcome));
+                }
+            }
+            fixture.close().expect("remove private ACL fixture");
+            for (label, access, mutating, outcome) in observations {
+                if !mutating {
+                    assert!(
+                        outcome.is_ok(),
+                        "{label} {access} grant rejected: {outcome:?}"
+                    );
+                } else {
+                    let message = outcome.expect_err("shared write must remain rejected");
+                    assert!(
+                        message.contains(label) && message.contains("write or ACL-control"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn world_write_audit_distinguishes_shared_read_from_write_acl() {
+            let fixture = shared_acl_fixture();
+            let root =
+                Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("UTF-8 fixture");
+            let mut world = world_sid().expect("World SID");
+            let mut observations = Vec::new();
+            for (label, mask, mutating) in shared_acl_access_cases() {
+                let candidate = root.join(label);
+                std::fs::create_dir(&candidate).expect("audit candidate");
+                set_fixture_shared_allow(&candidate, world.as_mut_ptr().cast(), mask);
+                let handle = super::open_audit_candidate(&candidate, super::READ_CONTROL)
+                    .expect("open audit candidate");
+                let world_writable = super::opened_acl_allows_world_write(
+                    handle.raw(),
+                    &candidate,
+                    world.as_mut_ptr().cast(),
+                )
+                .expect("audit opened candidate");
+                observations.push((label, world_writable, mutating));
+            }
+            fixture.close().expect("remove private ACL fixture");
+            let mismatches = observations
+                .into_iter()
+                .filter(|(_, observed, expected)| observed != expected)
+                .collect::<Vec<_>>();
+            assert!(
+                mismatches.is_empty(),
+                "audit misclassifications: {mismatches:?}"
+            );
         }
 
         #[test]
@@ -3002,62 +3034,41 @@ mod windows {
             assert!(block.contains("HTTPS_PROXY=http://127.0.0.1:9\0"));
             assert!(!block.contains("https_proxy="));
         }
+    }
+}
 
-        #[test]
-        fn restricted_token_default_dacl_excludes_shared_restricting_sids() {
-            let base = open_current_process_token().expect("base token");
-            let mut user = token_user_sid(base.raw()).expect("user SID");
-            let mut logon = token_logon_sid(base.raw()).expect("logon SID");
-            let mut world = world_sid().expect("World SID");
-            let token = create_workspace_write_token(&[]).expect("restricted token");
-            let mut needed = 0u32;
-            unsafe {
-                windows_sys::Win32::Security::GetTokenInformation(
-                    token.raw(),
-                    windows_sys::Win32::Security::TokenDefaultDacl,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut needed,
-                );
-            }
-            assert!(needed > 0);
-            let mut buffer = vec![0u8; needed as usize];
-            assert_ne!(
-                unsafe {
-                    windows_sys::Win32::Security::GetTokenInformation(
-                        token.raw(),
-                        windows_sys::Win32::Security::TokenDefaultDacl,
-                        buffer.as_mut_ptr().cast(),
-                        needed,
-                        &mut needed,
-                    )
-                },
-                0
-            );
-            let info =
-                unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TokenDefaultDaclInfo>()) };
-            assert!(acl_has_entry(
-                info.default_dacl,
-                user.as_mut_ptr().cast(),
-                ACCESS_ALLOWED_ACE_TYPE,
-                GENERIC_ALL,
-                0,
-            ));
-            assert!(!acl_has_entry(
-                info.default_dacl,
-                logon.as_mut_ptr().cast(),
-                ACCESS_ALLOWED_ACE_TYPE,
-                GENERIC_ALL,
-                0,
-            ));
-            assert!(!acl_has_entry(
-                info.default_dacl,
-                world.as_mut_ptr().cast(),
-                ACCESS_ALLOWED_ACE_TYPE,
-                GENERIC_ALL,
-                0,
-            ));
-        }
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn advisory_offline_environment_preserves_the_existing_overrides() {
+        let mut environment = HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://previous-proxy".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "localhost".to_string()),
+            ("KEEP".to_string(), "inherited".to_string()),
+        ]);
+        apply_advisory_offline_environment(&mut environment);
+        let expected = HashMap::from([
+            ("HTTP_PROXY", "http://127.0.0.1:9"),
+            ("HTTPS_PROXY", "http://127.0.0.1:9"),
+            ("ALL_PROXY", "http://127.0.0.1:9"),
+            ("SBX_NONET_ACTIVE", "1"),
+            ("NO_PROXY", ""),
+            ("PIP_NO_INDEX", "1"),
+            ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+            ("NPM_CONFIG_OFFLINE", "true"),
+            ("CARGO_NET_OFFLINE", "true"),
+            ("GIT_ALLOW_PROTOCOL", ""),
+            ("KEEP", "inherited"),
+        ])
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<HashMap<_, _>>();
+        assert_eq!(environment, expected);
     }
 }
 
@@ -3191,7 +3202,7 @@ mod integration_tests {
                 cwd: workspace_root.clone(),
                 environment: captured_process_environment(&shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 64 * 1024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3292,7 +3303,7 @@ mod integration_tests {
                     cwd: workspace_root.clone(),
                     environment: captured_process_environment(&config.shell),
                     stdin: Vec::new(),
-                    timeout_ms: 30_000,
+                    timeout_ms: Some(30_000),
                     max_output_bytes: 8 * 1024,
                     hide_window: true,
                     cancel: CancellationToken::new(),
@@ -3388,7 +3399,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8 * 1024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3449,7 +3460,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8 * 1024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3520,7 +3531,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8 * 1024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3609,7 +3620,7 @@ mod integration_tests {
                     cwd: first_workspace,
                     environment: first_environment,
                     stdin: Vec::new(),
-                    timeout_ms: 30_000,
+                    timeout_ms: Some(30_000),
                     max_output_bytes: 8 * 1024,
                     hide_window: true,
                     cancel: CancellationToken::new(),
@@ -3657,7 +3668,7 @@ mod integration_tests {
                 cwd: workspace_root.clone(),
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8 * 1024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3753,7 +3764,7 @@ mod integration_tests {
                     cwd: workspace_root.clone(),
                     environment: captured_process_environment(&config.shell),
                     stdin: Vec::new(),
-                    timeout_ms: 30_000,
+                    timeout_ms: Some(30_000),
                     max_output_bytes: 8 * 1024,
                     hide_window: true,
                     cancel: CancellationToken::new(),
@@ -3820,7 +3831,7 @@ mod integration_tests {
                 cwd: workspace_root.clone(),
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 10_000,
+                timeout_ms: Some(10_000),
                 max_output_bytes: 4_096,
                 hide_window: true,
                 cancel: cancelled,
@@ -3843,7 +3854,7 @@ mod integration_tests {
                 cwd: workspace_root.clone(),
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 10_000,
+                timeout_ms: Some(10_000),
                 max_output_bytes: 4_096,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3866,7 +3877,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 10_000,
+                timeout_ms: Some(10_000),
                 max_output_bytes: 4_096,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3923,7 +3934,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 10_000,
+                timeout_ms: Some(10_000),
                 max_output_bytes: 4_096,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -3988,7 +3999,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 10_000,
+                timeout_ms: Some(10_000),
                 max_output_bytes: 4_096,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4057,7 +4068,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8_192,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4129,7 +4140,7 @@ mod integration_tests {
                     cwd: victim_worker_root,
                     environment: victim_environment,
                     stdin: Vec::new(),
-                    timeout_ms: 60_000,
+                    timeout_ms: Some(60_000),
                     max_output_bytes: 8_192,
                     hide_window: true,
                     cancel: victim_worker_cancel,
@@ -4182,7 +4193,7 @@ mod integration_tests {
                 cwd: attacker_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8_192,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4270,7 +4281,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment,
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8_192,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4323,7 +4334,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 1_024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4409,7 +4420,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 8_192,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4465,7 +4476,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: vec![b'x'; 1024 * 1024],
-                timeout_ms: 30_000,
+                timeout_ms: Some(30_000),
                 max_output_bytes: 1_024,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4538,7 +4549,7 @@ mod integration_tests {
                     cwd: worker_root,
                     environment,
                     stdin: Vec::new(),
-                    timeout_ms: 60_000,
+                    timeout_ms: Some(60_000),
                     max_output_bytes: 8_192,
                     hide_window: true,
                     cancel: worker_cancel,
@@ -4633,7 +4644,7 @@ mod integration_tests {
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
                 stdin: Vec::new(),
-                timeout_ms: 10_000,
+                timeout_ms: Some(10_000),
                 max_output_bytes: 8_192,
                 hide_window: true,
                 cancel: CancellationToken::new(),
@@ -4717,7 +4728,7 @@ mod integration_tests {
                     cwd: worker_root,
                     environment,
                     stdin: Vec::new(),
-                    timeout_ms: 5_000,
+                    timeout_ms: Some(5_000),
                     max_output_bytes: 8_192,
                     hide_window: true,
                     cancel: CancellationToken::new(),

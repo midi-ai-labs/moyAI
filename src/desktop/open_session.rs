@@ -68,6 +68,12 @@ impl OpenSessionView {
         self.read.active_turn_id
     }
 
+    pub fn turn_progress(&self) -> Option<&crate::session::model::CanonicalTurnProgress> {
+        self.read.turn_progress.as_ref().filter(|progress| {
+            Some(progress.turn_id) == self.read.active_turn_id.or(self.read.latest_turn_id)
+        })
+    }
+
     pub fn latest_turn_id(&self) -> Option<crate::protocol::TurnId> {
         self.read.latest_turn_id
     }
@@ -133,12 +139,8 @@ impl OpenSessionView {
         read.turns = turns;
         read.turns.session = read.session.clone();
         read.turn_elapsed_ms = turn_elapsed_ms;
-        read.session_token_usage = incoming.session_token_usage.clone();
-        // The queue projection and canonical transcript are read from one
-        // repository snapshot. Never merge pending input by visible text or
-        // retain it from an older page: the incoming snapshot is authoritative
-        // for the pending -> delivered transition.
-        read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
+        // Queue and usage belong to the selected metadata snapshot. An older
+        // history page may extend the transcript without restoring discarded input.
         self.stored_detail = build_session_detail_with_roots(
             &read,
             None,
@@ -158,12 +160,21 @@ impl OpenSessionView {
         {
             return false;
         }
+        if self.read.admission_revision > incoming.admission_revision
+            || (self.read.admission_revision == incoming.admission_revision
+                && self.read.active_turn_id.is_some()
+                && self.read.active_turn_id == incoming.active_turn_id
+                && self.read.active_turn_sequence_no > incoming.active_turn_sequence_no)
+        {
+            return true;
+        }
         self.read.session = incoming.session.clone();
         self.read.history = incoming.history.clone();
         self.read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
         self.read.latest_turn_id = incoming.latest_turn_id;
         self.read.active_turn_id = incoming.active_turn_id;
         self.read.active_turn_sequence_no = incoming.active_turn_sequence_no;
+        self.read.turn_progress = incoming.turn_progress.clone();
         self.read.admission_revision = incoming.admission_revision;
         self.read.turn_elapsed_ms.extend(
             incoming
@@ -340,17 +351,19 @@ fn canonical_suffix_boundary(
         let mut boundary = None;
         let mut invalid = false;
         for (live_index, row) in &live_primary {
-            let Some((expected_kind, expected_body)) = expected.get(expected_index) else {
-                break;
-            };
-            if row.row_kind == *expected_kind && row.body == *expected_body {
-                expected_index += 1;
+            if let Some(matched) =
+                canonical_conversation_match(expected, expected_index, row.row_kind, &row.body)
+            {
+                expected_index = matched + 1;
                 boundary = Some(*live_index);
                 if expected_index == expected.len() {
                     break;
                 }
-            } else if row.row_kind != Assistant {
-                invalid = true;
+            } else {
+                // Unknown live content is not an overlap. Preserve the remaining
+                // suffix, including streaming text, instead of skipping it to
+                // find a later matching user row.
+                invalid = row.row_kind != Assistant;
                 break;
             }
         }
@@ -479,34 +492,55 @@ fn canonical_suffix_covers_live_conversation(
     stored: &[(super::models::DesktopTranscriptRowKind, String)],
     live: &[(super::models::DesktopTranscriptRowKind, String)],
 ) -> bool {
-    use super::models::DesktopTranscriptRowKind::{Assistant, Error};
-
     for suffix_start in 0..stored.len() {
-        let mut live_index = 0;
+        let mut stored_index = suffix_start;
         let mut valid = true;
-        for stored_row in &stored[suffix_start..] {
-            match live.get(live_index) {
-                Some(live_row) if live_row == stored_row => live_index += 1,
-                Some(live_row)
-                    if stored_row.0 == Assistant
-                        && live_row.0 == Assistant
-                        && !live_row.1.is_empty()
-                        && stored_row.1.starts_with(&live_row.1) =>
-                {
-                    live_index += 1;
-                }
-                _ if matches!(stored_row.0, Assistant | Error) => {}
-                _ => {
-                    valid = false;
-                    break;
-                }
+        for (kind, body) in live {
+            if let Some(matched) = canonical_conversation_match(stored, stored_index, *kind, body) {
+                stored_index = matched + 1;
+            } else {
+                valid = false;
+                break;
             }
         }
-        if valid && live_index == live.len() {
+        if valid
+            && stored[stored_index..]
+                .iter()
+                .all(|row| canonical_row_may_be_missing_live(row.0))
+        {
             return true;
         }
     }
     false
+}
+
+/// Ordered overlap shared by active and terminal projection. Canonical assistant
+/// and error delivery may precede live rendering, but a user boundary may not be
+/// skipped and unmatched live content is never treated as already stored.
+fn canonical_conversation_match(
+    stored: &[(super::models::DesktopTranscriptRowKind, String)],
+    start: usize,
+    live_kind: super::models::DesktopTranscriptRowKind,
+    live_body: &str,
+) -> Option<usize> {
+    use super::models::DesktopTranscriptRowKind::Assistant;
+    for (index, (kind, body)) in stored.iter().enumerate().skip(start) {
+        if *kind == live_kind
+            && (body == live_body
+                || (*kind == Assistant && !live_body.is_empty() && body.starts_with(live_body)))
+        {
+            return Some(index);
+        }
+        if !canonical_row_may_be_missing_live(*kind) {
+            return None;
+        }
+    }
+    None
+}
+
+fn canonical_row_may_be_missing_live(kind: super::models::DesktopTranscriptRowKind) -> bool {
+    use super::models::DesktopTranscriptRowKind::{Assistant, Error};
+    matches!(kind, Assistant | Error)
 }
 
 fn stored_lifecycle_matches_live(stored: crate::session::SessionStatus, live: RunStatus) -> bool {
@@ -616,10 +650,16 @@ fn canonical_metadata_is_newer(
     if incoming.admission_revision != existing.admission_revision {
         return incoming.admission_revision > existing.admission_revision;
     }
+    if incoming.active_turn_id.is_some()
+        && incoming.active_turn_id == existing.active_turn_id
+        && incoming.active_turn_sequence_no != existing.active_turn_sequence_no
+    {
+        return incoming.active_turn_sequence_no > existing.active_turn_sequence_no;
+    }
     if incoming.session.updated_at_ms != existing.session.updated_at_ms {
         return incoming.session.updated_at_ms > existing.session.updated_at_ms;
     }
-    session_status_rank(incoming.session.status) > session_status_rank(existing.session.status)
+    session_status_rank(incoming.session.status) >= session_status_rank(existing.session.status)
 }
 
 const fn session_status_rank(status: crate::session::SessionStatus) -> u8 {
@@ -694,6 +734,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
+            turn_progress: None,
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -816,6 +857,10 @@ mod tests {
             terminal_turn_count: 1,
             measured_turn_count: 1,
             reasoning_measured_turn_count: 1,
+            model_request_count: 1,
+            reported_request_count: 1,
+            reasoning_reported_request_count: 1,
+            unrecorded_turn_count: 0,
             prompt_tokens: 80,
             completion_tokens: 20,
             total_tokens: 100,
@@ -827,6 +872,10 @@ mod tests {
             terminal_turn_count: 2,
             measured_turn_count: 2,
             reasoning_measured_turn_count: 2,
+            model_request_count: 2,
+            reported_request_count: 2,
+            reasoning_reported_request_count: 2,
+            unrecorded_turn_count: 0,
             prompt_tokens: 200,
             completion_tokens: 50,
             total_tokens: 250,
@@ -838,12 +887,12 @@ mod tests {
         assert_eq!(view.stored_detail().session_usage_state, "complete");
         assert_eq!(
             view.stored_detail().session_usage_label,
-            "セッション累計: 250 token"
+            "このチャットの累計: 250 トークン"
         );
 
         let live = view.live_detail(&AppState::default(), None);
         assert_eq!(live.session_usage_state, "complete");
-        assert_eq!(live.session_usage_label, "セッション累計: 250 token");
+        assert_eq!(live.session_usage_label, "このチャットの累計: 250 トークン");
     }
 
     fn transcript_row(
@@ -1040,7 +1089,7 @@ mod tests {
         running_read.active_turn_id = Some(turn_id);
         let mut view = OpenSessionView::from_loaded(&running_read);
         let mut live = AppState::default();
-        live.load_turn_items_with_active_turn(&running_session, &items, Some(turn_id));
+        live.load_turn_items_with_active_turn(&running_session, &items, Some(turn_id), None);
 
         let running_identity = view
             .live_detail(&live, None)
@@ -1079,7 +1128,7 @@ mod tests {
             items.clone(),
         );
         assert!(view.merge_contiguous(&completed_read));
-        live.load_turn_items_with_active_turn(&completed_session, &items, None);
+        live.load_turn_items_with_active_turn(&completed_session, &items, None, None);
         live.apply_run_summary(crate::session::RunSummary::from_terminal(
             completed_session.id,
             turn_id,
@@ -1478,6 +1527,148 @@ mod tests {
                 "{body} appears once across canonical delivery and the live suffix"
             );
         }
+    }
+
+    #[test]
+    fn running_detail_does_not_duplicate_users_when_prior_assistant_is_missing_from_live() {
+        let mut session = session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let prior = TurnId::new();
+        let active = TurnId::new();
+        let items = vec![
+            turn_item(
+                session.id,
+                prior,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "first request".into(),
+                },
+            ),
+            turn_item(
+                session.id,
+                prior,
+                2,
+                TurnItemPayload::AgentMessage {
+                    text: "first final".into(),
+                },
+            ),
+            turn_item(
+                session.id,
+                prior,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+            turn_item(
+                session.id,
+                active,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "second request".into(),
+                },
+            ),
+        ];
+        let mut read = canonical_read(&session, 0, items.len(), items.len(), items);
+        read.active_turn_id = Some(active);
+        let view = OpenSessionView::from_loaded(&read);
+        let mut live = AppState::default();
+        live.current_session_id = Some(session.id);
+        live.run_status = RunStatus::Running;
+        live.transcript_entries = ["first request", "second request"]
+            .into_iter()
+            .map(|body| TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".into(),
+                body: body.into(),
+                response_id: None,
+                tool_call_id: None,
+            })
+            .collect();
+
+        let detail = view.live_detail(&live, None);
+
+        assert_eq!(
+            primary_conversation_rows(&detail),
+            vec![
+                (DesktopTranscriptRowKind::User, "first request".into()),
+                (DesktopTranscriptRowKind::Assistant, "first final".into()),
+                (DesktopTranscriptRowKind::User, "second request".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_reconciliation_keeps_unmatched_live_content_and_user_order() {
+        use DesktopTranscriptRowKind::{Assistant, Error, User};
+        let prefix = vec![
+            transcript_row(User, "User", "first request"),
+            transcript_row(Assistant, "Assistant", "first final"),
+            transcript_row(User, "User", "second request"),
+        ];
+        for kind in [User, Assistant, Error] {
+            let live = vec![
+                transcript_row(User, "User", "first request"),
+                transcript_row(kind, "Live", "unmatched live content"),
+                transcript_row(User, "User", "second request"),
+            ];
+            let merged = merge_canonical_prefix_with_live_suffix(prefix.clone(), live);
+            let unmatched = merged
+                .iter()
+                .position(|row| row.body == "unmatched live content")
+                .unwrap();
+            assert_eq!(
+                merged
+                    .iter()
+                    .filter(|row| row.body == "unmatched live content")
+                    .count(),
+                1
+            );
+            assert!(
+                merged[unmatched + 1..]
+                    .iter()
+                    .any(|row| row.row_kind == User && row.body == "second request")
+            );
+        }
+        let reversed = vec![
+            transcript_row(User, "User", "second request"),
+            transcript_row(User, "User", "first request"),
+        ];
+        let merged = merge_canonical_prefix_with_live_suffix(prefix, reversed);
+        assert!(primary_conversation_rows_from_rows(&merged).ends_with(&[
+            (User, "second request".into()),
+            (User, "first request".into()),
+        ]));
+    }
+
+    #[test]
+    fn active_reconciliation_preserves_repeated_user_submissions_and_current_streaming_text() {
+        use DesktopTranscriptRowKind::{Assistant, Error, User};
+        let prefix = vec![
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(Error, "Error", "stored warning"),
+            transcript_row(Assistant, "Assistant", "previous final"),
+            transcript_row(User, "User", "repeat this"),
+        ];
+        let live = vec![
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(User, "User", "repeat this"),
+            transcript_row(Assistant, "Assistant", "current stream"),
+        ];
+        let merged = merge_canonical_prefix_with_live_suffix(prefix, live);
+        assert_eq!(
+            primary_conversation_rows_from_rows(&merged),
+            vec![
+                (User, "repeat this".into()),
+                (Error, "stored warning".into()),
+                (Assistant, "previous final".into()),
+                (User, "repeat this".into()),
+                (User, "repeat this".into()),
+                (Assistant, "current stream".into()),
+            ]
+        );
     }
 
     #[test]
@@ -2869,17 +3060,43 @@ mod tests {
         )];
         let mut current = canonical_read(&completed, 0, 1, 1, items.clone());
         current.latest_turn_id = Some(turn_id);
+        current.session_token_usage.total_tokens = 42;
+        current.session_token_usage.terminal_turn_count = 1;
         let mut stale_running_session = completed.clone();
         stale_running_session.status = SessionStatus::Running;
         stale_running_session.updated_at_ms = completed.updated_at_ms.saturating_sub(1);
         stale_running_session.completed_at_ms = None;
         let mut stale = canonical_read(&stale_running_session, 0, 1, 1, items);
         stale.active_turn_id = Some(turn_id);
+        stale.pending_turn_inputs = vec![pending_input(HistoryItemId::new(), turn_id, "discarded")];
+        stale.session_token_usage.total_tokens = 12;
         let mut view = OpenSessionView::from_loaded(&current);
 
         assert!(view.merge_contiguous(&stale));
         assert_eq!(view.read.session.status, SessionStatus::Completed);
         assert_eq!(view.read.active_turn_id, None);
         assert_eq!(view.read.turns.session.status, SessionStatus::Completed);
+        assert!(view.pending_turn_inputs().is_empty());
+        assert_eq!(view.read.session_token_usage, current.session_token_usage);
+    }
+
+    #[test]
+    fn equal_metadata_page_keeps_fresh_queue_delivery_and_usage() {
+        let mut session = session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let turn_id = TurnId::new();
+        let mut current = canonical_read(&session, 0, 1, 0, Vec::new());
+        current.active_turn_id = Some(turn_id);
+        current.active_turn_sequence_no = Some(2);
+        current.pending_turn_inputs = vec![pending_input(HistoryItemId::new(), turn_id, "queued")];
+        let mut fresh = current.clone();
+        fresh.pending_turn_inputs.clear();
+        fresh.session_token_usage.total_tokens = 42;
+        let mut view = OpenSessionView::from_loaded(&current);
+
+        assert!(view.merge_contiguous(&fresh));
+        assert!(view.pending_turn_inputs().is_empty());
+        assert_eq!(view.read.session_token_usage, fresh.session_token_usage);
     }
 }

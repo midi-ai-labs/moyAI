@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tauri::{
-    Manager, State, WindowEvent,
+    Emitter, Manager, State, WindowEvent,
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
 };
@@ -12,10 +12,19 @@ use tokio::sync::Mutex;
 use crate::app::App;
 use crate::cli::ReviewDecision;
 use crate::config::{ProviderEndpoint, ProviderProfile, ReasoningSummary, ResolvedConfig};
+use crate::device_network::{DeviceNetworkProjection, DeviceNetworkService, SharedHubConfig};
 use crate::error::AppRunError;
+use crate::hub::{
+    CatalogRevision, HubConnection, HubConnectionProjection, HubReviewContext, HubSelection,
+    HubSettingsStore,
+};
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
+use crate::mcp_publish::{PublishProfileId, PublishService};
 use crate::protocol::TurnId;
-use crate::session::{ActiveTurnExpectation, SessionId, SessionSettingsPatch, SessionSpawnEdge};
+use crate::session::{
+    ActiveTurnExpectation, ProjectId, SessionId, SessionSettingsPatch, SessionSpawnEdge,
+};
+use crate::tool::shell::ManagedShells;
 
 use super::app::{
     DesktopController, PendingPermissionResolution, RootSessionSettingsApplyError,
@@ -36,6 +45,15 @@ use super::web_model::{
 
 type SharedController = Arc<Mutex<DesktopController>>;
 
+#[derive(Default)]
+struct McpHistoryExportGate(Mutex<()>);
+
+#[derive(Default)]
+struct JoinConfigActivationGate(Mutex<()>);
+
+#[derive(Default)]
+struct DesktopExitGate(Arc<Mutex<()>>);
+
 // Keep the wire-visible Desktop command registry in one place. The handler
 // and its contract tests consume this same identifier list, so a renamed or
 // unannotated command fails at compile time instead of becoming a runtime-only
@@ -46,8 +64,10 @@ macro_rules! desktop_command_manifest {
         $consumer! {
             desktop_state,
             submit_prompt,
+            prepare_latest_message_edit,
             cancel_run,
             ensure_side_chat,
+            capture_side_chat_direct_provider,
             load_side_chat_models,
             save_side_chat_draft,
             submit_side_chat,
@@ -94,6 +114,50 @@ macro_rules! desktop_command_manifest {
             show_project_menu,
             create_project_from_picker,
             show_config_editor,
+            show_hub_editor,
+            show_shared_work,
+            shared_work_projection,
+            shared_work_command,
+            browse_shared_project_folder,
+            device_execution_projection,
+            device_execution_command,
+            receiver_activity_projection,
+            receiver_activity_stop,
+            receiver_service_stop,
+            origin_work_projection,
+            origin_work_stop_apps,
+            origin_work_stop_all,
+            hub_projection,
+            hub_connect,
+            hub_refresh,
+            hub_save_review,
+            hub_disconnect,
+            hub_set_route_mode,
+            show_mcp_history,
+            mcp_history_list,
+            mcp_history_detail,
+            mcp_history_export,
+            mcp_history_stop,
+            remote_job_cancel,
+            device_network_projection,
+            device_network_import,
+            device_network_initial_setup_import,
+            device_network_join,
+            device_network_request_join,
+            device_network_receiver,
+            device_network_select,
+            device_network_refresh,
+            device_network_leave,
+            device_network_reset,
+            device_network_jobs,
+            device_network_diagnose,
+            device_network_artifacts,
+            device_network_export_artifacts,
+            device_network_cancel,
+            mcp_peer_projection,
+            mcp_peer_add,
+            mcp_peer_remove,
+            mcp_peer_check,
             show_session_settings,
             show_provider_editor,
             show_workspace_picker,
@@ -120,6 +184,7 @@ macro_rules! desktop_command_manifest {
             apply_session_config,
             save_global_config,
             finish_initial_setup,
+            choose_initial_setup_purpose,
             apply_session_settings,
             toggle_access_mode,
             preview_window_opacity,
@@ -217,6 +282,7 @@ enum DesktopCommandErrorCode {
     ModelUnavailable,
     ImageUnsupported,
     PermissionPolicyDenied,
+    TeamSetupUnavailable,
     RuntimeFailure,
     StorageFailure,
 }
@@ -252,6 +318,16 @@ impl DesktopCommandError {
             kind: "internal",
             category: DesktopCommandErrorCategory::Storage,
             code: DesktopCommandErrorCode::StorageFailure,
+            message: message.into(),
+            state: None,
+        }
+    }
+
+    fn team_setup_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: "internal",
+            category: DesktopCommandErrorCategory::Runtime,
+            code: DesktopCommandErrorCode::TeamSetupUnavailable,
             message: message.into(),
             state: None,
         }
@@ -329,26 +405,284 @@ unsafe extern "system" {
 }
 
 pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
-    let controller = DesktopController::new(app, args).await?;
+    let mut controller = DesktopController::new(app, args).await?;
+    let hub_path = crate::config::loader::global_config_path()
+        .map_err(|_| AppRunError::Message("failed to resolve Hub settings directory".into()))?
+        .with_file_name("hub-settings.json");
+    let hub_connection = HubConnection::new(HubSettingsStore::new(hub_path));
+    controller.state.hub_connection = Some(hub_connection.clone());
+    let (remote_jobs, mcp_publish, device_network) =
+        if let Some(device_network) = controller.app.device_network.clone() {
+            (
+                device_network.remote_jobs(),
+                device_network.publish_service(),
+                device_network,
+            )
+        } else {
+            // Initial setup has no saved Hub binding yet. Create the same process
+            // owner here so importing a join file can attach it to this store.
+            let config_path = crate::config::loader::global_config_path().map_err(|_| {
+                AppRunError::Message("failed to resolve device settings directory".into())
+            })?;
+            let remote_jobs =
+                crate::remote_agent::RemoteJobService::new(controller.app.process_runtime.clone())
+                    .map_err(|error| AppRunError::Message(error.to_string()))?;
+            let mcp_publish = PublishService::new(
+                config_path.with_file_name("mcp-publish.json"),
+                controller.app.store.clone(),
+                controller.app.config.clone(),
+            )
+            .with_remote_jobs(remote_jobs.clone());
+            let device_network = DeviceNetworkService::new(
+                config_path.with_file_name("device-network"),
+                controller.app.store.clone(),
+                controller.state.global_config().clone(),
+                remote_jobs.clone(),
+                mcp_publish.clone(),
+            );
+            (remote_jobs, mcp_publish, device_network)
+        };
+    controller.state.mcp_publish = Some(mcp_publish.clone());
+    device_network.attach_hub_connection(hub_connection.clone());
+    hub_connection.attach_device_network(device_network.downgrade());
+    controller.state.device_network = Some(device_network.clone());
+    let managed_shells = controller.app.process_runtime.managed_shells();
     let shared: SharedController = Arc::new(Mutex::new(controller));
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+    let mut context = tauri::generate_context!();
+    context.config_mut().identifier =
+        super::single_instance::desktop_identifier().map_err(AppRunError::Message)?;
+    let result = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             restore_main_window(app);
+            let shared = app.state::<SharedController>().inner().clone();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if handle_join_config_activation(&app, &argv, &cwd).await {
+                    return;
+                }
+                shared.lock().await.state.set_status_message(
+                    "moyAI は既に起動しています。既存のウィンドウを表示しました。",
+                );
+                let _ = app.emit_to("main", "desktop-state-changed", ());
+            });
         }))
         .manage(shared)
+        .manage(hub_connection)
+        .manage(mcp_publish)
+        .manage(remote_jobs)
+        .manage(McpHistoryExportGate::default())
+        .manage(JoinConfigActivationGate::default())
+        .manage(DesktopExitGate::default())
+        .manage(device_network)
+        .manage(managed_shells.clone())
         .setup(|app| {
             install_tray(app.handle())?;
+            let network = app.state::<DeviceNetworkService>().inner().clone();
+            let attention_network = network.downgrade();
+            tauri::async_runtime::spawn(async move {
+                let mut attention = super::attention::SharedAttention::default();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let Some(network) = attention_network.upgrade() else {
+                        break;
+                    };
+                    if let Some((identity, inbox)) = network.shared_notification_inbox().await {
+                        for body in attention.observe(&identity, &inbox) {
+                            super::app::send_windows_desktop_notification("moyAI", &body);
+                        }
+                    }
+                }
+            });
+            let handle = app.handle().clone();
+            let arguments = std::env::args().collect::<Vec<_>>();
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            tauri::async_runtime::spawn(async move {
+                let _ = network.resume().await;
+                network.start_execution_management();
+                handle_join_config_activation(&handle, &arguments, &cwd).await;
+            });
             Ok(())
         })
         .invoke_handler(desktop_command_manifest!(generate_desktop_invoke_handler))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                if window
+                    .app_handle()
+                    .state::<DesktopExitGate>()
+                    .0
+                    .try_lock()
+                    .is_err()
+                {
+                    return;
+                }
+                disconnect_hub(window.app_handle(), false);
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
+        .run(context);
+    managed_shells.shutdown().await;
+    result.map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
+}
+
+async fn handle_join_config_activation(
+    app: &tauri::AppHandle,
+    arguments: &[String],
+    cwd: &str,
+) -> bool {
+    let path = match super::join_config::from_launch_args(arguments, cwd) {
+        Ok(None) => return false,
+        Ok(Some(path)) => path,
+        Err(error) => {
+            show_join_config_error(app, &error).await;
+            return true;
+        }
+    };
+    let gate = app.state::<JoinConfigActivationGate>();
+    let Ok(_lease) = gate.0.try_lock() else {
+        show_join_config_error(app,
+            "別の接続ファイルを確認中です。確認を終えてから、開きたい接続ファイルをもう一度開いてください。"
+        ).await;
+        return true;
+    };
+    if let Err(error) = review_join_config_activation(app, path).await {
+        show_join_config_error(app, &error).await;
+    }
+    // Native activation has no command response. Invalidate the ordinary
+    // snapshot after settlement, including when idle polling has stopped.
+    let _ = app.emit_to("main", "desktop-state-changed", ());
+    true
+}
+
+async fn show_join_config_error(app: &tauri::AppHandle, message: &str) {
+    app.state::<SharedController>()
+        .lock()
+        .await
+        .state
+        .set_status_message(message);
+    let mut dialog = rfd::AsyncMessageDialog::new()
+        .set_title("moyAI: 接続ファイル")
+        .set_description(message)
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok);
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    let _ = dialog.show().await;
+}
+
+async fn review_join_config_activation(
+    app: &tauri::AppHandle,
+    path: camino::Utf8PathBuf,
+) -> Result<(), String> {
+    let shared_controller = app.state::<SharedController>().inner().clone();
+    let service = app.state::<DeviceNetworkService>().inner().clone();
+    let (target, before, current) = {
+        let mut controller = shared_controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_unscoped_prompt_review_action(&mut controller, "Hub connection file")
+            .map_err(|_| "現在の確認操作を終えてから、接続ファイルをもう一度開いてください。")?;
+        let target = DesktopConfigMutationTarget {
+            workspace_path: controller.app.workspace.authority_root().to_string(),
+            session_id: controller
+                .state
+                .app_state
+                .current_session_id
+                .map(|id| id.to_string()),
+            config_generation: controller
+                .state
+                .provider_config
+                .config_generation
+                .to_string(),
+        };
+        (
+            target,
+            service.projection_now(),
+            controller.state.global_config().device_network.clone(),
+        )
+    };
+    let shared = tokio::task::spawn_blocking(move || super::join_config::load(&path))
+        .await
+        .map_err(|_| "接続ファイルを読み取れません。")??;
+    let mut dialog = rfd::AsyncMessageDialog::new()
+        .set_title("moyAI: チームの接続先を確認")
+        .set_description(super::join_config::review_text(
+            &shared,
+            &current,
+            before.device_id.is_some(),
+        )?)
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::OkCancel);
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    if dialog.show().await != rfd::MessageDialogResult::Ok {
+        return Ok(());
+    }
+    let prepared = service
+        .prepare_configuration(shared, &before.revision, &before.generation)
+        .await
+        .map_err(|error| super::join_config::configuration_error(error).to_string())?;
+    let endpoint_changed = prepared.endpoint_changed();
+    let mut controller = shared_controller.lock().await;
+    controller.drain_runtime_messages();
+    let changed = if endpoint_changed {
+        super::join_config::ENDPOINT_NOT_SAVED
+    } else {
+        "確認中に画面や接続設定が変更されました。接続ファイルをもう一度開いて確認してください。"
+    };
+    ensure_config_mutation_target(&controller, &target).map_err(|_| changed)?;
+    ensure_unscoped_prompt_review_action(&mut controller, "Hub connection file")
+        .map_err(|_| changed)?;
+    service
+        .check_target(&before.revision, &before.generation)
+        .map_err(|_| changed)?;
+    let mut persist_error = None;
+    let result = service
+        .commit_configuration(prepared, |saved| {
+            controller
+                .save_device_network_config(saved, false)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    if let Some(error) = persist_error {
+        if endpoint_changed {
+            return Err(super::join_config::ENDPOINT_NOT_SAVED.into());
+        }
+        return Err(error);
+    }
+    let result = result.map_err(|error| {
+        if endpoint_changed {
+            super::join_config::ENDPOINT_NOT_SAVED.into()
+        } else {
+            error.to_string()
+        }
+    })?;
+    // A failed candidate never changes the existing navigation intent.
+    controller.choose_initial_setup_purpose(super::preferences::DesktopOnboardingIntent::Team)?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    controller.state.set_status_message(
+        "接続情報を保存しました。「moyAI Hub」でこのPCの参加状態を確認できます。",
+    );
+    drop(controller);
+    if endpoint_changed {
+        service.reconnect_model_after_endpoint_change().await;
+    }
+    if let Err(error) = service
+        .request_join(&result.revision, &result.generation)
+        .await
+    {
+        return Err(format!(
+            "接続情報は保存済みです。共有仕事画面で接続状態を確認し、再接続してください。\n{error}"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -379,7 +713,13 @@ fn start_windows_caption_drag(window: &tauri::WebviewWindow) -> Result<(), Strin
 
 fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open_moyai", "Open moyAI", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit_moyai", "終了", true, None::<&str>)?;
+    let quit = MenuItem::with_id(
+        app,
+        "quit_moyai",
+        "終了（このPCの仕事も停止）",
+        true,
+        None::<&str>,
+    )?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     let mut builder = TrayIconBuilder::with_id("moyai-tray")
         .tooltip("moyAI")
@@ -387,7 +727,7 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open_moyai" => restore_main_window(app),
-            "quit_moyai" => app.exit(0),
+            "quit_moyai" => disconnect_hub(app, true),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -407,6 +747,12 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
+    if let Some(network) = app.try_state::<DeviceNetworkService>() {
+        network.window_shown();
+    }
+    if let Some(publish) = app.try_state::<PublishService>() {
+        publish.window_shown();
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -416,6 +762,10 @@ fn restore_main_window(app: &tauri::AppHandle) {
 
 #[tauri::command]
 fn hide_to_tray(app: tauri::AppHandle) {
+    if app.state::<DesktopExitGate>().0.try_lock().is_err() {
+        return;
+    }
+    disconnect_hub(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -454,7 +804,113 @@ fn toggle_maximize_window(window: tauri::WebviewWindow) -> Result<bool, String> 
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    disconnect_hub(&app, true);
+}
+
+fn disconnect_hub(app: &tauri::AppHandle, exit: bool) {
+    if exit {
+        exit_desktop_and_runner(app);
+        return;
+    }
+    // Closing the window only hides it; an explicit Exit owns Runner shutdown.
+    if app.state::<DesktopExitGate>().0.try_lock().is_err() {
+        return;
+    }
+    let connection = app.state::<HubConnection>().inner().clone();
+    let publish = app.state::<PublishService>().inner().clone();
+    let network = app.state::<DeviceNetworkService>().inner().clone();
+    let hidden_receiver = network.window_hide_requested();
+    let hidden_profiles = publish.window_hide_requested();
+    tauri::async_runtime::spawn(async move {
+        connection.shutdown().await;
+        network.finish_window_hide(hidden_receiver).await;
+        publish.finish_window_hide(hidden_profiles).await;
+    });
+}
+
+fn exit_desktop_and_runner(app: &tauri::AppHandle) {
+    let Ok(exit_guard) = app.state::<DesktopExitGate>().0.clone().try_lock_owned() else {
+        return;
+    };
+    let connection = app.state::<HubConnection>().inner().clone();
+    let publish = app.state::<PublishService>().inner().clone();
+    let network = app.state::<DeviceNetworkService>().inner().clone();
+    let managed_shells = app.state::<ManagedShells>().inner().clone();
+    // Close admission before any asynchronous wait, including the background
+    // management lane which could otherwise start a replacement Runner.
+    managed_shells.begin_shutdown();
+    network.begin_shutdown();
+    publish.begin_shutdown();
+    restore_main_window(app);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title("moyAI — このPCの仕事を停止して終了しています");
+        let _ = window.set_enabled(false);
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _exit_guard = exit_guard;
+        let stopped: Result<(), String> = async {
+            let runtime = {
+                let controller = app.state::<SharedController>();
+                let mut controller = controller.lock().await;
+                controller.begin_exit()?;
+                controller.state.set_status_message(
+                    "このPCの仕事とアプリを停止しています。停止を確認してからmoyAIを終了します。",
+                );
+                controller.app.process_runtime.agent_runtime()
+            };
+            let _ = app.emit_to("main", "desktop-state-changed", ());
+            connection.shutdown().await;
+            network.shutdown().await;
+            loop {
+                if app
+                    .state::<SharedController>()
+                    .lock()
+                    .await
+                    .local_exit_settled()?
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            while !publish.shutdown().await {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            managed_shells.shutdown().await;
+            // Local work returns its shared capacity through this Runner. Keep
+            // it alive until worker cleanup and ExternalFinish have settled.
+            runtime.wait_for_resource_drains().await?;
+            tauri::async_runtime::spawn_blocking(crate::runner::operations::shutdown_existing)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.message)
+        }
+        .await;
+        if let Err(error) = stopped {
+            let message = format!(
+                "このPCの仕事や実行機能の終了を確認できなかったため、moyAIの画面を残しています。\nもう一度「終了」を選んでください。解消しない場合は、この表示を管理者へ伝えてください。\n\n{error}"
+            );
+            app.state::<SharedController>()
+                .lock()
+                .await
+                .state
+                .set_status_message(&message);
+            let _ = app.emit_to("main", "desktop-state-changed", ());
+            let mut dialog = rfd::AsyncMessageDialog::new()
+                .set_title("moyAIを終了できませんでした")
+                .set_description(&message)
+                .set_level(rfd::MessageLevel::Error)
+                .set_buttons(rfd::MessageButtons::Ok);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title("moyAI");
+                let _ = window.set_enabled(true);
+                dialog = dialog.set_parent(&window);
+            }
+            let _ = dialog.show().await;
+        } else {
+            app.exit(0);
+        }
+    });
 }
 
 async fn mutate_controller<F>(
@@ -1445,6 +1901,122 @@ async fn submit_prompt(
     .await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreparedMessageEdit {
+    state: DesktopWebState,
+    forked_session_id: String,
+    editable_text: String,
+}
+
+#[tauri::command]
+async fn prepare_latest_message_edit(
+    controller: State<'_, SharedController>,
+    expected_run_target: DesktopRunMutationTarget,
+    expected_history_item_id: String,
+) -> Result<PreparedMessageEdit, DesktopCommandError> {
+    let (session_service, source_session_id, expected_turn_id, expected_revision) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let result = (|| {
+            ensure_stable_view_admission(&controller, "message editing")?;
+            if controller.state.view.hub_project_open {
+                return Err(DesktopCommandConflict::new(
+                    "open a local chat before editing its last message",
+                ));
+            }
+            let ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_id),
+                revision,
+            } = ensure_run_mutation_target(&controller, &expected_run_target)?
+            else {
+                return Err(DesktopCommandConflict::new(
+                    "stop the current task before editing its last message",
+                ));
+            };
+            let session_id = controller
+                .state
+                .app_state
+                .current_session_id
+                .ok_or_else(|| DesktopCommandConflict::new("select the chat to edit first"))?;
+            if controller.state.selected_session_id() != Some(session_id)
+                || controller
+                    .state
+                    .selected_detail()
+                    .transcript_rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.row_kind == super::models::DesktopTranscriptRowKind::User)
+                    .and_then(|row| row.stable_history_identity.as_deref())
+                    != Some(expected_history_item_id.as_str())
+            {
+                return Err(DesktopCommandConflict::new(
+                    "the message changed; reopen the latest chat and try again",
+                ));
+            }
+            Ok((
+                controller.app.session_service.clone(),
+                session_id,
+                turn_id,
+                revision,
+            ))
+        })();
+        result.map_err(|conflict| command_conflict_error(&mut controller, conflict))?
+    };
+
+    let prepared = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to start the message edit worker: {error}"))?;
+        runtime
+            .block_on(session_service.fork_latest_turn_for_edit(
+                source_session_id,
+                expected_turn_id,
+                expected_revision,
+            ))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| DesktopCommandError::storage(error.to_string()))?
+    .map_err(DesktopCommandError::storage)?;
+
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let result = (|| {
+        ensure_stable_view_admission(&controller, "message editing")?;
+        if controller.state.view.hub_project_open
+            || controller.state.selected_session_id() != Some(source_session_id)
+            || ensure_run_mutation_target(&controller, &expected_run_target)?
+                != (ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(expected_turn_id),
+                    revision: expected_revision,
+                })
+            || prepared.source_session.id != source_session_id
+            || prepared.forked_session.project_id != controller.app.workspace.project_id
+        {
+            return Err(DesktopCommandConflict::new(
+                "the chat changed while preparing the edit; open the new draft chat from the sidebar",
+            ));
+        }
+        if !controller.open_created_edit_fork(prepared.forked_session.id, prepared.retained_images)
+        {
+            return Err(DesktopCommandConflict::new(
+                "the new draft chat could not be opened",
+            ));
+        }
+        Ok(())
+    })();
+    result.map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+    Ok(PreparedMessageEdit {
+        state: controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        forked_session_id: prepared.forked_session.id.to_string(),
+        editable_text: prepared.editable_text,
+    })
+}
+
 #[tauri::command]
 async fn cancel_run(
     controller: State<'_, SharedController>,
@@ -1504,10 +2076,51 @@ async fn ensure_side_chat(
     .await
 }
 
+#[tauri::command]
+async fn capture_side_chat_direct_provider(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    side_chat_id: String,
+    expected_generation: String,
+    expected_draft_revision: String,
+    expected_config_generation: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        ensure_manual_ai_connection(controller)?;
+        let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat owner: {error}"))
+        })?;
+        validate_side_chat_config_owner(
+            owner_session_id,
+            &expected_config_generation,
+            controller.state.app_state.current_session_id,
+            controller.state.provider_config.config_generation,
+        )?;
+        let side_chat_id = side_chat_id
+            .parse::<crate::storage::SideChatId>()
+            .map_err(|error| {
+                DesktopCommandConflict::new(format!("invalid side chat id: {error}"))
+            })?;
+        let expected_generation = parse_canonical_owner_generation(&expected_generation)?;
+        let expected_draft_revision = parse_canonical_owner_generation(&expected_draft_revision)?;
+        controller
+            .capture_side_chat_direct_provider(
+                owner_session_id,
+                side_chat_id,
+                expected_generation,
+                expected_draft_revision,
+            )
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SideChatCatalogRequestTarget {
     base_url: String,
     provider_profile: ProviderProfile,
+    api_key_env: Option<String>,
     config_generation: u64,
 }
 
@@ -1524,6 +2137,7 @@ struct SideChatCatalogModelProjection {
 struct SideChatCatalogProjection {
     base_url: String,
     provider_profile: String,
+    api_key_env: String,
     config_generation: String,
     models: Vec<SideChatCatalogModelProjection>,
 }
@@ -1533,11 +2147,13 @@ async fn load_side_chat_models(
     controller: State<'_, SharedController>,
     base_url: String,
     provider_profile: String,
+    api_key_env: String,
     expected_config_generation: String,
 ) -> Result<SideChatCatalogProjection, DesktopCommandError> {
     let (target, probe_config) = {
         let mut controller = controller.lock().await;
         controller.drain_runtime_messages();
+        ensure_manual_ai_connection(&controller).map_err(read_only_command_conflict_error)?;
         validate_side_chat_global_config_target(
             &expected_config_generation,
             controller.state.provider_config.config_generation,
@@ -1549,11 +2165,13 @@ async fn load_side_chat_models(
             controller.state.provider_config.effective_config.clone(),
             &base_url,
             provider_profile,
+            &api_key_env,
         )
         .map_err(read_only_command_conflict_error)?;
         let target = SideChatCatalogRequestTarget {
             base_url: canonical_base_url,
             provider_profile,
+            api_key_env: probe_config.model.api_key_env.clone(),
             config_generation: controller.state.provider_config.config_generation,
         };
         (target, probe_config)
@@ -1581,6 +2199,7 @@ async fn load_side_chat_models(
     Ok(SideChatCatalogProjection {
         base_url: target.base_url,
         provider_profile: target.provider_profile.as_str().to_string(),
+        api_key_env: target.api_key_env.unwrap_or_default(),
         config_generation: target.config_generation.to_string(),
         models,
     })
@@ -1640,6 +2259,7 @@ fn side_chat_catalog_probe_config(
     mut config: ResolvedConfig,
     base_url: &str,
     provider_profile: ProviderProfile,
+    api_key_env: &str,
 ) -> Result<(ResolvedConfig, String), DesktopCommandConflict> {
     let canonical_base_url = ProviderEndpoint::parse(base_url)
         .map_err(|error| DesktopCommandConflict::new(error.to_string()))?
@@ -1652,14 +2272,14 @@ fn side_chat_catalog_probe_config(
     config.model.connect_timeout_ms = config.side_chat.connect_timeout_ms;
     config.model.max_retries = config.side_chat.max_retries;
     config.model.context_window = config.side_chat.context_window;
+    config.model.compaction_budget_tokens = None;
     config.model.system_prompt.clear();
     config.model.supports_tools = false;
     config.model.supports_images = false;
     config.model.parallel_tool_calls = false;
 
-    // Side Chat has no credential surface and must never inherit the main
-    // provider's authentication material or generation-body customization.
-    config.model.api_key_env = None;
+    // A catalog request owns its explicit Side reference, never Main's secret.
+    config.model.api_key_env = canonical_provider_api_key_env_input(api_key_env)?;
     config.model.extra_headers.clear();
     config.model.chat_completions_reasoning_parameters = None;
     config.model.reasoning_effort = None;
@@ -2615,9 +3235,29 @@ async fn unarchive_session(
 #[tauri::command]
 async fn rollback_session(
     controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::Session,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let session_id =
+            validated_session_id(&controller, index).map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), session_id)
+    };
+    guard_origin_chat_deletion(&app, &service, session_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -2770,6 +3410,25 @@ async fn delete_project(
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, project_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::Project,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let project_id =
+            validated_project_id(&controller, index).map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), project_id)
+    };
+    guard_origin_project_deletion(&app, project_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -2789,12 +3448,72 @@ async fn delete_project(
     .await
 }
 
+async fn guard_origin_project_deletion(app: &App, project_id: ProjectId) -> Result<(), String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("プロジェクトの会話を確認できません: {error}"))?;
+        runtime
+            .block_on(
+                app.session_service
+                    .guard_origin_project_history_mutation(project_id),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("プロジェクトの会話を確認できません: {error}"))?
+}
+
+async fn guard_origin_chat_deletion(
+    app: &App,
+    _service: &DeviceNetworkService,
+    session_id: SessionId,
+) -> Result<(), String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("会話の履歴を確認できません: {error}"))?;
+        runtime
+            .block_on(
+                app.session_service
+                    .guard_origin_history_mutation(session_id),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("会話の履歴を確認できません: {error}"))?
+}
+
 #[tauri::command]
 async fn delete_session(
     controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::Session,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let session_id =
+            validated_session_id(&controller, index).map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), session_id)
+    };
+    guard_origin_chat_deletion(&app, &service, session_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -2814,9 +3533,29 @@ async fn delete_session(
 #[tauri::command]
 async fn delete_chat_session(
     controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    let (app, session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_indexed_row_mutation_target(
+            &controller,
+            &expected_target,
+            DesktopRowCollection::QuickChatSession,
+            index,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let session_id = validated_quick_chat_session_id(&controller, index)
+            .map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), session_id)
+    };
+    guard_origin_chat_deletion(&app, &service, session_id)
+        .await
+        .map_err(|message| {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        })?;
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
             controller,
@@ -3127,6 +3866,1166 @@ async fn show_config_editor(
 }
 
 #[tauri::command]
+async fn show_shared_work(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "Shared work")?;
+        if !controller.state.show_shared_work() {
+            return Err(rejected_action(
+                controller,
+                "Shared work could not be opened",
+            ));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn shared_work_projection(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::SharedWorkProjection, String> {
+    Ok(service.shared_work_projection())
+}
+
+#[tauri::command]
+async fn shared_work_command(
+    service: State<'_, DeviceNetworkService>,
+    expected_generation: String,
+    request: crate::device_network::SharedWorkCommand,
+) -> Result<crate::device_network::SharedWorkProjection, String> {
+    Ok(service
+        .shared_work_command(&expected_generation, request)
+        .await)
+}
+
+#[tauri::command]
+async fn browse_shared_project_folder() -> Result<Option<String>, String> {
+    let selected = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("このPCで使うプロジェクトのフォルダーを選択")
+            .pick_folder()
+    })
+    .await
+    .map_err(|_| "フォルダーを選択できません。".to_string())?;
+    selected
+        .map(|path| {
+            camino::Utf8PathBuf::from_path_buf(path)
+                .map(|path| path.to_string())
+                .map_err(|_| "フォルダーのパスを読み取れません。".to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
+async fn show_hub_editor(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "Hub connection editor")?;
+        controller.state.show_hub_editor();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn device_execution_projection(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::DeviceExecutionProjection, String> {
+    Ok(service.execution_projection())
+}
+
+#[tauri::command]
+async fn device_execution_command(
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    request: crate::device_network::DeviceExecutionCommand,
+) -> Result<crate::device_network::DeviceExecutionProjection, String> {
+    Ok(service.execution_command(&expected_revision, request).await)
+}
+
+#[tauri::command]
+async fn receiver_activity_projection(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::ReceiverActivityProjection, String> {
+    Ok(service.receiver_activity_projection())
+}
+
+#[tauri::command]
+async fn receiver_activity_stop(
+    service: State<'_, DeviceNetworkService>,
+    target: crate::device_network::ReceiverStopTarget,
+) -> Result<crate::device_network::ReceiverActivityProjection, String> {
+    service.stop_receiver_attempt(target).await
+}
+
+#[tauri::command]
+async fn receiver_service_stop(
+    service: State<'_, DeviceNetworkService>,
+    target: crate::device_network::ReceiverServiceStopTarget,
+) -> Result<crate::device_network::ReceiverActivityProjection, String> {
+    service.stop_receiver_service(target).await
+}
+
+async fn validate_current_origin(
+    controller: &SharedController,
+    expected_target: &DesktopDraftActionTarget,
+) -> Result<String, String> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_draft_action_target(&controller, expected_target)
+        .map_err(|conflict| conflict.message)?;
+    let origin = expected_target
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "先に会話を開いてください。".to_string())?;
+    let parsed = origin
+        .parse::<SessionId>()
+        .map_err(|_| "会話の識別子を確認できません。".to_string())?;
+    if parsed.to_string() != origin {
+        return Err("会話の識別子を確認できません。".into());
+    }
+    Ok(origin.to_owned())
+}
+
+fn origin_full_stop_revision(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| *revision > 0 && revision.to_string() == value)
+        .ok_or_else(|| "会話の実行状態を確認できません。更新してください。".to_string())
+}
+
+fn origin_full_stop_local_target(
+    can_cancel_run: bool,
+    current: Option<&DesktopStopMutationTarget>,
+    expected: Option<&DesktopStopMutationTarget>,
+) -> Result<Option<DesktopStopMutationTarget>, String> {
+    if !can_cancel_run {
+        return Ok(None);
+    }
+    let expected = expected
+        .ok_or_else(|| "実行状態が変わりました。更新してから停止してください。".to_string())?;
+    if current != Some(expected) {
+        return Err("実行状態が変わりました。更新してから停止してください。".into());
+    }
+    Ok(Some(expected.clone()))
+}
+
+#[tauri::command]
+async fn origin_work_projection(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<crate::device_network::OriginWorkProjection, String> {
+    let origin = validate_current_origin(&controller, &expected_target).await?;
+    let projection = service.origin_work(&origin).await?;
+    validate_current_origin(&controller, &expected_target).await?;
+    Ok(projection)
+}
+
+fn origin_app_stop_targets(
+    projection: &crate::device_network::OriginWorkProjection,
+    expected_service_ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    use std::collections::BTreeSet;
+    if expected_service_ids.is_empty() || expected_service_ids.len() > 4096 {
+        return Err("停止対象のアプリを確認できません。更新してください。".into());
+    }
+    let expected: BTreeSet<_> = expected_service_ids.iter().collect();
+    let current: BTreeSet<_> = projection
+        .retained_services
+        .iter()
+        .map(|row| &row.service.service_id)
+        .collect();
+    if expected.len() != expected_service_ids.len() || expected != current {
+        return Err("アプリの状態が変わりました。更新してから停止してください。".into());
+    }
+    let mut conversations = BTreeSet::new();
+    for row in &projection.retained_services {
+        if !row.service.can_stop || row.service.uncertain {
+            return Err("停止できないアプリがあります。状態と権限を確認してください。".into());
+        }
+        if !row.service.stop_requested {
+            conversations.insert((row.project_id.clone(), row.service.conversation_id.clone()));
+        }
+    }
+    if conversations.is_empty() {
+        return Err("停止を要求できるアプリはありません。状態を更新してください。".into());
+    }
+    Ok(conversations.into_iter().collect())
+}
+
+#[tauri::command]
+async fn origin_work_stop_apps(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_target: DesktopDraftActionTarget,
+    expected_service_ids: Vec<String>,
+) -> Result<crate::device_network::OriginWorkProjection, String> {
+    let origin = validate_current_origin(&controller, &expected_target).await?;
+    let projection = service.origin_work(&origin).await?;
+    validate_current_origin(&controller, &expected_target).await?;
+    let conversations = origin_app_stop_targets(&projection, &expected_service_ids)?;
+    for (project_id, conversation_id) in conversations {
+        validate_current_origin(&controller, &expected_target).await?;
+        service
+            .agent_stop_conversation(
+                &ulid::Ulid::new().to_string(),
+                &project_id,
+                &conversation_id,
+                || Ok(()),
+            )
+            .await?;
+    }
+    validate_current_origin(&controller, &expected_target).await?;
+    service.origin_work(&origin).await
+}
+
+#[tauri::command]
+async fn origin_work_stop_all(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_target: DesktopDraftActionTarget,
+    expected_admission_revision: String,
+    expected_stop_target: Option<DesktopStopMutationTarget>,
+) -> Result<crate::device_network::OriginWorkProjection, String> {
+    let revision = origin_full_stop_revision(&expected_admission_revision)?;
+    let origin = validate_current_origin(&controller, &expected_target).await?;
+    if service.origin_revision(&origin).await? != revision {
+        return Err("会話が更新されました。状態を確認してから停止してください。".into());
+    }
+    {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_draft_action_target(&controller, &expected_target)
+            .map_err(|conflict| conflict.message)?;
+        let view = controller.next_web_state()?;
+        let local_stop = origin_full_stop_local_target(
+            view.can_cancel_run,
+            view.stop_target.as_ref(),
+            expected_stop_target.as_ref(),
+        )?
+        .map(|stop_target| {
+            ensure_stop_mutation_target(&controller, &stop_target)
+                .map_err(|conflict| conflict.message)
+        })
+        .transpose()?;
+        // Keep the exact Desktop target locked from final validation through
+        // the durable remote receipt and local Stop admission.
+        if !service.queue_origin_conversation_stop(&origin, revision)? {
+            return Err(
+                "Hubへの接続情報を確認できません。接続を回復してから停止してください。".into(),
+            );
+        }
+        if let Some(admission) = local_stop {
+            apply_stop_admission(&mut controller, admission).map_err(|conflict| {
+                format!(
+                    "Hubへの停止要求は保存しました。現在の回答の停止は確認できません: {}",
+                    conflict.message
+                )
+            })?;
+        }
+    }
+    service.agent_retry_origin_turn_stops().await?;
+    service.origin_work(&origin).await
+}
+
+#[tauri::command]
+async fn show_mcp_history(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "MCP history")?;
+        if !controller.state.show_mcp_history() {
+            return Err(rejected_action(
+                controller,
+                "MCP history could not be opened",
+            ));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn mcp_history_list(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    offset: usize,
+    anchor: Option<String>,
+) -> Result<crate::remote_agent::McpHistoryPage, String> {
+    jobs.history_page(direction, offset, 20, anchor.as_deref())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_history_detail(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    id: String,
+) -> Result<crate::remote_agent::McpHistoryDetail, String> {
+    jobs.history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_history_export(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    gate: State<'_, McpHistoryExportGate>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let _pending = gate
+        .0
+        .try_lock()
+        .map_err(|_| "MCP履歴の保存先を選択中です。".to_string())?;
+    // Capture this exact task before opening the native dialog. A selection or
+    // runtime update cannot replace the document being saved while it is open.
+    let detail = jobs
+        .history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let direction_name = match direction {
+        crate::remote_agent::McpHistoryDirection::Instruction => "instruction",
+        crate::remote_agent::McpHistoryDirection::Execution => "execution",
+    };
+    let file_name = format!("mcp-{direction_name}-{}.md", detail.row.id);
+    let selected = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("MCP履歴をMarkdownで保存")
+            .add_filter("Markdown", &["md"])
+            .set_file_name(file_name)
+            .save_file()
+    })
+    .await
+    .map_err(|_| "保存先を選択できません。".to_string())?;
+    let Some(selected) = selected else {
+        return Ok(serde_json::json!({"path":null}));
+    };
+    let destination = camino::Utf8PathBuf::from_path_buf(selected)
+        .map_err(|_| "保存先のパスをUTF-8で読み取れません。".to_string())?;
+    // Do not change the filename after the native overwrite confirmation.
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        return Err("保存先には拡張子 .md のファイル名を指定してください。".into());
+    }
+    let receipt = serde_json::json!({"path":destination});
+    tokio::task::spawn_blocking(move || {
+        super::app::write_markdown_export_atomic(&destination, &detail.markdown)
+    })
+    .await
+    .map_err(|_| "MCP履歴を保存できません。".to_string())??;
+    Ok(receipt)
+}
+
+#[tauri::command]
+async fn mcp_history_stop(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    service: State<'_, DeviceNetworkService>,
+    direction: crate::remote_agent::McpHistoryDirection,
+    id: String,
+) -> Result<crate::remote_agent::McpHistoryDetail, String> {
+    let detail = jobs
+        .history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !detail.row.can_stop {
+        return Err("この履歴のタスクは現在停止できません。".into());
+    }
+    match direction {
+        crate::remote_agent::McpHistoryDirection::Instruction => {
+            service
+                .cancel(&id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        crate::remote_agent::McpHistoryDirection::Execution => {
+            let profile = detail
+                .row
+                .profile_id
+                .parse::<ulid::Ulid>()
+                .map_err(|_| "実行履歴の公開対象を確認できません。".to_string())?;
+            let job = detail
+                .row
+                .id
+                .parse::<ulid::Ulid>()
+                .map_err(|_| "実行履歴のタスクを確認できません。".to_string())?;
+            jobs.cancel_job(PublishProfileId(profile), job)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    jobs.history_detail(direction, &id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn remote_job_cancel(
+    jobs: State<'_, crate::remote_agent::RemoteJobService>,
+    profile_id: PublishProfileId,
+    job_id: ulid::Ulid,
+) -> Result<crate::remote_agent::RemoteJobRow, String> {
+    jobs.cancel_job(profile_id, job_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_peer_projection(
+    controller: State<'_, SharedController>,
+) -> Result<serde_json::Value, String> {
+    let controller = controller.lock().await;
+    serde_json::to_value(super::mcp_peers::projection(
+        controller.state.global_config(),
+    ))
+    .map_err(|_| "接続一覧を表示できません。".into())
+}
+
+#[tauri::command]
+async fn device_network_projection(
+    service: State<'_, DeviceNetworkService>,
+    publish: State<'_, PublishService>,
+) -> Result<DeviceNetworkProjection, String> {
+    let _ = publish.refresh().await;
+    Ok(service.projection_now())
+}
+
+#[tauri::command]
+async fn device_network_refresh(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<DeviceNetworkProjection, String> {
+    service.refresh().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_join(
+    service: State<'_, DeviceNetworkService>,
+    code: String,
+    confirmed: bool,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .join(code, confirmed, &expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_request_join(
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .request_join(&expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_diagnose(
+    service: State<'_, DeviceNetworkService>,
+    scope: crate::device_network::DiagnosticScope,
+    device_id: Option<String>,
+    profile_id: Option<String>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<crate::device_network::DeviceDiagnostic, String> {
+    service
+        .diagnose(
+            scope,
+            device_id,
+            profile_id,
+            &expected_revision,
+            &expected_generation,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_artifacts(
+    service: State<'_, DeviceNetworkService>,
+    reference_id: String,
+    version: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let manifest = service
+        .artifacts(&reference_id, version.as_deref())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"reference_id":reference_id,"manifest":manifest}))
+}
+
+#[tauri::command]
+async fn device_network_export_artifacts(
+    service: State<'_, DeviceNetworkService>,
+    reference_id: String,
+    version: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let manifest = service
+        .cached_artifact_manifest(&reference_id, &version)
+        .map_err(|error| error.to_string())?;
+    let selected = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("成果物を書き出す親フォルダを選択")
+            .pick_folder()
+    })
+    .await
+    .map_err(|_| "保存先を選択できません。".to_string())?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let parent = camino::Utf8PathBuf::from_path_buf(selected)
+        .map_err(|_| "保存先のパスをUTF-8で読み取れません。".to_string())?;
+    let current = service
+        .cached_artifact_manifest(&reference_id, &version)
+        .map_err(|error| error.to_string())?;
+    if current != manifest {
+        return Err("artifacts_unavailable".into());
+    }
+    let directory = parent.join(format!(
+        "moyai-{}-{}",
+        manifest.job_id,
+        &manifest.version[..12]
+    ));
+    let destination = directory.clone();
+    let service = service.inner().clone();
+    let receipt = serde_json::json!({"reference_id":reference_id,"job_id":manifest.job_id,"version":version,"directory":directory});
+    tokio::task::spawn_blocking(move || {
+        service.export_artifacts(&reference_id, &version, &destination)
+    })
+    .await
+    .map_err(|_| "成果物の書き出しを完了できません。".to_string())??;
+    Ok(Some(receipt))
+}
+
+#[tauri::command]
+async fn device_network_receiver(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    enabled: bool,
+    target: crate::mcp_publish::PublishTarget,
+    access_mode: crate::config::AccessMode,
+    model_mode: crate::hub::HubRouteMode,
+    confirmed: bool,
+    start_on_launch: bool,
+    keep_when_hidden: bool,
+    bind_ip: Option<std::net::Ipv4Addr>,
+    port: Option<u16>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    let config = controller.lock().await.state.global_config().clone();
+    service.update_runtime_config(config);
+    service
+        .receiver_with_bind(
+            enabled,
+            target,
+            access_mode,
+            model_mode,
+            confirmed,
+            start_on_launch,
+            keep_when_hidden,
+            crate::device_network::ReceiverBindSettings { bind_ip, port },
+            &expected_revision,
+            &expected_generation,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_select(
+    service: State<'_, DeviceNetworkService>,
+    device_id: String,
+    profile_id: String,
+    enabled: bool,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .select(
+            device_id,
+            profile_id,
+            enabled,
+            &expected_revision,
+            &expected_generation,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_leave(
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    service
+        .leave(&expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_reset(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+    confirmed: bool,
+) -> Result<DeviceNetworkProjection, String> {
+    if !confirmed {
+        return Err("confirmation_required".into());
+    }
+    let prepared = service
+        .prepare_reset(&expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let mut persist_error = None;
+    let result = service
+        .reset_local_prepared(prepared, |empty| {
+            controller
+                .save_device_network_config(empty, false)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    if let Some(error) = persist_error {
+        return Err(error);
+    }
+    let mut projection = result.map_err(|error| error.to_string())?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    drop(controller);
+    if crate::runner::operations::remove_autostart_after_reset().is_err() {
+        projection.error = Some("reset_autostart_unconfirmed".into());
+    }
+    Ok(projection)
+}
+
+#[tauri::command]
+async fn device_network_jobs(
+    service: State<'_, DeviceNetworkService>,
+) -> Result<crate::device_network::DeviceNetworkJobs, String> {
+    service.jobs().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn device_network_cancel(
+    service: State<'_, DeviceNetworkService>,
+    reference_id: String,
+) -> Result<crate::device_network::DeviceDelegationRow, String> {
+    service
+        .cancel(&reference_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn pick_shared_hub_config(
+    start: camino::Utf8PathBuf,
+) -> Result<Option<SharedHubConfig>, String> {
+    tokio::task::spawn_blocking(move || {
+        let selected = rfd::FileDialog::new()
+            .set_title("Hubの接続ファイルを選択")
+            .add_filter("moyAI Hub connection", &["moyai-join", "toml"])
+            .set_directory(start.as_std_path())
+            .pick_file()
+            .map(camino::Utf8PathBuf::from_path_buf)
+            .transpose()
+            .map_err(|_| "invalid_configuration".to_string())?;
+        selected
+            .map(|path| {
+                let text = crate::config::loader::read_toml_utf8_bounded(&path)
+                    .map_err(|_| "invalid_configuration".to_string())?;
+                SharedHubConfig::import(&text).map_err(|error| error.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|_| "storage_error".to_string())?
+}
+
+async fn confirm_registered_endpoint_change(
+    shared: &SharedHubConfig,
+    current: &SharedHubConfig,
+    registered: bool,
+) -> Result<bool, String> {
+    if !registered || shared == current {
+        return Ok(true);
+    }
+    let review = super::join_config::review_text(shared, current, true)?;
+    Ok(rfd::AsyncMessageDialog::new()
+        .set_title("moyAI: 登録済みHubの接続先変更")
+        .set_description(review)
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show()
+        .await
+        == rfd::MessageDialogResult::Ok)
+}
+
+#[tauri::command]
+async fn device_network_import(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_revision: String,
+    expected_generation: String,
+) -> Result<DeviceNetworkProjection, String> {
+    let (start, target, current, registered, initial_setup_generation) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
+            .map_err(|_| "connection_changed")?;
+        service
+            .check_target(&expected_revision, &expected_generation)
+            .map_err(|error| error.to_string())?;
+        let target = DesktopConfigMutationTarget {
+            workspace_path: controller.app.workspace.authority_root().to_string(),
+            session_id: controller
+                .state
+                .app_state
+                .current_session_id
+                .map(|id| id.to_string()),
+            config_generation: controller
+                .state
+                .provider_config
+                .config_generation
+                .to_string(),
+        };
+        (
+            controller.app.workspace.root.clone(),
+            target,
+            controller.state.global_config().device_network.clone(),
+            service.projection_now().device_id.is_some(),
+            hub_import_completes_initial_setup(
+                controller.state.startup.requires_initial_setup(),
+                controller.state.view.overlay,
+                controller.state.view.hub_project_open,
+                controller.state.startup.onboarding_intent,
+            )
+            .then_some(controller.state.startup.setup_generation),
+        )
+    };
+    let Some(shared) = pick_shared_hub_config(start).await? else {
+        return Ok(service.projection_now());
+    };
+    if !confirm_registered_endpoint_change(&shared, &current, registered).await? {
+        return Ok(service.projection_now());
+    }
+    let prepared = service
+        .prepare_configuration(shared, &expected_revision, &expected_generation)
+        .await
+        .map_err(|error| error.to_string())?;
+    let endpoint_changed = prepared.endpoint_changed();
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let changed = if endpoint_changed {
+        "endpoint_change_not_saved"
+    } else {
+        "connection_changed"
+    };
+    ensure_config_mutation_target(&controller, &target).map_err(|_| changed)?;
+    if initial_setup_generation.is_some_and(|generation| {
+        generation != controller.state.startup.setup_generation
+            || !hub_import_completes_initial_setup(
+                controller.state.startup.requires_initial_setup(),
+                controller.state.view.overlay,
+                controller.state.view.hub_project_open,
+                controller.state.startup.onboarding_intent,
+            )
+    }) {
+        return Err(changed.into());
+    }
+    ensure_unscoped_prompt_review_action(&mut controller, "Hub common configuration")
+        .map_err(|_| changed)?;
+    service
+        .check_target(&expected_revision, &expected_generation)
+        .map_err(|error| {
+            if endpoint_changed {
+                "endpoint_change_not_saved".into()
+            } else {
+                error.to_string()
+            }
+        })?;
+    let mut persist_error = None;
+    let result = service
+        .commit_configuration(prepared, |saved| {
+            controller
+                .save_device_network_config(saved, initial_setup_generation.is_some())
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    if let Some(error) = persist_error {
+        if endpoint_changed {
+            return Err("endpoint_change_not_saved".into());
+        }
+        return Err(error);
+    }
+    let result = result.map_err(|error| {
+        if endpoint_changed {
+            "endpoint_change_not_saved".into()
+        } else {
+            error.to_string()
+        }
+    })?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    let return_to_shared_work = controller.state.view.hub_project_open
+        && controller.state.view.overlay == DesktopOverlay::None;
+    let completion_error = if initial_setup_generation.is_some() {
+        let result = controller.finish_initial_setup_after_device_network_persist();
+        if result.is_ok() {
+            if return_to_shared_work {
+                controller.state.show_shared_work();
+            }
+            service.enable_default_model_on_join();
+        }
+        result.err()
+    } else {
+        None
+    };
+    drop(controller);
+    if endpoint_changed {
+        service.reconnect_model_after_endpoint_change().await;
+    }
+    let joined = service
+        .request_join(&result.revision, &result.generation)
+        .await
+        .map_err(|error| error.to_string());
+    if completion_error.is_some() {
+        return Err("接続情報は保存済みです。初回設定の完了状態を保存できませんでした。設定の保存先を確認し、同じ接続ファイルを読み込み直してください。".into());
+    }
+    joined
+}
+
+fn hub_import_completes_initial_setup(
+    required: bool,
+    overlay: DesktopOverlay,
+    hub_project_open: bool,
+    intent: Option<super::preferences::DesktopOnboardingIntent>,
+) -> bool {
+    use super::preferences::DesktopOnboardingIntent::{Execution, Team};
+    required
+        && match intent {
+            Some(Execution) => overlay == DesktopOverlay::HubConnection,
+            Some(Team) => {
+                overlay == DesktopOverlay::HubConnection
+                    || (overlay == DesktopOverlay::None && hub_project_open)
+            }
+            _ => false,
+        }
+}
+
+#[tauri::command]
+async fn device_network_initial_setup_import(
+    controller: State<'_, SharedController>,
+    service: State<'_, DeviceNetworkService>,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+    expected_config_target: DesktopConfigMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let shared_controller = controller.inner().clone();
+    let before = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+            .and_then(|()| ensure_config_mutation_target(&controller, &expected_config_target))
+            .and_then(|()| ensure_config_draft_commit_admission(&controller))
+            .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+        service.projection_now()
+    };
+    let current = {
+        controller
+            .lock()
+            .await
+            .state
+            .global_config()
+            .device_network
+            .clone()
+    };
+    let loaded = pick_shared_hub_config(camino::Utf8PathBuf::from(
+        &expected_setup_target.workspace_path,
+    ))
+    .await;
+    let prepared = match loaded {
+        Ok(Some(shared)) => {
+            match confirm_registered_endpoint_change(&shared, &current, before.device_id.is_some())
+                .await
+            {
+                Ok(true) => Some(
+                    service
+                        .prepare_configuration(shared, &before.revision, &before.generation)
+                        .await
+                        .map_err(|error| {
+                            super::join_config::configuration_error(error).to_string()
+                        }),
+                ),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    };
+    let endpoint_changed = prepared
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|value| value.endpoint_changed());
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+        .and_then(|()| ensure_config_mutation_target(&controller, &expected_config_target))
+        .and_then(|()| ensure_config_draft_commit_admission(&controller))
+        .map_err(|conflict| {
+            command_conflict_error(
+                &mut controller,
+                if endpoint_changed {
+                    DesktopCommandConflict::new(super::join_config::ENDPOINT_NOT_SAVED)
+                } else {
+                    conflict
+                },
+            )
+        })?;
+    let Some(prepared) = prepared else {
+        return controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal);
+    };
+    let prepared = prepared.map_err(|error| {
+        command_conflict_error(&mut controller, DesktopCommandConflict::new(error))
+    })?;
+    let mut persist_error = None;
+    let result = service
+        .commit_configuration(prepared, |saved| {
+            controller
+                .save_device_network_config(saved, true)
+                .map_err(|error| {
+                    persist_error = Some(error);
+                    crate::device_network::DeviceError::Storage
+                })
+        })
+        .await;
+    let outcome = persist_error.map_or_else(
+        || result.map(|_| ()).map_err(|error| error.to_string()),
+        Err,
+    );
+    outcome.map_err(|error| {
+        command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::new(if endpoint_changed {
+                super::join_config::ENDPOINT_NOT_SAVED.into()
+            } else {
+                error
+            }),
+        )
+    })?;
+    service.update_runtime_config(controller.state.global_config().clone());
+    let completion_error = controller
+        .finish_initial_setup_after_device_network_persist()
+        .err();
+    service.enable_default_model_on_join();
+    let target = service.projection_now();
+    drop(controller);
+    if endpoint_changed {
+        service.reconnect_model_after_endpoint_change().await;
+    }
+    let _ = service
+        .request_join(&target.revision, &target.generation)
+        .await;
+    let mut controller = shared_controller.lock().await;
+    if completion_error.is_some() {
+        return Err(command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::with_status(
+                DesktopStatusCode::InitialSetupPreferencesSaveFailed,
+                "接続情報は保存済みです。初回設定の完了状態を保存できませんでした。設定の保存先を確認し、同じ接続ファイルを読み込み直してください。実行受付は自動再開しません。",
+            ),
+        ));
+    }
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
+}
+
+#[tauri::command]
+async fn mcp_peer_add(
+    controller: State<'_, SharedController>,
+    peer: super::mcp_peers::McpPeerDraft,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<(DesktopWebState, bool), DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_config_mutation_target(&controller, &expected_target)
+        .and_then(|()| ensure_config_draft_commit_admission(&controller))
+        .map_err(|error| command_conflict_error(&mut controller, error))?;
+    // Invalid form values do not invalidate the UI owner or require a replacement
+    // projection. Keep the editable draft and report the failure in its form.
+    let config = super::mcp_peers::add(controller.state.global_config(), peer)
+        .map_err(DesktopCommandError::internal)?;
+    let servers = serde_json::to_string(&config.mcp.servers)
+        .map_err(|error| DesktopCommandError::internal(error.to_string()))?;
+    let saved = controller.save_global_config(vec![
+        ("mcp.enabled".into(), "true".into()),
+        ("mcp.servers_json".into(), servers),
+    ]);
+    controller.drain_runtime_messages();
+    Ok((
+        controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        saved,
+    ))
+}
+
+#[tauri::command]
+async fn mcp_peer_remove(
+    controller: State<'_, SharedController>,
+    id: String,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<(DesktopWebState, bool), DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    ensure_config_mutation_target(&controller, &expected_target)
+        .and_then(|()| ensure_config_draft_commit_admission(&controller))
+        .map_err(|error| command_conflict_error(&mut controller, error))?;
+    let config = super::mcp_peers::remove(controller.state.global_config(), &id)
+        .map_err(DesktopCommandError::internal)?;
+    let servers = serde_json::to_string(&config.mcp.servers)
+        .map_err(|error| DesktopCommandError::internal(error.to_string()))?;
+    let saved = controller.save_global_config(vec![("mcp.servers_json".into(), servers)]);
+    controller.drain_runtime_messages();
+    Ok((
+        controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        saved,
+    ))
+}
+
+#[tauri::command]
+async fn mcp_peer_check(
+    controller: State<'_, SharedController>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let config = controller.lock().await.state.global_config().clone();
+    let result = super::mcp_peers::check(&config, &id).await?;
+    serde_json::to_value(result).map_err(|_| "接続結果を表示できません。".into())
+}
+
+#[tauri::command]
+async fn hub_projection(
+    connection: State<'_, HubConnection>,
+) -> Result<HubConnectionProjection, String> {
+    Ok(connection.projection().await)
+}
+
+#[tauri::command]
+async fn hub_connect(
+    connection: State<'_, HubConnection>,
+    endpoint: String,
+    token: String,
+    label: String,
+    expected_settings_revision: String,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .connect(
+            endpoint,
+            token,
+            label,
+            expected_settings_revision,
+            expected_connection_generation,
+        )
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_refresh(
+    connection: State<'_, HubConnection>,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .refresh(expected_connection_generation)
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_save_review(
+    connection: State<'_, HubConnection>,
+    context: HubReviewContext,
+    selection: HubSelection,
+    expected_hub_id: String,
+    expected_catalog_revision: CatalogRevision,
+    expected_settings_revision: String,
+    expected_connection_generation: String,
+    use_hub_default: Option<bool>,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .save_review_with_source(
+            context,
+            selection,
+            expected_hub_id,
+            expected_catalog_revision,
+            expected_settings_revision,
+            expected_connection_generation,
+            use_hub_default.unwrap_or(false),
+        )
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_disconnect(
+    connection: State<'_, HubConnection>,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    connection
+        .disconnect(expected_connection_generation)
+        .await
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
+async fn hub_set_route_mode(
+    controller: State<'_, SharedController>,
+    connection: State<'_, HubConnection>,
+    context: HubReviewContext,
+    mode: crate::hub::HubRouteMode,
+    expected_settings_revision: String,
+    expected_connection_generation: String,
+) -> Result<HubConnectionProjection, String> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if controller.hub_context_active(context) {
+        return Err("route_busy".into());
+    }
+    connection
+        .set_route_mode_now(
+            context,
+            mode,
+            expected_settings_revision,
+            expected_connection_generation,
+        )
+        .map_err(|error| error.code().to_string())
+}
+
+#[tauri::command]
 async fn show_session_settings(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
@@ -3149,7 +5048,7 @@ async fn show_provider_editor(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_unscoped_prompt_review_action(controller, "provider editor")?;
-        controller.state.show_provider_editor();
+        controller.state.show_config_editor();
         Ok(())
     })
     .await
@@ -3251,7 +5150,7 @@ async fn browse_workspace(
         return Err(command_conflict_error(&mut controller, conflict));
     }
     if let Some(path) = selected {
-        controller.state.set_workspace_input(path.to_string());
+        controller.state.show_workspace_picker(path.as_str());
     }
     controller
         .next_web_state()
@@ -3291,6 +5190,9 @@ async fn import_global_config_toml(
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_manual_ai_connection(&controller) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     if let Err(conflict) =
         ensure_unscoped_prompt_review_action(&mut controller, "configuration import")
     {
@@ -3498,7 +5400,8 @@ async fn insert_command(
 struct DesktopProviderActionInput {
     base_url: String,
     provider_profile: String,
-    api_key_env: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
     context_window: String,
     selected_model_id: String,
 }
@@ -3534,6 +5437,7 @@ fn accept_provider_action_input(
     controller: &mut DesktopController,
     mut input: DesktopProviderActionInput,
 ) -> Result<(), DesktopCommandConflict> {
+    ensure_manual_ai_connection(controller)?;
     input.base_url = match crate::config::ProviderEndpoint::parse(&input.base_url) {
         Ok(endpoint) => endpoint.as_str().to_string(),
         Err(error) => {
@@ -3551,11 +5455,22 @@ fn accept_provider_action_input(
                 .set_status_message("the provider connection type is invalid");
             rejected_action(controller, &error.message)
         })?;
-    let api_key_env =
-        canonical_provider_api_key_env_input(&input.api_key_env).map_err(|error| {
-            controller.state.set_status_message(error.message.clone());
-            error
-        })?;
+    let connection_changed = crate::llm::normalize_provider_base_url(&input.base_url)
+        != crate::llm::normalize_provider_base_url(
+            &controller.state.provider_config.provider_base_url_input,
+        )
+        || provider_profile != controller.state.provider_config.provider_profile_input;
+    let api_key_env = match input.api_key_env.as_deref() {
+        Some(value) => canonical_provider_api_key_env_input(value),
+        None if connection_changed => Ok(None),
+        None => canonical_provider_api_key_env_input(
+            &controller.state.provider_config.provider_api_key_env_input,
+        ),
+    }
+    .map_err(|error| {
+        controller.state.set_status_message(error.message.clone());
+        error
+    })?;
     controller.accept_provider_action_input(
         input.base_url,
         provider_profile,
@@ -3801,26 +5716,142 @@ fn validate_complete_config_draft(
     controller: &DesktopController,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    complete_config_draft_is_dirty(controller.state.global_config(), values)
+    validate_config_draft(controller, values, ConfigDraftShape::Snapshot)
+}
+
+fn validate_config_commit_draft(
+    controller: &DesktopController,
+    values: &[DesktopConfigValueInput],
+) -> Result<bool, DesktopCommandConflict> {
+    validate_config_draft(controller, values, ConfigDraftShape::Commit)
+}
+
+#[derive(Clone, Copy)]
+enum ConfigDraftShape {
+    Snapshot,
+    Commit,
+}
+
+fn validate_config_draft(
+    controller: &DesktopController,
+    values: &[DesktopConfigValueInput],
+    shape: ConfigDraftShape,
+) -> Result<bool, DesktopCommandConflict> {
+    let dirty = match shape {
+        ConfigDraftShape::Snapshot => {
+            complete_config_draft_is_dirty(controller.state.global_config(), values)?
+        }
+        ConfigDraftShape::Commit => {
+            config_draft_is_dirty(controller.state.global_config(), values, shape)?
+        }
+    };
+    validate_managed_ai_draft(
+        controller.state.global_config(),
+        values,
+        hub_manages_ai_connection(controller),
+    )?;
+    Ok(dirty)
+}
+
+const HUB_MANAGED_AI_SETTINGS: &str = "AIの接続先はHubから設定されています。モデルは「AIの接続」で選択してください。手動接続に戻す場合は接続設定をリセットしてください。";
+
+fn hub_manages_ai_connection(controller: &DesktopController) -> bool {
+    controller
+        .state
+        .device_network
+        .as_ref()
+        .is_some_and(|network| !network.projection_now().hub_url.trim().is_empty())
+}
+
+fn ensure_manual_ai_connection(
+    controller: &DesktopController,
+) -> Result<(), DesktopCommandConflict> {
+    if hub_manages_ai_connection(controller) {
+        return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
+    }
+    Ok(())
+}
+
+fn validate_managed_ai_draft(
+    config: &crate::config::ResolvedConfig,
+    values: &[DesktopConfigValueInput],
+    managed: bool,
+) -> Result<(), DesktopCommandConflict> {
+    if !managed {
+        return Ok(());
+    }
+    let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+        config,
+        values
+            .iter()
+            .map(|value| (value.key.clone(), value.text.clone()))
+            .collect(),
+    )
+    .map_err(DesktopCommandConflict::new)?;
+    use crate::config::ConfigField;
+    if editor.fields.iter().any(|field| {
+        field.dirty
+            && matches!(
+                field.key,
+                ConfigField::BaseUrl
+                    | ConfigField::Model
+                    | ConfigField::ProviderProfile
+                    | ConfigField::ApiKeyEnv
+                    | ConfigField::ExtraHeadersJson
+                    | ConfigField::SideChatBaseUrl
+                    | ConfigField::SideChatModel
+                    | ConfigField::SideChatProviderProfile
+                    | ConfigField::SideChatApiKeyEnv
+                    | ConfigField::ApproveBaseUrl
+                    | ConfigField::ApproveModel
+                    | ConfigField::ApproveProviderProfile
+                    | ConfigField::ApproveApiKeyEnv
+            )
+    }) {
+        return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
+    }
+    Ok(())
 }
 
 fn complete_config_draft_is_dirty(
     effective_config: &crate::config::ResolvedConfig,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    let expected_field_count = crate::config::ConfigField::ALL
+    config_draft_is_dirty(effective_config, values, ConfigDraftShape::Snapshot)
+}
+
+fn config_draft_is_dirty(
+    effective_config: &crate::config::ResolvedConfig,
+    values: &[DesktopConfigValueInput],
+    shape: ConfigDraftShape,
+) -> Result<bool, DesktopCommandConflict> {
+    let mut seen = std::collections::BTreeSet::new();
+    let current_fields = crate::config::ConfigField::ALL
         .into_iter()
         .filter(|field| !field.is_host_owned_generation())
-        .count();
+        .collect::<Vec<_>>();
     let contains_only_current_gui_fields = values.iter().all(|value| {
-        crate::config::ConfigField::ALL
-            .into_iter()
-            .any(|field| !field.is_host_owned_generation() && field.label() == value.key.as_str())
+        seen.insert(value.key.as_str())
+            && current_fields
+                .iter()
+                .any(|field| field.label() == value.key.as_str())
     });
-    if values.len() != expected_field_count || !contains_only_current_gui_fields {
-        return Err(DesktopCommandConflict::new(
-            "the complete settings draft must accompany the configuration owner target",
-        ));
+    // Commits distinguish untouched credentials from an explicit grant to a
+    // changed connection. Snapshots still contain the complete browser draft.
+    let includes_required_fields = current_fields.iter().all(|field| {
+        (matches!(shape, ConfigDraftShape::Commit)
+            && (field.is_approve() || field.is_connection_private_value()))
+            || seen.contains(field.label())
+    });
+    if !contains_only_current_gui_fields || !includes_required_fields {
+        return Err(DesktopCommandConflict::new(match shape {
+            ConfigDraftShape::Snapshot => {
+                "the complete settings draft must accompany the configuration owner target"
+            }
+            ConfigDraftShape::Commit => {
+                "the settings commit must include every ordinary GUI field and only current GUI fields"
+            }
+        }));
     }
     let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
         effective_config,
@@ -3830,6 +5861,20 @@ fn complete_config_draft_is_dirty(
             .collect(),
     )
     .map_err(DesktopCommandConflict::new)?;
+    if matches!(shape, ConfigDraftShape::Commit) {
+        let approve_values = editor
+            .fields
+            .iter()
+            .filter(|field| field.key.is_approve() && seen.contains(field.key.label()))
+            .map(|field| (field.key, field.value.as_str()))
+            .collect::<Vec<_>>();
+        // Initial-setup imports hydrate private fields in the commit owner.
+        // Validate the optional role patch without resolving that public snapshot early.
+        crate::config::field::validate_complete_config_field_values(&approve_values)
+            .map_err(DesktopCommandConflict::new)?;
+        crate::config::field::parse_config_field_patch(&approve_values)
+            .map_err(DesktopCommandConflict::new)?;
+    }
     Ok(editor.fields.iter().any(|field| field.dirty))
 }
 
@@ -4224,14 +6269,22 @@ fn build_session_settings_patch(
     };
     let context_window =
         parse_optional_session_settings_u32("context window", &input.context_window, true)?;
-    Ok(session_settings_patch_for_values(
+    let (patch, changed) = session_settings_patch_for_values(
         session,
         base_url,
         model,
         provider_connection,
         input.access_mode,
         context_window,
-    ))
+    );
+    if hub_manages_ai_connection(controller)
+        && (patch.base_url.is_some()
+            || patch.model.is_some()
+            || patch.provider_connection.is_some())
+    {
+        return Err(DesktopCommandConflict::new(HUB_MANAGED_AI_SETTINGS));
+    }
+    Ok((patch, changed))
 }
 
 fn session_settings_storage_error(
@@ -4351,7 +6404,7 @@ async fn apply_session_config(
     if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+    if let Err(conflict) = validate_config_commit_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let applied = controller.apply_session_config(
@@ -4386,7 +6439,7 @@ async fn save_global_config(
     if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+    if let Err(conflict) = validate_config_commit_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let saved = controller.save_global_config(
@@ -4402,6 +6455,49 @@ async fn save_global_config(
             .map_err(DesktopCommandError::internal)?,
         saved,
     ))
+}
+
+#[tauri::command]
+async fn choose_initial_setup_purpose(
+    controller: State<'_, SharedController>,
+    purpose: super::preferences::DesktopOnboardingIntent,
+    expected_config_target: DesktopConfigMutationTarget,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    {
+        let mut owner = controller.lock().await;
+        owner.drain_runtime_messages();
+        ensure_unscoped_prompt_review_action(&mut owner, "initial setup purpose")
+            .and_then(|()| ensure_initial_setup_mutation_target(&owner, &expected_setup_target))
+            .and_then(|()| ensure_config_mutation_target(&owner, &expected_config_target))
+            .and_then(|()| ensure_config_draft_commit_admission(&owner))
+            .map_err(|conflict| command_conflict_error(&mut owner, conflict))?;
+        owner
+            .choose_initial_setup_purpose(purpose)
+            .map_err(DesktopCommandError::internal)?;
+        if purpose != super::preferences::DesktopOnboardingIntent::Hosting {
+            return owner
+                .next_web_state()
+                .map_err(DesktopCommandError::internal);
+        }
+    }
+    tokio::task::spawn_blocking(super::team_setup::launch_team_setup)
+        .await
+        .map_err(|error| DesktopCommandError::team_setup_unavailable(error.to_string()))?
+        .map_err(DesktopCommandError::team_setup_unavailable)?;
+    let mut owner = controller.lock().await;
+    owner.drain_runtime_messages();
+    if ensure_initial_setup_mutation_target(&owner, &expected_setup_target).is_ok()
+        && ensure_config_mutation_target(&owner, &expected_config_target).is_ok()
+        && owner.state.startup.onboarding_intent == Some(purpose)
+    {
+        owner.state.set_status_message(
+            "チーム管理画面を開きました。Hubの利用準備後、このPCもチームへ参加できます。",
+        );
+    }
+    owner
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 #[tauri::command]
@@ -4427,7 +6523,7 @@ async fn finish_initial_setup(
     if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+    if let Err(conflict) = validate_config_commit_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let import_generation =
@@ -4477,7 +6573,7 @@ async fn apply_session_settings(
         if patch.is_empty() {
             controller
                 .state
-                .set_status_message("session settings already match the saved root-session values");
+                .set_status_message("チャットの設定は保存済みの内容と同じです。");
             return Ok((
                 controller
                     .next_web_state()
@@ -4694,7 +6790,48 @@ async fn answer_permission(
     controller: State<'_, SharedController>,
     decision: ReviewDecision,
     confirmation_id: String,
+    remote_job_id: Option<String>,
+    remote_profile_id: Option<String>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    if remote_job_id.is_some() || remote_profile_id.is_some() {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let target = remote_job_id
+            .as_deref()
+            .and_then(|job| job.parse::<ulid::Ulid>().ok())
+            .zip(
+                remote_profile_id
+                    .as_deref()
+                    .and_then(|profile| profile.parse::<ulid::Ulid>().ok()),
+            )
+            .zip(confirmation_id.parse::<ulid::Ulid>().ok());
+        let resolved = target.is_some_and(|((job, profile), id)| {
+            controller
+                .state
+                .device_network
+                .as_ref()
+                .is_some_and(|network| {
+                    network.remote_jobs().answer_approval(
+                        id,
+                        job,
+                        crate::mcp_publish::PublishProfileId(profile),
+                        decision,
+                    )
+                })
+        });
+        return if resolved {
+            controller
+                .next_web_state()
+                .map_err(DesktopCommandError::internal)
+        } else {
+            Err(command_conflict_error(
+                &mut controller,
+                DesktopCommandConflict::new(
+                    "the receiver permission confirmation is no longer current",
+                ),
+            ))
+        };
+    }
     let confirmation_id = parse_permission_confirmation_id(&confirmation_id)
         .map_err(DesktopCommandError::internal)?;
     let mut controller = controller.lock().await;
@@ -4756,6 +6893,131 @@ mod tests {
 
     const TEST_ADMISSION_REVISION: u64 = 7;
 
+    #[test]
+    fn origin_full_stop_requires_canonical_revision_and_exact_live_local_target() {
+        let session_id = SessionId::new();
+        let exact = DesktopStopMutationTarget::Turn {
+            workspace_path: "C:/workspace".into(),
+            session_id: session_id.to_string(),
+            turn_id: TurnId::new().to_string(),
+            admission_revision: "7".into(),
+            root_epoch: "2".into(),
+        };
+        let different = DesktopStopMutationTarget::Turn {
+            workspace_path: "C:/workspace".into(),
+            session_id: session_id.to_string(),
+            turn_id: TurnId::new().to_string(),
+            admission_revision: "7".into(),
+            root_epoch: "2".into(),
+        };
+        assert_eq!(origin_full_stop_revision("7"), Ok(7));
+        for value in ["0", "07", "-1", "18446744073709551616"] {
+            assert!(origin_full_stop_revision(value).is_err());
+        }
+        assert!(origin_full_stop_local_target(true, Some(&exact), None).is_err());
+        assert!(origin_full_stop_local_target(true, Some(&exact), Some(&different)).is_err());
+        assert_eq!(
+            origin_full_stop_local_target(true, Some(&exact), Some(&exact)),
+            Ok(Some(exact.clone()))
+        );
+        assert_eq!(
+            origin_full_stop_local_target(false, None, Some(&different)),
+            Ok(None),
+            "a completed local turn must not block the exact remote Stop"
+        );
+    }
+
+    #[test]
+    fn first_use_hub_import_finishes_only_the_selected_team_or_execution_surface() {
+        use super::super::preferences::DesktopOnboardingIntent::{Execution, Personal, Team};
+
+        assert!(hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Execution)
+        ));
+        assert!(hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Team)
+        ));
+        assert!(hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::None,
+            true,
+            Some(Team)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Personal)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::InitialSetup,
+            false,
+            Some(Execution)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::None,
+            false,
+            Some(Team)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            true,
+            DesktopOverlay::None,
+            true,
+            Some(Execution)
+        ));
+        assert!(!hub_import_completes_initial_setup(
+            false,
+            DesktopOverlay::HubConnection,
+            false,
+            Some(Execution)
+        ));
+    }
+
+    #[test]
+    fn origin_app_stop_requires_the_exact_current_set_and_permission() {
+        let projection: crate::device_network::OriginWorkProjection = serde_json::from_value(
+            serde_json::json!({
+                "origin_session_ref":"local-session-a","jobs":[],"observed_at_ms":42,"admission_revision":"7",
+                "retained_services":[
+                    {"project_id":"project-a","service":{"service_id":"service-a",
+                        "conversation_id":"conversation-a","environment_id":"env-a",
+                        "expires_at_ms":100,"stop_requested":false,"uncertain":false,"can_stop":true}},
+                    {"project_id":"project-a","service":{"service_id":"service-b",
+                        "conversation_id":"conversation-a","environment_id":"env-a",
+                        "expires_at_ms":100,"stop_requested":false,"uncertain":false,"can_stop":true}}
+                ]
+            }),
+        )
+        .expect("typed origin projection");
+        let expected = vec!["service-b".to_string(), "service-a".to_string()];
+        assert_eq!(
+            origin_app_stop_targets(&projection, &expected).expect("exact target"),
+            vec![("project-a".into(), "conversation-a".into())]
+        );
+        assert!(origin_app_stop_targets(&projection, &["service-a".into()]).is_err());
+        assert!(
+            origin_app_stop_targets(&projection, &["service-a".into(), "service-a".into()])
+                .is_err()
+        );
+        let mut one_pending = projection.clone();
+        one_pending.retained_services[0].service.stop_requested = true;
+        assert_eq!(
+            origin_app_stop_targets(&one_pending, &expected).expect("other app still stoppable"),
+            vec![("project-a".into(), "conversation-a".into())]
+        );
+        let mut denied = projection;
+        denied.retained_services[1].service.can_stop = false;
+        assert!(origin_app_stop_targets(&denied, &expected).is_err());
+    }
+
     fn root_receipt(
         session_id: SessionId,
         turn_id: TurnId,
@@ -4801,6 +7063,23 @@ mod tests {
             frontend_name_set, backend_names,
             "frontend invoke guard and Tauri handler command names drifted"
         );
+    }
+
+    #[test]
+    fn retired_manual_publish_commands_cannot_be_invoked_but_remote_stop_and_history_remain() {
+        assert!(!DESKTOP_COMMAND_WIRE_NAMES.iter().any(|name| {
+            *name == "show_mcp_publish_editor" || name.starts_with("mcp_publish_")
+        }));
+        for name in [
+            "remote_job_cancel",
+            "device_network_receiver",
+            "mcp_history_list",
+            "mcp_history_detail",
+            "mcp_history_export",
+            "mcp_history_stop",
+        ] {
+            assert!(DESKTOP_COMMAND_WIRE_NAMES.contains(&name), "{name}");
+        }
     }
 
     #[test]
@@ -6832,6 +9111,349 @@ mod tests {
         assert!(complete_config_draft_is_dirty(&config, &values).is_err());
     }
 
+    fn config_commit_fixture_values(config: &ResolvedConfig) -> Vec<DesktopConfigValueInput> {
+        crate::tui::config_editor::ConfigEditorState::from_config(config)
+            .fields
+            .into_iter()
+            .filter(|field| !field.key.is_host_owned_generation() && !field.key.is_approve())
+            .map(|field| DesktopConfigValueInput {
+                key: field.key.label().into(),
+                text: field.value,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn config_commit_accepts_sparse_approve_without_weakening_complete_snapshots() {
+        let config = ResolvedConfig::default();
+        let values = config_commit_fixture_values(&config);
+        assert!(complete_config_draft_is_dirty(&config, &values).is_err());
+        assert!(!config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+        let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+            &config,
+            values
+                .iter()
+                .map(|value| (value.key.clone(), value.text.clone()))
+                .collect(),
+        )
+        .unwrap();
+        assert!(
+            editor
+                .build_resolved_config(&config)
+                .unwrap()
+                .approve
+                .is_none()
+        );
+
+        for field in crate::config::ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_approve())
+        {
+            let mut values = values.clone();
+            values.push(DesktopConfigValueInput {
+                key: field.label().into(),
+                text: field.editor_value(&config),
+            });
+            assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).is_ok());
+            assert!(complete_config_draft_is_dirty(&config, &values).is_err());
+        }
+        let mut values = values;
+        values.push(DesktopConfigValueInput {
+            key: "approve.model".into(),
+            text: "independent-judge".into(),
+        });
+        assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+        let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+            &config,
+            values
+                .into_iter()
+                .map(|value| (value.key, value.text))
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            editor
+                .build_resolved_config(&config)
+                .unwrap()
+                .approve
+                .unwrap()
+                .model,
+            "independent-judge"
+        );
+    }
+
+    #[test]
+    fn config_commit_rejects_incomplete_duplicate_unknown_and_invalid_fields() {
+        let config = ResolvedConfig::default();
+        let values = config_commit_fixture_values(&config);
+        let mut missing = values.clone();
+        missing.retain(|value| value.key != "model.model");
+        assert!(config_draft_is_dirty(&config, &missing, ConfigDraftShape::Commit).is_err());
+        let mut duplicate = values.clone();
+        duplicate.push(values[0].clone());
+        assert!(config_draft_is_dirty(&config, &duplicate, ConfigDraftShape::Commit).is_err());
+        for (key, text) in [
+            ("approve.extra_headers_json", "{}"),
+            ("model.temperature", "0.7"),
+            ("approve.request_timeout_ms", "not-an-integer"),
+            ("approve.model", ""),
+        ] {
+            let mut invalid = values.clone();
+            invalid.push(DesktopConfigValueInput {
+                key: key.into(),
+                text: text.into(),
+            });
+            assert!(
+                config_draft_is_dirty(&config, &invalid, ConfigDraftShape::Commit).is_err(),
+                "accepted {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_commit_public_import_draft_leaves_private_hydration_to_the_commit_owner() {
+        use crate::config::ConfigField;
+        let config = ResolvedConfig::default();
+        let mut imported = config.clone();
+        imported.model.model = "imported-main".into();
+        imported
+            .model
+            .extra_headers
+            .insert("X-Import".into(), "private-main-header".into());
+        imported.mcp.enabled = true;
+        imported.mcp.servers[0].enabled = true;
+        imported.mcp.servers[0]
+            .headers
+            .insert("X-Import".into(), "private-mcp-header".into());
+        let mut approve = crate::config::ApproveConfig::from_model(&imported.model);
+        approve.model = "imported-review".into();
+        approve
+            .extra_headers
+            .insert("X-Review".into(), "private-review-header".into());
+        imported.approve = Some(approve.clone());
+        let mut values = ConfigField::ALL
+            .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
+            .map(|field| DesktopConfigValueInput {
+                key: field.label().into(),
+                text: field.public_value(&imported).value,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            values
+                .iter()
+                .find(|value| value.key == "mcp.servers_json")
+                .unwrap()
+                .text
+                .is_empty()
+        );
+        let public = serde_json::to_string(&values).unwrap();
+        for marker in [
+            "private-main-header",
+            "private-mcp-header",
+            "private-review-header",
+        ] {
+            assert!(!public.contains(marker));
+        }
+        assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+
+        for value in &mut values {
+            let field = ConfigField::ALL
+                .into_iter()
+                .find(|field| field.label() == value.key)
+                .unwrap();
+            if field.is_sensitive() && value.text.is_empty() {
+                value.text = field.editor_value(&imported);
+            }
+        }
+        let editor = crate::tui::config_editor::ConfigEditorState::from_complete_config_values(
+            &config,
+            values
+                .into_iter()
+                .map(|value| (value.key, value.text))
+                .collect(),
+        )
+        .unwrap()
+        .with_imported_approve(approve.clone());
+        let hydrated = editor.build_resolved_config(&config).unwrap();
+        assert_eq!(hydrated.model.extra_headers, imported.model.extra_headers);
+        assert_eq!(hydrated.mcp, imported.mcp);
+        assert_eq!(hydrated.approve, Some(approve));
+    }
+
+    #[test]
+    fn config_commit_sparse_approve_saves_and_reloads_an_independent_connection() {
+        const CHILD_MARKER: &str = "MOYAI_CONFIG_COMMIT_TEST_CHILD";
+        const TEST_NAME: &str = "desktop::tauri_app::tests::config_commit_sparse_approve_saves_and_reloads_an_independent_connection";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let path = camino::Utf8PathBuf::from(std::env::var("MOYAI_CONFIG_PATH").unwrap());
+            let config =
+                crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+                    &path,
+                    &std::fs::read_to_string(&path).unwrap(),
+                )
+                .unwrap();
+            let mut values = config_commit_fixture_values(&config);
+            values
+                .iter_mut()
+                .find(|value| value.key == "model.model")
+                .unwrap()
+                .text = "new-main".into();
+            assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+            let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+                &config,
+                values
+                    .into_iter()
+                    .map(|value| (value.key, value.text))
+                    .collect(),
+            )
+            .unwrap();
+            let saved = editor
+                .save_global(
+                    &path.parent().unwrap(),
+                    crate::tui::config_editor::GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+                )
+                .unwrap();
+            assert!(saved.resolved_config.approve.is_none());
+            let saved_text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                toml::from_str::<toml::Value>(&saved_text)
+                    .unwrap()
+                    .get("approve")
+                    .is_none()
+            );
+            let config =
+                crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+                    &path,
+                    &saved_text,
+                )
+                .unwrap();
+            assert_eq!(config.model.model, "new-main");
+
+            let mut values = config_commit_fixture_values(&config);
+            values.push(DesktopConfigValueInput {
+                key: "approve.model".into(),
+                text: "independent-judge".into(),
+            });
+            assert!(config_draft_is_dirty(&config, &values, ConfigDraftShape::Commit).unwrap());
+            let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+                &config,
+                values
+                    .into_iter()
+                    .map(|value| (value.key, value.text))
+                    .collect(),
+            )
+            .unwrap();
+            editor
+                .save_global(
+                    &path.parent().unwrap(),
+                    crate::tui::config_editor::GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+                )
+                .unwrap();
+            let saved_text = std::fs::read_to_string(&path).unwrap();
+            let loaded =
+                crate::config::ConfigLoader::resolve_global_config_text_without_environment(
+                    &path,
+                    &saved_text,
+                )
+                .unwrap();
+            assert_eq!(loaded.model.model, "new-main");
+            assert_eq!(loaded.approve.as_ref().unwrap().model, "independent-judge");
+            assert_eq!(
+                loaded.approve.as_ref().unwrap().base_url,
+                config.model.base_url
+            );
+            assert_eq!(
+                toml::from_str::<toml::Value>(&saved_text).unwrap()["approve"]
+                    .as_table()
+                    .unwrap()
+                    .len(),
+                9
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[model]\nmodel='old-main'\nbase_url='https://main.example/v1'\n",
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        for (name, _) in
+            std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("MOYAI_"))
+        {
+            child.env_remove(name);
+        }
+        let result = child
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env("MOYAI_CONFIG_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "isolated settings save failed: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn hub_managed_ai_preserves_manual_connections_while_other_settings_remain_editable() {
+        use crate::config::ConfigField;
+        let config = crate::config::ResolvedConfig::default();
+        for field in [
+            ConfigField::BaseUrl,
+            ConfigField::Model,
+            ConfigField::ProviderProfile,
+            ConfigField::ApiKeyEnv,
+            ConfigField::ExtraHeadersJson,
+            ConfigField::SideChatBaseUrl,
+            ConfigField::SideChatModel,
+            ConfigField::SideChatProviderProfile,
+            ConfigField::SideChatApiKeyEnv,
+            ConfigField::ApproveBaseUrl,
+            ConfigField::ApproveModel,
+            ConfigField::ApproveProviderProfile,
+            ConfigField::ApproveApiKeyEnv,
+        ] {
+            let values = vec![DesktopConfigValueInput {
+                key: field.label().to_string(),
+                text: "changed-connection-value".into(),
+            }];
+            assert!(validate_managed_ai_draft(&config, &values, true).is_err());
+            assert!(validate_managed_ai_draft(&config, &values, false).is_ok());
+        }
+        let unchanged = crate::tui::config_editor::ConfigEditorState::from_config(&config)
+            .fields
+            .into_iter()
+            .filter(|field| !field.key.is_host_owned_generation())
+            .map(|field| DesktopConfigValueInput {
+                key: field.key.label().into(),
+                text: field.value,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_managed_ai_draft(&config, &unchanged, true).is_ok());
+        let prompts = vec![DesktopConfigValueInput {
+            key: ConfigField::SystemPrompt.label().into(),
+            text: "日本語で回答してください".into(),
+        }];
+        assert!(validate_managed_ai_draft(&config, &prompts, true).is_ok());
+        for field in [
+            ConfigField::ApproveContextWindow,
+            ConfigField::ApproveRequestTimeoutMs,
+            ConfigField::ApproveConnectTimeoutMs,
+            ConfigField::ApproveMaxRetries,
+        ] {
+            let values = vec![DesktopConfigValueInput {
+                key: field.label().into(),
+                text: "17".into(),
+            }];
+            assert!(validate_managed_ai_draft(&config, &values, true).is_ok());
+        }
+    }
+
     #[test]
     fn access_mode_target_rejects_owner_generation_and_mode_drift() {
         let expected = DesktopAccessModeMutationTarget {
@@ -7028,6 +9650,7 @@ mod tests {
         let target = SideChatCatalogRequestTarget {
             base_url: "http://127.0.0.1:1234".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible,
+            api_key_env: None,
             config_generation: 7,
         };
         assert!(validate_side_chat_catalog_target(&target, 7).is_ok());
@@ -7035,7 +9658,7 @@ mod tests {
     }
 
     #[test]
-    fn side_chat_catalog_probe_is_canonical_and_credential_free() {
+    fn side_chat_catalog_probe_is_canonical_and_does_not_inherit_main_credentials() {
         let mut config = ResolvedConfig::default();
         let profile = ProviderProfile::OpenAiCompatible;
         config.side_chat.connect_timeout_ms = 3_210;
@@ -7064,7 +9687,7 @@ mod tests {
         }));
 
         let (probe, canonical) =
-            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ", profile)
+            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ", profile, "")
                 .expect("valid side chat provider endpoint");
         assert_eq!(canonical, "http://127.0.0.1:1234");
         assert_eq!(probe.model.base_url, canonical);
@@ -7092,6 +9715,46 @@ mod tests {
                 ResolvedConfig::default(),
                 "http://user:password@127.0.0.1:1234",
                 ProviderProfile::OpenAiCompatible,
+                "",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn side_chat_catalog_probe_accepts_only_its_explicit_api_key_reference() {
+        let mut config = ResolvedConfig::default();
+        config.model.api_key_env = Some("MAIN_KEY".to_string());
+        config.side_chat.api_key_env = Some("SAVED_SIDE_KEY".to_string());
+        config
+            .model
+            .extra_headers
+            .insert("X-Main-Secret".to_string(), "main-only".to_string());
+        for reference in [" MAIN_KEY ", "SIDE_KEY"] {
+            let (probe, _) = side_chat_catalog_probe_config(
+                config.clone(),
+                "https://side.example/v1",
+                ProviderProfile::OpenAiCompatible,
+                reference,
+            )
+            .expect("explicit Side catalog reference");
+            assert_eq!(probe.model.api_key_env.as_deref(), Some(reference.trim()));
+            assert!(probe.model.extra_headers.is_empty());
+        }
+        let (anonymous, _) = side_chat_catalog_probe_config(
+            config.clone(),
+            "https://side.example/v1",
+            ProviderProfile::OpenAiCompatible,
+            "",
+        )
+        .unwrap();
+        assert_eq!(anonymous.model.api_key_env, None);
+        assert!(
+            side_chat_catalog_probe_config(
+                config,
+                "https://side.example/v1",
+                ProviderProfile::OpenAiCompatible,
+                "INVALID-NAME",
             )
             .is_err()
         );
@@ -7122,6 +9785,7 @@ mod tests {
         let projection = SideChatCatalogProjection {
             base_url: "http://127.0.0.1:1234".to_string(),
             provider_profile: ProviderProfile::OpenAiCompatible.as_str().to_string(),
+            api_key_env: String::new(),
             config_generation: "7".to_string(),
             models: vec![model],
         };
@@ -7129,6 +9793,7 @@ mod tests {
         assert!(json.get("ownerSessionId").is_none());
         assert_eq!(json["baseUrl"], "http://127.0.0.1:1234");
         assert_eq!(json["providerProfile"], "openai_compatible");
+        assert_eq!(json["apiKeyEnv"], "");
         assert_eq!(json["configGeneration"], "7");
         assert_eq!(json["models"][0]["loadState"], "loaded");
     }
@@ -7158,6 +9823,13 @@ mod tests {
         let json = serde_json::to_value(error).expect("serialize command error");
         assert_eq!(json["category"], "unknown");
         assert_eq!(json["code"], "unknown");
+        let team = serde_json::to_value(DesktopCommandError::team_setup_unavailable(
+            "opaque process diagnostic",
+        ))
+        .expect("serialize team setup error");
+        assert_eq!(team["category"], "runtime");
+        assert_eq!(team["code"], "team_setup_unavailable");
+        assert_eq!(team["message"], "opaque process diagnostic");
         assert_eq!(
             serde_json::to_string(&DesktopCommandErrorCode::ProviderTransport)
                 .expect("provider code"),

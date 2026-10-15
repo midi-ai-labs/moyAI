@@ -3,6 +3,7 @@ import path from "node:path";
 import { readFile, stat, writeFile } from "node:fs/promises";
 
 import { waitForObservation } from "../core/deadline.mjs";
+import { expectedConfigCommandValues } from "../core/config_command_values.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import {
   DesktopCommandProbe,
@@ -97,7 +98,7 @@ function errorObservation(error) {
   };
 }
 
-function configValues(projection, overrides = {}) {
+function configValues(projection, overrides = {}, imported = false) {
   if (!Array.isArray(projection?.config_fields)) {
     throw new TypeError("Initial Setup command expectation requires projected config fields");
   }
@@ -106,10 +107,9 @@ function configValues(projection, overrides = {}) {
   if (unknownKeys.length > 0) {
     throw new TypeError(`Initial Setup import overrides contain unknown fields: ${unknownKeys.join(", ")}`);
   }
-  return projection.config_fields.map((field) => ({
-    key: field.key,
-    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
-  }));
+  return expectedConfigCommandValues(projection, overrides, { editedKeys: imported ? [...projectedKeys].filter(key => [
+    "model.api_key_env", "model.extra_headers_json", "model.extra_body_json", "side_chat.api_key_env",
+  ].includes(key)) : [] });
 }
 
 export function initialSetupImportConfig(baseUrl, secret = INITIAL_SETUP_SECRET_SENTINEL) {
@@ -162,6 +162,16 @@ export function initialSetupImportedPublicOverrides(baseUrl) {
     "model.supports_images": "false",
     "model.parallel_tool_calls": "false",
     "model.max_parallel_predictions": "1",
+    // An absent Approve role is displayed using the imported Main snapshot.
+    // Only differences from the saved public baseline enter the Finish command.
+    "approve.base_url": baseUrl,
+    "approve.model": SCRIPTED_PROVIDER_MODEL_ID,
+    "approve.provider_profile": INITIAL_SETUP_PROVIDER_PROFILE,
+    "approve.api_key_env": INITIAL_SETUP_PROVIDER_API_KEY_ENV,
+    "approve.context_window": "65536",
+    "approve.request_timeout_ms": "120000",
+    "approve.connect_timeout_ms": "10000",
+    "approve.max_retries": "0",
     "permissions.access_mode": "default",
     "multi_agent.enabled": "false",
     "multi_agent.mode": "explicit_request_only",
@@ -174,6 +184,12 @@ export function initialSetupImportedPublicOverrides(baseUrl) {
   });
 }
 
+export function initialSetupImportedApproveAbsent(projection, persistedText) {
+  return projection?.approve_model_configured === false
+    && typeof persistedText === "string"
+    && !/^[ \t]*\[[ \t]*approve(?:[ \t]*\]|[ \t]*\.)/mu.test(persistedText);
+}
+
 export function expectedInitialSetupFinishCommand(surface, importGeneration = null, valueOverrides = {}) {
   const projection = surface?.projection;
   const expectedConfigTarget = projection?.config_target;
@@ -184,7 +200,7 @@ export function expectedInitialSetupFinishCommand(surface, importGeneration = nu
   return {
     command: "finish_initial_setup",
     args: {
-      values: configValues(projection, valueOverrides),
+      values: configValues(projection, valueOverrides, importGeneration !== null),
       expectedConfigTarget: structuredClone(expectedConfigTarget),
       expectedSetupTarget: structuredClone(expectedSetupTarget),
       importGeneration,
@@ -213,9 +229,17 @@ export async function observeInitialSetupSurface(cdp) {
     };
     const button = (selector) => {
       const found = one(selector);
+      const rect = found.node?.getBoundingClientRect();
+      const labelRange = document.createRange();
+      if (found.node) labelRange.selectNodeContents(found.node);
+      const labelRects = found.node ? Array.from(labelRange.getClientRects()) : [];
       return {
         count: found.count,
         visible: found.visible,
+        label_line_count: labelRects.length,
+        label_contained: Boolean(rect) && labelRects.length > 0 && labelRects.every(label =>
+          label.left >= rect.left - 1 && label.right <= rect.right + 1
+          && label.top >= rect.top - 1 && label.bottom <= rect.bottom + 1),
         enabled: found.node instanceof HTMLButtonElement
           && !found.node.disabled
           && found.node.getAttribute('aria-disabled') !== 'true',
@@ -271,6 +295,7 @@ export async function observeInitialSetupSurface(cdp) {
           height: rect.height,
         },
         step_rows: stepRows,
+        purposes: ["personal", "team", "hosting"].map(purpose => button('[data-surface="initial-setup"] button[data-action="initial-setup-' + purpose + '"]')),
         next: button('[data-surface="initial-setup"] button[data-action="initial-setup-next"]'),
         back: button('[data-surface="initial-setup"] button[data-action="initial-setup-back"]'),
         finish: button('[data-surface="initial-setup"] button[data-action="finish-initial-setup"]'),
@@ -310,6 +335,26 @@ export async function observeInitialSetupSurface(cdp) {
   })()`);
 }
 
+export function initialSetupPurposeButtonsReady(surface) {
+  return surface?.wizard?.current_step === "start"
+    && surface.wizard.purposes?.length === 3
+    && surface.wizard.purposes.every(button => button.count === 1 && button.visible === true
+      && button.enabled === true && button.label_contained === true && button.label_line_count === 1);
+}
+
+export function initialSetupHostingUnavailableReady(value) {
+  const surface = value?.surface, notice = value?.notice;
+  return surface?.projection?.overlay === "initial_setup"
+    && surface.projection.startup?.initial_setup_required === true
+    && surface.projection.startup.onboarding_intent === "hosting"
+    && surface.wizard?.current_step === "start"
+    && surface.visible_fatal_count === 0
+    && notice?.visible === true && notice.details_open === false
+    && notice.text.includes("Hub同梱版を導入") && notice.text.includes("既存の管理PCでHubを起動")
+    && sameValue(notice.purposes?.map(row => row.action).sort(), ["initial-setup-hosting", "initial-setup-personal", "initial-setup-team"])
+    && notice.purposes.every(row => row.enabled);
+}
+
 function errorFree(surface) {
   return surface?.visible_fatal_count === 0
     && surface?.visible_recoverable_error_count === 0
@@ -320,6 +365,7 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
   const target = surface?.projection?.startup?.setup_target;
   const rect = surface?.wizard?.rect;
   const viewport = surface?.viewport;
+  const primary = expectedStep === "finish" ? surface?.wizard?.finish : surface?.wizard?.next;
   const providerFieldsReady = expectedStep !== "provider" || (
     surface?.wizard?.provider?.profile?.count === 1
     && surface.wizard.provider.profile.visible === true
@@ -337,7 +383,7 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
     && errorFree(surface)
     && surface?.projection?.overlay === "initial_setup"
     && surface?.projection?.startup?.initial_setup_required === true
-    && surface.projection.startup.initial_setup_reason === "config_missing"
+    && ["config_missing", "setup_unfinished"].includes(surface.projection.startup.initial_setup_reason)
     && surface.projection.startup.action_overlay === "initial_setup"
     && target !== null
     && typeof target?.globalConfigPath === "string"
@@ -347,7 +393,7 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
     && surface?.wizard?.count === 1
     && surface.wizard.visible === true
     && surface.wizard.current_step === expectedStep
-    && sameValue(surface.wizard.step_rows.map((row) => row.step), INITIAL_SETUP_STEPS)
+    && sameValue(surface.wizard.step_rows.map((row) => row.step), expectedStep === "start" ? ["start"] : INITIAL_SETUP_STEPS)
     && surface.wizard.step_rows.filter((row) => row.current === "step").length <= 1
     && Number.isFinite(rect?.left)
     && Math.abs(rect.left) <= 1
@@ -361,9 +407,8 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
     && surface.visible_shell_count === 0
     && surface.visible_dialog_count === 0
     && surface.visible_backdrop_count === 0
-    && (expectedStep === "finish"
-      ? surface.wizard.finish.count === 1 && surface.wizard.finish.visible && surface.wizard.finish.enabled
-      : surface.wizard.next.count === 1 && surface.wizard.next.visible && surface.wizard.next.enabled)
+    && primary?.count === 1 && primary.visible && primary.enabled
+    && primary.label_contained === true && primary.label_line_count === 1
     && (expectedStep !== "start"
       || (surface.wizard.import_config.count === 1 && surface.wizard.import_config.visible))
     && INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS.every((key) => (
@@ -595,6 +640,86 @@ export function createSettingsInitialSetupScenario() {
       const provider = state.provider;
       if (provider === null) throw new Error("Initial Setup scripted provider was not prepared");
       if (state.importPath === null) throw new Error("Initial Setup import fixture was not prepared");
+      // The bootstrap has already created config.toml. A complete process
+      // restart before Finish must still return to the unfinished welcome.
+      await firstCdp.call("Runtime.enable");
+      const interrupted = (await waitForStep(firstCdp, provider, context, "start")).value.surface;
+      if (!initialSetupPurposeButtonsReady(interrupted)) {
+        await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-purpose-layout-failure", owner: OWNER });
+        throw new DesktopE2eError("product", "initial-purpose-label-layout", "The three purpose labels must fit their enabled buttons", { purposes: interrupted.wizard.purposes });
+      }
+      const purposeInput = new WebviewInput(firstCdp, { probeId: "settings-initial-purpose" });
+      try {
+        await purposeInput.installProbe();
+        await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-three-purposes", owner: OWNER });
+        const hostingClick = await trustedClick(purposeInput, {
+          selector: '[data-surface="initial-setup"] button[data-action="initial-setup-hosting"]',
+          identity: { tag: "BUTTON", action: "initial-setup-hosting" },
+        });
+        const hostingUnavailable = await waitForObservation({
+          label: "Missing bundled Hub gives ordinary visible guidance and keeps all entry actions usable", timeoutMs: 10_000, pollMs: 75,
+          sample: async () => ({
+            surface: await observeInitialSetupSurface(firstCdp),
+            notice: await firstCdp.evaluate(`(() => {
+              const e = document.querySelector('#initial-setup-recoverable-error');
+              return { visible:Boolean(e?.getClientRects().length && !e.hidden), text:e?.innerText ?? '', details_open:e?.querySelector('details')?.open === true,
+                purposes:[...document.querySelectorAll('[data-surface="initial-setup"] button[data-action="initial-setup-personal"], [data-surface="initial-setup"] button[data-action="initial-setup-team"], [data-surface="initial-setup"] button[data-action="initial-setup-hosting"]')].map(b => ({ action:b.dataset.action, enabled:!b.disabled })) };
+            })()`),
+          }),
+          accept: value => initialSetupHostingUnavailableReady(value),
+        });
+        await sink.record("initial-setup-hosting-unavailable", {
+          click: hostingClick,
+          notice: hostingUnavailable.value.notice,
+          intent: hostingUnavailable.value.surface.projection.startup.onboarding_intent,
+          responsive_after_failure: true,
+          scope: "Debug layout without bundled Hub. Successful packaged Hub launch is not exercised.",
+        }, { phase: "executing", owner: OWNER });
+        await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-hosting-unavailable", owner: OWNER });
+        await trustedClick(purposeInput, {
+          selector: '#initial-setup-recoverable-error button[data-action="dismiss-ui-error"]',
+          identity: { tag: "BUTTON", action: "dismiss-ui-error" },
+        });
+        await waitForStep(firstCdp, provider, context, "start");
+        await trustedClick(purposeInput, {
+          selector: '[data-surface="initial-setup"] button[data-action="initial-setup-personal"]',
+          identity: { tag: "BUTTON", action: "initial-setup-personal" },
+        });
+        await waitForObservation({
+          label: "Personal purpose opens the short local AI setup", timeoutMs: 10_000, pollMs: 75,
+          sample: () => observeInitialSetupSurface(firstCdp),
+          accept: surface => surface.projection.startup.onboarding_intent === "personal"
+            && surface.wizard.current_step === "provider"
+            && sameValue(surface.wizard.step_rows.map(row => row.step), ["start", "provider", "model", "finish"]),
+        });
+      } finally { await purposeInput.cleanup(); }
+      const resumed = await host.restart({ context, scenario: this, sink, driver: firstCdp, phase: "executing" });
+      firstCdp = resumed.driver;
+      runtime = resumed.runtime;
+      await firstCdp.call("Runtime.enable");
+      const restoredPurpose = await waitForObservation({
+        label: "Incomplete personal setup resumes after config exists", timeoutMs: 10_000, pollMs: 75,
+        sample: () => observeInitialSetupSurface(firstCdp),
+        accept: surface => surface.projection.startup.initial_setup_required
+          && surface.projection.startup.onboarding_intent === "personal"
+          && surface.wizard.current_step === "provider",
+      });
+      await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "initial-setup-personal-resumed", owner: OWNER });
+      const backInput = new WebviewInput(firstCdp, { probeId: "settings-initial-resumed-purpose" });
+      try {
+        await backInput.installProbe();
+        await trustedClick(backInput, {
+          selector: '[data-surface="initial-setup"] button[data-action="initial-setup-back"]',
+          identity: { tag: "BUTTON", action: "initial-setup-back" },
+        });
+      } finally { await backInput.cleanup(); }
+      const restoredWelcome = (await waitForStep(firstCdp, provider, context, "start")).value.surface;
+      await sink.record("initial-setup-unfinished-restart", {
+        before: interrupted.projection.startup,
+        after: restoredWelcome.projection.startup,
+        resumed_purpose: restoredPurpose.value.projection.startup.onboarding_intent,
+        config_exists: (await stat(context.paths.config_file)).isFile(),
+      }, { phase: "executing", owner: OWNER });
       state.nativeOwner = nativeOwner(context, runtime);
       await firstCdp.call("Runtime.enable");
       await firstCdp.call("DOM.enable");
@@ -749,6 +874,14 @@ export function createSettingsInitialSetupScenario() {
         const configBytes = await readFile(context.paths.config_file);
         const configStat = await stat(context.paths.config_file);
         const persistedText = configBytes.toString("utf8");
+        const finishedSurface = await observeInitialSetupSurface(firstCdp);
+        if (!initialSetupImportedApproveAbsent(finishedSurface.projection, persistedText)) {
+          throw productFailure(
+            "initial-setup-imported-approve-materialized",
+            "Main-only import and Finish created an explicit Approve role",
+            { approve_model_configured: finishedSurface.projection.approve_model_configured },
+          );
+        }
         const persistedSecretCount = persistedText.split(INITIAL_SETUP_SECRET_SENTINEL).length - 1;
         if (persistedSecretCount !== 1) {
           throw productFailure(
@@ -786,6 +919,7 @@ export function createSettingsInitialSetupScenario() {
             size_bytes: configStat.size,
             sha256: crypto.createHash("sha256").update(configBytes).digest("hex"),
             imported_secret_preserved_once: persistedSecretCount === 1,
+            imported_approve_absent: true,
           },
           provider_docling_ledger: provider.requestLedger,
           screenshots: {
@@ -822,6 +956,14 @@ export function createSettingsInitialSetupScenario() {
         const restoredSensitive = restored.value.surface.projection.config_fields.filter(
           (field) => field?.key === "model.extra_headers_json",
         );
+        const reopenedConfigText = await readFile(context.paths.config_file, "utf8");
+        if (!initialSetupImportedApproveAbsent(restored.value.surface.projection, reopenedConfigText)) {
+          throw productFailure(
+            "initial-setup-restarted-approve-materialized",
+            "restart materialized the absent Approve role from the Main-only import",
+            { approve_model_configured: restored.value.surface.projection.approve_model_configured },
+          );
+        }
         if (restoredSensitive.length !== 1
           || restoredSensitive[0].sensitive !== true
           || restoredSensitive[0].configured !== true
@@ -837,6 +979,7 @@ export function createSettingsInitialSetupScenario() {
           restart: restarted.restart,
           surface: restored.value.surface,
           stable_for_ms: INITIAL_SETUP_RESTART_STABILITY_MS,
+          imported_approve_absent: true,
           accepted_provider_docling_ledger: state.acceptedLedger,
           screenshot: restartScreenshot,
         }, { phase: "executing", owner: OWNER });

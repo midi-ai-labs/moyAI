@@ -12,6 +12,10 @@ use crate::session::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunAdmissionKind {
     NewUserRun,
+    /// Receiver-owned root execution, bound to a durable authenticated job receipt.
+    RemoteTask {
+        job_id: ulid::Ulid,
+    },
     RootContinuation {
         predecessor_turn_id: TurnId,
         predecessor_revision: u64,
@@ -40,6 +44,7 @@ struct AppProcessRuntimeInner {
     session_service: crate::session::SessionService,
     session_event_hub: SessionRuntimeEventHub,
     agent_runtime: std::sync::Arc<crate::app::AgentRuntime>,
+    managed_shells: crate::tool::shell::ManagedShells,
 }
 
 impl AppProcessRuntime {
@@ -55,6 +60,7 @@ impl AppProcessRuntime {
                 session_service,
                 session_event_hub,
                 agent_runtime,
+                managed_shells: Default::default(),
             }),
         }
     }
@@ -73,6 +79,10 @@ impl AppProcessRuntime {
 
     pub(crate) fn agent_runtime(&self) -> std::sync::Arc<crate::app::AgentRuntime> {
         std::sync::Arc::clone(&self.inner.agent_runtime)
+    }
+
+    pub(crate) fn managed_shells(&self) -> crate::tool::shell::ManagedShells {
+        self.inner.managed_shells.clone()
     }
 
     #[cfg(test)]
@@ -97,11 +107,18 @@ pub struct App {
     pub session_event_hub: SessionRuntimeEventHub,
     pub(crate) resolved_run_session_id: Option<SessionId>,
     pub(crate) process_runtime: AppProcessRuntime,
+    /// Keeps the process's approved device connection alive for CLI, TUI, and Desktop agents.
+    pub(crate) device_network: Option<crate::device_network::DeviceNetworkService>,
 }
 
 impl App {
     pub fn resolved_run_session_id(&self) -> Option<SessionId> {
         self.resolved_run_session_id
+    }
+
+    /// Drain process-owned commands before the application's runtime exits.
+    pub async fn shutdown_managed_shells(&self) {
+        self.process_runtime.managed_shells().shutdown().await;
     }
 
     pub fn subscribe_session_runtime_events(

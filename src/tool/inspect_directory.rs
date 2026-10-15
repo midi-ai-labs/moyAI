@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::read_context::ReadToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
@@ -53,11 +54,20 @@ impl Tool for InspectDirectoryTool {
     async fn execute(
         &self,
         raw_arguments: serde_json::Value,
-        mut ctx: ToolContext<'_>,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_read(raw_arguments, ReadToolContext::agent(ctx))
+            .await
+    }
+
+    async fn execute_read(
+        &self,
+        raw_arguments: serde_json::Value,
+        mut ctx: ReadToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<InspectDirectoryInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::List)?;
+        let guarded = PathGuard::require_path(ctx.workspace(), &requested, AccessKind::List)?;
         ctx.confirm_if_needed(
             AccessKind::List,
             format!("Inspect {}", guarded.absolute),
@@ -70,20 +80,20 @@ impl Tool for InspectDirectoryTool {
 
         let limit = input
             .limit
-            .unwrap_or(ctx.config.tool_output.max_results.max(1))
+            .unwrap_or(ctx.config().tool_output.max_results.max(1))
             .max(1)
-            .min(ctx.config.tool_output.max_results.max(1));
+            .min(ctx.config().tool_output.max_results.max(1));
         let max_depth = input
             .max_depth
-            .unwrap_or(ctx.config.inspection.default_max_depth)
+            .unwrap_or(ctx.config().inspection.default_max_depth)
             .max(1);
         let include_hidden = input
             .include_hidden
-            .unwrap_or(ctx.config.inspection.include_hidden_by_default);
+            .unwrap_or(ctx.config().inspection.include_hidden_by_default);
         let visit_limit = limit.saturating_mul(8).max(128).min(4_096);
         let page = walk_guarded_page(
             &guarded,
-            ctx.workspace,
+            ctx.workspace(),
             input.cursor.as_deref(),
             TraversalOptions {
                 include_hidden,
@@ -102,8 +112,8 @@ impl Tool for InspectDirectoryTool {
         let mut files = 0usize;
         let mut extension_counts = BTreeMap::<String, usize>::new();
         let mut large_file_candidates = Vec::new();
-        let max_lines = ctx.config.tool_output.max_lines.max(1);
-        let max_bytes = ctx.config.tool_output.max_bytes.max(1);
+        let max_lines = ctx.config().tool_output.max_lines.max(1);
+        let max_bytes = ctx.config().tool_output.max_bytes.max(1);
 
         for entry in &page.entries {
             let relative = entry.relative_path.as_str().replace('\\', "/");
@@ -150,7 +160,7 @@ impl Tool for InspectDirectoryTool {
                     .unwrap_or_else(|| "(no extension)".to_string());
                 *extension_counts.entry(extension).or_insert(0) += 1;
                 if let Some(size_bytes) = size_bytes
-                    .filter(|size| *size >= ctx.config.file_guard.large_file_warning_bytes)
+                    .filter(|size| *size >= ctx.config().file_guard.large_file_warning_bytes)
                 {
                     large_file_candidates.push(LargeFileCandidate {
                         path: relative,

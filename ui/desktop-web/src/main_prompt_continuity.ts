@@ -1,3 +1,5 @@
+import type { FocusTargetElement, PostRenderFocusIntent } from "./focus_arbiter.ts";
+
 export interface RefreshPromptFocusContinuation {
   owner: string;
   interactionGeneration: bigint;
@@ -57,6 +59,30 @@ export function refreshPromptFocusContinuationAccepted(
     && continuation.interactionGeneration === currentInteractionGeneration
     && continuation.owner === currentOwner
     && refreshStillOwnsFocus;
+}
+
+export function createRefreshPromptFocusIntent(options: {
+  prompt: FocusTargetElement;
+  resolvePrompt: () => FocusTargetElement | null;
+  refreshOwners: readonly FocusTargetElement[];
+  settle: (target: FocusTargetElement) => void;
+  isCurrent: () => boolean;
+}): PostRenderFocusIntent {
+  return {
+    source: "refresh-prompt",
+    // The accepted pointer continuation returns to the editor that owned focus before
+    // Refresh. A generic snapshot of the intervening Refresh button must not defeat it.
+    priority: "explicit-transfer",
+    claim: { kind: "yield-from", owners: options.refreshOwners },
+    candidates: [{
+      resolve: () => {
+        const prompt = options.resolvePrompt();
+        return prompt === options.prompt ? prompt : null;
+      },
+      settle: options.settle,
+    }],
+    isCurrent: options.isCurrent,
+  };
 }
 
 export function wireMainPromptInputOnce(

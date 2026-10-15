@@ -11,7 +11,10 @@ import {
   permissionRestartGuardianFixtureConfig,
   permissionRestartGuardianPressureOverlapFailures,
   permissionRestartGuardianPressureFailures,
+  permissionRestartGuardianRenderedTerminalFailures,
   permissionRestartGuardianReviewObserved,
+  permissionRestartGuardianSeedTerminalDecision,
+  permissionRestartGuardianTerminalDecision,
   permissionRestartGuardianTerminalFailures,
 } from "../scenarios/permission_restart_guardian.mjs";
 
@@ -68,8 +71,8 @@ function projection(overrides = {}) {
     composer_submit_mode: "new_request",
     can_submit: true,
     status_message: "完了",
-    session_usage_label: "セッション累計: 42 token",
-    session_usage_title: "canonical terminal telemetry: 2 / 2 turn計測。入力 30、出力 12、reasoning 0、合計 42 token。完了済みturnの累計です。",
+    session_usage_label: "このチャットの累計: 42 トークン",
+    session_usage_title: "完了した依頼のうち 2 / 2件を計測。入力 30、出力 12、思考分 0、合計 42 トークン。完了した依頼の累計です。",
     session_usage_state: "complete",
     draft_target: { sessionId: SESSION_ID },
     run_target: {
@@ -93,9 +96,21 @@ function projection(overrides = {}) {
 }
 
 function surface(projectionOverrides = {}, surfaceOverrides = {}) {
+  const value = projection(projectionOverrides);
   return {
-    projection: projection(projectionOverrides),
-    prompt: { visible: true, enabled: true, value: "" },
+    projection: value,
+    composer: { count: 1, visible: true, run_target: structuredClone(value.run_target) },
+    session_usage: {
+      count: 1,
+      visible: true,
+      text: value.session_usage_label.trim(),
+      title: value.session_usage_title,
+      state: value.session_usage_state,
+    },
+    thread_count: 1,
+    assistants: value.transcript_rows.filter((row) => row.row_kind === "assistant")
+      .map((row) => ({ text: row.body, visible: true })),
+    prompt: { count: 1, visible: true, enabled: true, value: "" },
     send: { count: 1, visible: true, enabled: false },
     visible_fatal_count: 0,
     visible_recoverable_error_count: 0,
@@ -202,8 +217,8 @@ test("permission restart Guardian terminal requires settled status, exact histor
 
 test("permission restart Guardian Chat terminal preserves missing reasoning as unmeasured", () => {
   const chatSurface = surface({
-    session_usage_label: "セッション累計: 42 token（reasoning未計測）",
-    session_usage_title: "canonical terminal telemetry: 2 / 2 turn計測。入力 30、出力 12、reasoning 未計測（2 turnすべて未報告）、合計 42 token。",
+    session_usage_label: "このチャットの累計: 42 トークン（思考分は未計測）",
+    session_usage_title: "完了した依頼のうち 2 / 2件を計測。入力 30、出力 12、思考分は未計測（2件すべて未報告）、合計 42 トークン。",
     session_usage_state: "partial",
   });
   assert.deepEqual(permissionRestartGuardianTerminalFailures(
@@ -213,7 +228,7 @@ test("permission restart Guardian Chat terminal preserves missing reasoning as u
   ), []);
 
   const misreported = structuredClone(chatSurface);
-  misreported.projection.session_usage_title = "reasoning 0";
+  misreported.projection.session_usage_title = "思考分 0";
   const failures = permissionRestartGuardianTerminalFailures(
     misreported,
     seedOwner,
@@ -221,6 +236,86 @@ test("permission restart Guardian Chat terminal preserves missing reasoning as u
   );
   assert.ok(failures.includes("session-reasoning-usage-title-mismatch"));
   assert.ok(failures.includes("session-reasoning-usage-misreported-zero"));
+});
+
+test("permission restart Guardian waits for rendered owner, usage, and the exact final assistant", () => {
+  const terminal = surface();
+  assert.deepEqual(permissionRestartGuardianRenderedTerminalFailures(terminal), []);
+  assert.equal(permissionRestartGuardianTerminalDecision({ surface: terminal, ledger: ledger() }, seedOwner), "pass");
+  for (const [field, mutate] of [
+    ["composer.run_target", changed => changed.composer.run_target.expectedState.kind = "running"],
+    ["composer.run_target", changed => changed.composer.run_target.expectedState.latestTurnId = SEED_TURN_ID],
+    ["session_usage.text", changed => changed.session_usage.text = "このチャットの累計: 6 トークン"],
+    ["session_usage.title", changed => changed.session_usage.title = "seed usage"],
+    ["session_usage.state", changed => changed.session_usage.state = "missing"],
+    ["prompt.value", changed => changed.prompt.value = PERMISSION_RESTART_GUARDIAN_TASK_PROMPT],
+    ["assistants.text", changed => changed.assistants.pop()],
+    ["assistants.text", changed => changed.assistants[1].text = "still streaming"],
+    ["assistants.visible", changed => changed.assistants[1].visible = false],
+  ]) {
+    const stale = structuredClone(terminal);
+    mutate(stale);
+    assert.deepEqual(permissionRestartGuardianTerminalFailures(stale, seedOwner), []);
+    assert.ok(permissionRestartGuardianRenderedTerminalFailures(stale).some(failure => failure.field === field), field);
+    assert.equal(permissionRestartGuardianTerminalDecision({ surface: stale, ledger: ledger() }, seedOwner), "pending", field);
+  }
+});
+
+test("permission restart Guardian canonical and provider failures remain failures when DOM is stale", () => {
+  for (const mutate of [
+    changed => changed.projection.transcript_rows[5].body = "unexpected canonical response",
+    changed => changed.projection.transcript_rows.push({ row_kind: "error", body: "guardian request failed" }),
+    changed => changed.projection.run_target.expectedState.admissionRevision = "8",
+    changed => changed.projection.session_usage_state = "missing",
+    changed => changed.projection.status_message = "guardian request failed: storage is busy",
+    changed => changed.projection.run_status_key = "failed",
+  ]) {
+    const invalid = surface();
+    invalid.composer.run_target.expectedState.kind = "running";
+    invalid.assistants.pop();
+    mutate(invalid);
+    assert.equal(permissionRestartGuardianTerminalDecision({ surface: invalid, ledger: ledger() }, seedOwner), "fail");
+  }
+  const rejectedLedger = ledger();
+  rejectedLedger[3].contract.pass = false;
+  assert.equal(permissionRestartGuardianTerminalDecision({ surface: surface(), ledger: rejectedLedger }, seedOwner), "fail");
+});
+
+test("permission restart Guardian seed and restart stability wait for the same rendered seed", () => {
+  const restored = surface({
+    run_target: {
+      sessionId: SESSION_ID,
+      expectedState: { kind: "idle", latestTurnId: SEED_TURN_ID, admissionRevision: "6" },
+    },
+    transcript_rows: [
+      { row_kind: "user", body: PERMISSION_RESTART_GUARDIAN_SEED_PROMPT },
+      { row_kind: "work_summary_completed", body: "seed completed" },
+      { row_kind: "assistant", body: PERMISSION_RESTART_GUARDIAN_SEED_RESPONSE },
+    ],
+  });
+  const seedLedger = ledger().slice(0, 2);
+  assert.equal(permissionRestartGuardianSeedTerminalDecision({ surface: restored, ledger: seedLedger }), "pass");
+  let observedAt = 1_000;
+  const decide = createPermissionRestartGuardianStableRestartDecision(seedOwner, 300, () => observedAt);
+  assert.equal(decide({ surface: restored, ledger: seedLedger }), "pending");
+  observedAt += 300;
+  for (const mutate of [
+    changed => changed.composer.run_target.expectedState.kind = "running",
+    changed => changed.session_usage.text = "未計測",
+    changed => changed.assistants = [],
+  ]) {
+    const stale = structuredClone(restored);
+    mutate(stale);
+    assert.equal(permissionRestartGuardianSeedTerminalDecision({ surface: stale, ledger: seedLedger }), "pending");
+    assert.equal(decide({ surface: stale, ledger: seedLedger }), "pending");
+  }
+  assert.equal(decide({ surface: restored, ledger: seedLedger }), "pending");
+  observedAt += 300;
+  assert.equal(decide({ surface: restored, ledger: seedLedger }), "pass");
+  const invalid = structuredClone(restored);
+  invalid.projection.transcript_rows[2].body = "unexpected canonical seed";
+  assert.equal(permissionRestartGuardianSeedTerminalDecision({ surface: invalid, ledger: seedLedger }), "fail");
+  assert.equal(decide({ surface: invalid, ledger: seedLedger }), "fail");
 });
 
 test("permission restart Guardian requires one continuously stable restart owner", () => {

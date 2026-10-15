@@ -12,10 +12,12 @@ import {
   exactChatToolContinuationLedger,
   providerChatToolContinuationFixtureConfig,
 } from "../scenarios/provider_chat_tool_continuation.mjs";
+import { providerRenderedTerminalFailures } from "../scenarios/provider_restart.mjs";
 
 const SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const TURN_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const USER_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const ASSISTANT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const HASH = "a".repeat(64);
 const TIME = Object.freeze({
   local: "2026-08-26T12:34:56+09:00",
@@ -25,7 +27,7 @@ const TIME = Object.freeze({
 });
 
 function toolStatus() {
-  return `ツール:\n- Current time [completed] local: ${TIME.local}\nutc: ${TIME.utc}\ntimezone: ${TIME.timezone}\nunix_ms: ${TIME.unixMs}`;
+  return `ツール: 1件中1件を表示（要確認を優先・新しい順）\n- [完了] Current time: local: ${TIME.local} utc: ${TIME.utc} timezone: ${TIME.timezone} unix_ms: ${TIME.unixMs}`;
 }
 
 function workSummary() {
@@ -104,9 +106,9 @@ function baseProjection(overrides = {}) {
     task_activity_state: "running",
     busy: true,
     agent_tree_active: false,
-    tool_status_text: "ツール: 実行履歴はまだありません。",
-    latest_tool_summary: "ツール: 実行履歴はまだありません。",
-    progress_text: "Running\nモデル要求: 0\nツール: 0件開始 / 0件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
+    tool_status_text: toolStatus(),
+    latest_tool_summary: "完了: 時刻の確認",
+    progress_text: "Running\nモデル要求: 2\nツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
     run_target: {
       sessionId: SESSION_ID,
       expectedState: { kind: "turn", turnId: TURN_ID, admissionRevision: "1" },
@@ -154,7 +156,7 @@ function terminalProjection(overrides = {}) {
     task_activity_state: "idle",
     busy: false,
     tool_status_text: toolStatus(),
-    latest_tool_summary: "ツール:",
+    latest_tool_summary: "完了: 時刻の確認",
     progress_text: "Completed\nモデル要求: 2\nツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
     post_run_refresh_pending: false,
     background_mutation_pending: false,
@@ -186,6 +188,7 @@ function terminalProjection(overrides = {}) {
       },
       {
         row_kind: "assistant",
+        stable_history_identity: ASSISTANT_ID,
         body: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE,
       },
     ],
@@ -202,7 +205,7 @@ function terminalSurface(overrides = {}) {
       SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE,
     ].join("\n"),
     assistants: [{
-      history_identity: null,
+      history_identity: ASSISTANT_ID,
       text: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE,
       visible: true,
     }],
@@ -313,6 +316,45 @@ test("terminal continuation keeps one canonical tool result and one exact final 
     "1787715296001",
   );
   assert.match(chatToolContinuationTerminalFailures(toolDrift, TIME).join(","), /time-evidence/u);
+});
+
+test("the passing Chat continuation oracle still needs the same rendered owner and usage before its terminal screenshot", () => {
+  const sample = { surface: terminalSurface(), ledger: ledger(["completed", "completed"]) };
+  assert.deepEqual(chatToolContinuationTerminalFailures(sample, TIME), []);
+  const surface = sample.surface;
+  Object.assign(surface.projection, { session_usage_label: "累計 34 tokens", session_usage_title: "2 requests", session_usage_state: "complete" });
+  surface.composer = { count: 1, visible: true, run_target: structuredClone(surface.projection.run_target) };
+  surface.session_usage = { count: 1, visible: true, text: "未計測", title: "まだ記録されていません", state: "missing" };
+  assert.deepEqual(chatToolContinuationTerminalFailures(sample, TIME), []);
+  assert.deepEqual(providerRenderedTerminalFailures(surface).map(failure => failure.field), ["session_usage.text", "session_usage.title", "session_usage.state"]);
+  Object.assign(surface.session_usage, { text: surface.projection.session_usage_label, title: surface.projection.session_usage_title, state: surface.projection.session_usage_state });
+  assert.deepEqual(providerRenderedTerminalFailures(surface), []);
+  surface.composer.run_target.expectedState.admissionRevision = "2";
+  assert.deepEqual(providerRenderedTerminalFailures(surface).map(failure => failure.field), ["composer.run_target"]);
+});
+
+test("held and completed tool evidence requires one completed current_time, with durable Assistant identity", () => {
+  const held = { surface: baseSurface(), ledger: ledger() };
+  const terminal = { surface: terminalSurface(), ledger: ledger(["completed", "completed"]) };
+  for (const change of [
+    (v) => { v.tool_status_text = "ツール: 実行履歴はまだありません。"; },
+    (v) => { v.tool_status_text = v.tool_status_text.replace("1件中1件", "2件中2件"); },
+    (v) => { v.tool_status_text = v.tool_status_text.replace("[完了]", "[失敗]"); },
+    (v) => { v.latest_tool_summary = "ツール:"; },
+  ]) {
+    const before = structuredClone(held); change(before.surface.projection);
+    assert.ok(chatToolContinuationHeldFailures(before).includes("held-tool-projection-mismatch"));
+    const after = structuredClone(terminal); change(after.surface.projection);
+    assert.ok(chatToolContinuationTerminalFailures(after, TIME).includes("terminal-tool-projection-mismatch"));
+  }
+  for (const identity of [null, "not-canonical", USER_ID]) {
+    const invalid = structuredClone(terminal);
+    invalid.surface.projection.transcript_rows.at(-1).stable_history_identity = identity;
+    invalid.surface.assistants[0].history_identity = identity;
+    assert.ok(chatToolContinuationTerminalFailures(invalid, TIME).includes("terminal-assistant-not-exact"));
+  }
+  const wrongDom = structuredClone(terminal); wrongDom.surface.assistants[0].history_identity = USER_ID;
+  assert.ok(chatToolContinuationTerminalFailures(wrongDom, TIME).includes("terminal-dom-history-mismatch"));
 });
 
 test("provider.chat-tool-continuation factory binds common terminal and SQLite owners", () => {

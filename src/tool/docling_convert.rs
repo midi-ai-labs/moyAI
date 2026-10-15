@@ -45,6 +45,9 @@ const ALLOWED_TO_FORMATS: &[&str] = &[
     "vtt",
 ];
 
+#[cfg(test)]
+mod admission_tests;
+
 #[derive(Debug, Deserialize)]
 pub struct DoclingConvertInput {
     pub path: Option<Utf8PathBuf>,
@@ -192,6 +195,7 @@ impl Tool for DoclingConvertTool {
             }
         };
 
+        let mut started = false;
         let result = crate::docling::DoclingClient::new(ctx.config.docling.clone())
             .convert(
                 DoclingConvertRequest {
@@ -203,9 +207,17 @@ impl Tool for DoclingConvertTool {
                     include_images: Some(include_images),
                     page_range,
                 },
-                || effect_admission.admit(),
+                || {
+                    effect_admission.admit()?;
+                    started = true;
+                    Ok(())
+                },
             )
-            .await?;
+            .await;
+        if started {
+            effect_admission.finish_started_effect()?;
+        }
+        let result = result?;
 
         let preview = ctx.services.truncator.preview_chunks(
             convert_output_chunks(&result),

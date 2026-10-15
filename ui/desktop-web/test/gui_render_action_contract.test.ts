@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deviceUiFixture } from "./device_network_fixture.ts";
+import { executionRecoveryKey, deviceNetworkPresentation } from "../src/device_network_state.ts";
+import { renderDeviceExecution } from "../src/device_execution.ts";
+import { sharedWorkPresentation } from "../src/shared_work_state.ts";
+import { renderSharedWork } from "../src/shared_work_render.ts";
+import { renderReceiverActivity } from "../src/receiver_activity.ts";
+import { sharedUiFixture } from "./shared_work_fixture.ts";
 
 import { ACTIONS, actionById, actionEnabledById } from "../src/actions.ts";
 import {
@@ -34,6 +41,15 @@ import type {
 } from "../src/types.ts";
 import type { AgentExecutionCacheEntry } from "../src/ui_state.ts";
 import { rootStopTarget, turnStopTarget } from "./stop_target_fixture.ts";
+
+test("the local sidebar creates a local chat while Hub is selected", async () => {
+  const state = representativeState({ overlay: "none", confirmation_visible: false, hub_project_open: true });
+  const calls: string[] = [];
+  const context = { mutate: async (name: string) => { calls.push(name); } } as unknown as import("../src/actions.ts").ActionContext;
+  await actionById("new-chat")!.run(state, context, { value: "local" });
+  assert.deepEqual(calls, ["new_chat"]);
+  assert.match(renderSidebar(state), /data-action="new-chat" data-value="local"/);
+});
 
 interface RenderedSurface {
   name: string;
@@ -146,7 +162,7 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       max_output_tokens_inherited: true,
       provider_mutation_enabled: false,
       access_mutation_enabled: false,
-      unavailable_reason: "root sessionを選択すると変更できます。",
+      unavailable_reason: "メインチャットを開くと変更できます。",
       target: null,
     },
     config_draft_capabilities: {
@@ -194,8 +210,8 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
     token_meter_label: "12%",
     token_meter_title: "Context use 12%",
     token_meter_level: "low",
-    session_usage_label: "セッション累計: 1.2k token（一部）",
-    session_usage_title: "canonical terminal telemetry: 2 / 3 turn計測",
+    session_usage_label: "このチャットの累計: 1.2k トークン（一部）",
+    session_usage_title: "完了した依頼のうち 2 / 3件を計測",
     session_usage_state: "partial",
     confirmation_visible: true,
     confirmation_id: PERMISSION_ID,
@@ -260,6 +276,7 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
     about: {
       product_name: "moyAI",
       version: "test",
+      codename: "test-codename",
       license_identifier: "MIT",
       copyright_notice: "Copyright test",
     },
@@ -524,6 +541,25 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
   };
 }
 
+test("Hub conversation disables actions that implicitly target the hidden local draft and history", () => {
+  const base = representativeState({ confirmation_visible: false, overlay: "none", run_status_key: "idle" });
+  const local = defaultRenderLocal();
+  const localModel = createDesktopRenderModel(base, local);
+  const hubModel = createDesktopRenderModel({ ...base, hub_project_open: true }, local);
+  for (const id of ["enhance-prompt", "review-uncommitted", "toggle-session-archived-search", "export-history", "archive-session", "rollback-session", "fork-session", "load-previous-turn-page", "set-image", "browse-image", "clear-images", "insert-command"]) {
+    const payload = id === "insert-command" ? { index: 0, value: "" } : { index: -1, value: "" };
+    assert.equal(actionEnabledById(id, localModel, payload), true, `${id} stays available on the local surface`);
+    assert.equal(actionEnabledById(id, hubModel, payload), false, `${id} must not use a hidden local target`);
+  }
+  for (const id of ["project", "session", "new-project-session"]) {
+    assert.equal(actionEnabledById(id, hubModel, { index: 0, value: "" }), true, `${id} explicitly selects a local target`);
+  }
+  for (const id of ["show-hub", "show-config", "create-project-from-picker"]) {
+    assert.equal(actionEnabledById(id, hubModel), true, `${id} remains available`);
+  }
+  assert.equal(actionEnabledById("archive-session", hubModel, { index: 0, value: "" }), true, "an explicit local row retains its own action");
+});
+
 function defaultRenderLocal(overrides: {
   artifactPane?: Partial<DesktopRenderLocalPresentation["artifactPane"]>;
   attachmentTrayOpen?: boolean;
@@ -576,23 +612,72 @@ function defaultRenderLocal(overrides: {
 function representativeSurfaces(): RenderedSurface[] {
   const base = representativeState();
   const local = defaultRenderLocal();
+  local.mcpHistory = { ...local.mcpHistory, loaded: true, rows: [{ id: "ref-a", direction: "instruction",
+    created_at_ms: 1_700_000_000_000, updated_at_ms: null, title: "Investigate WinB", peer_label: "WinB", target_label: "temp",
+    state: "running", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
+    root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: true, state_source: "last_observed", result_received: false }] };
+  local.deviceNetwork = deviceNetworkPresentation(deviceUiFixture());
+  local.deviceNetwork.projection!.peers[0].selected = true;
+  local.deviceNetwork.execution = { revision: "1", state: "ready", projects: [{ id: "project-a", label: "解析 A", can_control: false, can_execute: true,
+    environment_id: "env-a", preparation_state: "pending", error: null, directory: null, access_mode: "default", participation_generation: 7 }],
+    review: { id: "review", directory: "C:/shared", access_mode: "default" }, directory: "C:/shared", access_mode: "default", accepting: true,
+    can_pause: true, can_resume: false, error: null, unknown_attempts: [{ attempt_id: "unknown", generation: 1, job_id: "job-a", environment_id: "env-a", run_id: "run-a", state: "unknown" }] };
+  local.deviceNetwork.executionRecoveryTarget = executionRecoveryKey(local.deviceNetwork.execution.unknown_attempts[0]);
+  local.deviceNetwork.jobs.outgoing[0].state = "completed";
+  local.deviceNetwork.jobs.outgoing[0].can_stop = false;
+  local.mcpPeers = { ...local.mcpPeers, rows: [{ id: "WinB", base_url: "https://192.168.10.22/mcp", enabled: true, credential_configured: true, certificate_sha256: null }] };
   const surfaces: RenderedSurface[] = [
     { name: "startup", html: renderStartupSplash(base, 1_000, 500) },
     { name: "titlebar", html: renderTitlebar(true, false, "file_menu") },
     { name: "sidebar", html: renderSidebar(base) },
     { name: "topbar", html: renderTopbar(base, local) },
     { name: "run-status", html: renderRunStatusStrip(base) },
+    { name: "mcp-run-status", html: renderRunStatusStrip({ ...base, task_activity_state: "idle", mcp_activity: {
+      running: 1, waiting: 0, awaiting_approval: 0, cancelling: 0, unavailable: false,
+    } }) },
     { name: "thread", html: renderThreadContent(base, local) },
     { name: "pending-turn-input", html: renderPendingTurnInputs(base.pending_turn_inputs) },
     { name: "composer", html: renderComposer(base, local) },
     { name: "plan", html: renderPlanProjection(base) },
     { name: "artifact-output", html: renderArtifactPane(base, local) },
     { name: "permission", html: renderConfirmation(base) },
+    { name: "receiver-permission", html: renderConfirmation({ ...base, confirmation: { ...base.confirmation!, remote: {
+      job_id: "job-b", profile_id: "profile-b", session_id: "session-b", requester_label: "WinA", target_label: "Temp",
+    } } }) },
   ];
+  surfaces.push({ name: "stopped-local-message-edit", html: renderThreadContent(representativeState({
+    task_activity_state: "idle", pending_turn_inputs: [], confirmation_visible: false, can_cancel_run: false, stop_target: null,
+  }), local) });
+  const originLocal = {
+    ...local,
+    deviceNetwork: {
+      ...local.deviceNetwork,
+      originOwner: JSON.stringify(["C:/workspace", SESSION_IDLE, "2", local.deviceNetwork.projection!.hub_url, local.deviceNetwork.projection!.device_id]),
+      originWork: {
+        origin_session_ref: SESSION_IDLE,
+        jobs: [],
+        retained_services: [{ project_id: "project-a", service: {
+          service_id: "service-a", conversation_id: "conversation-a", environment_id: "environment-a",
+          expires_at_ms: Date.now() + 60_000, stop_requested: false, uncertain: false, can_stop: true,
+        } }],
+        observed_at_ms: Date.now(),
+        admission_revision: "7",
+      },
+    },
+  };
+  surfaces.push({ name: "ordinary-chat-origin-app", html: renderDesktopMarkup(
+    createDesktopRenderModel(base, originLocal), { backgroundInert: false, taskActivityDelay: "0ms" },
+  ) });
+  surfaces.push({ name: "device-execution-ready", html: renderDeviceExecution(local.deviceNetwork) });
+  surfaces.push({ name: "device-execution-paused", html: renderDeviceExecution({ ...local.deviceNetwork, execution: { ...local.deviceNetwork.execution, state: "paused", accepting: false, can_pause: false, can_resume: true, autostart: true } }) });
+  surfaces.push({ name: "device-execution-leave-confirmation", html: renderDeviceExecution({ ...local.deviceNetwork,
+    executionLeaveConfirmation: { projectId: "project-a", participationGeneration: 7 } }) });
 
   for (const overlay of [
     "provider",
     "config",
+    "hub",
+    "mcp_history",
     "workspace",
     "prompt_review",
     "command_palette",
@@ -608,6 +693,8 @@ function representativeSurfaces(): RenderedSurface[] {
       html: renderOverlay(representativeState({ overlay }), local),
     });
   }
+
+  surfaces.push({ name: "overlay-config-manual", html: renderOverlay(representativeState({ overlay: "config" }), defaultRenderLocal()) });
 
   const setup = representativeState({
     overlay: "config",
@@ -720,6 +807,10 @@ function representativeSurfaces(): RenderedSurface[] {
     name: "overlay-session_settings",
     html: renderOverlay(sessionSettingsState, sessionSettingsLocal),
   });
+  surfaces.push({
+    name: "overlay-session_settings-managed",
+    html: renderOverlay(sessionSettingsState, { ...sessionSettingsLocal, deviceNetwork: local.deviceNetwork }),
+  });
 
   for (const kind of ["session", "archive_session", "rollback_session"] as const) {
     const confirmation: LocalConfirmation = {
@@ -800,11 +891,81 @@ function representativeSurfaces(): RenderedSurface[] {
     },
   });
   surfaces.push({ name: "artifact-side-chat", html: renderArtifactPane(base, sideChatLocal) });
+  surfaces.push({ name: "artifact-side-chat-first-direct", html: renderArtifactPane({
+    ...base,
+    side_chat: { ...base.side_chat, can_send: false, direct_provider_capture: {
+      base_url: "http://direct.test:1234/v1", model: "direct-model",
+      provider_profile: "openai_compatible", enabled: true,
+      reason: "会話を保持し、最初のDirect設定を適用します。",
+    } },
+  }, defaultRenderLocal({ artifactPane: { mode: "side_chat" } })) });
   surfaces.push({
     name: "side-chat-delete-confirmation",
     html: renderSideChatDeleteConfirmation(base, sideChatLocal),
   });
 
+  const shared = sharedUiFixture();
+  shared.projection!.conversations = [{ id: "job-a", title: "試験の会話", latest_job_id: "job-a", updated_at_ms: 2,
+    revision: 1, delete_pending: false, can_rename: true, can_delete: true }];
+  shared.projection!.selected_conversation_id = "job-a";
+  shared.editingConversationId = "job-a";
+  shared.renameDraft = "新しい会話名";
+  shared.projection!.principal!.administrator = true;
+  shared.projection!.approval = { id: "approval-a", attempt_id: "attempt-a", request: { access: "shell", summary: "実行の確認", details: [], targets: [], outside_workspace: false, risks: [] }, status: "pending", decision: null, can_decide: true, expires_at_ms: 9999999999999 };
+  shared.projection!.submission_uncertain = true;
+  const asset = { id: "asset-a", project_id: "project-a", job_id: "job-a", kind: "artifact", name: "result.txt", sha256: "a".repeat(64), byte_length: 4, created_at_ms: 1, version: 1, base_sha256: null, purged_at_ms: null };
+  shared.projection!.inputs = [asset]; shared.projection!.assets = [asset];
+  shared.projection!.detail = { id: "job-a", project_id: "project-a", root_id: "job-a", parent_id: null, environment_id: "env-a", title: "終了した仕事", input: {}, result: "done", state: "succeeded", awaiting_child_id: null, revision: 7, created_at_ms: 1, updated_at_ms: 2, can_continue: true };
+  shared.projection!.conversation_history = { project_id: "project-a", conversation_id: "job-a", snapshot: 1, next_before: 1,
+    jobs: [{ job: { ...shared.projection!.status!.jobs[0], conversation_id: "job-a" }, input: { prompt: "前の依頼" }, result: { text: "完了" }, artifacts: [], more_artifacts: false }] };
+  shared.projection!.detail.retained_services = [{ service_id: "service-a", environment_id: "env-a", expires_at_ms: 9_999_999_999_999, stop_requested: false, uncertain: false, can_stop: true }];
+  shared.projection!.inbox = { items: [{ id: "finished:job-a", project_id: "project-a", job_id: "job-a", kind: "finished", title: "完了", created_at_ms: 1, read_at_ms: null, can_act: true, approval_id: null }], unread_count: 1, next_before: "older" };
+  shared.projection!.transcript = { items: [], next_after: 100 };
+  surfaces.push({ name: "shared-work-authenticated", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.submission_uncertain = false;
+  surfaces.push({ name: "shared-work-stop-all", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  const parked = structuredClone(shared);
+  parked.projection!.detail!.state = "running";
+  parked.projection!.detail!.can_continue = false;
+  parked.projection!.approval = {
+    ...parked.projection!.approval!,
+    status: "expired", expires_at_ms: 1, can_decide: false, can_reconfirm: true,
+    context: { job_id: "child-b", project_id: "project-a", root_id: "job-a", conversation_id: "job-a",
+      job_title: "実行の確認", controller_device_id: "WinA", controller_device_label: "WinA",
+      execution_device_id: "WinB", execution_device_label: "WinB" },
+  };
+  surfaces.push({ name: "shared-work-expired-child-approval", html: renderSharedWork(sharedWorkPresentation(parked)) });
+  shared.projection!.submission_uncertain = true;
+  const receiver = deviceUiFixture();
+  receiver.receiverActivity = { runner_id: "01K5RSWRDNYVZ5QNS5FD6C0FTM", observed_at_ms: 1, unavailable: false,
+    attempts: [{ attempt_id: "attempt-a", generation: "3", job_id: "job-a", project_id: "project-a", environment_id: "env-a", run_id: "01K5RSWRDNYVZ5QNS5FD6C0FTK", state: "executing", local_state: "running" }],
+    retained_services: [{ service_id: "service-a", attempt_id: "attempt-a", generation: "3", project_id: "project-a", conversation_id: "job-a", environment_id: "env-a", expires_at_ms: 9_999_999_999_999, local_state: "running", uncertain: false }] };
+  surfaces.push({ name: "receiver-activity", html: renderReceiverActivity(deviceNetworkPresentation(receiver), sharedWorkPresentation(shared)) });
+  shared.projection!.status!.next_before = "older";
+  surfaces.push({ name: "shared-work-sidebar", html: renderSidebar({ ...base, hub_project_open: true }, sharedWorkPresentation(shared)) });
+  shared.confirmation = { kind: "delete_conversation", projectId: "project-a", participationGeneration: 1, conversationId: "job-a", generation: "1", title: "試験の会話" };
+  surfaces.push({ name: "shared-work-delete-confirmation", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.confirmation = null;
+  shared.projection!.detail!.can_revise = true;
+  shared.projection!.detail!.state = "cancelled";
+  shared.projection!.conversation_history!.jobs[0].job.can_cancel = false;
+  shared.projection!.conversation_history!.jobs[0].job.state = "cancelled";
+  surfaces.push({ name: "shared-work-revise-available", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.editingJobId = "job-a";
+  shared.editingJobRevision = 7;
+  shared.revisionDraft = "再送する依頼";
+  surfaces.push({ name: "shared-work-revise-editor", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.editingJobId = null;
+  shared.editingJobRevision = null;
+  shared.revisionDraft = "";
+  shared.projection!.detail = null;
+  shared.projection!.selected_job_id = null;
+  shared.projection!.submission_uncertain = false;
+  surfaces.push({ name: "shared-work-new-conversation", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.principal = null;
+  surfaces.push({ name: "shared-work-device-access", html: renderSharedWork(sharedWorkPresentation(shared)) });
+  shared.projection!.connected = false;
+  surfaces.push({ name: "shared-work-enrollment", html: renderSharedWork(sharedWorkPresentation(shared)) });
   return surfaces;
 }
 
@@ -854,7 +1015,9 @@ function actionButtons(html: string): Array<{
       index: Number(attribute(tag, "data-index") ?? "-1"),
       value: attribute(tag, "data-agent-path")
         ?? attribute(tag, "data-history-target")
+        ?? attribute(tag, "data-provider-profile")
         ?? attribute(tag, "data-mode")
+        ?? attribute(tag, "data-value")
         ?? "",
       disabled: /\sdisabled(?:\s|>)/i.test(tag),
     }];
@@ -889,27 +1052,27 @@ test("composer exposes the exact frontend-owned run target for settlement checks
   assert.deepEqual(JSON.parse(decodeHtmlAttribute(encoded ?? "")), state.run_target);
 });
 
-test("initial setup is a six-step blocking shell and session settings exposes stable root-only locators", () => {
+test("initial setup retains advanced setup and session settings exposes stable root-only locators", () => {
   const surfaces = new Map(representativeSurfaces().map((surface) => [surface.name, surface.html]));
   const setup = surfaces.get("initial-setup-start") ?? "";
   assert.match(setup, /data-surface="initial-setup" data-current-step="start"/);
-  assert.equal(Array.from(setup.matchAll(/\bdata-step="(?:start|provider|model|permissions|tools|finish)"/g)).length, 6);
+  assert.equal(Array.from(setup.matchAll(/\bdata-step="(?:start|provider|model|permissions|tools|finish)"/g)).length, 1);
   assert.equal(
     Array.from(setup.matchAll(/<li data-step="(?:start|provider|model|permissions|tools|finish)"[^>]*aria-label="[1-6]\. [^"]+"/g)).length,
-    6,
+    1,
   );
   assert.doesNotMatch(setup, /<div class="shell"/);
   assert.doesNotMatch(setup, /class="modal-backdrop"/);
   assert.match(setup, /data-action="import-config-toml"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
-  assert.match(setup, /ディスクへの保存とruntime reloadはFinishまで行いません/);
+  assert.match(setup, /最後に保存するまで、現在の設定は変わりません/);
   assert.match(surfaces.get("initial-setup-tools") ?? "", /data-action="check-docling-readiness"/);
   assert.match(surfaces.get("initial-setup-finish") ?? "", /data-action="finish-initial-setup"/);
 
   const session = surfaces.get("overlay-session_settings") ?? "";
   assert.match(session, /class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings"/);
-  assert.match(session, /data-session-scope="root-only">このセッションだけ/);
-  assert.equal(Array.from(session.matchAll(/placeholder="Global Settingsを継承"/g)).length, 1);
-  assert.match(session, /保存後の次のpermission decisionからrootと子Agentへ反映/);
+  assert.match(session, /data-session-scope="root-only">このチャットだけ/);
+  assert.equal(Array.from(session.matchAll(/placeholder="共通設定を継承"/g)).length, 1);
+  assert.match(session, /次に承認が必要になる操作から適用/);
   for (const field of [
     "base-url",
     "model",
@@ -928,6 +1091,91 @@ test("initial setup is a six-step blocking shell and session settings exposes st
     surfaces.get("local-confirm-session-settings-close") ?? "",
     /data-modal="session-settings-close-confirmation"/,
   );
+});
+
+test("Hub-managed session settings retain the local context budget without another connection editor", () => {
+  const html = representativeSurfaces().find((surface) => surface.name === "overlay-session_settings-managed")!.html;
+  assert.match(html, /<div class="settings-field">\s*<label for="session-settings-context-window"/);
+  assert.match(html, /data-session-setting="context-window"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+  for (const field of ["base-url", "provider-profile", "api-key-env", "model"]) {
+    assert.match(html, new RegExp(`<div class="settings-field" hidden>\\s*<label for="session-settings-${field}"`));
+    assert.match(html, new RegExp(`data-session-setting="${field}"[^>]*disabled`));
+  }
+  assert.match(html, /AIの接続を開く/);
+});
+
+test("received work locks local Send while preserving the draft, then unlocks after Runner release", () => {
+  const state = representativeState({ overlay: "none", confirmation_visible: false });
+  const local = defaultRenderLocal();
+  local.deviceNetwork = { ...local.deviceNetwork, receiverActivity: {
+    runner_id: "runner", attempts: [{ attempt_id: "attempt", generation: "7", job_id: "job", project_id: "project", environment_id: "environment", run_id: "run", state: "executing", local_state: "running" }],
+    retained_services: [], observed_at_ms: Date.now(), unavailable: false,
+  } };
+  const model = createDesktopRenderModel(state, local);
+  assert.equal(actionEnabledById("send", model), false);
+  const locked = renderDesktopMarkup(model, { backgroundInert: false, taskActivityDelay: "0ms" });
+  assert.match(locked, /data-action="send"[^>]*disabled/);
+  assert.match(locked, /このPCに受信した仕事またはアプリが残っています/);
+  assert.match(locked, /Check every control/);
+  assert.match(locked, /data-action="receiver-stop"/);
+
+  local.deviceNetwork = { ...local.deviceNetwork, receiverActivity: { ...local.deviceNetwork.receiverActivity!, attempts: [] } };
+  const released = createDesktopRenderModel(state, local);
+  assert.equal(actionEnabledById("send", released), true);
+  assert.doesNotMatch(renderComposer(state, local), /このPCに受信した仕事またはアプリが残っています/);
+});
+
+test("initial welcome offers execution separately and guided review keeps permissions visible without requiring a workspace", () => {
+  const baseline = representativeState();
+  const state = representativeState({
+    confirmation_visible: false, overlay: "initial_setup",
+    startup: { ...baseline.startup, action_overlay: "initial_setup", initial_setup_required: true },
+    config_fields: [...baseline.config_fields, {
+      key: "permissions.access_mode", value: "default", value_type: "enum", required: true,
+      min_value: null, max_value: null, options: ["default", "auto_review", "full_access"],
+      env_override: null, sensitive: false, configured: true,
+    }],
+  });
+  const welcome = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal()), { backgroundInert: false, taskActivityDelay: "0ms" });
+  for (const purpose of ["personal", "execution", "team", "hosting"]) assert.match(welcome, new RegExp(`data-action="initial-setup-${purpose}"`));
+  assert.doesNotMatch(welcome, /<li data-step="(?:provider|model|permissions|tools|finish)"/);
+  assert.match(welcome, /作業フォルダーは後から選べます/);
+  assert.match(welcome, /依頼と結果の閲覧は、このPCにAIを設定せずに利用できます/);
+  const review = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step: "finish", guided: true } })), { backgroundInert: false, taskActivityDelay: "0ms" });
+  assert.match(review, /data-config-key="permissions.access_mode"/);
+  assert.match(review, /未接続でも設定を保存できます/);
+  assert.match(review, /<details data-details-key="initial-setup-optional-tools"/);
+  assert.doesNotMatch(review, /<li data-step="(?:permissions|tools)"/);
+  state.startup.onboarding_intent = "execution";
+  const executionReview = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step: "finish", guided: true } })), { backgroundInert: false, taskActivityDelay: "0ms" });
+  assert.match(executionReview, /AI設定を保存してPCの接続へ/);
+  assert.doesNotMatch(executionReview, /data-config-key="permissions.access_mode"/);
+  assert.match(executionReview, /仕事を実行する保存先と承認方法は、その後にこのPCで設定/);
+});
+
+test("Initial Setup exposes both system prompts as multiline editors without losing draft line breaks", () => {
+  const baseline = representativeState();
+  const text = "日本語の追加指示\nsecond <line> & detail";
+  const promptKeys = ["model.system_prompt", "side_chat.system_prompt"];
+  const fields: ConfigFieldProjection[] = promptKeys.map(key => ({
+    key, value: text, value_type: "string", required: false, min_value: null,
+    max_value: null, options: [], sensitive: false, configured: true, env_override: null,
+  }));
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "initial_setup",
+    startup: { ...baseline.startup, action_overlay: "initial_setup", initial_setup_required: true },
+    config_fields: [...baseline.config_fields.filter(field => !promptKeys.includes(field.key)), ...fields],
+  });
+  for (const [step, key] of [["model", "model.system_prompt"], ["finish", "side_chat.system_prompt"]] as const) {
+    const html = renderDesktopMarkup(createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step } })),
+      { backgroundInert: false, taskActivityDelay: "0ms" });
+    const escapedKey = key.replaceAll(".", "\\.");
+    const controls = [...html.matchAll(new RegExp(`<textarea\\b[^>]*data-config-key="${escapedKey}"[^>]*>([\\s\\S]*?)<\\/textarea>`, "g"))];
+    assert.equal(controls.length, 1, `${key} must be one multiline control in ${step}`);
+    assert.equal(controls[0][1], "日本語の追加指示\nsecond &lt;line&gt; &amp; detail");
+    assert.doesNotMatch(html, new RegExp(`<input\\b[^>]*data-config-key="${escapedKey}"`));
+  }
 });
 
 test("initial setup owns a retained dismissible live error inside its blocking shell", () => {
@@ -1030,7 +1278,7 @@ test("Session Settings keeps an Apply failure visible inside the exact dirty pan
       },
     }),
     recoverableError: {
-      title: "Session Settingsを適用できませんでした",
+      title: "チャットの設定を適用できませんでした",
       hint: "入力内容を保持したまま、もう一度お試しください。",
       details: "storage transaction failed",
     },
@@ -1041,7 +1289,7 @@ test("Session Settings keeps an Apply failure visible inside the exact dirty pan
   );
 
   assert.match(html, /data-settings-passive="session-settings-recoverable-error"/);
-  assert.match(html, /Session Settingsを適用できませんでした/);
+  assert.match(html, /チャットの設定を適用できませんでした/);
   assert.match(html, /storage transaction failed/);
   assert.match(html, /data-session-setting="model"[^>]*value="locally-edited-model"/);
   assert.match(html, /data-action="apply-session-settings"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
@@ -1147,7 +1395,7 @@ test("Wizard Advanced sections enumerate typed hidden fields and open at the rep
   for (const key of ["model.supports_tools", "model.supports_images", "model.parallel_tool_calls"]) {
     assert.match(model, new RegExp(`data-config-key="${key.replace(".", "\\.")}"`));
   }
-  assert.match(model, /sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
+  assert.match(model, /回答の長さや思考の設定には、AIサーバー側の設定を使います。/);
   assert.match(tools, /data-config-key="docling\.headers_json"/);
   assert.match(
     finish,
@@ -1209,7 +1457,7 @@ test("a stale session-settings owner disables editors while keeping Discard and 
         staleTarget: true,
         providerChanged: false,
         accessChanged: false,
-        reason: "保存済みSession Settingsが別の操作で更新されました。",
+        reason: "保存済みチャットの設定が別の操作で更新されました。",
       },
     },
   });
@@ -1268,7 +1516,7 @@ test("an unavailable Session Settings underlay becomes inert below its dirty-clo
         staleTarget: true,
         providerChanged: false,
         accessChanged: false,
-        reason: "root sessionを選択すると変更できます。",
+        reason: "メインチャットを開くと変更できます。",
       },
     },
   });
@@ -1286,6 +1534,7 @@ test("an unavailable Session Settings underlay becomes inert below its dirty-clo
 
 test("each primary GUI surface retains its required action routes", () => {
   const requiredActionsBySurface = {
+    "shared-work-expired-child-approval": ["shared-reconfirm-approval"],
     titlebar: [
       "show-file-menu",
       "show-edit-menu",
@@ -1334,6 +1583,7 @@ test("each primary GUI surface retains its required action routes", () => {
       "remove-image",
     ],
     "run-status": ["cancel-run"],
+    "mcp-run-status": ["show-mcp-execution-history"],
     permission: ["abort-permission", "cancel-run", "approve-permission"],
     "local-confirm-session": ["cancel-local-confirm", "confirm-local-delete"],
     "local-confirm-archive_session": ["cancel-local-confirm", "confirm-local-archive-state"],
@@ -1370,10 +1620,14 @@ test("each primary GUI surface retains its required action routes", () => {
       "close-overlay",
       "open-global-config-folder",
       "open-user-data-folder",
-      "show-provider",
-      "load-side-chat-models",
+      "hub-refresh",
+      "hub-save-main",
+      "hub-save-side",
       "show-session-settings",
     ],
+    "overlay-hub": ["close-overlay", "show-config", "device-network-reset"],
+    "overlay-config-manual": ["load-provider-models", "load-side-chat-models", "device-network-reset"],
+    "overlay-mcp_history": ["close-overlay", "mcp-history-direction", "mcp-history-refresh", "mcp-history-export", "mcp-history-stop"],
     "overlay-workspace": [
       "close-overlay",
       "switch-workspace",
@@ -1421,11 +1675,15 @@ test("each primary GUI surface retains its required action routes", () => {
   assert.deepEqual(missing, []);
 });
 
-test("the sidebar connection shortcut opens Settings instead of a duplicate provider editor", () => {
+test("the sidebar separates Hub preparation from ordinary Settings", () => {
   const html = renderSidebar(representativeState());
 
-  assert.match(html, /class="rail-item" data-action="show-config" title="Settingsでglobal既定値を確認・変更"/);
-  assert.match(html, />接続設定<\/span>/);
+  assert.match(html, /class="rail-item" data-action="show-hub"/);
+  assert.match(html, />moyAI Hub<\/span>/);
+  assert.doesNotMatch(html, /class="rail-item" data-action="show-mcp-history"/);
+  assert.match(renderOverlay(representativeState({ overlay: "config" }), defaultRenderLocal()), /data-action="show-mcp-history"/);
+  assert.doesNotMatch(html, /data-action="show-mcp-publish"/);
+  assert.match(html, /class="settings" data-action="show-config"/);
   assert.doesNotMatch(html, /class="rail-item" data-action="show-provider"/);
 });
 
@@ -1464,8 +1722,8 @@ test("composer shows canonical session usage separately from the context meter",
 
   assert.match(html, /class="token-meter low"/);
   assert.match(html, /class="session-usage partial"/);
-  assert.match(html, /セッション累計: 1\.2k token（一部）/);
-  assert.match(html, /canonical terminal telemetry: 2 \/ 3 turn計測/);
+  assert.match(html, /このチャットの累計: 1\.2k トークン（一部）/);
+  assert.match(html, /完了した依頼のうち 2 \/ 3件を計測/);
 });
 
 test("Initial Setup Finish and Session Settings Apply render as text-sized primary actions", () => {
@@ -1483,8 +1741,19 @@ test("Initial Setup Finish and Session Settings Apply render as text-sized prima
   assert.ok(sessionSettings);
   assert.match(
     sessionSettings,
-    /<button class="send wide-send" data-action="apply-session-settings"[^>]*>このセッションに適用<\/button>/,
+    /<button class="send wide-send" data-action="apply-session-settings"[^>]*>このチャットに適用<\/button>/,
   );
+});
+
+test("workspace validation feedback is readable inside the active dialog", () => {
+  for (const message of ["workspace path is empty", "workspace path is not accessible: <missing>", "workspace path is not a directory"]) {
+    const state = representativeState({ overlay: "workspace", confirmation_visible: false, status_message: message });
+    const html = renderOverlay(state, defaultRenderLocal());
+    const dialog = html.match(/<section[^>]*aria-labelledby="workspace-dialog-title"[\s\S]*?<\/section>/)?.[0];
+    assert.ok(dialog);
+    const feedback = dialog.match(/<pre[^>]*id="workspace-feedback"[^>]*role="status"[^>]*>([\s\S]*?)<\/pre>/)?.[1];
+    assert.equal(feedback, message.replaceAll("<", "&lt;").replaceAll(">", "&gt;"));
+  }
 });
 
 test("every action rendered by public GUI surfaces resolves through the single registry", () => {
@@ -1523,6 +1792,8 @@ test("production render button availability matches the shared action resolver",
     ...[
       "provider",
       "config",
+      "hub",
+      "mcp_history",
       "workspace",
       "prompt_review",
       "command_palette",
@@ -1597,6 +1868,37 @@ test("dirty Settings close layers an inert retained dialog below the alertdialog
   for (const backdrop of backdropTags) assert.doesNotMatch(backdrop, /data-action=/);
 });
 
+test("Main and Side Stop are named visibly and an idle Side has no misleading Stop control", () => {
+  const running = representativeState();
+  assert.match(renderRunStatusStrip(running), />メインチャットを停止<\/span>/);
+  const local = defaultRenderLocal({ artifactPane: { mode: "side_chat" } });
+  assert.match(renderArtifactPane(running, local), />Sideを停止<\/span>/);
+  const completed = representativeState({
+    status_code: "user_stopped",
+    status_message: "run stopped by user",
+    side_chat: { ...running.side_chat, status: "completed", can_cancel: false, can_send: true },
+  });
+  assert.doesNotMatch(renderArtifactPane(completed, local), /data-action="cancel-side-chat"|停止不可/);
+  assert.match(renderTopbar(completed), /実行を停止しました/);
+  assert.doesNotMatch(renderTopbar(completed), /run stopped by user/);
+});
+
+test("production MCP history keeps both direction buttons and a saved task selectable", () => {
+  const state = representativeState({ confirmation_visible: false, overlay: "mcp_history" });
+  const local = defaultRenderLocal();
+  local.mcpHistory = { ...local.mcpHistory, loaded: true, rows: [{ id: "history-row-a", direction: "instruction",
+    created_at_ms: 1_700_000_000_000, updated_at_ms: null, title: "WinBのCPU使用率", peer_label: "WinB", target_label: "temp",
+    state: "completed", stop_status: "none", session_id: "session-a", job_id: "job-b", profile_id: "profile-b",
+    root_task_id: "session-a", device_path: ["WinA", "WinB"], can_stop: false, state_source: "last_observed", result_received: true }] };
+  const html = renderDesktopMarkup(createDesktopRenderModel(state, local), { backgroundInert: false, taskActivityDelay: "0ms" });
+  for (const id of ["mcp-history-instruction", "mcp-history-execution", "mcp-history-row-history-row-a"]) {
+    const tag = html.match(new RegExp(`<button\\b[^>]*id="${id}"[^>]*>`))?.[0];
+    assert.ok(tag, `${id} is visible`);
+    assert.doesNotMatch(tag, /\sdisabled(?:\s|>)/, `${id} must remain usable after the final action-availability pass`);
+    assert.match(tag, /aria-disabled="false"/);
+  }
+});
+
 test("activity remains visible while Stop is neither rendered nor activatable without its exact Rust target", () => {
   const targetless = representativeState({ can_cancel_run: true, stop_target: null });
 
@@ -1643,17 +1945,17 @@ test("quick-chat activity uses the selected chat identity and keeps background r
   assert.match(selectedRow, /aria-current="page"/);
   assert.match(selectedRow, /class="task-activity-indicator" data-task-activity="finalizing" aria-hidden="true"/);
   assert.doesNotMatch(selectedRow, /class="task-activity-indicator small"/);
-  assert.match(selectedRow, /<small>最終反映中 · turn 4<\/small>/);
+  assert.match(selectedRow, /<small>最終反映中 · 依頼 4<\/small>/);
   assert.doesNotMatch(selectedRow, /\[実行中\]/);
   assert.ok(backgroundRow);
   assert.doesNotMatch(backgroundRow, /aria-current="page"/);
   assert.match(backgroundRow, /class="task-activity-indicator small" data-task-activity="running" aria-hidden="true"/);
-  assert.match(backgroundRow, /<small>実行中 · turn 4<\/small>/);
+  assert.match(backgroundRow, /<small>実行中 · 依頼 4<\/small>/);
   assert.doesNotMatch(backgroundRow, /\[実行中\]/);
   assert.match(html, /data-task-activity-row="finalizing"/);
   assert.match(html, /data-task-activity-row="running"/);
   assert.doesNotMatch(html, /class="task-activity-indicator[^>]*aria-label=/);
-  assert.match(html, /<span class="section-label">チャット<\/span>/);
+  assert.match(html, /<span class="section-label">このPCのチャット<\/span>/);
   assert.equal(Array.from(html.matchAll(/class="task-activity-indicator/g)).length, 2);
 });
 
@@ -1676,7 +1978,7 @@ test("a selected active row keeps the Rust state and removes its duplicate durab
     /class="task-activity-indicator" data-task-activity="running" aria-hidden="true"/,
   );
   assert.match(html, /<span>Active session active<\/span>/);
-  assert.match(html, /<small>実行中 · turn 4<\/small>/);
+  assert.match(html, /<small>実行中 · 依頼 4<\/small>/);
   assert.doesNotMatch(html, /\[実行中\]/);
   assert.doesNotMatch(html, /class="task-activity-indicator[^>]*aria-label=/);
 });

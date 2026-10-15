@@ -18,6 +18,7 @@ interface TranscriptRenderOptions {
   selectedAgentPath?: string | null;
   stableLatestAssistant?: boolean;
   sideChatQuoteOwnerSessionId?: string | null;
+  editableUserHistoryId?: string | null;
 }
 
 interface AgentHistoryEvent {
@@ -84,6 +85,7 @@ export function renderTranscriptRows(
       anchor.row,
       prefixedAnchorId(prefix, anchor.id),
       options.sideChatQuoteOwnerSessionId ?? null,
+      options.editableUserHistoryId ?? null,
     ));
   });
   if (pendingAgentEvents.length > 0) {
@@ -112,6 +114,7 @@ function renderHistoryRail(anchors: readonly TranscriptAnchor[]): string {
   return `
     <nav class="history-rail" aria-label="会話履歴">
       <div class="history-rail-markers" style="--history-marker-count: ${markers.length}">
+        <span class="history-rail-label" aria-hidden="true">履歴</span>
         ${markers.map((anchor) => `
           <button type="button" class="history-rail-marker history-kind-${escapeHtml(anchor.row.row_kind)}"
             data-action="jump-history-anchor" data-history-target="${escapeHtml(anchor.id)}"
@@ -155,6 +158,7 @@ function renderTranscriptRow(
   row: TranscriptRow,
   anchorId: string,
   sideChatQuoteOwnerSessionId: string | null,
+  editableUserHistoryId: string | null,
 ): string {
   if (row.row_kind === "file_changes") {
     return renderFileChanges(row, anchorId, sideChatQuoteOwnerSessionId);
@@ -165,12 +169,13 @@ function renderTranscriptRow(
     ? sideChatQuoteSourceKind(row)
     : null;
   return `
-    <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
+    <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
       ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
         ${routineConversation ? "" : `<h2>${escapeHtml(row.title)}</h2>`}
         <div class="markdown-body">${renderMarkdown(row.body)}</div>
+        ${row.row_kind === "user" && durableIdentity === editableUserHistoryId ? `<div class="message-edit-actions"><button type="button" data-action="edit-local-message" data-value="${escapeHtml(durableIdentity)}">編集して再送</button><span>作成済みファイルや起動中のアプリは元に戻りません。</span></div>` : ""}
         ${quoteSourceKind && durableIdentity ? renderSideChatQuoteAction(durableIdentity) : ""}
       </div>
     </article>
@@ -190,7 +195,7 @@ function renderFileChanges(
     ? `<div class="markdown-body">${renderMarkdown(row.body)}</div>`
     : renderFileChangeTable(row.file_changes);
   return `
-    <article class="message file_changes" data-history-anchor="${escapeHtml(anchorId)}"
+    <article class="message file_changes" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
       ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
@@ -216,8 +221,8 @@ function renderSideChatQuoteAction(historyItemId: string): string {
       <button type="button" class="message-quote-action"
         data-action="quote-selection-to-side-chat"
         data-source-history-item-id="${escapeHtml(historyItemId)}"
-        title="この履歴行内のテキストを選択してSide Chatで引用"
-        aria-label="選択したテキストをSide Chatで引用">Side Chatで引用</button>
+        title="この履歴行内のテキストを選択してサイドチャットで引用"
+        aria-label="選択したテキストをサイドチャットで引用">サイドチャットで引用</button>
     </div>
   `;
 }
@@ -269,7 +274,7 @@ function renderWorkSummary(
     options,
   );
   return `
-    <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
+    <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}>
       <div class="message-body">
         <details data-details-key="work-summary:${escapeHtml(detailsId)}" ${open}>
@@ -329,7 +334,7 @@ function renderAgentHistoryEvents(
       - (firstEventIndexes.get(right.agentPath) ?? 0);
   });
   return `
-    <div class="work-summary-agent-events" aria-label="Sub Agentの作業履歴">
+    <div class="work-summary-agent-events" aria-label="サブエージェントの作業履歴">
       ${presentedEvents.map((event) => {
         const activity = activityByPath.get(event.agentPath);
         const visual = stableAgentVisual(event.agentPath);
@@ -346,7 +351,7 @@ function renderAgentHistoryEvents(
               : "updated");
         const selected = options.selectedAgentPath === event.agentPath;
         const ariaLabel = [
-          `${label}のSub Agent履歴を表示`,
+          `${label}のサブエージェント履歴を表示`,
           description,
           status,
         ].filter(Boolean).join(" · ");
@@ -476,7 +481,7 @@ function presentedWorkHistoryItems(
     const waitCompleted = /^(?:wait_agent|Agent wait completed)$/i.test(item.label);
     const detail = normalizedWorkHistoryDetail(item.detail);
     const candidate = waitCompleted
-      ? { label: "Sub Agentの完了を待ちました", detail: "", status: item.status || "完了" }
+      ? { label: "サブエージェントの完了を待ちました", detail: "", status: item.status || "完了" }
       : { ...item, detail };
     const previous = presented.at(-1);
     if (
@@ -595,13 +600,13 @@ function agentEventStatus(
 }
 
 function agentNameFromPath(path: string): string {
-  const name = path.split("/").filter(Boolean).pop()?.trim() || "Sub Agent";
+  const name = path.split("/").filter(Boolean).pop()?.trim() || "サブエージェント";
   return name.replace(/[_-]+/g, " ");
 }
 
 function humanizeAgentName(value: string): string {
   const spaced = value.trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
-  if (!spaced) return "Sub Agent";
+  if (!spaced) return "サブエージェント";
   return `${spaced.charAt(0).toUpperCase()}${spaced.slice(1)}`;
 }
 

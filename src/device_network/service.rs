@@ -1,0 +1,1678 @@
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use camino::Utf8PathBuf;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
+
+use super::client::EnrollmentReceipt;
+use super::{
+    DeviceClient, DeviceError, DeviceIdentity, DeviceIdentityStore, DeviceSettings,
+    DeviceSettingsStore, DirectoryPeer, ReceiverBindSettings, ReceiverSettings, SelectedPeer,
+    SharedHubConfig, canonical_revision,
+};
+use crate::config::{AccessMode, ResolvedConfig};
+use crate::mcp_publish::{PublishService, PublishTarget};
+use crate::remote_agent::RemoteJobService;
+use crate::storage::StoreBundle;
+
+mod configuration;
+mod enrollment;
+pub use configuration::{PreparedDeviceConfiguration, PreparedDeviceReset};
+#[cfg(test)]
+mod enrollment_tests;
+mod history;
+mod runner;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceTargetChoice {
+    pub target: PublishTarget,
+    pub label: String,
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::storage::{SqliteStore, StoragePaths};
+    pub(super) async fn fixture() -> (tempfile::TempDir, DeviceNetworkService) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let paths = StoragePaths {
+            data_dir: root.join("data"),
+            database_path: root.join("data/db.sqlite3"),
+            truncation_dir: root.join("data/output"),
+        };
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let service = DeviceNetworkService::for_workspace(
+            root.join("config/device"),
+            workspace,
+            StoreBundle::new(sqlite),
+            ResolvedConfig::default(),
+        )
+        .await
+        .unwrap();
+        (temp, service)
+    }
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_execution_management_before_runner_exit() {
+        let (_temp, service) = fixture().await;
+        let lane = service.inner.execution.lane.lock().await;
+        let stopping_service = service.clone();
+        let stopping = tokio::spawn(async move { stopping_service.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(service.inner.state.lock().unwrap().closing);
+        assert!(
+            !stopping.is_finished(),
+            "Runner startup may still own the management lane"
+        );
+        drop(lane);
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn receiver_confirmation_is_reused_only_for_the_same_authority() {
+        let (_temp, service) = fixture().await;
+        let first = service
+            .receiver(
+                false,
+                PublishTarget::Temp {},
+                AccessMode::Default,
+                crate::hub::HubRouteMode::Direct,
+                true,
+                false,
+                false,
+                "0",
+                "0",
+            )
+            .await
+            .unwrap();
+        assert!(first.receiver.confirmed);
+        let same = service
+            .receiver(
+                false,
+                PublishTarget::Temp {},
+                AccessMode::Default,
+                crate::hub::HubRouteMode::Direct,
+                false,
+                true,
+                true,
+                &first.revision,
+                &first.generation,
+            )
+            .await
+            .unwrap();
+        assert!(same.receiver.confirmed);
+        let changed = service
+            .receiver(
+                false,
+                PublishTarget::Temp {},
+                AccessMode::FullAccess,
+                crate::hub::HubRouteMode::Direct,
+                false,
+                true,
+                true,
+                &same.revision,
+                &same.generation,
+            )
+            .await
+            .unwrap();
+        assert!(!changed.receiver.confirmed);
+        assert!(matches!(
+            service
+                .receiver(
+                    true,
+                    PublishTarget::Temp {},
+                    AccessMode::FullAccess,
+                    crate::hub::HubRouteMode::Direct,
+                    false,
+                    true,
+                    true,
+                    &changed.revision,
+                    &changed.generation
+                )
+                .await,
+            Err(DeviceError::SharedWorkRequired)
+        ));
+    }
+    #[tokio::test]
+    async fn receiver_restart_and_hide_do_not_reenable_a_saved_reception_intent() {
+        let (_temp, service) = fixture().await;
+        let mut settings = service.inner.settings.load().unwrap();
+        settings.receiver.enabled = true;
+        settings.receiver.confirmed = true;
+        let settings = service.inner.settings.save(&settings).unwrap();
+        let reopened = DeviceNetworkService::new(
+            service.inner.directory.clone(),
+            service.inner.store.clone(),
+            service.inner.global_config.lock().unwrap().clone(),
+            service.inner.jobs.clone(),
+            service.inner.publish.clone(),
+        );
+        assert!(!reopened.projection_now().receiver.enabled);
+        assert_eq!(reopened.projection_now().receiver.status, "stopped");
+        assert!(!service.inner.directory.join("identity.json").exists());
+        {
+            let mut state = reopened.inner.state.lock().unwrap();
+            state.settings = settings;
+            state.receiver_requested = true;
+            state.receiver_status = "receiving";
+        }
+        assert!(reopened.window_hide_requested());
+        reopened.window_shown();
+        assert!(!reopened.projection_now().receiver.enabled);
+        assert!(reopened.projection_now().receiver.confirmed);
+        assert!(
+            reopened.inner.settings.load().unwrap().receiver.enabled,
+            "window lifecycle must not rewrite saved authority"
+        );
+        {
+            let mut state = reopened.inner.state.lock().unwrap();
+            state.receiver_requested = true;
+            state.receiver_status = "receiving";
+        }
+        reopened.finish_window_hide(true).await;
+        assert!(
+            reopened.projection_now().receiver.enabled,
+            "late hide completion cannot undo a newly requested reception"
+        );
+        assert_eq!(reopened.projection_now().receiver.status, "receiving");
+    }
+    #[tokio::test]
+    async fn explicit_reconnect_preserves_identity_and_never_uses_start_on_launch_to_receive() {
+        let (_temp, service) = fixture().await;
+        let identity = service.inner.identity.load_or_create().unwrap();
+        let key = rcgen::KeyPair::from_pem(identity.private_key_pem()).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        {
+            let mut state = service.inner.state.lock().unwrap();
+            state.shared = SharedHubConfig {
+                hub_url: format!("https://{address}"),
+                ca_certificate_pem: cert.pem(),
+            };
+            state.identity = Some(identity);
+            let mut saved = state.settings.clone();
+            saved.hub_id = Some("hub-fixture".into());
+            saved.device_id = Some("device-fixture".into());
+            saved.label = "Win19".into();
+            saved.certificate_pem = Some(cert.pem());
+            saved.certificate_sha256 = Some("a".repeat(64));
+            saved.expires_at_ms = Some("1".into());
+            saved.receiver.enabled = true;
+            saved.receiver.confirmed = true;
+            saved.receiver.start_on_launch = true;
+            saved.selected_peers.push(SelectedPeer {
+                device_id: "device-other".into(),
+                profile_id: "profile-other".into(),
+            });
+            state.settings = service.inner.settings.save(&saved).unwrap();
+            state.status = "disconnected";
+        }
+        let projection = service.refresh().await.unwrap();
+        assert_eq!(projection.device_id.as_deref(), Some("device-fixture"));
+        assert_eq!(
+            projection.enrollment, "error",
+            "explicit refresh must attempt the registered connection"
+        );
+        assert!(!projection.receiver.enabled);
+        assert!(service.inner.receiver.lock().await.is_none());
+        assert!(
+            projection
+                .peers
+                .iter()
+                .any(|peer| peer.device_id == "device-other" && peer.selected)
+        );
+        service.shutdown().await;
+    }
+    #[tokio::test]
+    async fn retired_receiver_start_rejects_new_work_and_keeps_explicit_off_available() {
+        let (_temp, service) = fixture().await;
+        {
+            let mut state = service.inner.state.lock().unwrap();
+            state.receiver_requested = true;
+            state.receiver_status = "starting";
+        }
+        assert_eq!(
+            service.start_receiver().await,
+            Err(DeviceError::SharedWorkRequired)
+        );
+        let projection = service.projection_now();
+        assert_eq!(projection.receiver.status, "paused");
+        assert!(!projection.receiver.enabled);
+        assert!(projection.receiver.can_change);
+        let off = service
+            .receiver(
+                false,
+                PublishTarget::Temp {},
+                AccessMode::Default,
+                crate::hub::HubRouteMode::Hub,
+                false,
+                false,
+                false,
+                &projection.revision,
+                &projection.generation,
+            )
+            .await
+            .unwrap();
+        assert!(!off.receiver.enabled);
+    }
+
+    #[tokio::test]
+    async fn changed_certificate_ip_requires_renewal_after_restart_without_a_listener() {
+        let (_temp, service) = fixture().await;
+        let identity = service.inner.identity.load_or_create().unwrap();
+        let key = rcgen::KeyPair::from_pem(identity.private_key_pem()).unwrap();
+        let old = rcgen::CertificateParams::new(vec!["127.0.0.2".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let shared = SharedHubConfig {
+            hub_url: format!("https://{address}"),
+            ca_certificate_pem: old.pem(),
+        };
+        let client = DeviceClient::new(
+            &shared,
+            Some((&identity, &old.pem())),
+            "device-fixture".into(),
+        )
+        .unwrap();
+        {
+            let mut state = service.inner.state.lock().unwrap();
+            state.settings.device_id = Some("device-fixture".into());
+            state.settings.hub_id = Some("hub-fixture".into());
+            state.settings.certificate_pem = Some(old.pem());
+            state.settings.expires_at_ms = Some(
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 30 * 86400 * 1000)
+                    .to_string(),
+            );
+            state.shared = shared;
+            state.identity = Some(identity);
+            state.client = Some(client);
+        }
+        assert!(service.inner.receiver.lock().await.is_none());
+        assert_eq!(
+            service.renew_if_needed().await,
+            Err(DeviceError::Unavailable),
+            "a changed SAN must attempt renewal even without a listener; an unreachable Hub must keep reception closed"
+        );
+        assert!(service.inner.receiver.lock().await.is_none());
+        assert!(!service.projection_now().receiver.enabled);
+    }
+}
+#[cfg(test)]
+#[path = "service/renewal_tests.rs"]
+mod renewal_tests;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicePeerProjection {
+    pub device_id: String,
+    pub profile_id: String,
+    pub display_name: String,
+    pub name: String,
+    pub selected: bool,
+    pub online: bool,
+    pub receiving: bool,
+    pub can_use: bool,
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceReceiverProjection {
+    pub profile_id: String,
+    pub enabled: bool,
+    pub status: String,
+    pub target: PublishTarget,
+    pub access_mode: AccessMode,
+    pub model_mode: crate::hub::HubRouteMode,
+    pub start_on_launch: bool,
+    pub keep_when_hidden: bool,
+    pub bind_ip: Option<Ipv4Addr>,
+    pub port: Option<u16>,
+    pub confirmed: bool,
+    pub endpoint: Option<String>,
+    pub can_change: bool,
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceNetworkProjection {
+    pub revision: String,
+    pub generation: String,
+    pub hub_url: String,
+    pub device_id: Option<String>,
+    pub display_name: String,
+    pub local_hostname: String,
+    pub request_id: Option<String>,
+    pub local_ipv4: Option<String>,
+    pub enrollment: String,
+    pub receiver: DeviceReceiverProjection,
+    pub targets: Vec<DeviceTargetChoice>,
+    pub peers: Vec<DevicePeerProjection>,
+    pub can_join: bool,
+    pub can_leave: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DeviceNetworkService {
+    pub(super) inner: Arc<DeviceNetworkInner>,
+}
+#[derive(Clone)]
+pub(crate) struct WeakDeviceNetwork {
+    inner: Weak<DeviceNetworkInner>,
+}
+impl WeakDeviceNetwork {
+    pub(crate) fn upgrade(&self) -> Option<DeviceNetworkService> {
+        self.inner
+            .upgrade()
+            .map(|inner| DeviceNetworkService { inner })
+    }
+}
+
+pub(super) struct DeviceNetworkInner {
+    pub state: Mutex<DeviceState>,
+    pub lane: AsyncMutex<()>,
+    pub settings: DeviceSettingsStore,
+    pub identity: DeviceIdentityStore,
+    pub directory: Utf8PathBuf,
+    pub store: StoreBundle,
+    pub jobs: RemoteJobService,
+    pub publish: PublishService,
+    pub protected: Vec<Utf8PathBuf>,
+    pub global_config: Mutex<ResolvedConfig>,
+    pub hub: Mutex<Option<crate::hub::HubConnection>>,
+    pub use_default_model: std::sync::atomic::AtomicBool,
+    pub receiver: AsyncMutex<Option<super::receiver::ManagedReceiver>>,
+    pub outgoing: super::outgoing::OutgoingOwner,
+    pub shared_work: super::shared_work::SharedWorkOwner,
+    pub execution: super::execution::ExecutionOwner,
+}
+pub(super) struct DeviceState {
+    pub settings: DeviceSettings,
+    pub shared: SharedHubConfig,
+    pub generation: u64,
+    pub status: &'static str,
+    pub client: Option<DeviceClient>,
+    pub identity: Option<DeviceIdentity>,
+    pending_join: Option<enrollment::PendingJoin>,
+    pub peers: Vec<DirectoryPeer>,
+    pub receiver_status: &'static str,
+    pub receiver_endpoint: Option<String>,
+    pub receiver_requested: bool,
+    pub cancellation: CancellationToken,
+    pub error: Option<DeviceError>,
+    pub closing: bool,
+    pub hidden: bool,
+}
+impl DeviceState {
+    pub fn check(&self, revision: &str, generation: &str) -> Result<(), DeviceError> {
+        if self.closing || canonical_revision(generation) != Some(self.generation) {
+            return Err(DeviceError::ConnectionChanged);
+        }
+        if self.settings.revision != revision {
+            return Err(DeviceError::SettingsChanged);
+        }
+        if self.error == Some(DeviceError::SettingsCorrupt) {
+            return Err(DeviceError::SettingsCorrupt);
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for DeviceNetworkService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceNetworkService(<runtime>)")
+    }
+}
+
+impl DeviceNetworkService {
+    pub(crate) fn remote_jobs(&self) -> RemoteJobService {
+        self.inner.jobs.clone()
+    }
+    pub(crate) fn publish_service(&self) -> PublishService {
+        self.inner.publish.clone()
+    }
+    pub(crate) async fn acknowledge_incoming_job(
+        &self,
+        authority: &super::VerifiedGrant,
+        job_id: &str,
+    ) -> Result<(), DeviceError> {
+        {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            if state.closing
+                || state.settings.device_id.as_ref() != Some(&authority.claims().audience_device_id)
+                || state.settings.hub_id.as_ref() != Some(&authority.claims().hub_id)
+            {
+                return Err(DeviceError::GrantDenied);
+            }
+        }
+        self.client()?
+            .acknowledge_job(&authority.grant_id, job_id)
+            .await
+    }
+    pub(crate) async fn settle_incoming_job(
+        &self,
+        grant_id: &str,
+        job_id: &str,
+        state: &str,
+    ) -> Result<(), DeviceError> {
+        // Settlement is allowed during local shutdown; Hub still validates the exact audience.
+        let client = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .client
+            .clone()
+            .ok_or(DeviceError::Unavailable)?;
+        client.settle_job(grant_id, job_id, state).await
+    }
+    pub(crate) fn execution_identity(
+        &self,
+        authority: &super::VerifiedGrant,
+    ) -> Result<serde_json::Value, DeviceError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        if state.settings.hub_id.as_ref() != Some(&authority.claims().hub_id)
+            || state.settings.device_id.as_ref() != Some(&authority.claims().audience_device_id)
+            || state.settings.label.trim().is_empty()
+        {
+            return Err(DeviceError::InvalidIdentity);
+        }
+        Ok(serde_json::json!({
+            "device_id":state.settings.device_id,
+            "display_name":state.settings.label,
+            "os_hostname":std::env::var("COMPUTERNAME").ok(),
+        }))
+    }
+
+    /// Host the same receiver runtime without a Desktop window. The caller owns its
+    /// isolated store, workspace and shutdown; no GUI singleton contract is bypassed.
+    pub async fn for_workspace(
+        directory: Utf8PathBuf,
+        workspace: Utf8PathBuf,
+        store: StoreBundle,
+        config: ResolvedConfig,
+    ) -> Result<Self, DeviceError> {
+        let process_runtime = crate::app::AppBootstrap::create_process_runtime(store.clone())
+            .await
+            .map_err(|_| DeviceError::Unavailable)?;
+        let app = crate::app::AppBootstrap::rebuild_for_directory_as_workspace_root_with_process_runtime_and_config(
+            &workspace,
+            process_runtime,
+            config.clone(),
+        )
+        .await
+        .map_err(|_| DeviceError::InvalidConfiguration)?;
+        let jobs = RemoteJobService::new(app.process_runtime.clone())
+            .map_err(|_| DeviceError::Unavailable)?;
+        let publish = PublishService::new(
+            directory.join("manual-publish.json"),
+            store.clone(),
+            config.clone(),
+        );
+        Ok(Self::new(directory, store, config, jobs, publish))
+    }
+    pub fn new(
+        directory: Utf8PathBuf,
+        store: StoreBundle,
+        config: ResolvedConfig,
+        jobs: RemoteJobService,
+        publish: PublishService,
+    ) -> Self {
+        let settings_store = DeviceSettingsStore::new(directory.join("device.json"));
+        let identity_store = DeviceIdentityStore::new(directory.join("identity.json"));
+        let (mut settings, mut error) = match settings_store.load() {
+            Ok(settings) => (settings, None),
+            Err(error) => (DeviceSettings::default(), Some(error)),
+        };
+        let reset = super::reset::ResetState::load(&directory);
+        let reset_pending = reset.as_ref().map_or(true, |value| value.pending);
+        error = error.or(reset.err());
+        if reset_pending {
+            settings = DeviceSettings {
+                revision: settings.revision,
+                ..DeviceSettings::default()
+            };
+        }
+        let identity = if reset_pending {
+            Ok(None)
+        } else {
+            identity_store.load()
+        };
+        let pending = if !reset_pending && settings.device_id.is_none() {
+            enrollment::PendingJoin::load(
+                &directory,
+                &config.device_network,
+                identity.as_ref().ok().and_then(Option::as_ref),
+            )
+        } else {
+            Ok(None)
+        };
+        let error = error
+            .or(identity.as_ref().err().copied())
+            .or(pending.as_ref().err().copied());
+        let shared = if reset_pending {
+            SharedHubConfig::default()
+        } else {
+            config.device_network.clone()
+        };
+        let status = if error.is_some() {
+            "error"
+        } else if !shared.configured() {
+            "unconfigured"
+        } else if settings.device_id.is_none() {
+            pending
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map_or("not_enrolled", enrollment::PendingJoin::status)
+        } else {
+            "disconnected"
+        };
+        let state = DeviceState {
+            settings,
+            shared,
+            generation: 0,
+            status,
+            client: None,
+            identity: identity.ok().flatten(),
+            pending_join: pending.ok().flatten(),
+            peers: vec![],
+            receiver_status: "stopped",
+            receiver_endpoint: None,
+            receiver_requested: false,
+            cancellation: CancellationToken::new(),
+            error,
+            closing: false,
+            hidden: false,
+        };
+        let protected = vec![
+            directory.parent().unwrap_or(&directory).to_owned(),
+            store.paths().data_dir.clone(),
+        ];
+        let service = Self {
+            inner: Arc::new(DeviceNetworkInner {
+                state: Mutex::new(state),
+                lane: AsyncMutex::new(()),
+                settings: settings_store,
+                identity: identity_store,
+                directory: directory.clone(),
+                store: store.clone(),
+                jobs,
+                publish,
+                protected,
+                global_config: Mutex::new(config),
+                hub: Mutex::new(None),
+                use_default_model: std::sync::atomic::AtomicBool::new(false),
+                receiver: AsyncMutex::new(None),
+                outgoing: super::outgoing::OutgoingOwner::new(store.clone()),
+                shared_work: super::shared_work::SharedWorkOwner::new(
+                    directory.join("shared-submissions.json"),
+                ),
+                execution: super::execution::ExecutionOwner::default(),
+            }),
+        };
+        store.attach_device_network(service.downgrade());
+        service
+    }
+    pub(crate) fn downgrade(&self) -> WeakDeviceNetwork {
+        WeakDeviceNetwork {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+    pub fn attach_hub_connection(&self, hub: crate::hub::HubConnection) {
+        *self.inner.hub.lock().unwrap() = Some(hub);
+    }
+    pub fn enable_default_model_on_join(&self) {
+        self.inner
+            .use_default_model
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    async fn adopt_model_session(&self, force: bool) {
+        let hub = self.inner.hub.lock().unwrap().clone();
+        let Some(hub) = hub else {
+            return;
+        };
+        if !force && hub.projection_now().status == crate::hub::HubConnectionStatus::Connected {
+            return;
+        }
+        let Ok(client) = self.client() else {
+            return;
+        };
+        let use_default = {
+            let config = self.inner.global_config.lock().unwrap();
+            self.inner
+                .use_default_model
+                .load(std::sync::atomic::Ordering::Acquire)
+                || config.model.model.trim().is_empty()
+        };
+        if hub
+            .connect_device(&client.endpoint(), client.http(), use_default, None)
+            .await
+            .is_ok()
+        {
+            self.inner
+                .use_default_model
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    pub fn projection_now(&self) -> DeviceNetworkProjection {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("device network state poisoned");
+        let active = state.status == "active" && !state.closing;
+        let mut peers: Vec<_> = state
+            .peers
+            .iter()
+            .map(|peer| DevicePeerProjection {
+                device_id: peer.device_id.clone(),
+                profile_id: peer.profile_id.clone(),
+                display_name: peer.label.clone(),
+                name: peer.name.clone(),
+                selected: state.settings.selected_peers.iter().any(|selected| {
+                    selected.device_id == peer.device_id && selected.profile_id == peer.profile_id
+                }),
+                online: active,
+                receiving: active,
+                can_use: active && peer.mode == "agent",
+                reason: if !active {
+                    Some("unavailable".into())
+                } else if peer.mode != "agent" {
+                    Some("read_tools_only".into())
+                } else {
+                    None
+                },
+            })
+            .collect();
+        for selected in &state.settings.selected_peers {
+            if !peers.iter().any(|peer| {
+                peer.device_id == selected.device_id && peer.profile_id == selected.profile_id
+            }) {
+                peers.push(DevicePeerProjection {
+                    device_id: selected.device_id.clone(),
+                    profile_id: selected.profile_id.clone(),
+                    display_name: selected.device_id.clone(),
+                    name: selected.profile_id.clone(),
+                    selected: true,
+                    online: false,
+                    receiving: false,
+                    can_use: false,
+                    reason: Some("not_available_or_not_allowed".into()),
+                });
+            }
+        }
+        let receiver = &state.settings.receiver;
+        DeviceNetworkProjection {
+            revision: state.settings.revision.clone(),
+            generation: state.generation.to_string(),
+            hub_url: state.shared.hub_url.clone(),
+            device_id: state.settings.device_id.clone(),
+            display_name: state.settings.label.clone(),
+            local_hostname: enrollment::local_device_label(),
+            request_id: state
+                .pending_join
+                .as_ref()
+                .map(|pending| pending.receipt.request_id.clone()),
+            local_ipv4: state
+                .pending_join
+                .as_ref()
+                .map(|pending| pending.ip.to_string()),
+            enrollment: state.status.into(),
+            receiver: DeviceReceiverProjection {
+                profile_id: receiver.profile_id.0.to_string(),
+                enabled: state.receiver_requested,
+                status: state.receiver_status.into(),
+                target: receiver.target.clone(),
+                access_mode: receiver.access_mode,
+                model_mode: receiver.model_mode,
+                start_on_launch: receiver.start_on_launch,
+                keep_when_hidden: receiver.keep_when_hidden,
+                bind_ip: receiver.bind_ip,
+                port: receiver.port,
+                confirmed: receiver.confirmed,
+                endpoint: state.receiver_endpoint.clone(),
+                can_change: !state.closing && state.receiver_status != "starting",
+                reason: if !active {
+                    Some("connection_required".into())
+                } else {
+                    state.error.map(|error| error.to_string())
+                },
+            },
+            targets: self
+                .inner
+                .publish
+                .projection_now()
+                .targets
+                .into_iter()
+                .filter(|choice| !matches!(choice.target, PublishTarget::LegacySession { .. }))
+                .map(|choice| DeviceTargetChoice {
+                    target: choice.target,
+                    label: choice.label,
+                })
+                .collect(),
+            peers,
+            can_join: !state.closing
+                && state.shared.configured()
+                && state.settings.device_id.is_none()
+                && !matches!(state.status, "pending" | "revoked" | "stopped")
+                && state.error != Some(DeviceError::JoinSuperseded),
+            can_leave: !state.closing
+                && state.status != "pending"
+                && state.settings.device_id.is_some(),
+            error: state.error.map(|error| error.to_string()),
+        }
+    }
+    pub fn polling_required(&self) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("device network state poisoned");
+        state.client.is_some() || state.status == "pending" || state.receiver_status == "starting"
+    }
+    pub(crate) fn client(&self) -> Result<DeviceClient, DeviceError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        if state.closing || !matches!(state.status, "active" | "stopped") {
+            return Err(DeviceError::Unavailable);
+        }
+        if let (Some(hub), Some(device)) = (&state.settings.hub_id, &state.settings.device_id) {
+            if super::reset::execution_identity_reset(&self.inner.directory, hub, device)? {
+                return Err(DeviceError::Revoked);
+            }
+        }
+        state.client.clone().ok_or(DeviceError::Unavailable)
+    }
+    pub fn update_runtime_config(&self, config: ResolvedConfig) {
+        *self
+            .inner
+            .global_config
+            .lock()
+            .expect("device config poisoned") = config;
+    }
+    pub fn check_target(&self, revision: &str, generation: &str) -> Result<(), DeviceError> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .check(revision, generation)
+    }
+    pub async fn configure(
+        &self,
+        shared: SharedHubConfig,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        self.configure_with_commit(shared, revision, generation, |_| Ok(()))
+            .await
+    }
+    pub async fn configure_with_commit(
+        &self,
+        shared: SharedHubConfig,
+        revision: &str,
+        generation: &str,
+        commit: impl FnOnce(&SharedHubConfig) -> Result<(), DeviceError>,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let prepared = self
+            .prepare_configuration(shared, revision, generation)
+            .await?;
+        self.commit_configuration(prepared, commit).await
+    }
+    pub async fn join(
+        &self,
+        code: String,
+        confirmed: bool,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        if !confirmed {
+            return Err(DeviceError::ConfirmationRequired);
+        }
+        if code.trim().is_empty() || code.len() > 256 {
+            return Err(DeviceError::EnrollmentDenied);
+        }
+        let _lane = self.inner.lane.lock().await;
+        let (shared, identity) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            state.check(revision, generation)?;
+            if state.settings.device_id.is_some() {
+                return Err(DeviceError::ConnectionChanged);
+            }
+            let identity = self.inner.identity.load_or_create()?;
+            state.identity = Some(identity.clone());
+            state.status = "pending";
+            (state.shared.clone(), identity)
+        };
+        let result = async {
+            let bind_ip = self.inner.state.lock().unwrap().settings.receiver.bind_ip;
+            let client = DeviceClient::new_from(&shared, None, String::new(), bind_ip)?;
+            let ip = client.route_ip().await?;
+            let csr = self.stable_csr(&identity, ip)?;
+            let receipt = client.enroll(code.trim(), &csr).await?;
+            if !super::identity::certificate_covers_ip(&receipt.certificate_pem, ip)? {
+                return Err(DeviceError::InvalidResponse);
+            }
+            self.adopt_receipt(receipt, &shared, &identity, generation, None)?;
+            Ok::<(), DeviceError>(())
+        }
+        .await;
+        drop(code);
+        if let Err(error) = result {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            if state.closing || canonical_revision(generation) != Some(state.generation) {
+                return Err(DeviceError::ConnectionChanged);
+            }
+            state.error = Some(error);
+            state.status = "not_enrolled";
+            return Err(error);
+        }
+        drop(_lane);
+        self.start_heartbeat();
+        self.refresh().await
+    }
+    fn stable_csr(&self, identity: &DeviceIdentity, ip: Ipv4Addr) -> Result<String, DeviceError> {
+        use std::io::Write;
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Csr {
+            ip: Ipv4Addr,
+            #[serde(default)]
+            key_sha256: Option<String>,
+            csr_pem: String,
+        }
+        let key_sha256 = identity.public_key_sha256()?;
+        let path = self.inner.directory.join("pending-csr.json");
+        if let Ok(bytes) = std::fs::read(&path) {
+            if bytes.len() > 65536 {
+                return Err(DeviceError::InvalidIdentity);
+            }
+            let old: Csr =
+                serde_json::from_slice(&bytes).map_err(|_| DeviceError::InvalidIdentity)?;
+            // An old process can finish writing after a local reset. The IP
+            // alone cannot bind its CSR to this registration's current key.
+            // Legacy caches have no binding, so regenerate them once.
+            if old.ip == ip && old.key_sha256.as_deref() == Some(key_sha256.as_str()) {
+                return Ok(old.csr_pem);
+            }
+        }
+        let csr_pem = identity.csr(ip)?;
+        let mut file = tempfile::NamedTempFile::new_in(&self.inner.directory)
+            .map_err(|_| DeviceError::Storage)?;
+        file.write_all(
+            &serde_json::to_vec(&Csr {
+                ip,
+                key_sha256: Some(key_sha256),
+                csr_pem: csr_pem.clone(),
+            })
+            .map_err(|_| DeviceError::Storage)?,
+        )
+        .map_err(|_| DeviceError::Storage)?;
+        file.as_file()
+            .sync_all()
+            .map_err(|_| DeviceError::Storage)?;
+        file.persist(path).map_err(|_| DeviceError::Storage)?;
+        Ok(csr_pem)
+    }
+    fn adopt_receipt(
+        &self,
+        receipt: EnrollmentReceipt,
+        shared: &SharedHubConfig,
+        identity: &DeviceIdentity,
+        generation: &str,
+        transport: Option<super::ManagedHubHttp>,
+    ) -> Result<reqwest::Client, DeviceError> {
+        use sha2::{Digest, Sha256};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+        let supplied = CertificateDer::from_pem_slice(receipt.ca_certificate_pem.as_bytes())
+            .map_err(|_| DeviceError::InvalidResponse)?;
+        let trusted = CertificateDer::from_pem_slice(shared.ca_certificate_pem.as_bytes())
+            .map_err(|_| DeviceError::InvalidConfiguration)?;
+        let certificate = CertificateDer::from_pem_slice(receipt.certificate_pem.as_bytes())
+            .map_err(|_| DeviceError::InvalidResponse)?;
+        if supplied != trusted
+            || format!("{:x}", Sha256::digest(certificate.as_ref())) != receipt.certificate_sha256
+        {
+            return Err(DeviceError::InvalidResponse);
+        }
+        crate::mcp_publish::tls::load_mtls_acceptor(
+            &receipt.certificate_pem,
+            identity.private_key_pem(),
+            &shared.ca_certificate_pem,
+        )
+        .map_err(|_| DeviceError::InvalidIdentity)?;
+        let bind_ip = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .settings
+            .receiver
+            .bind_ip;
+        let mut client = DeviceClient::new_from(
+            shared,
+            Some((identity, &receipt.certificate_pem)),
+            receipt.device_id.clone(),
+            bind_ip,
+        )?;
+        let http = client.http().snapshot();
+        if let Some(transport) = transport {
+            client.use_transport(transport);
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        if state.closing
+            || canonical_revision(generation) != Some(state.generation)
+            || state
+                .settings
+                .hub_id
+                .as_ref()
+                .is_some_and(|id| id != &receipt.hub_id)
+            || state
+                .settings
+                .device_id
+                .as_ref()
+                .is_some_and(|id| id != &receipt.device_id)
+        {
+            return Err(DeviceError::ConnectionChanged);
+        }
+        let mut proposed = state.settings.clone();
+        proposed.hub_id = Some(receipt.hub_id);
+        proposed.device_id = Some(receipt.device_id);
+        proposed.label = receipt.label;
+        proposed.certificate_pem = Some(receipt.certificate_pem);
+        proposed.certificate_sha256 = Some(receipt.certificate_sha256);
+        proposed.expires_at_ms = Some(receipt.expires_at_ms.to_string());
+        state.settings = self.inner.settings.save(&proposed)?;
+        self.inner.outgoing.peer_connections.clear();
+        state.client = Some(client);
+        state.status = "active";
+        state.error = None;
+        state.generation += 1;
+        Ok(http)
+    }
+    pub async fn resume(&self) -> Result<DeviceNetworkProjection, DeviceError> {
+        self.resume_with_startup(true).await
+    }
+    async fn resume_with_startup(
+        &self,
+        _startup: bool,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let join = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            !state.closing && state.settings.device_id.is_none() && state.shared.configured()
+        };
+        if join {
+            let result = self.refresh_join(None).await;
+            self.start_heartbeat();
+            return result;
+        }
+        let _lane = self.inner.lane.lock().await;
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            if state.closing {
+                return Err(DeviceError::ConnectionChanged);
+            }
+            let Some(device_id) = state.settings.device_id.clone() else {
+                return Ok(self.projection_without_lock(state));
+            };
+            let identity = state
+                .identity
+                .as_ref()
+                .ok_or(DeviceError::InvalidIdentity)?;
+            let certificate = state
+                .settings
+                .certificate_pem
+                .as_deref()
+                .ok_or(DeviceError::InvalidIdentity)?;
+            state.client = Some(DeviceClient::new_from(
+                &state.shared,
+                Some((identity, certificate)),
+                device_id,
+                state.settings.receiver.bind_ip,
+            )?);
+            state.status = "active";
+        }
+        if let Err(error) = self.refresh_certificate().await {
+            let mut state = self.inner.state.lock().unwrap();
+            state.status = "error";
+            state.error = Some(error);
+            drop(state);
+            drop(_lane);
+            self.start_heartbeat();
+            return Ok(self.projection_now());
+        }
+        drop(_lane);
+        let result = self.refresh_connected().await;
+        self.start_heartbeat();
+        // Saved receiver settings remain historical; project jobs use the shared execution host.
+        result
+    }
+    fn projection_without_lock(
+        &self,
+        state: std::sync::MutexGuard<'_, DeviceState>,
+    ) -> DeviceNetworkProjection {
+        drop(state);
+        self.projection_now()
+    }
+    pub async fn refresh(&self) -> Result<DeviceNetworkProjection, DeviceError> {
+        let join = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            !state.closing && state.settings.device_id.is_none() && state.shared.configured()
+        };
+        if join {
+            let result = self.refresh_join(None).await;
+            self.start_heartbeat();
+            return result;
+        }
+        let reconnect = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            !state.closing && state.client.is_none() && state.settings.device_id.is_some()
+        };
+        if reconnect {
+            self.resume_with_startup(false).await
+        } else {
+            self.refresh_connected().await
+        }
+    }
+    async fn refresh_connected(&self) -> Result<DeviceNetworkProjection, DeviceError> {
+        let _lane = self.inner.lane.lock().await;
+        let (client, generation, hub_id) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            let Some(client) = state.client.clone() else {
+                return Ok(self.projection_without_lock(state));
+            };
+            if super::reset::execution_identity_reset(
+                &self.inner.directory,
+                state
+                    .settings
+                    .hub_id
+                    .as_deref()
+                    .ok_or(DeviceError::InvalidIdentity)?,
+                &client.device_id,
+            )? {
+                return Err(DeviceError::Revoked);
+            }
+            (client, state.generation, state.settings.hub_id.clone())
+        };
+        let result = async {
+            client.presence().await?;
+            let own = client.self_status().await?;
+            if own.admission == super::client::DeviceAdmission::Stopped {
+                if own.device_id != client.device_id || Some(&own.hub_id) != hub_id.as_ref() {
+                    return Err(DeviceError::InvalidResponse);
+                }
+                return Ok((Vec::new(), own));
+            }
+            let directory = client.directory(None).await?;
+            if own.device_id != client.device_id
+                || Some(&own.hub_id) != hub_id.as_ref()
+                || own.hub_id != directory.hub_id
+                || own.label.len() > 256
+                || own.label.chars().any(char::is_control)
+                || own.groups.len() > 256
+                || own.groups.iter().any(|group| !super::stable_id(group))
+                || canonical_revision(&own.revision).is_none()
+                || canonical_revision(&directory.revision) < canonical_revision(&own.revision)
+            {
+                return Err(DeviceError::InvalidResponse);
+            }
+            self.cancel_announced_lineages(&own.cancelled_lineages);
+            Ok::<_, DeviceError>((directory.peers, own))
+        }
+        .await;
+        let accepted = result.is_ok();
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            if state.generation != generation || state.closing {
+                return Err(DeviceError::ConnectionChanged);
+            }
+            match result {
+                Ok((peers, own)) => {
+                    if state.settings.certificate_sha256.as_ref() != Some(&own.certificate_sha256) {
+                        state.status = "error";
+                        state.error = Some(DeviceError::InvalidIdentity);
+                        return Err(DeviceError::InvalidIdentity);
+                    }
+                    if state
+                        .settings
+                        .expires_at_ms
+                        .as_deref()
+                        .and_then(canonical_revision)
+                        != Some(own.expires_at_ms)
+                    {
+                        return Err(DeviceError::InvalidResponse);
+                    }
+                    if state.settings.label != own.label {
+                        let mut settings = state.settings.clone();
+                        settings.label = own.label;
+                        state.settings = self.inner.settings.save(&settings)?;
+                    }
+                    state.peers = peers;
+                    let stopped = own.admission == super::client::DeviceAdmission::Stopped;
+                    state.status = if stopped { "stopped" } else { "active" };
+                    state.error = if stopped {
+                        Some(DeviceError::Stopped)
+                    } else {
+                        None
+                    };
+                    if stopped {
+                        state.receiver_status = "paused";
+                        self.inner
+                            .jobs
+                            .set_network_accepting(state.settings.receiver.profile_id, false);
+                    }
+                }
+                Err(error) => {
+                    state.status = if error == DeviceError::Revoked {
+                        "revoked"
+                    } else {
+                        "error"
+                    };
+                    state.error = Some(error);
+                    self.inner
+                        .jobs
+                        .set_network_accepting(state.settings.receiver.profile_id, false);
+                    state.receiver_status = if state.receiver_endpoint.is_some() {
+                        "error"
+                    } else {
+                        "stopped"
+                    };
+                }
+            }
+        }
+        let active = self.inner.state.lock().unwrap().status == "active";
+        if accepted {
+            if let Err(error) = self.announce_receiver_with(&client).await {
+                let mut state = self.inner.state.lock().unwrap();
+                state.error = Some(error);
+                state.receiver_status = "error";
+                self.inner
+                    .jobs
+                    .set_network_accepting(state.settings.receiver.profile_id, false);
+            }
+            if active {
+                self.adopt_model_session(false).await;
+            }
+            self.serve_history_requests(&client, generation).await;
+            if self.has_pending_origin_turn_stops() {
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let _ = service.retry_origin_turn_stops_connected().await;
+                });
+            }
+        }
+        Ok(self.projection_now())
+    }
+    pub async fn select(
+        &self,
+        device_id: String,
+        profile_id: String,
+        enabled: bool,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        if enabled {
+            return Err(DeviceError::SharedWorkRequired);
+        }
+        let _lane = self.inner.lane.lock().await;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        state.check(revision, generation)?;
+        if enabled
+            && (state.status != "active"
+                || !state.peers.iter().any(|peer| {
+                    peer.device_id == device_id
+                        && peer.profile_id == profile_id
+                        && peer.mode == "agent"
+                }))
+        {
+            return Err(DeviceError::PolicyDenied);
+        }
+        let mut next = state.settings.clone();
+        next.selected_peers
+            .retain(|peer| peer.device_id != device_id || peer.profile_id != profile_id);
+        if enabled {
+            next.selected_peers.push(SelectedPeer {
+                device_id,
+                profile_id,
+            });
+        }
+        state.settings = self.inner.settings.save(&next)?;
+        drop(state);
+        Ok(self.projection_now())
+    }
+    pub async fn receiver(
+        &self,
+        enabled: bool,
+        target: PublishTarget,
+        access_mode: AccessMode,
+        model_mode: crate::hub::HubRouteMode,
+        confirmed: bool,
+        start_on_launch: bool,
+        keep_when_hidden: bool,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let bind = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?
+            .settings
+            .receiver
+            .bind();
+        self.receiver_with_bind(
+            enabled,
+            target,
+            access_mode,
+            model_mode,
+            confirmed,
+            start_on_launch,
+            keep_when_hidden,
+            bind,
+            revision,
+            generation,
+        )
+        .await
+    }
+    pub async fn receiver_with_bind(
+        &self,
+        enabled: bool,
+        target: PublishTarget,
+        access_mode: AccessMode,
+        model_mode: crate::hub::HubRouteMode,
+        confirmed: bool,
+        start_on_launch: bool,
+        keep_when_hidden: bool,
+        bind: ReceiverBindSettings,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        if enabled {
+            return Err(DeviceError::SharedWorkRequired);
+        }
+        bind.validate()?;
+        let _lane = self.inner.lane.lock().await;
+        let old = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            state.check(revision, generation)?;
+            state.settings.clone()
+        };
+        let same_authority = old.receiver.target == target
+            && old.receiver.access_mode == access_mode
+            && old.receiver.model_mode == model_mode;
+        let confirmed = confirmed || (same_authority && old.receiver.confirmed);
+        if matches!(target, PublishTarget::LegacySession { .. }) || (enabled && !confirmed) {
+            return Err(DeviceError::ConfirmationRequired);
+        }
+        if enabled {
+            self.client()?;
+        }
+        if let Some(ip) = bind.bind_ip {
+            let socket = tokio::net::UdpSocket::bind((ip, 0))
+                .await
+                .map_err(|_| DeviceError::ReceiverAddressUnavailable)?;
+            drop(socket);
+        }
+        if old.receiver.target != target
+            || old.receiver.access_mode != access_mode
+            || old.receiver.model_mode != model_mode
+            || old.receiver.bind() != bind
+        {
+            if self.inner.jobs.has_active_profile(old.receiver.profile_id) {
+                return Err(DeviceError::ReceiverBusy);
+            }
+            self.stop_receiver_transport().await;
+            if self.inner.receiver.lock().await.is_some() {
+                return Err(DeviceError::ReceiverBusy);
+            }
+            if !same_authority {
+                self.inner.jobs.cancel_profile(old.receiver.profile_id);
+            }
+        }
+        crate::mcp_publish::dispatch::validate_target(
+            &self.inner.store,
+            &target,
+            &self.inner.protected,
+        )
+        .await
+        .map_err(|_| DeviceError::InvalidConfiguration)?;
+        let mut next = old;
+        next.receiver = ReceiverSettings {
+            profile_id: next.receiver.profile_id,
+            enabled,
+            target,
+            access_mode,
+            model_mode,
+            confirmed,
+            start_on_launch,
+            keep_when_hidden,
+            bind_ip: bind.bind_ip,
+            port: bind.port,
+        };
+        let saved = self.inner.settings.save(&next)?;
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.settings = saved;
+            state.receiver_requested = enabled;
+        }
+        if enabled {
+            self.start_receiver().await?;
+        } else {
+            self.pause_receiver().await?;
+        }
+        Ok(self.projection_now())
+    }
+    fn start_heartbeat(&self) {
+        let (cancel, generation) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("device network state poisoned");
+            state.cancellation.cancel();
+            state.cancellation = CancellationToken::new();
+            (state.cancellation.clone(), state.generation)
+        };
+        let weak = self.downgrade();
+        tokio::spawn(async move {
+            loop {
+                let delay = weak
+                    .upgrade()
+                    .map(|service| {
+                        let state = service.inner.state.lock().unwrap();
+                        if state.status == "pending" && state.error.is_none() {
+                            2
+                        } else {
+                            10
+                        }
+                    })
+                    .unwrap_or(10);
+                tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(delay)) => {} }
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                if service.inner.state.lock().unwrap().generation != generation {
+                    break;
+                }
+                let registered = service
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .settings
+                    .device_id
+                    .is_some();
+                if registered && service.connection_locally_retired().unwrap_or(true) {
+                    service.begin_shutdown();
+                    break;
+                }
+                let pending = {
+                    let state = service.inner.state.lock().unwrap();
+                    state.settings.device_id.is_none()
+                        && state.shared.configured()
+                        && state.status != "revoked"
+                };
+                if pending {
+                    let _ = service.refresh_join(None).await;
+                } else {
+                    let _ = service.refresh_connected().await;
+                }
+                let _ = service.renew_if_needed().await;
+                service.poll_outgoing().await;
+                service
+                    .inner
+                    .jobs
+                    .reconcile_network_receipts(service.clone())
+                    .await;
+            }
+        });
+    }
+    async fn renew_if_needed(&self) -> Result<(), DeviceError> {
+        let _lane = self.inner.lane.lock().await;
+        let renewed = match self.refresh_certificate().await {
+            Ok(renewed) => renewed,
+            Err(DeviceError::ReceiverBusy) => return Ok(()),
+            Err(error) => {
+                self.inner.state.lock().unwrap().error = Some(error);
+                return Err(error);
+            }
+        };
+        if renewed || self.receiver_certificate_changed().await {
+            if let Err(error) = self.restart_receiver_certificate().await {
+                self.inner.state.lock().unwrap().error = Some(error);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    /// Called under the device command lane. The signed leaf, not a live listener,
+    /// decides whether a changed route needs enrollment renewal.
+    pub(super) async fn refresh_certificate(&self) -> Result<bool, DeviceError> {
+        let (client, identity, shared, generation, expiry, certificate, bind_ip) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| DeviceError::Unavailable)?;
+            let Some(client) = state.client.clone() else {
+                return Ok(false);
+            };
+            if super::reset::execution_identity_reset(
+                &self.inner.directory,
+                state
+                    .settings
+                    .hub_id
+                    .as_deref()
+                    .ok_or(DeviceError::InvalidIdentity)?,
+                &client.device_id,
+            )? {
+                return Err(DeviceError::Revoked);
+            }
+            (
+                client,
+                state.identity.clone().ok_or(DeviceError::InvalidIdentity)?,
+                state.shared.clone(),
+                state.generation.to_string(),
+                state
+                    .settings
+                    .expires_at_ms
+                    .as_deref()
+                    .and_then(canonical_revision)
+                    .unwrap_or(0),
+                state
+                    .settings
+                    .certificate_pem
+                    .clone()
+                    .ok_or(DeviceError::InvalidIdentity)?,
+                state.settings.receiver.bind_ip,
+            )
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let candidate = DeviceClient::new_from(
+            &shared,
+            Some((&identity, &certificate)),
+            client.device_id.clone(),
+            bind_ip,
+        )?;
+        let ip = candidate.route_ip().await?;
+        let changed_ip = !super::identity::certificate_covers_ip(&certificate, ip)?;
+        let renew = expiry <= now.saturating_add(7 * 86400 * 1000) || changed_ip;
+        if !renew && client.local_ip() == bind_ip {
+            return Ok(false);
+        }
+        let http = client.http();
+        let rotation = http.try_rotate().ok_or(DeviceError::ReceiverBusy)?;
+        if renew {
+            let csr = self.stable_csr(&identity, ip)?;
+            let receipt = candidate.renew(&csr).await?;
+            if !super::identity::certificate_covers_ip(&receipt.certificate_pem, ip)? {
+                return Err(DeviceError::InvalidResponse);
+            }
+            let fresh = self.adopt_receipt(receipt, &shared, &identity, &generation, Some(http))?;
+            rotation.replace(fresh);
+        } else {
+            let fresh = candidate.http().snapshot();
+            let mut candidate = candidate;
+            candidate.use_transport(http);
+            self.inner.state.lock().unwrap().client = Some(candidate);
+            rotation.replace(fresh);
+        }
+        drop(rotation);
+        if renew {
+            self.start_heartbeat();
+        }
+        Ok(renew)
+    }
+    pub fn begin_shutdown(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("device network state poisoned");
+        state.closing = true;
+        self.inner.outgoing.peer_connections.clear();
+        state.receiver_requested = false;
+        state.generation += 1;
+        state.cancellation.cancel();
+        self.inner
+            .jobs
+            .cancel_profile(state.settings.receiver.profile_id);
+    }
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
+        // A refresh already in this lane can still be starting its Runner.
+        // Drain it before Desktop stops the Runner, so it cannot respawn after Exit.
+        let _execution_lane = self.inner.execution.lane.lock().await;
+        self.stop_receiver_transport().await;
+        self.cancel_all_outgoing().await;
+    }
+    pub async fn window_hidden(&self) {
+        let pause = self.window_hide_requested();
+        self.finish_window_hide(pause).await;
+    }
+    pub async fn finish_window_hide(&self, pause: bool) {
+        let _lane = self.inner.lane.lock().await;
+        let still_hidden = {
+            let state = self.inner.state.lock().unwrap();
+            state.hidden && !state.receiver_requested
+        };
+        if pause && still_hidden {
+            let _ = self.pause_receiver().await;
+        }
+    }
+    pub fn window_hide_requested(&self) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        state.hidden = true;
+        let pause = !state.settings.receiver.keep_when_hidden;
+        if pause {
+            state.receiver_requested = false;
+            state.receiver_status = "paused";
+            self.inner
+                .jobs
+                .set_network_accepting(state.settings.receiver.profile_id, false);
+        }
+        pause
+    }
+    pub fn window_shown(&self) {
+        self.inner.state.lock().unwrap().hidden = false;
+    }
+    pub async fn leave(
+        &self,
+        revision: &str,
+        generation: &str,
+    ) -> Result<DeviceNetworkProjection, DeviceError> {
+        let _lane = self.inner.lane.lock().await;
+        self.check_target(revision, generation)?;
+        self.pause_receiver().await?;
+        self.stop_receiver_transport().await;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| DeviceError::Unavailable)?;
+        state.cancellation.cancel();
+        state.client = None;
+        self.inner.outgoing.peer_connections.clear();
+        state.peers.clear();
+        state.status = "disconnected";
+        state.generation += 1;
+        // Disconnect preserves the durable enrolled identity. Re-enrollment is never automatic.
+        drop(state);
+        Ok(self.projection_now())
+    }
+}

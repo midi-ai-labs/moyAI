@@ -92,10 +92,23 @@ fn token_budget_text(goal: &GoalSnapshot) -> String {
 }
 
 fn render_template(template: &str, values: &[(&str, &str)]) -> String {
-    let mut rendered = template.to_string();
-    for (name, value) in values {
-        rendered = rendered.replace(&format!("{{{{ {name} }}}}"), value);
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{{ ") {
+        rendered.push_str(&remaining[..start]);
+        let field = &remaining[start + 3..];
+        let Some(end) = field.find(" }}") else {
+            rendered.push_str(&remaining[start..]);
+            return rendered;
+        };
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == &field[..end]) {
+            rendered.push_str(value);
+        } else {
+            rendered.push_str(&remaining[start..start + 3 + end + 3]);
+        }
+        remaining = &field[end + 3..];
     }
+    rendered.push_str(remaining);
     rendered
 }
 
@@ -160,5 +173,24 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn goal_objective_preserves_literal_template_fields_in_both_statuses() {
+        for status in [ThreadGoalStatus::Active, ThreadGoalStatus::BudgetLimited] {
+            let mut goal = goal(status);
+            goal.objective = "Fix {{ tokens_used }} and {{ token_budget }}; keep {{ objective }}, {{ remaining_tokens }} and {{ time_used_seconds }} <literal>".to_string();
+            let Some(ModelMessage::User { content }) =
+                steering_message_for_goal(&GoalSnapshot::capture("goal-1", &goal))
+            else {
+                panic!("goal should produce steering");
+            };
+            assert!(content.contains(&format!(
+                "<objective>\n{}\n</objective>",
+                escape_xml_text(&goal.objective)
+            )));
+            assert!(content.contains("- Tokens used: 40"));
+            assert!(content.contains("- Token budget: 100"));
+        }
     }
 }

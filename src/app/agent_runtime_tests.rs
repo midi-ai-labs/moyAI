@@ -591,6 +591,7 @@ async fn wait_agent_returns_immediately_for_steer_queued_before_wait_starts() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let mut prompt = AllowPrompt;
     let context = ToolContext {
@@ -666,6 +667,7 @@ async fn wait_agent_polls_cross_store_steer_and_delivers_it_to_the_prompt_once()
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let mut prompt = AllowPrompt;
     let context = ToolContext {
@@ -2039,6 +2041,153 @@ async fn child_finish_fixture(
     child_finish_fixture_with_capacity(test_name, 2).await
 }
 
+#[tokio::test]
+async fn desktop_exit_stops_process_root_and_detached_child_then_waits_for_their_owners() {
+    let (runtime, root_execution, _, child_lease, child) =
+        child_finish_fixture("desktop-exit-tree").await;
+    let root_id = root_execution.context.session_id;
+    // RunService registers the admitted turn's control, not the stable scope
+    // used to coordinate successive root turns.
+    let root_control = root_execution.run_control();
+    let root_target = runtime
+        .session_service
+        .active_turn_expectation_for_session(root_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::session::ActiveTurnExpectation::Turn { turn_id, revision } = root_target else {
+        panic!("active root")
+    };
+    let root_active = runtime
+        .store
+        .active_runs()
+        .try_start(root_id, root_control.clone())
+        .unwrap();
+    root_active.set_turn_target(turn_id, revision).unwrap();
+    let child_turn = TurnId::new();
+    let admitted = runtime
+        .store
+        .session_repo()
+        .admit_session_turn(child.session.id, child_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let child_control = child_lease.run_control();
+    let child_active = runtime
+        .store
+        .active_runs()
+        .try_start(child.session.id, child_control.clone())
+        .unwrap();
+    child_active
+        .set_turn_target(child_turn, admitted.admission_revision)
+        .unwrap();
+
+    let mut stopping = Box::pin(runtime.stop_process_trees());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stopping.as_mut())
+            .await
+            .is_err(),
+        "cancellation receipt does not prove worker quiescence"
+    );
+    assert!(root_control.is_cancelled());
+    assert_eq!(
+        child_control.cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::TreeStopped
+        ))
+    );
+    root_execution
+        .context
+        .tree
+        .control
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
+        .unwrap();
+    root_execution.complete(AgentStatus::Interrupted).unwrap();
+    drop(child_active);
+    drop(root_active);
+    tokio::time::timeout(Duration::from_secs(2), stopping)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn desktop_exit_resource_drain_waits_for_the_existing_receipt_task() {
+    let (runtime, _, _) = direct_runtime_fixture("desktop-exit-resource-drain", 2).await;
+    let release = CancellationToken::new();
+    let task_release = release.clone();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_finished = finished.clone();
+    runtime
+        .retain_resource_drain(move || async move {
+            task_release.cancelled().await;
+            task_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+    let mut drained = Box::pin(runtime.wait_for_resource_drains());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), drained.as_mut())
+            .await
+            .is_err()
+    );
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    release.cancel();
+    tokio::time::timeout(Duration::from_secs(2), drained)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    runtime.wait_for_resource_drains().await.unwrap();
+}
+
+#[tokio::test]
+async fn desktop_exit_allows_a_deleted_quiescent_chat_but_rejects_a_missing_active_owner() {
+    let (runtime, session, config) = direct_runtime_fixture("desktop-exit-deleted-chat", 2).await;
+    let execution = runtime
+        .begin_root(
+            &session,
+            captured_turn_config(config),
+            SharedConfirmationPrompt::new(AllowPrompt),
+            RunControl::new(),
+        )
+        .await
+        .unwrap();
+    let tree = execution.context.tree.clone();
+    execution.complete(AgentStatus::Completed(None)).unwrap();
+    runtime
+        .session_service
+        .delete_session(session.session.id)
+        .await
+        .expect("ordinary idle chat delete");
+    assert!(
+        runtime.has_tree_for_session(session.session.id),
+        "the existing runtime retains completed trees"
+    );
+    assert!(
+        runtime
+            .session_service
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    runtime
+        .stop_process_trees()
+        .await
+        .expect("a deleted, fully quiescent chat must not block Exit");
+
+    // A disappeared durable row is not proof that a late local execution ended.
+    let live = tree
+        .control
+        .try_acquire_root_execution(RunControl::new())
+        .unwrap();
+    assert!(runtime.stop_process_trees().await.is_err());
+    tree.control
+        .complete_execution(live, InactiveAgentStatus::Interrupted, None)
+        .unwrap();
+}
+
 async fn child_finish_fixture_with_capacity(
     test_name: &str,
     max_concurrent_agents: usize,
@@ -2267,6 +2416,7 @@ async fn child_permission_uses_live_root_mode_and_keeps_the_admitted_process_pla
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let control = RunControl::new();
     let mut prompt = AllowPrompt;
@@ -4710,7 +4860,7 @@ fn pre_admission_terminal_fence_purges_the_claimed_trigger_before_completion() {
 }
 
 #[tokio::test]
-async fn durable_activity_projection_restores_three_completed_paths_tasks_and_results() {
+async fn durable_activity_projection_restores_exact_completed_results_after_restart() {
     let (original_runtime, root_session, config) =
         direct_runtime_fixture("durable-desktop-projection", 4).await;
     let protocol_store = original_runtime.store.protocol_event_store();
@@ -4790,6 +4940,35 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
                 },
             })
             .expect("durable child result");
+        protocol_store
+            .seed_history_item_for_test(&HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: child.session.id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 2,
+                created_at_ms: SystemClock::now_ms(),
+                payload: HistoryItemPayload::Error {
+                    message: "earlier retry error".to_string(),
+                },
+            })
+            .expect("earlier retry error");
+        if task_name == "tests" {
+            protocol_store
+                .seed_history_item_for_test(&HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id: child.session.id,
+                    scope: HistoryScope::Turn { turn_id },
+                    sequence_no: 3,
+                    created_at_ms: SystemClock::now_ms(),
+                    payload: HistoryItemPayload::AssistantMessage {
+                        response_id: ModelResponseId::new(),
+                        content: vec![ContentPart::Text {
+                            text: "unrelated later assistant message".to_string(),
+                        }],
+                    },
+                })
+                .expect("unrelated later assistant message");
+        }
         terminalize_admitted_test_session(
             &original_runtime,
             child.session.id,
@@ -4798,7 +4977,7 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
             &terminal_event(
                 child.session.id,
                 TurnTerminalOutcome::Completed,
-                Some(response_id),
+                (task_name != "review").then_some(response_id),
             ),
         )
         .await;
@@ -4842,9 +5021,20 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
         assert_eq!(record.agent_path, agent_path);
         assert_eq!(record.task_name, task_name);
         assert_eq!(record.task_preview, task);
-        assert!(matches!(record.status, AgentStatus::Completed(Some(_))));
+        if task_name == "review" {
+            assert!(matches!(record.status, AgentStatus::Completed(None)));
+        } else {
+            assert!(matches!(record.status, AgentStatus::Completed(Some(_))));
+        }
         assert!(!record.is_current_turn);
-        assert_eq!(record.result_preview, result);
+        assert_eq!(
+            record.result_preview,
+            if task_name == "review" {
+                "Completed".to_string()
+            } else {
+                result
+            }
+        );
         assert!(record.current_activity.is_empty());
 
         let mut running = session;
@@ -7401,6 +7591,7 @@ fn bind_agent_script_run_service(
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(config);
     let llm = Arc::new(AgentScriptClient { state: script });
@@ -7568,6 +7759,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(AgentScriptState::default());
@@ -7797,6 +7989,7 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
@@ -8011,6 +8204,7 @@ async fn root_terminal_is_not_recalled_or_rewritten_by_late_child_interrupt() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
@@ -8189,6 +8383,7 @@ async fn idle_goal_continuation_uses_explicit_wait_agent_for_detached_child() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
@@ -8413,6 +8608,7 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
         truncator: ToolTruncator,
         mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         skills: crate::skill::SkillsService::new(),
+        managed_shells: Default::default(),
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(AgentScriptState::default());

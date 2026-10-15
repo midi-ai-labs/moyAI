@@ -19,6 +19,29 @@ test("bounded readiness waits for the accepted observation without mutation retr
   assert.equal(result.elapsed_ms, 20);
 });
 
+test("an explicitly unbounded observation keeps sampling beyond 120 minutes", async () => {
+  let time = 0;
+  let samples = 0;
+  const result = await waitForObservation({
+    label: "unbounded manual run", timeoutMs: Infinity, pollMs: 500,
+    now: () => time, sleep: async milliseconds => { time += milliseconds; },
+    sample: async () => { time += 3 * 60 * 60 * 1000; return ++samples; },
+    accept: value => value === 2,
+  });
+  assert.equal(result.attempts, 2);
+  assert.ok(result.elapsed_ms > 7_200_000);
+});
+
+test("a long explicit observation budget does not overflow Node's timer delay", async () => {
+  const result = await waitForObservation({
+    label: "long manual run", timeoutMs: 2_147_483_648,
+    sample: () => new Promise(resolve => setTimeout(() => resolve("ready"), 15)),
+    accept: value => value === "ready",
+  });
+  assert.equal(result.value, "ready");
+  assert.equal(result.attempts, 1);
+});
+
 test("bounded readiness returns typed timeout evidence and can reject sampling errors immediately", async () => {
   let time = 0;
   await assert.rejects(

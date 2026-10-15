@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StorageError;
 use crate::runtime::{Clock, SystemClock};
-use crate::session::{ProjectId, ProjectRecord, ProjectRepository};
+use crate::session::{ProjectId, ProjectRecord, ProjectRepository, SessionId};
 use crate::storage::session_repo::mutation_blocker_for_project_in_connection;
 
 #[derive(Clone)]
@@ -18,16 +18,25 @@ impl SqliteProjectRepository {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
     }
-}
+    /// Internal temporary workspaces acquire their purpose atomically with project creation.
+    /// A normal upsert preserves purpose; it can never promote an ordinary project.
+    pub(crate) async fn upsert_remote_temp_project(
+        &self,
+        id: ProjectId,
+        root_path: &Utf8Path,
+        display_name: &str,
+        profile_id: ulid::Ulid,
+    ) -> Result<ProjectRecord, StorageError> {
+        self.upsert_project_with_purpose(id, root_path, display_name, "none", Some(profile_id))
+    }
 
-#[async_trait(?Send)]
-impl ProjectRepository for SqliteProjectRepository {
-    async fn upsert_project(
+    fn upsert_project_with_purpose(
         &self,
         id: ProjectId,
         root_path: &Utf8Path,
         display_name: &str,
         vcs_kind: &str,
+        remote_temp_profile_id: Option<ulid::Ulid>,
     ) -> Result<ProjectRecord, StorageError> {
         let now = SystemClock.now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
@@ -48,30 +57,36 @@ impl ProjectRepository for SqliteProjectRepository {
                 existing_id_for_root.expect("checked existing project id")
             )));
         }
-        let existing_root_for_id = transaction
+        let existing = transaction
             .query_row(
-                "SELECT root_path FROM projects WHERE id = ?1",
+                "SELECT root_path, remote_temp_profile_id FROM projects WHERE id = ?1",
                 params![id.to_string()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
-        if existing_root_for_id
-            .as_deref()
-            .is_some_and(|existing| existing != root_path.as_str())
-        {
-            return Err(StorageError::Message(format!(
-                "project {id} is already bound to root `{}`",
-                existing_root_for_id.expect("checked existing project root")
-            )));
+        if let Some((existing_root, existing_purpose)) = existing {
+            if existing_root != root_path.as_str() {
+                return Err(StorageError::Message(format!(
+                    "project {id} is already bound to root `{existing_root}`"
+                )));
+            }
+            if let Some(profile) = remote_temp_profile_id
+                && existing_purpose.as_deref() != Some(profile.to_string().as_str())
+            {
+                return Err(StorageError::Message(
+                    "ordinary or another receiver's project cannot become a remote temp workspace"
+                        .into(),
+                ));
+            }
         }
         transaction.execute(
-            "INSERT INTO projects (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO projects (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms, remote_temp_profile_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                  display_name=excluded.display_name,
                  vcs_kind=excluded.vcs_kind,
                  updated_at_ms=excluded.updated_at_ms",
-            params![id.to_string(), root_path.as_str(), display_name, vcs_kind, now, now],
+            params![id.to_string(), root_path.as_str(), display_name, vcs_kind, now, now, remote_temp_profile_id.map(|id| id.to_string())],
         )?;
         let project = transaction.query_row(
             "SELECT root_path, display_name, vcs_kind, created_at_ms, updated_at_ms
@@ -90,6 +105,19 @@ impl ProjectRepository for SqliteProjectRepository {
         )?;
         transaction.commit()?;
         Ok(project)
+    }
+}
+
+#[async_trait(?Send)]
+impl ProjectRepository for SqliteProjectRepository {
+    async fn upsert_project(
+        &self,
+        id: ProjectId,
+        root_path: &Utf8Path,
+        display_name: &str,
+        vcs_kind: &str,
+    ) -> Result<ProjectRecord, StorageError> {
+        self.upsert_project_with_purpose(id, root_path, display_name, vcs_kind, None)
     }
 
     async fn get_project(&self, id: ProjectId) -> Result<ProjectRecord, StorageError> {
@@ -122,6 +150,7 @@ impl ProjectRepository for SqliteProjectRepository {
                     COALESCE(MAX(sessions.updated_at_ms), projects.updated_at_ms) AS last_activity_ms
              FROM projects
              LEFT JOIN sessions ON sessions.project_id = projects.id
+             WHERE projects.remote_temp_profile_id IS NULL
              GROUP BY projects.id
              ORDER BY projects.created_at_ms ASC, lower(projects.display_name) ASC, lower(projects.root_path) ASC
              LIMIT ?1",
@@ -147,8 +176,66 @@ impl ProjectRepository for SqliteProjectRepository {
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<(), StorageError> {
+        self.delete_project_checked(id, None).await
+    }
+}
+
+impl SqliteProjectRepository {
+    /// Recheck the complete local history owner set in the same transaction
+    /// that erases the project. Hub was consulted before this transaction; a
+    /// newly admitted and already completed turn must still invalidate it.
+    pub(crate) async fn delete_project_checked(
+        &self,
+        id: ProjectId,
+        expected_revisions: Option<&[(SessionId, u64)]>,
+    ) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(expected_revisions) = expected_revisions {
+            let mut statement = tx.prepare(
+                "SELECT session.id, revision.revision
+                 FROM sessions AS session
+                 INNER JOIN session_admission_revisions AS revision ON revision.session_id=session.id
+                 WHERE session.project_id=?1 ORDER BY session.id",
+            )?;
+            let actual = statement
+                .query_map(params![id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut expected = expected_revisions
+                .iter()
+                .map(|(session_id, revision)| {
+                    Ok((
+                        session_id.to_string(),
+                        i64::try_from(*revision).map_err(|_| {
+                            StorageError::Message("project chat revision is invalid".into())
+                        })?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            expected.sort();
+            if actual != expected {
+                return Err(StorageError::Message(
+                    "project chats changed while Hub work was being checked; refresh before deleting"
+                        .into(),
+                ));
+            }
+        }
+        let has_remote_job: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM remote_agent_jobs AS job
+                 INNER JOIN sessions AS session ON session.id = job.session_id
+                 WHERE session.project_id = ?1
+             )",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
+        if has_remote_job {
+            return Err(StorageError::Message(
+                "遠隔タスクの実行記録があるため、この中間版ではプロジェクトを削除できません".into(),
+            ));
+        }
         let active_session_id = mutation_blocker_for_project_in_connection(&tx, id)?;
         if let Some(active_session_id) = active_session_id {
             return Err(StorageError::Message(format!(
@@ -233,6 +320,12 @@ impl ProjectRepository for SqliteProjectRepository {
         tx.execute(
             "DELETE FROM turn_steer_inputs
              WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_mailbox_messages
+             WHERE root_session_id IN (SELECT id FROM sessions WHERE project_id = ?1)
+                OR recipient_session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
             params![id.to_string()],
         )?;
         tx.execute(
@@ -361,6 +454,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_project_delete_rejects_new_or_changed_chats_after_hub_snapshot() {
+        let (store, root) = project_store_fixture();
+        let project_id = ProjectId::new();
+        let repo = store.project_repo();
+        repo.upsert_project(project_id, &root, "project", "none")
+            .await
+            .unwrap();
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "later chat".into(),
+                cwd: root,
+                model: "model".into(),
+                base_url: "http://localhost:1234".into(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            repo.delete_project_checked(project_id, Some(&[]))
+                .await
+                .is_err()
+        );
+        assert!(
+            repo.delete_project_checked(project_id, Some(&[(session.id, 999)]))
+                .await
+                .is_err()
+        );
+        assert!(repo.get_project(project_id).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn delete_project_removes_protocol_turn_sequence_allocators() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
@@ -466,6 +593,111 @@ mod tests {
             )
             .await
             .expect("reviewer edge");
+
+        let root_turn = TurnId::new();
+        let root_admission = repository
+            .admit_session_turn(sessions[0].id, root_turn)
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        let child_turn = TurnId::new();
+        let child_admission = repository
+            .admit_session_turn(sessions[1].id, child_turn)
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+        for payload in ["delivered message", "discarded message"] {
+            repository
+                .append_inter_agent_communication_for_caller_turn_with_protocol_bundle_and_capacity(
+                    sessions[1].id,
+                    child_admission.admission_id,
+                    child_turn,
+                    sessions[0].id,
+                    crate::protocol::InterAgentCommunication {
+                        author: "/root/worker".into(),
+                        recipient: "/root".into(),
+                        content: crate::protocol::render_inter_agent_message(
+                            crate::protocol::InterAgentMessageType::Message,
+                            "/root",
+                            "/root/worker",
+                            payload,
+                        ),
+                        trigger_turn: false,
+                    },
+                    true,
+                    true,
+                )
+                .expect("enqueue child message");
+        }
+        repository
+            .deliver_pending_agent_mail_for_admitted_turn_with_selector(
+                sessions[0].id,
+                root_admission.admission_id,
+                root_turn,
+                crate::storage::session_repo::AgentMailboxDeliverySelector::AllPending,
+                1,
+            )
+            .expect("deliver first message");
+        repository
+            .record_agent_tree_stop_fence(
+                sessions[0].id,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            )
+            .await
+            .expect("discard remaining message at Stop");
+        for (session_id, admission_id, turn_id, cause) in [
+            (
+                sessions[0].id,
+                root_admission.admission_id,
+                root_turn,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            ),
+            (
+                sessions[1].id,
+                child_admission.admission_id,
+                child_turn,
+                crate::protocol::TurnInterruptionCause::TreeStopped,
+            ),
+        ] {
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &crate::session::RunEvent::TurnTerminal {
+                        session_id,
+                        terminal: Box::new(crate::session::DurableTurnTerminal {
+                            outcome: crate::protocol::TurnTerminalOutcome::Interrupted { cause },
+                            final_response_id: None,
+                            tool_call_count: 0,
+                            failed_tool_count: 0,
+                            change_count: 0,
+                            metrics: Default::default(),
+                        }),
+                    },
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("settle stopped owner");
+        }
+        let states = {
+            let project_repository = store.project_repo();
+            let connection = project_repository.connection.lock().expect("sqlite mutex");
+            let mut statement = connection
+                .prepare("SELECT state FROM agent_mailbox_messages ORDER BY state")
+                .expect("mailbox query");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("mailbox states")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("mailbox rows")
+        };
+        assert_eq!(states, ["delivered", "discarded"]);
+        SqliteStore::open(store.paths())
+            .expect("reopen valid mailbox database")
+            .migrate()
+            .expect("mailbox identities are valid before deletion");
 
         store
             .project_repo()

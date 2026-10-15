@@ -8,6 +8,8 @@ import { CdpClient, assertLocalTargetEndpoint, discoverDevToolsEndpoint, waitFor
 import { auditClosedSqlite } from "./sqlite_cleanup.mjs";
 import { acquireDesktopAdmission } from "./windows_admission_lock.mjs";
 import { invokeWindowsProcess, waitForChildExit } from "./windows_process.mjs";
+import { runWindowsExternalProcess } from "./windows_external_process.mjs";
+import { desktopFixtureRoot, desktopLaunchEnvironment, desktopOwnersMatch, normalizeDesktopIsolation, prepareDesktopFixtureEnvironment } from "../core/desktop_isolation.mjs";
 
 function arrayValue(value) {
   if (value === null || value === undefined) return [];
@@ -54,6 +56,7 @@ const HARNESS_OWNED_ENVIRONMENT = new Set([
   "MOYAI_CONFIG_PATH",
   "MOYAI_DATA_DIR",
   "MOYAI_DESKTOP_PREFS_PATH",
+  "MOYAI_DESKTOP_E2E_ROOT",
 ]);
 
 export function normalizeScenarioEnvironment(value) {
@@ -72,6 +75,19 @@ export function normalizeScenarioEnvironment(value) {
     normalized[key] = entry;
   }
   return normalized;
+}
+
+export function desktopLaunchArguments(context, joinConfigPath = null, startupTarget = "workspace") {
+  if (!["workspace", "preferences"].includes(startupTarget)) throw new TypeError("startupTarget must be workspace or preferences");
+  const args = startupTarget === "workspace" ? ["--dir", context.paths.workspace] : [];
+  if (joinConfigPath === null || joinConfigPath === undefined) return args;
+  if (typeof joinConfigPath !== "string" || joinConfigPath.includes("\0") || joinConfigPath.length > 32767
+    || !path.win32.isAbsolute(joinConfigPath)) throw new TypeError("joinConfigPath must be a bounded absolute Windows path");
+  const relative = path.win32.relative(context.paths.workspace, joinConfigPath);
+  if (!relative || relative === ".." || relative.startsWith("..\\") || path.win32.isAbsolute(relative)) {
+    throw new TypeError("joinConfigPath must belong to the scenario workspace");
+  }
+  return [...args, "--join-config", joinConfigPath];
 }
 
 export function selectActiveCleanupDriver(currentDriver, initialDriver, { restartBegan }) {
@@ -142,22 +158,62 @@ export class WindowsTauriHost {
   #stdoutHandle = null;
   #stderrHandle = null;
   #processTemp = null;
+  #launchEnvironment = null;
+  #duplicateCount = 0;
+  #activeContext = null;
+  #preservedDesktops = null;
+  #desktopOwner = null;
+  #parentHost = null;
+  #companions = [];
+  #runtime = null;
+
+  // A scenario may restart Desktop as part of its own test. Suite callers must
+  // acquire the current attachment instead of keeping that closed CDP client.
+  async attachedRuntime() {
+    if (this.#desktop === null || this.#desktop.exitCode !== null || this.#driver === null || this.#runtime === null) {
+      throw new DesktopE2eError("harness", "desktop-attachment-not-live", "the suite Desktop is no longer attached");
+    }
+    await this.#checkDesktops([this.#desktopOwner]);
+    return { driver: this.#driver, runtime: structuredClone(this.#runtime) };
+  }
+
+  async #checkDesktops(owned = []) {
+    const root = this.#parentHost ?? this;
+    if (root.#preservedDesktops === null) return null;
+    // Peer generations belong to the same admission owner. Read their current
+    // captured identities, so restarting A does not turn its old PID into an
+    // allegedly preserved outside process in B's ledger.
+    const peers = [root, ...root.#companions.map(child => child.host)]
+      .filter(host => host !== this).map(host => host.#desktopOwner).filter(Boolean);
+    const expected = [...peers, ...owned];
+    const observed = arrayValue(await invokeWindowsProcess("ListDesktop"));
+    if (!desktopOwnersMatch(root.#preservedDesktops, observed, expected)) {
+      throw new DesktopE2eError("environment", "desktop-singleton-race", "Desktop ownership changed after preflight", {
+        preserved_desktops: root.#preservedDesktops, expected_owned: expected, observed_desktops: observed,
+      });
+    }
+    return observed;
+  }
 
   async preflight({ context, sink, phase }) {
     if (process.platform !== "win32") {
       throw new DesktopE2eError("environment", "windows-required", "actual Desktop qualification requires Windows");
     }
     try {
-      this.#admission = await acquireDesktopAdmission();
+      if (this.#parentHost === null) this.#admission = await acquireDesktopAdmission();
+      else if (this.#parentHost.#admission === null) throw new Error("companion parent has no active admission");
     } catch (error) {
       if (error?.code === "desktop-e2e-admission-busy") {
         throw new DesktopE2eError("environment", error.code, error.message, error.evidence ?? null);
       }
       throw error;
     }
-    await sink.record("admission-acquired", this.#admission.identity, { phase, owner: "process-ledger" });
+    if (this.#admission !== null) await sink.record("admission-acquired", this.#admission.identity, { phase, owner: "process-ledger" });
     const existing = arrayValue(await invokeWindowsProcess("ListDesktop"));
-    if (existing.length > 0) {
+    this.#preservedDesktops = this.#parentHost?.#preservedDesktops ?? existing;
+    const isolation = normalizeDesktopIsolation(context.desktopIsolation);
+    await sink.record("desktop-preexisting-owners", { desktop_isolation: isolation, processes: existing }, { phase, owner: "process-ledger" });
+    if (existing.length > 0 && isolation !== "fixture") {
       throw new DesktopE2eError(
         "environment",
         "desktop-already-running",
@@ -169,19 +225,22 @@ export class WindowsTauriHost {
       binary: context.manifest.binary,
       harness_tree_sha256: context.manifest.harness.tree_sha256,
       sealed_manifest: context.sealedManifest,
-      existing_desktop_count: 0,
+      existing_desktop_count: existing.length,
+      desktop_isolation: isolation,
     }, { phase, owner: "run-context" });
   }
 
   async launch({ context, scenario, sink, phase }) {
+    this.#activeContext = context;
     const launchStartedAt = new Date().toISOString();
     this.#generation += 1;
-    const processTemp = path.join(context.paths.logs, "desktop-temp");
-    if (this.#processTemp === null) {
-      await mkdir(processTemp, { recursive: false });
+    await this.#checkDesktops();
+    const fixture = normalizeDesktopIsolation(context.desktopIsolation) === "fixture";
+    const fixtureRoot = fixture ? (await prepareDesktopFixtureEnvironment(context)).root : null;
+    const processTemp = fixture ? path.join(fixtureRoot, "temp") : path.join(context.paths.logs, "desktop-temp");
+    if (this.#processTemp !== processTemp) {
+      try { await mkdir(processTemp, { recursive: false }); } catch (error) { if (!fixture || error.code !== "EEXIST") throw error; }
       this.#processTemp = processTemp;
-    } else if (path.resolve(this.#processTemp).toLowerCase() !== path.resolve(processTemp).toLowerCase()) {
-      throw new DesktopE2eError("harness", "desktop-temp-owner-drift", "Desktop process temp owner changed across generations");
     }
     const processTempItem = await lstat(processTemp);
     if (!processTempItem.isDirectory() || processTempItem.isSymbolicLink()) {
@@ -198,21 +257,11 @@ export class WindowsTauriHost {
     this.#stdoutHandle = await open(stdout, "wx");
     this.#stderrHandle = await open(stderr, "wx");
     this.#logPaths.push(stdout, stderr);
-    this.#desktop = spawn(context.binary, ["--dir", context.paths.workspace], {
+    this.#launchEnvironment = desktopLaunchEnvironment({ context, scenarioEnvironment: normalizeScenarioEnvironment(scenario.environment), processTemp });
+    const launchArguments = desktopLaunchArguments(context, scenario.joinConfigPath, scenario.startupTarget);
+    this.#desktop = spawn(context.binary, launchArguments, {
       cwd: context.paths.workspace,
-      env: {
-        ...process.env,
-        ...normalizeScenarioEnvironment(scenario.environment),
-        MOYAI_CONFIG_PATH: context.paths.config_file,
-        MOYAI_DATA_DIR: context.paths.data,
-        MOYAI_DESKTOP_PREFS_PATH: context.paths.prefs_file,
-        WEBVIEW2_USER_DATA_FOLDER: context.paths.webview,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=0",
-        TEMP: processTemp,
-        TMP: processTemp,
-        TMPDIR: processTemp,
-        RUST_BACKTRACE: "1",
-      },
+      env: this.#launchEnvironment,
       windowsHide: false,
       stdio: ["ignore", this.#stdoutHandle.fd, this.#stderrHandle.fd],
     });
@@ -222,17 +271,8 @@ export class WindowsTauriHost {
       ExpectedExecutable: context.binary,
       ExpectedParentProcessId: process.pid,
     });
-    const desktops = arrayValue(await invokeWindowsProcess("ListDesktop"));
-    const exactSingleton = desktops.length === 1
-      && desktops[0].process_id === owner.process_id
-      && desktops[0].process_start_time_utc_ticks === owner.process_start_time_utc_ticks
-      && path.resolve(desktops[0].executable_path).toLowerCase() === path.resolve(owner.executable_path).toLowerCase();
-    if (!exactSingleton) {
-      throw new DesktopE2eError("environment", "desktop-singleton-race", "Desktop ownership changed between preflight and launch", {
-        expected_owner: owner,
-        observed_desktops: desktops,
-      });
-    }
+    this.#desktopOwner = owner;
+    await this.#checkDesktops([owner]);
     const ownerName = this.#generation === 1 ? "owners/desktop.json" : `owners/desktop.g${this.#generation}.json`;
     const identity = await sink.writeJson(ownerName, owner);
     this.#desktopOwnerPath = path.join(sink.root, ...identity.relative_path.split("/"));
@@ -242,15 +282,21 @@ export class WindowsTauriHost {
       stdout,
       stderr,
       process_temp: processTemp,
+      desktop_isolation: normalizeDesktopIsolation(context.desktopIsolation),
+      fixture_root: fixtureRoot,
+      preserved_desktops: this.#preservedDesktops,
       launch_started_at: launchStartedAt,
+      startup_target: scenario.startupTarget ?? "workspace",
+      arguments: launchArguments,
     }, { phase, owner: "desktop-app" });
-    return {
+    this.#runtime = {
       generation: this.#generation,
       desktop_process_id: this.#desktop.pid,
       desktop_owner: owner,
       desktop_owner_path: this.#desktopOwnerPath,
       launch_started_at: launchStartedAt,
     };
+    return structuredClone(this.#runtime);
   }
 
   async attach({ context, sink, runtime, phase }) {
@@ -279,6 +325,34 @@ export class WindowsTauriHost {
     }
   }
 
+  async launchDuplicate({ context, sink, phase = "executing", joinConfigPath = null }) {
+    if (this.#desktop === null || this.#driver === null || this.#launchEnvironment === null) {
+      throw new DesktopE2eError("harness", "duplicate-owner-missing", "duplicate launch requires an attached live Desktop");
+    }
+    const label = `desktop-duplicate-${++this.#duplicateCount}`;
+    const stdout = path.join(context.paths.logs, `${label}.stdout.log`);
+    const stderr = path.join(context.paths.logs, `${label}.stderr.log`);
+    this.#logPaths.push(stdout, stderr);
+    // The common Job owner settles even a broken duplicate and its descendants.
+    // Reuse the live generation's config, data, WebView profile and temp owners.
+    const processResult = await runWindowsExternalProcess({
+      executionRoot: context.root, executable: context.binary,
+      args: desktopLaunchArguments(context, joinConfigPath), cwd: context.paths.workspace,
+      env: this.#launchEnvironment, stdoutPath: stdout, stderrPath: stderr,
+      timeoutMs: 10_000, label,
+    });
+    const observed = await this.#checkDesktops([this.#desktopOwner]);
+    const result = {
+      process: processResult,
+      stdout: await readFile(stdout, "utf8"), stderr: await readFile(stderr, "utf8"),
+      desktops: normalizeDesktopIsolation(context.desktopIsolation) === "fixture"
+        ? observed.filter(row => row.process_id === this.#desktopOwner.process_id) : observed,
+      observed_desktops: observed,
+    };
+    await sink.record("desktop-duplicate-launched", result, { phase, owner: "desktop-app" });
+    return result;
+  }
+
   async #closeCurrentLogs() {
     let primary = null;
     try { await this.#stdoutHandle?.close(); } catch (error) { primary ??= error; }
@@ -288,11 +362,25 @@ export class WindowsTauriHost {
     if (primary !== null) throw primary;
   }
 
-  async restart({ context, scenario, sink, driver, phase = "executing" }) {
+  async restart({ context, nextContext = context, scenario, sink, driver, phase = "executing", beforeRelaunch = null }) {
+    if (beforeRelaunch !== null && typeof beforeRelaunch !== "function") throw new TypeError("beforeRelaunch must be a function");
+    if ((this.#parentHost !== null || this.#companions.length)
+      && ["workspace", "config", "data", "prefs", "webview"].some(name => nextContext.paths[name] !== context.paths[name])) {
+      throw new Error("companion restart must retain the same PC fixture paths");
+    }
+    if (normalizeDesktopIsolation(nextContext.desktopIsolation) !== normalizeDesktopIsolation(context.desktopIsolation)) throw new Error("Desktop isolation cannot change across restart");
+    if (nextContext.root !== context.root || nextContext.binary !== context.binary || nextContext.paths.logs !== context.paths.logs) {
+      throw new DesktopE2eError("harness", "restart-context-owner-drift", "Another Desktop fixture must keep the same execution, binary, and log owner");
+    }
+    for (const name of ["workspace", "config", "data", "prefs", "webview"]) {
+      const relative = path.relative(context.root, nextContext.paths[name]);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new DesktopE2eError("harness", "restart-context-outside-execution", "Desktop fixture paths must remain inside the execution");
+    }
     const activeDriver = this.#driver ?? driver;
     if (activeDriver === null || this.#desktop === null) {
       throw new DesktopE2eError("harness", "restart-owner-missing", "Desktop restart requires an attached live generation");
     }
+    desktopLaunchArguments(nextContext, scenario.joinConfigPath, scenario.startupTarget);
     this.#restartBegan = true;
     const previous = {
       generation: this.#generation,
@@ -322,14 +410,22 @@ export class WindowsTauriHost {
     await this.#closeCurrentLogs();
     this.#desktop = null;
     this.#desktopOwnerPath = null;
+    this.#desktopOwner = null;
+    await this.#checkDesktops();
     await sink.record("desktop-restart-boundary", {
       previous,
       graceful_exit: gracefulExit,
       desktop_exited: true,
       profile_webviews_remaining: 0,
     }, { phase, owner: "desktop-app" });
-    const runtime = await this.launch({ context, scenario, sink, phase });
-    const nextDriver = await this.attach({ context, scenario, sink, runtime, phase });
+    await sink.record("desktop-next-fixture", { paths: nextContext.paths, previous_paths: context.paths }, { phase, owner: "run-context" });
+    // Persisted-state fixtures may change only after the exact Desktop and its
+    // WebView generation have exited. The callback owns any other process it stops.
+    if (beforeRelaunch) await beforeRelaunch({ context: nextContext, previous });
+    const runtime = await this.launch({ context: nextContext, scenario, sink, phase });
+    const nextDriver = await this.attach({ context: nextContext, scenario, sink, runtime, phase });
+    const companion = this.#parentHost?.#companions.find(child => child.host === this);
+    if (companion) Object.assign(companion, { context: nextContext, runtime, driver: nextDriver });
     return {
       runtime,
       driver: nextDriver,
@@ -344,8 +440,8 @@ export class WindowsTauriHost {
     };
   }
 
-  async cleanup({ context, scenario, driver, inputs, releaseScenarioResources }) {
-    if (typeof releaseScenarioResources !== "function") throw new TypeError("releaseScenarioResources callback is required");
+  async #settleCurrent({ context, scenario, driver, inputs }) {
+    context = this.#activeContext ?? context;
     const activeDriver = selectActiveCleanupDriver(this.#driver, driver, { restartBegan: this.#restartBegan });
     let gracefulExit = { requested: false, reason: activeDriver === null ? "not-attached" : "not-requested" };
     const cleanup = {
@@ -396,6 +492,17 @@ export class WindowsTauriHost {
       profileRows = null;
       cleanup.profile_webviews_remaining = null;
     }
+    try {
+      if (cleanup.desktop_exited) this.#desktopOwner = null;
+      cleanup.preserved_desktops = await this.#checkDesktops(cleanup.desktop_exited ? [] : [this.#desktopOwner].filter(Boolean));
+      cleanup.preserved_desktops_intact = this.#preservedDesktops === null ? null : true;
+    } catch (error) { primary ??= error; cleanup.preserved_desktops_intact = false; }
+    return { context, scenario, driver, inputs, cleanup, gracefulExit, primary, profileRows };
+  }
+
+  async #finishCleanup(settled, releaseScenarioResources) {
+    const { context, scenario, inputs, cleanup, gracefulExit, profileRows } = settled;
+    let primary = settled.primary;
     let scenarioReleaseAttempted = false;
     const orderedScenarioRelease = async () => {
       scenarioReleaseAttempted = true;
@@ -432,15 +539,8 @@ export class WindowsTauriHost {
     } catch (error) {
       primary ??= error;
     }
-    if (this.#admission === null) cleanup.admission_released = true;
-    else {
-      try {
-        await this.#admission.release();
-        cleanup.admission_released = true;
-      } catch (error) {
-        primary ??= error;
-      }
-    }
+    cleanup.admission_scope = this.#parentHost === null ? "execution" : "borrowed-from-parent";
+    cleanup.admission_released = this.#parentHost !== null;
     if (primary !== null) {
       throw new DesktopE2eError("harness", "exact-cleanup-failed", primary.message, { graceful_exit: gracefulExit, cleanup });
     }
@@ -449,5 +549,70 @@ export class WindowsTauriHost {
       cleanup,
       input: exactCleanupPassed({ acquisition: inputs.acquisition, gracefulExit, cleanup }) ? "pass" : "fail",
     };
+  }
+
+  async openCompanion({ context, scenario, sink, phase = "executing" }) {
+    if (this.#parentHost !== null || this.#admission === null || this.#desktopOwner === null || normalizeDesktopIsolation(this.#activeContext?.desktopIsolation) !== "fixture") throw new Error("companion requires an attached fixture root host with admission");
+    if (context.root !== this.#activeContext.root || context.binary !== this.#activeContext.binary || normalizeDesktopIsolation(context.desktopIsolation) !== "fixture" || !context.desktopName) throw new Error("companion execution context does not match its parent");
+    const childRoot = desktopFixtureRoot(context), primaryRoot = desktopFixtureRoot(this.#activeContext);
+    if (childRoot === primaryRoot || this.#companions.some(child => desktopFixtureRoot(child.context) === childRoot)) throw new Error("companion must have a distinct fixture root");
+    await this.#checkDesktops([this.#desktopOwner]);
+    const childSink = sink.scope(`companions/${context.desktopName}`);
+    await childSink.writeJson("execution-context.json", { desktop_isolation: "fixture", execution_id: context.executionId, desktop_name: context.desktopName, root: context.root, paths: context.paths, binary: context.manifest.binary });
+    const host = new WindowsTauriHost(); host.#parentHost = this;
+    const child = { context, scenario, sink: childSink, host, runtime: null, driver: null, inputs: { acquisition: "not_run" } };
+    this.#companions.push(child);
+    await host.preflight({ context, sink: childSink, phase });
+    await scenario.prepare({ context, sink: childSink, phase });
+    child.runtime = await host.launch({ context, scenario, sink: childSink, phase });
+    child.driver = await host.attach({ context, sink: childSink, runtime: child.runtime, phase });
+    child.inputs.acquisition = "pass";
+    return { context, host, driver: child.driver, runtime: child.runtime, sink: childSink };
+  }
+
+  async cleanup({ context, scenario, driver, inputs, releaseScenarioResources }) {
+    if (this.#parentHost !== null) throw new Error("companion cleanup is owned by its parent host");
+    if (typeof releaseScenarioResources !== "function") throw new TypeError("releaseScenarioResources callback is required");
+    // Every Desktop reaches process/profile zero before any shared resource is
+    // released or any of their databases is audited. Reverse order preserves
+    // the exact owner set observed when each companion joined.
+    const children = [];
+    for (const child of [...this.#companions].reverse()) children.push({ child, settled: await child.host.#settleCurrent(child) });
+    const settled = await this.#settleCurrent({ context, scenario, driver, inputs });
+    const childReleases = [];
+    for (const { child } of children) {
+      try {
+        const outcome = await child.scenario.quiesce({ ...child, phase: "cleaning" });
+        childReleases.push(outcome);
+      } catch (error) { childReleases.push({ input: "fail", resources: [], error: error.message }); }
+    }
+    let release;
+    try { release = await releaseScenarioResources(); }
+    catch (error) { release = { input: "fail", resources: [], error: error.message }; }
+    const companionResults = [];
+    for (const [index, { child, settled: childSettled }] of children.entries()) {
+      let outcome;
+      try { outcome = await child.host.#finishCleanup(childSettled, async () => childReleases[index]?.input === "pass" && release?.input === "pass" ? childReleases[index] : { input: "fail", resources: childReleases[index]?.resources ?? [] }); }
+      catch (error) { outcome = { input: "fail", error: error.message, ...error.evidence }; }
+      try {
+        const scenarioCleanup = await child.scenario.cleanup({ ...child, phase: "cleaning" });
+        if (scenarioCleanup?.input !== "pass") outcome.input = "fail";
+        outcome.scenario_cleanup = scenarioCleanup;
+      } catch (error) { outcome.input = "fail"; outcome.scenario_cleanup_error = error.message; }
+      companionResults.push({ desktop_name: child.context.desktopName, ...outcome });
+      try { await child.sink.record("companion-cleanup", companionResults.at(-1), { phase: "cleaning", owner: "process-ledger" }); }
+      catch (error) { companionResults.at(-1).input = "fail"; companionResults.at(-1).evidence_error = error.message; }
+    }
+    let result, failure;
+    try { result = await this.#finishCleanup(settled, async () => release); }
+    catch (error) { failure = error; result = { gracefulExit: error.evidence?.graceful_exit ?? settled.gracefulExit, cleanup: error.evidence?.cleanup ?? settled.cleanup, input: "fail" }; }
+    result.cleanup.companions = companionResults;
+    try {
+      if (this.#admission !== null) await this.#admission.release();
+      result.cleanup.admission_released = true;
+    } catch (error) { failure ??= error; }
+    result.input = failure === undefined && companionResults.every(row => row.input === "pass") && exactCleanupPassed({ acquisition: inputs.acquisition, gracefulExit: result.gracefulExit, cleanup: result.cleanup }) ? "pass" : "fail";
+    if (failure) throw new DesktopE2eError("harness", "exact-cleanup-failed", failure.message, { graceful_exit: result.gracefulExit, cleanup: result.cleanup });
+    return result;
   }
 }

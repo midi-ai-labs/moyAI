@@ -1,6 +1,17 @@
 pub const MAX_USER_CONFIGURED_SYSTEM_PROMPT_CHARS: usize = 16_384;
 
+pub(crate) const DOCUMENTATION_INSTRUCTIONS: &str =
+    include_str!("../assets/prompts/documentation.md");
+
 const USER_CONFIGURED_SYSTEM_PROMPT_HEADING: &str = "## User-configured system prompt";
+
+pub(crate) fn hub_model_system_prompt_section(custom: &str) -> String {
+    if custom.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Hub model system prompt\n\n{custom}")
+    }
+}
 
 pub fn normalize_user_configured_system_prompt(
     value: Option<&str>,

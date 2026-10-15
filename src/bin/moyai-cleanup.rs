@@ -14,6 +14,18 @@ fn main() -> ExitCode {
             println!("moyai-cleanup {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Ok(CleanupCommand::Preview) => {
+            return match cleanup_targets() {
+                Ok(targets) => {
+                    println!("{}", cleanup_preview(&targets));
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    eprintln!("{message}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         Ok(CleanupCommand::Clean) => {}
         Err(message) => {
             eprintln!("{message}");
@@ -36,6 +48,7 @@ fn main() -> ExitCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanupCommand {
+    Preview,
     Clean,
     Help,
     Version,
@@ -43,7 +56,13 @@ enum CleanupCommand {
 
 fn cleanup_command(args: &[String]) -> Result<CleanupCommand, String> {
     if args.is_empty() {
+        return Ok(CleanupCommand::Preview);
+    }
+    if args == ["--reset-user-data", "--confirm-delete"] {
         return Ok(CleanupCommand::Clean);
+    }
+    if args == ["--preview"] {
+        return Ok(CleanupCommand::Preview);
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return Ok(CleanupCommand::Help);
@@ -55,7 +74,22 @@ fn cleanup_command(args: &[String]) -> Result<CleanupCommand, String> {
 }
 
 fn cleanup_help() -> &'static str {
-    "Usage: moyai-cleanup\n\nRemoves moyAI AppData config, data, and cache directories.\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version"
+    "Usage: moyai-cleanup [--preview]\n       moyai-cleanup --reset-user-data --confirm-delete\n\nWithout arguments, only shows the affected moyAI AppData directories.\nReset permanently deletes config, device and human credentials, history, and cached results.\nClose Desktop and Runner and back up needed data before an explicit reset.\nNormal updates and uninstall do not require a reset. Hub data and project folders are not reset.\n\nOptions:\n  --preview                         Show targets without changing files (default)\n  --reset-user-data --confirm-delete Permanently delete the displayed AppData targets\n  -h, --help                        Print help\n  -V, --version                     Print version"
+}
+
+fn cleanup_preview(targets: &[Utf8PathBuf]) -> String {
+    format!(
+        "{}\n\nTargets (no files changed):\n{}",
+        cleanup_help(),
+        targets
+            .iter()
+            .map(|path| format!(
+                "  {path} [{}]",
+                if path.exists() { "present" } else { "absent" }
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 fn run() -> Result<String, String> {
@@ -200,6 +234,40 @@ mod tests {
             cleanup_command(&["-V".to_string()]),
             Ok(CleanupCommand::Version)
         );
+    }
+
+    #[test]
+    fn reset_requires_both_explicit_arguments() {
+        assert_eq!(cleanup_command(&[]), Ok(CleanupCommand::Preview));
+        assert_eq!(
+            cleanup_command(&["--preview".into()]),
+            Ok(CleanupCommand::Preview)
+        );
+        assert!(cleanup_command(&["--reset-user-data".into()]).is_err());
+        assert!(cleanup_command(&["--confirm-delete".into()]).is_err());
+        assert_eq!(
+            cleanup_command(&["--reset-user-data".into(), "--confirm-delete".into()]),
+            Ok(CleanupCommand::Clean)
+        );
+        assert!(
+            cleanup_command(&[
+                "--reset-user-data".into(),
+                "--confirm-delete".into(),
+                "extra".into()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preview_preserves_existing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = directory.path().join("saved-history.txt");
+        fs::write(&saved, "keep me").unwrap();
+        let target = Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap();
+        let preview = cleanup_preview(&[target]);
+        assert!(preview.contains("no files changed"));
+        assert_eq!(fs::read_to_string(saved).unwrap(), "keep me");
     }
 
     #[test]

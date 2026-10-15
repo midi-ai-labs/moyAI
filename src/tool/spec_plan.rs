@@ -53,6 +53,11 @@ impl ToolSpecPlan {
         if step.external_tools.mcp.is_none() {
             router.retain_tools(|name| name != "mcp_call");
         }
+        if !crate::tool::wait_remote_tasks::remote_wait_available(
+            step.turn.resolved_config().runtime_config(),
+        ) {
+            router.retain_tools(|name| name != "wait_remote_tasks");
+        }
 
         let model_visible_specs = router
             .specs()
@@ -63,8 +68,12 @@ impl ToolSpecPlan {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
-        let parallel_tool_calls =
-            model_visible_specs.len() > 1 && step.turn.policy.model.supports_parallel_tool_calls;
+        // Shared delegation can yield a checkpoint for only one tool call at a time.
+        let parallel_tool_calls = model_visible_specs.len() > 1
+            && step.turn.policy.model.supports_parallel_tool_calls
+            && !model_visible_specs
+                .iter()
+                .any(|spec| spec.name == "shared_delegate");
         Self {
             router,
             model_visible_specs,
@@ -150,6 +159,146 @@ mod tests {
 
     fn step(mode_kind: ModeKind) -> StepContext {
         step_for_config(mode_kind, &ResolvedConfig::default())
+    }
+
+    fn shared_registry(config: &ResolvedConfig, environments: &[String]) -> ToolRegistry {
+        ToolRegistry::core_agent_for_config(config).with_shared_environments(
+            "project",
+            "parent-job",
+            "parent-attempt",
+            1,
+            "current-environment",
+            environments,
+            &[],
+        )
+    }
+
+    #[test]
+    fn ordinary_tool_surfaces_keep_the_models_parallel_policy() {
+        for supported in [false, true] {
+            let mut config = ResolvedConfig::default();
+            config.model.parallel_tool_calls = supported;
+            let registry = ToolRegistry::core_agent_for_config(&config);
+            for mode in [ModeKind::Default, ModeKind::Plan] {
+                let plan = ToolSpecPlan::build(&step_for_config(mode, &config), &registry);
+                assert!(plan.model_visible_specs().len() > 1);
+                assert!(!plan.tool_names().contains(&"shared_delegate".into()));
+                assert_eq!(plan.parallel_tool_calls(), supported);
+                assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_delegate_surface_disables_parallel_tool_calls() {
+        for supported in [false, true] {
+            let mut config = ResolvedConfig::default();
+            config.model.parallel_tool_calls = supported;
+            let registry = shared_registry(&config, &["child-environment".into()]);
+            let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Default, &config), &registry);
+            assert!(plan.tool_names().contains(&"shared_delegate".into()));
+            assert!(plan.tool_names().contains(&"read".into()));
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+            assert!(
+                !plan.parallel_tool_calls(),
+                "a surface with single-call shared delegation cannot advertise parallel calls"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_plan_surface_without_delegate_keeps_the_models_parallel_policy() {
+        for supported in [false, true] {
+            let mut config = ResolvedConfig::default();
+            config.model.parallel_tool_calls = supported;
+            let registry = shared_registry(&config, &["child-environment".into()]);
+            let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Plan, &config), &registry);
+            assert!(!plan.tool_names().contains(&"shared_delegate".into()));
+            assert!(plan.tool_names().contains(&"read".into()));
+            assert!(plan.tool_names().contains(&"shared_services".into()));
+            assert_eq!(plan.parallel_tool_calls(), supported);
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+        }
+    }
+
+    #[test]
+    fn shared_surface_without_child_targets_keeps_the_models_parallel_policy() {
+        for supported in [false, true] {
+            let mut config = ResolvedConfig::default();
+            config.model.parallel_tool_calls = supported;
+            let registry = shared_registry(&config, &[]);
+            let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Default, &config), &registry);
+            assert!(!plan.tool_names().contains(&"shared_delegate".into()));
+            assert!(plan.tool_names().contains(&"shared_services".into()));
+            assert_eq!(plan.parallel_tool_calls(), supported);
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+        }
+    }
+
+    #[test]
+    fn remote_wait_is_advertised_and_routed_as_a_read_with_local_multi_agent_disabled() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        config.mcp.servers[0].id = "hub-device-peer".into();
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        for mode in [ModeKind::Default, ModeKind::Plan] {
+            let plan = ToolSpecPlan::build(&step_for_config(mode, &config), &registry);
+            assert!(plan.tool_names().contains(&"wait_remote_tasks".into()));
+            assert!(!plan.tool_names().contains(&"wait_agent".into()));
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+            assert_eq!(
+                plan.router()
+                    .validate_call_effect("wait_remote_tasks", &serde_json::json!({}), &config.mcp)
+                    .unwrap(),
+                ToolEffectClass::Read
+            );
+        }
+    }
+
+    #[test]
+    fn remote_wait_current_step_hides_stale_hub_registration() {
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].remote_agent = true;
+        config.mcp.servers[0].id = "hub-device-peer".into();
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        config.mcp.servers[0].id = "manual-agent".into();
+        for enabled in [true, false] {
+            config.mcp.enabled = enabled;
+            let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Default, &config), &registry);
+            assert!(!plan.tool_names().contains(&"wait_remote_tasks".into()));
+            assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+            assert!(
+                plan.router()
+                    .validate_call_effect("wait_remote_tasks", &serde_json::json!({}), &config.mcp)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_wait_stays_available_for_configured_hub_when_live_directory_is_empty() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = false;
+        config.mcp.enabled = false;
+        config.mcp.servers.clear();
+        config.device_network.hub_url = "https://hub.example.test:9471".into();
+        let registry = ToolRegistry::core_agent().with_config_overlays(&config);
+        let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Default, &config), &registry);
+        assert!(plan.tool_names().contains(&"wait_remote_tasks".into()));
+        assert!(!plan.tool_names().contains(&"mcp_call".into()));
+        assert!(!plan.tool_names().contains(&"wait_agent".into()));
+        assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+        assert_eq!(
+            plan.router()
+                .validate_call_effect("wait_remote_tasks", &serde_json::json!({}), &config.mcp)
+                .unwrap(),
+            ToolEffectClass::Read
+        );
     }
 
     #[test]

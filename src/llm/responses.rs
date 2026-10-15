@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -298,43 +298,62 @@ impl ResponseOutputIdentityRegistry {
 enum MessageTextLifecycle {
     Streaming,
     TextDone,
-    ItemComplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MessageTextState {
+struct MessageTextPartState {
     text: String,
     lifecycle: MessageTextLifecycle,
+    emitted_bytes: usize,
 }
 
-impl MessageTextState {
+impl MessageTextPartState {
     fn incomplete() -> Self {
         Self {
             text: String::new(),
             lifecycle: MessageTextLifecycle::Streaming,
+            emitted_bytes: 0,
         }
     }
+}
 
-    fn text_done(text: String) -> Self {
-        Self {
-            text,
-            lifecycle: MessageTextLifecycle::TextDone,
-        }
-    }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MessageTextState {
+    parts: BTreeMap<u64, MessageTextPartState>,
+    item_complete: bool,
+}
 
-    fn complete(text: String) -> Self {
-        Self {
-            text,
-            lifecycle: MessageTextLifecycle::ItemComplete,
-        }
+impl MessageTextState {
+    fn incomplete() -> Self {
+        Self::default()
     }
 
     fn is_complete(&self) -> bool {
-        self.lifecycle == MessageTextLifecycle::ItemComplete
+        self.item_complete
     }
 
     fn is_text_finalized(&self) -> bool {
-        self.lifecycle != MessageTextLifecycle::Streaming
+        self.item_complete
+            || self
+                .parts
+                .values()
+                .any(|part| part.lifecycle == MessageTextLifecycle::TextDone)
+    }
+
+    fn take_pending_text(&mut self) -> String {
+        let mut text = String::new();
+        for (next_index, (&content_index, part)) in self.parts.iter_mut().enumerate() {
+            if content_index != next_index as u64 {
+                break;
+            }
+            text.push_str(&part.text[part.emitted_bytes..]);
+            part.emitted_bytes = part.text.len();
+            // Later parts must wait until preceding text can no longer grow.
+            if part.lifecycle == MessageTextLifecycle::Streaming {
+                break;
+            }
+        }
+        text
     }
 }
 
@@ -567,28 +586,39 @@ impl ResponsesStreamAccumulator {
         let delta = required_string(event, "delta", context)?;
         let item_id = required_nonempty_string(event, "item_id", context)?;
         let output_index = required_u64(event, "output_index", context)?;
+        let content_index = message_content_index(event, context)?;
         self.output_identities.ensure_binding(
             item_id,
             output_index,
             ResponseOutputItemKind::Message,
         )?;
-        if self
-            .message_text_items
-            .get(item_id)
-            .is_some_and(MessageTextState::is_text_finalized)
+        if let Some(state) = self.message_text_items.get(item_id)
+            && (state.is_complete()
+                || state
+                    .parts
+                    .get(&content_index)
+                    .is_some_and(|part| part.lifecycle == MessageTextLifecycle::TextDone))
         {
             return Err(LlmError::Message(format!(
-                "Responses message item `{item_id}` received a text delta after its text was finalized"
+                "Responses message item `{item_id}` part {content_index} received a text delta after its text was finalized"
             )));
         }
         self.output_identities
             .bind(item_id, output_index, ResponseOutputItemKind::Message)?;
-        self.message_text_items
+        let state = self
+            .message_text_items
             .entry(item_id.to_string())
-            .or_insert_with(MessageTextState::incomplete)
+            .or_insert_with(MessageTextState::incomplete);
+        state
+            .parts
+            .entry(content_index)
+            .or_insert_with(MessageTextPartState::incomplete)
             .text
             .push_str(delta);
-        events.push(LlmEvent::TextDelta(delta.to_string()));
+        let pending = state.take_pending_text();
+        if !pending.is_empty() || delta.is_empty() {
+            events.push(LlmEvent::TextDelta(pending));
+        }
         Ok(())
     }
 
@@ -601,6 +631,7 @@ impl ResponsesStreamAccumulator {
         let text = required_string(event, "text", context)?;
         let item_id = required_nonempty_string(event, "item_id", context)?;
         let output_index = required_u64(event, "output_index", context)?;
+        let content_index = message_content_index(event, context)?;
         self.output_identities.ensure_binding(
             item_id,
             output_index,
@@ -608,43 +639,43 @@ impl ResponsesStreamAccumulator {
         )?;
 
         if let Some(state) = self.message_text_items.get(item_id) {
-            match state.lifecycle {
-                MessageTextLifecycle::ItemComplete => {
-                    return Err(LlmError::Message(format!(
-                        "Responses message item `{item_id}` received output_text.done after item completion"
-                    )));
-                }
-                MessageTextLifecycle::TextDone => {
-                    if state.text == text {
+            if state.is_complete() {
+                return Err(LlmError::Message(format!(
+                    "Responses message item `{item_id}` received output_text.done after item completion"
+                )));
+            }
+            if let Some(part) = state.parts.get(&content_index) {
+                if part.lifecycle == MessageTextLifecycle::TextDone {
+                    if part.text == text {
                         return Ok(());
                     }
                     return Err(LlmError::Message(format!(
-                        "Responses message item `{item_id}` received conflicting output_text.done values"
+                        "Responses message item `{item_id}` part {content_index} received conflicting output_text.done values"
                     )));
                 }
-                MessageTextLifecycle::Streaming => {}
+                if !text.starts_with(&part.text) {
+                    return Err(LlmError::Message(format!(
+                        "Responses message item `{item_id}` part {content_index} finalized text that conflicts with its streamed deltas"
+                    )));
+                }
             }
         }
 
-        let accumulated = self
-            .message_text_items
-            .get(item_id)
-            .map(|state| state.text.as_str())
-            .unwrap_or_default();
-        let missing_suffix = text.strip_prefix(accumulated).ok_or_else(|| {
-            LlmError::Message(format!(
-                "Responses message item `{item_id}` finalized text that conflicts with its streamed deltas"
-            ))
-        })?;
-        let missing_suffix = missing_suffix.to_string();
         self.output_identities
             .bind(item_id, output_index, ResponseOutputItemKind::Message)?;
-        self.message_text_items.insert(
-            item_id.to_string(),
-            MessageTextState::text_done(text.to_string()),
-        );
-        if !missing_suffix.is_empty() {
-            events.push(LlmEvent::TextDelta(missing_suffix));
+        let state = self
+            .message_text_items
+            .entry(item_id.to_string())
+            .or_insert_with(MessageTextState::incomplete);
+        let part = state
+            .parts
+            .entry(content_index)
+            .or_insert_with(MessageTextPartState::incomplete);
+        part.text = text.to_string();
+        part.lifecycle = MessageTextLifecycle::TextDone;
+        let pending = state.take_pending_text();
+        if !pending.is_empty() {
+            events.push(LlmEvent::TextDelta(pending));
         }
         Ok(())
     }
@@ -794,7 +825,7 @@ impl ResponsesStreamAccumulator {
         let context = "Responses message output item done";
         let item_id = required_nonempty_string(item, "id", context)?;
         validate_assistant_message_role(item, context)?;
-        let completed_text = required_message_output_text(item, context)?;
+        let completed_parts = required_message_output_text_parts(item, context)?;
         self.output_identities.ensure_binding(
             item_id,
             output_index,
@@ -805,7 +836,14 @@ impl ResponsesStreamAccumulator {
             .get(item_id)
             .filter(|state| state.is_complete())
         {
-            if state.text == completed_text {
+            if state.parts.len() == completed_parts.len()
+                && state.parts.iter().all(|(&index, part)| {
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|index| completed_parts.get(index))
+                        .is_some_and(|text| part.text == *text)
+                })
+            {
                 return Ok(());
             }
             return Err(LlmError::Message(format!(
@@ -813,34 +851,48 @@ impl ResponsesStreamAccumulator {
             )));
         }
 
-        if let Some(state) = self.message_text_items.get(item_id)
-            && state.lifecycle == MessageTextLifecycle::TextDone
-            && state.text != completed_text
-        {
-            return Err(LlmError::Message(format!(
-                "Responses message item `{item_id}` item completion conflicts with output_text.done"
-            )));
+        if let Some(state) = self.message_text_items.get(item_id) {
+            for (&content_index, part) in &state.parts {
+                let completed_text = usize::try_from(content_index)
+                    .ok()
+                    .and_then(|index| completed_parts.get(index))
+                    .ok_or_else(|| {
+                        LlmError::Message(format!(
+                            "Responses message item `{item_id}` completion omitted observed part {content_index}"
+                        ))
+                    })?;
+                if part.lifecycle == MessageTextLifecycle::TextDone {
+                    if part.text != *completed_text {
+                        return Err(LlmError::Message(format!(
+                            "Responses message item `{item_id}` part {content_index} item completion conflicts with output_text.done"
+                        )));
+                    }
+                } else if !completed_text.starts_with(&part.text) {
+                    return Err(LlmError::Message(format!(
+                        "Responses message item `{item_id}` part {content_index} completed with text that conflicts with its streamed deltas"
+                    )));
+                }
+            }
         }
 
-        let accumulated = self
-            .message_text_items
-            .get(item_id)
-            .map(|state| state.text.as_str())
-            .unwrap_or_default();
-        let missing_suffix = completed_text.strip_prefix(accumulated).ok_or_else(|| {
-            LlmError::Message(format!(
-                "Responses message item `{item_id}` completed with text that conflicts with its streamed deltas"
-            ))
-        })?;
-        let missing_suffix = missing_suffix.to_string();
         self.output_identities
             .bind(item_id, output_index, ResponseOutputItemKind::Message)?;
-        self.message_text_items.insert(
-            item_id.to_string(),
-            MessageTextState::complete(completed_text),
-        );
-        if !missing_suffix.is_empty() {
-            events.push(LlmEvent::TextDelta(missing_suffix));
+        let state = self
+            .message_text_items
+            .entry(item_id.to_string())
+            .or_insert_with(MessageTextState::incomplete);
+        for (content_index, text) in completed_parts.into_iter().enumerate() {
+            let part = state
+                .parts
+                .entry(content_index as u64)
+                .or_insert_with(MessageTextPartState::incomplete);
+            part.text = text.to_string();
+            part.lifecycle = MessageTextLifecycle::TextDone;
+        }
+        state.item_complete = true;
+        let pending = state.take_pending_text();
+        if !pending.is_empty() {
+            events.push(LlmEvent::TextDelta(pending));
         }
         Ok(())
     }
@@ -1637,6 +1689,15 @@ fn required_u64(value: &Value, field: &str, context: &str) -> Result<u64, LlmErr
     })
 }
 
+fn message_content_index(event: &Value, context: &str) -> Result<u64, LlmError> {
+    if event.get("content_index").is_some() {
+        required_u64(event, "content_index", context)
+    } else {
+        // Single-part provider streams have historically omitted this field.
+        Ok(0)
+    }
+}
+
 fn validate_assistant_message_role(item: &Value, context: &str) -> Result<(), LlmError> {
     let role = required_string(item, "role", context)?;
     if role != "assistant" {
@@ -1647,12 +1708,15 @@ fn validate_assistant_message_role(item: &Value, context: &str) -> Result<(), Ll
     Ok(())
 }
 
-fn required_message_output_text(item: &Value, context: &str) -> Result<String, LlmError> {
+fn required_message_output_text_parts<'a>(
+    item: &'a Value,
+    context: &str,
+) -> Result<Vec<&'a str>, LlmError> {
     let content = item
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| LlmError::Message(format!("{context} is missing array field `content`")))?;
-    collect_message_output_text(content, context)
+    collect_message_output_text_parts(content, context)
 }
 
 fn validate_optional_message_output_text(item: &Value, context: &str) -> Result<(), LlmError> {
@@ -1662,11 +1726,14 @@ fn validate_optional_message_output_text(item: &Value, context: &str) -> Result<
     let content = content.as_array().ok_or_else(|| {
         LlmError::Message(format!("{context} contains a non-array field `content`"))
     })?;
-    collect_message_output_text(content, context).map(drop)
+    collect_message_output_text_parts(content, context).map(drop)
 }
 
-fn collect_message_output_text(content: &[Value], context: &str) -> Result<String, LlmError> {
-    let mut text = String::new();
+fn collect_message_output_text_parts<'a>(
+    content: &'a [Value],
+    context: &str,
+) -> Result<Vec<&'a str>, LlmError> {
+    let mut parts = Vec::with_capacity(content.len());
     for part in content {
         let part_type = required_string(part, "type", context)?;
         if part_type != "output_text" {
@@ -1674,9 +1741,9 @@ fn collect_message_output_text(content: &[Value], context: &str) -> Result<Strin
                 "{context} contains unsupported content part type `{part_type}`"
             )));
         }
-        text.push_str(required_string(part, "text", context)?);
+        parts.push(required_string(part, "text", context)?);
     }
-    Ok(text)
+    Ok(parts)
 }
 
 fn consistent_arguments<'a, const N: usize>(
@@ -2377,6 +2444,154 @@ mod tests {
                 usage: None,
             }]
         ));
+    }
+
+    #[test]
+    fn output_text_parts_complete_independently_without_duplicate_text() {
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        let item = json!({"type":"message","id":"msg_parts","role":"assistant",
+            "content":[{"type":"output_text","text":"日本語"},{"type":"output_text","text":" text"}]});
+        let mut visible = String::new();
+        for event in [
+            json!({"type":"response.output_text.delta","item_id":"msg_parts","output_index":0,"content_index":0,"delta":"日本"}),
+            json!({"type":"response.output_text.done","item_id":"msg_parts","output_index":0,"content_index":0,"text":"日本語"}),
+            json!({"type":"response.output_text.delta","item_id":"msg_parts","output_index":0,"content_index":1,"delta":" text"}),
+            json!({"type":"response.output_text.done","item_id":"msg_parts","output_index":0,"content_index":1,"text":" text"}),
+            json!({"type":"response.output_text.done","item_id":"msg_parts","output_index":0,"content_index":1,"text":" text"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":item.clone()}),
+            json!({"type":"response.output_item.done","output_index":0,"item":item.clone()}),
+            json!({"type":"response.completed","response":{"id":"resp_parts","output":[item]}}),
+        ] {
+            let update = accumulator
+                .push_value(&event)
+                .expect("each content part has its own text lifecycle");
+            for event in update.events {
+                if let LlmEvent::TextDelta(text) = event {
+                    visible.push_str(&text);
+                }
+            }
+        }
+        assert_eq!(visible, "日本語 text");
+        assert!(matches!(
+            accumulator.terminal(),
+            Some(ResponsesTerminal::Completed {
+                finish_reason: FinishReason::Stop,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn output_text_parts_buffer_later_parts_and_emit_in_content_order() {
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","item_id":"msg_order","output_index":0,"content_index":1,"delta":" sec"}),
+            json!({"type":"response.output_text.done","item_id":"msg_order","output_index":0,"content_index":1,"text":" second"}),
+        ] {
+            assert!(
+                accumulator
+                    .push_value(&event)
+                    .expect("later part waits")
+                    .events
+                    .is_empty()
+            );
+        }
+        let first_delta = accumulator
+            .push_value(&json!({
+                "type":"response.output_text.delta","item_id":"msg_order","output_index":0,
+                "content_index":0,"delta":"fir"
+            }))
+            .expect("first part can stream");
+        assert!(
+            matches!(first_delta.events.as_slice(), [LlmEvent::TextDelta(text)] if text == "fir")
+        );
+        let first_done = accumulator
+            .push_value(&json!({
+                "type":"response.output_text.done","item_id":"msg_order","output_index":0,
+                "content_index":0,"text":"first"
+            }))
+            .expect("first completion releases following part");
+        assert!(
+            matches!(first_done.events.as_slice(), [LlmEvent::TextDelta(text)] if text == "st second")
+        );
+        let item_done = accumulator.push_value(&json!({
+            "type":"response.output_item.done","output_index":0,
+            "item":{"type":"message","id":"msg_order","role":"assistant",
+                "content":[{"type":"output_text","text":"first"},{"type":"output_text","text":" second"}]}
+        })).expect("ordered item reconciles");
+        assert!(item_done.events.is_empty());
+    }
+
+    #[test]
+    fn output_text_parts_reject_conflicts_omission_and_late_events_without_mutation() {
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        for (content_index, text) in [(0, "first"), (1, " second")] {
+            accumulator
+                .push_value(&json!({
+                    "type":"response.output_text.done","item_id":"msg_guard","output_index":0,
+                    "content_index":content_index,"text":text
+                }))
+                .expect("seed distinct finalized parts");
+        }
+        let item = json!({"type":"message","id":"msg_guard","role":"assistant",
+            "content":[{"type":"output_text","text":"first"},{"type":"output_text","text":" second"}]});
+        let before = accumulator_state_snapshot(&accumulator);
+        for event in [
+            json!({"type":"response.output_text.done","item_id":"msg_guard","output_index":0,"content_index":1,"text":" different"}),
+            json!({"type":"response.output_text.delta","item_id":"msg_guard","output_index":0,"content_index":0,"delta":"late"}),
+            json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"message","id":"msg_guard","role":"assistant",
+                    "content":[{"type":"output_text","text":"first"}]}}),
+            json!({"type":"response.completed","response":{"id":"resp_guard","output":[{
+                "type":"message","id":"msg_guard","role":"assistant",
+                "content":[{"type":"output_text","text":"first "},{"type":"output_text","text":"second"}]
+            }]}}),
+        ] {
+            accumulator
+                .push_value(&event)
+                .expect_err("conflicting parts must fail");
+            assert_eq!(accumulator_state_snapshot(&accumulator), before);
+        }
+        for content_index in [json!(null), json!(-1), json!("1"), json!(1.5)] {
+            for event_type in ["response.output_text.delta", "response.output_text.done"] {
+                accumulator
+                    .push_value(&json!({
+                        "type":event_type,"item_id":"msg_guard","output_index":0,
+                        "content_index":content_index,"delta":"late","text":" second"
+                    }))
+                    .expect_err("present content index must be an unsigned integer");
+                assert_eq!(accumulator_state_snapshot(&accumulator), before);
+            }
+        }
+        let complete = accumulator
+            .push_value(&json!({
+                "type":"response.output_item.done","output_index":0,"item":item.clone()
+            }))
+            .expect("exact part completion");
+        assert!(complete.events.is_empty());
+        let completed = accumulator_state_snapshot(&accumulator);
+        for event in [
+            json!({"type":"response.output_text.delta","item_id":"msg_guard","output_index":0,"content_index":2,"delta":"late"}),
+            json!({"type":"response.output_text.done","item_id":"msg_guard","output_index":0,"content_index":1,"text":" second"}),
+            json!({"type":"response.output_item.added","output_index":0,"item":item.clone()}),
+            json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"message","id":"msg_guard","role":"assistant",
+                    "content":[{"type":"output_text","text":"first second"}]}}),
+        ] {
+            accumulator
+                .push_value(&event)
+                .expect_err("completed message parts cannot change");
+            assert_eq!(accumulator_state_snapshot(&accumulator), completed);
+        }
+        assert!(
+            accumulator
+                .push_value(&json!({
+                    "type":"response.output_item.done","output_index":0,"item":item
+                }))
+                .expect("exact repeated completion remains valid")
+                .events
+                .is_empty()
+        );
     }
 
     #[test]

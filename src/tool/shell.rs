@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ShellFamily;
@@ -13,12 +13,15 @@ use crate::error::ToolError;
 use crate::tool::context::ToolContext;
 use crate::tool::executable::ResolvedExecutable;
 use crate::tool::os_sandbox::ProcessSandboxPlan;
+use crate::tool::permission_guardian::{
+    PermissionGuardianEvidence, PermissionGuardianEvidenceState,
+};
 use crate::tool::process::ManagedProcess;
 #[cfg(test)]
 use crate::tool::process::{ProcessTerminationStep, process_tree_termination_plan};
 use crate::tool::registry::Tool;
 use crate::tool::sandbox_process::{
-    SandboxedProcessRequest, captured_process_environment, execute_workspace_write,
+    SandboxedProcessRequest, captured_process_environment, execute_workspace_write_observed,
 };
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
@@ -58,7 +61,7 @@ pub struct ShellTool;
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         let description = if cfg!(windows) {
-            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial, including a Windows child-created protected-DACL temp path; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner; current edit baselines are retained and revalidated per path against current contents before the next whole-file write."
+            include_str!("../../assets/prompts/shell_powershell.md")
         } else {
             "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner; current edit baselines are retained and revalidated per path against current contents before the next whole-file write."
         };
@@ -100,14 +103,16 @@ impl Tool for ShellTool {
             risks,
             execution,
         } = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
+        let guardian_evidence = execution.guardian_evidence(&guarded.absolute, &input.command);
         let effect_admission = ctx
-            .confirm_if_needed_with_details(
+            .confirm_if_needed_with_details_and_guardian_evidence(
                 AccessKind::Shell,
                 description.clone(),
                 details,
                 targets,
                 outside_workspace,
                 risks,
+                guardian_evidence,
             )
             .await?;
         let timeout_ms = input
@@ -117,6 +122,7 @@ impl Tool for ShellTool {
         ctx.run_mutation_fence.assert_owned().await?;
         effect_admission.admit()?;
         PathGuard::revalidate(&guarded)?;
+        let sandbox_plan = effect_admission.sandbox_plan().clone();
         let output = execute_shell_command_with_resolved_programs(
             &ctx.config.shell,
             &guarded.absolute,
@@ -124,12 +130,13 @@ impl Tool for ShellTool {
             timeout_ms,
             ctx.config.tool_output.max_bytes.max(1),
             ctx.cancel.clone(),
-            effect_admission.sandbox_plan(),
+            &sandbox_plan,
             execution.family,
             execution.environment,
             execution.programs,
         )
         .await?;
+        effect_admission.finish_started_effect()?;
         let merged_output = format_shell_output_for_display(
             &input.command,
             &output.stdout,
@@ -148,8 +155,7 @@ impl Tool for ShellTool {
         } else {
             "not_started"
         };
-        let sandbox_failure_hint =
-            classify_shell_sandbox_failure_hint(effect_admission.sandbox_plan(), &output);
+        let sandbox_failure_hint = classify_shell_sandbox_failure_hint(&sandbox_plan, &output);
 
         Ok(ToolResult {
             title: description,
@@ -170,7 +176,7 @@ impl Tool for ShellTool {
                     "effects_unknown": output.effect_started,
                     "session_edit_baselines_invalidated": false,
                 },
-                "sandbox": effect_admission.sandbox_plan().audit_description(),
+                "sandbox": sandbox_plan.audit_description(),
             }),
             truncated_output_path: preview.truncated_output_path,
             recorded_changes: Vec::new(),
@@ -194,6 +200,32 @@ struct ResolvedShellExecution {
     family: ShellFamily,
     environment: std::collections::HashMap<String, String>,
     programs: Vec<ResolvedExecutable>,
+}
+
+impl ResolvedShellExecution {
+    fn guardian_evidence(&self, cwd: &Utf8Path, command: &str) -> PermissionGuardianEvidenceState {
+        PermissionGuardianEvidenceState::Complete(PermissionGuardianEvidence::ShellExecution {
+            shell_family: self.family,
+            cwd: cwd.to_path_buf(),
+            executable_candidates: self
+                .programs
+                .iter()
+                .map(|program| program.path().to_path_buf())
+                .collect(),
+            arguments: shell_arguments(self.family, command),
+        })
+    }
+}
+
+fn shell_arguments(family: ShellFamily, command: &str) -> Vec<String> {
+    match family {
+        ShellFamily::PowerShell => vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            command.to_string(),
+        ],
+        ShellFamily::Bash => vec!["-lc".to_string(), command.to_string()],
+    }
 }
 
 fn shell_permission_intent(
@@ -222,33 +254,45 @@ fn shell_permission_intent(
         &guarded.absolute,
         &workspace.root,
     )?;
+    let literal_paths = shell_literal_paths(&guarded.absolute, &input.command, family);
     let outside_workspace = requested_elevation
         || (!guarded.inside_workspace && !guarded.trusted_external)
-        || references_outside_workspace_from(workspace, &guarded.absolute, &input.command);
+        || literal_paths
+            .paths
+            .iter()
+            .any(|path| path_is_outside_writable_boundary(workspace, path));
     let description = if input.description.trim().is_empty() {
         default_description(&input.command)
     } else {
         input.description.clone()
     };
-    let mut risks = shell_permission_risks_from(workspace, &guarded, &input.command);
+    let mut risks = shell_permission_risks_from(
+        workspace,
+        &guarded,
+        &input.command,
+        &literal_paths,
+        shell_has_move_risk_for_family(&input.command, family),
+    );
     let requires_typed_review = match family {
         ShellFamily::PowerShell => powershell_command_requires_typed_review(&input.command),
         ShellFamily::Bash => shell_command_has_child_interpreter_boundary(&input.command),
     };
-    if requires_typed_review && !risks.contains(&PermissionRisk::UnclassifiedShell) {
+    if (requires_typed_review || literal_paths.unresolved)
+        && !risks.contains(&PermissionRisk::UnclassifiedShell)
+    {
         risks.push(PermissionRisk::UnclassifiedShell);
     }
     if command_mentions_configured_instruction_target(
         workspace,
         &config.instructions.additional_files,
-        &guarded,
         &input.command,
+        &literal_paths.paths,
     ) && !risks.contains(&PermissionRisk::ProtectedWorkspaceAuthority)
     {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     let mut details = shell_permission_details(&input.command, &guarded.absolute);
-    let mut targets = shell_permission_targets(&guarded, &input.command);
+    let mut targets = shell_permission_targets(&guarded, &literal_paths.paths);
     for program in &programs {
         details.push(format!(
             "Canonical executable candidate (identity pinned): {}",
@@ -281,14 +325,14 @@ fn shell_permission_intent(
     })
 }
 
-fn shell_permission_targets(guarded_workdir: &GuardedPath, command: &str) -> Vec<Utf8PathBuf> {
+fn shell_permission_targets(
+    guarded_workdir: &GuardedPath,
+    paths: &[Utf8PathBuf],
+) -> Vec<Utf8PathBuf> {
     let mut targets = vec![guarded_workdir.absolute.clone()];
-    for extracted in extract_absolute_paths(&guarded_workdir.absolute, command) {
-        let target =
-            crate::workspace::project::normalize_path(&guarded_workdir.absolute, &extracted)
-                .unwrap_or(extracted);
-        if !targets.contains(&target) {
-            targets.push(target);
+    for target in paths {
+        if !targets.contains(target) {
+            targets.push(target.clone());
         }
     }
     targets
@@ -348,7 +392,8 @@ fn format_shell_output_for_display(
     .join("\n\n")
 }
 
-struct CommandOutput {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CommandOutput {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
@@ -475,14 +520,50 @@ async fn execute_shell_command_with_resolved_programs(
     environment: std::collections::HashMap<String, String>,
     programs: Vec<ResolvedExecutable>,
 ) -> Result<CommandOutput, ToolError> {
-    let arguments = match family {
-        ShellFamily::PowerShell => vec![
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            command_text.to_string(),
-        ],
-        ShellFamily::Bash => vec!["-lc".to_string(), command_text.to_string()],
-    };
+    execute_shell_command_observed(
+        shell,
+        workdir,
+        command_text,
+        Some(timeout_ms),
+        max_output_bytes,
+        cancel,
+        sandbox_plan,
+        family,
+        environment,
+        programs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_shell_command_observed(
+    shell: &crate::config::ShellConfig,
+    workdir: &Utf8Path,
+    command_text: &str,
+    timeout_ms: Option<u64>,
+    max_output_bytes: usize,
+    cancel: CancellationToken,
+    sandbox_plan: &ProcessSandboxPlan,
+    family: ShellFamily,
+    environment: std::collections::HashMap<String, String>,
+    programs: Vec<ResolvedExecutable>,
+    started: Option<crate::tool::sandbox_process::ProcessStarted>,
+) -> Result<CommandOutput, ToolError> {
+    if cancel.is_cancelled() {
+        return Ok(CommandOutput {
+            stdout: String::new(),
+            stderr: "command cancelled before start".into(),
+            exit_code: None,
+            timed_out: false,
+            cancelled: true,
+            effect_started: false,
+            cleanup_failed: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+    }
+    let arguments = shell_arguments(family, command_text);
 
     if let ProcessSandboxPlan::NoProcess = sandbox_plan {
         return Err(ToolError::SandboxExecution(
@@ -498,7 +579,7 @@ async fn execute_shell_command_with_resolved_programs(
             let mut argv = Vec::with_capacity(arguments.len() + 1);
             argv.push(program.path().to_string());
             argv.extend(arguments.iter().cloned());
-            match execute_workspace_write(
+            match execute_workspace_write_observed(
                 profile.clone(),
                 SandboxedProcessRequest {
                     executable: program.clone(),
@@ -511,6 +592,7 @@ async fn execute_shell_command_with_resolved_programs(
                     hide_window: shell.hide_windows,
                     cancel: cancel.clone(),
                 },
+                started.clone(),
             )
             .await
             {
@@ -578,12 +660,18 @@ async fn execute_shell_command_with_resolved_programs(
     }
     let mut process = process
         .ok_or_else(|| ToolError::Message("no shell program candidate could be launched".into()))?;
+    if let Some(started) = started {
+        started(process.id());
+    }
     let wait_outcome = tokio::select! {
         _ = cancel.cancelled() => ShellWaitOutcome::Cancelled,
-        result = timeout(Duration::from_millis(timeout_ms), process.wait()) => match result {
-            Ok(result) => ShellWaitOutcome::Exited(result),
-            Err(_) => ShellWaitOutcome::TimedOut,
-        }
+        result = process.wait() => ShellWaitOutcome::Exited(result),
+        _ = async {
+            match timeout_ms {
+                Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => ShellWaitOutcome::TimedOut,
     };
     let (completed, timed_out, cancelled, execution_error) = match wait_outcome {
         ShellWaitOutcome::Exited(Ok(status)) => {
@@ -631,6 +719,10 @@ async fn execute_shell_command_with_resolved_programs(
     })
 }
 
+mod managed;
+pub use managed::{ManagedShells, ShellStartTool, ShellStatusTool, ShellStopTool};
+pub(crate) use managed::{RetainedService, RetainedServiceState};
+
 fn resolve_shell_programs(
     shell: &crate::config::ShellConfig,
     family: ShellFamily,
@@ -665,7 +757,7 @@ fn resolve_shell_executables(
         resolve_program_candidates(&programs, workdir, environment)
     } else {
         resolve_program_candidates_with(&programs, |program| {
-            ResolvedExecutable::resolve_from_captured_search_path(
+            ResolvedExecutable::discover_shell_from_captured_search_path(
                 program,
                 environment,
                 workspace_root,
@@ -794,17 +886,479 @@ fn references_outside_workspace(workspace: &crate::workspace::Workspace, command
     references_outside_workspace_from(workspace, &workspace.cwd, command)
 }
 
+#[cfg(test)]
 fn references_outside_workspace_from(
     workspace: &crate::workspace::Workspace,
     workdir: &Utf8Path,
     command: &str,
 ) -> bool {
-    if command.contains("..") {
-        return true;
+    shell_literal_paths(
+        workdir,
+        command,
+        if cfg!(windows) {
+            ShellFamily::PowerShell
+        } else {
+            ShellFamily::Bash
+        },
+    )
+    .paths
+    .into_iter()
+    .any(|path| path_is_outside_writable_boundary(workspace, &path))
+}
+
+#[derive(Default)]
+struct ShellLiteralPaths {
+    paths: Vec<Utf8PathBuf>,
+    unresolved: bool,
+}
+
+struct ShellLiteralWord {
+    text: String,
+    literal: bool,
+    quoted: bool,
+    option_prefix: bool,
+    redirection: bool,
+}
+
+// This is a literal-word view, not a script evaluator. Unknown effects retain
+// review; only a known operand with a known cwd becomes a relative target.
+fn shell_literal_words(command: &str, family: ShellFamily) -> (Vec<Vec<ShellLiteralWord>>, bool) {
+    let mut segments = Vec::new();
+    let mut words = Vec::new();
+    let mut text = String::new();
+    let mut literal = true;
+    let mut quoted: Option<usize> = None;
+    let mut redirection = false;
+    let mut quote = None;
+    let mut complete = true;
+    let mut characters = command.chars().peekable();
+    let flush = |words: &mut Vec<ShellLiteralWord>,
+                 text: &mut String,
+                 literal: &mut bool,
+                 quoted: &mut Option<usize>,
+                 redirection: &mut bool| {
+        if !text.is_empty() || quoted.is_some() {
+            let option_prefix = text.starts_with('-') && *quoted != Some(0);
+            words.push(ShellLiteralWord {
+                text: std::mem::take(text),
+                literal: *literal,
+                quoted: quoted.is_some(),
+                option_prefix,
+                redirection: *redirection,
+            });
+            *literal = true;
+            *quoted = None;
+            *redirection = false;
+        }
+    };
+    while let Some(character) = characters.next() {
+        let escape = match family {
+            ShellFamily::PowerShell => character == '`' && quote != Some('\''),
+            ShellFamily::Bash => character == '\\' && quote != Some('\''),
+        };
+        if escape {
+            if let Some(next) = characters.next() {
+                text.push(next);
+                // Escaped shell syntax and continued lines are not resolved
+                // as literal filesystem operands by this bounded view.
+                literal = false;
+            } else {
+                complete = false;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                if family == ShellFamily::PowerShell
+                    && character == '\''
+                    && characters.peek() == Some(&'\'')
+                {
+                    characters.next();
+                    text.push('\'');
+                } else {
+                    quote = None;
+                }
+            } else {
+                if active_quote == '"'
+                    && (character == '$' || (family == ShellFamily::Bash && character == '`'))
+                {
+                    literal = false;
+                }
+                text.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => {
+                quote = Some(character);
+                quoted.get_or_insert(text.len());
+            }
+            '#' if family == ShellFamily::PowerShell || text.is_empty() => {
+                while characters
+                    .peek()
+                    .is_some_and(|next| !matches!(next, '\r' | '\n'))
+                {
+                    characters.next();
+                }
+            }
+            '{' | '}' if family == ShellFamily::Bash && !text.is_empty() => {
+                // Braces within a Bash word are expansion syntax, not a new
+                // command boundary (for example, a parameter expansion).
+                literal = false;
+                text.push(character);
+            }
+            ';' | '|' | '\r' | '\n' | '{' | '}' | '(' | ')' | '&' => {
+                flush(
+                    &mut words,
+                    &mut text,
+                    &mut literal,
+                    &mut quoted,
+                    &mut redirection,
+                );
+                if !words.is_empty() {
+                    segments.push(std::mem::take(&mut words));
+                }
+                if character == '&' && characters.peek() == Some(&'&') {
+                    characters.next();
+                } else if character == '&' && family == ShellFamily::PowerShell {
+                    words.push(ShellLiteralWord {
+                        text: "&".to_string(),
+                        literal: false,
+                        quoted: false,
+                        option_prefix: false,
+                        redirection: false,
+                    });
+                }
+            }
+            '>' | '<' => {
+                flush(
+                    &mut words,
+                    &mut text,
+                    &mut literal,
+                    &mut quoted,
+                    &mut redirection,
+                );
+                redirection = true;
+                if characters.peek() == Some(&character) {
+                    characters.next();
+                }
+                if character == '<' && characters.peek() == Some(&'#') {
+                    complete = false;
+                }
+            }
+            ',' => {
+                flush(
+                    &mut words,
+                    &mut text,
+                    &mut literal,
+                    &mut quoted,
+                    &mut redirection,
+                );
+                words.push(ShellLiteralWord {
+                    text: ",".to_string(),
+                    literal: false,
+                    quoted: false,
+                    option_prefix: false,
+                    redirection: false,
+                });
+            }
+            whitespace if whitespace.is_whitespace() => flush(
+                &mut words,
+                &mut text,
+                &mut literal,
+                &mut quoted,
+                &mut redirection,
+            ),
+            other => {
+                if other == '$' || (family == ShellFamily::Bash && other == '`') {
+                    literal = false;
+                }
+                text.push(other);
+            }
+        }
     }
-    extract_absolute_paths(workdir, command)
-        .into_iter()
-        .any(|path| path_is_outside_writable_boundary(workspace, &path))
+    flush(
+        &mut words,
+        &mut text,
+        &mut literal,
+        &mut quoted,
+        &mut redirection,
+    );
+    if !words.is_empty() {
+        segments.push(words);
+    }
+    // Here-strings and block comments require a different grammar. Keep their
+    // effects under review instead of treating their contents as known data.
+    complete &= quote.is_none()
+        && !command.contains("<#")
+        && !command.contains("@\"")
+        && !command.contains("@'");
+    (segments, complete)
+}
+
+fn is_literal_data_command(command: &str, family: ShellFamily) -> bool {
+    if family == ShellFamily::Bash {
+        return matches!(command, "echo" | "printf");
+    }
+    matches!(
+        command,
+        "write-output"
+            | "write-host"
+            | "write-debug"
+            | "write-error"
+            | "write-verbose"
+            | "write-warning"
+            | "echo"
+    )
+}
+
+fn is_literal_path_command(command: &str, family: ShellFamily) -> bool {
+    if family == ShellFamily::Bash {
+        return matches!(command, "cat" | "ls" | "cp" | "mv" | "rm" | "rmdir" | "cd");
+    }
+    matches!(
+        command,
+        "get-content"
+            | "get-childitem"
+            | "get-item"
+            | "get-itemproperty"
+            | "set-content"
+            | "add-content"
+            | "out-file"
+            | "export-csv"
+            | "import-csv"
+            | "test-path"
+            | "resolve-path"
+            | "new-item"
+            | "remove-item"
+            | "move-item"
+            | "rename-item"
+            | "copy-item"
+            | "cd"
+            | "chdir"
+            | "set-location"
+            | "push-location"
+            | "cat"
+            | "ls"
+            | "cp"
+            | "copy"
+            | "mv"
+            | "move"
+            | "ren"
+            | "rename"
+            | "rm"
+            | "del"
+            | "rd"
+            | "rmdir"
+    )
+}
+
+fn literal_path_value(value: &str) -> &str {
+    if !value.starts_with('-') {
+        return value;
+    }
+    let binding = value.split_once(['=', ':']).filter(|(name, _)| {
+        name.chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    });
+    binding.map_or(value, |(_, rhs)| rhs)
+}
+
+fn has_parent_path_component(value: &str) -> bool {
+    !value.contains("://")
+        && value
+            .split(|character| character == '/' || (cfg!(windows) && character == '\\'))
+            .any(|component| component == "..")
+}
+
+fn add_resolved_literal_path(paths: &mut ShellLiteralPaths, workdir: &Utf8Path, path: &Utf8Path) {
+    match crate::workspace::project::normalize_path(workdir, path) {
+        Ok(path) => paths.paths.push(path),
+        Err(_) => paths.unresolved = true,
+    }
+}
+
+fn shell_literal_paths(
+    workdir: &Utf8Path,
+    command: &str,
+    family: ShellFamily,
+) -> ShellLiteralPaths {
+    let (segments, complete) = shell_literal_words(command, family);
+    let mut paths = ShellLiteralPaths {
+        unresolved: !complete,
+        ..Default::default()
+    };
+    let mut known_cwd = complete;
+    for words in segments {
+        let invoked = words.first().is_some_and(|word| word.text == "&");
+        let head_index = usize::from(invoked);
+        let Some(head) = words.get(head_index) else {
+            continue;
+        };
+        let head_name = match family {
+            ShellFamily::PowerShell => head.text.to_ascii_lowercase(),
+            ShellFamily::Bash => head.text.clone(),
+        };
+        let arguments = words
+            .iter()
+            .skip(head_index + 1)
+            .map(|word| word.text.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let child = child_interpreter_reinterprets_input(&head_name, &arguments);
+        let literal_expression = family == ShellFamily::PowerShell
+            && head.literal
+            && !head.quoted
+            && head
+                .text
+                .starts_with(|character: char| character.is_ascii_digit())
+            && head.text.chars().all(|character| {
+                character.is_ascii_digit() || matches!(character, '.' | '+' | '-')
+            });
+        let known_head =
+            head.literal && !(family == ShellFamily::PowerShell && head.quoted && !invoked);
+        let data = known_head && is_literal_data_command(&head_name, family);
+        let path_command = known_head && is_literal_path_command(&head_name, family);
+        if family == ShellFamily::Bash
+            && words.iter().any(|word| {
+                !word.redirection
+                    && (head.redirection || (!path_command && !data) || !word.literal)
+                    && command_tokens(&word.text)
+                        .iter()
+                        .any(|token| is_move_command(token))
+            })
+        {
+            // Prefixes, wrappers and control grammar can hide the actual head.
+            // Retain review for the previous move suspicion without claiming
+            // that an unresolved word is an executed move command.
+            paths.unresolved = true;
+        }
+        let ambiguous_binding = words.iter().any(|word| word.text == ",");
+        let mut next_parameter: Option<String> = None;
+        let mut positional = 0;
+        let mut bound_path = false;
+        for (index, word) in words.iter().enumerate() {
+            let mut parameter = next_parameter.take();
+            let option = index > head_index && parameter.is_none() && word.option_prefix;
+            let value = if option {
+                literal_path_value(&word.text)
+            } else {
+                &word.text
+            };
+            if option {
+                let name = word
+                    .text
+                    .split(['=', ':'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if value == word.text {
+                    next_parameter = Some(name);
+                } else {
+                    parameter = Some(name);
+                }
+            } else if index > head_index && parameter.is_none() && !word.redirection {
+                positional += 1;
+            }
+            let content_command = family == ShellFamily::PowerShell
+                && path_command
+                && matches!(head_name.as_str(), "set-content" | "add-content");
+            let data_value = content_command
+                && !ambiguous_binding
+                && (matches!(parameter.as_deref(), Some("-value"))
+                    || (parameter.is_none() && bound_path));
+            if content_command && matches!(parameter.as_deref(), Some("-path" | "-literalpath")) {
+                bound_path = true;
+            }
+            if (data || data_value) && index > head_index && !word.redirection {
+                if known_cwd && word.literal {
+                    continue;
+                }
+                paths.unresolved = true;
+            }
+            // Preserve existing literal absolute evidence, including nested
+            // interpreter arguments, without reinterpreting relative child code.
+            let value = match cfg!(windows)
+                .then(|| windows_provider_path(value))
+                .flatten()
+            {
+                Some(WindowsProviderPath::FileSystem(path)) => path,
+                Some(WindowsProviderPath::Unresolved) => {
+                    // Unknown providers and PSDrives are not filesystem evidence.
+                    paths.unresolved = true;
+                    continue;
+                }
+                None => value,
+            };
+            let drive_relative = cfg!(windows) && is_windows_drive_relative(value);
+            if drive_relative
+                && (!known_cwd || child || !word.literal || !(path_command || word.redirection))
+            {
+                paths.unresolved = true;
+                continue;
+            }
+            let whole_path = if cfg!(windows) {
+                resolve_quoted_windows_path(workdir, value)
+            } else {
+                let path = Utf8PathBuf::from(value);
+                path.is_absolute().then_some(path)
+            };
+            if cfg!(windows) && is_windows_drive_relative(value) && whole_path.is_none() {
+                paths.unresolved = true;
+            }
+            if let Some(absolute) = whole_path {
+                add_resolved_literal_path(&mut paths, workdir, &absolute);
+                if !word.literal {
+                    paths.unresolved = true;
+                }
+            } else {
+                for absolute in extract_absolute_paths(workdir, &word.text) {
+                    add_resolved_literal_path(&mut paths, workdir, &absolute);
+                    if !word.literal {
+                        paths.unresolved = true;
+                    }
+                }
+            }
+            let path_operand = path_command
+                && !ambiguous_binding
+                && !(content_command && parameter.is_none() && positional > 1)
+                && (parameter.is_none()
+                    || matches!(
+                        parameter.as_deref(),
+                        Some("-path" | "-literalpath" | "-filepath" | "-source" | "-destination")
+                    ));
+            let effect_path_operand = path_operand || word.redirection;
+            if word.text.contains("..")
+                && (!effect_path_operand || !known_cwd || child || !word.literal)
+            {
+                paths.unresolved = true;
+            }
+            if !has_parent_path_component(value) || Utf8Path::new(value).is_absolute() {
+                continue;
+            }
+            if word.literal && known_cwd && !child && effect_path_operand {
+                add_resolved_literal_path(&mut paths, workdir, Utf8Path::new(value));
+            } else {
+                paths.unresolved = true;
+            }
+        }
+        if invoked
+            || !known_head
+            || child
+            || matches!(
+                head_name.as_str(),
+                "cd" | "chdir" | "set-location" | "push-location" | "pop-location"
+            )
+            || (family == ShellFamily::PowerShell
+                && !literal_expression
+                && powershell_has_unknown_literal_command(&head.text))
+            || (family == ShellFamily::Bash && !path_command && !data)
+        {
+            known_cwd = false;
+        }
+    }
+    paths.paths.sort();
+    paths.paths.dedup();
+    paths
 }
 
 fn path_is_outside_writable_boundary(
@@ -823,11 +1377,13 @@ fn path_is_outside_writable_boundary(
 fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf> {
     let mut paths = Vec::new();
     let mut quoted_path_ranges = Vec::new();
-    let quoted_values = [
-        Regex::new(r#""([^"]+)""#).expect("double-quoted shell value regex"),
-        Regex::new(r"'([^']+)'").expect("single-quoted shell value regex"),
-    ];
-    for quoted in &quoted_values {
+    static QUOTED_VALUES: std::sync::LazyLock<[Regex; 2]> = std::sync::LazyLock::new(|| {
+        [
+            Regex::new(r#""([^"]+)""#).expect("double-quoted shell value regex"),
+            Regex::new(r"'([^']+)'").expect("single-quoted shell value regex"),
+        ]
+    });
+    for quoted in QUOTED_VALUES.iter() {
         for capture in quoted.captures_iter(command) {
             let Some(candidate) = capture.get(1) else {
                 continue;
@@ -841,14 +1397,23 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
             if let Some(path) = resolved {
                 paths.push(path);
                 quoted_path_ranges.push(candidate.start()..candidate.end());
+            } else if cfg!(windows) && windows_provider_path(candidate.as_str()).is_some() {
+                quoted_path_ranges.push(candidate.start()..candidate.end());
             }
         }
     }
 
     if cfg!(windows) {
-        let regex =
-            Regex::new(r#"(?i)(?:[A-Z]:[\\/]|\\\\|//)[^\s"'|;,<>]+"#).expect("windows path regex");
-        for candidate in regex.find_iter(command) {
+        static ABSOLUTE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(
+                r#"(?i)(?:^|[\s"'|;=,()<>\[\]{}])((?:(?:Microsoft\.PowerShell\.Core\\)?FileSystem::)?(?:[A-Z]:[\\/]|\\\\|//)[^\s"'|;,<>]+)"#,
+            )
+            .expect("windows path regex")
+        });
+        for capture in ABSOLUTE.captures_iter(command) {
+            let Some(candidate) = capture.get(1) else {
+                continue;
+            };
             if quoted_path_ranges
                 .iter()
                 .any(|range| range.contains(&candidate.start()))
@@ -856,15 +1421,15 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
             {
                 continue;
             }
-            let path = Utf8PathBuf::from(candidate.as_str().replace('/', "\\"));
-            if path.is_absolute() {
+            if let Some(path) = resolve_quoted_windows_path(workdir, candidate.as_str()) {
                 paths.push(path);
             }
         }
-        let drive_relative =
+        static DRIVE_RELATIVE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
             Regex::new(r#"(?i)(?:^|[\s"'|;=,()<>\[\]{}])([A-Z]:[^\\/\s"'|;,<>][^\s"'|;,<>]*)"#)
-                .expect("windows drive-relative path regex");
-        for capture in drive_relative.captures_iter(command) {
+                .expect("windows drive-relative path regex")
+        });
+        for capture in DRIVE_RELATIVE.captures_iter(command) {
             let Some(candidate) = capture.get(1) else {
                 continue;
             };
@@ -880,9 +1445,10 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
             }
         }
     } else {
-        let regex =
-            Regex::new(r#"(?:^|[\s"'|;=,()<>\[\]{}])(/[^\s"'|;,<>]+)"#).expect("unix path regex");
-        for capture in regex.captures_iter(command) {
+        static ABSOLUTE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?:^|[\s"'|;=,()<>\[\]{}])(/[^\s"'|;,<>]+)"#).expect("unix path regex")
+        });
+        for capture in ABSOLUTE.captures_iter(command) {
             let Some(candidate) = capture.get(1) else {
                 continue;
             };
@@ -904,7 +1470,40 @@ fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf>
     paths
 }
 
+enum WindowsProviderPath<'a> {
+    FileSystem(&'a str),
+    Unresolved,
+}
+
+fn windows_provider_path(value: &str) -> Option<WindowsProviderPath<'_>> {
+    let (name, path) = value.split_once(':')?;
+    if name.len() <= 1
+        || name.starts_with('\\')
+        || path.starts_with("//")
+        || !name.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '\\')
+        })
+    {
+        return None;
+    }
+    Some(match path.strip_prefix(':') {
+        Some(path)
+            if (name.eq_ignore_ascii_case("FileSystem")
+                || name.eq_ignore_ascii_case(r"Microsoft.PowerShell.Core\FileSystem"))
+                && Utf8Path::new(path).is_absolute() =>
+        {
+            WindowsProviderPath::FileSystem(path)
+        }
+        _ => WindowsProviderPath::Unresolved,
+    })
+}
+
 fn resolve_quoted_windows_path(workdir: &Utf8Path, value: &str) -> Option<Utf8PathBuf> {
+    let value = match windows_provider_path(value) {
+        Some(WindowsProviderPath::FileSystem(path)) => path,
+        Some(WindowsProviderPath::Unresolved) => return None,
+        None => value,
+    };
     let path = Utf8PathBuf::from(value.replace('/', "\\"));
     if path.is_absolute() {
         return Some(path);
@@ -922,8 +1521,9 @@ fn resolve_quoted_windows_path(workdir: &Utf8Path, value: &str) -> Option<Utf8Pa
 
 fn shell_path_candidate_is_inside_uri(command: &str, start: usize, end: usize) -> bool {
     let token_start = command[..start]
-        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '|' | ';' | ','))
-        .map(|index| index + 1)
+        .char_indices()
+        .rfind(|(_, ch)| ch.is_whitespace() || matches!(ch, '"' | '\'' | '|' | ';' | ','))
+        .map(|(index, ch)| index + ch.len_utf8())
         .unwrap_or(0);
     let token_end = command[end..]
         .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '|' | ';' | ','))
@@ -939,8 +1539,9 @@ fn shell_path_candidate_is_inside_uri(command: &str, start: usize, end: usize) -
             return false;
         }
         let scheme_start = token[..marker]
-            .rfind(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '+' | '-' | '.'))
-            .map(|index| index + 1)
+            .char_indices()
+            .rfind(|(_, ch)| !ch.is_ascii_alphanumeric() && !matches!(ch, '+' | '-' | '.'))
+            .map(|(index, ch)| index + ch.len_utf8())
             .unwrap_or(0);
         let scheme = &token[scheme_start..marker];
         scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
@@ -978,11 +1579,23 @@ fn resolve_windows_drive_relative(workdir: &Utf8Path, drive_relative: &str) -> O
     }
     let drive = &drive_relative[..2];
     let relative = drive_relative[2..].replace('/', "\\");
-    let workdir_text = workdir.as_str();
+    let workdir_text = workdir
+        .as_str()
+        .strip_prefix(r"\\?\")
+        .unwrap_or(workdir.as_str());
     if workdir_text.len() >= 2 && workdir_text[..2].eq_ignore_ascii_case(drive) {
         return Some(workdir.join(relative));
     }
-    Some(Utf8PathBuf::from(format!("{drive}\\{relative}")))
+    // Other drives have their own process cwd, which is not captured here.
+    None
+}
+
+fn is_windows_drive_relative(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !matches!(bytes[2], b'\\' | b'/')
 }
 
 fn default_description(command: &str) -> String {
@@ -1015,20 +1628,36 @@ fn shell_permission_risks(
 ) -> Vec<PermissionRisk> {
     let guarded = PathGuard::require_path(workspace, &workspace.cwd, AccessKind::Shell)
         .expect("test workspace cwd");
-    shell_permission_risks_from(workspace, &guarded, command)
+    let family = if cfg!(windows) {
+        ShellFamily::PowerShell
+    } else {
+        ShellFamily::Bash
+    };
+    let paths = shell_literal_paths(&guarded.absolute, command, family);
+    shell_permission_risks_from(
+        workspace,
+        &guarded,
+        command,
+        &paths,
+        shell_has_move_risk_for_family(command, family),
+    )
 }
 
 fn shell_permission_risks_from(
     workspace: &crate::workspace::Workspace,
     guarded_workdir: &GuardedPath,
     command: &str,
+    paths: &ShellLiteralPaths,
+    move_risk: bool,
 ) -> Vec<PermissionRisk> {
     let mut risks = Vec::new();
-    let references_network_path = shell_references_network_path(&guarded_workdir.absolute, command);
+    let references_network_path = cfg!(windows)
+        && (is_windows_unc_path(&guarded_workdir.absolute)
+            || paths.paths.iter().any(|path| is_windows_unc_path(path)));
     if shell_has_delete_risk(command) {
         risks.push(PermissionRisk::DestructiveDelete);
     }
-    if shell_has_move_risk(command) {
+    if move_risk {
         risks.push(PermissionRisk::MoveOrRename);
     }
     if shell_has_network_risk(command) || references_network_path {
@@ -1037,8 +1666,11 @@ fn shell_permission_risks_from(
     if shell_requires_external_connection_review(command) || references_network_path {
         risks.push(PermissionRisk::ExternalConnection);
     }
-    if command_mentions_protected_target(workspace, guarded_workdir, command) {
+    if command_mentions_protected_target(workspace, guarded_workdir, command, &paths.paths) {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
+    }
+    if paths.unresolved {
+        risks.push(PermissionRisk::UnclassifiedShell);
     }
     risks
 }
@@ -1050,13 +1682,20 @@ pub(crate) fn process_argv_permission_risks(
     configured_instruction_files: &[Utf8PathBuf],
 ) -> Vec<PermissionRisk> {
     let command = argv.join(" ");
-    let mut risks = shell_permission_risks_from(workspace, guarded_workdir, &command);
+    let paths = process_argv_literal_paths(&guarded_workdir.absolute, argv);
+    let mut risks = shell_permission_risks_from(
+        workspace,
+        guarded_workdir,
+        &command,
+        &paths,
+        argv.first().is_some_and(|head| is_move_command(head)),
+    );
     if process_argv_has_child_interpreter_boundary(argv)
         && !risks.contains(&PermissionRisk::UnclassifiedShell)
     {
         risks.push(PermissionRisk::UnclassifiedShell);
     }
-    let structured_paths = process_argv_path_candidates(&guarded_workdir.absolute, argv);
+    let structured_paths = &paths.paths;
     if structured_paths.iter().any(|path| {
         PathGuard::require_path(workspace, path, AccessKind::Shell).is_ok_and(|guarded| {
             PathGuard::targets_protected_workspace_authority(&workspace.root, &guarded)
@@ -1068,8 +1707,8 @@ pub(crate) fn process_argv_permission_risks(
     if command_mentions_configured_instruction_target(
         workspace,
         configured_instruction_files,
-        guarded_workdir,
         &command,
+        structured_paths,
     ) && !risks.contains(&PermissionRisk::ProtectedWorkspaceAuthority)
     {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
@@ -1100,19 +1739,34 @@ pub(crate) fn process_argv_references_outside_workspace(
     guarded_workdir: &GuardedPath,
     argv: &[String],
 ) -> bool {
-    references_outside_workspace_from(workspace, &guarded_workdir.absolute, &argv.join(" "))
-        || process_argv_path_candidates(&guarded_workdir.absolute, argv)
-            .iter()
-            .any(|path| path_is_outside_writable_boundary(workspace, path))
+    process_argv_literal_paths(&guarded_workdir.absolute, argv)
+        .paths
+        .iter()
+        .any(|path| path_is_outside_writable_boundary(workspace, path))
 }
 
-fn process_argv_path_candidates(workdir: &Utf8Path, argv: &[String]) -> Vec<Utf8PathBuf> {
-    let mut paths = extract_absolute_paths(workdir, &argv.join(" "));
+fn process_argv_literal_paths(workdir: &Utf8Path, argv: &[String]) -> ShellLiteralPaths {
+    let mut paths = ShellLiteralPaths::default();
     for argument in argv {
-        for candidate in std::iter::once(argument.as_str())
-            .chain(argument.split_once('=').map(|(_, value)| value))
-        {
+        for candidate in std::iter::once(argument.as_str()).chain(
+            argument
+                .starts_with('-')
+                .then(|| argument.split_once('='))
+                .flatten()
+                .map(|(_, value)| value),
+        ) {
             let candidate = candidate.trim_matches(['"', '\'']);
+            let candidate = match cfg!(windows)
+                .then(|| windows_provider_path(literal_path_value(candidate)))
+                .flatten()
+            {
+                Some(WindowsProviderPath::FileSystem(path)) => path,
+                Some(WindowsProviderPath::Unresolved) => {
+                    paths.unresolved = true;
+                    continue;
+                }
+                None => candidate,
+            };
             let resolved = if cfg!(windows) {
                 resolve_quoted_windows_path(workdir, candidate)
             } else {
@@ -1120,15 +1774,30 @@ fn process_argv_path_candidates(workdir: &Utf8Path, argv: &[String]) -> Vec<Utf8
                 path.is_absolute().then_some(path)
             };
             if let Some(path) = resolved {
-                paths.push(path);
+                add_resolved_literal_path(&mut paths, workdir, &path);
+            } else {
+                for path in extract_absolute_paths(workdir, candidate) {
+                    add_resolved_literal_path(&mut paths, workdir, &path);
+                }
+                if has_parent_path_component(candidate)
+                    || candidate
+                        .split_once('=')
+                        .is_some_and(|(_, value)| has_parent_path_component(value))
+                    || (cfg!(windows) && is_windows_drive_relative(candidate))
+                {
+                    // A formatter's argv has no shell range/quote grammar. A
+                    // parent-looking argument may be data or an effect path.
+                    paths.unresolved = true;
+                }
             }
         }
     }
-    paths.sort();
-    paths.dedup();
+    paths.paths.sort();
+    paths.paths.dedup();
     paths
 }
 
+#[cfg(test)]
 fn shell_references_network_path(workdir: &Utf8Path, command: &str) -> bool {
     cfg!(windows)
         && (is_windows_unc_path(workdir)
@@ -1138,7 +1807,14 @@ fn shell_references_network_path(workdir: &Utf8Path, command: &str) -> bool {
 }
 
 fn is_windows_unc_path(path: &Utf8Path) -> bool {
-    path.as_str().replace('/', "\\").starts_with("\\\\")
+    let normalized = path.as_str().replace('/', "\\");
+    // Extended DOS paths name the same local drive paths as ordinary DOS paths.
+    // Keep UNC and unknown device namespaces subject to network-path review.
+    let extended_dos_path = normalized.strip_prefix(r"\\?\").is_some_and(|suffix| {
+        let bytes = suffix.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    });
+    normalized.starts_with(r"\\") && !extended_dos_path
 }
 
 fn shell_has_delete_risk(command: &str) -> bool {
@@ -1150,12 +1826,37 @@ fn shell_has_delete_risk(command: &str) -> bool {
     })
 }
 
+fn is_move_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let name = lower.rsplit(['/', '\\']).next().unwrap_or_default();
+    matches!(
+        name.strip_suffix(".exe").unwrap_or(name),
+        "mv" | "move" | "ren" | "rename" | "move-item" | "rename-item"
+    )
+}
+
+#[cfg(test)]
 fn shell_has_move_risk(command: &str) -> bool {
-    command_tokens(command).iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "mv" | "move" | "ren" | "rename" | "move-item" | "rename-item"
-        )
+    shell_has_move_risk_for_family(
+        command,
+        if cfg!(windows) {
+            ShellFamily::PowerShell
+        } else {
+            ShellFamily::Bash
+        },
+    )
+}
+
+fn shell_has_move_risk_for_family(command: &str, family: ShellFamily) -> bool {
+    let (segments, _) = shell_literal_words(command, family);
+    segments.iter().any(|words| {
+        let invoked = words.first().is_some_and(|word| word.text == "&");
+        words.get(usize::from(invoked)).is_some_and(|head| {
+            head.literal
+                && !head.redirection
+                && !(family == ShellFamily::PowerShell && head.quoted && !invoked)
+                && is_move_command(&head.text)
+        })
     })
 }
 
@@ -1553,6 +2254,7 @@ fn command_mentions_protected_target(
     workspace: &crate::workspace::Workspace,
     guarded_workdir: &GuardedPath,
     command: &str,
+    paths: &[Utf8PathBuf],
 ) -> bool {
     if PathGuard::targets_protected_workspace_authority(&workspace.root, guarded_workdir) {
         return true;
@@ -1572,23 +2274,20 @@ fn command_mentions_protected_target(
     {
         return true;
     }
-    extract_absolute_paths(&guarded_workdir.absolute, command)
-        .into_iter()
-        .any(|path| {
-            PathGuard::require_path(workspace, &path, AccessKind::Shell).is_ok_and(|guarded| {
-                PathGuard::targets_protected_workspace_authority(&workspace.root, &guarded)
-            })
+    paths.iter().any(|path| {
+        PathGuard::require_path(workspace, &path, AccessKind::Shell).is_ok_and(|guarded| {
+            PathGuard::targets_protected_workspace_authority(&workspace.root, &guarded)
         })
+    })
 }
 
 fn command_mentions_configured_instruction_target(
     workspace: &crate::workspace::Workspace,
     configured_files: &[Utf8PathBuf],
-    guarded_workdir: &GuardedPath,
     command: &str,
+    paths: &[Utf8PathBuf],
 ) -> bool {
     let lower = command.replace('/', "\\").to_ascii_lowercase();
-    let absolute_paths = extract_absolute_paths(&guarded_workdir.absolute, command);
     configured_files.iter().any(|configured| {
         let candidate = if configured.is_absolute() {
             configured.clone()
@@ -1599,7 +2298,7 @@ fn command_mentions_configured_instruction_target(
         else {
             return false;
         };
-        absolute_paths.iter().any(|path| {
+        paths.iter().any(|path| {
             PathGuard::stable_identity_key(path) == PathGuard::stable_identity_key(&candidate)
         }) || lower.contains(&candidate.as_str().replace('/', "\\").to_ascii_lowercase())
             || candidate
@@ -1610,6 +2309,7 @@ fn command_mentions_configured_instruction_target(
 
 #[cfg(test)]
 mod tests {
+    mod managed_tests;
     use camino::Utf8PathBuf;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
@@ -1695,6 +2395,7 @@ mod tests {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         };
         ShellToolFixture {
             _temp: temp,
@@ -2090,6 +2791,72 @@ mod tests {
     }
 
     #[test]
+    fn shell_audit_uses_captured_execution_and_excludes_model_explanations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let cwd = root.join("nested");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        let executable =
+            Utf8PathBuf::from_path_buf(temp.path().join("custom-shell.exe")).expect("utf8 program");
+        std::fs::write(&executable, b"pinned executable fixture").expect("program");
+        for (family, command, expected_args) in [
+            (
+                crate::config::ShellFamily::PowerShell,
+                "Write-Output hello",
+                vec!["-NoProfile", "-Command", "Write-Output hello"],
+            ),
+            (
+                crate::config::ShellFamily::Bash,
+                "printf hello",
+                vec!["-lc", "printf hello"],
+            ),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.shell.program = Some(executable.clone());
+            config.shell.family = Some(family);
+            let workspace =
+                WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+            let mut input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command, "workdir": "nested", "description": "the user approved it",
+                "sandbox_permissions": "require_escalated", "justification": "history makes it safe",
+            })).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            let evidence = intent
+                .execution
+                .guardian_evidence(&intent.guarded.absolute, &input.command);
+            let crate::tool::permission_guardian::PermissionGuardianEvidenceState::Complete(
+                crate::tool::permission_guardian::PermissionGuardianEvidence::ShellExecution {
+                    shell_family,
+                    cwd: audited_cwd,
+                    executable_candidates,
+                    arguments,
+                },
+            ) = &evidence
+            else {
+                panic!("expected typed execution evidence")
+            };
+            assert_eq!(*shell_family, family);
+            assert_eq!(audited_cwd, &intent.guarded.absolute);
+            assert_eq!(
+                executable_candidates,
+                &vec![intent.execution.programs[0].path().to_path_buf()]
+            );
+            assert_eq!(arguments, &expected_args);
+            input.description = "do not trust this explanation".into();
+            input.justification = "another model explanation".into();
+            let changed = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("changed intent");
+            assert_eq!(
+                evidence,
+                changed
+                    .execution
+                    .guardian_evidence(&changed.guarded.absolute, &input.command)
+            );
+        }
+    }
+
+    #[test]
     fn shell_output_is_factual_without_retry_coaching() {
         let output = super::format_shell_output_for_display(
             "Get-Process",
@@ -2292,6 +3059,171 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn implicit_windows_shell_skips_reparse_candidates_but_explicit_override_rejects_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = root.join("workspace");
+        let aliases = root.join("aliases");
+        let trusted = root.join("trusted");
+        for directory in [&workspace, &aliases, &trusted] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        let trusted_candidate = trusted.join("pwsh.exe");
+        std::fs::write(&trusted_candidate, b"regular executable fixture")
+            .expect("fixture executable");
+        let alias = aliases.join("pwsh.exe");
+        std::os::windows::fs::symlink_file(&trusted_candidate, &alias)
+            .expect("shell reparse fixture");
+        let search_path = std::env::join_paths([aliases.as_std_path(), trusted.as_std_path()])
+            .expect("search path")
+            .to_string_lossy()
+            .into_owned();
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), search_path),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        let mut shell = ResolvedConfig::default().shell;
+
+        let implicit = super::resolve_shell_executables(
+            &shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workspace,
+            &workspace,
+        )
+        .expect("regular shell after alias");
+        assert_eq!(implicit.len(), 1);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(implicit[0].path()),
+            crate::workspace::PathGuard::stable_identity_key(&trusted_candidate)
+        );
+        implicit[0].revalidate().expect("stable selected identity");
+        drop(implicit);
+
+        for program in [Utf8PathBuf::from("pwsh"), alias] {
+            shell.program = Some(program);
+            let error = super::resolve_shell_executables(
+                &shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+                &workspace,
+                &workspace,
+            )
+            .expect_err("explicit alias must be rejected");
+            assert!(error.to_string().contains("reparse point"));
+        }
+        assert!(
+            crate::tool::executable::ResolvedExecutable::resolve_from_captured_search_path(
+                "pwsh",
+                &environment,
+                &workspace,
+            )
+            .is_err(),
+            "formatter discovery must remain strict"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn implicit_windows_shell_falls_back_from_an_alias_only_program_to_powershell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = root.join("workspace");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let regular = bin.join("powershell.exe");
+        std::fs::write(&regular, b"regular fallback fixture").expect("executable");
+        std::os::windows::fs::symlink_file(&regular, bin.join("pwsh.exe")).expect("alias fixture");
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), bin.to_string()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        let programs = super::resolve_shell_executables(
+            &ResolvedConfig::default().shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workspace,
+            &workspace,
+        )
+        .expect("fallback shell");
+        assert_eq!(programs.len(), 1);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(programs[0].path()),
+            crate::workspace::PathGuard::stable_identity_key(&regular)
+        );
+        drop(programs);
+        std::fs::remove_file(&regular).expect("remove regular fallback");
+        assert!(
+            super::resolve_shell_executables(
+                &ResolvedConfig::default().shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+                &workspace,
+                &workspace,
+            )
+            .is_err(),
+            "alias-only discovery must not launch an alias"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn implicit_windows_shell_does_not_skip_a_non_reparse_directory_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace = root.join("workspace");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(bin.join("pwsh.exe")).expect("non-file candidate");
+        std::fs::write(bin.join("powershell.exe"), b"fallback must not be selected")
+            .expect("regular fallback");
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), bin.to_string()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+
+        assert!(
+            super::resolve_shell_executables(
+                &ResolvedConfig::default().shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+                &workspace,
+                &workspace,
+            )
+            .is_err(),
+            "a non-reparse non-file must not permit fallback"
+        );
+    }
+
+    #[test]
+    fn shell_candidate_admission_failure_does_not_try_another_program() {
+        for error in [
+            crate::tool::executable::ExecutableIdentityError::InvalidPath {
+                program: "pwsh".to_string(),
+                reason: "identity unavailable".to_string(),
+            },
+            crate::tool::executable::ExecutableIdentityError::Unavailable {
+                program: "pwsh".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+        ] {
+            let mut error = Some(error);
+            let mut attempts = Vec::new();
+            let result = super::resolve_program_candidates_with(
+                &["pwsh".to_string(), "powershell".to_string()],
+                |program| {
+                    attempts.push(program.to_string());
+                    Err(error.take().expect("no fallback after admission failure"))
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, ["pwsh"]);
+        }
+    }
+
+    #[test]
     fn network_urls_are_not_classified_as_outside_workspace_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
@@ -2305,6 +3237,109 @@ mod tests {
             let risks = super::shell_permission_risks(&workspace, command);
             assert!(risks.contains(&crate::tool::PermissionRisk::Network));
             assert!(risks.contains(&crate::tool::PermissionRisk::ExternalConnection));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_permission_intent_accepts_local_workdir_namespaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(root.join("nested")).expect("workspace directories");
+        let extended_root = Utf8PathBuf::from(format!(r"\\?\{root}"));
+        let config = ResolvedConfig::default();
+
+        for workspace_root in [&root, &extended_root] {
+            let workspace = WorkspaceDiscovery::discover_fixed_root(workspace_root, &config)
+                .expect("workspace");
+            for workdir in [
+                None,
+                Some(Utf8PathBuf::from(".")),
+                Some(Utf8PathBuf::from("nested")),
+                Some(root.clone()),
+                Some(extended_root.clone()),
+            ] {
+                let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                    "command": "python --version",
+                    "workdir": workdir,
+                }))
+                .expect("shell input");
+                let intent = super::shell_permission_intent(&workspace, &config, &input)
+                    .expect("permission intent");
+
+                assert!(!intent.outside_workspace, "{workspace_root}: {workdir:?}");
+                assert!(
+                    intent.risks.is_empty(),
+                    "{workspace_root}: {workdir:?}: {:?}",
+                    intent.risks
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_permission_intent_preserves_literal_path_boundaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let nested = root.join("nested");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("sibling")).expect("utf8 sibling");
+        std::fs::create_dir_all(&nested).expect("workspace directories");
+        std::fs::create_dir_all(&external).expect("external directory");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        for (path, outside_workspace) in [(&root, false), (&nested, false), (&external, true)] {
+            for literal in [path.clone(), Utf8PathBuf::from(format!(r"\\?\{path}"))] {
+                for literal in [
+                    literal.clone(),
+                    Utf8PathBuf::from(literal.as_str().replace('\\', "/")),
+                ] {
+                    let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                        "command": format!("Get-ChildItem -LiteralPath '{literal}'"),
+                    }))
+                    .expect("shell input");
+                    let intent = super::shell_permission_intent(&workspace, &config, &input)
+                        .expect("permission intent");
+
+                    assert_eq!(intent.outside_workspace, outside_workspace, "{literal}");
+                    assert!(intent.risks.is_empty(), "{literal}: {:?}", intent.risks);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_network_paths_keep_unc_and_device_review() {
+        for literal in [
+            r"\\server\shared folder\target.txt",
+            r"\\?\UNC\server\shared folder\target.txt",
+            r"\\?\uNc\server\shared folder\target.txt",
+            r"//server/shared folder/target.txt",
+            r"//?/UNC/server/shared folder/target.txt",
+            r"\\.\C:\device-target",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\target",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\target",
+            r"\\?\C:drive-relative",
+            r"\\?\1:\target",
+            r"\\?\C:",
+        ] {
+            assert!(
+                super::shell_references_network_path(
+                    camino::Utf8Path::new(literal),
+                    "python --version"
+                ),
+                "workdir: {literal}"
+            );
+            assert!(
+                super::shell_references_network_path(
+                    camino::Utf8Path::new(r"C:\workspace"),
+                    &format!("Get-ChildItem -LiteralPath '{literal}'")
+                ),
+                "command path: {literal}"
+            );
         }
     }
 
@@ -2386,6 +3421,323 @@ mod tests {
         assert_eq!(intent.guarded.absolute, selected);
         assert!(intent.targets.contains(&sibling));
         assert!(intent.outside_workspace);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_registry_provider_paths_do_not_become_filesystem_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        for command in [
+            r"Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'",
+            r#"Get-ItemProperty "HKCU:\Software\User Settings\Current""#,
+            r"Get-Item HKLM:\SOFTWARE",
+            r"Get-Item 'HKLM:SOFTWARE'",
+            r"Get-Item 'Cert:\CurrentUser\My'",
+            r"Get-Item 'FileSystem:M:\outside folder\target.txt'",
+            r"Get-Item 'OtherModule\FileSystem::M:\outside folder\target.txt'",
+            r"Get-Item 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Component Based Servicing'",
+            r"Get-Item 'Microsoft.PowerShell.Core\Registry::HKEY_CURRENT_USER\Software'",
+            r"Get-Item 'HKLM:\SOFTWARE\Example Key \\server\shared folder'",
+            r"Remove-Item 'HKLM:\SOFTWARE\Example Key'",
+            r#"powershell -NoProfile -Command "Test-Path 'HKLM:\SOFTWARE\Component Based Servicing'""#,
+            r#"powershell -NoProfile -Command "Get-Item 'HKLM:\SOFTWARE\Example Key \\server\shared folder'""#,
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+
+            assert!(!intent.outside_workspace, "{command}: {:?}", intent.targets);
+            assert!(
+                intent.targets.iter().all(|target| {
+                    target == &workspace.cwd
+                        || intent.execution.programs.iter().any(|program| {
+                            crate::workspace::PathGuard::stable_identity_key(target)
+                                == crate::workspace::PathGuard::stable_identity_key(program.path())
+                        })
+                }),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "unsupported provider must retain review: {command}: {:?}",
+                intent.risks
+            );
+            if command.starts_with("Remove-Item") {
+                assert!(
+                    intent
+                        .risks
+                        .contains(&crate::tool::PermissionRisk::DestructiveDelete)
+                );
+            }
+            assert_eq!(intent.details[0], format!("Command: {command}"));
+            let request = crate::tool::PermissionRequest {
+                access: crate::workspace::AccessKind::Shell,
+                summary: intent.description,
+                details: intent.details,
+                targets: intent.targets,
+                outside_workspace: intent.outside_workspace,
+                risks: intent.risks,
+                agent_path: None,
+                agent_task_name: None,
+            };
+            for mode in [AccessMode::Default, AccessMode::AutoReview] {
+                assert!(
+                    !crate::tool::context::access_mode_allows_permission(mode, &request),
+                    "provider requires a decision: {command}: {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_registry_provider_paths_preserve_real_filesystem_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let drive_path = Utf8PathBuf::from(r"M:\outside folder\日本語 target.txt");
+        let unc_path = Utf8PathBuf::from(r"\\server\shared folder\target.txt");
+
+        for command in [
+            format!(
+                "Get-Item 'HKLM:\\SOFTWARE\\Component Based Servicing'; Get-Item '{drive_path}'; Get-Item '{unc_path}'"
+            ),
+            format!(
+                "powershell -NoProfile -Command \"Get-Item 'HKCU:\\Software\\User Settings'; Get-Item '{drive_path}'; Get-Item '{unc_path}'\""
+            ),
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+
+            assert!(intent.outside_workspace, "{command}");
+            assert!(
+                intent.targets.contains(&drive_path),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent.targets.contains(&unc_path),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent.targets.iter().all(|target| {
+                    target == &workspace.cwd
+                        || target == &drive_path
+                        || target == &unc_path
+                        || intent.execution.programs.iter().any(|program| {
+                            crate::workspace::PathGuard::stable_identity_key(target)
+                                == crate::workspace::PathGuard::stable_identity_key(program.path())
+                        })
+                }),
+                "{command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+            assert!(intent.risks.contains(&crate::tool::PermissionRisk::Network));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_filesystem_provider_paths_keep_filesystem_boundaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external = Utf8PathBuf::from(r"M:\outside folder\日本語 target.txt");
+        let unc = Utf8PathBuf::from(r"\\server\shared folder\target.txt");
+        let unc_stream = Utf8PathBuf::from(r"\\server\shared folder\target.txt:stream");
+
+        for (literal, expected, outside) in [
+            (format!("FileSystem::{root}"), &root, false),
+            (format!("FileSystem::{external}"), &external, true),
+            (
+                format!("Microsoft.PowerShell.Core\\FileSystem::{external}"),
+                &external,
+                true,
+            ),
+            (
+                format!("Microsoft.PowerShell.Core\\FileSystem::{unc}"),
+                &unc,
+                true,
+            ),
+            (unc_stream.to_string(), &unc_stream, true),
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": format!("Get-Item -LiteralPath '{literal}'"),
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+
+            assert_eq!(
+                intent.outside_workspace, outside,
+                "{literal}: {:?}",
+                intent.targets
+            );
+            assert!(
+                intent.targets.contains(expected),
+                "{literal}: {:?}",
+                intent.targets
+            );
+            assert!(
+                !intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "known filesystem provider: {literal}: {:?}",
+                intent.risks
+            );
+        }
+
+        for command in [
+            r"Get-Item Microsoft.PowerShell.Core\FileSystem::M:\outside\target.txt",
+            r#"powershell -Command "Get-Item Microsoft.PowerShell.Core\FileSystem::M:\outside\target.txt""#,
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+            assert!(intent.outside_workspace);
+            assert!(
+                intent
+                    .targets
+                    .contains(&Utf8PathBuf::from(r"M:\outside\target.txt")),
+                "{command}: {:?}",
+                intent.targets
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_filesystem_provider_paths_keep_drive_relative_cwd_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(root.join("nested")).expect("workspace directories");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let drive = &root.as_str()[..2];
+        let literal = format!("FileSystem::{drive}..\\provider-outside.txt");
+        for command in [
+            format!("Get-Item '{literal}'"),
+            format!("python -c '{literal}'"),
+            format!("Set-Location nested; Get-Item '{literal}'"),
+            format!("powershell -Command \"Get-Item '{literal}'\""),
+            format!("Get-Item 'Microsoft.PowerShell.Core\\{literal}'"),
+            r"Get-Item 'FileSystem::..\provider-outside.txt'".into(),
+            r#"powershell -Command "Get-Item 'FileSystem::..\provider-outside.txt'""#.into(),
+        ] {
+            let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+                "command": command,
+            }))
+            .expect("shell input");
+            let intent = super::shell_permission_intent(&workspace, &config, &input)
+                .expect("permission intent");
+            assert!(
+                !intent.outside_workspace,
+                "unresolved cwd: {command}: {:?}",
+                intent.targets
+            );
+            assert!(
+                !intent
+                    .targets
+                    .contains(&root.parent().unwrap().join("provider-outside.txt"))
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_argv_provider_paths_keep_review_and_real_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let guarded = crate::workspace::PathGuard::require_path(
+            &workspace,
+            &root,
+            crate::workspace::AccessKind::Shell,
+        )
+        .expect("guard");
+        for argument in [
+            r"HKLM:\SOFTWARE\Example Key \\server\shared folder",
+            r"--path=HKLM:\SOFTWARE\Example Key \\server\shared folder",
+            r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE",
+            r"FileSystem:M:\outside folder\target.txt",
+            r"OtherModule\FileSystem::M:\outside folder\target.txt",
+            r"FileSystem::C:..\provider-outside.txt",
+            r"--path=FileSystem::..\provider-outside.txt",
+        ] {
+            let argv = vec!["formatter".into(), argument.into()];
+            assert!(
+                !super::process_argv_references_outside_workspace(&workspace, &guarded, &argv),
+                "unknown provider: {argument}"
+            );
+            let risks = super::process_argv_permission_risks(&workspace, &guarded, &argv, &[]);
+            assert!(
+                risks.contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "{argument}"
+            );
+            assert!(
+                !risks.contains(&crate::tool::PermissionRisk::Network),
+                "{argument}"
+            );
+        }
+
+        let drive_path = Utf8PathBuf::from(r"M:\outside folder\日本語 target.txt");
+        let unc_path = Utf8PathBuf::from(r"\\server\shared folder\target.txt");
+        let argv = vec![
+            "formatter".into(),
+            r"HKLM:\SOFTWARE\Example Key \\fake\share".into(),
+            format!("--path=Microsoft.PowerShell.Core\\FileSystem::{drive_path}"),
+            unc_path.to_string(),
+        ];
+        let paths = super::process_argv_literal_paths(&root, &argv);
+        assert_eq!(paths.paths.len(), 2);
+        assert!(paths.paths.contains(&drive_path));
+        assert!(paths.paths.contains(&unc_path));
+        assert!(super::process_argv_references_outside_workspace(
+            &workspace, &guarded, &argv
+        ));
+        let risks = super::process_argv_permission_risks(&workspace, &guarded, &argv, &[]);
+        assert!(risks.contains(&crate::tool::PermissionRisk::UnclassifiedShell));
+        assert!(risks.contains(&crate::tool::PermissionRisk::Network));
+
+        let argv = vec!["formatter".into(), format!("--path=FileSystem::{root}")];
+        assert!(!super::process_argv_references_outside_workspace(
+            &workspace, &guarded, &argv
+        ));
+        assert!(
+            !super::process_argv_permission_risks(&workspace, &guarded, &argv, &[])
+                .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+        );
     }
 
     #[cfg(windows)]
@@ -2523,6 +3875,431 @@ mod tests {
                 .risks
                 .contains(&crate::tool::PermissionRisk::ProtectedWorkspaceAuthority)
         );
+    }
+
+    #[test]
+    fn shell_intent_distinguishes_ranges_data_and_parent_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("repo")).expect("utf8 root");
+        std::fs::create_dir_all(root.join("nested")).expect("nested workdir");
+        std::fs::write(root.join("README.txt"), "fixture").expect("workspace file");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for command in [
+            "1..5 | ForEach-Object { Write-Output $_ }",
+            "$loads = 1..10 | ForEach-Object { Get-Process }",
+            "Write-Output '..'",
+            "Write-Output '../sibling/file.txt'",
+            "Write-Output 'a..b.txt'",
+        ] {
+            let input = serde_json::from_value(serde_json::json!({"command": command}))
+                .expect("shell input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(!intent.outside_workspace, "{command}");
+            if command.starts_with("1..") || command.starts_with('$') {
+                assert!(
+                    intent
+                        .risks
+                        .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+                );
+            }
+        }
+        for (workdir, command, outside, target) in [
+            (
+                "nested",
+                "Get-Content -LiteralPath '../README.txt'",
+                false,
+                root.join("README.txt"),
+            ),
+            (
+                ".",
+                "Get-Content -LiteralPath '../sibling/file.txt'",
+                true,
+                root.parent().unwrap().join("sibling/file.txt"),
+            ),
+            (
+                ".",
+                "1..5; Get-Content -LiteralPath '../sibling/file.txt'",
+                true,
+                root.parent().unwrap().join("sibling/file.txt"),
+            ),
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command,"workdir": workdir}))
+                    .expect("shell input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert_eq!(intent.outside_workspace, outside, "{command}");
+            assert!(
+                intent.targets.contains(&target),
+                "{command}: {:?}",
+                intent.targets
+            );
+        }
+    }
+
+    #[test]
+    fn shell_intent_does_not_classify_argument_text_as_a_move_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for command in [
+            "python -c \"g2.move_player(1, 2)\"",
+            "Write-Output move",
+            "Write-Output 'mv source target'",
+            "Write-Output ready # Move-Item source target",
+        ] {
+            let input = serde_json::from_value(serde_json::json!({"command": command}))
+                .expect("shell input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(
+                !intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::MoveOrRename),
+                "{command}"
+            );
+            if command.starts_with("python") {
+                assert!(
+                    intent
+                        .risks
+                        .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+                );
+            }
+        }
+        for command in [
+            "Move-Item source target",
+            "Write-Output ready | Move-Item source target",
+            "Write-Output ready; ren source target",
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::MoveOrRename),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_literal_classification_preserves_review_for_unresolved_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("repo")).expect("utf8 root");
+        std::fs::create_dir_all(root.join("nested")).expect("nested workdir");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for command in [
+            "Unknown-Command '../file.txt'",
+            "Set-Location nested; Get-Content '../file.txt'",
+            "Get-Content \"$folder/../file.txt\"",
+            "Write-Output @'\n../file.txt\n'@",
+            "Write-Output ready <# ../file.txt #>",
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(
+                !intent.outside_workspace,
+                "unresolved is not confirmed outside: {command}"
+            );
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "{command}"
+            );
+            let request = crate::tool::PermissionRequest {
+                access: crate::workspace::AccessKind::Shell,
+                summary: intent.description,
+                details: intent.details,
+                targets: intent.targets,
+                outside_workspace: intent.outside_workspace,
+                risks: intent.risks,
+                agent_path: None,
+                agent_task_name: None,
+            };
+            for mode in [AccessMode::Default, AccessMode::AutoReview] {
+                assert!(
+                    !crate::tool::context::access_mode_allows_permission(mode, &request),
+                    "{command}: {mode:?}"
+                );
+            }
+        }
+        for command in [
+            "Write-Output '..' > ../outside.txt",
+            "Get-Content -LiteralPath:../outside.txt",
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(intent.outside_workspace, "{command}");
+            assert!(
+                intent
+                    .targets
+                    .contains(&root.parent().unwrap().join("outside.txt"))
+            );
+        }
+        for command in [
+            "Set-Content out.txt '..'",
+            "Set-Content -LiteralPath out.txt -Value '..'",
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(!intent.outside_workspace, "value is data: {command}");
+        }
+    }
+
+    #[test]
+    fn shell_parent_paths_respect_additional_write_roots_and_bash_roles() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 fixture");
+        let root = fixture.join("repo");
+        let extra = fixture.join("extra");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&extra).expect("extra root");
+        let mut config = ResolvedConfig::default();
+        config.permissions.additional_write_roots = vec![extra.clone()];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let input = serde_json::from_value(
+            serde_json::json!({"command": "Get-Content '../extra/file.txt'"}),
+        )
+        .expect("input");
+        let intent = super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+        assert!(!intent.outside_workspace);
+        assert!(intent.targets.contains(&extra.join("file.txt")));
+        for (command, outside, unclassified, moved) in [
+            ("printf '../file.txt'", false, false, false),
+            ("cat '../file.txt'", true, false, false),
+            ("printf '..' > ../file.txt", true, false, false),
+            ("unknown '../file.txt'", false, true, false),
+            ("cd nested; cat '../file.txt'", false, true, false),
+            ("printf 'mv source target'", false, false, false),
+            ("printf ready; mv source target", false, false, true),
+        ] {
+            let paths =
+                super::shell_literal_paths(&root, command, crate::config::ShellFamily::Bash);
+            assert_eq!(
+                paths
+                    .paths
+                    .iter()
+                    .any(|path| super::path_is_outside_writable_boundary(&workspace, path)),
+                outside,
+                "{command}"
+            );
+            assert_eq!(paths.unresolved, unclassified, "{command}");
+            assert_eq!(
+                super::shell_has_move_risk_for_family(command, crate::config::ShellFamily::Bash),
+                moved,
+                "{command}"
+            );
+        }
+        let guarded = crate::workspace::PathGuard::require_path(
+            &workspace,
+            &root,
+            crate::workspace::AccessKind::Shell,
+        )
+        .expect("guard");
+        for argv in [
+            vec!["formatter".into(), "--label=..".into()],
+            vec!["formatter".into(), "--out=../file.txt".into()],
+        ] {
+            assert!(!super::process_argv_references_outside_workspace(
+                &workspace, &guarded, &argv
+            ));
+            assert!(
+                super::process_argv_permission_risks(&workspace, &guarded, &argv, &[])
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+        }
+    }
+
+    #[test]
+    fn literal_effect_paths_preserve_quoted_names_and_uncertain_binding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 fixture");
+        let root = fixture.join("repo");
+        let extra = fixture.join("allowed");
+        let outside = fixture.join("allowed sibling/file.txt");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&extra).expect("extra");
+        let mut config = ResolvedConfig::default();
+        config.permissions.additional_write_roots = vec![extra];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for (command, target) in [
+            (format!("Get-Content -LiteralPath '{outside}'"), outside),
+            (
+                "Get-Content -LiteralPath '../x=y/../secret.txt'".to_string(),
+                fixture.join("secret.txt"),
+            ),
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(intent.outside_workspace, "{command}: {:?}", intent.targets);
+            assert!(
+                intent.targets.contains(&target),
+                "{command}: {:?}",
+                intent.targets
+            );
+        }
+        for command in [
+            "Set-Content out.txt,../outside.txt changed",
+            "Unknown-Command -Message ../outside.txt",
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(
+                intent.outside_workspace
+                    || intent
+                        .risks
+                        .contains(&crate::tool::PermissionRisk::UnclassifiedShell),
+                "{command}"
+            );
+        }
+        let paths = super::shell_literal_paths(
+            &root,
+            "unknown -message ../outside.txt",
+            crate::config::ShellFamily::Bash,
+        );
+        assert!(paths.unresolved);
+        let paths = super::shell_literal_paths(
+            &root,
+            "ECHO ../outside.txt",
+            crate::config::ShellFamily::Bash,
+        );
+        assert!(paths.unresolved);
+        let input = serde_json::from_value(
+            serde_json::json!({"command": "Set-Content -Path out.txt '..'"}),
+        )
+        .expect("input");
+        let intent = super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+        assert!(!intent.outside_workspace);
+        assert!(intent.risks.is_empty());
+    }
+
+    #[test]
+    fn literal_roles_keep_family_binding_and_cwd_uncertainty_under_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 fixture");
+        let root = fixture.join("repo");
+        std::fs::create_dir_all(root.join("nested")).expect("root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for command in [
+            "Get-Content -LiteralPath '-dir/../../x=y'",
+            "Get-Content -LiteralPath:'../x=y'",
+        ] {
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command})).expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(intent.outside_workspace, "{command}: {:?}", intent.targets);
+            assert!(
+                intent.targets.iter().any(
+                    |target| crate::workspace::PathGuard::stable_identity_key(target)
+                        == crate::workspace::PathGuard::stable_identity_key(&fixture.join("x=y"))
+                ),
+                "{command}: {:?}",
+                intent.targets
+            );
+        }
+        for command in [
+            "write-output ../outside.txt",
+            "set-content nested/../inside.txt value",
+            "echo \"$(cat ../secret.txt)\"",
+            "echo `cat ../secret.txt`",
+            "alias echo=cat; echo ../secret.txt",
+            "unknown 'data ../outside.txt'",
+        ] {
+            let paths =
+                super::shell_literal_paths(&root, command, crate::config::ShellFamily::Bash);
+            assert!(paths.unresolved, "{command}");
+        }
+        #[cfg(windows)]
+        {
+            let drive = &root.as_str()[..2];
+            let command = format!("Set-Location ..; Get-Content '{drive}..\\secret.txt'");
+            let input =
+                serde_json::from_value(serde_json::json!({"command": command,"workdir":"nested"}))
+                    .expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+            assert!(!intent.targets.contains(&root.join("secret.txt")));
+            let other_drive = if drive.eq_ignore_ascii_case("C:") {
+                "D:"
+            } else {
+                "C:"
+            };
+            let input = serde_json::from_value(
+                serde_json::json!({"command":format!("Get-Content '{other_drive}..\\secret.txt'")}),
+            )
+            .expect("input");
+            let intent =
+                super::shell_permission_intent(&workspace, &config, &input).expect("intent");
+            assert!(
+                intent
+                    .risks
+                    .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+            );
+        }
+    }
+
+    #[test]
+    fn bash_unresolved_move_heads_preserve_review_without_false_move_labels() {
+        use crate::config::ShellFamily;
+        let root = Utf8PathBuf::from(if cfg!(windows) { "C:/repo" } else { "/repo" });
+        for command in [
+            "> out.txt mv source target",
+            "FLAG=1 mv source target",
+            "command mv source target",
+            "env FLAG=1 mv source target",
+            "if true; then mv source target; fi",
+            "for x in a; do mv source target; done",
+            "cp \"$(mv source target)\" result",
+            "$mv source target",
+            "${mv} source target",
+        ] {
+            assert!(
+                super::shell_literal_paths(&root, command, ShellFamily::Bash).unresolved,
+                "unresolved move must retain review: {command}"
+            );
+            assert!(
+                !super::shell_has_move_risk_for_family(command, ShellFamily::Bash),
+                "unconfirmed head: {command}"
+            );
+        }
+        for command in [
+            "echo 'mv source target'",
+            "cat g2.move_player",
+            "> mv echo ready",
+        ] {
+            assert!(
+                !super::shell_has_move_risk_for_family(command, ShellFamily::Bash),
+                "data is not a move head: {command}"
+            );
+            assert!(
+                !super::shell_literal_paths(&root, command, ShellFamily::Bash).unresolved,
+                "literal data: {command}"
+            );
+        }
     }
 
     #[test]
@@ -3096,6 +4873,54 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn windows_shell_machine_name_inheritance_respects_explicit_exclusion_in_both_profiles() {
+        let expected = std::env::var("COMPUTERNAME").expect("Windows machine environment");
+        assert!(!expected.is_empty());
+        std::fs::create_dir_all("target").expect("target directory");
+        let temp = tempfile::Builder::new()
+            .prefix("moyai-shell-environment-")
+            .tempdir_in("target")
+            .expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let plans = [
+            crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+                crate::config::AccessMode::Default,
+                &workspace,
+            )
+            .expect("workspace process profile"),
+            crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+        ];
+        for plan in &plans {
+            for inherit in [true, false] {
+                let mut shell = config.shell.clone();
+                if !inherit {
+                    shell
+                        .env_allowlist
+                        .retain(|name| !name.eq_ignore_ascii_case("COMPUTERNAME"));
+                }
+                let output = super::execute_shell_command(
+                    &shell,
+                    &root,
+                    "[Console]::Out.Write([Environment]::GetEnvironmentVariable('COMPUTERNAME'))",
+                    30_000,
+                    2_048,
+                    CancellationToken::new(),
+                    plan,
+                )
+                .await
+                .expect("shell environment execution");
+                assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
+                assert_eq!(output.stdout, if inherit { expected.as_str() } else { "" });
+                assert!(output.stderr.is_empty(), "{}", output.stderr);
+                assert!(!output.cleanup_failed);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn windows_shell_environment_is_allowlist_only_without_encoding_injection() {
         let config = ResolvedConfig::default();
         let system_root = std::env::var("SystemRoot").expect("SystemRoot");
@@ -3115,6 +4940,32 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).expect("utf8 output");
         assert!(output.status.success());
         assert_eq!(stdout, "|");
+    }
+
+    #[test]
+    fn uri_path_classification_preserves_unicode_boundaries() {
+        let command = "例　C:/temp/file.txt";
+        assert!(!super::shell_path_candidate_is_inside_uri(
+            command,
+            "例　".len(),
+            command.len(),
+        ));
+        let command = "界https://example.com/file";
+        assert!(super::shell_path_candidate_is_inside_uri(
+            command,
+            "界https:".len(),
+            command.len(),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_extraction_accepts_japanese_quoted_argument_data() {
+        let paths = super::extract_absolute_paths(
+            camino::Utf8Path::new("C:/workspace"),
+            "python -c \"print('例　C:/temp/file.txt')\"",
+        );
+        assert_eq!(paths, vec![camino::Utf8PathBuf::from(r"C:\temp\file.txt")]);
     }
 
     #[cfg(windows)]

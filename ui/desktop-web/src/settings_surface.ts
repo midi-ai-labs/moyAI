@@ -2,11 +2,33 @@ import { sameConfigMutationTarget } from "./config_mutation.ts";
 import type { FocusTargetCandidate } from "./focus_arbiter.ts";
 import type { InitialSetupStep } from "./initial_setup_state.ts";
 import type { ConfigMutationTarget, DesktopViewState, DesktopWebState } from "./types.ts";
+import { restoreScrollPosition } from "./scroll_state.ts";
 
 export interface SettingsActionFocusContinuation {
   target: ConfigMutationTarget;
   primaryAction: string;
   fallbackAction: string | null;
+  viewport?: { sourceTarget: ConfigMutationTarget; scrollLeft: number; scrollTop: number };
+}
+
+/** A successful exact-target mutation may carry its viewport across its own config revision. */
+export function restoreSettingsActionViewport(
+  continuation: SettingsActionFocusContinuation | null,
+  previous: DesktopViewState | null,
+  state: DesktopViewState,
+  query: (selector: string) => HTMLElement | null,
+): boolean {
+  const viewport = continuation?.viewport;
+  if (!continuation || !viewport || !previous || !settingsActionFocusStillTargets(continuation, state)
+    || previous.overlay !== "config" || previous.confirmation_visible
+    || viewport.sourceTarget.workspacePath !== continuation.target.workspacePath
+    || viewport.sourceTarget.sessionId !== continuation.target.sessionId
+    || (!sameConfigMutationTarget(viewport.sourceTarget, previous.config_target)
+      && !sameConfigMutationTarget(continuation.target, previous.config_target))) return false;
+  const content = query(".settings-modal .settings-content");
+  if (!content) return false;
+  restoreScrollPosition(content, viewport.scrollLeft, viewport.scrollTop);
+  return true;
 }
 
 const SETTINGS_SECTION_FRAGMENT = /^#(settings-[A-Za-z0-9_-]+)$/;
@@ -34,7 +56,10 @@ export function activateSettingsSectionNavigation(anchor: HTMLAnchorElement): bo
     || !content.contains(section)
   ) return false;
 
-  section.scrollIntoView({ block: "start", inline: "nearest" });
+  // A dirty field's blur can defer a render until this click ends. Finish explicit
+  // navigation before that render captures/restores the connected form's viewport;
+  // CSS smooth scrolling would otherwise be cancelled at its old position.
+  section.scrollIntoView({ behavior: "instant", block: "start", inline: "nearest" });
   const editor = Array.from(
     section.querySelectorAll<HTMLElement>(".settings-control, .desktop-preference-control"),
   ).find(settingsNavigationEditorIsAvailable);
@@ -104,6 +129,7 @@ function settingsFocusTargetDisabled(target: HTMLElement): boolean {
 /**
  * Identifies the Settings form subtree that owns in-progress browser interaction.
  * Global config values are intentionally excluded: the live input nodes own unsaved edits.
+ * Temporary edit availability is synchronized on those nodes, not a new form owner.
  * Runtime Side Chat state is a different owner and must not replace a focused Global Settings
  * editor. The explicitly loaded model catalog is synchronized onto the connected controls.
  */
@@ -112,6 +138,8 @@ export function settingsSurfaceIdentity(
   initialSetupStep?: InitialSetupStep,
 ): string | null {
   if (!state || state.confirmation_visible) return null;
+  if (state.overlay === "hub") return "hub:application";
+  if (state.overlay === "mcp_history") return "mcp-history:application";
   if (state.overlay === "initial_setup") {
     const target = state.startup.setup_target;
     if (!state.startup.initial_setup_required || target === null || initialSetupStep === undefined) {
@@ -140,7 +168,6 @@ export function settingsSurfaceIdentity(
     sessionId: state.config_target.sessionId,
     configGeneration: state.config_target.configGeneration,
     initialSetup: state.startup.initial_setup_required,
-    editEnabled: state.config_draft.edit_enabled,
     fields: state.config_fields.map((field) => ({
       key: field.key,
       envOverride: field.env_override,
@@ -228,7 +255,11 @@ export function synchronizeRetainedSettingsSurface(
     current.hidden = next.hidden;
     synchronizeRetainedAvailabilityAnnotation(current, next, "aria-busy");
     synchronizeRetainedAvailabilityAnnotation(current, next, "aria-haspopup");
-    if (synchronizeValues) {
+    synchronizeRetainedAvailabilityAnnotation(current, next, "aria-pressed");
+    synchronizeRetainedAvailabilityAnnotation(current, next, "aria-checked");
+    synchronizeRetainedAvailabilityAnnotation(current, next, "aria-label");
+    synchronizeRetainedAvailabilityAnnotation(current, next, "aria-describedby");
+    if (synchronizeValues && !current.hasAttribute("data-settings-dom-value")) {
       synchronizeRetainedControlValue(current, next);
       synchronizeRetainedAvailabilityAnnotation(current, next, "aria-invalid");
     }
@@ -267,18 +298,26 @@ function synchronizeRetainedPassiveRegions(
   nextModal.querySelectorAll<HTMLElement>("[data-settings-passive]").forEach((next) => {
     const identity = next.dataset.settingsPassive ?? "";
     const current = currentRegions.get(identity);
-    if (
-      identity
-      && current
-      && !(
-        current.hasAttribute("data-settings-preserve-focused-region")
-        && current.contains(current.ownerDocument.activeElement)
-      )
-    ) current.replaceWith(next);
+    // An earlier parent replacement already includes its fresh descendants. The
+    // static query results must not move those descendants into the detached old parent.
+    if (!identity || !current || !currentModal.contains(current)) return;
+    if (current.hasAttribute("data-settings-preserve-focused-region")
+      && current.contains(current.ownerDocument.activeElement)) return;
+    const currentDetails = new Map(Array.from(
+      current.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"),
+      (detail) => [detail.dataset.detailsKey, detail.open] as const,
+    ));
+    for (const detail of next.querySelectorAll<HTMLDetailsElement>("details[data-details-key]")) {
+      const open = currentDetails.get(detail.dataset.detailsKey);
+      if (open !== undefined) detail.open = open;
+    }
+    // Browser-owned disclosure state is not new projection content. Equal polls
+    // retain the complete subtree, including selection and scroll containers.
+    if (!current.isEqualNode(next)) current.replaceWith(next);
   });
 }
 
-function synchronizeRetainedControlValue(
+export function synchronizeRetainedControlValue(
   current: SettingsSurfaceControl,
   next: SettingsSurfaceControl,
 ): void {

@@ -199,6 +199,7 @@ export async function executeDesktopScenario({ context, scenario, host, sink, no
         driver,
         host,
         inputs: structuredClone(inputs),
+        cleanup: structuredClone(cleanup),
         phase: "cleaning",
       });
       if (outcome?.input !== "pass" && outcome?.input !== "fail") {

@@ -1,4 +1,8 @@
 import { command } from "./api.ts";
+import { clearHubError, editHubField } from "./hub_state.ts";
+import { editDeviceNetworkField } from "./device_network_state.ts";
+import { editSharedWork } from "./shared_work_state.ts";
+import { editMcpPeerField } from "./mcp_peer.ts";
 import {
   actionEnabledById,
   dispatchAction,
@@ -8,6 +12,7 @@ import {
 } from "./actions.ts";
 import {
   configDraftAppliesTo,
+  configCommandValues,
   configMutationValues,
   reconcileConfigDraftTarget,
   type ConfigValueInput,
@@ -215,7 +220,7 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         trapDialogFocus(event);
       } else if (event.key === "Escape" && currentState.confirmation_visible) {
         event.preventDefault();
-        if (permissionDecisionForEscape(currentState.confirmation_visible, event.repeat) === "abort") {
+        if (permissionDecisionForEscape(currentState.confirmation_visible, event.repeat, Boolean(currentState.confirmation?.remote)) === "abort") {
           void dispatchAction("abort-permission", context, { index: -1, value: "" });
         }
       } else if (event.key === "Escape" && context.uiState.pendingLocalConfirmation) {
@@ -229,7 +234,13 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         if (!startupSetupRequired(currentState)) dismissOverlayForState(currentState, context);
       } else if (modalShortcutShouldPreventDefault(
         event,
-        isRegularModalOverlay(currentState.overlay) && isNativeTextEditingTarget(target),
+        isRegularModalOverlay(currentState.overlay) && (
+          isNativeTextEditingTarget(target)
+          || (event.key.toLowerCase() === "c"
+            && !currentState.confirmation_visible
+            && activeLocalModalIdentity === null
+            && nativeModalCopySelectionAvailable(target))
+        ),
       )) {
         event.preventDefault();
       }
@@ -355,6 +366,21 @@ function isNativeTextEditingTarget(target: EventTarget | null): boolean {
   return target.closest('[contenteditable="true"], [contenteditable="plaintext-only"]') !== null;
 }
 
+function nativeModalCopySelectionAvailable(target: EventTarget | null): boolean {
+  if (!(target instanceof Element) || !target.isConnected) return false;
+  const modal = target.closest('[data-modal][role="dialog"]');
+  if (!modal) return false;
+  if (target instanceof HTMLTextAreaElement) return !target.disabled;
+  if (target instanceof HTMLInputElement) {
+    return !target.disabled && !NON_TEXT_INPUT_TYPES.has(target.type.toLowerCase());
+  }
+  // Read-only text such as the original prompt uses the document's native selection,
+  // even when focus stays on the containing dialog rather than an editable control.
+  const selection = target.ownerDocument.getSelection();
+  return selection !== null && selection.rangeCount > 0 && !selection.isCollapsed
+    && modal.contains(selection.anchorNode) && modal.contains(selection.focusNode);
+}
+
 /**
  * Keeps Select All owned by the current Settings editor even when WebView2 temporarily routes
  * the native Ctrl+A default action to the document while a Tauri command is pending. The current
@@ -421,12 +447,12 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
         if (enhance) {
           synchronizeActionButtonAvailability(enhance, context);
           const title = projection.navigation_loading
-            ? "画面の切り替え完了後にEnhanceできます"
+            ? "画面の切り替え後に依頼文を整えられます"
             : projection.busy
-              ? "実行中はEnhanceできません"
+              ? "依頼文を整える操作は、実行が終わってから使えます"
             : text.trim().length === 0
               ? "依頼文を入力してください"
-              : "Enhance";
+              : "依頼文を整える";
           enhance.title = title;
           enhance.setAttribute("aria-label", title);
         }
@@ -469,7 +495,12 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     if (
       normalizeProviderBaseUrl(next)
       !== normalizeProviderBaseUrl(context.uiState.drafts.provider.baseUrl)
-    ) context.uiState.drafts.providerCatalogIdentityRevision += 1;
+    ) {
+      context.uiState.drafts.providerCatalogIdentityRevision += 1;
+      context.uiState.drafts.provider.apiKeyEnv = "";
+      const credential = document.querySelector<HTMLInputElement>("#provider-api-key-env");
+      if (credential) credential.value = "";
+    }
     context.uiState.drafts.provider.baseUrl = next;
     context.uiState.drafts.providerRevision += 1;
     updateProviderActionButtons(context);
@@ -479,6 +510,9 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     if (!isProviderProfile(next)) return;
     if (context.uiState.drafts.provider.providerProfile !== next) {
       context.uiState.drafts.providerCatalogIdentityRevision += 1;
+      context.uiState.drafts.provider.apiKeyEnv = "";
+      const credential = document.querySelector<HTMLInputElement>("#provider-api-key-env");
+      if (credential) credential.value = "";
     }
     context.uiState.drafts.provider.providerProfile = next;
     context.uiState.drafts.providerRevision += 1;
@@ -568,6 +602,15 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
   }
 }
 
+function actionPayloadValue(node: HTMLElement): string {
+  return node.dataset.agentPath
+    ?? node.dataset.historyTarget
+    ?? node.dataset.providerProfile
+    ?? node.dataset.mode
+    ?? node.dataset.value
+    ?? "";
+}
+
 function installDelegatedActionEvents(context: ActionContext): void {
   if (delegatedEventsInstalled) return;
   delegatedEventsInstalled = true;
@@ -624,6 +667,31 @@ function installDelegatedActionEvents(context: ActionContext): void {
     ) {
       return;
     }
+    if (target.dataset.mcpPeerField !== undefined) {
+      if (context.getViewState()?.overlay !== "config") return;
+      editMcpPeerField(context.uiState.mcpPeers, target.dataset.mcpPeerField, target.value);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.sharedField !== undefined) {
+      if (context.getViewState()?.hub_project_open !== true) return;
+      editSharedWork(context.uiState.sharedWork, target.dataset.sharedField, target.value);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.networkField !== undefined) {
+      if (!["hub", "config"].includes(context.getViewState()?.overlay ?? "")) return;
+      editDeviceNetworkField(context.uiState.deviceNetwork, target.dataset.networkField, target.value, target instanceof HTMLInputElement && target.checked);
+      context.rerender();
+      return;
+    }
+    if (target.dataset.hubField !== undefined) {
+      if (!["hub", "config"].includes(context.getViewState()?.overlay ?? "")) return;
+      editHubField(context.uiState.hub, target.dataset.hubField ?? "", target.value, target instanceof HTMLInputElement && target.checked);
+      clearHubError(context.uiState.hub);
+      context.rerender();
+      return;
+    }
     if (target.matches(".session-settings-control")) {
       const currentState = context.getViewState();
       const currentTarget = currentState?.session_settings.target ?? null;
@@ -656,6 +724,10 @@ function installDelegatedActionEvents(context: ActionContext): void {
       if (target.dataset.configKey?.startsWith("side_chat.")) {
         synchronizeSideChatCatalogControls(currentState, context, configDraftEditOpen(context.uiState));
       }
+      if (target.dataset.configKey?.startsWith("model.")) {
+        // Keep the connected URL input, but retire options belonging to its previous target.
+        context.rerender();
+      }
     }
     if (event.type === "change" && target.dataset.configKey === "docling.enabled") {
       context.rerender();
@@ -663,6 +735,12 @@ function installDelegatedActionEvents(context: ActionContext): void {
   };
   document.addEventListener("input", updateSettingsControl);
   document.addEventListener("change", updateSettingsControl);
+  document.addEventListener("focusout", (event) => {
+    if (event.target instanceof Element && event.target.closest(".hub-modal")) {
+      // Apply a deferred passive model-list refresh only after the user leaves its controls.
+      queueMicrotask(() => { if (context.getViewState()?.overlay === "hub") context.rerender(); });
+    }
+  });
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
@@ -714,11 +792,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
       action,
     );
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath
-      ?? node.dataset.historyTarget
-      ?? node.dataset.providerProfile
-      ?? node.dataset.mode
-      ?? "";
+    const value = actionPayloadValue(node);
     const capturedSideChatQuote = action === "quote-selection-to-side-chat"
       ? sideChatPointerQuotes.get(node) ?? null
       : null;
@@ -781,7 +855,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     event.stopPropagation();
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
+    const value = actionPayloadValue(node);
     void dispatchAction(action, context, { index, value }).catch((error) => context.reportError(error));
   });
   document.addEventListener("pointerdown", (event) => {
@@ -980,6 +1054,9 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
     const target = entry.target;
     const generation = entry.generation;
     entry.args = null;
+    // A debounce can outlive its palette or navigation owner. Reject it before IPC;
+    // ignoring the eventual receipt cannot undo a stale command's backend status.
+    if (!searchTargetStillMatches(key, target, context)) continue;
     const settlementOwner = (): TextMutationSettlementOwner => ({
       hasQueuedValue: entry.args !== null,
       currentGeneration: entry.generation,
@@ -1017,7 +1094,7 @@ function searchTargetStillMatches(key: string, target: string, context: ActionCo
   if (!state) return false;
   return key === "session-search"
     ? sessionSearchOwner(state) === target
-    : localSearchOwner(state) === target;
+    : state.overlay === "command_palette" && localSearchOwner(state) === target;
 }
 
 function updateProviderActionButtons(context: ActionContext): void {
@@ -1027,7 +1104,14 @@ function updateProviderActionButtons(context: ActionContext): void {
     .querySelectorAll<HTMLButtonElement>('[data-action="apply-provider-session"], [data-action="save-provider-global"]')
     .forEach((button) => synchronizeActionButtonAvailability(button, context));
   const view = context.getViewState();
-  if (view) synchronizeProviderOverlayFeedback(view);
+  if (view) {
+    synchronizeProviderOverlayFeedback(view);
+    document.querySelectorAll<HTMLButtonElement>('[data-action="select-provider-model"]').forEach((button) => {
+      const index = Number(button.dataset.index);
+      button.hidden = view.provider_model_ids[index] === undefined;
+      synchronizeActionButtonAvailability(button, context);
+    });
+  }
 }
 
 export function textMutationSettlementOwnerIsCurrent(
@@ -1082,7 +1166,7 @@ function synchronizeActionButtonAvailability(
   const model = context.getRenderModel();
   const payload: ActionPayload = {
     index: Number(button.dataset.index ?? "-1"),
-    value: button.dataset.agentPath ?? button.dataset.historyTarget ?? button.dataset.mode ?? "",
+    value: actionPayloadValue(button),
   };
   button.disabled = !model || !actionEnabledById(action, model, payload);
   button.setAttribute("aria-disabled", String(button.disabled));
@@ -1097,7 +1181,7 @@ export function prepareConfigMutation(
   if (!currentState) return null;
   const values = prepareConfigSnapshot(context, target);
   if (!values || !validateConfigValues(values, currentState.config_fields, true)) return null;
-  return values;
+  return configCommandValues(context.uiState, target, values);
 }
 
 export function prepareConfigSnapshot(
@@ -1159,7 +1243,7 @@ function synchronizeProviderModelControls(source: SettingsControl): void {
     if (control instanceof HTMLSelectElement) {
       control.querySelectorAll<HTMLOptionElement>("option[data-manual-option]").forEach((option) => option.remove());
       const existing = Array.from(control.options).some((option) => option.value === value);
-      if (!existing && value.length > 0) {
+      if (!existing && value.length > 0 && !source.matches("[data-main-provider-model-control]")) {
         const option = document.createElement("option");
         option.value = value;
         option.textContent = `${value}（手入力）`;
@@ -1184,7 +1268,6 @@ function validateSettingsForm(
     const key = control.dataset.configKey ?? "";
     return key ? [{ key, text: settingsControlValue(control) }] : [];
   });
-  const formValidation = validateConfigFieldValues(fields, values);
   const initialSetup = document.querySelector("[data-surface='initial-setup']") !== null;
   const currentValues = context.getViewState()?.config_fields.map((field) => ({
     key: field.key,
@@ -1196,13 +1279,16 @@ function validateSettingsForm(
       fields,
       currentValues,
     )
-    : formValidation;
+    : validateConfigFieldValues(fields, currentValues);
   for (const control of controls) {
     const key = control.dataset.configKey ?? "";
     if (!key) continue;
     const field = fields.find((candidate) => candidate.key === key);
     if (!field) continue;
-    const result = validateConfigInput(field, settingsControlValue(control), currentValues);
+    const value = control.matches("select[data-main-provider-model-control]")
+      ? currentValues.find((entry) => entry.key === key)?.text ?? ""
+      : settingsControlValue(control);
+    const result = validateConfigInput(field, value, currentValues);
     if (result.ok) control.removeAttribute("aria-invalid");
     else control.setAttribute("aria-invalid", "true");
   }
@@ -1211,7 +1297,7 @@ function validateSettingsForm(
       ? initialSetup
         ? "入力形式は問題ありません。"
         : context.uiState.configDirty
-          ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+          ? "未保存の設定があります。適用、保存、または変更を破棄してから別画面の設定を変更できます。"
           : "入力形式は問題ありません。"
       : `${visibleValidation.invalidKey}: ${visibleValidation.message}`;
     validation.classList.toggle("ok", visibleValidation.ok);
@@ -1294,7 +1380,7 @@ function updateSessionSettingsControls(
   const status = document.querySelector<HTMLElement>("#session-settings-status");
   if (status) {
     status.textContent = local.activeMutation
-      ? "Session Settingsを適用しています…"
+      ? "チャットの設定を適用しています…"
       : availability.reason;
     status.classList.toggle("ok", validation?.ok !== false && (availability.enabled || !local.dirty));
     status.classList.toggle("error", validation?.ok === false);
@@ -1355,7 +1441,7 @@ function synchronizeSideChatCatalogControls(
       key: field.key,
       text: field.value,
     })))
-    : { ok: false, message: "Side ChatのLLM URL設定が見つかりません。" };
+    : { ok: false, message: "サイドチャットの接続先URL設定が見つかりません。" };
   const options = sideChatModelOptions(catalog, model);
   const select = document.querySelector<HTMLSelectElement>("#side-chat-model");
   if (select) {
@@ -1507,9 +1593,12 @@ export function focusOverlayPrimary(
   const focusSelectors = confirmationOverlay
     ? confirmationFocusSelectors(confirmationPending)
     : selectors;
+  const titlebarPopup = titlebarMenuFromOverlay(overlayKey) !== null;
   return {
-    source: "modal-primary",
-    priority: "modal-containment",
+    source: titlebarPopup ? "titlebar-menu" : "modal-primary",
+    // Menu entry is a fallback after rerender: an exact action/range snapshot must keep
+    // ownership. Actual modal entry retains priority over every background continuation.
+    priority: titlebarPopup ? "fallback" : "modal-containment",
     claim: { kind: "force" },
     candidates: focusSelectors.map((selector) => ({
       resolve: () => document.querySelector<HTMLElement>(selector),

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ManualObservationBudget } from "../core/deadline.mjs";
 
 import {
   case52Stage5ActiveContextMatches,
@@ -39,6 +40,7 @@ function surface({
   contextScope = "owner_session",
   appendPosition = "194",
   canonicalExtraRows = [],
+  apiKeyEnv = "",
 } = {}) {
   const sideMessages = messages.map((message) => ({ ...message }));
   const domMessages = (renderedMessages ?? messages).map((message) => ({ ...message }));
@@ -74,6 +76,7 @@ function surface({
         draft_revision: draftRevision,
         context_as_of_append_position: appendPosition,
         provider_profile: PROFILE,
+        api_key_env: apiKeyEnv,
         base_url: BASE_URL,
         model: MODEL,
         status,
@@ -104,7 +107,7 @@ function surface({
       prompt_enabled: true,
       send_visible: paneVisible,
       send_enabled: paneVisible && ["idle", "completed"].includes(status) && draft !== "",
-      stop_visible: paneVisible,
+      stop_visible: paneVisible && status === "running",
       stop_enabled: paneVisible && status === "running",
       metadata: ["参照: このタスクの履歴", "履歴位置: 194"],
       truncated_count: contextTruncated ? 1 : 0,
@@ -144,7 +147,7 @@ function completedTerminalSurface({ staleDom = false, answer = ANSWER } = {}) {
   return completed;
 }
 
-function terminalDomExecution(observeTerminal, { timeoutMs = 20_000 } = {}) {
+function terminalDomExecution(observeTerminal, { timeoutMs = 20_000, observationBudgetFactory = null } = {}) {
   const state = {
     phase: "ready",
     now: 1_000,
@@ -153,10 +156,12 @@ function terminalDomExecution(observeTerminal, { timeoutMs = 20_000 } = {}) {
     observations: 0,
     removed: false,
   };
+  const observationBudget = observationBudgetFactory?.(state) ?? null;
   const run = () => executeCase52SideChatStage({
     cdp: {}, input: {}, sink: { async record() {}, async writeJson() { return {}; } },
     sessionId: SESSION, providerProfile: PROFILE, providerBaseUrl: BASE_URL, model: MODEL,
-    promptInput: { text: QUESTION }, timeoutMs,
+    promptInput: { text: QUESTION }, timeoutMs: observationBudget === null ? timeoutMs : Math.max(1, observationBudget.remainingMs()),
+    observationBudget,
   }, {
     now: () => state.now,
     sleep: async (milliseconds) => {
@@ -175,7 +180,8 @@ function terminalDomExecution(observeTerminal, { timeoutMs = 20_000 } = {}) {
       assert.equal(await accept(value), true);
       return { value };
     },
-    click: async (_input, locator) => {
+    click: async (_input, locator, acquisitionOptions) => {
+      acquisitionOptions?.beforeDispatch?.();
       if (locator.identity.action === "send-side-chat") {
         state.phase = "terminal";
         state.calls.push({
@@ -217,6 +223,21 @@ test("Stage5 readiness fixes the exact selected Main owner and one empty configu
   const main = case52Stage5MainSnapshot(current);
   assert.equal(case52Stage5MainMatches(current, main), true);
   assert.equal(case52Stage5Ready(current, readyExpected(main)), true);
+});
+
+test("Stage5 readiness and terminal retain the explicitly selected credential reference", () => {
+  const initial = surface({ apiKeyEnv: "SIDE_TEST_KEY" });
+  const main = case52Stage5MainSnapshot(initial);
+  const expected = { ...readyExpected(main), api_key_env: "SIDE_TEST_KEY" };
+  assert.equal(case52Stage5Ready(initial, expected), true);
+  assert.equal(case52Stage5Ready(initial, { ...expected, api_key_env: "OTHER_KEY" }), false);
+  const completed = surface({ apiKeyEnv: "SIDE_TEST_KEY", status: "completed", generation: "1", messages: [
+    { id: "side-user", role: "user", content: QUESTION },
+    { id: "side-assistant", role: "assistant", content: ANSWER },
+  ] });
+  const terminalExpected = { ...expected, chat_id: CHAT, generation: "0", question: QUESTION, context_as_of_append_position: "194" };
+  assert.equal(case52Stage5TerminalMatches(completed, terminalExpected), true);
+  assert.equal(case52Stage5TerminalMatches(completed, { ...terminalExpected, api_key_env: "OTHER_KEY" }), false);
 });
 
 test("Stage5 readiness rejects non-empty or cross-session Side state and any Main drift", async (t) => {
@@ -299,6 +320,8 @@ test("Stage5 terminal rejects changed question, empty answer, control tokens, er
   ];
   const staleFinalControls = surface({ status: "completed", generation: "1", messages: messages() });
   staleFinalControls.side.stop_enabled = true;
+  const obsoleteStopControl = surface({ status: "completed", generation: "1", messages: messages() });
+  obsoleteStopControl.side.stop_visible = true;
   const variants = [
     ["unchanged generation", surface({ status: "completed", messages: messages() })],
     ["changed question", surface({ status: "completed", generation: "1", messages: messages(ANSWER, "other") })],
@@ -318,6 +341,7 @@ test("Stage5 terminal rejects changed question, empty answer, control tokens, er
       ],
     })],
     ["stale final controls", staleFinalControls],
+    ["obsolete visible Stop after completion", obsoleteStopControl],
     ["changed Main", surface({ status: "completed", generation: "1", messages: messages(), mainDraft: "replaced" })],
   ];
   for (const [name, candidate] of variants) {
@@ -728,6 +752,61 @@ test("executeCase52SideChatStage waits for bounded Side DOM settlement after can
   assert.deepEqual(state.sleeps, [500, 500]);
   assert.equal(state.observations, 3);
   assert.equal(state.removed, true);
+});
+
+test("Stage5 consumes the remaining case budget without restarting it after earlier stages", async () => {
+  let budget;
+  const { run, state } = terminalDomExecution(() => completedTerminalSurface({ staleDom: true }), {
+    observationBudgetFactory: (current) => {
+      budget = new ManualObservationBudget({ timeoutMs: 1_800, now: () => current.now });
+      current.now = 0;
+      budget.beginOnce();
+      current.now = 1_000;
+      return budget;
+    },
+  });
+  await assert.rejects(run, (error) => error.code === "manual-observation-timeout");
+  assert.deepEqual(state.sleeps, [500, 300]);
+  assert.equal(budget.snapshot().deadline_ms, 1_800);
+  assert.equal(state.now, 1_800);
+  assert.equal(state.calls.length, 1);
+  assert.equal(state.removed, true);
+});
+
+test("an explicit case budget permits Stage5 observation beyond 120 minutes", async () => {
+  const { run, state } = terminalDomExecution((_index, current) => {
+    current.now = 10_801_000;
+    return completedTerminalSurface();
+  }, {
+    observationBudgetFactory: (current) => {
+      const budget = new ManualObservationBudget({ timeoutMs: 43_200_000, now: () => current.now });
+      current.now = 0;
+      budget.beginOnce();
+      current.now = 1_000;
+      return budget;
+    },
+  });
+  const result = await run();
+  assert.equal(result.answer, ANSWER);
+  assert.equal(state.now, 10_801_000);
+  assert.equal(state.calls.length, 1);
+  assert.equal(state.removed, true);
+});
+
+test("an exhausted case budget rejects Stage5 before a Side request or probe is created", async () => {
+  const { run, state } = terminalDomExecution(() => completedTerminalSurface(), {
+    observationBudgetFactory: (current) => {
+      const budget = new ManualObservationBudget({ timeoutMs: 1_000, now: () => current.now });
+      current.now = 0;
+      budget.beginOnce();
+      current.now = 1_000;
+      return budget;
+    },
+  });
+  await assert.rejects(run, (error) => error.code === "manual-observation-timeout");
+  assert.deepEqual(state.calls, []);
+  assert.deepEqual(state.sleeps, []);
+  assert.equal(state.removed, false);
 });
 
 test("executeCase52SideChatStage bounds a persistent completed-canonical Side DOM mismatch", async () => {

@@ -1,5 +1,6 @@
 import {
   configDraftAppliesTo,
+  configCommandValues,
   configMutationPending,
   reconcileConfigDraftTarget,
   type ConfigValueInput,
@@ -405,8 +406,9 @@ export function synchronizeInitialSetupProviderDraft(
   state: DesktopWebState,
   uiState: UiLocalState,
 ): boolean {
-  if (!state.startup.initial_setup_required || state.overlay !== "initial_setup") return false;
-  const next = providerDraftFromConfigFields(state.config_fields, uiState.drafts.provider);
+  if (state.overlay !== "config"
+    && (!state.startup.initial_setup_required || state.overlay !== "initial_setup")) return false;
+  const next = providerDraftForCurrentSurface(state, uiState);
   if (sameProviderDraft(next, uiState.drafts.provider)) return false;
   const catalogIdentityChanged = !sameProviderCatalogIdentity(next, uiState.drafts.provider);
   uiState.drafts.provider = next;
@@ -673,11 +675,14 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
   const providerTargetChangedDuringLoad = providerCatalogTargetChangedDuringLoad(state, uiState);
   const providerCompletionRejected = uiState.rejectedProviderCatalogRequest !== null;
   const providerCatalogMismatch = state.provider_catalog_base_url !== null && !providerCatalogAccepted;
-  const providerStatus = providerTargetChangedDuringLoad || providerCompletionRejected || providerCatalogMismatch
+  const providerFailureTargetChanged = state.provider_status.kind === "error"
+    && uiState.providerCatalogRevision !== null
+    && uiState.providerCatalogRevision !== uiState.drafts.providerCatalogIdentityRevision;
+  const providerStatus = providerTargetChangedDuringLoad || providerCompletionRejected || providerCatalogMismatch || providerFailureTargetChanged
     ? {
       kind: "warning" as const,
       title: "モデル一覧の対象が変更されました",
-      hint: "現在のBase URLとConnection typeで、もう一度モデル一覧を読み込んでください。",
+      hint: "現在の接続先URLと接続方式で、もう一度モデル一覧を読み込んでください。",
       details: "編集中の接続先と一致しないモデル一覧は表示・適用されません。",
     }
     : state.provider_status;
@@ -791,10 +796,19 @@ function providerDraftForCurrentSurface(
   state: DesktopWebState,
   uiState: UiLocalState,
 ): ProviderDraft {
-  if (!state.startup.initial_setup_required || state.overlay !== "initial_setup") {
+  if (state.overlay !== "config"
+    && (!state.startup.initial_setup_required || state.overlay !== "initial_setup")) {
     return uiState.drafts.provider;
   }
-  return providerDraftFromConfigFields(activeConfigFields(state, uiState), uiState.drafts.provider);
+  const fields = activeConfigFields(state, uiState);
+  const draft = providerDraftFromConfigFields(fields, uiState.drafts.provider);
+  const baselineUrl = uiState.configDraftBaselineValues.get("model.base_url") ?? state.provider_effective_base_url;
+  const baselineProfile = uiState.configDraftBaselineValues.get("model.provider_profile") ?? state.provider_effective_profile;
+  const connectionChanged = normalizeProviderBaseUrl(draft.baseUrl) !== normalizeProviderBaseUrl(baselineUrl)
+    || draft.providerProfile !== baselineProfile;
+  const values = configCommandValues(uiState, state.config_target, fields.map(field => ({ key: field.key, text: field.value })));
+  if (connectionChanged && !values.some(value => value.key === "model.api_key_env")) draft.apiKeyEnv = "";
+  return draft;
 }
 
 function providerDraftFromConfigFields(

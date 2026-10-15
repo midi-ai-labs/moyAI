@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { waitForObservation } from "../core/deadline.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
 import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
@@ -17,15 +18,15 @@ const OWNER = "scenario:provider.restart";
 export const PROVIDER_RESTART_PROMPT = "return only main-ok";
 export const RESTORED_STATE_STABILITY_MS = 500;
 const SHOW_PROVIDER = Object.freeze({
-  selector: 'aside.sidebar button[data-action="show-provider"][title="LLM URL"]',
+  selector: 'header.topbar button[data-action="show-provider"]',
   identity: { tag: "BUTTON", action: "show-provider" },
 });
 const LOAD_MODELS = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="load-provider-models"]',
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] #settings-provider button[data-action="load-provider-models"]',
   identity: { tag: "BUTTON", action: "load-provider-models" },
 });
 const CLOSE_PROVIDER = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="close-overlay"]',
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]',
   identity: { tag: "BUTTON", action: "close-overlay" },
 });
 const PROMPT_TARGET = Object.freeze({
@@ -259,8 +260,25 @@ export async function observeProviderTurnSurface(cdp) {
     }));
     const prompt = document.querySelector('textarea#prompt');
     const send = document.querySelector('button[data-action="send"]');
+    const composer = document.querySelector('section.composer');
+    let composerRunTarget = null;
+    try { composerRunTarget = JSON.parse(composer?.getAttribute('data-run-target') ?? 'null'); }
+    catch { composerRunTarget = { parse_error: true }; }
+    const usage = composer?.querySelector('.session-usage') ?? null;
     return {
       projection,
+      composer: {
+        count: document.querySelectorAll('section.composer').length,
+        visible: visible(composer),
+        run_target: composerRunTarget,
+      },
+      session_usage: {
+        count: document.querySelectorAll('section.composer .session-usage').length,
+        visible: visible(usage),
+        text: usage ? (usage.querySelector('span:not([aria-hidden="true"])')?.innerText ?? '').trim() : null,
+        title: usage?.getAttribute('title') ?? null,
+        state: usage ? Array.from(usage.classList).filter(name => name !== 'session-usage').join(' ') : null,
+      },
       thread_count: document.querySelectorAll('main.conversation #thread').length,
       users: rows('main.conversation #thread article.message.user'),
       assistants: rows('main.conversation #thread article.message.assistant'),
@@ -284,6 +302,26 @@ export async function observeProviderTurnSurface(cdp) {
       visible_modal_backdrop_count: Array.from(document.querySelectorAll('.modal-backdrop')).filter(visible).length,
     };
   })()`);
+}
+
+export function providerRenderedTerminalFailures(surface) {
+  const projection = surface?.projection;
+  const failures = [];
+  const compare = (field, expected, actual) => {
+    if (!isDeepStrictEqual(expected, actual)) failures.push({ field, expected, actual: actual ?? null });
+  };
+  compare("composer.count", 1, surface?.composer?.count);
+  compare("composer.visible", true, surface?.composer?.visible);
+  compare("composer.run_target", projection?.run_target, surface?.composer?.run_target);
+  const label = projection?.session_usage_label?.trim() ?? "";
+  compare("session_usage.count", label ? 1 : 0, surface?.session_usage?.count);
+  if (label) {
+    compare("session_usage.visible", true, surface?.session_usage?.visible);
+    compare("session_usage.text", label, surface?.session_usage?.text);
+    compare("session_usage.title", projection?.session_usage_title ?? "", surface?.session_usage?.title);
+    compare("session_usage.state", projection?.session_usage_state?.trim() || "missing", surface?.session_usage?.state);
+  }
+  return failures;
 }
 
 function exactIdentityForKind(history, kind) {
@@ -539,7 +577,7 @@ export function createProviderRestartScenario() {
           label: "provider overlay after trusted activation",
           timeoutMs: 10_000,
           sample: () => invokeDesktopProjection(firstCdp),
-          decide: (projection) => projection?.overlay === "provider" && projection?.provider_loading === false ? "pass" : "pending",
+          decide: (projection) => projection?.overlay === "config" && projection?.provider_loading === false ? "pass" : "pending",
           code: "provider-overlay-did-not-open",
           message: "trusted provider activation did not open the provider surface",
         });

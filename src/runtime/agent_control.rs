@@ -543,6 +543,7 @@ impl AgentControl {
         }
 
         let root_turn_control = RunControl::new();
+        root_turn_control.inherit_effect_authority(&root_scope_control);
         let (activity_tx, _) = watch::channel(0);
         let (mailbox_activity_tx, _) = watch::channel(0);
         let root = AgentPath::root();
@@ -716,6 +717,7 @@ impl AgentControl {
         }
         let run_control = RunControl::new();
         let mut state = self.lock()?;
+        run_control.inherit_effect_authority(&state.root_scope_control);
         if state.root_scope_control.is_cancelled() {
             return Err(AgentControlError::TreeCancelled);
         }
@@ -786,6 +788,7 @@ impl AgentControl {
             return Err(AgentControlError::TreeCancelled);
         }
         let root_turn_control = RunControl::new();
+        root_turn_control.inherit_effect_authority(&root_scope_control);
         self.install_root_terminal_router(&root_scope_control)?;
         self.install_root_terminal_router(&root_turn_control)?;
         if root_scope_control.is_cancelled() {
@@ -841,6 +844,7 @@ impl AgentControl {
         }
         let run_control = RunControl::new();
         self.install_root_terminal_router(&run_control)?;
+        run_control.inherit_effect_authority(&state.root_scope_control);
         let marker = Arc::new(());
         let root = state
             .agents
@@ -938,6 +942,7 @@ impl AgentControl {
         };
         let run_control = RunControl::new();
         let (mailbox_activity_tx, _) = watch::channel(0);
+        run_control.inherit_effect_authority(&state.root_scope_control);
         let awaiting_deferred_turn_id = match &status {
             InactiveAgentStatus::AwaitingDescendants(turn_id) => Some(*turn_id),
             _ => None,
@@ -1715,7 +1720,11 @@ impl AgentControl {
                 return Err(AgentControlError::StaleExecution(path.clone()));
             }
             agent.run_control.supersede();
+            let previous_control = agent.run_control.clone();
             agent.run_control = RunControl::new();
+            agent
+                .run_control
+                .inherit_effect_authority(&previous_control);
             for notice in &mut agent.mailbox {
                 if notice.trigger_turn {
                     notice.schedule_ready = false;
@@ -2685,6 +2694,7 @@ impl AgentControl {
                 .expect("a scheduled agent must retain one durable wake owner");
             let marker = Arc::new(());
             let run_control = RunControl::new();
+            run_control.inherit_effect_authority(&state.root_scope_control);
             let agent = state
                 .agents
                 .get_mut(&path)
@@ -2937,6 +2947,7 @@ fn insert_child_locked(
     };
     let marker = Arc::new(());
     let run_control = RunControl::new();
+    run_control.inherit_effect_authority(&state.root_scope_control);
     let (mailbox_activity_tx, _) = watch::channel(0);
     state.agents.insert(
         child_path.clone(),

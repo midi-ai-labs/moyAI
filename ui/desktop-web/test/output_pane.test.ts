@@ -86,7 +86,7 @@ test("output pane uses one document-flow scroll owner with semantic ordered sect
   assert.match(html, /<h3 id="output-preview-heading">プレビュー<\/h3>/);
   assert.match(html, /<h3 id="output-activity-heading">進捗／ツール<\/h3>/);
   assert.match(html, /aria-label="完全な実行履歴への導線"/);
-  assert.match(html, /完全な詳細はcanonical会話履歴に残ります/);
+  assert.match(html, /会話履歴の該当箇所を開いて詳細を確認できます/);
   assert.match(html, /data-action="export-transcript"/);
   assert.match(html, /<ol class="plan-list">/);
   assert.match(html, /<ul class="artifact-list">/);
@@ -101,6 +101,13 @@ test("output pane uses one document-flow scroll owner with semantic ordered sect
   assert.ok(scrollStart >= 0);
   assert.ok(scrollStart < agentSection && agentSection < planSection);
   assert.ok(planSection < fileSection && fileSection < previewSection && previewSection < activitySection);
+});
+
+test("running output routes to an existing conversation detail without requiring completion", () => {
+  const state = outputState();
+  state.transcript_rows = [{ row_kind: "work_summary_running", title: "実行履歴", body: "確認中", file_changes: [] }];
+  const html = renderArtifactPane(state, useOutputPane());
+  assert.match(html, /<button[^>]*data-action="jump-history-anchor"[^>]*data-history-target="[^"]+">会話履歴で詳細を開く<\/button>/);
 });
 
 test("artifact row exposes the complete path while keeping selected and focus identity", () => {

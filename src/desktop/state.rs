@@ -31,12 +31,14 @@ pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
 #[serde(rename_all = "snake_case")]
 pub enum DesktopStatusCode {
     Plain,
+    GoalControl,
     ProviderTransport,
     ModelUnavailable,
     ImageUnsupported,
     ImageAttachmentInvalid,
     PermissionPolicyDenied,
     ConfigImportFailed,
+    InitialSetupPreferencesSaveFailed,
     ApprovalAborted,
     UserStopped,
     AgentInterrupted,
@@ -100,6 +102,8 @@ pub enum DesktopOverlay {
     HelpMenu,
     ProjectMenu,
     ConfigEditor,
+    HubConnection,
+    McpHistory,
     SessionSettings,
     ProviderEditor,
     WorkspacePicker,
@@ -129,6 +133,9 @@ pub struct DesktopState {
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
     pub status_code: DesktopStatusCode,
+    pub(crate) hub_connection: Option<crate::hub::HubConnection>,
+    pub(crate) mcp_publish: Option<crate::mcp_publish::PublishService>,
+    pub(crate) device_network: Option<crate::device_network::DeviceNetworkService>,
     global_config: ResolvedConfig,
     file_change_storage_root: Option<camino::Utf8PathBuf>,
     file_change_display_root: Option<camino::Utf8PathBuf>,
@@ -144,6 +151,7 @@ fn root_session_settings_match(
         && current.cwd == persisted.cwd
         && current.model == persisted.model
         && current.base_url == persisted.base_url
+        && current.provider_connection == persisted.provider_connection
         && current.access_mode == persisted.access_mode
         && current.model_parameters.context_window == persisted.model_parameters.context_window
         && current.session_settings_revision == persisted.session_settings_revision
@@ -163,6 +171,9 @@ fn merge_root_session_settings(
     let mut merged = current.clone();
     merged.model.clone_from(&persisted.model);
     merged.base_url.clone_from(&persisted.base_url);
+    merged
+        .provider_connection
+        .clone_from(&persisted.provider_connection);
     merged.access_mode = persisted.access_mode;
     merged
         .model_parameters
@@ -178,6 +189,9 @@ impl DesktopState {
         let global_config = effective_config.clone();
         Self {
             snapshot,
+            hub_connection: None,
+            mcp_publish: None,
+            device_network: None,
             app_state: AppState::default(),
             open_session: None,
             composer,
@@ -255,8 +269,32 @@ impl DesktopState {
                 break;
             }
         }
+        // A fresh draft stays unselected even when the query supplies a default history row.
+        if self.selected_session_id().is_none() && self.app_state.current_session_id.is_none() {
+            snapshot.selected_session_index = snapshot.session_rows.len();
+        }
         self.snapshot = snapshot;
         self.clamp_artifact_selection();
+    }
+
+    /// A newly created edit branch is not in the previous sidebar snapshot.
+    /// Select its exact row rather than preserving the previously open chat.
+    pub fn replace_snapshot_selecting_session(
+        &mut self,
+        mut snapshot: DesktopSnapshot,
+        session_id: SessionId,
+    ) -> bool {
+        let Some(index) = snapshot
+            .session_rows
+            .iter()
+            .position(|row| row.session_id == session_id)
+        else {
+            return false;
+        };
+        snapshot.selected_session_index = index;
+        self.snapshot = snapshot;
+        self.clamp_artifact_selection();
+        true
     }
 
     pub fn replace_snapshot_preserving_current_owner(&mut self, mut snapshot: DesktopSnapshot) {
@@ -803,8 +841,8 @@ impl DesktopState {
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
                     .to_string(),
                 run_status_text: "待機中".to_string(),
-                session_usage_label: "セッション累計: 未計測".to_string(),
-                session_usage_title: "完了済みturnのcanonical terminal telemetryはまだありません。"
+                session_usage_label: "このチャットの累計: 未計測".to_string(),
+                session_usage_title: "完了した依頼のトークン使用量は、まだ記録されていません。"
                     .to_string(),
                 session_usage_state: "missing".to_string(),
                 artifacts: Vec::new(),
@@ -862,6 +900,12 @@ impl DesktopState {
     }
 
     fn image_attachment_mutation_admission_open(&mut self) -> bool {
+        if !self.composer.retained_images.is_empty() {
+            self.set_status_message(
+                "元の依頼の画像を保持しています。編集では本文だけを変更できます。",
+            );
+            return false;
+        }
         if self.app_state.prompt_review.is_none() {
             return true;
         }
@@ -1055,10 +1099,15 @@ impl DesktopState {
                     active_turn_expectation.latest_turn_id(),
                 );
         } else {
-            self.app_state
-                .load_turn_items_with_active_turn(&session, &turn_items, active_turn_id);
+            self.app_state.load_turn_items_with_active_turn(
+                &session,
+                &turn_items,
+                active_turn_id,
+                active_turn_expectation.latest_turn_id(),
+            );
         }
         self.app_state.active_turn_expectation = active_turn_expectation;
+        self.reconcile_current_turn_progress();
         self.status_code = self
             .app_state
             .interruption_cause
@@ -1083,6 +1132,7 @@ impl DesktopState {
         if self.merge_open_session_history(read) {
             self.apply_canonical_terminal_to_running_session(read);
             self.reconcile_current_terminal_tool_projection();
+            self.reconcile_current_turn_progress();
             return true;
         }
         let preserved = self
@@ -1112,6 +1162,7 @@ impl DesktopState {
         self.update_session_row_status(session.id, session.status);
         self.apply_canonical_terminal_to_running_session(read);
         self.reconcile_current_terminal_tool_projection();
+        self.reconcile_current_turn_progress();
         false
     }
 
@@ -1173,6 +1224,7 @@ impl DesktopState {
         let session_id = summary.session_id();
         let session_status = summary.status();
         self.app_state.apply_run_summary(summary);
+        self.reconcile_current_turn_progress();
         self.status_code = self
             .app_state
             .interruption_cause
@@ -1227,15 +1279,39 @@ impl DesktopState {
         let turn_items = open_session.turn_items();
         let detail = open_session.stored_detail().clone();
         self.apply_root_session_config(&session);
+        if self.app_state.current_session_id == Some(session.id)
+            && open_session.admission_revision() > self.app_state.active_turn_expectation.revision()
+        {
+            self.app_state.active_turn_expectation = open_session.active_turn_expectation();
+        }
         self.app_state.refresh_plan_from_turn_items(turn_items);
         if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
         {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.open_session = Some(open_session);
+        self.reconcile_current_turn_progress();
         self.snapshot.replace_detail(detail);
         self.update_session_title_projection(session.id, &session.title);
         self.update_session_row_status(session.id, session.status);
+    }
+
+    fn reconcile_current_turn_progress(&mut self) {
+        if let Some(open_session) = &self.open_session
+            && let Some(progress) = open_session.turn_progress()
+            && (self.app_state.run_status == RunStatus::Running
+                || (open_session.active_turn_id().is_none()
+                    && matches!(
+                        open_session.session().status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    )))
+        {
+            self.app_state.reconcile_turn_progress(
+                open_session.session_id(),
+                progress,
+                open_session.turn_items(),
+            );
+        }
     }
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
@@ -1314,9 +1390,20 @@ impl DesktopState {
         self.app_state.progress.active_step = reason.to_string();
     }
 
-    pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
-        self.app_state
-            .apply_durable_prompt_dispatch(prompt_dispatch);
+    pub fn apply_durable_prompt_dispatch(
+        &mut self,
+        prompt_dispatch: &PromptDispatchPart,
+        user_turn: Option<&crate::protocol::UserTurn>,
+    ) {
+        // Use the same representation as canonical UserMessage projection, including
+        // immutable image labels. A text-only live row cannot overlap that history.
+        let user_text = user_turn.map(crate::protocol::user_turn_text);
+        self.app_state.apply_durable_prompt_dispatch(
+            prompt_dispatch,
+            user_text
+                .as_deref()
+                .unwrap_or(&prompt_dispatch.dispatch_prompt_text),
+        );
     }
 
     pub fn begin_prompt_enhance_at(
@@ -1465,7 +1552,7 @@ impl DesktopState {
             .replace_effective_config(self.global_config.clone());
         self.view.artifact_selected_index = 0;
         self.view.overlay = DesktopOverlay::None;
-        self.set_status_message("new chat ready");
+        self.set_status_message("新しいチャットを開始できます。");
     }
 
     fn finish_prompt_enhance_transport(&mut self, request_id: u64) {
@@ -1647,7 +1734,7 @@ impl DesktopState {
             self.view.overlay = DesktopOverlay::PromptReview;
             return false;
         }
-        if self.startup.requires_initial_setup() {
+        if self.startup.requires_initial_setup() && !self.view.hub_project_open {
             self.view.overlay = DesktopOverlay::InitialSetup;
             self.view.startup_overlay_forced = true;
             return false;
@@ -1661,6 +1748,37 @@ impl DesktopState {
         }
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ConfigEditor;
+        true
+    }
+
+    pub fn show_shared_work(&mut self) -> bool {
+        if self.prompt_review_owns_overlay()
+            || self.navigation_loading()
+            || self.background_mutation_pending()
+        {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.hub_project_open = true;
+        self.view.overlay = DesktopOverlay::None;
+        true
+    }
+
+    pub fn show_hub_editor(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::HubConnection;
+        true
+    }
+
+    pub fn show_mcp_history(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::McpHistory;
         true
     }
 
@@ -1690,14 +1808,11 @@ impl DesktopState {
         self.provider_config.provider_context_window_input =
             self.global_config.model.context_window.to_string();
         self.provider_config.provider_selected_model_id_input = global_config.model.model.clone();
-        self.provider_config.provider_models = ensure_current_model(
-            self.provider_config.provider_models.clone(),
-            &global_config.model.model,
-        );
-        self.provider_config.provider_model_infos = ensure_current_model_info(
-            self.provider_config.provider_model_infos.clone(),
-            &global_config,
-        );
+        if self.provider_config.provider_loaded_base_url.is_none() {
+            self.provider_config.provider_models = initial_provider_models(&global_config);
+            self.provider_config.provider_model_infos =
+                initial_provider_model_infos(&global_config);
+        }
         self.provider_config.provider_selected_index = self
             .provider_config
             .provider_models
@@ -1771,7 +1886,7 @@ impl DesktopState {
         if !self.begin_unscoped_overlay_transition() {
             if self.startup.requires_initial_setup() {
                 self.set_status_message(
-                    "初期設定が必要です。各ステップを確認し、Finish で設定を保存してください。",
+                    "初回設定が必要です。画面に沿って入力し、最後に設定を保存してください。",
                 );
             }
             return false;
@@ -1782,6 +1897,8 @@ impl DesktopState {
     }
 
     pub(crate) fn complete_initial_setup_after_persist(&mut self) {
+        let configure_execution = self.startup.onboarding_intent
+            == Some(super::preferences::DesktopOnboardingIntent::Execution);
         self.startup.complete_after_persist();
         if !self.startup.requires_initial_setup()
             && let Some(session) = self
@@ -1792,6 +1909,9 @@ impl DesktopState {
             self.apply_root_session_config(&session);
         }
         self.apply_startup_overlay();
+        if configure_execution && !self.startup.requires_initial_setup() {
+            self.show_hub_editor();
+        }
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
@@ -1805,7 +1925,7 @@ impl DesktopState {
         self.provider_config.provider_loaded_api_key_env = None;
         self.provider_config.set_status(
             DesktopProviderStatusKind::Loading,
-            "Provider 状態",
+            "AIの接続状態",
             "詳細は必要な場合だけ展開してください。",
             "Loading models in the background...",
         );
@@ -1867,10 +1987,9 @@ impl DesktopState {
         let normalized_base_url =
             normalize_provider_base_url(&self.provider_config.provider_base_url_input);
         let models = infos.iter().map(|info| info.id.clone()).collect::<Vec<_>>();
-        self.provider_config.provider_models =
-            ensure_current_model(models, &self.provider_config.effective_config.model.model);
-        self.provider_config.provider_model_infos =
-            ensure_current_model_infos(infos, &self.provider_config.effective_config);
+        // A server catalog is evidence for this endpoint, not a list of saved defaults.
+        self.provider_config.provider_models = models;
+        self.provider_config.provider_model_infos = infos;
         let desired_model_id = self
             .provider_config
             .provider_selected_model_id_input
@@ -1912,7 +2031,7 @@ impl DesktopState {
             .unwrap_or_default();
         self.provider_config.set_status(
             DesktopProviderStatusKind::Success,
-            "Provider 設定を読み込みました",
+            "AIの接続設定を読み込みました",
             "選択したモデルとBase URLをセッションまたは設定ファイルへ適用できます。",
             format!(
                 "Loaded {} models. {}",
@@ -1935,8 +2054,8 @@ impl DesktopState {
         let message = message.into();
         self.provider_config.set_status(
             DesktopProviderStatusKind::Error,
-            "Providerモデル一覧を読み込めません",
-            "Base URL と Provider の稼働状態を確認し、もう一度モデル一覧を読み込んでください。",
+            "AIのモデル一覧を読み込めません",
+            "接続先URLとAIサーバーの稼働状態を確認し、もう一度モデル一覧を読み込んでください。",
             message,
         );
         self.provider_config.provider_models = ensure_current_model(
@@ -1960,7 +2079,7 @@ impl DesktopState {
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.set_status(
             DesktopProviderStatusKind::Idle,
-            "Provider 設定を確認できます",
+            "AIの接続先とモデルを設定できます",
             "Base URL、mode、model を選択してセッションへ適用できます。",
             "",
         );
@@ -2056,7 +2175,7 @@ impl DesktopState {
             }
         }
         if lines.is_empty() {
-            "一致する項目はありません。".to_string()
+            "一致するプロジェクト・チャット・履歴・成果物・コマンドはありません。".to_string()
         } else {
             lines.into_iter().take(24).collect::<Vec<_>>().join("\n")
         }
@@ -2207,7 +2326,10 @@ impl DesktopState {
         }
     }
 
-    fn apply_startup_overlay(&mut self) {
+    pub(crate) fn apply_startup_overlay(&mut self) {
+        if self.view.hub_project_open && !self.prompt_review_owns_overlay() {
+            return;
+        }
         if !self.begin_unscoped_overlay_transition() {
             return;
         }
@@ -2300,14 +2422,6 @@ pub(crate) fn ensure_current_model_infos(
     }
     infos
 }
-
-fn ensure_current_model_info(
-    infos: Vec<ProviderModelInfo>,
-    config: &ResolvedConfig,
-) -> Vec<ProviderModelInfo> {
-    ensure_current_model_infos(infos, config)
-}
-
 fn provider_info_from_config(config: &ResolvedConfig) -> ProviderModelInfo {
     ProviderModelInfo {
         id: config.model.model.clone(),
@@ -2452,6 +2566,7 @@ mod tests {
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             session_token_usage: Default::default(),
+            turn_progress: None,
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -2473,6 +2588,259 @@ mod tests {
             sequence_no,
             payload,
         }
+    }
+
+    fn running_progress_read(
+        session: &SessionRecord,
+        turn_id: crate::protocol::TurnId,
+        revision: u64,
+        prior_items: &[crate::protocol::TurnItem],
+    ) -> CanonicalSessionRead {
+        let mut session = session.clone();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        session.updated_at_ms = revision as i64 + 2;
+        let mut items = prior_items.to_vec();
+        items.push(turn_item(
+            session.id,
+            turn_id,
+            1,
+            TurnItemPayload::UserMessage {
+                text: format!("request {revision}"),
+            },
+        ));
+        for index in 0..revision {
+            items.push(turn_item(
+                session.id,
+                turn_id,
+                index as i64 + 2,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: if index == 0 {
+                        crate::protocol::ToolLifecycleStatus::Completed
+                    } else {
+                        crate::protocol::ToolLifecycleStatus::Running
+                    },
+                    title: format!("read document {index}"),
+                    summary: String::new(),
+                },
+            ));
+        }
+        let mut read = canonical_read(&session, Vec::new(), items);
+        read.active_turn_id = Some(turn_id);
+        read.latest_turn_id = Some(turn_id);
+        read.active_turn_sequence_no = Some(revision as _);
+        read.admission_revision = revision;
+        read.turn_progress = Some(crate::session::model::CanonicalTurnProgress {
+            turn_id,
+            model_request_count: revision as usize * 2,
+            tool_call_count: revision as usize,
+            completed_tool_count: 1,
+            declined_tool_count: 0,
+            cancelled_tool_count: 0,
+            failed_tool_count: 0,
+            compaction_count: 0,
+        });
+        read
+    }
+
+    #[test]
+    fn continued_turn_progress_updates_running_summary_for_second_and_third_turns() {
+        let session = session_record(SessionId::new());
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        let mut previous_items = Vec::new();
+        for revision in 1..=3 {
+            let turn_id = crate::protocol::TurnId::new();
+            let read = running_progress_read(&session, turn_id, revision, &previous_items);
+            if revision == 1 {
+                state.load_open_session(&read);
+            } else {
+                state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+                    session_id: session.id,
+                    title: session.title.clone(),
+                });
+                assert_eq!(state.app_state.progress.model_requests, 0);
+                assert!(state.app_state.tool_statuses.is_empty());
+            }
+            state.refresh_open_session_projection(&read);
+            assert_eq!(
+                state.app_state.progress.model_requests,
+                revision as usize * 2,
+                "running canonical counts must follow this admission, including turns 2 and 3"
+            );
+            assert_eq!(
+                state.app_state.progress.tool_calls_started,
+                revision as usize
+            );
+            assert_eq!(state.app_state.progress.tool_calls_completed, 1);
+            assert_eq!(state.app_state.tool_statuses.len(), revision as usize);
+            assert_eq!(
+                state.app_state.active_turn_expectation,
+                ActiveTurnExpectation::Turn { turn_id, revision }
+            );
+            let detail = state.selected_detail();
+            let summary = detail
+                .transcript_rows
+                .iter()
+                .find(|row| {
+                    row.row_kind
+                        == super::super::models::DesktopTranscriptRowKind::WorkSummaryRunning
+                })
+                .expect("public running summary");
+            assert!(
+                summary
+                    .body
+                    .contains(&format!("モデル要求: {}", revision * 2)),
+                "the public summary must use the current canonical count: {}",
+                summary.body
+            );
+            let progress = state.app_state.progress.clone();
+            let tools = state.app_state.tool_statuses.clone();
+            state.refresh_open_session_projection(&read);
+            assert_eq!(
+                state.app_state.progress, progress,
+                "duplicate refresh is idempotent"
+            );
+            assert_eq!(state.app_state.tool_statuses, tools);
+
+            state.apply_run_event(&terminal_event(
+                session.id,
+                crate::protocol::TurnTerminalOutcome::Completed,
+            ));
+            let mut terminal_read = read;
+            terminal_read.active_turn_id = None;
+            terminal_read.active_turn_sequence_no = None;
+            terminal_read.session.status = SessionStatus::Completed;
+            terminal_read.session.completed_at_ms = Some(revision as i64 + 3);
+            terminal_read.session.updated_at_ms += 1;
+            terminal_read.history.session = terminal_read.session.clone();
+            terminal_read.turns.session = terminal_read.session.clone();
+            terminal_read.turns.items.push(turn_item(
+                session.id,
+                turn_id,
+                revision as i64 + 2,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            ));
+            terminal_read.turns.total = terminal_read.turns.items.len();
+            state.refresh_open_session_projection(&terminal_read);
+            assert_eq!(
+                state.app_state.active_turn_expectation,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_id),
+                    revision
+                }
+            );
+            previous_items = terminal_read.turns.items;
+        }
+    }
+
+    #[test]
+    fn continued_turn_progress_uses_retained_metadata_for_a_noncontiguous_stale_page() {
+        let session = session_record(SessionId::new());
+        let current_turn = crate::protocol::TurnId::new();
+        let current = running_progress_read(&session, current_turn, 3, &[]);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&current);
+        state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+            session_id: session.id,
+            title: session.title.clone(),
+        });
+        let mut stale = running_progress_read(&session, crate::protocol::TurnId::new(), 1, &[]);
+        stale.turns.offset = current.turns.total + 10;
+        stale.turns.total = stale.turns.offset + stale.turns.items.len();
+        state.refresh_open_session_projection(&stale);
+        let accepted = state.open_session.as_ref().unwrap();
+        assert_eq!(accepted.active_turn_id(), Some(current_turn));
+        assert_eq!(accepted.admission_revision(), 3);
+        assert_eq!(
+            accepted
+                .turn_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            current
+                .turns
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.app_state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id: current_turn,
+                revision: 3
+            }
+        );
+        assert_eq!(state.app_state.progress.model_requests, 6);
+        assert_eq!(state.app_state.progress.tool_calls_started, 3);
+        assert_eq!(state.app_state.tool_statuses.len(), 3);
+    }
+
+    #[test]
+    fn continued_turn_progress_keeps_same_revision_other_turn_rejected() {
+        let session = session_record(SessionId::new());
+        let current_turn = crate::protocol::TurnId::new();
+        let current = running_progress_read(&session, current_turn, 2, &[]);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&current);
+        state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+            session_id: session.id,
+            title: session.title.clone(),
+        });
+        let mut different = running_progress_read(&session, crate::protocol::TurnId::new(), 2, &[]);
+        different.turns.offset = current.turns.total + 10;
+        different.turns.total = different.turns.offset + different.turns.items.len();
+        state.refresh_open_session_projection(&different);
+        assert_eq!(
+            state.app_state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id: current_turn,
+                revision: 2
+            }
+        );
+        assert_eq!(
+            state.app_state.progress.model_requests, 0,
+            "same-revision different-turn metadata must not bypass the existing progress guard"
+        );
+        assert_eq!(state.app_state.progress.tool_calls_started, 0);
+        assert!(state.app_state.tool_statuses.is_empty());
+        state.refresh_open_session_projection(&current);
+        assert_eq!(state.app_state.progress.model_requests, 4);
+        assert_eq!(state.app_state.progress.tool_calls_started, 2);
     }
 
     fn assert_nested_file_change_projection(state: &mut DesktopState) {
@@ -2599,6 +2967,291 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_live_refresh_projects_progress_beyond_history_page_and_replay() {
+        use crate::runtime::RunEventSink;
+        use crate::session::{ProjectRepository, SessionRepository};
+        struct NullSink;
+        impl RunEventSink for NullSink {
+            fn emit(
+                &mut self,
+                _: crate::session::RunEvent,
+            ) -> Result<(), crate::error::RuntimeError> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let paths = crate::storage::StoragePaths {
+            data_dir: root.clone(),
+            database_path: root.join("db.sqlite3"),
+            truncation_dir: root.join("output"),
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &root, "progress", "none")
+            .await
+            .unwrap();
+        let session = store
+            .session_repo()
+            .create_session(crate::session::NewSession {
+                project_id,
+                title: "progress".into(),
+                cwd: root,
+                model: "fixture".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        let turn_id = crate::protocol::TurnId::new();
+        let admitted = store
+            .session_repo()
+            .admit_session_turn(session.id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let service = crate::session::SessionService::new(store.clone());
+        let initial = service
+            .canonical_session_read(session.id, 0, 1, 0, 1)
+            .await
+            .unwrap();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&initial);
+        assert_eq!(state.app_state.progress.model_requests, 0);
+        let HistoryItemPayload::RequestDiagnostics { diagnostics } =
+            diagnostics_history_item(&session, None).payload
+        else {
+            unreachable!()
+        };
+        let mut null = NullSink;
+        let mut sink = crate::protocol::ProtocolRecordingSink::new(
+            store.protocol_event_store(),
+            Some(session.id),
+            turn_id,
+            &mut null,
+        )
+        .with_admission_id(admitted.admission_id);
+        for _ in 0..130 {
+            sink.emit(crate::session::RunEvent::ModelRequestPrepared {
+                session_id: session.id,
+                diagnostics: diagnostics.clone(),
+            })
+            .unwrap();
+        }
+        let call_id = crate::session::ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session.id,
+                admitted.admission_id,
+                turn_id,
+                crate::storage::session_repo::ModelResponseWrite {
+                    response_id: crate::protocol::ModelResponseId::new(),
+                    assistant_text: Some("remote work is running".into()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![crate::storage::session_repo::PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "remote-status".into(),
+                        tool_name: "mcp_call".into(),
+                        arguments_json: "{}".into(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let refreshed = service
+            .canonical_session_read(session.id, 0, 1, 0, 32)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.history.items.len(), 1);
+        assert!(refreshed.history.has_more);
+        assert!(refreshed.turns.items.iter().any(|item| matches!(&item.payload, TurnItemPayload::ToolStatus { call_id: id, .. } if *id == call_id)));
+        state.refresh_open_session_projection(&refreshed);
+        assert!(state.open_session.as_ref().unwrap().turn_items().iter().any(
+            |item| matches!(&item.payload, TurnItemPayload::AgentMessage { text } if text == "remote work is running")
+        ), "the canonical history was accepted before progress is checked");
+        assert_eq!(state.app_state.progress.model_requests, 130);
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+        assert!(
+            state
+                .selected_detail()
+                .tool_status_text
+                .contains("mcp_call")
+        );
+        state.refresh_open_session_projection(&refreshed);
+        assert_eq!(
+            state.app_state.progress.model_requests, 130,
+            "replayed canonical pages do not double count"
+        );
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+        state.refresh_open_session_projection(&initial);
+        assert_eq!(
+            state.app_state.progress.model_requests, 130,
+            "an older same-turn page cannot roll progress back"
+        );
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+
+        let live_response = crate::protocol::ModelResponseId::new();
+        state.apply_run_event(&crate::session::RunEvent::TextDelta {
+            response_id: live_response,
+            delta: "uncommitted live suffix".into(),
+        });
+        state.app_state.progress.current_phase = RunProgressPhase::StopRequested;
+        state.app_state.progress.active_step = "stop is settling".into();
+        store
+            .session_repo()
+            .complete_tool_call_with_protocol_bundle(
+                session.id,
+                admitted.admission_id,
+                call_id,
+                crate::tool::ToolName::McpCall,
+                "remote reply",
+                serde_json::json!({}),
+                "receiver result",
+                None,
+                turn_id,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = service
+            .canonical_session_read(session.id, 0, 1, 2, 1)
+            .await
+            .unwrap();
+        state.refresh_open_session_projection(&completed);
+        assert_eq!(state.app_state.progress.tool_calls_started, 1);
+        assert_eq!(
+            state.app_state.progress.tool_calls_completed, 1,
+            "latest lifecycle replaces pending without counting a second call"
+        );
+        assert_eq!(state.app_state.progress.model_requests, 130);
+        assert_eq!(
+            state.app_state.progress.current_phase,
+            RunProgressPhase::StopRequested
+        );
+        assert!(
+            state
+                .app_state
+                .transcript_entries
+                .iter()
+                .any(|entry| entry.body == "uncommitted live suffix")
+        );
+        state.refresh_open_session_projection(&refreshed);
+        assert_eq!(state.app_state.progress.tool_calls_completed, 1);
+
+        let mut reopened = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session.id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        reopened.load_open_session(&completed);
+        assert_eq!(reopened.app_state.progress.model_requests, 130);
+        assert_eq!(reopened.app_state.progress.tool_calls_started, 1);
+        assert_eq!(reopened.app_state.progress.tool_calls_completed, 1);
+        assert!(
+            !serde_json::to_string(&completed)
+                .unwrap()
+                .contains("turn_progress"),
+            "the process-local projection does not alter stored/exported contracts"
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_preserves_fresh_chat_until_its_created_owner_is_loaded() {
+        let old_id = SessionId::new();
+        let new_id = SessionId::new();
+        let old_row = session_row(old_id, "previous chat", SessionStatus::Completed);
+        let mut state = DesktopState::new(
+            snapshot(vec![old_row.clone()], 0),
+            ResolvedConfig::default(),
+        );
+        state.start_new_chat();
+
+        state.replace_snapshot_preserving_current_owner(snapshot(vec![old_row.clone()], 0));
+
+        assert_eq!(state.app_state.current_session_id, None);
+        assert_eq!(state.selected_session_id(), None);
+        assert_eq!(state.snapshot.session_rows[0].session_id, old_id);
+        state.apply_run_event(&crate::session::RunEvent::SessionStarted {
+            session_id: new_id,
+            title: "created chat".into(),
+        });
+        assert_eq!(state.app_state.current_session_id, Some(new_id));
+        assert_eq!(state.selected_session_id(), None);
+
+        state.replace_snapshot_preserving_current_owner(snapshot(
+            vec![
+                session_row(new_id, "created chat", SessionStatus::Running),
+                old_row.clone(),
+            ],
+            1,
+        ));
+        assert_eq!(state.selected_session_id(), Some(new_id));
+        state.apply_run_event(&terminal_event(
+            new_id,
+            crate::protocol::TurnTerminalOutcome::Completed,
+        ));
+        state.replace_snapshot_preserving_current_owner(snapshot(
+            vec![
+                old_row,
+                session_row(new_id, "created chat", SessionStatus::Completed),
+            ],
+            0,
+        ));
+        assert_eq!(state.selected_session_id(), Some(new_id));
+        assert_eq!(state.app_state.current_session_id, Some(new_id));
+    }
+
+    #[test]
+    fn snapshot_refresh_preserves_an_explicit_other_chat_selection() {
+        let current_id = SessionId::new();
+        let selected_id = SessionId::new();
+        let current_row = session_row(current_id, "current chat", SessionStatus::Completed);
+        let selected_row = session_row(selected_id, "selected chat", SessionStatus::Completed);
+        let mut state = DesktopState::new(
+            snapshot(vec![current_row.clone(), selected_row.clone()], 0),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&canonical_read(
+            &session_record(current_id),
+            Vec::new(),
+            Vec::new(),
+        ));
+        state.select_session(1);
+
+        state.replace_snapshot_preserving_current_owner(snapshot(
+            vec![selected_row, current_row],
+            1,
+        ));
+
+        assert_eq!(state.selected_session_id(), Some(selected_id));
+        assert_eq!(state.app_state.current_session_id, Some(current_id));
     }
 
     #[test]
@@ -3042,6 +3695,78 @@ mod tests {
             SessionStatus::Cancelled
         );
         assert!(!state.snapshot.session_rows[0].label.contains("[実行中]"));
+    }
+
+    #[test]
+    fn terminal_progress_uses_canonical_counts_when_tool_rows_are_outside_the_loaded_page() {
+        let session_id = SessionId::new();
+        let turn_id = crate::protocol::TurnId::new();
+        let session = session_record(session_id);
+        let mut read = canonical_read(
+            &session,
+            Vec::new(),
+            vec![turn_item(
+                session_id,
+                turn_id,
+                20,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            )],
+        );
+        read.turns.limit = 1;
+        read.turns.total = 21;
+        read.turns.has_more = true;
+        read.turn_progress = Some(crate::session::model::CanonicalTurnProgress {
+            turn_id,
+            model_request_count: 3,
+            tool_call_count: 4,
+            completed_tool_count: 2,
+            declined_tool_count: 1,
+            cancelled_tool_count: 0,
+            failed_tool_count: 1,
+            compaction_count: 0,
+        });
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&read);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+        let summary = crate::session::RunSummary::from_terminal(
+            session_id,
+            turn_id,
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 4,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        );
+        state.apply_run_summary(summary.clone());
+        state.load_open_session_preserving_history(&read);
+        assert_eq!(state.app_state.progress.tool_calls_completed, 2);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+        state.apply_run_summary(summary);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+
+        let mut stale = read.clone();
+        stale.session.status = SessionStatus::Running;
+        stale.turns.session.status = SessionStatus::Running;
+        stale.active_turn_id = Some(turn_id);
+        stale.turn_progress.as_mut().unwrap().failed_tool_count = 0;
+        state.load_open_session_preserving_history(&stale);
+        assert_eq!(state.app_state.progress.tool_calls_failed, 1);
+        assert_eq!(state.app_state.run_status, RunStatus::Completed);
     }
 
     #[test]
@@ -3592,6 +4317,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_catalog_never_invents_saved_models_for_another_endpoint() {
+        let mut config = ResolvedConfig::default();
+        config.model.model = "saved-only".to_string();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+        let mut info = provider_info_from_config(&config);
+        info.id = "server-model".to_string();
+        info.source = "provider_catalog".to_string();
+        state.begin_provider_model_load(config.model.base_url.clone());
+        state.finish_provider_model_load(vec![info]);
+        assert_eq!(state.provider_config.provider_models, vec!["server-model"]);
+        assert_eq!(state.provider_config.provider_selected_index, -1);
+        assert_eq!(state.provider_config.provider_model_infos.len(), 1);
+        state.reset_effective_config(config);
+        assert_eq!(state.provider_config.provider_models, vec!["server-model"]);
+        assert!(state.show_provider_editor());
+        assert_eq!(state.provider_config.provider_models, vec!["server-model"]);
+    }
+
+    #[test]
     fn provider_editor_projects_the_global_owner_when_root_effective_settings_differ() {
         let mut global = ResolvedConfig::default();
         global.model.base_url = "http://127.0.0.1:1234".to_string();
@@ -3657,6 +4401,12 @@ mod tests {
         persisted.cwd = Utf8PathBuf::from("C:/workspace/stale-root");
         persisted.model = "saved-model".to_string();
         persisted.base_url = "http://saved-provider".to_string();
+        let mut provider_config = ResolvedConfig::default();
+        provider_config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        provider_config.model.api_key_env = Some("TEST_PROVIDER_KEY".to_string());
+        persisted.provider_connection = Some(
+            crate::session::SessionProviderConnection::from_model_config(&provider_config.model),
+        );
         persisted.access_mode = AccessMode::FullAccess;
         persisted.model_parameters.context_window = Some(65_536);
         persisted.session_settings_revision = 8;
@@ -3698,10 +4448,15 @@ mod tests {
         assert_eq!(projected.completed_at_ms, current.completed_at_ms);
         assert_eq!(projected.model, persisted.model);
         assert_eq!(projected.base_url, persisted.base_url);
+        assert_eq!(projected.provider_connection, persisted.provider_connection);
         assert_eq!(projected.access_mode, persisted.access_mode);
         assert_eq!(projected.model_parameters, persisted.model_parameters);
         assert_eq!(projected.session_settings_revision, 8);
         assert!(state.persisted_root_session_settings_are_projected(&persisted));
+
+        let mut connection_conflict = persisted.clone();
+        connection_conflict.provider_connection = None;
+        assert!(!state.persisted_root_session_settings_are_projected(&connection_conflict));
 
         let mut runtime_newer = projected.clone();
         runtime_newer.title = "runtime title after settings CAS".to_string();
@@ -3945,7 +4700,7 @@ mod tests {
 
             assert_eq!(
                 state.provider_config.provider_status.title,
-                "Providerモデル一覧を読み込めません"
+                "AIのモデル一覧を読み込めません"
             );
             assert_eq!(state.provider_config.provider_status.details, message);
             assert!(
@@ -3998,6 +4753,45 @@ mod tests {
     }
 
     #[test]
+    fn execution_setup_opens_pc_connection_only_after_valid_saved_ai_config() {
+        use super::super::preferences::DesktopOnboardingIntent;
+        for intent in [
+            DesktopOnboardingIntent::Personal,
+            DesktopOnboardingIntent::Execution,
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.model.base_url = "http://127.0.0.1:1234".to_string();
+            config.model.model = "model-a".to_string();
+            config.docling.enabled = false;
+            let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
+            state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+            state.startup.resume_onboarding(intent);
+            assert!(state.startup.requires_initial_setup());
+            state.complete_initial_setup_after_persist();
+            assert!(!state.startup.requires_initial_setup());
+            assert_eq!(state.startup.onboarding_intent, None);
+            assert_eq!(
+                state.view.overlay,
+                if intent == DesktopOnboardingIntent::Execution {
+                    DesktopOverlay::HubConnection
+                } else {
+                    DesktopOverlay::None
+                }
+            );
+        }
+        let mut config = ResolvedConfig::default();
+        config.model.base_url.clear();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
+        state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+        state
+            .startup
+            .resume_onboarding(DesktopOnboardingIntent::Execution);
+        state.complete_initial_setup_after_persist();
+        assert!(state.startup.requires_initial_setup());
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
+    }
+
+    #[test]
     fn about_overlay_uses_the_rust_owner_and_closes_without_changing_run_state() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
         let run_status = state.app_state.run_status;
@@ -4011,6 +4805,23 @@ mod tests {
 
         state.hide_overlay();
         assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert_eq!(state.app_state.run_status, run_status);
+    }
+
+    #[test]
+    fn mcp_history_navigation_preserves_the_local_chat_and_draft() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let session_id = SessionId::new();
+        state.app_state.current_session_id = Some(session_id);
+        state.composer.draft_prompt = "編集中の指示 😀".into();
+        let generation = state.composer.owner_generation();
+        let run_status = state.app_state.run_status;
+        assert!(state.show_mcp_history());
+        assert_eq!(state.view.overlay, DesktopOverlay::McpHistory);
+        state.hide_overlay();
+        assert_eq!(state.app_state.current_session_id, Some(session_id));
+        assert_eq!(state.composer.draft_prompt, "編集中の指示 😀");
+        assert_eq!(state.composer.owner_generation(), generation);
         assert_eq!(state.app_state.run_status, run_status);
     }
 
@@ -4070,8 +4881,44 @@ mod tests {
                 .app_state
                 .status_message
                 .as_deref()
-                .is_some_and(|message| message.contains("Finish"))
+                .is_some_and(|message| message.contains("最後に設定を保存してください"))
         );
+    }
+
+    #[test]
+    fn shared_work_entry_does_not_require_or_finish_local_setup() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+        assert!(state.startup.requires_initial_setup());
+        assert!(state.show_shared_work());
+        state.apply_startup_overlay();
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(state.view.hub_project_open);
+        assert!(state.startup.requires_initial_setup());
+        state.hide_overlay();
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(state.view.hub_project_open);
+        assert!(state.startup.requires_initial_setup());
+    }
+
+    #[test]
+    fn shared_work_entry_waits_for_local_owner_mutations_but_allows_an_active_run() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let deletion = state.begin_session_delete_mutation();
+        assert!(!state.show_shared_work());
+        assert!(!state.view.hub_project_open);
+        assert!(state.finish_session_delete_mutation(deletion));
+        let archive = state.begin_session_archive_mutation();
+        assert!(!state.show_shared_work());
+        assert!(!state.view.hub_project_open);
+        assert!(state.finish_session_archive_mutation(archive));
+        state.app_state.run_status = RunStatus::Running;
+        assert!(state.is_busy());
+        assert!(state.show_shared_work());
+        state.show_hub_editor();
+        state.hide_overlay();
+        assert!(state.view.hub_project_open);
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
     }
 
     #[test]
@@ -4100,7 +4947,7 @@ mod tests {
                 .app_state
                 .status_message
                 .as_deref()
-                .is_some_and(|message| message.contains("Finish"))
+                .is_some_and(|message| message.contains("最後に設定を保存してください"))
         );
     }
 
@@ -4547,6 +5394,7 @@ mod tests {
         let original_workspace_input = state.workspace_input.clone();
 
         assert!(!state.show_config_editor());
+        assert!(!state.show_mcp_history());
         assert!(!state.show_provider_editor());
         assert!(!state.show_workspace_picker("C:/other"));
         assert!(!state.show_file_menu());

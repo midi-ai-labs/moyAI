@@ -12,6 +12,7 @@ import {
 import {
   overlayDismissAction,
   shouldDispatchDelegatedKeyboardAction,
+  wireEvents,
 } from "../src/events.ts";
 import { InteractionLifecycle, type InteractionEnd } from "../src/interaction_lifecycle.ts";
 import {
@@ -129,6 +130,8 @@ function state(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
     },
     provider_apply_enabled: false,
     provider_model_ids: [],
+    provider_effective_base_url: "http://127.0.0.1:1234",
+    provider_effective_profile: "lm_studio",
     docling_readiness: {
       status: "idle",
       endpoint: "",
@@ -268,10 +271,9 @@ const EXACT_DELIVERY_ACTION_IDS = [
     "insert-command",
   ] as const;
 
-test("the single GUI action registry owns all 97 actions without duplicates", () => {
+test("the single GUI action registry owns every registered action without duplicates", () => {
   const actionIds = ACTIONS.map((action) => action.id);
 
-  assert.equal(actionIds.length, 97);
   assert.deepEqual(ACTION_IDS, actionIds);
   assert.equal(new Set(actionIds).size, actionIds.length);
   assert.equal(ACTION_BY_ID.size, actionIds.length);
@@ -279,6 +281,26 @@ test("the single GUI action registry owns all 97 actions without duplicates", ()
     assert.equal(actionById(id)?.id, id, id);
   }
   assert.equal(actionById("not-a-gui-action"), undefined);
+});
+
+test("File Exit uses the existing application exit boundary while window Close retains tray behavior", async () => {
+  const nativeCalls: string[] = [];
+  const current = state();
+  const actionContext = context(current, []);
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async (name: string) => { nativeCalls.push(name); } } },
+  });
+  try {
+    assert.equal(actionById("exit-app")?.menu, "file");
+    await dispatchGuiAction("close-window", -1, "", current, actionContext);
+    await dispatchGuiAction("exit-app", -1, "", current, actionContext);
+    assert.deepEqual(nativeCalls, ["hide_to_tray", "exit_app"]);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
 });
 
 test("delivery-sensitive GUI actions preserve their exact native boundaries", async () => {
@@ -1095,6 +1117,8 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     ],
   });
   const actionContext = context(wizard, []);
+  const errors: unknown[] = [];
+  actionContext.reportError = error => { errors.push(error); };
   const nativeCalls: MutationCall[] = [];
   let release!: (result: unknown) => void;
   const blockedResult = new Promise((resolve) => { release = resolve; });
@@ -1134,6 +1158,7 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     });
     await first;
 
+    assert.deepEqual(errors, []);
     assert.equal(actionContext.uiState.configDirty, true);
     assert.deepEqual(Array.from(actionContext.uiState.configDraftValues), [
       ["model.model", "model-b"],
@@ -1151,6 +1176,40 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
     else delete (globalThis as Record<string, unknown>).window;
   }
+});
+
+test("Initial Setup Hub import uses both native owners once and preserves draft on cancellation or stale settlement", async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  try {
+    for (const outcome of ["joined-flow", "cancel", "stale"] as const) {
+      const setupTarget = { workspacePath: "C:/workspace", globalConfigPath: "C:/config/config.toml", setupGeneration: "3" };
+      const wizard = state({ overlay: "initial_setup", startup: { ...state().startup, action_overlay: "initial_setup",
+        initial_setup_required: true, initial_setup_reason: "config_missing", setup_target: setupTarget } });
+      const actionContext = context(wizard, []);
+      actionContext.uiState.configDraftValues.set("model.model", "kept-draft");
+      const accepted: unknown[] = [];
+      actionContext.acceptProjection = next => { accepted.push(next); };
+      const calls: MutationCall[] = [];
+      let release!: (value: unknown) => void;
+      const response = new Promise(resolve => { release = resolve; });
+      Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: { getItem: () => null }, __TAURI_INTERNALS__: {
+        invoke: async (name: string, args: Record<string, unknown>) => { calls.push({ name, args }); return response; },
+      } } });
+      const first = dispatchGuiAction("initial-setup-hub", -1, "", wizard, actionContext);
+      await dispatchGuiAction("initial-setup-hub", -1, "", wizard, actionContext);
+      await dispatchGuiAction("initial-setup-next", -1, "", wizard, actionContext);
+      assert.equal(actionContext.uiState.initialSetup.step, "start");
+      assert.deepEqual(calls, [{ name: "device_network_initial_setup_import", args: { expectedSetupTarget: setupTarget, expectedConfigTarget: wizard.config_target } }]);
+      if (outcome === "stale") actionContext.uiState.configDraftRevision += 1n;
+      const next = outcome === "cancel" ? wizard : { ...wizard, overlay: "hub", startup: { ...wizard.startup, initial_setup_required: false } };
+      release(next);
+      await first;
+      assert.equal(actionContext.uiState.initialSetupAuxiliary.active, null);
+      assert.equal(actionContext.uiState.configDraftValues.get("model.model"), "kept-draft");
+      assert.deepEqual(accepted, outcome === "stale" ? [] : [next]);
+      if (outcome !== "stale") assert.equal(actionContext.uiState.hub.tab, "devices");
+    }
+  } finally { if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else delete (globalThis as Record<string, unknown>).window; }
 });
 
 test("Initial Setup Docling check sends the complete draft and admits only its endpoint result", async () => {

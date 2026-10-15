@@ -31,6 +31,7 @@ pub struct ToolServices {
     pub truncator: ToolTruncator,
     pub mcp: Arc<crate::mcp::McpClient>,
     pub skills: crate::skill::SkillsService,
+    pub managed_shells: crate::tool::shell::ManagedShells,
 }
 
 pub struct ToolContext<'a> {
@@ -107,6 +108,18 @@ impl ToolFormatterPlan {
         self.invocation.command()
     }
 
+    pub(crate) fn guardian_evidence(
+        &self,
+    ) -> crate::tool::permission_guardian::FormatterExecutionEvidence {
+        crate::tool::permission_guardian::FormatterExecutionEvidence {
+            target: self.invocation.target().to_path_buf(),
+            cwd: self.invocation.working_directory().to_path_buf(),
+            // resolve_invocation replaces argv[0] with the pinned executable's canonical path.
+            executable: Utf8PathBuf::from(&self.invocation.command()[0]),
+            argv: self.invocation.command().to_vec(),
+        }
+    }
+
     pub fn permission_risks(&self) -> &[crate::tool::PermissionRisk] {
         &self.permission_risks
     }
@@ -146,14 +159,17 @@ pub struct ToolEffectAdmission {
     control: RunControl,
     sandbox_plan: ProcessSandboxPlan,
     permission_retry_lease: Option<crate::storage::PermissionReviewLease>,
+    external_approval_id: Option<String>,
 }
 
 impl ToolEffectAdmission {
     pub(crate) fn new(control: RunControl, sandbox_plan: ProcessSandboxPlan) -> Self {
+        let external_approval_id = control.take_approval_identity();
         Self {
             control,
             sandbox_plan,
             permission_retry_lease: None,
+            external_approval_id,
         }
     }
 
@@ -169,11 +185,38 @@ impl ToolEffectAdmission {
         &self.sandbox_plan
     }
 
+    /// Settle the approval after an admitted effect attempt returns, or before
+    /// handing off an observed managed-process startup. No further effect may use
+    /// this ticket. Unlike Drop, a tool response must confirm settlement.
+    pub(crate) fn finish_started_effect(self) -> Result<(), ToolError> {
+        let Some(lease) = &self.permission_retry_lease else {
+            return Ok(());
+        };
+        match lease.release() {
+            Ok(crate::storage::PermissionReviewTransition::Applied) => Ok(()),
+            other => {
+                let message =
+                    format!("操作の承認記録を確定できないため、処理を停止しました: {other:?}");
+                self.control.fail(message.clone());
+                Err(ToolError::Message(message))
+            }
+        }
+    }
+
     /// Linearizes one observable tool effect against Stop, Abort, failure, and supersession.
     /// Multi-stage tools reuse the same approved ticket before every independently startable
     /// effect so a later formatter, process, network request, or mutation cannot start after a
     /// terminal producer wins.
     pub fn admit(&self) -> Result<(), ToolError> {
+        self.control
+            .authorize_external_effect(self.external_approval_id.as_deref())
+            .map_err(|message| {
+                if self.control.is_cancelled() {
+                    return ToolError::RunInterrupted;
+                }
+                self.control.fail(message.clone());
+                ToolError::Message(message)
+            })?;
         if let Some(lease) = &self.permission_retry_lease {
             let admission = lease.admit_if_authority_current().map_err(|error| {
                 let message = format!(
@@ -249,6 +292,37 @@ pub struct RunMutationFence {
 }
 
 impl RunMutationFence {
+    pub(crate) fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    /// Bind a Hub origin to the exact durable local turn order. The revision is
+    /// read while this turn still owns the session, so a later Stop can fence a
+    /// delayed Hub admission without relying on wall-clock or ULID ordering.
+    pub(crate) async fn origin_turn_revision(&self) -> Result<u64, ToolError> {
+        self.assert_owned().await?;
+        match self
+            .repo
+            .active_turn_expectation_for_session(self.session_id)
+            .await?
+        {
+            Some(crate::session::ActiveTurnExpectation::Turn { turn_id, revision })
+                if turn_id == self.turn_id =>
+            {
+                Ok(revision)
+            }
+            _ => Err(self.rejected_error("the active turn changed before Hub admission")),
+        }
+    }
+
+    pub(crate) fn has_pending_turn_steer_input(&self) -> Result<bool, ToolError> {
+        Ok(self.repo.has_pending_turn_steers_for_admitted_turn(
+            self.session_id,
+            self.admission_id,
+            self.turn_id,
+        )?)
+    }
+
     pub fn new(
         repo: SqliteSessionRepository,
         session_id: SessionId,
@@ -422,6 +496,7 @@ impl<'a> ToolContext<'a> {
             );
         }
 
+        let mut human_review_lease = None;
         if access_mode == AccessMode::AutoReview {
             let evidence = match &guardian_evidence {
                 PermissionGuardianEvidenceState::Complete(evidence) => evidence,
@@ -441,42 +516,109 @@ impl<'a> ToolContext<'a> {
                 }
             };
             if self.run_control.is_cancelled() {
+                if let Some(lease) = self
+                    .permission_guardian
+                    .as_deref_mut()
+                    .and_then(PermissionGuardian::take_retry_lease)
+                {
+                    self.require_owned_review_transition(lease.release())?;
+                }
                 return Err(ToolError::RunInterrupted);
             }
-            return match decision {
-                Ok(PermissionGuardianDecision::Allow { .. }) => {
+            let decision = decision.map(|assessment| {
+                (
+                    assessment.decision(),
+                    assessment.risk_level,
+                    assessment.rationale,
+                )
+            });
+            let (reason, fence_outcome) = match decision {
+                Ok((PermissionGuardianDecision::Allow, _, _)) => {
                     let Some(retry_lease) = self
                         .permission_guardian
                         .as_deref_mut()
-                        .and_then(PermissionGuardian::take_approved_retry_lease)
+                        .and_then(PermissionGuardian::take_retry_lease)
                     else {
                         return self.fail_unfenced_auto_review(
                             "automatic permission Guardian allowed an elevated effect without an owned retry-fence lease"
                                 .to_string(),
                         );
                     };
-                    self.accept_tool_effect(
+                    return self.accept_tool_effect(
                         approved_process_sandbox_plan(request.access),
                         Some(retry_lease),
-                    )
+                    );
                 }
-                Ok(PermissionGuardianDecision::Deny { rationale }) => self.decline_permission(
+                Ok((PermissionGuardianDecision::AskUser, risk_level, rationale)) => (
                     format!(
-                        "automatic permission guardian denied the action: {rationale}. The action was not executed; do not retry it or an equivalent workaround without new user authorization"
+                        "{}。{rationale}",
+                        match risk_level {
+                            crate::tool::permission_guardian::PermissionRiskLevel::High =>
+                                "この操作は危険度が高いため、確認が必要です",
+                            _ => "この操作の危険度を判断できないため、確認が必要です",
+                        }
                     ),
+                    crate::storage::PermissionRetryFenceOutcome::GuardianDenied,
                 ),
-                Err(crate::tool::permission_guardian::PermissionGuardianError::UnfencedAdmission(
-                    reason,
-                )) => self.fail_unfenced_auto_review(reason),
-                Err(error) => self.decline_permission(format!(
-                    "automatic permission guardian could not authorize the action, so it was blocked: {error}. Do not retry it or an equivalent workaround without new user authorization"
-                )),
+                Ok((PermissionGuardianDecision::Deny, _, rationale)) => {
+                    return self.stop_permission_work(format!(
+                        "この操作は重大な危険があると判定されたため、実行せず停止しました。代理承認の判断: {rationale}。内容を確認して、次の指示を入力してください。"
+                    ));
+                }
+                Err(
+                    crate::tool::permission_guardian::PermissionGuardianError::UnfencedAdmission(
+                        reason,
+                    ),
+                ) => return self.fail_unfenced_auto_review(reason),
+                Err(crate::tool::permission_guardian::PermissionGuardianError::RetryFenced(_)) => {
+                    return self.stop_permission_work(
+                        "この依頼には未解決または拒否済みの承認があるため、別の方法では実行せず停止しました。承認の結果を確認し、続ける場合は次の指示を入力してください。".to_string(),
+                    );
+                }
+                Err(crate::tool::permission_guardian::PermissionGuardianError::Cancelled) => {
+                    self.run_control
+                        .interrupt(crate::protocol::TurnInterruptionCause::AgentInterrupted);
+                    return Err(ToolError::RunInterrupted);
+                }
+                Err(crate::tool::permission_guardian::PermissionGuardianError::Request(_)) => (
+                    "代理承認に使うAIに接続できないか、回答を受け取れませんでした。".to_string(),
+                    crate::storage::PermissionRetryFenceOutcome::GuardianError,
+                ),
+                Err(
+                    crate::tool::permission_guardian::PermissionGuardianError::InvalidDecision(_),
+                ) => (
+                    "代理承認に使うAIの回答から、操作の危険度を確認できませんでした。".to_string(),
+                    crate::storage::PermissionRetryFenceOutcome::InvalidDecision,
+                ),
+                Err(crate::tool::permission_guardian::PermissionGuardianError::TotalDeadline {
+                    ..
+                }) => (
+                    "代理承認の待ち時間を超えたため、AIの判断を確認できませんでした。".to_string(),
+                    crate::storage::PermissionRetryFenceOutcome::DeadlineExceeded,
+                ),
             };
+            let Some(lease) = self
+                .permission_guardian
+                .as_deref_mut()
+                .and_then(PermissionGuardian::take_retry_lease)
+            else {
+                return self.fail_unfenced_auto_review(
+                    "automatic permission handoff has no owned retry-fence lease".to_string(),
+                );
+            };
+            request
+                .details
+                .push(format!("代理承認からの確認: {reason}"));
+            request.details.push(
+                "この操作はまだ実行していません。内容を確認して許可するか、拒否してください。拒否すると処理を停止し、次の指示を待ちます。".to_string(),
+            );
+            human_review_lease = Some((lease, fence_outcome));
         }
 
         let outcome = self
             .prompt
-            .confirm_with_control(&request, &self.run_control)
+            .confirm_with_control_async(&request, &self.run_control)
+            .await
             .map_err(|error| {
                 let message = format!("failed to prompt for permission: {error}");
                 self.run_control.fail(message.clone());
@@ -484,12 +626,31 @@ impl<'a> ToolContext<'a> {
             })?;
         match outcome {
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved) => {
-                self.accept_tool_effect(approved_process_sandbox_plan(request.access), None)
+                let lease = if let Some((lease, _)) = human_review_lease {
+                    self.require_owned_review_transition(lease.mark_allowed_pending())?;
+                    Some(lease)
+                } else {
+                    None
+                };
+                self.accept_tool_effect(approved_process_sandbox_plan(request.access), lease)
             }
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Denied { reason }) => {
-                self.decline_permission(reason)
+                if let Some((lease, fence_outcome)) = human_review_lease {
+                    self.require_owned_review_transition(lease.mark_denied(fence_outcome))?;
+                    let result = self.decline_permission(format!(
+                        "操作が拒否されたため実行せず停止しました。別の方法で続行せず、次の指示を待ちます。{reason}"
+                    ));
+                    self.run_control
+                        .interrupt(crate::protocol::TurnInterruptionCause::ApprovalAborted);
+                    result
+                } else {
+                    self.decline_permission(reason)
+                }
             }
             ConfirmationOutcome::AbortRequested => {
+                if let Some((lease, _)) = human_review_lease {
+                    self.require_owned_review_transition(lease.release())?;
+                }
                 let approval_abort = RunCancellationCause::Interruption(
                     crate::protocol::TurnInterruptionCause::ApprovalAborted,
                 );
@@ -503,9 +664,39 @@ impl<'a> ToolContext<'a> {
                     Err(ToolError::RunInterrupted)
                 }
             }
-            ConfirmationOutcome::Aborted => Err(ToolError::PermissionAborted),
-            ConfirmationOutcome::Interrupted => Err(ToolError::RunInterrupted),
+            ConfirmationOutcome::Aborted | ConfirmationOutcome::Interrupted => {
+                if let Some((lease, _)) = human_review_lease {
+                    self.require_owned_review_transition(lease.release())?;
+                }
+                Err(if matches!(outcome, ConfirmationOutcome::Aborted) {
+                    ToolError::PermissionAborted
+                } else {
+                    ToolError::RunInterrupted
+                })
+            }
         }
+    }
+
+    fn require_owned_review_transition(
+        &self,
+        transition: Result<crate::storage::PermissionReviewTransition, crate::error::StorageError>,
+    ) -> Result<(), ToolError> {
+        match transition {
+            Ok(crate::storage::PermissionReviewTransition::Applied) => Ok(()),
+            other => {
+                let message = format!(
+                    "代理承認から引き継いだ操作の承認記録を確認できないため、実行しませんでした: {other:?}"
+                );
+                self.run_control.fail(message.clone());
+                Err(ToolError::Message(message))
+            }
+        }
+    }
+
+    fn stop_permission_work(&self, reason: String) -> Result<ToolEffectAdmission, ToolError> {
+        let result = self.decline_permission(reason.clone());
+        self.run_control.fail(reason);
+        result
     }
 
     fn accept_tool_effect(
@@ -536,18 +727,28 @@ impl<'a> ToolContext<'a> {
     }
 
     async fn current_permission_access_mode(&self) -> Result<AccessMode, ToolError> {
-        let owner_session_id = self
-            .agent
-            .map(crate::app::AgentRunContext::root_session_id)
-            .unwrap_or(self.session.session.id);
-        Ok(self
-            .services
-            .store
-            .session_repo()
-            .get_session(owner_session_id)
-            .await?
-            .access_mode)
+        Ok(current_permission_access_mode(
+            &self.services.store,
+            self.session.session.id,
+            self.agent,
+        )
+        .await?)
     }
+}
+
+pub(crate) async fn current_permission_access_mode(
+    store: &StoreBundle,
+    session_id: SessionId,
+    agent: Option<&crate::app::AgentRunContext>,
+) -> Result<AccessMode, crate::error::StorageError> {
+    let owner_session_id = agent
+        .map(crate::app::AgentRunContext::root_session_id)
+        .unwrap_or(session_id);
+    Ok(store
+        .session_repo()
+        .get_session(owner_session_id)
+        .await?
+        .access_mode)
 }
 
 fn process_sandbox_plan_for_admission(
@@ -563,7 +764,7 @@ fn process_sandbox_plan_for_admission(
     }
 }
 
-fn approved_process_sandbox_plan(access: AccessKind) -> ProcessSandboxPlan {
+pub(crate) fn approved_process_sandbox_plan(access: AccessKind) -> ProcessSandboxPlan {
     if access == AccessKind::Shell {
         ProcessSandboxPlan::Unrestricted
     } else {
@@ -603,7 +804,9 @@ mod tests {
     use crate::protocol::ReviewDecision;
     use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
     use crate::storage::{SqliteStore, StoragePaths};
-    use crate::tool::permission_guardian::{PermissionGuardianDecision, PermissionGuardianError};
+    use crate::tool::permission_guardian::{
+        PermissionGuardianAssessment, PermissionGuardianError, PermissionRiskLevel,
+    };
     use crate::workspace::{AccessKind, WorkspaceDiscovery};
 
     #[derive(Default)]
@@ -624,6 +827,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FixedGuardianOutcome {
         Allow,
+        AskUser,
         Deny,
         Fail,
     }
@@ -644,14 +848,20 @@ mod tests {
             &mut self,
             _request: &crate::tool::PermissionRequest,
             _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
-        ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+        ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
             self.requests += 1;
             match self.outcome {
-                FixedGuardianOutcome::Allow => Ok(PermissionGuardianDecision::Allow {
+                FixedGuardianOutcome::Allow => Ok(PermissionGuardianAssessment {
+                    risk_level: PermissionRiskLevel::Low,
                     rationale: "scoped action".to_string(),
                 }),
-                FixedGuardianOutcome::Deny => Ok(PermissionGuardianDecision::Deny {
-                    rationale: "not authorized".to_string(),
+                FixedGuardianOutcome::AskUser => Ok(PermissionGuardianAssessment {
+                    risk_level: PermissionRiskLevel::High,
+                    rationale: "confirm the destination".to_string(),
+                }),
+                FixedGuardianOutcome::Deny => Ok(PermissionGuardianAssessment {
+                    risk_level: PermissionRiskLevel::Critical,
+                    rationale: "critical danger".to_string(),
                 }),
                 FixedGuardianOutcome::Fail => Err(PermissionGuardianError::Request(
                     "fixture transport failure".to_string(),
@@ -666,9 +876,10 @@ mod tests {
             &mut self,
             request: &crate::tool::PermissionRequest,
             _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
-        ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+        ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
             self.requests.push(request.clone());
-            Ok(PermissionGuardianDecision::Allow {
+            Ok(PermissionGuardianAssessment {
+                risk_level: PermissionRiskLevel::Low,
                 rationale: "scoped elevation".to_string(),
             })
         }
@@ -747,6 +958,7 @@ mod tests {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
             skills: crate::skill::SkillsService::new(),
+            managed_shells: Default::default(),
         };
         (config, SessionContext { session, workspace }, services)
     }
@@ -1161,9 +1373,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_review_has_no_human_fallback_and_allow_requires_owned_retry_lease() {
+    async fn auto_review_allow_and_human_handoff_require_an_owned_retry_lease() {
         for outcome in [
             FixedGuardianOutcome::Allow,
+            FixedGuardianOutcome::AskUser,
             FixedGuardianOutcome::Deny,
             FixedGuardianOutcome::Fail,
         ] {
@@ -1204,15 +1417,271 @@ mod tests {
                 .await;
             drop(context);
             match guardian.outcome {
-                FixedGuardianOutcome::Allow => {
+                FixedGuardianOutcome::Allow
+                | FixedGuardianOutcome::AskUser
+                | FixedGuardianOutcome::Fail => {
                     assert!(matches!(result, Err(ToolError::Message(_))))
                 }
-                FixedGuardianOutcome::Deny | FixedGuardianOutcome::Fail => {
+                FixedGuardianOutcome::Deny => {
                     assert!(matches!(result, Err(ToolError::PermissionDenied { .. })))
                 }
             }
             assert_eq!(guardian.requests, 1);
             assert_eq!(prompt.requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_review_handoff_keeps_exact_claim_until_human_decision_and_rechecks_authority() {
+        struct HandoffGuardian {
+            lease: Option<crate::storage::PermissionReviewLease>,
+            timeout: bool,
+            risk_level: PermissionRiskLevel,
+        }
+        #[async_trait::async_trait(?Send)]
+        impl PermissionGuardian for HandoffGuardian {
+            async fn review(
+                &mut self,
+                _request: &crate::tool::PermissionRequest,
+                _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
+            ) -> Result<PermissionGuardianAssessment, PermissionGuardianError> {
+                if self.timeout {
+                    Err(PermissionGuardianError::TotalDeadline {
+                        milliseconds: 60_000,
+                    })
+                } else {
+                    Ok(PermissionGuardianAssessment {
+                        risk_level: self.risk_level,
+                        rationale: "接続先の確認が必要です".into(),
+                    })
+                }
+            }
+            fn take_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
+                self.lease.take()
+            }
+        }
+        struct HandoffPrompt {
+            store: StoreBundle,
+            lease: crate::storage::PermissionReviewLease,
+            control: RunControl,
+            action: &'static str,
+            requests: usize,
+        }
+        impl ConfirmationPrompt for HandoffPrompt {
+            fn confirm(
+                &mut self,
+                request: &crate::tool::PermissionRequest,
+            ) -> Result<ReviewDecision, crate::error::CliPromptError> {
+                self.requests += 1;
+                let claim = self.lease.claim();
+                let fence = self.store.permission_retry_fence_store();
+                assert_eq!(
+                    fence.record(&claim.key).unwrap().unwrap().state,
+                    crate::storage::PermissionRetryFenceState::Reviewing
+                );
+                assert!(matches!(
+                    fence
+                        .begin_review(
+                            claim.key.clone(),
+                            claim.authority_history_item_id,
+                            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        )
+                        .unwrap(),
+                    crate::storage::BeginPermissionReview::Blocked(_)
+                ));
+                assert_eq!(request.summary, "run exact command");
+                assert_eq!(
+                    request.targets,
+                    vec![Utf8PathBuf::from("C:/workspace/target")]
+                );
+                assert!(
+                    request
+                        .details
+                        .iter()
+                        .any(|detail| detail.contains("代理承認からの確認"))
+                );
+                match self.action {
+                    "denied" => Ok(ReviewDecision::Denied),
+                    "abort" => Ok(ReviewDecision::Abort),
+                    "stop" => {
+                        self.control
+                            .interrupt(crate::protocol::TurnInterruptionCause::UserStop);
+                        Ok(ReviewDecision::Approved)
+                    }
+                    "authority_changed" => {
+                        self.store
+                            .protocol_event_store()
+                            .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                                id: crate::protocol::HistoryItemId::new(),
+                                session_id: claim.key.root_session_id(),
+                                scope: crate::protocol::HistoryScope::Turn {
+                                    turn_id: TurnId::new(),
+                                },
+                                sequence_no: 1,
+                                created_at_ms: 2,
+                                payload: crate::protocol::HistoryItemPayload::UserTurn {
+                                    content: vec![crate::protocol::ContentPart::Text {
+                                        text: "stop the previous action".into(),
+                                    }],
+                                    prompt_dispatch: None,
+                                    editor_context: None,
+                                },
+                            })
+                            .unwrap();
+                        Ok(ReviewDecision::Approved)
+                    }
+                    "lost_claim" => {
+                        assert_eq!(
+                            self.lease.release().unwrap(),
+                            crate::storage::PermissionReviewTransition::Applied
+                        );
+                        Ok(ReviewDecision::Approved)
+                    }
+                    _ => Ok(ReviewDecision::Approved),
+                }
+            }
+        }
+        for action in [
+            "approved",
+            "denied",
+            "abort",
+            "stop",
+            "authority_changed",
+            "lost_claim",
+            "timeout",
+            "unknown",
+        ] {
+            let (config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+            let authority_id = crate::protocol::HistoryItemId::new();
+            services
+                .store
+                .protocol_event_store()
+                .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                    id: authority_id,
+                    session_id: session.session.id,
+                    scope: crate::protocol::HistoryScope::Turn {
+                        turn_id: TurnId::new(),
+                    },
+                    sequence_no: 0,
+                    created_at_ms: 1,
+                    payload: crate::protocol::HistoryItemPayload::UserTurn {
+                        content: vec![crate::protocol::ContentPart::Text {
+                            text: "perform the requested work".into(),
+                        }],
+                        prompt_dispatch: None,
+                        editor_context: None,
+                    },
+                })
+                .unwrap();
+            let key = crate::storage::PermissionRetryFenceKey::new(
+                session.session.id,
+                1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+            let lease = match services
+                .store
+                .permission_retry_fence_store()
+                .begin_review(
+                    key.clone(),
+                    authority_id,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .unwrap()
+            {
+                crate::storage::BeginPermissionReview::Claimed(lease) => lease,
+                other => panic!("expected claim: {other:?}"),
+            };
+            let control = RunControl::new();
+            let mut guardian = HandoffGuardian {
+                lease: Some(lease.clone()),
+                timeout: action == "timeout",
+                risk_level: if action == "unknown" {
+                    PermissionRiskLevel::Unknown
+                } else {
+                    PermissionRiskLevel::High
+                },
+            };
+            let mut prompt = HandoffPrompt {
+                store: services.store.clone(),
+                lease: lease.clone(),
+                control: control.clone(),
+                action,
+                requests: 0,
+            };
+            let mut context = ToolContext {
+                session: &session,
+                workspace: &session.workspace,
+                config: &config,
+                tool_call_id: ToolCallId::new(),
+                cancel: control.token(),
+                run_control: control.clone(),
+                run_mutation_fence: RunMutationFence::new(
+                    services.store.session_repo(),
+                    session.session.id,
+                    AdmissionId::new(),
+                    TurnId::new(),
+                    control.clone(),
+                ),
+                prompt: &mut prompt,
+                services: &services,
+                agent: None,
+                permission_guardian: Some(&mut guardian),
+            };
+            let result = context
+                .confirm_if_needed(
+                    AccessKind::Shell,
+                    "run exact command".into(),
+                    vec![Utf8PathBuf::from("C:/workspace/target")],
+                    true,
+                    vec![crate::tool::PermissionRisk::ExternalConnection],
+                )
+                .await;
+            drop(context);
+            assert_eq!(prompt.requests, 1, "{action}");
+            match action {
+                "approved" | "timeout" | "unknown" => {
+                    let admission = result.as_ref().unwrap();
+                    assert!(matches!(
+                        admission.sandbox_plan(),
+                        ProcessSandboxPlan::Unrestricted
+                    ));
+                    admission.admit().expect("human-approved exact admission");
+                    assert!(!control.is_cancelled());
+                }
+                "authority_changed" => assert!(matches!(
+                    result.as_ref().unwrap().admit(),
+                    Err(ToolError::PermissionDenied { .. })
+                )),
+                "denied" => assert!(matches!(result, Err(ToolError::PermissionDenied { .. }))),
+                "abort" => assert!(matches!(result, Err(ToolError::PermissionAborted))),
+                "stop" => assert!(matches!(result, Err(ToolError::RunInterrupted))),
+                "lost_claim" => assert!(matches!(result, Err(ToolError::Message(_)))),
+                _ => unreachable!(),
+            }
+            drop(result);
+            drop(prompt);
+            drop(guardian);
+            drop(lease);
+            let stored = services
+                .store
+                .permission_retry_fence_store()
+                .record(&key)
+                .unwrap();
+            if action == "denied" {
+                assert_eq!(
+                    stored.unwrap().state,
+                    crate::storage::PermissionRetryFenceState::Denied
+                );
+            } else {
+                assert!(
+                    stored.is_none(),
+                    "{action}: stale or settled claim must not survive"
+                );
+            }
+            if matches!(action, "denied" | "abort" | "stop" | "lost_claim") {
+                assert!(control.is_cancelled(), "{action}");
+            }
         }
     }
 
@@ -1430,6 +1899,363 @@ mod tests {
 
         assert!(matches!(admission.admit(), Err(ToolError::Message(_))));
         assert!(control.is_cancelled());
+    }
+
+    fn started_effect_review_lease(
+        services: &ToolServices,
+        session_id: SessionId,
+    ) -> (
+        crate::storage::PermissionRetryFenceKey,
+        crate::protocol::HistoryItemId,
+        crate::storage::PermissionReviewLease,
+    ) {
+        let authority_id = crate::protocol::HistoryItemId::new();
+        services
+            .store
+            .protocol_event_store()
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                id: authority_id,
+                session_id,
+                scope: crate::protocol::HistoryScope::Turn {
+                    turn_id: TurnId::new(),
+                },
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "start a managed process, then independently verify it".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+            })
+            .expect("seed canonical authority");
+        let key = crate::storage::PermissionRetryFenceKey::new(
+            session_id,
+            1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("retry key");
+        let lease = match services
+            .store
+            .permission_retry_fence_store()
+            .begin_review(
+                key.clone(),
+                authority_id,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .expect("begin review")
+        {
+            crate::storage::BeginPermissionReview::Claimed(lease) => lease,
+            other => panic!("expected claimed review, got {other:?}"),
+        };
+        (key, authority_id, lease)
+    }
+
+    #[tokio::test]
+    async fn started_effect_finish_releases_the_review_before_worker_ticket_is_dropped() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let (key, authority_id, lease) = started_effect_review_lease(&services, session.session.id);
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record allow"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .with_permission_retry_lease(Some(lease));
+        let worker_ticket = admission.clone();
+        worker_ticket
+            .admit()
+            .expect("admit the exact startup effect");
+        admission
+            .finish_started_effect()
+            .expect("settle successful startup");
+        assert!(!control.is_cancelled());
+
+        let store = services.store.permission_retry_fence_store();
+        assert!(store.record(&key).expect("read released fence").is_none());
+        let next_lease = match store
+            .begin_review(
+                key.clone(),
+                authority_id,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .expect("review the independent follow-up under the same user instruction")
+        {
+            crate::storage::BeginPermissionReview::Claimed(lease) => lease,
+            other => panic!("expected a new review after startup, got {other:?}"),
+        };
+        drop(worker_ticket);
+        assert_eq!(
+            store
+                .record(&key)
+                .expect("read subsequent review")
+                .expect("worker cleanup must preserve the new review")
+                .review_id,
+            next_lease.claim().review_id
+        );
+        assert_eq!(
+            next_lease.release().expect("release fixture review"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+    }
+
+    #[test]
+    fn started_effect_finish_without_auto_review_does_not_cancel_the_run() {
+        let control = RunControl::new();
+        ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .finish_started_effect()
+            .expect("startup with no automatic review needs no fence settlement");
+        assert!(!control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn started_effect_finish_waits_for_transient_sqlite_contention() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let (key, _authority_id, lease) =
+            started_effect_review_lease(&services, session.session.id);
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record allow"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .with_permission_retry_lease(Some(lease));
+        admission.admit().expect("admit one effect");
+        let database = rusqlite::Connection::open(&services.storage_paths.database_path)
+            .expect("open isolated fixture writer");
+        database
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold an external writer during settlement");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal settlement start");
+            finished_tx
+                .send(admission.finish_started_effect())
+                .expect("return checked settlement");
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("settlement worker started");
+        let early_result = finished_rx.recv_timeout(std::time::Duration::from_millis(50));
+        database
+            .execute_batch("ROLLBACK")
+            .expect("release writer before checking assertions");
+        let waited_for_writer = matches!(
+            &early_result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let result = match early_result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("settlement completed after writer released"),
+            Err(error) => panic!("settlement worker disconnected: {error}"),
+        };
+        worker.join().expect("join settlement worker");
+        assert!(
+            waited_for_writer,
+            "a response must wait for checked settlement"
+        );
+        result.expect("transient contention must not leave a blocking approved fence");
+        assert!(!control.is_cancelled());
+        assert!(
+            services
+                .store
+                .permission_retry_fence_store()
+                .record(&key)
+                .expect("read settled approval")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn started_effect_finish_lost_ownership_fails_the_run() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let (_key, _authority_id, lease) =
+            started_effect_review_lease(&services, session.session.id);
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record allow"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .with_permission_retry_lease(Some(lease.clone()));
+        admission.admit().expect("admit startup");
+        assert_eq!(
+            lease.release().expect("remove the owned fixture claim"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+
+        assert!(matches!(
+            admission.finish_started_effect(),
+            Err(ToolError::Message(_))
+        ));
+        assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn started_effect_finish_storage_failure_fails_the_run_and_retains_the_fence() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let (key, _authority_id, lease) =
+            started_effect_review_lease(&services, session.session.id);
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record allow"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .with_permission_retry_lease(Some(lease.clone()));
+        admission.admit().expect("admit startup");
+        let database = rusqlite::Connection::open(&services.storage_paths.database_path)
+            .expect("open this test's isolated database");
+        database
+            .execute_batch(
+                "CREATE TRIGGER fixture_block_fence_release
+                 BEFORE DELETE ON permission_retry_fences
+                 BEGIN SELECT RAISE(ABORT, 'fixture release failure'); END;",
+            )
+            .expect("inject a durable-settlement failure");
+
+        assert!(matches!(
+            admission.finish_started_effect(),
+            Err(ToolError::Message(_))
+        ));
+        assert!(control.is_cancelled());
+        assert_eq!(
+            services
+                .store
+                .permission_retry_fence_store()
+                .record(&key)
+                .expect("read retained fence")
+                .expect("failed settlement must remain fenced")
+                .state,
+            crate::storage::PermissionRetryFenceState::Admitted
+        );
+        database
+            .execute_batch("DROP TRIGGER fixture_block_fence_release;")
+            .expect("remove fixture failure");
+        assert_eq!(
+            lease.release().expect("clean up owned fixture claim"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn started_effect_finish_cannot_remove_a_denied_claim() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let (key, _authority_id, lease) =
+            started_effect_review_lease(&services, session.session.id);
+        assert_eq!(
+            lease
+                .mark_denied(crate::storage::PermissionRetryFenceOutcome::GuardianDenied)
+                .expect("record Guardian denial"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::Unrestricted)
+            .with_permission_retry_lease(Some(lease));
+
+        assert!(matches!(
+            admission.finish_started_effect(),
+            Err(ToolError::Message(_))
+        ));
+        assert!(control.is_cancelled());
+        let denied = services
+            .store
+            .permission_retry_fence_store()
+            .record(&key)
+            .expect("read rejection fence")
+            .expect("settlement must not remove a rejected operation");
+        assert_eq!(
+            denied.state,
+            crate::storage::PermissionRetryFenceState::Denied
+        );
+        assert_eq!(
+            denied.outcome,
+            Some(crate::storage::PermissionRetryFenceOutcome::GuardianDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_wait_fence_reads_cross_store_steer_without_an_agent_or_consuming_input() {
+        use crate::protocol::{SteerTurn, UserInputItem, UserTurn};
+
+        let (store, session_id) = fence_test_session().await;
+        let repo = store.session_repo();
+        let turn_id = TurnId::new();
+        let admitted = repo
+            .admit_session_turn(session_id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let admission_id = admitted.admission_id;
+        repo.append_user_turn_with_protocol_bundle(
+            session_id,
+            admission_id,
+            &UserTurn {
+                turn_id,
+                items: vec![UserInputItem::Text {
+                    text: "Wait for the remote task".into(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+            turn_id,
+            0,
+        )
+        .await
+        .unwrap();
+        let fence = RunMutationFence::new(
+            repo.clone(),
+            session_id,
+            admission_id,
+            turn_id,
+            RunControl::new(),
+        );
+        assert_eq!(
+            fence.origin_turn_revision().await.unwrap(),
+            admitted.admission_revision
+        );
+        assert!(!fence.has_pending_turn_steer_input().unwrap());
+        let other_store = StoreBundle::new(SqliteStore::open(store.paths()).unwrap());
+        let steer_id = other_store
+            .session_repo()
+            .accept_active_turn_steer(
+                session_id,
+                1,
+                &SteerTurn {
+                    expected_turn_id: turn_id,
+                    items: vec![UserInputItem::Text {
+                        text: "Inspect the latest result first".into(),
+                    }],
+                    additional_context: Default::default(),
+                    client_user_message_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(fence.has_pending_turn_steer_input().unwrap());
+        assert!(fence.has_pending_turn_steer_input().unwrap());
+        let stale = RunMutationFence::new(
+            repo.clone(),
+            session_id,
+            admission_id,
+            TurnId::new(),
+            RunControl::new(),
+        );
+        assert!(stale.has_pending_turn_steer_input().is_err());
+        assert_eq!(
+            repo.deliver_all_pending_turn_steers_for_admitted_turn(
+                session_id,
+                admission_id,
+                turn_id
+            )
+            .unwrap(),
+            vec![steer_id]
+        );
+        assert!(!fence.has_pending_turn_steer_input().unwrap());
     }
 
     #[tokio::test]

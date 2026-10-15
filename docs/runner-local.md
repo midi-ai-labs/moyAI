@@ -1,0 +1,84 @@
+# 独立ローカル Runner
+
+`moyai-runner` は Windows 上で Desktop とは別プロセスとして通常の Agent を実行する入口です。共有提供を設定していない専用の私用PCでは、Hubの登録やログインは不要です。投入用CLIの終了、Desktopの×によるトレイ格納、クラッシュや画面接続断だけではRunnerの実行は停止しません。
+
+Desktopのメニューまたはトレイの「終了」は、接続しているこのPCのRunnerへ正常終了を要求します。実行中の仕事と保持アプリを停止し、Runnerの実プロセス終了を確認してからDesktopを終了します。Hub本体は別に管理します。この終了連携を含まない従来の配布物から更新する場合は、[Windowsの更新手順](user/windows-setup.md#更新アンインストール)に従ってRunnerをCLIから終了してください。
+
+複数人で使う実行用PCを設定する場合は、[共有RunnerのGUI手順](runner-shared.md#desktopの画面から提供する)から始めてください。実行PCではDesktopで場所・権限を一度確認し、Hub管理者がプロジェクトへ操作PCと実行PCを選ぶと、自動で準備します。通常はRunnerを手動起動しません。このページはローカル投入用のCLIと、その実行・停止の契約を説明します。
+
+ローカル受付は単一Agentの実行を対象とします。専用の私用PCではHub不要です。共有提供を設定したPCでは、Desktop・CLI・TUIが実行前にHubの共通資源枠を確保します。既定のDevice範囲は、別フォルダ・別config・パス別名からの実行も同じ端末資源へ参加させます。個別moyAI接続による新しい仕事の委任は廃止したため、Hubのプロジェクトから依頼してください。保存済みの履歴・状態確認・停止と、一般の外部MCPは維持します。サーバー側の利用者資格を遠隔利用者の代わりに使いません。
+
+提供したOSアカウント以外からの直接実行は受け付けません。そのアカウントのDesktopからHubへ共有仕事を送信し、提供Runnerに実行させてください。ProgramDataの固定policyは全Windowsユーザーが読み、提供operator・SYSTEM・Administratorsだけが変更できます。初回設置に必要な権限がない場合は提供設定を拒否し、自動昇格しません。管理外のアプリをOS全体で停止・隔離する機能ではありません。
+
+Device範囲では、本人が選んだprojectに属する現在有効な公開環境から共通枠を確保します。利用可能な環境がなければ受付を拒否し、別projectや私用実行へ切り替えません。全ユーザーが読むDevice policyには提供Runnerへの接続情報だけを置き、project名・作業フォルダ一覧は公開しません。明示的なWorkspaceIsolationでは、対象フォルダの環境との対応を維持します。
+
+## 起動と投入
+
+非管理者の Windows ユーザーで起動します。Runner は昇格・サービスとして動作せず、同じユーザー・ログオン・有効な権限のクライアントだけを named pipe で受け付けます。通信相手が申告する名前や localhost の token を OS 本人性の証拠には使いません。外部からの共有サーバー公開は行いません。
+
+`serve`を単独で起動するときは、制限付きコマンドを実行する起動補助機能についてWindowsの管理者承認を一度求めます。承認を取り消すと起動を中止します。Desktopが自動起動するRunnerはDesktopで承認済みの補助機能を引き継ぐため、もう一度の承認は求めません。`identity`や`status`など、起動済みRunnerへの操作だけでは管理者承認を求めません。Windowsサインイン時の独立した自動起動も、起動時の承認が必要です。
+
+```powershell
+moyai-runner serve
+```
+
+別のターミナルから起動 ID を取得し、一度生成した実行 ID を保管して投入します。
+
+```powershell
+$runnerInfo = moyai-runner identity | ConvertFrom-Json
+$runnerId = $runnerInfo.identity.runner_id
+$runId = moyai-runner new-id
+moyai-runner run --runner $runnerId --run $runId --directory C:\work\private --single-agent "作業の依頼"
+moyai-runner status --runner $runnerId --run $runId
+moyai-runner list --runner $runnerId
+```
+
+`--single-agent` は今回の実行だけ子 Agent を無効にします。グローバル設定の `multi_agent.enabled = false` であれば省略できます。既存セッションへ新しいユーザー指示を送る場合は `--session <session ID>` も指定します。子 Agent の記録を持つセッションと遠隔受入のセッションは、この入口では再開しません。通常のセッション・workspace・turn の検証を通るため、実行中の別 turn を上書きしません。
+
+モデル接続・permission は通常のローカル設定を使います。`default` で追加承認が必要な操作だけ `waiting_approval` になり、`status` が返す正確な `approval_id` で回答します。`auto_review` と `full_access` の意味は既存の Agent と同じです。フルアクセスでも OS の管理者権限へは昇格しません。
+
+```powershell
+moyai-runner approve --runner $runnerId --run $runId --approval <approval_id> approve
+# 回答は approve / deny / stop
+moyai-runner stop --runner $runnerId --run $runId
+moyai-runner shutdown --runner $runnerId
+```
+
+## 実行と結果の寿命
+
+一つのRunnerが同時に受け付けるrootは一つです。終了したrootがmanaged shell processを保持している場合は`processes_running`と表示し、実際のprocess終了まで次の投入を拒否します。`stop`はその実行のmanaged processも停止し、`shutdown`は全実行とmanaged processの終了を待ちます。共有提供PCの共通枠は別構成のmoyAI入口にも適用され、子Agentとmanaged processの終了まで返却しません。
+
+Hubからの取消も、完了ターンが保持するmanaged processまで停止対象にします。取消監視の終了を確認してから共通枠を返却するため、古い実行の監視が後続実行へ停止を送ることはありません。
+
+実 worker と managed process の終了を確認した受付記録は確定します。同じセッションへ別の実行 ID で追加しても古い結果を実行中へ戻しません。確定した古い ID への `stop` も、新しい実行の結果や process に影響しません。
+
+投入応答が失われた場合は、同じ Runner 起動 ID、実行 ID、内容で再送するか照会します。異なる内容への ID 再利用は拒否します。クライアントは新しい ID を自動生成して再試行しないでください。
+
+このローカル受付台帳は一つのRunnerの寿命に限定します。Runnerを再起動すると起動IDが変わり、旧IDの操作を拒否します。通常のcanonicalセッション履歴は保存されますが、ローカル仕事はプロセス再起動後に自動実行再開しません。共有modeの永続journalとは別の契約です。`status`の最終回答は最大32KiBの表示用抜粋で、完全な履歴は保存されたセッションから確認できます。
+
+同じ構成では受け付けた ID を最大 128 件保持し、古い ID を破棄して同一要求が再実行されることを防ぎます。上限後はセッション ID を保管し、実行を終了してから Runner を再起動します。構成の位置は既存の `MOYAI_CONFIG_PATH`、データの位置は `MOYAI_DATA_DIR` を使います。起動側と各クライアントで一致させてください。
+
+## 提供PCで使うプロジェクト
+
+Desktopでは、登録PCに許可されたプロジェクトを選びます。CLI/TUIからは次のコマンドで提供Runnerの対象を選びます。ユーザー名やパスワードは不要です。同じWindows利用者のIPCを通し、各実行受付で登録PCに結び付く現在の資格を取得します。
+
+```powershell
+moyai-runner use-project --runner <提供RunnerのID> --project <プロジェクトID>
+moyai-runner clear-project --runner <提供RunnerのID>
+```
+
+`clear-project`はプロジェクト選択だけを解除します。HubのPC登録や仕事の履歴を削除しません。無効・失効した資格から私用実行へ切り替えず、旧remoteの呼出人をローカル利用者の資格で代用しません。
+
+ローカル実行の会話をHubへ自動公開しません。Hubには担当者・project・実行先・占有・終端を記録します。共有仕事の承認はHubで、ローカル仕事は従来のpermission/Guardian経路で判断します。
+
+## 実プロセス検証
+
+機械単位の製品policyを試験で変更しないため、`tests/runner_host.rs`の6件は専用gateです。current libtest内の`runner::shared::process_fixture::isolated_runner_process`が同じRunnerHost・named pipe・SharedWorkerを起動し、policyの保存先だけを`cfg(test)`で隔離します。製品の`serve`と同じ補助機能の起動処理を通り、shutdown完了まで接続を保持します。[Windows native testhostの手順](testing-windows-sandbox.md)で管理者承認を済ませたtesthostの`MOYAI_SANDBOX_ENDPOINT`を、このgateの試験プロセスへ渡してください。IPC consumerはcurrent製品binaryを使います。接続先変更のケースでは、停止済みHubに接続する受付停止中のRunnerに対し、実際のDesktop helperから静止確認のIPCを送り、同じprocess handleの終了待ち・同意保持・再起動後の受付停止も検証します。
+
+```powershell
+# 直前に cargo test --lib --no-run で生成されたcurrent libtest.exeを指定する
+$env:MOYAI_TEST_RUNNER_LIB_EXE = 'C:\...\target\debug\deps\moyai-<hash>.exe'
+cargo test --offline --test runner_host -- --ignored --test-threads=1
+```
+
+環境変数がない状態を成功扱いしません。標準full suiteとこの6件の結果を別に記録します。通常の製品binaryにはmachine policyを迂回する設定・環境変数・起動flagはありません。

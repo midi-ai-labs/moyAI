@@ -522,7 +522,7 @@ impl SqlitePermissionRetryFenceStore {
     }
 }
 
-fn latest_authority_history_item_id(
+pub(crate) fn latest_authority_history_item_id(
     connection: &Connection,
     root_session_id: SessionId,
 ) -> Result<Option<HistoryItemId>, StorageError> {
