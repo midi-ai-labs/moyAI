@@ -518,8 +518,9 @@ mod tests {
         let mut staged = tempfile::NamedTempFile::new_in(directory)?;
         std::io::copy(&mut contents, staged.as_file_mut())?;
         staged.as_file().sync_all()?;
-        // The private endpoint becomes readable only after publication completes.
+        // Close the writer before publication so Windows readers can open immediately.
         staged
+            .into_temp_path()
             .persist_noclobber(path)
             .map_err(|error| error.error)?;
         Ok(())
