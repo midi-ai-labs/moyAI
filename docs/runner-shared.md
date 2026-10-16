@@ -1,6 +1,8 @@
 # Hubに接続する共有Runner
 
-Runnerは各PCで仕事を動かす独立プロセスです。通常はDesktopが起動・再接続を管理します。Desktopの×によるトレイ格納、クラッシュや画面接続断では受け付けた仕事は続きます。メニューまたはトレイの「終了」は、接続しているこのPCのRunnerの仕事・保持アプリを正常停止し、Runnerの実プロセス終了を確認してからDesktopを終了します。Hub本体は別に管理します。Windowsの終了・サインアウト後の継続やWindows serviceによる無人運転は提供しません。
+Runnerは各PCで仕事を動かす独立した通常ユーザーのプロセスです。通常はDesktopが起動・再接続を管理します。Desktopの×によるトレイ格納、クラッシュや画面接続断では受け付けた仕事は続きます。メニューまたはトレイの「終了」は、接続しているこのPCのRunnerの仕事・保持アプリを正常停止し、Runnerの実プロセス終了を確認してからDesktopを終了します。Hub本体は別に管理します。Windowsの終了・サインアウト後もRunnerをWindows serviceとして動かす無人運転は提供しません。
+
+制限付きコマンドには、[Windowsセットアップ](user/windows-setup.md)で導入する固定の`MoyAISandbox` serviceを利用します。初回導入・更新・削除時だけUACが必要で、DesktopやRunnerの通常起動・サインイン時自動起動では不要です。補助serviceは利用時に開始し、最後の起動familyとJobの清算後に停止します。登録とProgram Files配下の固定EXEは残り、Runner自身のWindows service化や操作権限の追加は行いません。個々の操作の承認と許可範囲外への制限は維持します。更新・削除前には、そのPCのすべてのmoyAIとRunnerを正常終了してください。
 
 ## Desktopの画面から提供する
 

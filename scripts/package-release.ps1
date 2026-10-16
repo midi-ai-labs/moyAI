@@ -147,6 +147,8 @@ try {
       if (-not (Test-Path -LiteralPath (Join-Path $WebView2FixedRuntimePath $name) -PathType Leaf)) { throw "Fixed WebView2 runtime is incomplete: $name" }
     }
     Assert-MoyaiX64Pe (Join-Path $WebView2FixedRuntimePath 'msedgewebview2.exe')
+    $vcDlls = @(Get-ChildItem -LiteralPath $VcRuntimePath -Recurse -File -Force | Where-Object { $_.Extension -ieq '.dll' })
+    if ($vcDlls.Count -ne 3) { throw 'App-local VC++ inputs must contain exactly vcruntime140.dll, vcruntime140_1.dll and msvcp140.dll. Extra DLLs are not copied or silently excluded.' }
     foreach ($name in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
       $path = Join-Path $VcRuntimePath $name
       if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "App-local VC++ runtime is incomplete: $name" }
@@ -356,7 +358,7 @@ try {
   Copy-RequiredFile $runnerExe (Join-Path $releaseRoot "app\bin\moyai-runner.exe")
   Copy-RequiredFile $sandboxExe (Join-Path $releaseRoot "app\bin\moyai-sandbox.exe")
   Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup.exe")
-  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1')) {
+  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1')) {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$script") (Join-Path $releaseRoot "scripts\$script")
   }
   foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd')) {
@@ -407,6 +409,7 @@ try {
     desktop = $buildIdentity
     hub = $hubIdentity
     hub_compatibility_verified = $hubCompatibilityVerified
+    machine_sandbox = [ordered]@{ service='MoyAISandbox'; setup='scripts/Setup-Sandbox.ps1' }
     runtime = [ordered]@{
       webview2 = if ($RuntimeMode -eq 'Bundled') { 'bundled-fixed' } else { 'system-installed' }
       visual_cpp = if ($RuntimeMode -eq 'Bundled') { 'app-local' } else { 'system-installed' }

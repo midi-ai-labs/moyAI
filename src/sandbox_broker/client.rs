@@ -19,10 +19,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::Threading::*;
-use windows_sys::Win32::UI::Shell::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use super::native::{self, Handle, Peer, wide};
+use super::installed::InstalledService;
+use super::native::{self, Handle, Peer};
 use super::wire::{Request, Response, Run, VERSION};
 use crate::tool::os_sandbox::WorkspaceWriteSandboxProfile;
 use crate::tool::sandbox_process::{
@@ -43,8 +42,9 @@ struct Endpoint {
 
 pub struct LaunchGuard {
     endpoint: Arc<Endpoint>,
-    bootstrap: Option<Handle>,
+    owns_launch: bool,
     attached: Option<Handle>,
+    _installed: InstalledService,
     _source_ancestors: Vec<File>,
     _source_pin: File,
     _runtime_pins: Vec<File>,
@@ -97,7 +97,7 @@ fn verify_source_kind(file: &File, path: &Path, directory: bool) -> Result<(), S
     Ok(())
 }
 
-fn pin_source_ancestors(path: &Path) -> Result<Vec<File>, String> {
+pub(super) fn pin_source_ancestors(path: &Path) -> Result<Vec<File>, String> {
     if !path.is_absolute() {
         return Err("Sandbox startup source must have an absolute path".into());
     }
@@ -136,7 +136,7 @@ fn pin_source_ancestors(path: &Path) -> Result<Vec<File>, String> {
     Ok(pins)
 }
 
-fn pin_helper(path: &Path) -> Result<(File, [u8; 32]), String> {
+pub(super) fn pin_helper(path: &Path) -> Result<(File, [u8; 32]), String> {
     let mut file = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
@@ -161,7 +161,7 @@ fn pin_helper(path: &Path) -> Result<(File, [u8; 32]), String> {
     Ok((file, hash.finalize().into()))
 }
 
-fn pin_bundled_runtime(path: &std::path::Path) -> Result<Vec<File>, String> {
+pub(super) fn pin_bundled_runtime(path: &std::path::Path) -> Result<Vec<File>, String> {
     let directory = path
         .parent()
         .ok_or("Sandbox helper has no installation directory")?;
@@ -204,7 +204,7 @@ fn active() -> Result<Arc<Endpoint>, String> {
         super::validate_session(&endpoint.session)?;
         return Ok(Arc::new(endpoint));
     }
-    Err("起動時の管理者承認が完了していません。moyAIを再起動してください。コマンドを制限外で再実行することはありません。".into())
+    Err("Windows実行補助サービスへの接続が確立していません。moyAIを再起動してください。コマンドを制限外で再実行することはありません。".into())
 }
 
 /// Passed explicitly only to an application-owned Runner, never to agent commands.
@@ -220,10 +220,39 @@ pub fn inherited_endpoint() -> Result<Option<String>, String> {
 }
 
 fn connect(endpoint: &Endpoint, helper_hash: &[u8; 32]) -> Result<(Handle, Handle), String> {
-    let pipe = native::open_pipe(&super::pipe_name(&endpoint.session))?;
+    let installed = InstalledService::open(helper_hash)?;
+    connect_installed(endpoint, helper_hash, &installed)
+}
+
+fn connect_installed(
+    endpoint: &Endpoint,
+    helper_hash: &[u8; 32],
+    installed: &InstalledService,
+) -> Result<(Handle, Handle), String> {
+    let pid = installed.running_pid()?;
+    connect_at(
+        endpoint,
+        helper_hash,
+        super::service_pipe_name(),
+        pid,
+        |path| installed.is_image(path),
+    )
+}
+
+fn connect_at(
+    endpoint: &Endpoint,
+    helper_hash: &[u8; 32],
+    name: &str,
+    expected_pid: u32,
+    is_image: impl FnOnce(&Path) -> bool,
+) -> Result<(Handle, Handle), String> {
+    let pipe = native::open_pipe(name)?;
     let mut pid = 0;
     if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut pid) } == 0 {
         return Err(native::last("identify sandbox server"));
+    }
+    if pid != expected_pid {
+        return Err("Sandbox pipe server differs from the installed service process".into());
     }
     let server = Handle::checked(
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) },
@@ -238,6 +267,9 @@ fn connect(endpoint: &Endpoint, helper_hash: &[u8; 32]) -> Result<(Handle, Handl
         return Err("Sandbox server is not the approved SYSTEM helper".into());
     }
     let path = native::process_image(server.0)?;
+    if !is_image(&path) {
+        return Err("Sandbox server image differs from the fixed installed helper".into());
+    }
     let (_pin, observed_hash) = pin_helper(&path)?;
     if &observed_hash != helper_hash {
         return Err("Sandbox helper binary differs from this moyAI installation".into());
@@ -277,15 +309,16 @@ pub fn start() -> Result<LaunchGuard, String> {
     let path = helper_path()?;
     let source_ancestors = pin_source_ancestors(&path)?;
     let (pin, hash) = pin_helper(&path)?;
-    // Pin the existing app-local VC runtime set before elevation. Directory
+    // Pin the existing app-local VC runtime set before connecting. Directory
     // pins prevent path replacement, not creation of previously absent files.
     let runtime_pins = pin_bundled_runtime(&path)?;
+    let installed = InstalledService::open(&hash)?;
     if std::env::var_os(INHERITED_ENDPOINT).is_some() {
         let endpoint = active()?;
         if endpoint.user != peer.user {
             return Err("Inherited sandbox belongs to another Windows user".into());
         }
-        let (pipe, _) = connect(&endpoint, &hash)?;
+        let (pipe, _) = connect_installed(&endpoint, &hash, &installed)?;
         let deadline = Instant::now() + Duration::from_secs(10);
         native::write_frame(
             pipe.0,
@@ -304,8 +337,9 @@ pub fn start() -> Result<LaunchGuard, String> {
             .map_err(|_| "Sandbox launch state is poisoned")? = Some(endpoint.clone());
         return Ok(LaunchGuard {
             endpoint,
-            bootstrap: None,
+            owns_launch: false,
             attached: Some(pipe),
+            _installed: installed,
             _source_ancestors: source_ancestors,
             _source_pin: pin,
             _runtime_pins: runtime_pins,
@@ -325,31 +359,15 @@ pub fn start() -> Result<LaunchGuard, String> {
         parent_created: peer.created,
         user: peer.user,
     });
-    let arguments = wide(&format!(
-        "--elevated-bootstrap --session {} --parent-pid {} --parent-created {} --user {}",
-        endpoint.session, endpoint.parent_pid, endpoint.parent_created, endpoint.user
-    ));
-    let executable = wide(path.to_str().ok_or("Sandbox helper path is not UTF-8")?);
-    let verb = wide("runas");
-    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
-    info.lpVerb = verb.as_ptr();
-    info.lpFile = executable.as_ptr();
-    info.lpParameters = arguments.as_ptr();
-    info.nShow = SW_HIDE;
-    if unsafe { ShellExecuteExW(&mut info) } == 0 {
-        return Err(if unsafe { GetLastError() } == ERROR_CANCELLED {
-            "管理者承認が取り消されたため、moyAIの起動を中止しました。".into()
-        } else {
-            native::last("起動補助プログラムを開始できません")
-        });
-    }
-    let bootstrap = Handle::checked(info.hProcess, "start sandbox bootstrap")?;
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut last_error = String::new();
     while Instant::now() < deadline {
-        match connect(&endpoint, &hash) {
+        // Only startup can retry an idle-stop race. Once this family is
+        // established, losing the service never replays a command or a lease.
+        match installed.start_if_stopped().and_then(|pid| {
+            pid.ok_or_else(|| "Windows実行補助サービスを起動中です。".to_string())?;
+            connect_installed(&endpoint, &hash, &installed)
+        }) {
             Ok(_) => {
                 *ACTIVE
                     .get_or_init(|| Mutex::new(None))
@@ -357,8 +375,9 @@ pub fn start() -> Result<LaunchGuard, String> {
                     .map_err(|_| "Sandbox launch state is poisoned")? = Some(endpoint.clone());
                 return Ok(LaunchGuard {
                     endpoint,
-                    bootstrap: Some(bootstrap),
+                    owns_launch: true,
                     attached: None,
+                    _installed: installed,
                     _source_ancestors: source_ancestors,
                     _source_pin: pin,
                     _runtime_pins: runtime_pins,
@@ -366,9 +385,7 @@ pub fn start() -> Result<LaunchGuard, String> {
             }
             Err(error) => last_error = error,
         }
-        if unsafe { WaitForSingleObject(bootstrap.0, 50) } != WAIT_TIMEOUT {
-            break;
-        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!(
         "起動補助機能の準備を確認できません。moyAIの起動を中止しました。{last_error}"
@@ -392,7 +409,7 @@ impl Drop for LaunchGuard {
                 native::deadline_check(Instant::now() + Duration::from_secs(1)),
             );
         }
-        if self.bootstrap.is_some() {
+        if self.owns_launch {
             if let Ok((_, hash)) = helper_path().and_then(|path| pin_helper(&path)) {
                 if let Ok((pipe, _)) = connect(&self.endpoint, &hash) {
                     let deadline = Instant::now() + Duration::from_secs(3);
@@ -622,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn preexisting_junction_source_ancestry_is_refused_before_elevation() {
+    fn preexisting_junction_source_ancestry_is_refused_before_connecting() {
         let fixture = source_fixture();
         let target = fixture.path().join("target");
         let link = fixture.path().join("link");
@@ -656,23 +673,19 @@ mod tests {
             parent_created: peer.created,
             user: peer.user,
         };
-        let _fake = super::native::create_pipe(
-            &super::super::pipe_name(&endpoint.session),
-            &endpoint.user,
-            true,
-        )
-        .unwrap();
-        let error = match super::connect(&endpoint, &[0; 32]) {
+        let name = format!(r"\\.\pipe\moyai-fake-server-{}", endpoint.session);
+        let _fake = super::native::create_pipe(&name, &endpoint.user, true).unwrap();
+        let error = match super::connect_at(&endpoint, &[0; 32], &name, peer.pid, |_| true) {
             Ok(_) => panic!("ordinary process was trusted as SYSTEM"),
             Err(error) => error,
         };
         assert!(error.contains("not the approved SYSTEM helper"), "{error}");
     }
 
-    /// An explicit test launch owns one UAC approval for native tests in child processes.
+    /// An explicit test launch owns a family on the installed service for child tests.
     /// Its endpoint grants nothing without the actual ordinary Windows caller identity.
     #[test]
-    #[ignore = "requires interactive startup UAC and MOYAI_SANDBOX_TEST_DIRECTORY"]
+    #[ignore = "requires the installed sandbox service and MOYAI_SANDBOX_TEST_DIRECTORY"]
     fn launch_host() {
         let directory = std::path::PathBuf::from(
             std::env::var_os("MOYAI_SANDBOX_TEST_DIRECTORY").expect("explicit test directory"),

@@ -1,9 +1,9 @@
-//! A Windows sandbox helper whose authority is granted once per application launch.
+//! A locally installed Windows sandbox service with process-owned application families.
 
 #[cfg(windows)]
-mod bootstrap;
-#[cfg(windows)]
 mod client;
+#[cfg(windows)]
+mod installed;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
@@ -36,36 +36,14 @@ pub fn helper_main() -> Result<(), String> {
     use clap::Parser;
     #[derive(Parser)]
     struct Args {
-        #[arg(long, conflicts_with = "service", required_unless_present = "service")]
-        elevated_bootstrap: bool,
-        #[arg(long)]
+        #[arg(long, required = true)]
         service: bool,
-        #[arg(long)]
-        session: String,
-        #[arg(long)]
-        parent_pid: u32,
-        #[arg(long)]
-        parent_created: u64,
-        #[arg(long)]
-        user: String,
     }
     let args = Args::parse();
-    validate_session(&args.session)?;
-    if args.elevated_bootstrap {
-        bootstrap::run_bootstrap(
-            &args.session,
-            args.parent_pid,
-            args.parent_created,
-            &args.user,
-        )
-    } else {
-        server::run_service(
-            args.session,
-            args.parent_pid,
-            args.parent_created,
-            args.user,
-        )
+    if !args.service {
+        return Err("The installed sandbox helper requires --service".into());
     }
+    server::run_service()
 }
 
 #[cfg(windows)]
@@ -80,6 +58,9 @@ pub(crate) fn validate_session(value: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn pipe_name(session: &str) -> String {
-    format!(r"\\.\pipe\moyai-sandbox-{session}")
+pub(crate) const SERVICE_NAME: &str = "MoyAISandbox";
+
+#[cfg(windows)]
+fn service_pipe_name() -> &'static str {
+    r"\\.\pipe\moyai-sandbox"
 }

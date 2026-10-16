@@ -13,6 +13,13 @@ use super::wire::{Request, Response, Run, VERSION};
 use crate::tool::executable::ResolvedExecutable;
 use crate::tool::sandbox_process::{SandboxExecutionError, SandboxedProcessRequest};
 
+mod lifecycle;
+
+const STARTUP_GRACE: Duration = Duration::from_secs(10);
+const MAX_FAMILIES: usize = 128;
+const MAX_CONNECTIONS: usize = 32;
+const MAX_ATTACHED_OWNERS: usize = MAX_CONNECTIONS / 2;
+
 // These ABI declarations use the Windows service APIs without adding a runtime dependency.
 #[repr(C)]
 struct ServiceTableEntry {
@@ -40,15 +47,22 @@ unsafe extern "system" {
     fn SetServiceStatus(handle: *mut c_void, status: *const ServiceStatus) -> i32;
 }
 
-struct Launch {
-    session: String,
-    parent_pid: u32,
-    parent_created: u64,
-    user: String,
+struct Service {
+    families: Mutex<Families>,
     stop: CancellationToken,
     result: Mutex<Option<Result<(), String>>>,
 }
-static LAUNCH: OnceLock<Launch> = OnceLock::new();
+static SERVICE: OnceLock<Service> = OnceLock::new();
+
+struct Families {
+    lifetime: lifecycle::Lifetime,
+    entries: HashMap<String, Arc<Family>>,
+}
+
+struct Family {
+    owners: Owners,
+    stop: CancellationToken,
+}
 
 struct Owners {
     parent: Arc<Peer>,
@@ -65,36 +79,198 @@ impl Owners {
 }
 
 struct Lease<'a> {
-    owners: &'a Owners,
+    service: &'a Service,
+    family: Arc<Family>,
+    caller: Arc<Peer>,
     id: String,
 }
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        if let Ok(mut leases) = self.owners.leases.lock() {
-            leases.remove(&self.id);
-        }
+        self.service.release(&self.family, &self.id);
     }
 }
 
-pub(super) fn run_service(
-    session: String,
-    parent_pid: u32,
-    parent_created: u64,
-    user: String,
-) -> Result<(), String> {
+impl Service {
+    fn complete(&self, result: Result<(), String>, stopped: impl FnOnce(bool)) {
+        let failed = result.is_err();
+        if let Ok(mut saved) = self.result.lock() {
+            *saved = Some(result);
+        }
+        // STOPPED can release the dispatcher immediately, so publish its result first.
+        stopped(failed);
+    }
+
+    fn family(&self, session: &str, caller: Peer) -> Result<(Arc<Family>, Peer), String> {
+        let mut families = self
+            .families
+            .lock()
+            .map_err(|_| "Sandbox family registry is poisoned")?;
+        if self.stop.is_cancelled() {
+            return Err("Sandbox service is stopping".into());
+        }
+        if let Some(family) = families.entries.get(session) {
+            native::authenticate_client(&caller, &family.owners.parent)?;
+            if !family.owners.alive() {
+                family.stop.cancel();
+            }
+            if family.stop.is_cancelled() {
+                return Err("Sandbox application family has ended".into());
+            }
+            return Ok((family.clone(), caller));
+        }
+        if families.entries.len() >= MAX_FAMILIES {
+            return Err("Sandbox service has reached its application-family limit".into());
+        }
+        let parent = Arc::new(Peer::open(caller.pid)?);
+        if parent.created != caller.created {
+            return Err("Sandbox application identity changed during registration".into());
+        }
+        native::authenticate_client(&caller, &parent)?;
+        families.lifetime.admit(Instant::now())?;
+        let family = Arc::new(Family {
+            owners: Owners {
+                parent: parent.clone(),
+                leases: Mutex::new(HashMap::from([("launch".into(), parent)])),
+            },
+            stop: CancellationToken::new(),
+        });
+        families.entries.insert(session.into(), family.clone());
+        Ok((family, caller))
+    }
+
+    fn check_family(&self, family: &Family) -> Result<(), String> {
+        let _families = self
+            .families
+            .lock()
+            .map_err(|_| "Sandbox family registry is poisoned")?;
+        if !family.owners.alive() {
+            family.stop.cancel();
+        }
+        if self.stop.is_cancelled() || family.stop.is_cancelled() {
+            return Err("Sandbox application family is stopping".into());
+        }
+        Ok(())
+    }
+
+    fn attach<'a>(&'a self, family: &Arc<Family>, caller: Peer) -> Result<Lease<'a>, String> {
+        let families = self
+            .families
+            .lock()
+            .map_err(|_| "Sandbox family registry is poisoned")?;
+        if !family.owners.alive() {
+            family.stop.cancel();
+        }
+        if self.stop.is_cancelled() || family.stop.is_cancelled() {
+            return Err("Sandbox application family is stopping".into());
+        }
+        let mut attached = 0;
+        for existing in families.entries.values() {
+            existing.owners.alive();
+            attached += existing
+                .owners
+                .leases
+                .lock()
+                .map_err(|_| "Sandbox owner registry is poisoned")?
+                .keys()
+                .filter(|id| id.as_str() != "launch")
+                .count();
+        }
+        if attached >= MAX_ATTACHED_OWNERS {
+            return Err("Sandbox service has reached its shared application-attachment limit; existing owners were retained".into());
+        }
+        let id = ulid::Ulid::new().to_string();
+        let caller = Arc::new(caller);
+        family
+            .owners
+            .leases
+            .lock()
+            .map_err(|_| "Sandbox owner registry is poisoned")?
+            .insert(id.clone(), caller.clone());
+        Ok(Lease {
+            service: self,
+            family: family.clone(),
+            caller,
+            id,
+        })
+    }
+
+    fn release(&self, family: &Family, id: &str) {
+        let Ok(_families) = self.families.lock() else {
+            self.stop.cancel();
+            family.stop.cancel();
+            return;
+        };
+        if let Ok(mut leases) = family.owners.leases.lock() {
+            leases.remove(id);
+        }
+        if !family.owners.alive() {
+            family.stop.cancel();
+        }
+    }
+
+    fn shutdown_family(&self, family: &Family, caller: &Peer) -> Result<(), String> {
+        let parent = &family.owners.parent;
+        if caller.pid != parent.pid || caller.created != parent.created {
+            return Err("Only the original application may release its launch lease".into());
+        }
+        self.release(family, "launch");
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.stop.cancel();
+        if let Ok(mut families) = self.families.lock() {
+            families.lifetime.stop();
+            for family in families.entries.values() {
+                family.stop.cancel();
+            }
+        }
+    }
+
+    fn begin_shutdown_if_idle(&self) -> Result<bool, String> {
+        let mut families = self
+            .families
+            .lock()
+            .map_err(|_| "Sandbox family registry is poisoned")?;
+        let mut live_owners = false;
+        for family in families.entries.values() {
+            if !family.owners.alive() {
+                family.stop.cancel();
+            } else {
+                live_owners = true;
+            }
+        }
+        // A connection owns its family through execution, handback and response
+        // acknowledgement. Owner death cancels work but cannot declare cleanup done.
+        families
+            .entries
+            .retain(|_, family| !family.stop.is_cancelled() || Arc::strong_count(family) > 1);
+        // Closing families remain while their workers own cleanup. Only the
+        // absence of every live application owner begins the service's bounded drain.
+        if families
+            .lifetime
+            .observe_empty(Instant::now(), !live_owners)
+        {
+            self.stop.cancel();
+        }
+        Ok(self.stop.is_cancelled())
+    }
+}
+
+pub(super) fn run_service() -> Result<(), String> {
     let own_token = native::process_token(unsafe {
         windows_sys::Win32::System::Threading::GetCurrentProcess()
     })?;
     if super::token::user_sid(own_token.0)? != "S-1-5-18" {
         return Err("Sandbox service requires its approved SYSTEM launch".into());
     }
-    let mut name = native::wide(&format!("moyAI-Sandbox-{session}"));
-    LAUNCH
-        .set(Launch {
-            session,
-            parent_pid,
-            parent_created,
-            user,
+    let mut name = native::wide(super::SERVICE_NAME);
+    SERVICE
+        .set(Service {
+            families: Mutex::new(Families {
+                lifetime: lifecycle::Lifetime::new(Instant::now(), STARTUP_GRACE),
+                entries: HashMap::new(),
+            }),
             stop: CancellationToken::new(),
             result: Mutex::new(None),
         })
@@ -112,7 +288,7 @@ pub(super) fn run_service(
     if unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } == 0 {
         return Err(native::last("start sandbox service dispatcher"));
     }
-    LAUNCH
+    SERVICE
         .get()
         .unwrap()
         .result
@@ -129,8 +305,8 @@ unsafe extern "system" fn service_control(
     _: *mut c_void,
 ) -> u32 {
     if matches!(control, 1 | 5) {
-        if let Some(launch) = LAUNCH.get() {
-            launch.stop.cancel();
+        if let Some(service) = SERVICE.get() {
+            service.stop();
         }
     }
     ERROR_SUCCESS
@@ -156,10 +332,10 @@ fn status(handle: *mut c_void, state: u32, failed: bool) {
 }
 
 unsafe extern "system" fn service_main(_: u32, _: *mut *mut u16) {
-    let Some(launch) = LAUNCH.get() else {
+    let Some(launch) = SERVICE.get() else {
         return;
     };
-    let name = native::wide(&format!("moyAI-Sandbox-{}", launch.session));
+    let name = native::wide(super::SERVICE_NAME);
     let service =
         unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(service_control), null_mut()) };
     if service.is_null() {
@@ -168,43 +344,39 @@ unsafe extern "system" fn service_main(_: u32, _: *mut *mut u16) {
         }
         return;
     }
-    let result = std::panic::catch_unwind(|| serve(launch, || status(service, 4, false)))
-        .unwrap_or_else(|_| {
-            Err("Sandbox service panicked; its process jobs are being closed".into())
-        });
-    status(service, 1, result.is_err());
-    if let Ok(mut saved) = launch.result.lock() {
-        *saved = Some(result);
-    }
+    let result = std::panic::catch_unwind(|| {
+        serve(
+            launch,
+            || status(service, 4, false),
+            || status(service, 3, false),
+        )
+    })
+    .unwrap_or_else(|_| Err("Sandbox service panicked; its process jobs are being closed".into()));
+    launch.complete(result, |failed| status(service, 1, failed));
 }
 
-fn serve(launch: &'static Launch, ready: impl FnOnce()) -> Result<(), String> {
-    let parent = Arc::new(Peer::open(launch.parent_pid)?);
-    if !parent.matches_launch(launch.parent_created, &launch.user) {
-        return Err("Sandbox launch parent identity changed".into());
-    }
-    native::allow_server_identity_query(&launch.user)?;
-    let owners = Arc::new(Owners {
-        parent: parent.clone(),
-        leases: Mutex::new(HashMap::from([("launch".into(), parent)])),
-    });
-    let name = super::pipe_name(&launch.session);
-    // Retaining every instance throughout the launch prevents replacement of the pipe name.
+fn serve(
+    launch: &'static Service,
+    ready: impl FnOnce(),
+    stopping: impl FnOnce(),
+) -> Result<(), String> {
+    // Eligible interactive users can identify the SYSTEM process and query its
+    // token; they receive no token duplication or process mutation authority.
+    native::allow_server_identity_query("IU")?;
+    let name = super::service_pipe_name();
+    // Retaining every instance throughout this service incarnation prevents replacement.
     let mut pipes = Vec::new();
-    for index in 0..32 {
-        pipes.push(native::create_pipe(&name, &launch.user, index == 0)?);
+    for index in 0..MAX_CONNECTIONS {
+        pipes.push(native::create_pipe(name, "IU", index == 0)?);
     }
     let mut workers = Vec::new();
     for pipe in pipes {
-        let owners = owners.clone();
         workers.push(std::thread::spawn(move || {
-            while !launch.stop.is_cancelled() && owners.alive() {
-                if native::connect_server(pipe.0, || launch.stop.is_cancelled() || !owners.alive())
-                    .is_err()
-                {
+            while !launch.stop.is_cancelled() {
+                if native::connect_server(pipe.0, || launch.stop.is_cancelled()).is_err() {
                     break;
                 }
-                if let Err(message) = connection(&pipe, &owners, launch) {
+                if let Err(message) = connection(&pipe, launch) {
                     let _ = final_response(pipe.0, &Response::Error { message });
                 }
                 unsafe {
@@ -214,10 +386,11 @@ fn serve(launch: &'static Launch, ready: impl FnOnce()) -> Result<(), String> {
         }));
     }
     ready();
-    while !launch.stop.is_cancelled() && owners.alive() {
+    while !launch.begin_shutdown_if_idle()? {
         std::thread::sleep(Duration::from_millis(50));
     }
-    launch.stop.cancel();
+    stopping();
+    launch.stop();
     let shutdown_deadline = Instant::now() + Duration::from_secs(30);
     while workers.iter().any(|worker| !worker.is_finished()) {
         if Instant::now() >= shutdown_deadline {
@@ -235,46 +408,52 @@ fn serve(launch: &'static Launch, ready: impl FnOnce()) -> Result<(), String> {
     Ok(())
 }
 
-fn connection(pipe: &Handle, owners: &Owners, launch: &Launch) -> Result<(), String> {
-    let parent = &owners.parent;
+fn connection(pipe: &Handle, launch: &Service) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
-    match native::read_frame(pipe.0, native::deadline_check(deadline))? {
-        Request::Hello { version, session } if version == VERSION && session == launch.session => {
-            ()
+    let session = match native::read_frame(pipe.0, || {
+        if launch.stop.is_cancelled() {
+            return Err("Sandbox service is stopping".into());
         }
+        native::deadline_check(deadline)()
+    })? {
+        Request::Hello { version, session } if version == VERSION => session,
         _ => return Err("Sandbox handshake version or launch does not match".into()),
-    }
+    };
+    super::validate_session(&session)?;
     // Pipe impersonation is meaningful only after the first client message has been read.
-    let caller = native::authenticate_client(pipe.0, parent)?;
+    let caller = native::authenticate_peer(pipe.0)?;
+    let (family, caller) = launch.family(&session, caller)?;
+    let parent = &family.owners.parent;
     native::write_frame(
         pipe.0,
         &Response::Ready {
             version: VERSION,
-            session: launch.session.clone(),
+            session,
             parent_pid: parent.pid,
             parent_created: parent.created,
         },
         native::deadline_check(deadline),
     )?;
-    let request = native::read_frame(pipe.0, native::deadline_check(deadline))?;
+    let request = native::read_frame(pipe.0, || {
+        if family.stop.is_cancelled() || launch.stop.is_cancelled() {
+            return Err("Sandbox application family is stopping".into());
+        }
+        native::deadline_check(deadline)()
+    })?;
     match request {
-        Request::Run { request } => run(pipe, &caller, launch, *request),
+        Request::Run { request } => {
+            launch.check_family(&family)?;
+            run(pipe, &caller, &family, *request)
+        }
         Request::Attach {} => {
-            let id = ulid::Ulid::new().to_string();
-            let caller = Arc::new(caller);
-            owners
-                .leases
-                .lock()
-                .map_err(|_| "Sandbox owner registry is poisoned")?
-                .insert(id.clone(), caller.clone());
-            let _lease = Lease { owners, id };
+            let _lease = launch.attach(&family, caller)?;
             native::write_frame(
                 pipe.0,
                 &Response::Attached,
                 native::deadline_check(deadline),
             )?;
             match native::read_frame::<Request>(pipe.0, || {
-                if launch.stop.is_cancelled() || !caller.live() {
+                if family.stop.is_cancelled() || !_lease.caller.live() {
                     Err("Sandbox application lease ended".into())
                 } else {
                     Ok(())
@@ -284,12 +463,8 @@ fn connection(pipe: &Handle, owners: &Owners, launch: &Launch) -> Result<(), Str
                 _ => Err("Unexpected sandbox application lease message".into()),
             }
         }
-        Request::Shutdown {} if caller.pid == parent.pid && caller.created == parent.created => {
-            owners
-                .leases
-                .lock()
-                .map_err(|_| "Sandbox owner registry is poisoned")?
-                .remove("launch");
+        Request::Shutdown {} => {
+            launch.shutdown_family(&family, &caller)?;
             native::write_frame(
                 pipe.0,
                 &Response::Stopping,
@@ -300,7 +475,7 @@ fn connection(pipe: &Handle, owners: &Owners, launch: &Launch) -> Result<(), Str
     }
 }
 
-fn run(pipe: &Handle, caller: &Peer, launch: &Launch, run: Run) -> Result<(), String> {
+fn run(pipe: &Handle, caller: &Peer, family: &Family, run: Run) -> Result<(), String> {
     run.validate()?;
     let executable = native::with_impersonation(caller.token.0, || {
         let executable =
@@ -313,7 +488,7 @@ fn run(pipe: &Handle, caller: &Peer, launch: &Launch, run: Run) -> Result<(), St
         }
         Ok(executable)
     })?;
-    let cancel = CancellationToken::new();
+    let cancel = family.stop.child_token();
     let request = SandboxedProcessRequest {
         executable,
         argv: run.argv,
@@ -334,7 +509,7 @@ fn run(pipe: &Handle, caller: &Peer, launch: &Launch, run: Run) -> Result<(), St
                 if completed.is_cancelled() {
                     return Err("Sandbox effect completed".into());
                 }
-                if launch.stop.is_cancelled() || !caller.live() {
+                if family.stop.is_cancelled() || !caller.live() {
                     cancel.cancel();
                     return Err("Sandbox caller or launch has ended".into());
                 }
@@ -408,12 +583,177 @@ fn final_response(
 mod tests {
     use super::*;
 
+    fn peer() -> Peer {
+        Peer::open(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() }).unwrap()
+    }
+
+    fn service() -> Service {
+        Service {
+            families: Mutex::new(Families {
+                lifetime: lifecycle::Lifetime::new(Instant::now(), STARTUP_GRACE),
+                entries: HashMap::new(),
+            }),
+            stop: CancellationToken::new(),
+            result: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn stopped_notification_exposes_final_result_to_dispatcher() {
+        for expected in [Ok(()), Err("service cleanup failed".to_owned())] {
+            let service = service();
+            service.complete(expected.clone(), |failed| {
+                assert_eq!(failed, expected.is_err());
+                // The dispatcher may return as soon as SCM observes STOPPED.
+                assert_eq!(service.result.lock().unwrap().take(), Some(expected));
+            });
+        }
+    }
+
+    #[test]
+    fn hello_retains_the_actual_parent_and_rejects_a_different_logon() {
+        let service = service();
+        let session = ulid::Ulid::new().to_string();
+        let (family, caller) = service.family(&session, peer()).unwrap();
+        assert_eq!(family.owners.parent.pid, caller.pid);
+        assert_eq!(family.owners.parent.created, caller.created);
+        let (same, _) = service.family(&session, peer()).unwrap();
+        assert!(Arc::ptr_eq(&family, &same));
+        for change in 0..3 {
+            let mut foreign = peer();
+            match change {
+                0 => foreign.user.push_str("-other"),
+                1 => foreign.session ^= 1,
+                _ => foreign.authentication ^= 1,
+            }
+            assert!(service.family(&session, foreign).is_err());
+        }
+        assert!(!family.stop.is_cancelled());
+        assert_eq!(service.families.lock().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn shutdown_cancels_only_its_family_and_final_owner_begins_bounded_drain() {
+        let service = service();
+        let session = ulid::Ulid::new().to_string();
+        let (first, caller) = service.family(&session, peer()).unwrap();
+        let (second, _) = service
+            .family(&ulid::Ulid::new().to_string(), peer())
+            .unwrap();
+        let mut reused_pid = peer();
+        reused_pid.created ^= 1;
+        assert!(service.shutdown_family(&first, &reused_pid).is_err());
+        assert!(!first.stop.is_cancelled());
+        service.shutdown_family(&first, &caller).unwrap();
+        assert!(first.stop.is_cancelled());
+        assert!(!second.stop.is_cancelled());
+        assert!(service.family(&session, peer()).is_err());
+        assert!(service.check_family(&first).is_err());
+        assert!(service.check_family(&second).is_ok());
+        assert!(!service.begin_shutdown_if_idle().unwrap());
+        assert_eq!(service.families.lock().unwrap().entries.len(), 2);
+        drop(first);
+        assert!(!service.begin_shutdown_if_idle().unwrap());
+        assert_eq!(service.families.lock().unwrap().entries.len(), 1);
+        service.release(&second, "launch");
+        assert!(service.begin_shutdown_if_idle().unwrap());
+        drop(second);
+        assert!(service.begin_shutdown_if_idle().unwrap());
+        assert!(
+            service
+                .family(&ulid::Ulid::new().to_string(), peer())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attached_owner_keeps_work_alive_and_dropped_lease_cannot_leak() {
+        let service = service();
+        let (family, caller) = service
+            .family(&ulid::Ulid::new().to_string(), peer())
+            .unwrap();
+        let lease = service.attach(&family, peer()).unwrap();
+        service.shutdown_family(&family, &caller).unwrap();
+        assert!(!family.stop.is_cancelled());
+        assert!(!service.begin_shutdown_if_idle().unwrap());
+        // This is also the rollback when writing Response::Attached fails.
+        drop(lease);
+        assert!(family.stop.is_cancelled());
+        assert!(service.attach(&family, peer()).is_err());
+        assert!(service.begin_shutdown_if_idle().unwrap());
+        drop(family);
+        assert!(service.begin_shutdown_if_idle().unwrap());
+    }
+
+    #[test]
+    fn empty_owners_cannot_be_revived_before_the_idle_poll() {
+        let service = service();
+        let session = ulid::Ulid::new().to_string();
+        let (family, _) = service.family(&session, peer()).unwrap();
+        let pending_effect = family.stop.child_token();
+        family.owners.leases.lock().unwrap().clear();
+        assert!(!family.stop.is_cancelled());
+        assert!(service.family(&session, peer()).is_err());
+        assert!(pending_effect.is_cancelled());
+        assert!(service.attach(&family, peer()).is_err());
+        assert!(service.check_family(&family).is_err());
+    }
+
+    #[test]
+    fn attachment_limit_preserves_existing_leases_and_execution_capacity() {
+        let service = service();
+        let (first, caller) = service
+            .family(&ulid::Ulid::new().to_string(), peer())
+            .unwrap();
+        let (second, _) = service
+            .family(&ulid::Ulid::new().to_string(), peer())
+            .unwrap();
+        let mut leases = Vec::new();
+        for _ in 0..MAX_ATTACHED_OWNERS {
+            leases.push(service.attach(&first, peer()).unwrap());
+        }
+        assert!(MAX_ATTACHED_OWNERS < MAX_CONNECTIONS);
+        assert!(service.attach(&second, peer()).is_err());
+        assert_eq!(first.owners.leases.lock().unwrap().len(), leases.len() + 1);
+        assert!(service.check_family(&first).is_ok());
+        assert!(service.check_family(&second).is_ok());
+        service.shutdown_family(&first, &caller).unwrap();
+        assert!(!first.stop.is_cancelled());
+        drop(leases.pop());
+        let replacement = service.attach(&second, peer()).unwrap();
+        drop(leases);
+        assert!(first.stop.is_cancelled());
+        assert!(!second.stop.is_cancelled());
+        drop(replacement);
+    }
+
+    #[test]
+    fn service_stop_cancels_all_families_and_rejects_new_admission() {
+        let service = service();
+        let (family, _) = service
+            .family(&ulid::Ulid::new().to_string(), peer())
+            .unwrap();
+        let pending_effect = family.stop.child_token();
+        service.stop();
+        assert!(pending_effect.is_cancelled());
+        assert!(service.attach(&family, peer()).is_err());
+        assert!(service.check_family(&family).is_err());
+        assert!(
+            service
+                .family(&ulid::Ulid::new().to_string(), peer())
+                .is_err()
+        );
+    }
+
     #[test]
     fn terminal_response_survives_until_the_client_consumes_it() {
         let peer =
             Peer::open(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() })
                 .unwrap();
-        let name = crate::sandbox_broker::pipe_name(&ulid::Ulid::new().to_string());
+        let name = format!(
+            r"\\.\pipe\moyai-terminal-response-test-{}",
+            ulid::Ulid::new()
+        );
         let server = native::create_pipe(&name, &peer.user, true).unwrap();
         let client = native::open_pipe(&name).unwrap();
         let worker = std::thread::spawn(move || {

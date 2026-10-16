@@ -7,6 +7,7 @@
 $ErrorActionPreference = 'Stop'
 try {
   . (Join-Path $PSScriptRoot 'common.ps1')
+  Assert-MoyaiUserSetup
   $sourceRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\', '/')
   $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
   if ($InstallRoot -eq [IO.Path]::GetPathRoot($InstallRoot) -or $InstallRoot -eq $env:USERPROFILE -or $InstallRoot -eq $env:LOCALAPPDATA) { throw '導入先にはmoyAI専用のフォルダーを指定してください。通常は導入先を指定せず、Setup-moyAI.cmdを開いてください。' }
@@ -50,7 +51,7 @@ try {
       if ((Test-Path -LiteralPath $directory) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { Remove-Item -LiteralPath $directory -Force }
     }
     if (@(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -eq 0) { Remove-Item -LiteralPath $InstallRoot -Force }
-    Write-Output "アンインストールが完了しました。`nアプリ本体と、この配置に一致するRunner・Hubの自動起動を取り除きました。`n設定・ログイン情報・履歴・作業フォルダー、追加・変更したファイル、別の導入先の登録は残しています。`nこの画面を閉じてください。"
+    Write-Output "アンインストールが完了しました。`nアプリ本体と、この配置に一致するRunner・Hubの自動起動を取り除きました。`n設定・ログイン情報・履歴・作業フォルダー、追加・変更したファイル、別の導入先の登録は残しています。`nPC共通sandbox helperは他の利用者のために残しています。全員が利用を終了した場合の削除手順は docs/user/windows-setup.md を参照してください。`nこの画面を閉じてください。"
     exit 0
   }
   $manifest = Read-MoyaiDeployment $sourceRoot -VerifyHashes
@@ -59,6 +60,7 @@ try {
     if ($installed.hub -and -not $manifest.hub) { throw '現在の導入先にはチーム管理用のHubがありますが、新しい配布物には含まれていません。配布担当から対応するHub同梱版を受け取り、更新してください。既存のHubと設定は保持しています。' }
   }
   [void](Test-MoyaiRuntime $sourceRoot $manifest -PreparingInstall)
+  Ensure-MoyaiSandboxInstallation $sourceRoot $manifest -CheckOnly:$CheckOnly
   if ($CheckOnly) { Write-Output "確認のみ完了しました。配布物の照合と必要な実行環境の検査に通りました。`n導入予定先: $InstallRoot`nまだ導入・起動していません。初めて使うPCでの動作や仕事の実行は、この検査だけでは確認できません。"; exit 0 }
   $parent = Split-Path -Parent $InstallRoot
   New-Item -ItemType Directory -Path $parent -Force | Out-Null

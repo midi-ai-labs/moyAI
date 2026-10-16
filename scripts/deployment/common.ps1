@@ -1,5 +1,6 @@
 ﻿Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'runtime-access.ps1')
+. (Join-Path $PSScriptRoot 'sandbox-service.ps1')
 
 function Resolve-MoyaiChild([string]$Root, [string]$Relative) {
   if ([string]::IsNullOrWhiteSpace($Relative) -or [IO.Path]::IsPathRooted($Relative) -or $Relative.Contains(':')) {
@@ -26,10 +27,17 @@ function Assert-MoyaiRegularPath([string]$Root, [string]$Path) {
   throw "指定フォルダーの外への操作はできません。配布物と導入先を確認してください。対象: $Path"
 }
 
-function Read-MoyaiDeployment([string]$Root, [switch]$VerifyHashes, [switch]$AllowMissingFiles) {
+function Read-MoyaiDeployment([string]$Root, [switch]$VerifyHashes, [switch]$AllowMissingFiles, [string]$ExpectedSha256 = '') {
   $manifestPath = Join-Path $Root 'deployment.json'
   Assert-MoyaiRegularPath $Root $manifestPath
-  try { $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json }
+  try {
+    $bytes = [IO.File]::ReadAllBytes($manifestPath)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $actual = ([BitConverter]::ToString($hasher.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+    if ($ExpectedSha256 -and ($ExpectedSha256 -cnotmatch '^[a-f0-9]{64}$' -or $actual -cne $ExpectedSha256)) { throw 'The package inventory changed while administrator approval was pending.' }
+    $manifest = [Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xfeff) | ConvertFrom-Json
+    $manifest | Add-Member NoteProperty validated_manifest_sha256 $actual -Force
+  }
   catch { throw "配布物の構成情報を読み込めません。ZIPを一式すべて展開し直してください。対象: $manifestPath`n詳細: $($_.Exception.Message)" }
   if ($manifest.schema -ne 1 -or $manifest.product -ne 'moyai-windows-user') { throw 'この配布物の形式には対応していません。配布担当から対応するWindows版を受け取ってください。対象: deployment.json' }
   if ($manifest.target -ne 'windows-x86_64') { throw 'このPCにはWindows x64版の配布物が必要です。配布担当へ確認してください。' }
@@ -46,7 +54,12 @@ function Read-MoyaiDeployment([string]$Root, [switch]$VerifyHashes, [switch]$All
     if ($file.sha256 -notmatch '^[a-f0-9]{64}$') { throw "配布物の照合情報が不正です。配布担当から一式を受け取り直してください。対象: $($file.path)" }
     if ($VerifyHashes -and $present -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $file.sha256) { throw "配布物のファイルが元の内容と一致しません。信頼できる配布元からZIPを受け取り直し、別のフォルダーへ展開してください。対象: $($file.path)" }
   }
-  foreach ($required in @('app/bin/moyai-desktop.exe', 'app/bin/moyai-runner.exe', 'app/bin/moyai-sandbox.exe', 'scripts/common.ps1', 'scripts/runtime-access.ps1', 'scripts/Start-moyAI.ps1', 'scripts/Setup-moyAI.ps1')) {
+  $requiredFiles = @('app/bin/moyai-desktop.exe', 'app/bin/moyai-runner.exe', 'app/bin/moyai-sandbox.exe', 'scripts/common.ps1', 'scripts/runtime-access.ps1', 'scripts/Start-moyAI.ps1', 'scripts/Setup-moyAI.ps1')
+  if ($manifest.PSObject.Properties.Name -contains 'machine_sandbox') {
+    if ($manifest.machine_sandbox.service -cne 'MoyAISandbox' -or $manifest.machine_sandbox.setup -cne 'scripts/Setup-Sandbox.ps1') { throw 'Unsupported machine sandbox package contract.' }
+    $requiredFiles += @('scripts/sandbox-service.ps1', 'scripts/Setup-Sandbox.ps1')
+  }
+  foreach ($required in $requiredFiles) {
     if (-not $seen.ContainsKey((Resolve-MoyaiChild $Root $required))) { throw "配布物の一覧に必要なファイルがありません。配布担当へ確認してください。対象: $required" }
   }
   if ($manifest.hub) {

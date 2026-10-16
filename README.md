@@ -37,7 +37,7 @@ Documentation and explanatory comments use built-in writing guidance inspired by
 
 For the 3.0.0 Windows package:
 
-1. Extract the whole ZIP and run `Setup-moyAI.cmd`. Open **moyAI** from the Start menu. Portable use starts with `Start-moyAI.cmd`. Accept the Windows administrator approval on each new startup; cancelling it stops startup.
+1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt for initial installation or a changed shared sandbox helper; cancelling stops before the user application is installed. Open **moyAI** from the Start menu without a startup UAC prompt. Portable use also requires the shared helper; follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
 
    | Purpose | Entry |
@@ -90,7 +90,7 @@ moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile 
 
 The 3.0.0 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
-On Windows, Run and TUI require one administrator approval at startup. Help, version and metadata-only commands do not start the sandbox helper.
+On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
 
 ## Project Instructions
 
@@ -104,13 +104,13 @@ Windows x64 is the primary supported and verified deployment. Distribution needs
 
 **Ask for approval** and **Approve for me** share Windows workspace restrictions; the latter uses an AI reviewer for permission decisions. **Full access** runs approved processes with the current Windows user's authority. These restrictions are not a complete OS isolation boundary. Native process sandboxing is Windows-only; restricted process operations fail closed elsewhere. Unix updates/deletes may return a partial-commit error with a preserved backup, which must be reviewed.
 
-Startup approval prepares a temporary SYSTEM sandbox helper; the app and Runner remain ordinary user processes. It does not approve individual tool operations or automatically rerun a failed restricted command with full access. The current startup path supports local Windows SAM accounts. Unsupported account types and helper preparation failures stop startup. Standard Python private-directory and pytest temporary-directory access inside the allowed workspace/TEMP must work without changing project files or requesting unrestricted execution; outside and other-effect restrictions remain separate checks.
+Administrator setup installs the fixed `MoyAISandbox` demand-start LocalSystem service under Windows Program Files. Only administrators and SYSTEM can change its executable and configuration; interactive users can query and start it. The app and Runner remain ordinary user processes. Installation does not approve individual tool operations or automatically rerun a failed restricted command with full access. The current sandbox supports local Windows SAM accounts. Unsupported account types and helper validation failures stop startup. Standard Python private-directory and pytest temporary-directory access inside the allowed workspace/TEMP must work without changing project files or requesting unrestricted execution; outside and other-effect restrictions remain separate checks.
 
 Start from an ordinary installation folder. Startup refuses a helper or bundled runtime reached through a junction, symbolic link or other reparse point; move the complete package to an ordinary folder if that check fails.
 
 Stop and editing a request do not undo files already written or applications already started. Only the latest user message can be edited and resent. Text edits keep the original images and attachments; to change them, send a new request. A shared job's accepted cancellation is not proof that its process has stopped.
 
-Runner operates while its Windows user is logged in. A Runner started by Desktop attaches to the approved startup helper without a second UAC and keeps its own lifetime lease. The helper is cleaned up after the last owner exits. An independently started Runner, including Windows logon autostart, requests its own startup approval. The temporary helper does not run Runner itself as a Windows service. Automatic Hub root-CA replacement and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
+Runner operates while its Windows user is logged in. Desktop and independently started Runner, including logon autostart, use the installed helper without UAC and retain their own lifetime leases. The helper stops when unused; it does not run Runner itself as a Windows service. Shared-helper updates and its explicit machine-wide removal require administrator approval and reject an in-use service. Per-user app uninstall retains the helper for other users. Automatic Hub root-CA replacement and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
 
 ## Development and Verification
 

@@ -9,7 +9,7 @@ use crate::tool::sandbox_process::{
     SandboxExecutionError, SandboxedProcessOutput, SandboxedProcessRequest,
 };
 
-pub(super) const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 2;
 pub(super) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]

@@ -136,9 +136,6 @@ impl Peer {
     pub fn live(&self) -> bool {
         unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_TIMEOUT }
     }
-    pub fn matches_launch(&self, created: u64, user: &str) -> bool {
-        self.created == created && self.user == user
-    }
 }
 
 pub(crate) fn with_impersonation<T>(
@@ -163,18 +160,12 @@ pub(crate) fn with_impersonation<T>(
     result
 }
 
-pub(super) fn authenticate_client(pipe: HANDLE, launch: &Peer) -> Result<Peer, String> {
+pub(super) fn authenticate_peer(pipe: HANDLE) -> Result<Peer, String> {
     let mut pid = 0;
     if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
         return Err(last("identify sandbox pipe client"));
     }
     let mut peer = Peer::open(pid)?;
-    if peer.user != launch.user
-        || peer.session != launch.session
-        || peer.authentication != launch.authentication
-    {
-        return Err("Sandbox pipe client belongs to a different Windows logon".into());
-    }
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         return Err(last("authenticate sandbox pipe token"));
     }
@@ -208,8 +199,29 @@ pub(super) fn authenticate_client(pipe: HANDLE, launch: &Peer) -> Result<Peer, S
     Ok(peer)
 }
 
+pub(super) fn authenticate_client(peer: &Peer, launch: &Peer) -> Result<(), String> {
+    if peer.user != launch.user
+        || peer.session != launch.session
+        || peer.authentication != launch.authentication
+    {
+        return Err("Sandbox pipe client belongs to a different Windows logon".into());
+    }
+    Ok(())
+}
+
+const PIPE_CLIENT_ACCESS: u32 = FILE_READ_DATA
+    | FILE_WRITE_DATA
+    | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_ATTRIBUTES
+    | READ_CONTROL
+    | SYNCHRONIZE;
+
 pub(super) fn create_pipe(name: &str, user: &str, first: bool) -> Result<Handle, String> {
-    let descriptor = wide(&format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{user})"));
+    // GENERIC_WRITE also grants FILE_CREATE_PIPE_INSTANCE for named pipes.
+    // Clients may exchange frames, but only SYSTEM may add server instances.
+    let descriptor = wide(&format!(
+        "D:P(A;;GA;;;SY)(A;;0x{PIPE_CLIENT_ACCESS:x};;;{user})"
+    ));
     let mut sd = null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -272,7 +284,7 @@ pub(super) fn open_pipe(name: &str) -> Result<Handle, String> {
         unsafe {
             CreateFileW(
                 wide(name).as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                PIPE_CLIENT_ACCESS,
                 0,
                 null(),
                 OPEN_EXISTING,
@@ -455,7 +467,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_restricted_token_cannot_request_privileged_broker_operations() {
+    fn pipe_clients_exchange_frames_without_creating_server_instances() {
+        let peer = Peer::open(unsafe { GetCurrentProcessId() }).unwrap();
+        let name = format!(r"\\.\pipe\moyai-pipe-rights-test-{}", ulid::Ulid::new());
+        let server = create_pipe(&name, &peer.user, true).unwrap();
+        let client = open_pipe(&name).unwrap();
+        let extra = unsafe {
+            CreateNamedPipeW(
+                wide(&name).as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                32,
+                65536,
+                65536,
+                0,
+                null(),
+            )
+        };
+        let error = unsafe { GetLastError() };
+        if extra != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(extra) };
+            panic!("ordinary pipe client created an additional server instance");
+        }
+        assert_eq!(error, ERROR_ACCESS_DENIED);
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            connect_server(server.raw(), || false).unwrap();
+            let request: super::super::wire::Request =
+                read_frame(server.raw(), deadline_check(deadline)).unwrap();
+            assert!(matches!(
+                request,
+                super::super::wire::Request::Acknowledge {}
+            ));
+            write_frame(
+                server.raw(),
+                &super::super::wire::Response::Attached,
+                deadline_check(deadline),
+            )
+            .unwrap();
+            let _: super::super::wire::Request =
+                read_frame(server.raw(), deadline_check(deadline)).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        write_frame(
+            client.raw(),
+            &super::super::wire::Request::Acknowledge {},
+            deadline_check(deadline),
+        )
+        .unwrap();
+        let response: super::super::wire::Response =
+            read_frame(client.raw(), deadline_check(deadline)).unwrap();
+        assert!(matches!(response, super::super::wire::Response::Attached));
+        write_frame(
+            client.raw(),
+            &super::super::wire::Request::Acknowledge {},
+            deadline_check(deadline),
+        )
+        .unwrap();
+        worker.join().unwrap();
+    }
+
+    fn restricted_token() -> Handle {
         let current = process_token(unsafe { GetCurrentProcess() }).unwrap();
         assert!(standard_token(current.0).is_ok());
         let mut raw = null_mut();
@@ -485,7 +557,43 @@ mod tests {
             LocalFree(sid);
         }
         assert_ne!(created, 0);
-        let restricted = Handle::checked(raw, "restricted test token").unwrap();
+        Handle::checked(raw, "restricted test token").unwrap()
+    }
+
+    #[test]
+    fn a_restricted_token_cannot_request_privileged_broker_operations() {
+        let restricted = restricted_token();
         assert!(standard_token(restricted.0).is_err());
+    }
+
+    #[test]
+    fn pipe_authentication_rejects_a_restricted_thread_inside_an_ordinary_process() {
+        let restricted = restricted_token();
+        let name = format!(r"\\.\pipe\moyai-pipe-token-test-{}", ulid::Ulid::new());
+        // WORLD permits transport even under the fixture's restricting WORLD SID.
+        // The broker must reject the actual token after reading the first frame.
+        let server = create_pipe(&name, "WD", true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            connect_server(server.raw(), || Instant::now() >= deadline).unwrap();
+            let _: super::super::wire::Request =
+                read_frame(server.raw(), deadline_check(deadline)).unwrap();
+            match authenticate_peer(server.raw()) {
+                Ok(_) => panic!("restricted pipe token was treated as an ordinary application"),
+                Err(message) => assert!(message.contains("ordinary medium-integrity")),
+            }
+        });
+        let client = with_impersonation(restricted.raw(), || {
+            let client = open_pipe(&name)?;
+            write_frame(
+                client.raw(),
+                &super::super::wire::Request::Acknowledge {},
+                deadline_check(Instant::now() + Duration::from_secs(10)),
+            )?;
+            Ok(client)
+        })
+        .unwrap();
+        worker.join().unwrap();
+        drop(client);
     }
 }

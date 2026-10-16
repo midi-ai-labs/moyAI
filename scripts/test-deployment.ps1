@@ -9,11 +9,14 @@ $package = Join-Path $EvidenceRoot 'package'
 $destination = Join-Path $EvidenceRoot 'installed'
 $shortcutFolder = Join-Path $EvidenceRoot 'isolated Start menu'
 New-Item -ItemType Directory -Path (Join-Path $package 'scripts'), (Join-Path $package 'app/bin'), (Join-Path $package 'hub/bin') -Force | Out-Null
-foreach ($name in @('common.ps1', 'runtime-access.ps1', 'Setup-moyAI.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deployment/$name") -Destination (Join-Path $package "scripts/$name") }
+foreach ($name in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Setup-moyAI.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deployment/$name") -Destination (Join-Path $package "scripts/$name") }
 # Subprocess fixtures never open actual logon/association registry keys, even read-only.
 $fixtureCommon = Join-Path $package 'scripts/common.ps1'
 [IO.File]::WriteAllText($fixtureCommon, ((Get-Content -LiteralPath $fixtureCommon -Raw -Encoding UTF8) + "`nfunction Open-MoyaiRunKey([bool]`$Writable) { return `$null }`nfunction Open-MoyaiClassesKey([bool]`$Writable) { return `$null }`nfunction Get-MoyaiJoinFileDefaultOverrides { throw 'Fixture attempted to read actual registry defaults.' }`n"), [Text.UTF8Encoding]::new($true))
 [IO.File]::AppendAllText($fixtureCommon, ("function Get-MoyaiShortcutFolder { return '" + $shortcutFolder.Replace("'", "''") + "' }`n"), [Text.UTF8Encoding]::new($false))
+# The machine installation transaction has its own isolated SCM fixture tests.
+[IO.File]::AppendAllText($fixtureCommon, "function Ensure-MoyaiSandboxInstallation([string]`$SourceRoot, `$Manifest, [switch]`$CheckOnly) { }`n", [Text.UTF8Encoding]::new($false))
+[IO.File]::AppendAllText($fixtureCommon, "function Assert-MoyaiUserSetup { }`n", [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Start-moyAI.cmd') -Destination (Join-Path $package 'Start-moyAI.cmd')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Setup-moyAI.cmd') -Destination (Join-Path $package 'Setup-moyAI.cmd')
 Write-MoyaiUtf8 (Join-Path $package 'app/bin/moyai-runner.exe') 'inert deployment fixture; never execute'
@@ -183,7 +186,7 @@ New-Item -ItemType Directory -Path $missingPackage | Out-Null
 try { Read-MoyaiDeployment $missingPackage; throw 'Expected missing manifest failure.' }
 catch { Assert-That ($_.Exception.Message.Contains('展開し直してください') -and $_.Exception.Message.Contains((Join-Path $missingPackage 'deployment.json'))) 'missing package inventory gives Japanese recovery advice and exact location' }
 New-Item -ItemType Directory -Path (Join-Path $missingPackage 'scripts') | Out-Null
-foreach ($name in @('common.ps1', 'runtime-access.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $package "scripts/$name") -Destination (Join-Path $missingPackage "scripts/$name") }
+foreach ($name in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $package "scripts/$name") -Destination (Join-Path $missingPackage "scripts/$name") }
 # CheckOnly suppresses the native error dialog, but exercises the real error presentation.
 $previousErrorPreference = $ErrorActionPreference
 try {

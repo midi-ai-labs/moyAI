@@ -52,6 +52,9 @@ mod provider_diagnostics_tests {
                 }
             };
             stream
+                .set_nonblocking(false)
+                .expect("blocking fixture request stream");
+            stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("bounded fixture reads");
             stream
