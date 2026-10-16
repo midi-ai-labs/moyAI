@@ -61,7 +61,16 @@ function Get-ExactProcessOwner {
     if ($null -eq $process -or $null -eq $cim) { throw "Process $Id observation did not settle" }
   }
   $executable = if ([string]::IsNullOrWhiteSpace([string]$cim.ExecutablePath)) { [string]$process.Path } else { [string]$cim.ExecutablePath }
-  if ([string]::IsNullOrWhiteSpace($executable)) { throw "Process $Id has no executable identity" }
+  if ([string]::IsNullOrWhiteSpace($executable)) {
+    if ($AllowExited) {
+      # Exit can clear executable metadata before either process query reports absence.
+      # Do not accept a live, unreadable or reused PID as the captured owner.
+      $process = Get-ObservedProcess -Id $Id
+      $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $Id" -ErrorAction Stop
+      if ($null -eq $process -and $null -eq $cim) { return $null }
+    }
+    throw "Process $Id has no executable identity"
+  }
   return [ordered]@{
     process_id = [int]$Id
     parent_process_id = [int]$cim.ParentProcessId

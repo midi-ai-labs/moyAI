@@ -508,6 +508,80 @@ fn acknowledge(pipe: windows_sys::Win32::Foundation::HANDLE) {
 mod tests {
     use sha2::Digest;
 
+    fn publish_test_endpoint(
+        path: &std::path::Path,
+        mut contents: impl std::io::Read,
+    ) -> std::io::Result<()> {
+        let directory = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "endpoint has no parent")
+        })?;
+        let mut staged = tempfile::NamedTempFile::new_in(directory)?;
+        std::io::copy(&mut contents, staged.as_file_mut())?;
+        staged.as_file().sync_all()?;
+        // The private endpoint becomes readable only after publication completes.
+        staged
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_is_not_visible_until_all_bytes_are_written() {
+        struct ObservedRead<'a> {
+            endpoint: &'a std::path::Path,
+            contents: &'a [u8],
+        }
+        impl std::io::Read for ObservedRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.endpoint.try_exists()?);
+                if self.contents.is_empty() {
+                    return Ok(0);
+                }
+                buffer[0] = self.contents[0];
+                self.contents = &self.contents[1..];
+                Ok(1)
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let endpoint = fixture.path().join("endpoint.json");
+        let contents = br#"{"ready":true}"#;
+        publish_test_endpoint(
+            &endpoint,
+            ObservedRead {
+                endpoint: &endpoint,
+                contents,
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&endpoint).unwrap(), contents);
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn endpoint_publication_preserves_an_existing_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let endpoint = fixture.path().join("endpoint.json");
+        std::fs::write(&endpoint, b"existing").unwrap();
+        assert!(publish_test_endpoint(&endpoint, &b"replacement"[..]).is_err());
+        assert_eq!(std::fs::read(&endpoint).unwrap(), b"existing");
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn endpoint_read_failure_does_not_publish_partial_bytes() {
+        struct FailedRead;
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture read failure"))
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let endpoint = fixture.path().join("endpoint.json");
+        assert!(publish_test_endpoint(&endpoint, FailedRead).is_err());
+        assert!(!endpoint.try_exists().unwrap());
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
+    }
+
     fn source_fixture() -> tempfile::TempDir {
         let parent = std::env::current_dir().unwrap().join("target");
         std::fs::create_dir_all(&parent).unwrap();
@@ -599,21 +673,16 @@ mod tests {
     #[test]
     #[ignore = "requires interactive startup UAC and MOYAI_SANDBOX_TEST_DIRECTORY"]
     fn launch_host() {
-        use std::io::Write;
         let directory = std::path::PathBuf::from(
             std::env::var_os("MOYAI_SANDBOX_TEST_DIRECTORY").expect("explicit test directory"),
         );
         assert!(directory.is_absolute() && directory.is_dir());
         let guard = super::start().expect("approved sandbox launch");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(directory.join("endpoint.json"))
-            .unwrap();
-        file.write_all(&serde_json::to_vec(guard.endpoint.as_ref()).unwrap())
-            .unwrap();
-        file.sync_all().unwrap();
-        drop(file);
+        publish_test_endpoint(
+            &directory.join("endpoint.json"),
+            &serde_json::to_vec(guard.endpoint.as_ref()).unwrap()[..],
+        )
+        .unwrap();
         while !directory.join("stop").exists() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

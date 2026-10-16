@@ -9,7 +9,7 @@ cargo build --offline --bin moyai-sandbox
 cargo test --offline --lib --no-run --message-format=json
 ```
 
-既存の [`sandbox_broker::client::tests::launch_host`](../src/sandbox_broker/client.rs) が1回のUAC、endpointの保存、終了までの所有を担う。次はPowerShell 7.4以降の例であり、`$libtest`と`$taskRoot`を実際の絶対パスへ置き換える。task directoryは`project_sandbox/<task>/`に用意する。helperはlibtestの`deps/`の一つ上、`moyai-sandbox.exe`として必要になる。
+既存の [`sandbox_broker::client::tests::launch_host`](../src/sandbox_broker/client.rs) が1回のUAC、endpointの保存、終了までの所有を担う。endpointファイルは内容の書込みと同期を終えてから公開し、既存ファイルは上書きしない。次はPowerShell 7.4以降の例であり、`$libtest`と`$taskRoot`を実際の絶対パスへ置き換える。task directoryは`project_sandbox/<task>/`に用意する。helperはlibtestの`deps/`の一つ上、`moyai-sandbox.exe`として必要になる。
 
 ```powershell
 $libtest = '<compiler-artifact executable absolute path>'

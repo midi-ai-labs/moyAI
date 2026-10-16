@@ -69,6 +69,55 @@ function global:Get-CimInstance {
   }
 });
 
+test("empty executable identity proves exit only after both repeat queries report absence", { skip: process.platform !== "win32" }, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "moyai-e2e-empty-owner-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const ownerPath = path.join(root, "owner.json"), scriptPath = path.join(root, "query-fixture.ps1");
+  await writeFile(ownerPath, JSON.stringify({ process_id: 17, process_start_time_utc_ticks: "639261936000000000", executable_path: "C:\\owned\\runner.exe" }), { flag: "wx" });
+  await writeFile(scriptPath, `param($Adapter, $Root, $OwnerPath, $Mode, $Action)
+$global:probeReads = 0
+$global:probeMode = $Mode
+$global:probeProfile = Join-Path $Root 'webview'
+function global:Get-Process {
+  [CmdletBinding()]param([int]$Id)
+  $global:probeReads++
+  if ($global:probeReads -gt 1) {
+    if ($global:probeMode -eq 'process-error') { Write-Error 'Repeat process access denied'; return }
+    if ($global:probeMode -in @('exit', 'cim-error', 'partial-absence')) {
+      $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new([ArgumentException]::new('No process'), 'NoProcessFoundForGivenId', [System.Management.Automation.ErrorCategory]::ObjectNotFound, $Id)); return
+    }
+    if ($global:probeMode -eq 'reused-pid') { return [pscustomobject]@{ Path = 'C:\\foreign\\runner.exe'; StartTime = [DateTime]::new(639261936000000001, [DateTimeKind]::Utc) } }
+  }
+  [pscustomobject]@{ Path = ''; StartTime = [DateTime]::new(639261936000000000, [DateTimeKind]::Utc) }
+}
+function global:Get-CimInstance {
+  [CmdletBinding()]param($ClassName, $Filter)
+  if ($Filter -and $global:probeReads -gt 1) {
+    if ($global:probeMode -eq 'cim-error') { Write-Error 'Repeat CIM access denied'; return }
+    if ($global:probeMode -eq 'exit') { return $null }
+    if ($global:probeMode -eq 'reused-pid') { return [pscustomobject]@{ ProcessId = 17; ParentProcessId = 2; ExecutablePath = 'C:\\foreign\\runner.exe'; CommandLine = ''; Name = 'runner.exe' } }
+  }
+  [pscustomobject]@{ ProcessId = 17; ParentProcessId = 1; ExecutablePath = ''; CommandLine = 'msedgewebview2.exe --user-data-dir="' + $global:probeProfile + '"'; Name = 'msedgewebview2.exe' }
+}
+if ($Action -eq 'Capture') { & $Adapter -Action Capture -ProcessId 17 }
+elseif ($Action -eq 'Profile') { & $Adapter -Action Profile -ExecutionRoot $Root -ProfilePath $global:probeProfile }
+else { & $Adapter -Action ObserveOwner -ExecutionRoot $Root -OwnerPath $OwnerPath }
+`, { flag: "wx" });
+  const adapter = fileURLToPath(new URL("../drivers/windows_process.ps1", import.meta.url));
+  const invoke = (mode, action = "ObserveOwner") => promisify(execFile)("pwsh.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", scriptPath, adapter, root, ownerPath, mode, action], { windowsHide: true, timeout: 10000 });
+  for (const mode of ["unreadable", "partial-absence", "reused-pid"]) {
+    await assert.rejects(invoke(mode), error => /no executable identity/.test(error.stderr));
+  }
+  await assert.rejects(invoke("exit", "Capture"), error => /no executable identity/.test(error.stderr));
+  const observed = await invoke("exit");
+  assert.deepEqual(JSON.parse(observed.stdout), { live: false, process_id: 17 });
+  const profile = await invoke("exit", "Profile");
+  assert.deepEqual(JSON.parse(profile.stdout), []);
+  for (const [mode, message] of [["process-error", /Repeat process access denied/], ["cim-error", /Repeat CIM access denied/]]) {
+    await assert.rejects(invoke(mode), error => message.test(error.stderr));
+  }
+});
+
 test("Windows adapter captures and stops only an exact test-owned process", { skip: process.platform !== "win32" }, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "moyai-e2e-process-"));
   const child = spawn("pwsh.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Wait-Event"], {

@@ -19,7 +19,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.0-rc.1 is a release candidate for use with moyAI Hub 0.1.0.** This RC requires WebView2 and the x64 VC++ runtime to be installed on the PC. Package-specific acceptance results accompany the candidate. The published v2.1.1 ZIP has its original layout and behavior. See the [RC release notes](docs/release/v3.0.0-rc.1.md) for implemented changes and validation limits.
+**Desktop 3.0.0 targets Windows x64 and pairs with moyAI Hub 0.1.0.** This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.0 release notes](docs/release/v3.0.0.md) for implemented changes, acceptance evidence and validation limits.
 
 ## Highlights
 
@@ -35,7 +35,7 @@ Documentation and explanatory comments use built-in writing guidance inspired by
 
 ## Quick Start
 
-For a current development Windows package:
+For the 3.0.0 Windows package:
 
 1. Extract the whole ZIP and run `Setup-moyAI.cmd`. Open **moyAI** from the Start menu. Portable use starts with `Start-moyAI.cmd`. Accept the Windows administrator approval on each new startup; cancelling it stops startup.
 2. Choose your role in the first-use screen:
@@ -88,7 +88,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-Installed development packages keep binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+The 3.0.0 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
 On Windows, Run and TUI require one administrator approval at startup. Help, version and metadata-only commands do not start the sandbox helper.
 
@@ -134,7 +134,7 @@ Windows native sandbox tests require an explicitly approved helper testhost. Fol
 
 Use the [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md) and [manual test entrypoint](tests/manual_ST/README.md) to select checks for the changed behavior. Real-window evidence and Live LLM behavior must be distinguished from fixture tests. Source ownership is visible in [src/](src/) and [the multi-PC design](docs/design/multi-device-session.md); implementation details belong with their code and tests rather than being duplicated here.
 
-The RC source has completed Manual ST Cases 1–7 and the restoration stages. The latest virtual WinA/WinB tests passed the automated execution, result-transfer and cleanup checks with both a scripted provider and a live LLM. These used Hub 0.1.0 at `f437c4fe0191e69f0ff7f0affa16eb191db305f3` on one Windows PC. Generated-code evaluation failures and Side Chat answer inaccuracies remain recorded; completion of the test sequence does not mean that every generated answer passed. Packaged-application acceptance is recorded for each artifact. Fresh-PC installation and physical multi-PC/LAN/Firewall checks have not been confirmed for this RC.
+The RC source has completed Manual ST Cases 1–7 and the restoration stages. The latest virtual WinA/WinB tests passed the automated execution, result-transfer and cleanup checks with both a scripted provider and a live LLM. These used Hub 0.1.0 at `f437c4fe0191e69f0ff7f0affa16eb191db305f3` on one Windows PC. Generated-code evaluation failures and Side Chat answer inaccuracies remain recorded; completion of the test sequence does not mean that every generated answer passed. Final 3.0.0 package acceptance results and artifact identities are recorded in the development workspace at `project_sandbox/release-3.0.0-20261016/RESULTS.md`. RC results remain separate evidence. Fresh-PC installation and physical multi-PC/LAN/Firewall checks have not been confirmed.
 
 Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner, cleanup and the sandbox helper, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
 

@@ -19,7 +19,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.0-rc.1は、moyAI Hub 0.1.0と組み合わせるリリース候補です。** このRCはWebView2とx64 VC++ runtimeが導入済みのPC向けです。配布物ごとの受入結果を候補版に添付します。公開済みv2.1.1のZIPは従来の配置と機能です。RCの実装内容と検証上の制限は[リリースノート](docs/release/v3.0.0-rc.1.md)を参照してください。
+**Desktop 3.0.0はWindows x64向けで、moyAI Hub 0.1.0と組み合わせて使います。** このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。実装内容・受入確認の証拠・検証上の制限は[3.0.0リリースノート](docs/release/v3.0.0.md)を参照してください。
 
 ## できること
 
@@ -35,7 +35,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-現行開発版のWindows配布物では、次の順に進みます。
+3.0.0のWindows配布物では、次の順に進みます。
 
 1. ZIP全体を展開して `Setup-moyAI.cmd` を実行し、スタートメニューから **moyAI** を開きます。インストールせず使う場合は `Start-moyAI.cmd` を開きます。新しく起動するたびにWindowsの管理者承認を行います。取り消すと起動を中止します。
 2. 初回画面で目的を選びます。
@@ -82,7 +82,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-開発版配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.0配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、起動時に一度の管理者承認が必要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 
@@ -128,7 +128,7 @@ Windowsのnative sandbox試験には、明示的に起動承認したhelper test
 
 [GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-RCの元となる実装で、Manual ST Case1〜7と復元試験を実施しました。最新の仮想WinA/WinBでは、固定応答・実LLMの両方で実行・成果受渡し・終了処理の自動確認に通っています。組合せはHub 0.1.0（`f437c4fe0191e69f0ff7f0affa16eb191db305f3`）で、同じWindows PC上の試験です。生成コードの評価NGとSide Chat回答の精度不足は記録を保持しており、試験の実施完了を全回答の合格とは扱いません。配布物の最終受入は各artifactの結果へ記録します。新規PCへの導入、物理別PC・LAN・Firewallの確認は、このRCでは未確認です。
+RCの元となる実装で、Manual ST Case1〜7と復元試験を実施しました。最新の仮想WinA/WinBでは、固定応答・実LLMの両方で実行・成果受渡し・終了処理の自動確認に通っています。組合せはHub 0.1.0（`f437c4fe0191e69f0ff7f0affa16eb191db305f3`）で、同じWindows PC上の試験です。生成コードの評価NGとSide Chat回答の精度不足は記録を保持しており、試験の実施完了を全回答の合格とは扱いません。正式3.0.0配布物の最終受入結果と識別情報は、開発workspaceの `project_sandbox/release-3.0.0-20261016/RESULTS.md` に記録します。RCの結果とは区別します。新規PCへの導入、物理別PC・LAN・Firewallは未確認です。
 
 公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 
