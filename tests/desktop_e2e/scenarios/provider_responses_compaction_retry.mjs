@@ -40,17 +40,6 @@ const OWNER = "scenario:provider.responses-compaction-retry";
 export const PROVIDER_RESPONSES_COMPACTION_CONTEXT_WINDOW = 32_768;
 export const PROVIDER_RESPONSES_COMPACTION_INPUT_BYTE_THRESHOLD = 32_000;
 export const PROVIDER_RESPONSES_COMPACTION_SENTINEL_LINE_BYTES = 12_000;
-const EXPECTED_ROLES = Object.freeze([
-  ...Array.from(
-    { length: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT },
-    (_, index) => `read_${index + 1}`,
-  ),
-  "compaction_empty",
-  "compaction_valid",
-  "resumed_final",
-]);
-const HELD_ROLE_COUNT = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT + 1;
-const HELD_ROLES = Object.freeze(EXPECTED_ROLES.slice(0, HELD_ROLE_COUNT));
 const REASONING_STREAM_EVENT_TYPES = Object.freeze([
   "response.output_item.added",
   "response.reasoning_text.delta",
@@ -166,6 +155,22 @@ function acceptedToolContract(row, role) {
 
 function acceptedReadRow(row, index) {
   const evidence = row?.contract?.role_evidence;
+  if (evidence?.checkpoint_matches === true) {
+    const start = evidence.first_remaining_read_index;
+    return acceptedToolContract(row, `read_${index + 1}`)
+      && evidence.matches === true && evidence.first_prompt_matches === true
+      && canonicalUlid(evidence.checkpoint_references?.first_item_id)
+      && canonicalUlid(evidence.checkpoint_references?.last_item_id)
+      && sha256Identity(evidence.checkpoint_sha256)
+      && Number.isSafeInteger(start) && start >= 2 && start <= index
+      && evidence.remaining_read_count === index - start + 1
+      && evidence.last_observed_read_index === index
+      && evidence.input_count === 2 + evidence.remaining_read_count * 2
+      && isDeepStrictEqual(evidence.input_item_types, [
+        "message", "message",
+        ...Array.from({ length: evidence.remaining_read_count }, () => ["function_call", "function_call_output"]).flat(),
+      ]);
+  }
   const expectedTypes = [
     "message",
     ...Array.from({ length: index }, () => ["function_call", "function_call_output"]).flat(),
@@ -309,8 +314,9 @@ function exactHeldToolOutputIdentity(readRows, first) {
     && isDeepStrictEqual(firstPrefix, normalSeven.slice(0, firstEvidence.source_read_count));
 }
 
-function exactToolOutputIdentity(readRows, first, retry, final) {
-  const normalPrefixes = readRows.map((row, index) => (
+function exactToolOutputIdentity(readRows, first, retry, final, initialReadCount) {
+  const initialRows = readRows.slice(0, initialReadCount);
+  const normalPrefixes = initialRows.map((row, index) => (
     readOutputIdentities(row?.contract?.role_evidence, index)
   ));
   if (normalPrefixes.some((prefix) => prefix === null)) return false;
@@ -321,14 +327,13 @@ function exactToolOutputIdentity(readRows, first, retry, final) {
   const retryPrefix = readOutputIdentities(retryEvidence, retryEvidence?.source_read_count);
   const finalSuffix = readOutputIdentities(finalEvidence, finalEvidence?.remaining_read_count);
   const normalSeven = normalPrefixes.at(-1);
-  const lastRead = finalSuffix?.at(-1);
   if (firstPrefix === null
     || retryPrefix === null
     || finalSuffix === null
-    || !Array.isArray(normalSeven)
-    || lastRead === undefined) return false;
-  const complete = [...normalSeven, lastRead];
+    || !Array.isArray(normalSeven)) return false;
   const finalStart = finalEvidence?.first_remaining_read_index;
+  if (!Number.isSafeInteger(finalStart) || finalStart - 1 > normalSeven.length) return false;
+  const complete = [...normalSeven.slice(0, finalStart - 1), ...finalSuffix];
   return complete.length === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT
     && new Set(complete.map((identity) => identity.sha256)).size
       === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT
@@ -337,8 +342,18 @@ function exactToolOutputIdentity(readRows, first, retry, final) {
     ))
     && isDeepStrictEqual(firstPrefix, complete.slice(0, firstEvidence.source_read_count))
     && isDeepStrictEqual(retryPrefix, complete.slice(0, retryEvidence.source_read_count))
-    && Number.isSafeInteger(finalStart)
-    && isDeepStrictEqual(finalSuffix, complete.slice(finalStart - 1));
+    && isDeepStrictEqual(finalSuffix, complete.slice(finalStart - 1))
+    && readRows.slice(initialReadCount).every((row, offset) => {
+      const evidence = row.contract.role_evidence;
+      return evidence.checkpoint_matches === true
+        && evidence.checkpoint_sha256 === finalEvidence.checkpoint_sha256
+        && isDeepStrictEqual(evidence.checkpoint_references, finalEvidence.checkpoint_references)
+        && evidence.first_remaining_read_index === finalStart
+        && row.contract.compaction_replay?.pass === true
+        && row.contract.compaction_replay.summarized_read_count === retryEvidence.source_read_count
+        && isDeepStrictEqual(readOutputIdentities(evidence, evidence.remaining_read_count),
+          complete.slice(finalStart - 1, initialReadCount + offset));
+    });
 }
 
 function stableInstructionIdentity(ledger) {
@@ -347,11 +362,14 @@ function stableInstructionIdentity(ledger) {
 }
 
 function exactHeldCompactionLedger(ledger) {
+  const initialReadCount = Array.isArray(ledger) ? ledger.length - 1 : 0;
   if (!Array.isArray(ledger)
-    || ledger.length !== HELD_ROLE_COUNT
-    || !isDeepStrictEqual(ledger.map((row) => row?.contract?.role), HELD_ROLES)
+    || initialReadCount < 2 || initialReadCount > SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT
+    || !isDeepStrictEqual(ledger.map((row) => row?.contract?.role), [
+      ...Array.from({ length: initialReadCount }, (_, index) => `read_${index + 1}`), "compaction_empty",
+    ])
     || !stableInstructionIdentity(ledger)) return false;
-  const readRows = ledger.slice(0, SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT);
+  const readRows = ledger.slice(0, initialReadCount);
   const first = ledger.at(-1);
   const evidence = first?.contract?.role_evidence;
   return readRows.every((row, index) => acceptedReadRow(row, index))
@@ -371,29 +389,48 @@ function exactHeldCompactionLedger(ledger) {
 }
 
 export function exactResponsesCompactionLedger(ledger) {
+  const initialReadCount = Array.isArray(ledger)
+    ? ledger.findIndex((row) => row?.contract?.role === "compaction_empty") : -1;
   if (!Array.isArray(ledger)
     || ledger.length !== SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES
-    || !isDeepStrictEqual(ledger.map((row) => row?.contract?.role), EXPECTED_ROLES)
+    || initialReadCount < 2 || initialReadCount > SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT
+    || !isDeepStrictEqual(ledger.map((row) => row?.contract?.role), [
+      ...Array.from({ length: initialReadCount }, (_, index) => `read_${index + 1}`),
+      "compaction_empty", "compaction_valid",
+      ...Array.from({ length: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT - initialReadCount },
+        (_, index) => `read_${initialReadCount + index + 1}`), "resumed_final",
+    ])
     || !stableInstructionIdentity(ledger)) return false;
-  const readRows = ledger.slice(0, SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT);
-  const first = ledger[SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT];
-  const retry = ledger[SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT + 1];
-  const final = ledger[SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT + 2];
+  const readRows = ledger.filter((row) => /^read_\d+$/u.test(row?.contract?.role ?? ""));
+  const first = ledger[initialReadCount];
+  const retry = ledger[initialReadCount + 1];
+  const final = ledger.at(-1);
   return readRows.every((row, index) => acceptedReadRow(row, index))
     && acceptedCompactionRows(first, retry)
     && acceptedFinalRow(final, retry)
-    && exactToolOutputIdentity(readRows, first, retry, final);
+    && exactToolOutputIdentity(readRows, first, retry, final, initialReadCount);
 }
 
 function impossibleLedgerPrefix(ledger) {
   if (!Array.isArray(ledger)
     || ledger.length > SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES) return true;
-  return ledger.some((row, index) => row?.route !== "responses"
+  let nextRead = 1, phase = "initial";
+  const rolesInvalid = ledger.some((row) => {
+    const role = row?.contract?.role;
+    if (role == null) return false;
+    if (role === `read_${nextRead}` && nextRead <= SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT
+      && ["initial", "resumed"].includes(phase)) { nextRead += 1; return false; }
+    if (role === "compaction_empty" && phase === "initial" && nextRead >= 3) { phase = "retry"; return false; }
+    if (role === "compaction_valid" && phase === "retry") { phase = "resumed"; return false; }
+    if (role === "resumed_final" && phase === "resumed"
+      && nextRead === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT + 1) { phase = "done"; return false; }
+    return true;
+  });
+  return rolesInvalid || ledger.some((row) => row?.route !== "responses"
     || row?.method !== "POST"
     || row?.pathname !== "/v1/responses"
     || row?.query_present !== false
     || row?.contract?.pass === false
-    || (typeof row?.contract?.role === "string" && row.contract.role !== EXPECTED_ROLES[index])
     || ["rejected", "peer_closed"].includes(row?.response_phase)
     || (row?.response_status !== null && row.response_status !== 200));
 }
@@ -468,16 +505,18 @@ function blockingSurfaceFailure(surface) {
     || rawReasoningLeak(surface);
 }
 
-function exactHeldProviderResource(resource) {
+function exactHeldProviderResource(resource, ledger) {
+  const heldCount = ledger?.length;
+  const roles = ledger?.map((row) => row?.contract?.role);
   return resource?.script_kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND
-    && resource.request_count === HELD_ROLE_COUNT
+    && resource.request_count === heldCount
     && resource.active_request_count === 1
     && resource.open_connection_count === 1
-    && resource.accepted_response_count === HELD_ROLE_COUNT
-    && resource.successful_response_count === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT
-    && resource.scripted_responses_request_count === HELD_ROLE_COUNT
+    && resource.accepted_response_count === heldCount
+    && resource.successful_response_count === heldCount - 1
+    && resource.scripted_responses_request_count === heldCount
     && resource.scripted_responses_maximum === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES
-    && isDeepStrictEqual(resource.scripted_response_roles, HELD_ROLES)
+    && isDeepStrictEqual(resource.scripted_response_roles, roles)
     && resource.response_release_controlled === true
     && resource.response_release_count === 0
     && resource.response_release_cleanup_count === 0
@@ -488,7 +527,7 @@ function exactHeldProviderResource(resource) {
     });
 }
 
-function exactReleasedProviderResource(resource) {
+function exactReleasedProviderResource(resource, ledger) {
   return resource?.script_kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND
     && resource.request_count === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES
     && resource.active_request_count === 0
@@ -498,7 +537,7 @@ function exactReleasedProviderResource(resource) {
       === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES
     && resource.scripted_responses_maximum
       === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES
-    && isDeepStrictEqual(resource.scripted_response_roles, EXPECTED_ROLES)
+    && isDeepStrictEqual(resource.scripted_response_roles, ledger?.map((row) => row?.contract?.role))
     && resource.response_release_controlled === true
     && resource.response_release_count === 0
     && resource.response_release_cleanup_count === 0
@@ -514,7 +553,7 @@ export function responsesCompactionReasoningHeldFailures(sample) {
   const projection = surface?.projection;
   const failures = [];
   if (!exactHeldCompactionLedger(sample?.ledger)) failures.push("reasoning-stream-not-exactly-held");
-  if (!exactHeldProviderResource(sample?.resource)) failures.push("reasoning-release-owner-not-exact");
+  if (!exactHeldProviderResource(sample?.resource, sample?.ledger)) failures.push("reasoning-release-owner-not-exact");
   if (projection?.run_status_key !== "running"
     || projection?.task_activity_state !== "running"
     || projection?.busy !== true
@@ -529,8 +568,7 @@ export function responsesCompactionReasoningHeldFailures(sample) {
 export function responsesCompactionReasoningHeldDecision(sample) {
   const ledger = sample?.ledger;
   if (impossibleLedgerPrefix(ledger) || blockingSurfaceFailure(sample?.surface)) return "fail";
-  if (!Array.isArray(ledger) || ledger.length < HELD_ROLE_COUNT) return "pending";
-  if (ledger.length > HELD_ROLE_COUNT) return "fail";
+  if (!Array.isArray(ledger) || ledger.at(-1)?.contract?.role !== "compaction_empty") return "pending";
   const phase = ledger.at(-1)?.response_phase;
   if (["completed", "rejected", "peer_closed"].includes(phase)) return "fail";
   if (sample?.resource?.script_role_release?.released === true) return "fail";
@@ -548,7 +586,7 @@ export function responsesCompactionTerminalFailures(sample) {
   const summaries = rowsOfKind(projection, "work_summary_completed");
   const failures = [];
   if (!exactResponsesCompactionLedger(sample?.ledger)) failures.push("wire-ledger-not-exact");
-  if (!exactReleasedProviderResource(sample?.resource)) failures.push("reasoning-release-not-exact");
+  if (!exactReleasedProviderResource(sample?.resource, sample?.ledger)) failures.push("reasoning-release-not-exact");
   if (!terminalSettled(projection) || blockingSurfaceFailure(surface)) {
     failures.push("terminal-surface-not-settled");
   }
@@ -790,8 +828,8 @@ export function createProviderResponsesCompactionRetryScenario() {
             resource: provider.resourceObservation(),
           }),
           decide: responsesCompactionReasoningHeldDecision,
-          code: "provider-responses-compaction-reasoning-disclosure",
-          message: "the raw reasoning delta was not held privately across the runtime projection and DOM",
+          code: "provider-responses-compaction-reasoning-stage-mismatch",
+          message: "the expected private reasoning hold did not reach its exact request, stream and UI state",
           stabilityMs: REASONING_HOLD_STABILITY_MS,
         });
         await sink.record("provider-responses-compaction-reasoning-held", {

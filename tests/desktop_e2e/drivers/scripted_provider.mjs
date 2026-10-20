@@ -2157,7 +2157,7 @@ function responsesCompactionResumedInput(input, expectedPrompt, script) {
     && pairCount > 0
     && Number.isSafeInteger(firstReadIndex)
     && firstReadIndex >= 2
-    && firstReadIndex + pairCount - 1 === script.toolCallCount
+    && firstReadIndex + pairCount - 1 <= script.toolCallCount
     && pairs.every((pair) => pair.pass);
   return {
     matches,
@@ -2171,6 +2171,8 @@ function responsesCompactionResumedInput(input, expectedPrompt, script) {
       : null,
     remaining_read_count: pairCount,
     first_remaining_read_index: firstReadIndex,
+    last_observed_read_index: firstReadIndex === null || pairCount === null
+      ? null : firstReadIndex + pairCount - 1,
     read_output_size_bytes: pairs.map((pair) => pair.output_size_bytes),
     read_output_sha256: pairs.map((pair) => pair.output_sha256),
   };
@@ -2183,7 +2185,10 @@ function responsesCompactionRole(body, expectedPrompt, script) {
   if (hasTools && responsesCompactionCheckpointInput(input[1], script) !== null) {
     const resumed = responsesCompactionResumedInput(input, expectedPrompt, script);
     return {
-      role: resumed.matches ? "resumed_final" : null,
+      role: resumed.matches
+        ? resumed.last_observed_read_index === script.toolCallCount
+          ? "resumed_final" : `read_${resumed.last_observed_read_index + 1}`
+        : null,
       evidence: {
         input_size_bytes: inputSizeBytes,
         input_byte_threshold: script.inputByteThreshold,
@@ -4398,7 +4403,9 @@ export class ScriptedProvider {
       const callIndex = Number(readMatch[1]);
       prerequisites = callIndex === 1 ? [] : [`read_${callIndex - 1}`];
     } else if (role === "compaction_empty") {
-      prerequisites = [`read_${this.script.toolCallCount}`];
+      const sourceReadCount = row.contract.role_evidence.source_read_count;
+      prerequisites = Number.isSafeInteger(sourceReadCount) && sourceReadCount > 0
+        ? [`read_${sourceReadCount}`] : ["missing_completed_read_prefix"];
     } else if (role === "compaction_valid") {
       prerequisites = ["compaction_empty"];
       const oversized = this.#ledger.find((candidate) => (
@@ -4428,14 +4435,19 @@ export class ScriptedProvider {
       }
     } else if (role === "resumed_final") {
       prerequisites = ["compaction_valid"];
+    }
+    if (row.contract.role_evidence.checkpoint_matches === true) {
+      prerequisites.push("compaction_valid");
       const accepted = this.#ledger.find((candidate) => (
         candidate.contract?.role === "compaction_valid" && candidate.contract?.pass === true
       ));
       const summarizedReadCount = accepted?.contract?.role_evidence?.source_read_count;
       const resumed = row.contract.role_evidence;
+      const observedReadCount = role === "resumed_final"
+        ? this.script.toolCallCount : Number(readMatch?.[1]) - 1;
       const replayMatches = Number.isSafeInteger(summarizedReadCount)
         && resumed?.first_remaining_read_index === summarizedReadCount + 1
-        && resumed?.remaining_read_count === this.script.toolCallCount - summarizedReadCount;
+        && resumed?.remaining_read_count === observedReadCount - summarizedReadCount;
       row.contract.compaction_replay = {
         pass: replayMatches,
         summarized_read_count: summarizedReadCount ?? null,

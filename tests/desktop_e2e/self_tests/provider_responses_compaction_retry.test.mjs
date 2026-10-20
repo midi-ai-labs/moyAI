@@ -211,6 +211,28 @@ function heldLedger() {
   return ledger;
 }
 
+function earlierCompactionLedger() {
+  const ledger = exactLedger();
+  const first = ledger[8];
+  Object.assign(first.contract.role_evidence, {
+    source_read_count: 5, source_unit_count: 6, source_unit_signatures: Array(6).fill(HASH),
+    ...outputEvidence(0, 5),
+  });
+  Object.assign(ledger[9].contract.retry_alignment, { first_source_unit_count: 6 });
+  const resumed = row(commonContract("read_8", {
+    matches: true, first_prompt_matches: true, checkpoint_matches: true,
+    checkpoint_references: CHECKPOINT_REFERENCES, checkpoint_sha256: CHECKPOINT_HASH,
+    first_remaining_read_index: 2, last_observed_read_index: 7, remaining_read_count: 6,
+    input_count: 14, input_item_types: ["message", "message",
+      ...Array.from({ length: 6 }, () => ["function_call", "function_call_output"]).flat()],
+    ...outputEvidence(1, 6),
+  }, true));
+  resumed.contract.compaction_replay = {
+    pass: true, summarized_read_count: 1, first_remaining_read_index: 2, remaining_read_count: 6,
+  };
+  return [...ledger.slice(0, 7), first, ledger[9], resumed, ledger[10]];
+}
+
 function heldResource() {
   const heldCount = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT + 1;
   return {
@@ -430,6 +452,34 @@ test("Responses compaction ledger rejects tool-output identity mutation across e
   const resumedOverlapMutation = structuredClone(ledger);
   resumedOverlapMutation[10].contract.role_evidence.read_output_sha256[0] = "e".repeat(64);
   assert.equal(exactResponsesCompactionLedger(resumedOverlapMutation), false);
+});
+
+test("Responses compaction ledger retains exact identities when compaction precedes the last read", () => {
+  const ledger = earlierCompactionLedger();
+  assert.equal(exactResponsesCompactionLedger(ledger), true);
+  const rewritten = structuredClone(ledger);
+  rewritten[9].contract.role_evidence.read_output_sha256[0] = "e".repeat(64);
+  assert.equal(exactResponsesCompactionLedger(rewritten), false);
+  const reordered = structuredClone(ledger);
+  [reordered[7], reordered[9]] = [reordered[9], reordered[7]];
+  assert.equal(exactResponsesCompactionLedger(reordered), false);
+  const missingRead = structuredClone(ledger);
+  missingRead.splice(9, 1);
+  assert.equal(exactResponsesCompactionLedger(missingRead), false);
+});
+
+test("Responses compaction holds the exact earlier prefix without waiting for an unrequested read", () => {
+  const ledger = earlierCompactionLedger().slice(0, 8);
+  ledger.at(-1).response_phase = "held";
+  ledger.at(-1).response_stream = reasoningStream(true);
+  const resource = heldResource();
+  Object.assign(resource, {
+    request_count: 8, accepted_response_count: 8, successful_response_count: 7,
+    scripted_responses_request_count: 8, scripted_response_roles: ledger.map(row => row.contract.role),
+  });
+  const sample = { ledger, resource, surface: heldSurface() };
+  assert.deepEqual(responsesCompactionReasoningHeldFailures(sample), []);
+  assert.equal(responsesCompactionReasoningHeldDecision(sample), "pass");
 });
 
 test("Responses compaction ledger rejects a duplicated or truncated final read identity", () => {

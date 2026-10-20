@@ -147,8 +147,8 @@ async function startCompactionProvider(inputByteThreshold, options = {}) {
   });
 }
 
-async function consumeReads(provider) {
-  for (let readCount = 0; readCount < SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT; readCount += 1) {
+async function consumeReads(provider, count = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT) {
+  for (let readCount = 0; readCount < count; readCount += 1) {
     const response = await post(provider, toolBody(readPrefix(readCount)));
     assert.equal(response.status, 200);
     const events = parseSse(await response.text());
@@ -296,6 +296,35 @@ test("Responses compaction script holds after the raw reasoning delta until its 
     released: true,
     released_by_cleanup: false,
   });
+});
+
+test("Responses compaction can start before the final read and replay the checkpoint through that remaining read", async (context) => {
+  const prepared = await fixture();
+  const provider = await startCompactionProvider(prepared.threshold);
+  context.after(() => provider.close());
+  await consumeReads(provider, 7);
+  assert.equal((await post(provider, compactBody(readPrefix(5), prepared.compactionPrompt))).status, 200);
+  assert.equal((await post(provider, prepared.retry)).status, 200);
+  const resumed = count => [
+    inputText(SCRIPTED_PROVIDER_RESPONSES_COMPACTION_PROMPT),
+    inputText(`${prepared.summaryPrefix}\n${CHECKPOINT}`),
+    ...Array.from({ length: count - 1 }, (_, index) => readCall(index + 2)).flat(),
+  ];
+  const lastRead = await post(provider, toolBody(resumed(7)));
+  assert.equal(lastRead.status, 200);
+  assert.equal(parseSse(await lastRead.text())[0].item.call_id, "call_responses_compaction_read_8");
+  const final = await post(provider, toolBody(resumed(8)));
+  assert.equal(final.status, 200);
+  assert.equal(parseSse(await final.text())[0].delta, SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RESPONSE);
+  const rows = provider.requestLedger;
+  assert.deepEqual(rows.map(row => row.contract.role), [
+    ...Array.from({ length: 7 }, (_, index) => `read_${index + 1}`),
+    "compaction_empty", "compaction_valid", "read_8", "resumed_final",
+  ]);
+  assert.equal(rows.every(row => row.contract.pass && row.response_status === 200), true);
+  assert.equal(rows[9].contract.compaction_replay.pass, true);
+  assert.equal(rows[9].contract.compaction_replay.remaining_read_count, 6);
+  assert.equal(new Set(rows.map(row => row.contract.instructions_sha256)).size, 1);
 });
 
 test("Responses compaction script rejects host-policy overrides and a non-tool-less compaction", async (context) => {
