@@ -15,6 +15,7 @@ pub(crate) mod permission_guardian;
 pub(crate) mod process;
 pub mod read;
 pub mod read_context;
+pub mod read_history;
 pub mod registry;
 pub(crate) mod sandbox_process;
 pub mod search;

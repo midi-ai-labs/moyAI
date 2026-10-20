@@ -85,21 +85,38 @@ export function onboardingHubModelsAccepted(projection, expected) {
       && projection[`${role}_review`]?.selection?.preferred_model_id === expected[role]
       && isDeepStrictEqual(projection[`${role}_review`]?.selection?.allowed_model_ids, [expected[role]]));
 }
-export async function prepareOnboardingHubModels({ page, hub, providerBaseUrl, mainModel, sideModel = mainModel, approveModel = null, apiKey = null }) {
+export async function prepareOnboardingHubModels({ page, hub, providerBaseUrl, mainModel, sideModel = mainModel, approveModel = null, apiKey = null, roleProviders = {} }) {
   const roles = { main: mainModel, side_chat: sideModel, approve: approveModel };
-  const registrations = new Map();
-  const endpoint = new URL(providerBaseUrl);
-  endpoint.pathname = endpoint.pathname.replace(/\/+$/, "").replace(/(?:\/v1)+$/, "");
-  const registeredEndpoint = endpoint.href.replace(/\/+$/, "");
+  if (!roleProviders || typeof roleProviders !== "object" || Array.isArray(roleProviders)
+    || Object.keys(roleProviders).some(role => !Object.hasOwn(roles, role))) throw new TypeError("Unknown Hub role provider");
+  const providers = Object.fromEntries(Object.entries(roles).filter(([, model]) => model !== null).map(([role]) => {
+    // A role override owns its authentication; omitted keys must not inherit another host's key.
+    const provider = roleProviders[role] ?? { providerBaseUrl, apiKey };
+    if (!provider || typeof provider !== "object" || Array.isArray(provider)
+      || Object.keys(provider).some(key => !["providerBaseUrl", "apiKey"].includes(key))
+      || typeof provider.providerBaseUrl !== "string"
+      || provider.apiKey != null && typeof provider.apiKey !== "string") throw new TypeError("Invalid Hub role provider");
+    let endpoint;
+    try { endpoint = new URL(provider.providerBaseUrl); }
+    catch { throw new TypeError("Hub role provider requires a credential-free HTTP(S) endpoint"); }
+    if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+      throw new TypeError("Hub role provider requires a credential-free HTTP(S) endpoint");
+    }
+    endpoint.pathname = endpoint.pathname.replace(/\/+$/, "").replace(/(?:\/v1)+$/, "");
+    return [role, { providerBaseUrl: provider.providerBaseUrl, apiKey: provider.apiKey || null, registeredEndpoint: endpoint.href.replace(/\/+$/, "") }];
+  }));
+  const registrations = new Map(), expected = {};
   await page.locator('nav a[href="#models"]').click();
   for (const [role, model] of Object.entries(roles)) {
-    if (model === null || registrations.has(model)) continue;
+    if (model === null) { expected[role] = null; continue; }
+    const provider = providers[role];
+    // This private identity is used only in memory, never in returned or recorded evidence.
+    const identity = JSON.stringify([provider.registeredEndpoint, model, provider.apiKey]);
+    if (registrations.has(identity)) { expected[role] = registrations.get(identity); continue; }
     const label = role === "main" ? "WinBの標準AI" : role === "side_chat" ? "WinBのSub AI" : "WinBのApprove AI";
-    if (apiKey !== null) {
-      try { await page.locator("#api-key").fill(apiKey); }
-      catch { throw new DesktopE2eError("harness", "onboarding-private-key-input", "Could not enter the private upstream credential"); }
-    }
-    await page.locator("#endpoint").fill(providerBaseUrl);
+    await page.locator("#endpoint").fill(provider.providerBaseUrl);
+    try { await page.locator("#api-key").fill(provider.apiKey ?? ""); }
+    catch { throw new DesktopE2eError("harness", "onboarding-private-key-input", "Could not enter the private upstream credential"); }
     await page.locator("#profile").selectOption("openai_compatible_chat");
     await page.locator("#discover").click();
     await page.locator(`#model option[value=${JSON.stringify(model)}]`).waitFor({ state: "attached" });
@@ -115,13 +132,13 @@ export async function prepareOnboardingHubModels({ page, hub, providerBaseUrl, m
     const registered = snapshot.store.catalog.models.find(value => value.id === id && value.label === label);
     const deployment = snapshot.deployments.find(({ deployment: value }) => value.logical_model_id === id
       && value.enabled && value.provider_model === model && value.provider_profile === "openai_compatible_chat"
-      && value.endpoint === registeredEndpoint);
-    if (!registered || registered.capabilities.includes("tools") !== (role === "main") || !deployment) {
+      && value.endpoint === provider.registeredEndpoint);
+    if (!registered || role === "main" && !registered.capabilities.includes("tools") || !deployment) {
       throw fail("Hub did not register the requested model and capabilities", { role, model, logical_model_id: id });
     }
-    registrations.set(model, id);
+    registrations.set(identity, id);
+    expected[role] = id;
   }
-  const expected = Object.fromEntries(Object.entries(roles).map(([role, model]) => [role, model === null ? null : registrations.get(model)]));
   await page.locator("#team-standard-model").selectOption(expected.main);
   await page.locator("#team-standard-side-model").selectOption(expected.side_chat);
   if (expected.approve !== null) await page.locator("#team-standard-approve-model").selectOption(expected.approve);

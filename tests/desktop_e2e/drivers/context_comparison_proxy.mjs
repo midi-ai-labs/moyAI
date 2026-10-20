@@ -49,13 +49,15 @@ export function comparisonUpstream(credential, endpoint) {
   return { baseUrl: `${base}/v1`, authorization: `Bearer ${credential.key}` };
 }
 
-export async function startContextComparisonProxy({ endpoint, model, credentialFile, mode, captureDirectory }) {
+export async function startContextComparisonProxy({ endpoint, model, credentialFile, credential, mode, captureDirectory }) {
   if (!["remove", "preserve"].includes(mode) || typeof model !== "string" || !model)
     throw new TypeError("Comparison requires a mode and exact model");
-  if (!path.isAbsolute(credentialFile ?? "") || !path.isAbsolute(captureDirectory ?? ""))
+  const hasCredential = credential !== undefined, hasCredentialFile = credentialFile !== undefined;
+  if (hasCredential === hasCredentialFile) throw new TypeError("Specify exactly one comparison credential or credentialFile");
+  if (hasCredentialFile && !path.isAbsolute(credentialFile ?? "") || !path.isAbsolute(captureDirectory ?? ""))
     throw new TypeError("Comparison credential and private capture paths must be absolute");
-  // Read once, retain only in memory, and never put request headers in evidence.
-  const upstream = comparisonUpstream(JSON.parse(await readFile(credentialFile, "utf8")), endpoint);
+  // Both sources use one validator. Retain only in memory; never record credentials or headers.
+  const upstream = comparisonUpstream(hasCredential ? credential : JSON.parse(await readFile(credentialFile, "utf8")), endpoint);
   const secure = new URL(upstream.baseUrl).protocol === "https:";
   // The product owns request/idle deadlines. Built-in fetch adds Undici's
   // independent five-minute header/body timeout, so use a deadline-free agent.

@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 
 use crate::context::ContextWindowTokenStatus;
 use crate::context::context_window::estimate_model_messages_tokens;
-use crate::llm::{ChatRequest, ModelContentPart, ModelMessage, ModelToolCall};
+use crate::llm::{
+    ChatRequest, ChatToolContinuation, ModelContentPart, ModelMessage, ModelToolCall,
+};
 use crate::protocol::{
     CompactionLayout, CompactionMode, ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload,
     HistoryScope, ModelResponseId, ToolLifecycleStatus,
@@ -28,6 +30,9 @@ pub struct ContextManager {
     revision: HistoryRevision,
     append_cursor: Option<i64>,
     canonical_count: usize,
+    // Private provider state lives only for this admitted run. Canonical replay,
+    // exports and restart construct a fresh context without this map.
+    chat_continuations: HashMap<ModelResponseId, ChatToolContinuation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,7 +93,20 @@ impl ContextManager {
             revision,
             append_cursor,
             canonical_count,
+            chat_continuations: HashMap::new(),
         }
+    }
+
+    pub(crate) fn clear_chat_continuations(&mut self) {
+        self.chat_continuations.clear();
+    }
+
+    pub(crate) fn record_chat_continuation(
+        &mut self,
+        response_id: ModelResponseId,
+        continuation: ChatToolContinuation,
+    ) {
+        self.chat_continuations.insert(response_id, continuation);
     }
 
     /// Applies rows read strictly after [`Self::append_cursor`].
@@ -136,8 +154,15 @@ impl ContextManager {
                     .iter()
                     .position(|existing| replaced.contains(&existing.id))
                     .unwrap_or(self.history_items.len());
-                self.history_items
-                    .retain(|existing| !replaced.contains(&existing.id));
+                self.history_items.retain(|existing| {
+                    if !replaced.contains(&existing.id) {
+                        return true;
+                    }
+                    if let HistoryItemPayload::ToolCall { response_id, .. } = &existing.payload {
+                        self.chat_continuations.remove(response_id);
+                    }
+                    false
+                });
                 let insertion_index = insertion_index.min(self.history_items.len());
                 self.history_items.insert(insertion_index, item);
             } else {
@@ -176,6 +201,21 @@ impl ContextManager {
         &self.history_items
     }
 
+    pub(super) fn checkpoint_with_source_records(
+        &self,
+        body: &str,
+        item_ids: &[HistoryItemId],
+    ) -> Result<String, String> {
+        let selected = item_ids.iter().copied().collect::<HashSet<_>>();
+        let items = self
+            .history_items
+            .iter()
+            .filter(|item| selected.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        super::compaction::checkpoint_with_history_reference(body, &items)
+    }
+
     pub fn contains_user_turn_item(&self, item_id: HistoryItemId) -> bool {
         self.history_items.iter().any(|item| {
             item.id == item_id && matches!(item.payload, HistoryItemPayload::UserTurn { .. })
@@ -195,7 +235,11 @@ impl ContextManager {
     }
 
     pub fn model_messages(&self, supports_images: bool) -> Vec<ModelMessage> {
-        project_model_messages(&self.history_items, supports_images)
+        project_model_messages(
+            &self.history_items,
+            supports_images,
+            &self.chat_continuations,
+        )
     }
 
     /// A model-written continuation note covers completed history before its
@@ -237,6 +281,85 @@ impl ContextManager {
             .collect()
     }
 
+    /// Snapshot completed work up to the current boundary. Keep the newest
+    /// actual input of each kind raw, rather than converting it into generated
+    /// user authority. Older input is available through canonical history.
+    pub(crate) fn automatic_compaction_units_excluding(
+        &self,
+        excluded_item_ids: &HashSet<HistoryItemId>,
+    ) -> Vec<Vec<HistoryItemId>> {
+        let active = self.active_history_items();
+        let mut newest_user = None;
+        let mut newest_steer = None;
+        let mut newest_agent_input = None;
+        let mut protected = excluded_item_ids.clone();
+        for item in active.into_iter().rev() {
+            match &item.payload {
+                HistoryItemPayload::UserTurn { .. } if newest_user.is_none() => {
+                    newest_user = Some(item.id);
+                    protected.insert(item.id);
+                }
+                HistoryItemPayload::SteerTurn { .. } if newest_steer.is_none() => {
+                    newest_steer = Some(item.id);
+                    protected.insert(item.id);
+                }
+                HistoryItemPayload::InterAgentCommunication { communication }
+                    if communication.trigger_turn && newest_agent_input.is_none() =>
+                {
+                    newest_agent_input = Some(item.id);
+                    protected.insert(item.id);
+                }
+                HistoryItemPayload::Compaction {
+                    clm_checkpoint: Some(_),
+                    ..
+                } => {
+                    protected.insert(item.id);
+                }
+                _ => {}
+            }
+        }
+        self.semantic_compaction_units_excluding(excluded_item_ids)
+            .into_iter()
+            .filter(|unit| !unit.iter().any(|id| protected.contains(id)))
+            .collect()
+    }
+
+    pub(crate) fn compaction_source_messages_for_items(
+        &self,
+        item_ids: &[HistoryItemId],
+        excluded_item_ids: &HashSet<HistoryItemId>,
+        supports_images: bool,
+    ) -> Vec<ModelMessage> {
+        // The summary must see the real task even when its newest input remains
+        // outside the replacement. An excluded just-admitted input is not sampled.
+        let selected = item_ids.iter().copied().collect::<HashSet<_>>();
+        let input = self
+            .history_items
+            .iter()
+            .filter(|item| {
+                !excluded_item_ids.contains(&item.id)
+                    && (selected.contains(&item.id)
+                        || matches!(
+                            &item.payload,
+                            HistoryItemPayload::UserTurn { .. }
+                                | HistoryItemPayload::SteerTurn { .. }
+                        )
+                        || matches!(&item.payload,
+                        HistoryItemPayload::InterAgentCommunication { communication }
+                            if communication.trigger_turn)
+                        || matches!(
+                            &item.payload,
+                            HistoryItemPayload::Compaction {
+                                clm_checkpoint: Some(_),
+                                ..
+                            }
+                        ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        project_model_messages(&input, supports_images, &self.chat_continuations)
+    }
+
     pub fn model_messages_excluding(
         &self,
         excluded_item_ids: &HashSet<HistoryItemId>,
@@ -248,7 +371,7 @@ impl ContextManager {
             .filter(|item| !excluded_item_ids.contains(&item.id))
             .cloned()
             .collect::<Vec<_>>();
-        project_model_messages(&items, supports_images)
+        project_model_messages(&items, supports_images, &self.chat_continuations)
     }
 
     pub fn model_messages_for_items(
@@ -263,7 +386,7 @@ impl ContextManager {
             .filter(|item| selected.contains(&item.id))
             .cloned()
             .collect::<Vec<_>>();
-        project_model_messages(&items, supports_images)
+        project_model_messages(&items, supports_images, &self.chat_continuations)
     }
 
     pub fn active_item_ids(&self) -> Vec<HistoryItemId> {
@@ -691,6 +814,7 @@ fn revision_for(items: &[HistoryItem]) -> HistoryRevision {
 fn project_model_messages(
     history_items: &[HistoryItem],
     supports_images: bool,
+    chat_continuations: &HashMap<ModelResponseId, ChatToolContinuation>,
 ) -> Vec<ModelMessage> {
     let mut projected = Vec::<(usize, usize, ModelMessage)>::new();
     let index_by_id = history_items
@@ -801,6 +925,7 @@ fn project_model_messages(
             ModelMessage::AssistantToolCalls {
                 content,
                 tool_calls,
+                continuation: chat_continuations.get(response_id).cloned(),
             },
         ));
     }
@@ -1236,6 +1361,7 @@ fn append_model_visible_lines(output_text: &str, lines: &[String]) -> String {
 }
 
 pub(super) fn semantic_compaction_message(summary: &str) -> ModelMessage {
+    let summary = super::compaction::project_checkpoint_summary(summary);
     ModelMessage::User {
         content: format!(
             "{}\n{}",
@@ -1437,6 +1563,159 @@ mod tests {
             user_id,
             response_id,
         )
+    }
+
+    #[test]
+    fn chat_continuation_is_private_run_state_and_counts_toward_admission() {
+        let (mut context, _, response_id) = provider_tool_round();
+        let canonical_before = serde_json::to_value(context.history_items()).unwrap();
+        let mut request = token_status_request(context.model_messages(false));
+        let before = ContextWindowTokenStatus::for_request(&request, 0).active_context_tokens;
+        request.model.context_window = before + 1;
+        assert!(!ContextWindowTokenStatus::for_request(&request, 0).token_limit_reached);
+        let private = "private continuation evidence ".repeat(64);
+        context.record_chat_continuation(
+            response_id,
+            ChatToolContinuation::new(request.continuation_scope(), private.clone()),
+        );
+        let messages = context.model_messages(false);
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::AssistantToolCalls { continuation: Some(value), .. }
+                if value.reasoning_content() == private
+        )));
+        assert!(!format!("{context:?}").contains(&private));
+        assert!(!serde_json::to_string(&messages).unwrap().contains(&private));
+        assert_eq!(
+            serde_json::to_value(context.history_items()).unwrap(),
+            canonical_before
+        );
+        request.messages = messages;
+        assert!(ContextWindowTokenStatus::for_request(&request, 0).token_limit_reached);
+
+        let replay = ContextManager::rehydrate(context.history_items.clone());
+        assert!(replay.model_messages(false).iter().all(|message| !matches!(
+            message,
+            ModelMessage::AssistantToolCalls {
+                continuation: Some(_),
+                ..
+            }
+        )));
+        context.clear_chat_continuations();
+        assert!(
+            context
+                .model_messages(false)
+                .iter()
+                .all(|message| !matches!(
+                    message,
+                    ModelMessage::AssistantToolCalls {
+                        continuation: Some(_),
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[test]
+    fn committed_chat_continuation_survives_history_pages_before_its_tool_call() {
+        let (saved, _, response_id) = provider_tool_round();
+        let mut rows = saved.history_items.into_iter();
+        let mut context = ContextManager::from_active_history(Vec::new(), None, 0);
+        let request = token_status_request(Vec::new());
+        context.record_chat_continuation(
+            response_id,
+            ChatToolContinuation::new(
+                request.continuation_scope(),
+                "private paged response".into(),
+            ),
+        );
+        // The bundle has committed, but a bounded cursor page can end before
+        // its tool call. Absence from this partial projection is not removal.
+        context.ingest_committed_delta(vec![rows.next().unwrap()], Some(1));
+        assert!(context.chat_continuations.contains_key(&response_id));
+        context.ingest_committed_delta(vec![rows.next().unwrap()], Some(2));
+        context.ingest_committed_delta(rows.collect(), Some(3));
+        assert!(context.model_messages(false).iter().any(|message| matches!(
+            message,
+            ModelMessage::AssistantToolCalls { continuation: Some(value), .. }
+                if value.reasoning_content() == "private paged response"
+        )));
+    }
+
+    #[test]
+    fn chat_continuations_follow_canonical_response_identity_and_compaction_selection() {
+        let (mut context, _, first_response) = provider_tool_round();
+        let first_ids = context.active_item_ids();
+        let (second, _, second_response) = provider_tool_round();
+        let session_id = context.history_items[0].session_id;
+        let scope = context.history_items[0].scope;
+        let suffix = second
+            .history_items
+            .into_iter()
+            .skip(1)
+            .map(|mut item| {
+                item.session_id = session_id;
+                item.scope = scope;
+                item.sequence_no += 3;
+                item
+            })
+            .collect();
+        context.ingest_committed_delta(suffix, Some(5));
+        let request = token_status_request(Vec::new());
+        for (response, private) in [
+            (first_response, "first private"),
+            (second_response, "second private"),
+        ] {
+            context.record_chat_continuation(
+                response,
+                ChatToolContinuation::new(request.continuation_scope(), private.to_string()),
+            );
+        }
+        // Both providers used call_1. Their canonical response IDs still bind
+        // the private state to the right assistant unit.
+        let private_values = |messages: Vec<ModelMessage>| {
+            messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    ModelMessage::AssistantToolCalls {
+                        continuation: Some(value),
+                        ..
+                    } => Some(value.reasoning_content().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            private_values(context.model_messages(false)),
+            ["first private", "second private"]
+        );
+        assert_eq!(
+            private_values(context.model_messages_for_items(&first_ids, false)),
+            ["first private"]
+        );
+        context.ingest_committed_delta(
+            vec![HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope,
+                sequence_no: 7,
+                created_at_ms: 7,
+                payload: HistoryItemPayload::Compaction {
+                    clm_checkpoint: None,
+                    mode: CompactionMode::Automatic,
+                    layout: CompactionLayout::UserAnchoredCheckpoint,
+                    preserved_user_messages: vec!["inspect the file".into()],
+                    summary: "historical prefix checkpoint".into(),
+                    replacement_item_ids: first_ids,
+                },
+            }],
+            Some(6),
+        );
+        assert_eq!(
+            private_values(context.model_messages(false)),
+            ["second private"]
+        );
+        assert!(!context.chat_continuations.contains_key(&first_response));
     }
 
     fn provider_sent_request() -> (Vec<ModelMessage>, ChatRequest) {
@@ -2535,6 +2814,61 @@ mod tests {
     }
 
     #[test]
+    fn legacy_checkpoint_payload_projection_changes_only_model_input() {
+        let mut checkpoint = user_item("fixture identity");
+        let source_item_id = HistoryItemId::new();
+        let call_id = crate::session::ToolCallId::new();
+        let payload = "historical_document_text_should_not_recur ".repeat(2_000);
+        let arguments =
+            serde_json::json!({"path": "Exact/Original.MD", "content": payload}).to_string();
+        let card = serde_json::json!({
+            "version": 1,
+            "records": [{
+                "source_session_id": checkpoint.session_id,
+                "history_item_id": source_item_id,
+                "data": {
+                    "kind": "tool_call",
+                    "call_id": call_id,
+                    "model_call_id": "historical-provider-call",
+                    "tool_name": "write",
+                    "arguments_json": arguments,
+                },
+            }],
+        });
+        let body = "Keep exact user requirements; write attempt is not verification.\r\n";
+        let summary = format!(
+            "{body}\n{}\n{card}\n{}",
+            super::super::compaction::SOURCE_RECORDS_BEGIN,
+            super::super::compaction::SOURCE_RECORDS_END,
+        );
+        checkpoint.payload = HistoryItemPayload::Compaction {
+            mode: CompactionMode::Automatic,
+            layout: CompactionLayout::UserAnchoredCheckpoint,
+            preserved_user_messages: Vec::new(),
+            clm_checkpoint: None,
+            summary: summary.clone(),
+            replacement_item_ids: vec![source_item_id],
+        };
+        let context = ContextManager::from_active_history(vec![checkpoint], Some(1), 1);
+        let canonical_before = serde_json::to_value(context.history_items()).unwrap();
+        let messages = context.model_messages(false);
+        let [ModelMessage::User { content }] = messages.as_slice() else {
+            panic!("historical card remains one user-context message, not executable calls")
+        };
+        assert!(content.contains(body));
+        assert!(content.contains("read_history"));
+        assert!(!content.contains("tool_call_with_payload_references"));
+        assert!(!content.contains("historical_document_text_should_not_recur"));
+        assert!(content.len() < summary.len());
+        assert_eq!(
+            serde_json::to_value(context.history_items()).unwrap(),
+            canonical_before
+        );
+        assert!(matches!(&context.history_items()[0].payload,
+            HistoryItemPayload::Compaction { summary: saved, .. } if saved == &summary));
+    }
+
+    #[test]
     fn pre_turn_compaction_excludes_the_exact_new_user_until_the_following_sample() {
         let old = user_item("old context");
         let mut current = user_item("new explicit request");
@@ -2560,11 +2894,16 @@ mod tests {
         assert!(compaction_source.iter().all(
             |message| !matches!(message, ModelMessage::User { content } if content == "new explicit request")
         ));
+        let summary = context
+            .checkpoint_with_source_records("old work is summarized", &[old.id])
+            .expect("selected historical source records");
+        assert!(summary.contains(&old.id.to_string()));
+        assert!(!summary.contains("new explicit request"));
         let projected_for_compaction = context.model_messages_after_compaction(
             old.session_id,
             old.turn_id().expect("turn-scoped fixture"),
             vec!["old context".to_string()],
-            "old work is summarized".to_string(),
+            summary.clone(),
             vec![old.id],
             &excluded,
             true,
@@ -2587,7 +2926,7 @@ mod tests {
                     mode: crate::protocol::CompactionMode::Automatic,
                     layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
                     preserved_user_messages: vec!["old context".to_string()],
-                    summary: "old work is summarized".to_string(),
+                    summary,
                     replacement_item_ids: vec![old.id],
                 },
             }],
@@ -3114,6 +3453,7 @@ mod tests {
         let ModelMessage::AssistantToolCalls {
             content,
             tool_calls,
+            ..
         } = &projected[0]
         else {
             panic!("expected grouped assistant tool calls");
@@ -3183,6 +3523,7 @@ mod tests {
                 ModelMessage::AssistantToolCalls {
                     content: Some(content),
                     tool_calls,
+                    ..
                 },
                 ModelMessage::Tool { .. },
             ] if content == "\n \t\n"
@@ -3378,5 +3719,89 @@ mod tests {
         let units = context.semantic_compaction_units();
 
         assert_eq!(units, vec![vec![item.id]]);
+    }
+
+    #[test]
+    fn automatic_compaction_snapshot_covers_latest_tool_group_and_advances_past_prior_checkpoint() {
+        let user = user_item("original exact requirement");
+        let response = |label: &str| {
+            let response_id = ModelResponseId::new();
+            let call_id = ToolCallId::new();
+            let mut call = user.clone();
+            call.id = HistoryItemId::new();
+            call.payload = HistoryItemPayload::ToolCall {
+                call_id,
+                response_id,
+                model_call_id: label.into(),
+                tool_name: "read".into(),
+                arguments_json: serde_json::json!({"path": format!("{label}.txt")}).to_string(),
+            };
+            let mut output = call.clone();
+            output.id = HistoryItemId::new();
+            output.payload = HistoryItemPayload::ToolOutput {
+                call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "read".into(),
+                output_text: format!("{label} evidence"),
+                metadata: serde_json::Value::Null,
+                success: Some(true),
+            };
+            vec![call, output]
+        };
+        let first_group = response("first");
+        let mut items = vec![user.clone()];
+        items.extend(first_group.clone());
+        let mut context = ContextManager::from_active_history(items, Some(3), 3);
+        let first_ids = context
+            .automatic_compaction_units_excluding(&HashSet::new())
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_ids,
+            first_group.iter().map(|item| item.id).collect::<Vec<_>>()
+        );
+        let source =
+            context.compaction_source_messages_for_items(&first_ids, &HashSet::new(), false);
+        assert!(source.iter().any(|message| matches!(message,
+            ModelMessage::User { content } if content == "original exact requirement")));
+        let mut checkpoint = user.clone();
+        checkpoint.id = HistoryItemId::new();
+        checkpoint.payload = HistoryItemPayload::Compaction {
+            mode: CompactionMode::Automatic,
+            layout: CompactionLayout::UserAnchoredCheckpoint,
+            preserved_user_messages: Vec::new(),
+            clm_checkpoint: None,
+            summary: context
+                .checkpoint_with_source_records("first checkpoint", &first_ids)
+                .unwrap(),
+            replacement_item_ids: first_ids,
+        };
+        context.ingest_committed_delta(vec![checkpoint.clone()], Some(4));
+        let latest_group = response("latest");
+        context.ingest_committed_delta(latest_group.clone(), Some(6));
+        let second_ids = context
+            .automatic_compaction_units_excluding(&HashSet::new())
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            second_ids,
+            [
+                vec![checkpoint.id],
+                latest_group.iter().map(|item| item.id).collect()
+            ]
+            .concat()
+        );
+        assert!(!second_ids.contains(&user.id));
+        let source =
+            context.compaction_source_messages_for_items(&second_ids, &HashSet::new(), false);
+        assert!(source.iter().any(|message| matches!(message,
+            ModelMessage::Tool { call_id, .. } if call_id == "latest")));
+        let next = context
+            .checkpoint_with_source_records("latest checkpoint", &second_ids)
+            .unwrap();
+        assert!(!next.contains("first checkpoint"));
+        assert!(!next.contains(super::super::compaction::SOURCE_RECORDS_BEGIN));
     }
 }

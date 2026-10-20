@@ -151,6 +151,15 @@ fn assert_model_compaction_tool_pair(messages: &[ModelMessage], expected_call_id
     assert_eq!(matching_outputs, 1, "native output {expected_call_id}");
 }
 
+fn model_compaction_body_and_reference(summary: &str) -> (&str, &str) {
+    let (body, reference) = summary
+        .rsplit_once("\n\nHistorical evidence in this conversation: ")
+        .expect("bounded canonical evidence reference follows the body");
+    assert!(reference.contains("read_history"));
+    assert!(!summary.contains(compaction::SOURCE_RECORDS_BEGIN));
+    (body, reference)
+}
+
 #[tokio::test]
 async fn model_compaction_retains_recent_evidence_and_append_only_history() {
     let run = run_model_compaction_fixture(MODEL_COMPACTION_SUMMARY, false).await;
@@ -210,7 +219,15 @@ async fn model_compaction_retains_recent_evidence_and_append_only_history() {
         **layout,
         crate::protocol::CompactionLayout::UserAnchoredCheckpoint
     );
-    assert_eq!(*summary, MODEL_COMPACTION_SUMMARY);
+    let (body, reference) = model_compaction_body_and_reference(summary);
+    assert_eq!(body, MODEL_COMPACTION_SUMMARY);
+    let old_unit_ids = history_tool_unit_ids(&history, "old-read");
+    assert!(
+        old_unit_ids
+            .iter()
+            .any(|id| reference.contains(&id.to_string()))
+    );
+    assert!(!summary.contains("arguments_json"));
     for id in history_tool_unit_ids(&history, "old-read") {
         assert!(
             replaced.contains(&id),
@@ -366,7 +383,15 @@ async fn model_compaction_preserves_the_latest_explicit_steer_as_raw_input() {
 
 #[tokio::test]
 async fn model_compaction_rejects_invalid_and_expanding_summaries_without_replacing_history() {
-    for summary in ["   ".to_string(), "EXPANDING_SUMMARY ".repeat(5_000)] {
+    for summary in [
+        "   ".to_string(),
+        "EXPANDING_SUMMARY ".repeat(5_000),
+        format!(
+            "Model-provided records\n{}\n{{\"version\":1,\"records\":[]}}\n{}",
+            compaction::SOURCE_RECORDS_BEGIN,
+            compaction::SOURCE_RECORDS_END
+        ),
+    ] {
         let run = run_model_compaction_fixture(&summary, false).await;
         assert!(
             run.summary.is_ok(),
@@ -413,6 +438,13 @@ struct ModelCompactionSaveFixture {
 }
 
 async fn model_compaction_save_fixture() -> ModelCompactionSaveFixture {
+    model_compaction_save_fixture_with_call("read", serde_json::json!({"fixture": "old"})).await
+}
+
+async fn model_compaction_save_fixture_with_call(
+    tool_name: &str,
+    arguments: Value,
+) -> ModelCompactionSaveFixture {
     let mut config = ResolvedConfig::default();
     config.model.context_window = 128_000;
     config.model.max_output_tokens = 512;
@@ -420,11 +452,7 @@ async fn model_compaction_save_fixture() -> ModelCompactionSaveFixture {
         config.clone(),
         vec![
             ScriptedResponse {
-                events: model_compaction_tool_events(
-                    "settled-old-read",
-                    "read",
-                    serde_json::json!({"fixture": "old"}),
-                ),
+                events: model_compaction_tool_events("settled-old-read", tool_name, arguments),
                 finish_reason: FinishReason::ToolCall,
             },
             ScriptedResponse {
@@ -642,6 +670,7 @@ struct ModelCompactionStopAfterCommit {
     store: StoreBundle,
     control: RunControl,
     session_id: SessionId,
+    expected_summary: String,
     delivered_after_commit: bool,
 }
 
@@ -661,7 +690,7 @@ impl RunEventSink for ModelCompactionStopAfterCommit {
             .any(|item| {
                 matches!(
                     &item.payload, HistoryItemPayload::Compaction { summary, .. }
-                        if summary == MODEL_COMPACTION_SAVE_SUMMARY
+                        if summary == &self.expected_summary
                 )
             });
         assert!(
@@ -687,13 +716,17 @@ async fn model_compaction_save_survives_delivery_failure_and_later_stop() {
         template,
         source_ids,
     } = model_compaction_save_fixture().await;
+    let expected_summary = request
+        .context
+        .checkpoint_with_source_records(MODEL_COMPACTION_SAVE_SUMMARY, &source_ids)
+        .expect("host source records fit the source history");
     let expected_projection = request.context.model_messages_after_compaction(
         request.session.session.id,
         request.turn_id(),
         request
             .context
             .compaction_user_messages_for_items(&source_ids),
-        MODEL_COMPACTION_SAVE_SUMMARY.into(),
+        expected_summary.clone(),
         source_ids.clone(),
         &HashSet::new(),
         false,
@@ -706,6 +739,7 @@ async fn model_compaction_save_survives_delivery_failure_and_later_stop() {
         store: store.clone(),
         control: request.run_control.clone(),
         session_id: request.session.session.id,
+        expected_summary,
         delivered_after_commit: false,
     };
     assert!(
@@ -758,6 +792,10 @@ async fn model_compaction_save_uses_calibrated_full_request_budget() {
         source_ids,
     } = model_compaction_save_fixture().await;
     let before_tokens = estimate_model_messages_tokens(&request.context.model_messages(false));
+    let expected_summary = request
+        .context
+        .checkpoint_with_source_records(MODEL_COMPACTION_SAVE_SUMMARY, &source_ids)
+        .expect("host source records fit the source history");
     let after_tokens = estimate_model_messages_tokens(
         &request.context.model_messages_after_compaction(
             request.session.session.id,
@@ -765,7 +803,7 @@ async fn model_compaction_save_uses_calibrated_full_request_budget() {
             request
                 .context
                 .compaction_user_messages_for_items(&source_ids),
-            MODEL_COMPACTION_SAVE_SUMMARY.into(),
+            expected_summary,
             source_ids.clone(),
             &HashSet::new(),
             false,
@@ -815,6 +853,244 @@ async fn model_compaction_save_uses_calibrated_full_request_budget() {
         sink.events.as_slice(),
         [RunEvent::RecoverableRuntimeFeedback { .. }]
     ));
+}
+
+#[tokio::test]
+async fn model_compaction_budget_includes_history_reference() {
+    let ModelCompactionSaveFixture {
+        store,
+        agent,
+        mut request,
+        template,
+        source_ids,
+    } = model_compaction_save_fixture().await;
+    let before_tokens = estimate_model_messages_tokens(&request.context.model_messages(false));
+    let anchors = request
+        .context
+        .compaction_user_messages_for_items(&source_ids);
+    let body_only_tokens =
+        estimate_model_messages_tokens(&request.context.model_messages_after_compaction(
+            request.session.session.id,
+            request.turn_id(),
+            anchors.clone(),
+            MODEL_COMPACTION_SAVE_SUMMARY.into(),
+            source_ids.clone(),
+            &HashSet::new(),
+            false,
+        ));
+    let checkpoint = request
+        .context
+        .checkpoint_with_source_records(MODEL_COMPACTION_SAVE_SUMMARY, &source_ids)
+        .expect("host source records");
+    let with_records_tokens =
+        estimate_model_messages_tokens(&request.context.model_messages_after_compaction(
+            request.session.session.id,
+            request.turn_id(),
+            anchors,
+            checkpoint,
+            source_ids.clone(),
+            &HashSet::new(),
+            false,
+        ));
+    assert!(body_only_tokens < with_records_tokens);
+    assert!(with_records_tokens < before_tokens);
+    let working_limit = request.turn.policy.model.working_context_token_limit;
+    let calibrated_status = ContextWindowTokenStatus::from_provider_usage(
+        &template,
+        0,
+        working_limit
+            .saturating_add(before_tokens)
+            .saturating_sub(with_records_tokens),
+        &[],
+        0,
+    );
+    let calibrated_overhead = calibrated_status
+        .active_context_tokens
+        .saturating_sub(before_tokens);
+    assert!(calibrated_overhead.saturating_add(body_only_tokens) < working_limit);
+    assert_eq!(
+        calibrated_overhead.saturating_add(with_records_tokens),
+        working_limit
+    );
+    let before = model_compaction_save_snapshot(&store, &request);
+    let mut sink = CapturingSink::default();
+    assert!(
+        !agent
+            .apply_model_compaction(
+                &mut request,
+                &calibrated_status,
+                MODEL_COMPACTION_SAVE_SUMMARY.into(),
+                source_ids,
+                &mut sink,
+            )
+            .await
+            .expect("a host-card budget rejection is recoverable")
+    );
+    assert_eq!(model_compaction_save_snapshot(&store, &request), before);
+    assert!(matches!(
+        sink.events.as_slice(),
+        [RunEvent::RecoverableRuntimeFeedback { .. }]
+    ));
+}
+
+#[tokio::test]
+async fn model_compaction_resummarizing_replaces_body_and_bounded_reference() {
+    let ModelCompactionSaveFixture {
+        store,
+        agent,
+        mut request,
+        mut template,
+        source_ids,
+    } = model_compaction_save_fixture().await;
+    let first_body = "The earlier inspection completed; retain its exact call inputs and output reference while continuing the task. ".repeat(8);
+    let mut sink = CapturingSink::default();
+    assert!(
+        agent
+            .apply_model_compaction(
+                &mut request,
+                &ContextWindowTokenStatus::for_request(&template, 0),
+                first_body.clone(),
+                source_ids,
+                &mut sink,
+            )
+            .await
+            .unwrap()
+    );
+    let (checkpoint_id, first_checkpoint) = request
+        .context
+        .history_items()
+        .iter()
+        .find_map(|item| match &item.payload {
+            HistoryItemPayload::Compaction { summary, .. } => Some((item.id, summary.clone())),
+            _ => None,
+        })
+        .expect("first model checkpoint");
+    let (_, first_reference) = model_compaction_body_and_reference(&first_checkpoint);
+    let first_reference = first_reference.to_string();
+    template.messages = request.context.model_messages(false);
+    assert!(
+        agent
+            .apply_model_compaction(
+                &mut request,
+                &ContextWindowTokenStatus::for_request(&template, 0),
+                "Resume.".into(),
+                vec![checkpoint_id],
+                &mut sink,
+            )
+            .await
+            .unwrap()
+    );
+    let history = store
+        .protocol_event_store()
+        .list_history_items_for_session(request.session.session.id)
+        .unwrap();
+    let checkpoints = history
+        .iter()
+        .filter_map(|item| match &item.payload {
+            HistoryItemPayload::Compaction { summary, .. } => Some(summary),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(checkpoints[0], &first_checkpoint);
+    let (body, reference) = model_compaction_body_and_reference(checkpoints[1]);
+    assert_eq!(body, "Resume.");
+    assert!(reference.contains(&checkpoint_id.to_string()));
+    assert_ne!(reference, first_reference);
+    assert!(
+        reference.len() == first_reference.len(),
+        "reference size is independent of old Tool count"
+    );
+    assert!(!checkpoints[1].contains(&first_body));
+    assert_eq!(
+        sink.events
+            .iter()
+            .filter(|event| matches!(event, RunEvent::CompactionCompleted { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn model_compaction_write_payload_remains_canonical_after_commit_and_reload() {
+    let document = "Historical full document: 未検証\r\n".repeat(2_000);
+    let arguments = serde_json::json!({"path": "artifact.md", "content": document});
+    let expected_arguments = arguments.to_string();
+    let ModelCompactionSaveFixture {
+        store,
+        agent,
+        mut request,
+        template,
+        source_ids,
+    } = model_compaction_save_fixture_with_call("write", arguments).await;
+    let history_before = store
+        .protocol_event_store()
+        .list_history_items_for_session(request.session.session.id)
+        .unwrap();
+    let original_call = history_before
+        .iter()
+        .find(|item| {
+            matches!(&item.payload, HistoryItemPayload::ToolCall {
+            tool_name, arguments_json, ..
+        } if tool_name == "write" && arguments_json == &expected_arguments)
+        })
+        .expect("complete original write arguments are durable")
+        .clone();
+    let mut sink = CapturingSink::default();
+    assert!(agent.apply_model_compaction(
+        &mut request,
+        &ContextWindowTokenStatus::for_request(&template, 0),
+        "artifact.md was written; its historical input is referenced, not a current file verification.".into(),
+        source_ids,
+        &mut sink,
+    ).await.unwrap());
+    let history_after = store
+        .protocol_event_store()
+        .list_history_items_for_session(request.session.session.id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            history_after
+                .iter()
+                .find(|item| item.id == original_call.id)
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&original_call).unwrap(),
+        "compaction must not rewrite or delete canonical call bytes"
+    );
+    let summary = history_after
+        .iter()
+        .find_map(|item| match &item.payload {
+            HistoryItemPayload::Compaction { summary, .. } => Some(summary),
+            _ => None,
+        })
+        .unwrap();
+    let (_, reference) = model_compaction_body_and_reference(summary);
+    assert!(reference.contains(&original_call.id.to_string()));
+    assert!(!summary.contains("arguments_json"));
+    assert!(!summary.contains("Historical full document:"));
+
+    let mut builder = context_manager::ContextManager::active_history_builder();
+    let active = store
+        .protocol_event_store()
+        .visit_active_history_pages_for_session(
+            request.session.session.id,
+            crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+            &mut |page| {
+                builder.ingest_page(page.items);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let resumed = builder.finish(active.append_fence, active.canonical_count);
+    let projected = serde_json::to_string(&resumed.model_messages(false)).unwrap();
+    assert!(!projected.contains("Historical full document:"));
+    assert!(projected.contains("artifact.md"));
+    assert_eq!(
+        serde_json::to_value(resumed.model_messages(false)).unwrap(),
+        serde_json::to_value(request.context.model_messages(false)).unwrap()
+    );
 }
 
 #[test]

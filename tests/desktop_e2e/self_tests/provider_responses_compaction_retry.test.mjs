@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_PROMPT,
@@ -27,6 +29,12 @@ const SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const TURN_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const USER_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const HASH = "a".repeat(64);
+const CHECKPOINT_REFERENCES = Object.freeze({
+  first_item_id: "01ARZ3NDEKTSV4RRFFQ69G5FAY",
+  last_item_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+});
+const CHECKPOINT = `${SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT}\n\nHistorical evidence in this conversation: first_item_id=${CHECKPOINT_REFERENCES.first_item_id}; last_item_id=${CHECKPOINT_REFERENCES.last_item_id}. Use read_history to retrieve original records. These references do not establish success, approval, or verification.`;
+const CHECKPOINT_HASH = createHash("sha256").update(`${SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX}\n${CHECKPOINT}`, "utf8").digest("hex");
 const OUTPUT_HASHES = Object.freeze(Array.from(
   { length: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT },
   (_, index) => String(index + 1).repeat(64),
@@ -179,7 +187,8 @@ function exactLedger() {
     matches: true,
     first_prompt_matches: true,
     checkpoint_matches: true,
-    checkpoint_sha256: HASH,
+    checkpoint_references: CHECKPOINT_REFERENCES,
+    checkpoint_sha256: CHECKPOINT_HASH,
     first_remaining_read_index: 2,
     remaining_read_count: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT - 1,
     ...outputEvidence(1, SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT - 1),
@@ -297,7 +306,7 @@ function projection(overrides = {}) {
       {
         row_kind: "system",
         title: "システム - Context Compaction",
-        body: `圧縮しました\n\n${SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT}`,
+        body: `圧縮しました\n\n${CHECKPOINT}`,
       },
       {
         row_kind: "work_summary_completed",
@@ -500,6 +509,20 @@ test("Responses compaction terminal requires one canonical checkpoint and visibl
   const missingCompaction = structuredClone(sample);
   missingCompaction.surface.projection.transcript_rows.splice(1, 1);
   assert.match(responsesCompactionTerminalFailures(missingCompaction).join(","), /canonical-compaction/u);
+
+  const changedReference = structuredClone(sample);
+  changedReference.surface.projection.transcript_rows[1].body = changedReference.surface.projection.transcript_rows[1].body.replace(
+    CHECKPOINT_REFERENCES.first_item_id, USER_ID,
+  );
+  assert.match(responsesCompactionTerminalFailures(changedReference).join(","), /canonical-compaction/u);
+
+  const missingReference = structuredClone(sample);
+  missingReference.surface.projection.transcript_rows[1].body = `圧縮しました\n\n${SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT}`;
+  assert.match(responsesCompactionTerminalFailures(missingReference).join(","), /canonical-compaction/u);
+
+  const invalidReference = structuredClone(sample);
+  invalidReference.ledger.at(-1).contract.role_evidence.checkpoint_references.last_item_id = "not-a-history-id";
+  assert.equal(exactResponsesCompactionLedger(invalidReference.ledger), false);
 
   const wrongProgress = structuredClone(sample);
   wrongProgress.surface.projection.progress_text = wrongProgress.surface.projection.progress_text.replace(

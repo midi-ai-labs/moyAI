@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod continuation;
 pub mod contract;
 pub mod dto;
 pub mod image_validation;
@@ -10,6 +11,7 @@ pub mod request_diagnostics;
 pub mod responses;
 
 pub use catalog::{ConfigModelCatalog, ModelCatalog};
+pub use continuation::{ChatContinuationScope, ChatToolContinuation};
 pub use contract::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelCapabilities,
     ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ProviderToolChoice,

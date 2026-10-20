@@ -6,12 +6,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::model::ProviderApiMode;
 use crate::config::model::{ProviderReasoningCapability, ReasoningEffort, ReasoningSummary};
 use crate::config::{ProviderProfile, ProviderTarget};
 use crate::error::{LlmError, ProviderRequestLimit};
 use crate::session::{FinishReason, TokenUsage};
 
+use super::continuation::{ChatContinuationScope, ChatToolContinuation};
 use super::provider::ProviderPhaseEvent;
 use super::validate_image_payload;
 
@@ -79,6 +79,8 @@ pub enum ModelMessage {
     AssistantToolCalls {
         content: Option<String>,
         tool_calls: Vec<ModelToolCall>,
+        #[serde(skip)]
+        continuation: Option<ChatToolContinuation>,
     },
     Tool {
         call_id: String,
@@ -140,6 +142,7 @@ pub struct ChatRequest {
     pub(crate) seed: Option<u64>,
     pub(crate) stop_sequences: Vec<String>,
     pub(crate) extra_body: Option<serde_json::Value>,
+    continuation_scope: Option<ChatContinuationScope>,
 }
 
 impl fmt::Debug for ChatRequest {
@@ -220,11 +223,22 @@ impl ChatRequest {
             seed: None,
             stop_sequences: Vec::new(),
             extra_body: None,
+            continuation_scope: None,
         }
     }
 
     pub(crate) fn provider_target(&self) -> &ProviderTarget {
         &self.provider
+    }
+
+    pub(crate) fn continuation_scope(&self) -> ChatContinuationScope {
+        self.continuation_scope
+            .clone()
+            .unwrap_or_else(|| ChatContinuationScope::direct(&self.provider))
+    }
+
+    pub(crate) fn set_continuation_scope(&mut self, scope: ChatContinuationScope) {
+        self.continuation_scope = Some(scope);
     }
 
     pub(crate) fn extra_headers(&self) -> &BTreeMap<String, String> {
@@ -331,20 +345,6 @@ impl ChatRequest {
 
     fn validate_request_envelope_shape(&self) -> Result<(), LlmError> {
         let limits = self.provider.request_limits();
-        let message_count = if self.provider.api_mode() == ProviderApiMode::ChatCompletions {
-            self.messages
-                .iter()
-                .filter(|message| !matches!(message, ModelMessage::System { .. }))
-                .count()
-                .saturating_add(1)
-        } else {
-            self.messages.len()
-        };
-        ensure_request_limit(
-            ProviderRequestLimit::MessageCount,
-            message_count as u64,
-            limits.max_messages as u64,
-        )?;
         ensure_request_limit(
             ProviderRequestLimit::ToolCount,
             self.tools.len() as u64,
@@ -655,15 +655,29 @@ pub trait LlmEventSink {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmResponseSummary {
-    /// Terminal transport metadata only. Provider reasoning summaries are
-    /// emitted as runtime-only [`LlmEvent::ReasoningSummaryDelta`] values and
-    /// are deliberately not duplicated here.
+    /// Public terminal transport metadata. Provider reasoning summaries are
+    /// runtime-only [`LlmEvent::ReasoningSummaryDelta`] values. The private
+    /// continuation below is excluded from this type's serialized projection.
     pub finish_reason: FinishReason,
     pub usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    #[serde(skip)]
+    pub continuation: Option<ChatToolContinuation>,
+}
+
+impl fmt::Debug for LlmResponseSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmResponseSummary")
+            .field("finish_reason", &self.finish_reason)
+            .field("usage", &self.usage)
+            .field("response_id", &self.response_id)
+            .field("continuation", &self.continuation)
+            .finish()
+    }
 }
 
 pub fn validate_toolless_text_response(
@@ -834,64 +848,76 @@ mod tests {
     }
 
     #[test]
-    fn chat_message_limit_counts_the_injected_system_message() {
-        let mut provider = ProviderTarget::new(
-            "http://lm-studio.local:1234/v1",
-            "fixture-model",
+    fn long_tool_history_within_context_is_admitted_for_each_provider_profile() {
+        for profile in [
             ProviderProfile::OpenAiCompatible,
-            ProviderDeadlines {
-                request_timeout_ms: 10_000,
-                connect_timeout_ms: 1_000,
-                max_connect_retries: 0,
-            },
-        )
-        .expect("typed provider target");
-        let mut limits = ProviderRequestLimits::product_default();
-        limits.max_messages = 2;
-        provider.replace_request_limits(limits);
-        let mut request = ChatRequest::new(
-            provider,
-            ModelProfile {
-                name: "fixture-model".to_string(),
-                context_window: 16_384,
-                max_output_tokens: 1_024,
-                provider_profile: ProviderProfile::OpenAiCompatible,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: false,
-                    supports_images: false,
+            ProviderProfile::LmStudioChatCompletions,
+            ProviderProfile::OpenAiResponses,
+            ProviderProfile::LmStudio,
+        ] {
+            let provider = ProviderTarget::new(
+                "http://provider.local/v1",
+                "fixture-model",
+                profile,
+                ProviderDeadlines {
+                    request_timeout_ms: 10_000,
+                    connect_timeout_ms: 1_000,
+                    max_connect_retries: 0,
                 },
-            },
-            "injected system".to_string(),
-            vec![
-                ModelMessage::System {
-                    content: "merged system".to_string(),
+            )
+            .expect("typed provider target");
+            let mut messages = vec![ModelMessage::User {
+                content: "Summarize the observed source evidence".to_string(),
+            }];
+            for index in 0..300 {
+                let call_id = format!("call-{index}");
+                messages.push(ModelMessage::AssistantToolCalls {
+                    content: None,
+                    tool_calls: vec![super::ModelToolCall {
+                        call_id: call_id.clone(),
+                        tool_name: "read".to_string(),
+                        arguments_json: format!(r#"{{"path":"source-{index}.rs"}}"#),
+                    }],
+                    continuation: None,
+                });
+                messages.push(ModelMessage::Tool {
+                    call_id,
+                    tool_name: "read".to_string(),
+                    result: format!("Observed evidence {index}"),
+                    metadata: serde_json::Value::Null,
+                });
+            }
+            let request = ChatRequest::new(
+                provider,
+                ModelProfile {
+                    name: "fixture-model".to_string(),
+                    context_window: 32_768,
+                    max_output_tokens: 0,
+                    provider_profile: profile,
+                    capabilities: ModelCapabilities {
+                        supports_tools: true,
+                        supports_reasoning: false,
+                        supports_images: false,
+                    },
                 },
-                ModelMessage::User {
-                    content: "first user".to_string(),
-                },
-            ],
-            Vec::new(),
-            None,
-            ProviderReasoningCapability::Unsupported,
-            std::collections::BTreeMap::new(),
-        );
-
-        request
-            .validate_provider_lifecycle()
-            .expect("one wire system plus one user reaches the boundary");
-        request.messages.push(ModelMessage::User {
-            content: "second user".to_string(),
-        });
-
-        assert!(matches!(
-            request.validate_provider_lifecycle(),
-            Err(LlmError::ProviderRequestLimitExceeded {
-                surface: ProviderRequestLimit::MessageCount,
-                actual: 3,
-                maximum: 2,
-            })
-        ));
+                "Preserve source evidence".to_string(),
+                messages,
+                vec![ToolSchema {
+                    name: "read".to_string(),
+                    description: "Read source".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }],
+                None,
+                ProviderReasoningCapability::Unsupported,
+                std::collections::BTreeMap::new(),
+            );
+            let status =
+                crate::context::context_window::ContextWindowTokenStatus::for_request(&request, 0);
+            assert!(!status.token_limit_reached);
+            request
+                .validate_provider_lifecycle()
+                .expect("a long tool history within the context budget remains admissible");
+        }
     }
 
     #[test]
@@ -963,6 +989,7 @@ mod tests {
             FinishReason::Error,
         ] {
             let summary = LlmResponseSummary {
+                continuation: None,
                 finish_reason,
                 usage: None,
                 response_id: None,
@@ -982,6 +1009,7 @@ mod tests {
         }
 
         let summary = LlmResponseSummary {
+            continuation: None,
             finish_reason: FinishReason::Stop,
             usage: None,
             response_id: None,

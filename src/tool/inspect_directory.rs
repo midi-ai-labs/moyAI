@@ -8,6 +8,7 @@ use crate::error::ToolError;
 use crate::tool::context::ToolContext;
 use crate::tool::read_context::ReadToolContext;
 use crate::tool::registry::Tool;
+use crate::tool::search::with_discovery_scope;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
 use crate::workspace::traversal::{TraversalOptions, walk_guarded_page};
@@ -37,7 +38,7 @@ impl Tool for InspectDirectoryTool {
         ToolSpec {
             name: ToolName::InspectDirectory,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Inspect one bounded metadata-only page of a directory tree.",
+            description: "Inspect one bounded metadata-only directory discovery page. Workspace ignore rules and hidden/depth options apply; unlisted paths may still exist.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -182,7 +183,7 @@ impl Tool for InspectDirectoryTool {
 
         Ok(ToolResult {
             title: format!("Inspected {}", guarded.absolute),
-            output_text: lines.join("\n"),
+            output_text: with_discovery_scope(lines.join("\n")),
             metadata: json!({
                 "path": guarded.absolute,
                 "directory_count": directories,

@@ -16,7 +16,7 @@ const request = () => ({ model: "test-model", stream: true, temperature: 0.3,
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const scratchParent = fileURLToPath(new URL("../../../../project_sandbox/desktop-e2e-context-comparison/", import.meta.url));
 
-async function fixture(t, mode, respond) {
+async function fixture(t, mode, respond, credentialSource = "file") {
   await mkdir(scratchParent, { recursive: true });
   const root = await mkdtemp(path.join(scratchParent, "case-")), sockets = new Set(), received = [];
   const state = { proxy: null, expectedProxyFailure: false };
@@ -29,7 +29,8 @@ async function fixture(t, mode, respond) {
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const endpoint = `http://127.0.0.1:${server.address().port}`, secret = "fixture-only-upstream-secret";
   const credentialFile = path.join(root, "credential.json"), captureDirectory = path.join(root, "private-captures");
-  await writeFile(credentialFile, JSON.stringify({ endpoint, provider_profile: "openai_compatible_chat", key: secret }));
+  const credential = Object.freeze({ endpoint, provider_profile: "openai_compatible_chat", key: secret });
+  if (credentialSource === "file") await writeFile(credentialFile, JSON.stringify(credential));
   t.after(async () => {
     try {
       if (state.expectedProxyFailure) await state.proxy?.close().catch(() => {});
@@ -42,8 +43,9 @@ async function fixture(t, mode, respond) {
       await rm(resolved, { recursive: true, force: true });
     }
   });
-  state.proxy = await startContextComparisonProxy({ endpoint, model: "test-model", credentialFile, mode, captureDirectory });
-  return { ...state, state, proxy: state.proxy, received, endpoint, secret, credentialFile, captureDirectory };
+  state.proxy = await startContextComparisonProxy({ endpoint, model: "test-model", mode, captureDirectory,
+    ...(credentialSource === "file" ? { credentialFile } : { credential }) });
+  return { ...state, state, proxy: state.proxy, received, endpoint, secret, credentialFile, captureDirectory, root };
 }
 const post = (f, body = request(), signal) => fetch(`${f.proxy.baseUrl}/chat/completions`, {
   method: "POST", headers: { "content-type": "application/json", authorization: "Bearer local-header-must-not-forward" },
@@ -78,11 +80,30 @@ test("credentials bind the exact endpoint and Chat Completions profile", () => {
     assert.throws(() => comparisonUpstream({ ...saved, ...patch }, saved.endpoint));
 });
 
-for (const mode of ["remove", "preserve"]) test(`${mode} proxy captures private pre/post bodies and keeps discovery/model/auth routing exact`, async t => {
+test("proxy requires exactly one credential source and validates memory credentials before capture or listening", async () => {
+  const endpoint = "http://127.0.0.1:8119", secret = "fixture-only-validation-secret";
+  const credential = { endpoint, provider_profile: "openai_compatible_chat", key: secret };
+  const options = { endpoint, model: "test-model", mode: "preserve", captureDirectory: path.join(scratchParent, "unused-validation-captures") };
+  const credentialFile = path.join(scratchParent, "nonexistent-validation-credential.json");
+  for (const sources of [{}, { credential, credentialFile }]) {
+    await assert.rejects(startContextComparisonProxy({ ...options, ...sources }), error =>
+      error instanceof TypeError && /exactly one/.test(error.message) && !error.message.includes(secret));
+  }
+  for (const invalid of [null, [], { ...credential, endpoint: "http://127.0.0.1:8120" },
+    { ...credential, provider_profile: "openai_compatible_responses" }, { ...credential, key: "" },
+    { ...credential, key: "bad\r\nheader" }]) {
+    await assert.rejects(startContextComparisonProxy({ ...options, credential: invalid }), error =>
+      error instanceof TypeError && !error.message.includes(secret));
+  }
+  await assert.rejects(readdir(options.captureDirectory), { code: "ENOENT" });
+});
+
+for (const mode of ["remove", "preserve"]) for (const credentialSource of ["file", "memory"])
+test(`${mode} proxy with ${credentialSource} credentials captures bodies and keeps routing exact`, async t => {
   const f = await fixture(t, mode, (row, res) => {
     res.setHeader("content-type", "application/json");
     res.end(row.url === "/v1/models" ? '{"data":[{"id":"test-model"}]}' : '{"choices":[{"message":{"content":"ok"}}]}');
-  });
+  }, credentialSource);
   assert.equal((await (await fetch(`${f.proxy.baseUrl}/models`)).json()).data[0].id, "test-model");
   const raw = JSON.stringify(request(), null, 2);
   const response = await post(f, raw); assert.equal(response.status, 200); await response.text();
@@ -102,6 +123,7 @@ for (const mode of ["remove", "preserve"]) test(`${mode} proxy captures private 
     const text = (await readFile(path.join(f.captureDirectory, name))).toString();
     assert.equal(text.includes(f.secret), false); assert.equal(text.includes("local-header-must-not-forward"), false);
   }
+  if (credentialSource === "memory") assert.deepEqual(await readdir(f.root), ["private-captures"]);
 });
 
 test("SSE chunks stream immediately and preserve split UTF-8, finish and DONE bytes", { timeout: 10000 }, async t => {

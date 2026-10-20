@@ -46,6 +46,9 @@ const CHATML_ROLE_BOUNDARY_ARTIFACTS: [&str; 6] = [
 ];
 const PROVIDER_STREAM_ERROR_MESSAGE_LIMIT_BYTES: usize = 160;
 const PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES: usize = 48;
+const HTTP_FAILURE_MESSAGE_LIMIT_BYTES: usize = 1024;
+const HTTP_FAILURE_SOURCE_LIMIT_BYTES: usize = 256;
+const HTTP_FAILURE_SOURCE_DEPTH: usize = 8;
 
 #[derive(Clone)]
 pub struct OpenAiCompatClient {
@@ -106,27 +109,77 @@ impl OpenAiCompatClient {
         sink: &mut ProviderTraceSink<'_>,
     ) -> Result<LlmResponseSummary, LlmError> {
         request.validate_provider_lifecycle()?;
+        let deadlines = request.provider_target().deadlines();
+        let deadline = OperationDeadline::new(deadlines.request_timeout_ms);
+        loop {
+            let result = self
+                .stream_chat_attempt(request.clone(), cancel.clone(), sink, &deadline)
+                .await;
+            let Err(error) = &result else {
+                return result;
+            };
+            if !is_rate_limit_error(error)
+                || sink.replay_blocked
+                || sink.failure_origin.is_some()
+                || sink.attempt > u16::from(deadlines.max_connect_retries)
+            {
+                return result;
+            }
+            let delay = retry_delay_ms(sink.attempt.min(u16::from(u8::MAX)) as u8, None);
+            if !sleep_retry_delay_until_deadline(delay, &cancel, &deadline).await {
+                if cancel.is_cancelled() {
+                    return Ok(LlmResponseSummary {
+                        continuation: None,
+                        finish_reason: FinishReason::Cancelled,
+                        usage: None,
+                        response_id: None,
+                    });
+                }
+                return Err(LlmError::ProviderRequestTimeout {
+                    timeout_ms: deadlines.request_timeout_ms,
+                });
+            }
+        }
+    }
+
+    async fn stream_chat_attempt(
+        &self,
+        request: ChatRequest,
+        cancel: CancellationToken,
+        sink: &mut ProviderTraceSink<'_>,
+        deadline: &OperationDeadline,
+    ) -> Result<LlmResponseSummary, LlmError> {
         match request.provider_target().api_mode() {
             ProviderApiMode::Responses => {
-                return self.stream_responses(request, cancel, sink).await;
+                return self.stream_responses(request, cancel, sink, deadline).await;
             }
             ProviderApiMode::ChatCompletions => {}
         }
         let body = to_openai_request(&request)?;
         let body = request.serialize_wire_body(&body)?;
-        crate::llm::request_diagnostics::capture_http_request_wire_body(
-            sink.request_id(),
-            ProviderApiMode::ChatCompletions,
-            "v1/chat/completions",
-            &body,
-        )?;
+        if sink.attempt == 0 {
+            crate::llm::request_diagnostics::capture_http_request_wire_body(
+                sink.request_id(),
+                ProviderApiMode::ChatCompletions,
+                "v1/chat/completions",
+                &body,
+            )?;
+        }
         let body = bytes::Bytes::from(body);
 
         let Some(StartedResponse { response }) = self
-            .send_request(&request, "v1/chat/completions", body, &cancel, sink)
+            .send_request(
+                &request,
+                "v1/chat/completions",
+                body,
+                &cancel,
+                sink,
+                deadline,
+            )
             .await?
         else {
             return Ok(LlmResponseSummary {
+                continuation: None,
                 finish_reason: FinishReason::Cancelled,
                 usage: None,
                 response_id: None,
@@ -150,6 +203,7 @@ impl OpenAiCompatClient {
                         biased;
                         _ = cancel.cancelled() => {
                             return Ok(LlmResponseSummary {
+                                continuation: None,
                                 finish_reason: FinishReason::Cancelled,
                                 usage,
                                 response_id: None,
@@ -169,6 +223,7 @@ impl OpenAiCompatClient {
                         biased;
                         _ = cancel.cancelled() => {
                             return Ok(LlmResponseSummary {
+                                continuation: None,
                                 finish_reason: FinishReason::Cancelled,
                                 usage,
                                 response_id: None,
@@ -200,11 +255,31 @@ impl OpenAiCompatClient {
                 let chunk =
                     serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
                         LlmError::Message(format!(
-                            "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
-                            error,
-                            summarize_stream_chunk(&event.data)
+                            "failed to parse openai-compatible stream chunk at line {}, column {}",
+                            error.line(),
+                            error.column()
                         ))
                     })?;
+                // Private reasoning and usage are progress too, even when no
+                // public delta has been projected yet. Never discard them by replay.
+                sink.replay_blocked |= chunk.usage.is_some()
+                    || chunk.choices.iter().any(|choice| {
+                        let delta = &choice.delta;
+                        delta
+                            .content
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                            || delta.reasoning_content.is_some()
+                            || delta.reasoning.is_some()
+                            || delta
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|calls| !calls.is_empty())
+                            || delta.additional_fields.iter().any(|(key, value)| {
+                                key != "role" || value.as_str() != Some("assistant")
+                            })
+                            || choice.finish_reason.is_some()
+                    });
                 if let Some(error) = chunk.error.as_ref() {
                     return Err(LlmError::ProviderGenerationFailed {
                         response_id: None,
@@ -247,6 +322,13 @@ impl OpenAiCompatClient {
                 finish_reason,
                 usage,
                 response_id: None,
+                continuation: if finish_reason == FinishReason::ToolCall {
+                    accumulator.reasoning_content.take().map(|text| {
+                        super::ChatToolContinuation::new(request.continuation_scope(), text)
+                    })
+                } else {
+                    None
+                },
             })
         }
         .await;
@@ -288,21 +370,25 @@ impl OpenAiCompatClient {
         request: ChatRequest,
         cancel: CancellationToken,
         sink: &mut ProviderTraceSink<'_>,
+        deadline: &OperationDeadline,
     ) -> Result<LlmResponseSummary, LlmError> {
         let body = to_responses_request(&request, ResponsesRequestOptions::from_request(&request))?;
         let body = request.serialize_wire_body(&body)?;
-        crate::llm::request_diagnostics::capture_http_request_wire_body(
-            sink.request_id(),
-            ProviderApiMode::Responses,
-            "v1/responses",
-            &body,
-        )?;
+        if sink.attempt == 0 {
+            crate::llm::request_diagnostics::capture_http_request_wire_body(
+                sink.request_id(),
+                ProviderApiMode::Responses,
+                "v1/responses",
+                &body,
+            )?;
+        }
         let body = bytes::Bytes::from(body);
         let Some(StartedResponse { response }) = self
-            .send_request(&request, "v1/responses", body, &cancel, sink)
+            .send_request(&request, "v1/responses", body, &cancel, sink, deadline)
             .await?
         else {
             return Ok(LlmResponseSummary {
+                continuation: None,
                 finish_reason: FinishReason::Cancelled,
                 usage: None,
                 response_id: None,
@@ -323,6 +409,7 @@ impl OpenAiCompatClient {
                     biased;
                     _ = cancel.cancelled() => {
                         return Ok(LlmResponseSummary {
+                            continuation: None,
                             finish_reason: FinishReason::Cancelled,
                             usage: None,
                             response_id: None,
@@ -342,6 +429,7 @@ impl OpenAiCompatClient {
                     biased;
                     _ = cancel.cancelled() => {
                         return Ok(LlmResponseSummary {
+                            continuation: None,
                             finish_reason: FinishReason::Cancelled,
                             usage: None,
                             response_id: None,
@@ -374,8 +462,14 @@ impl OpenAiCompatClient {
                 ));
             }
 
-            let update = accumulator
-                .push_json(&event.data)
+            let update = serde_json::from_str::<Value>(&event.data)
+                .map_err(LlmError::from)
+                .and_then(|event| {
+                    // Responses can buffer function arguments or private reasoning
+                    // without an LlmEvent. Only metadata/error-only frames admit replay.
+                    sink.replay_blocked |= !responses_event_allows_rate_limit_replay(&event);
+                    accumulator.push_value(&event)
+                })
                 .map_err(|error| match error {
                     limit @ LlmError::ProviderStreamLimitExceeded { .. } => limit,
                     error => LlmError::Message(format!(
@@ -394,6 +488,7 @@ impl OpenAiCompatClient {
                         sink.push(event)?;
                     }
                     return Ok(LlmResponseSummary {
+                        continuation: None,
                         finish_reason,
                         usage,
                         response_id: Some(response_id),
@@ -429,6 +524,7 @@ impl OpenAiCompatClient {
         body: bytes::Bytes,
         cancel: &CancellationToken,
         trace: &mut ProviderTraceSink<'_>,
+        deadline: &OperationDeadline,
     ) -> Result<Option<StartedResponse>, LlmError> {
         // Header parsing is a local request preflight. Complete it before an
         // attempt exists so invalid configuration cannot project provider lifecycle.
@@ -449,9 +545,8 @@ impl OpenAiCompatClient {
             .endpoint()
             .join_api_path(endpoint_path)
             .map_err(|error| LlmError::Message(error.to_string()))?;
-        let mut attempt = 1u16;
-        let deadline = OperationDeadline::new(deadlines.request_timeout_ms);
         loop {
+            let attempt = trace.attempt.saturating_add(1);
             trace.begin_attempt(attempt)?;
             let request_builder = client
                 .post(endpoint_url.clone())
@@ -488,7 +583,7 @@ impl OpenAiCompatClient {
                         return Ok(Some(StartedResponse { response }));
                     }
                     let Some(failure) =
-                        parse_response_failure_until_cancelled(response, cancel, &deadline).await?
+                        parse_response_failure_until_cancelled(response, cancel, deadline).await?
                     else {
                         return Ok(None);
                     };
@@ -504,7 +599,7 @@ impl OpenAiCompatClient {
                         && attempt <= u16::from(deadlines.max_connect_retries) =>
                 {
                     let delay = retry_delay_ms(attempt.min(u16::from(u8::MAX)) as u8, None);
-                    if !sleep_retry_delay_until_deadline(delay, cancel, &deadline).await {
+                    if !sleep_retry_delay_until_deadline(delay, cancel, deadline).await {
                         if cancel.is_cancelled() {
                             return Ok(None);
                         }
@@ -512,7 +607,6 @@ impl OpenAiCompatClient {
                             timeout_ms: deadlines.request_timeout_ms,
                         });
                     }
-                    attempt += 1;
                 }
                 Err(error) => return Err(LlmError::Http(error.without_url())),
             }
@@ -530,6 +624,7 @@ struct ProviderTraceSink<'a> {
     first_progress_seen: bool,
     last_progress_elapsed_ms: Option<u64>,
     failure_origin: Option<ProviderTraceFailureOrigin>,
+    replay_blocked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +644,7 @@ impl<'a> ProviderTraceSink<'a> {
             first_progress_seen: false,
             last_progress_elapsed_ms: None,
             failure_origin: None,
+            replay_blocked: false,
         }
     }
 
@@ -565,6 +661,8 @@ impl<'a> ProviderTraceSink<'a> {
 
     fn begin_attempt(&mut self, attempt: u16) -> Result<(), LlmError> {
         self.attempt = attempt;
+        self.first_progress_seen = false;
+        self.last_progress_elapsed_ms = None;
         self.phase(ProviderPhase::AttemptStarted)
     }
 
@@ -583,6 +681,7 @@ impl<'a> ProviderTraceSink<'a> {
     }
 
     fn project_model_event(&mut self, event: LlmEvent) -> Result<(), LlmError> {
+        self.replay_blocked = true;
         let result = self.inner.push(event);
         self.record_projection_result(result)
     }
@@ -749,6 +848,10 @@ impl<'a> ProviderTraceSink<'a> {
                 LlmError::Http(error) if error.is_connect() => {
                     (ProviderFailureKind::Connect, None, None)
                 }
+                // reqwest classifies bytes_stream body-receive errors as decode errors too.
+                LlmError::Http(error) if error.is_decode() => {
+                    (ProviderFailureKind::Decode, None, None)
+                }
                 LlmError::ProviderRequestTimeout { .. } => {
                     (ProviderFailureKind::RequestTimeout, None, None)
                 }
@@ -793,8 +896,137 @@ impl<'a> ProviderTraceSink<'a> {
             kind,
             status,
             code,
-            message: source.to_string(),
+            message: match source {
+                LlmError::Http(error) => http_failure_message(error),
+                _ => source.to_string(),
+            },
         }
+    }
+}
+
+fn http_failure_message(error: &(dyn std::error::Error + 'static)) -> String {
+    use std::fmt::Write as _;
+
+    let mut message = BoundedDiagnostic::new(HTTP_FAILURE_MESSAGE_LIMIT_BYTES);
+    let _ = write!(message, "llm http error: {}", safe_http_error_source(error));
+    let mut source = error.source();
+    for depth in 1..=HTTP_FAILURE_SOURCE_DEPTH {
+        let Some(current) = source else {
+            return message.finish();
+        };
+        if write!(
+            message,
+            "; source[{depth}]={}",
+            safe_http_error_source(current)
+        )
+        .is_err()
+        {
+            return message.finish();
+        }
+        source = current.source();
+    }
+    if source.is_some() {
+        let _ = message.write_str("; source[...]=<depth limit>");
+    }
+    message.finish()
+}
+
+fn safe_http_error_source(error: &(dyn std::error::Error + 'static)) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = BoundedDiagnostic::new(HTTP_FAILURE_SOURCE_LIMIT_BYTES);
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        // A nested reqwest error may still own a URL even after the outer error was scrubbed.
+        let category = if error.is_decode() {
+            "error decoding response body"
+        } else if error.is_connect() {
+            "connection failed"
+        } else if error.is_timeout() {
+            "request timed out"
+        } else if error.is_body() {
+            "request or response body error"
+        } else if error.is_builder() {
+            "builder error"
+        } else if error.is_request() {
+            "error sending request"
+        } else {
+            "HTTP transport error"
+        };
+        let _ = text.write_str(category);
+    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        // Custom I/O messages can contain caller data; retain typed OS facts instead.
+        let _ = write!(
+            text,
+            "io kind={:?}, os_code={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+    } else {
+        let _ = write!(text, "{error}");
+    }
+    let text = text.finish();
+    let lower = text.to_ascii_lowercase();
+    if [
+        "://",
+        "authorization",
+        "bearer ",
+        "api_key",
+        "api-key",
+        "apikey",
+        "password",
+        "secret",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        "<redacted transport detail>".to_string()
+    } else {
+        text
+    }
+}
+
+struct BoundedDiagnostic {
+    text: String,
+    maximum: usize,
+    truncated: bool,
+}
+
+impl BoundedDiagnostic {
+    fn new(maximum: usize) -> Self {
+        Self {
+            text: String::with_capacity(maximum),
+            maximum,
+            truncated: false,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            let mut end = self.text.len().min(self.maximum.saturating_sub(3));
+            while !self.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.truncate(end);
+            self.text.push_str("...");
+        }
+        self.text
+    }
+}
+
+impl fmt::Write for BoundedDiagnostic {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let remaining = self.maximum.saturating_sub(self.text.len());
+        if value.len() <= remaining {
+            self.text.push_str(value);
+            return Ok(());
+        }
+        let mut end = remaining;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&value[..end]);
+        self.truncated = true;
+        Err(fmt::Error)
     }
 }
 
@@ -1237,6 +1469,58 @@ fn should_retry_transport_error(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
+fn is_rate_limit_error(error: &LlmError) -> bool {
+    match error {
+        LlmError::ProviderRejected {
+            status: Some(429), ..
+        } => true,
+        LlmError::ProviderGenerationFailed { code, .. } => {
+            matches!(code.as_deref(), Some("429" | "rate_limit_exceeded"))
+        }
+        _ => false,
+    }
+}
+
+fn responses_event_allows_rate_limit_replay(event: &Value) -> bool {
+    let metadata_or_error = matches!(
+        event.get("type").and_then(Value::as_str),
+        Some(
+            "response.created"
+                | "response.queued"
+                | "response.in_progress"
+                | "response.failed"
+                | "error"
+        )
+    );
+    metadata_or_error
+        && !responses_frame_has_model_data(event)
+        && event
+            .get("response")
+            .is_none_or(|response| !responses_frame_has_model_data(response))
+}
+
+fn responses_frame_has_model_data(frame: &Value) -> bool {
+    frame.get("usage").is_some_and(|usage| !usage.is_null())
+        || [
+            "output",
+            "delta",
+            "arguments",
+            "content",
+            "reasoning",
+            "reasoning_content",
+            "tool_calls",
+        ]
+        .iter()
+        .any(|key| {
+            frame.get(key).is_some_and(|value| match value {
+                Value::Null => false,
+                Value::String(text) => !text.is_empty(),
+                Value::Array(items) => !items.is_empty(),
+                _ => true,
+            })
+        })
+}
+
 fn retry_delay_ms(attempt: u8, header_delay_ms: Option<u64>) -> u64 {
     if let Some(delay) = header_delay_ms {
         return delay.min(RETRY_MAX_DELAY_MS);
@@ -1252,6 +1536,7 @@ struct ChatStreamAccumulator {
     tool_calls: HashMap<usize, PartialToolCall>,
     call_id_to_delta_index: HashMap<String, usize>,
     assistant_text: ChatAssistantTextHoldback,
+    reasoning_content: Option<String>,
 }
 
 struct ChatChunkUpdate {
@@ -1309,6 +1594,31 @@ impl ChatStreamAccumulator {
             )));
         }
         if !chunk.choices.is_empty() && self.finish_reason.is_some() {
+            let choice = &chunk.choices[0];
+            let delta = &choice.delta;
+            // Some providers repeat the terminal choice alongside final usage.
+            // Accept metadata only; do not append output or finish it again.
+            if chunk.usage.is_some()
+                && choice.index == 0
+                && choice
+                    .finish_reason
+                    .as_deref()
+                    .and_then(|value| parse_finish_reason(value).ok())
+                    == self.finish_reason
+                && delta.content.as_deref().is_none_or(str::is_empty)
+                && delta.tool_calls.is_none()
+                && delta.reasoning_content.is_none()
+                && delta.reasoning.is_none()
+                && delta
+                    .additional_fields
+                    .iter()
+                    .all(|(key, value)| key == "role" && value.as_str() == Some("assistant"))
+            {
+                return Ok(ChatChunkUpdate {
+                    events,
+                    saw_terminal_signal,
+                });
+            }
             return Err(LlmError::Message(
                 "openai-compatible stream returned a non-empty choices chunk after choice index `0` was terminal"
                     .to_string(),
@@ -1320,6 +1630,24 @@ impl ChatStreamAccumulator {
                     "openai-compatible stream returned unsupported choice index `{}`; moyAI admits exactly choice index `0`",
                     choice.index
                 )));
+            }
+            let reasoning = match (choice.delta.reasoning_content, choice.delta.reasoning) {
+                (Some(left), Some(right)) => {
+                    let left = left.into_string();
+                    if left != right.into_string() {
+                        return Err(LlmError::Message(
+                            "openai-compatible stream returned conflicting private reasoning aliases".into(),
+                        ));
+                    }
+                    Some(left)
+                }
+                (Some(value), None) | (None, Some(value)) => Some(value.into_string()),
+                (None, None) => None,
+            };
+            if let Some(reasoning) = reasoning {
+                self.reasoning_content
+                    .get_or_insert_with(String::new)
+                    .push_str(&reasoning);
             }
             if let Some(value) = choice.delta.content {
                 self.assistant_text.push_delta(value, &mut events);
@@ -1570,6 +1898,7 @@ struct ChatChunkJournal {
     tool_call_checkpoints: Vec<PartialToolCallCheckpoint>,
     inserted_call_id_aliases: Vec<String>,
     original_assistant_text: ChatAssistantTextHoldback,
+    original_reasoning_len: Option<usize>,
 }
 
 impl ChatChunkJournal {
@@ -1579,6 +1908,7 @@ impl ChatChunkJournal {
             tool_call_checkpoints: Vec::new(),
             inserted_call_id_aliases: Vec::new(),
             original_assistant_text: accumulator.assistant_text.clone(),
+            original_reasoning_len: accumulator.reasoning_content.as_ref().map(String::len),
         }
     }
 
@@ -1596,6 +1926,14 @@ impl ChatChunkJournal {
         }
         accumulator.finish_reason = self.original_finish_reason;
         accumulator.assistant_text = self.original_assistant_text;
+        match self.original_reasoning_len {
+            Some(length) => {
+                if let Some(reasoning) = accumulator.reasoning_content.as_mut() {
+                    reasoning.truncate(length);
+                }
+            }
+            None => accumulator.reasoning_content = None,
+        }
     }
 }
 
@@ -1775,6 +2113,7 @@ pub(crate) fn to_openai_request_with_reasoning(
         content: Some(OpenAiContent::Text(system_segments.join("\n\n"))),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
     messages.extend(non_system_messages.into_iter().map(|message| {
         match message {
@@ -1783,12 +2122,14 @@ pub(crate) fn to_openai_request_with_reasoning(
                 content: Some(OpenAiContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ModelMessage::User { content } => OpenAiMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ModelMessage::UserParts { parts } => OpenAiMessage {
                 role: "user".to_string(),
@@ -1812,16 +2153,19 @@ pub(crate) fn to_openai_request_with_reasoning(
                 )),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ModelMessage::Assistant { content } => OpenAiMessage {
                 role: "assistant".to_string(),
                 content: Some(OpenAiContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ModelMessage::AssistantToolCalls {
                 content,
                 tool_calls,
+                continuation,
             } => OpenAiMessage {
                 role: "assistant".to_string(),
                 content: content
@@ -1843,6 +2187,10 @@ pub(crate) fn to_openai_request_with_reasoning(
                         .collect(),
                 ),
                 tool_call_id: None,
+                reasoning_content: continuation
+                    .as_ref()
+                    .filter(|state| state.scope() == &request.continuation_scope())
+                    .map(|state| state.reasoning_content().to_string()),
             },
             ModelMessage::Tool {
                 call_id, result, ..
@@ -1851,6 +2199,7 @@ pub(crate) fn to_openai_request_with_reasoning(
                 content: Some(OpenAiContent::Text(result.clone())),
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
+                reasoning_content: None,
             },
             ModelMessage::System { .. } | ModelMessage::Developer { .. } => {
                 unreachable!("instruction messages are merged above")
@@ -2019,8 +2368,11 @@ fn chat_stream_error_code(error: &OpenAiErrorPayload) -> Option<String> {
     error
         .code
         .as_ref()
-        .and_then(Value::as_str)
-        .and_then(compact_stream_error_field)
+        .and_then(|code| match code {
+            Value::String(value) => compact_stream_error_field(value),
+            Value::Number(value) if value.is_i64() || value.is_u64() => Some(value.to_string()),
+            _ => None,
+        })
         .or_else(|| {
             error
                 .error_type
@@ -2328,6 +2680,7 @@ mod tests {
         let mut request = reasoning_fixture_request();
         request.messages = vec![
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: None,
                 tool_calls: vec![ModelToolCall {
                     call_id: "call_without_content".to_string(),
@@ -2342,6 +2695,7 @@ mod tests {
                 metadata: Value::Null,
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: Some("\n \t\n".to_string()),
                 tool_calls: vec![ModelToolCall {
                     call_id: "call_with_whitespace".to_string(),
@@ -2350,6 +2704,7 @@ mod tests {
                 }],
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: Some("  I will inspect another file.  ".to_string()),
                 tool_calls: vec![ModelToolCall {
                     call_id: "call_with_prose".to_string(),
@@ -3413,40 +3768,493 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn oversized_exact_wire_body_is_rejected_before_any_provider_post() {
-        let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
-        let mut request = responses_fixture_request(
-            &base_url,
-            vec![ModelMessage::User {
-                content: "x".repeat(4_096),
-            }],
-        );
-        let mut provider = request.provider_target().clone();
-        let mut limits = ProviderRequestLimits::product_default();
-        limits.max_serialized_body_bytes = 256;
-        provider.replace_request_limits(limits);
-        request.replace_provider_target(provider);
-        let client = OpenAiCompatClient::new(None);
-        let mut sink = RecordingLlmEventSink::default();
+    #[test]
+    fn http_failure_diagnostic_bounds_unicode_formatting_and_source_depth() {
+        #[derive(Debug)]
+        struct Cause {
+            label: &'static str,
+            repeat: usize,
+            rendered: Arc<AtomicUsize>,
+            next: Option<Box<Cause>>,
+        }
 
-        let error = client
+        impl std::fmt::Display for Cause {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..self.repeat {
+                    self.rendered.fetch_add(1, Ordering::SeqCst);
+                    formatter.write_str(self.label)?;
+                }
+                Ok(())
+            }
+        }
+
+        impl std::error::Error for Cause {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.next
+                    .as_deref()
+                    .map(|next| next as &dyn std::error::Error)
+            }
+        }
+
+        let rendered = Arc::new(AtomicUsize::new(0));
+        let unicode = Cause {
+            label: "界",
+            repeat: 4096,
+            rendered: rendered.clone(),
+            next: None,
+        };
+        let message = super::http_failure_message(&unicode);
+        assert!(message.contains('界'));
+        assert!(message.ends_with("..."));
+        assert!(message.len() <= 1024);
+        assert!(
+            rendered.load(Ordering::SeqCst) < 100,
+            "stop formatting at the UTF-8 byte bound"
+        );
+
+        let mut deep = Cause {
+            label: "unvisited-leaf",
+            repeat: 1,
+            rendered: rendered.clone(),
+            next: None,
+        };
+        for _ in 0..10 {
+            deep = Cause {
+                label: "transport layer",
+                repeat: 1,
+                rendered: rendered.clone(),
+                next: Some(Box::new(deep)),
+            };
+        }
+        rendered.store(0, Ordering::SeqCst);
+        let message = super::http_failure_message(&deep);
+        assert!(message.contains("<depth limit>"));
+        assert!(!message.contains("unvisited-leaf"));
+        assert_eq!(rendered.load(Ordering::SeqCst), 9);
+
+        let mut wide = Cause {
+            label: "界",
+            repeat: 4096,
+            rendered: rendered.clone(),
+            next: None,
+        };
+        for _ in 0..8 {
+            wide = Cause {
+                label: "界",
+                repeat: 4096,
+                rendered: rendered.clone(),
+                next: Some(Box::new(wide)),
+            };
+        }
+        let message = super::http_failure_message(&wide);
+        assert!(message.len() <= 1024);
+        assert!(message.ends_with("..."));
+    }
+
+    #[test]
+    fn http_failure_diagnostic_omits_url_credentials_and_custom_io_text() {
+        #[derive(Debug)]
+        struct TransportDetail(&'static str);
+        impl std::fmt::Display for TransportDetail {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+        impl std::error::Error for TransportDetail {}
+
+        for value in [
+            "connection failed for https://fixture:credential@fixture.invalid/private?api_key=canary",
+            "Authorization: Bearer private-token-canary",
+            "api_key=private-key-canary",
+        ] {
+            let message = super::http_failure_message(&TransportDetail(value));
+            assert!(message.contains("<redacted transport detail>"));
+            assert!(!message.contains("credential"));
+            assert!(!message.contains("canary"));
+            assert!(!message.contains("://"));
+        }
+        let error = std::io::Error::other("private-custom-io-canary");
+        let message = super::http_failure_message(&error);
+        assert!(message.contains("io kind=Other"));
+        assert!(!message.contains("private-custom-io-canary"));
+    }
+
+    #[tokio::test]
+    async fn truncated_http_body_is_decode_without_reposting_chat_before_progress() {
+        assert_truncated_http_body_is_decode(ProviderApiMode::ChatCompletions, false).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_http_body_is_decode_without_reposting_chat_after_progress() {
+        assert_truncated_http_body_is_decode(ProviderApiMode::ChatCompletions, true).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_http_body_is_decode_without_reposting_responses_before_progress() {
+        assert_truncated_http_body_is_decode(ProviderApiMode::Responses, false).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_http_body_is_decode_without_reposting_responses_after_progress() {
+        assert_truncated_http_body_is_decode(ProviderApiMode::Responses, true).await;
+    }
+
+    async fn assert_truncated_http_body_is_decode(api_mode: ProviderApiMode, after_progress: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const PRIVATE_BODY: &str = "private-body-fault-canary";
+        let first_event = if after_progress {
+            let event = match api_mode {
+                ProviderApiMode::ChatCompletions => json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "<|im_sta", "reasoning_content": PRIVATE_BODY },
+                        "finish_reason": null
+                    }]
+                }),
+                ProviderApiMode::Responses => json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "public-item",
+                    "output_index": 0,
+                    "delta": "public progress",
+                    "private_extension": PRIVATE_BODY
+                }),
+            };
+            format!("data: {event}\n\n")
+        } else {
+            String::new()
+        };
+        let incomplete_event = format!("data: {{\"private_extension\":\"{PRIVATE_BODY}\"");
+        let declared_bytes = first_event.len() + incomplete_event.len() + 128;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated-body fixture");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server_posts = posts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept fixture request");
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let (header_end, request_length) = loop {
+                    let count = socket
+                        .read(&mut buffer)
+                        .await
+                        .expect("read fixture headers");
+                    assert_ne!(count, 0, "request ended before its headers");
+                    request_bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request_bytes
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                    {
+                        let headers = std::str::from_utf8(&request_bytes[..end]).unwrap();
+                        assert!(headers.starts_with("POST "));
+                        let length = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                            .expect("fixture request has a known body length");
+                        break (end + 4, length);
+                    }
+                    assert!(request_bytes.len() < 128 * 1024);
+                };
+                while request_bytes.len() - header_end < request_length {
+                    let count = socket
+                        .read(&mut buffer)
+                        .await
+                        .expect("drain fixture request");
+                    assert_ne!(count, 0, "request ended before its body");
+                    request_bytes.extend_from_slice(&buffer[..count]);
+                }
+                server_posts.fetch_add(1, Ordering::SeqCst);
+                socket
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_bytes}\r\nConnection: close\r\n\r\n"
+                    ).as_bytes())
+                    .await
+                    .expect("write fixture headers");
+                socket.write_all(first_event.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                socket.write_all(incomplete_event.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut request = match api_mode {
+            ProviderApiMode::ChatCompletions => {
+                let mut request = reasoning_fixture_request();
+                replace_provider_endpoint(&mut request, &endpoint);
+                request
+            }
+            ProviderApiMode::Responses => responses_fixture_request(&endpoint, Vec::new()),
+        };
+        request.system_prompt = "private-request-fault-canary".to_string();
+        request.replace_extra_headers(BTreeMap::from([(
+            "x-provider-key".to_string(),
+            "private-header-fault-canary".to_string(),
+        )]));
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                request_timeout_ms: 2_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(Some("private-api-key-fault-canary".to_string()))
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("oversized wire body must fail before transport");
+            .expect_err("incomplete HTTP body must not become a completed SSE response");
         server.abort();
+        let _ = server.await;
 
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            error,
-            LlmError::ProviderRequestLimitExceeded {
-                surface: ProviderRequestLimit::SerializedBodyBytes,
-                maximum: 256,
-                ..
-            }
+            &error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(source.as_ref(), LlmError::Http(error) if error.is_decode())
         ));
-        assert!(requests.lock().expect("request capture").is_empty());
-        assert!(sink.phases.is_empty());
-        assert!(sink.events.is_empty());
+        let failure = error.provider_failure().expect("typed receive failure");
+        assert_eq!(failure.kind, ProviderFailureKind::Decode);
+        assert_eq!(
+            failure.phase,
+            if after_progress {
+                ProviderPhase::LastProgress
+            } else {
+                ProviderPhase::HeadersReceived
+            }
+        );
+        assert!(
+            failure.message.contains("source[1]="),
+            "retain the lower transport cause"
+        );
+        assert!(failure.message.len() <= 1024);
+        if api_mode == ProviderApiMode::ChatCompletions && !after_progress {
+            eprintln!(
+                "fixture-only truncated HTTP body diagnostic: {}",
+                failure.message
+            );
+        }
+        assert_eq!(
+            concatenated_text(&sink.events),
+            match (api_mode, after_progress) {
+                (_, false) => "",
+                (ProviderApiMode::ChatCompletions, true) => "<|im_sta",
+                (ProviderApiMode::Responses, true) => "public progress",
+            }
+        );
+        assert!(
+            !sink
+                .events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::Finished { .. }))
+        );
+        assert!(matches!(
+            sink.phases.last(),
+            Some(ProviderPhaseEvent {
+                phase: ProviderPhase::ProviderTerminal,
+                terminal_status: Some(ProviderTerminalStatus::Failed),
+                failure: Some(terminal_failure),
+                ..
+            }) if terminal_failure.kind == ProviderFailureKind::Decode
+        ));
+        let diagnostics = format!(
+            "{error:?}\n{}",
+            serde_json::to_string(&sink.phases).unwrap()
+        );
+        for private in [
+            PRIVATE_BODY,
+            "private-request-fault-canary",
+            "private-header-fault-canary",
+            "private-api-key-fault-canary",
+            endpoint.as_str(),
+        ] {
+            assert!(!failure.message.contains(private));
+            assert!(!error.public_message().contains(private));
+            assert!(!diagnostics.contains(private) || private == endpoint);
+        }
+        assert!(!error.public_message().contains("source[1]="));
+    }
+
+    #[tokio::test]
+    async fn oversized_exact_wire_body_is_rejected_before_any_provider_post() {
+        for responses in [false, true] {
+            let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
+            let messages = vec![ModelMessage::User {
+                content: "x".repeat(4_096),
+            }];
+            let mut request = if responses {
+                responses_fixture_request(&base_url, messages)
+            } else {
+                let mut request = reasoning_fixture_request();
+                replace_provider_endpoint(&mut request, &base_url);
+                request.messages = messages;
+                request
+            };
+            let mut provider = request.provider_target().clone();
+            let mut limits = ProviderRequestLimits::product_default();
+            limits.max_serialized_body_bytes = 256;
+            provider.replace_request_limits(limits);
+            request.replace_provider_target(provider);
+            let client = OpenAiCompatClient::new(None);
+            let mut sink = RecordingLlmEventSink::default();
+
+            let error = client
+                .stream_chat(request, CancellationToken::new(), &mut sink)
+                .await
+                .expect_err("oversized wire body must fail before transport");
+            server.abort();
+
+            assert!(matches!(
+                error,
+                LlmError::ProviderRequestLimitExceeded {
+                    surface: ProviderRequestLimit::SerializedBodyBytes,
+                    maximum: 256,
+                    ..
+                }
+            ));
+            assert!(requests.lock().expect("request capture").is_empty());
+            assert!(sink.phases.is_empty());
+            assert!(sink.events.is_empty());
+        }
+    }
+
+    #[test]
+    fn long_tool_history_preserves_order_and_exact_wire_byte_budget() {
+        // Exercise a long native history of small messages so count is independent
+        // of body-size admission.
+        const TOOL_TURNS: usize = 2_050;
+        for responses in [false, true] {
+            let mut messages = vec![
+                ModelMessage::System {
+                    content: "Additional system instructions".into(),
+                },
+                ModelMessage::Developer {
+                    content: "Developer instructions".into(),
+                },
+                ModelMessage::Agent {
+                    content: "Verified repository evidence".into(),
+                },
+                ModelMessage::User {
+                    content: "Document the repository".into(),
+                },
+            ];
+            for index in 0..TOOL_TURNS {
+                let call_id = format!("call-{index}");
+                messages.push(ModelMessage::AssistantToolCalls {
+                    content: None,
+                    tool_calls: vec![ModelToolCall {
+                        call_id: call_id.clone(),
+                        tool_name: "read".into(),
+                        arguments_json: json!({ "path": format!("src/item-{index}.rs") })
+                            .to_string(),
+                    }],
+                    continuation: None,
+                });
+                messages.push(ModelMessage::Tool {
+                    call_id,
+                    tool_name: "read".into(),
+                    result: format!("line {index}: \"値\"\\done\n"),
+                    metadata: Value::Null,
+                });
+            }
+            messages.push(ModelMessage::User {
+                content: "Continue with the requested document".into(),
+            });
+            let mut request = if responses {
+                responses_fixture_request("http://provider.fixture.invalid/v1", messages)
+            } else {
+                let mut request = reasoning_fixture_request();
+                request.messages = messages;
+                request
+            };
+            let instructions = format!(
+                "{}\n\nAdditional system instructions\n\nDeveloper instructions",
+                request.system_prompt
+            );
+            let body = if responses {
+                super::to_responses_request(
+                    &request,
+                    super::ResponsesRequestOptions::from_request(&request),
+                )
+                .expect("long Responses history within the byte budget")
+            } else {
+                to_openai_request(&request).expect("long Chat history within the byte budget")
+            };
+            let input = if responses {
+                assert_eq!(body["instructions"], instructions);
+                body["input"].as_array().expect("Responses input")
+            } else {
+                assert_eq!(body["messages"][0]["role"], "system");
+                assert_eq!(body["messages"][0]["content"], instructions);
+                body["messages"].as_array().expect("Chat messages")
+            };
+            let offset = usize::from(!responses);
+            assert_eq!(input.len(), TOOL_TURNS * 2 + 3 + offset);
+            for (index, content) in [
+                (offset, "Verified repository evidence"),
+                (offset + 1, "Document the repository"),
+                (input.len() - 1, "Continue with the requested document"),
+            ] {
+                assert_eq!(input[index]["role"], "user");
+                if responses {
+                    assert_eq!(input[index]["content"][0]["text"], content);
+                } else {
+                    assert_eq!(input[index]["content"], content);
+                }
+            }
+            for index in 0..TOOL_TURNS {
+                let call_id = format!("call-{index}");
+                let arguments = json!({ "path": format!("src/item-{index}.rs") }).to_string();
+                let result = format!("line {index}: \"値\"\\done\n");
+                let call = &input[offset + 2 + index * 2];
+                let output = &input[offset + 3 + index * 2];
+                if responses {
+                    assert_eq!(call["type"], "function_call");
+                    assert_eq!(call["call_id"], call_id);
+                    assert_eq!(call["name"], "read");
+                    assert_eq!(call["arguments"], arguments);
+                    assert_eq!(output["type"], "function_call_output");
+                    assert_eq!(output["call_id"], call_id);
+                    assert_eq!(output["output"], result);
+                } else {
+                    assert_eq!(call["role"], "assistant");
+                    let calls = call["tool_calls"].as_array().expect("native tool calls");
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0]["id"], call_id);
+                    assert_eq!(calls[0]["function"]["name"], "read");
+                    assert_eq!(calls[0]["function"]["arguments"], arguments);
+                    assert_eq!(output["role"], "tool");
+                    assert_eq!(output["tool_call_id"], call_id);
+                    assert_eq!(output["content"], result);
+                }
+            }
+
+            let exact = serde_json::to_vec(&body).expect("exact UTF-8 wire bytes");
+            let mut provider = request.provider_target().clone();
+            let mut limits = provider.request_limits();
+            assert!((exact.len() as u64) < limits.max_serialized_body_bytes);
+            assert_eq!(request.serialize_wire_body(&body).unwrap(), exact);
+            limits.max_serialized_body_bytes = exact.len() as u64;
+            provider.replace_request_limits(limits);
+            request.replace_provider_target(provider.clone());
+            assert_eq!(request.serialize_wire_body(&body).unwrap(), exact);
+
+            limits.max_serialized_body_bytes -= 1;
+            provider.replace_request_limits(limits);
+            request.replace_provider_target(provider);
+            assert!(matches!(
+                request.serialize_wire_body(&body),
+                Err(LlmError::ProviderRequestLimitExceeded {
+                    surface: ProviderRequestLimit::SerializedBodyBytes,
+                    actual,
+                    maximum,
+                }) if maximum == exact.len() as u64 - 1 && actual > maximum
+            ));
+        }
     }
 
     #[tokio::test]
@@ -3572,6 +4380,7 @@ mod tests {
         server.abort();
 
         assert_eq!(summary.finish_reason, FinishReason::Stop);
+        assert!(summary.continuation.is_none());
         assert!(matches!(
             sink.events.as_slice(),
             [
@@ -3581,6 +4390,251 @@ mod tests {
                     usage: None,
                 },
             ] if text == "visible answer"
+        ));
+    }
+
+    fn private_reasoning_tool_stream(delta: Value, finish: &str) -> String {
+        let terminal_delta = if finish == "tool_calls" {
+            json!({"tool_calls":[{"index":0,"id":"reused-call-id","function":{"name":"read","arguments":"{}"}}]})
+        } else {
+            json!({"content":"visible answer"})
+        };
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":terminal_delta,"finish_reason":finish}]})
+        )
+    }
+
+    #[tokio::test]
+    async fn private_chat_reasoning_is_replayed_only_for_a_complete_tool_response() {
+        let secret = "private-reasoning-canary";
+        for (delta, finish, retained) in [
+            (json!({"reasoning_content":secret}), "tool_calls", true),
+            (json!({"reasoning":secret}), "tool_calls", true),
+            (
+                json!({"reasoning":secret,"reasoning_content":secret}),
+                "tool_calls",
+                true,
+            ),
+            (json!({"reasoning_content":secret}), "length", false),
+            (json!({"reasoning_content":secret}), "stop", false),
+        ] {
+            let (base_url, _, server) =
+                start_responses_fixture(vec![private_reasoning_tool_stream(delta, finish)]).await;
+            let mut request = reasoning_fixture_request();
+            replace_provider_endpoint(&mut request, &base_url);
+            let mut sink = RecordingLlmEventSink::default();
+            let summary = OpenAiCompatClient::new(None)
+                .stream_chat(request.clone(), CancellationToken::new(), &mut sink)
+                .await
+                .expect("valid terminal stream");
+            server.abort();
+            assert_eq!(summary.continuation.is_some(), retained);
+            if let Some(state) = &summary.continuation {
+                assert_eq!(state.reasoning_content(), secret);
+                assert_eq!(state.scope(), &request.continuation_scope());
+            }
+            assert!(!format!("{summary:?}").contains(secret));
+            assert!(!serde_json::to_string(&summary).unwrap().contains(secret));
+            assert!(!format!("{:?}", sink.events).contains(secret));
+            assert!(
+                serde_json::from_value::<crate::llm::LlmResponseSummary>(
+                    serde_json::to_value(&summary).unwrap()
+                )
+                .unwrap()
+                .continuation
+                .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_is_not_returned_after_cancellation_or_incomplete_stream() {
+        let secret = "private-abandoned-canary";
+        let (base_url, _, server) = start_responses_fixture(vec![private_reasoning_tool_stream(
+            json!({"reasoning_content":secret}),
+            "tool_calls",
+        )])
+        .await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let cancel = CancellationToken::new();
+        let mut sink = CancelOnToolCallLlmEventSink {
+            events: Vec::new(),
+            phases: Vec::new(),
+            cancel: cancel.clone(),
+        };
+        let summary = OpenAiCompatClient::new(None)
+            .stream_chat(request, cancel, &mut sink)
+            .await
+            .expect("cancelled request");
+        server.abort();
+        assert_eq!(summary.finish_reason, FinishReason::Cancelled);
+        assert!(summary.continuation.is_none());
+        assert!(
+            !serde_json::to_string(&sink.events)
+                .unwrap()
+                .contains(secret)
+        );
+
+        let response = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":secret},"finish_reason":null}]})
+        );
+        let (base_url, _, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(None)
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("missing terminal");
+        server.abort();
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflicting_private_reasoning_aliases_fail_without_exposing_either_value() {
+        let response = private_reasoning_tool_stream(
+            json!({"reasoning":"private-left","reasoning_content":"private-right"}),
+            "tool_calls",
+        );
+        let (base_url, _, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(None)
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("conflicting private channels must fail");
+        server.abort();
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("private-left") && !debug.contains("private-right"));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_chat_reasoning_chunk_reports_location_without_private_body() {
+        let secret = "private-malformed-canary";
+        let response = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":secret,"delta":{"reasoning_content":secret},"finish_reason":null}]})
+        );
+        let (base_url, _, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(None)
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("malformed chunk");
+        server.abort();
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(
+            !serde_json::to_string(&sink.phases)
+                .unwrap()
+                .contains(secret)
+        );
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_obeys_raw_stream_limit_without_projection() {
+        let response = private_reasoning_tool_stream(
+            json!({"reasoning_content":"p".repeat(2048)}),
+            "tool_calls",
+        );
+        let (base_url, _, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let mut provider = request.provider_target().clone();
+        let mut limits = ProviderStreamLimits::product_default();
+        limits.max_raw_bytes = 128;
+        provider.replace_stream_limits(limits);
+        request.replace_provider_target(provider);
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(None)
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("private bytes remain within the existing raw stream budget");
+        server.abort();
+        assert!(matches!(error, LlmError::ProviderFailure { source, .. }
+            if matches!(*source, LlmError::ProviderStreamLimitExceeded { surface: ProviderStreamLimit::RawBytes, .. })));
+        assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn private_chat_replay_is_scoped_and_absent_from_canonical_message_serde() {
+        let mut request = reasoning_fixture_request();
+        let scope = request.continuation_scope();
+        let secret = "private-replay-canary";
+        let state = crate::llm::ChatToolContinuation::new(scope.clone(), secret.into());
+        let message = ModelMessage::AssistantToolCalls {
+            content: None,
+            tool_calls: vec![ModelToolCall {
+                call_id: "same-id".into(),
+                tool_name: "read".into(),
+                arguments_json: "{}".into(),
+            }],
+            continuation: Some(state),
+        };
+        assert!(!format!("{message:?}").contains(secret));
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert!(serialized.get("continuation").is_none());
+        assert!(!serialized.to_string().contains(secret));
+        assert!(matches!(
+            serde_json::from_value::<ModelMessage>(serialized).unwrap(),
+            ModelMessage::AssistantToolCalls {
+                continuation: None,
+                ..
+            }
+        ));
+        request.messages = vec![message];
+        assert_eq!(
+            to_openai_request(&request).unwrap()["messages"][1]["reasoning_content"],
+            secret
+        );
+        for foreign in [
+            crate::llm::ChatContinuationScope::hub(
+                "https://hub",
+                "hub",
+                "1",
+                "lease",
+                "model",
+                ProviderApiMode::ChatCompletions,
+            ),
+            crate::llm::ChatContinuationScope::hub(
+                "https://hub",
+                "hub",
+                "1",
+                "lease",
+                "model",
+                ProviderApiMode::Responses,
+            ),
+        ] {
+            request.set_continuation_scope(foreign);
+            assert!(
+                to_openai_request(&request).unwrap()["messages"][1]
+                    .get("reasoning_content")
+                    .is_none()
+            );
+        }
+        request.set_continuation_scope(scope);
+        let body = to_openai_request(&request).unwrap();
+        let size = request.serialize_wire_body(&body).unwrap().len();
+        let mut provider = request.provider_target().clone();
+        let mut limits = provider.request_limits();
+        limits.max_serialized_body_bytes = (size - 1) as u64;
+        provider.replace_request_limits(limits);
+        request.replace_provider_target(provider);
+        assert!(matches!(
+            request.serialize_wire_body(&body),
+            Err(LlmError::ProviderRequestLimitExceeded {
+                surface: ProviderRequestLimit::SerializedBodyBytes,
+                ..
+            })
         ));
     }
 
@@ -4071,6 +5125,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_accepts_usage_terminal_choice_without_replaying_output() {
+        for (tool_response, terminal_delta) in [
+            (false, json!({"role":"assistant","content":""})),
+            (true, json!({"role":"assistant","content":""})),
+            (false, json!({})),
+            (false, json!({"content":null})),
+        ] {
+            let usage = json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            });
+            let finish = if tool_response { "tool_calls" } else { "stop" };
+            let delta = if tool_response {
+                json!({
+                    "reasoning_content": "private-terminal-continuation",
+                    "tool_calls": [{
+                        "index": 0, "id": "call_1",
+                        "function": { "name": "read", "arguments": "{\"path\":\"task.md\"}" }
+                    }]
+                })
+            } else {
+                json!({ "content": "complete" })
+            };
+            let response = [
+                json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]}),
+                json!({
+                    "choices":[{"index":0,"delta":terminal_delta,
+                        "finish_reason":finish,"native_finish_reason":finish}],
+                    "usage":usage.clone()
+                }),
+                json!({"choices":[],"usage":usage}),
+            ]
+            .into_iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+            .collect::<String>();
+            let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+            let mut request = reasoning_fixture_request();
+            replace_provider_endpoint(&mut request, &base_url);
+            let mut sink = RecordingLlmEventSink::default();
+            let summary = OpenAiCompatClient::new(None)
+                .stream_chat(request, CancellationToken::new(), &mut sink)
+                .await
+                .expect("a usage-only terminal choice must complete");
+            server.abort();
+
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(summary.usage.as_ref().unwrap().total_tokens, 15);
+            assert_eq!(
+                sink.events
+                    .iter()
+                    .filter(|event| matches!(event, LlmEvent::Finished { .. }))
+                    .count(),
+                1
+            );
+            if tool_response {
+                assert_eq!(summary.finish_reason, FinishReason::ToolCall);
+                assert_eq!(
+                    summary.continuation.as_ref().unwrap().reasoning_content(),
+                    "private-terminal-continuation"
+                );
+                assert!(matches!(sink.events.as_slice(), [
+                    LlmEvent::ToolCallStart { call_id, tool_name },
+                    LlmEvent::ToolCallArgsDelta { delta, .. },
+                    LlmEvent::Finished { .. }
+                ] if call_id == "call_1" && tool_name == "read" && delta == "{\"path\":\"task.md\"}"));
+            } else {
+                assert_eq!(summary.finish_reason, FinishReason::Stop);
+                assert!(
+                    matches!(sink.events.as_slice(), [LlmEvent::TextDelta(text), LlmEvent::Finished { .. }] if text == "complete")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_terminal_choice_with_payload_or_inconsistent_metadata() {
+        let usage = json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15});
+        let terminal = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":usage.clone()});
+        let mut invalid = Vec::new();
+        for delta in [
+            json!({"content":"late"}),
+            json!({"content":" "}),
+            json!({"role":"user"}),
+            json!({"reasoning":"late-private"}),
+            json!({"reasoning_content":"late-private"}),
+            json!({"tool_calls":[{"index":0,"id":"late","function":{"name":"write","arguments":"{}"}}]}),
+            json!({"reasoning_details":[{"text":"late-private"}]}),
+            json!({"function_call":{"name":"write","arguments":"{}"}}),
+            json!({"refusal":"late"}),
+            json!({"unknown_extension":null}),
+        ] {
+            let mut chunk = terminal.clone();
+            chunk["choices"][0]["delta"] = delta;
+            invalid.push(chunk);
+        }
+        for finish in [
+            Value::Null,
+            json!("length"),
+            json!("private-terminal-metadata-canary"),
+        ] {
+            let mut chunk = terminal.clone();
+            chunk["choices"][0]["finish_reason"] = finish;
+            invalid.push(chunk);
+        }
+        let mut wrong_index = terminal.clone();
+        wrong_index["choices"][0]["index"] = json!(1);
+        invalid.push(wrong_index);
+        let mut no_usage = terminal.clone();
+        no_usage.as_object_mut().unwrap().remove("usage");
+        invalid.push(no_usage);
+        let mut conflicting_usage = terminal;
+        conflicting_usage["usage"] =
+            json!({"prompt_tokens":10,"completion_tokens":6,"total_tokens":16});
+        invalid.push(conflicting_usage);
+
+        for chunk in invalid {
+            let response = format!(
+                "data: {}\n\ndata: {chunk}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":{"content":"complete"},"finish_reason":"stop"}],"usage":usage.clone()})
+            );
+            let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+            let mut request = reasoning_fixture_request();
+            replace_provider_endpoint(&mut request, &base_url);
+            let mut sink = RecordingLlmEventSink::default();
+            let error = OpenAiCompatClient::new(None)
+                .stream_chat(request, CancellationToken::new(), &mut sink)
+                .await
+                .expect_err("late payload or inconsistent terminal metadata must fail");
+            server.abort();
+            assert!(
+                !error
+                    .to_string()
+                    .contains("private-terminal-metadata-canary")
+            );
+            assert!(!error.to_string().contains("late-private"));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(
+                matches!(sink.events.as_slice(), [LlmEvent::TextDelta(text)] if text == "complete")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn chat_rejects_conflicting_usage_repeat_without_projecting_finished() {
         let response = [
             format!(
@@ -4556,6 +5757,7 @@ mod tests {
                 content: "Inspect README.md".to_string(),
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: None,
                 tool_calls: vec![ModelToolCall {
                     call_id: "call_1".to_string(),
@@ -4752,6 +5954,567 @@ mod tests {
             }) if failure.kind == ProviderFailureKind::Generation
                 && failure.code.as_deref() == Some("server_error")
         ));
+    }
+
+    #[test]
+    fn stream_rate_limit_error_codes_preserve_integral_numbers_and_strings() {
+        for (code, expected) in [
+            (json!(429), Some("429")),
+            (json!(" 429 "), Some("429")),
+            (json!("rate_limit_exceeded"), Some("rate_limit_exceeded")),
+            (json!(-429), Some("-429")),
+            (json!(u64::MAX), Some("18446744073709551615")),
+            (json!(429.0), None),
+            (json!(429.5), None),
+            (json!(true), None),
+            (json!({ "code": 429 }), None),
+            (json!([429]), None),
+            (Value::Null, None),
+        ] {
+            let error = crate::llm::dto::OpenAiErrorPayload {
+                message: None,
+                error_type: None,
+                code: Some(code.clone()),
+            };
+            assert_eq!(
+                super::chat_stream_error_code(&error).as_deref(),
+                expected,
+                "unexpected error-code projection for {code}"
+            );
+        }
+
+        let fallback = crate::llm::dto::OpenAiErrorPayload {
+            message: None,
+            error_type: Some(" server_error ".to_string()),
+            code: Some(json!(true)),
+        };
+        assert_eq!(
+            super::chat_stream_error_code(&fallback).as_deref(),
+            Some("server_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_rate_limit_failure_without_quota_or_after_tools_does_not_repost() {
+        for partial_tool in [false, true] {
+            let prefix = if partial_tool {
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "tool_calls": [{
+                                "index": 0,
+                                "id": "unfinished_call",
+                                "type": "function",
+                                "function": { "name": "read", "arguments": "{\"path\":" }
+                            }] },
+                            "finish_reason": null
+                        }]
+                    })
+                )
+            } else {
+                String::new()
+            };
+            let private_message = "provider-payload-private-marker";
+            let failed = format!(
+                "{prefix}data: {}\n\n",
+                json!({
+                    "error": {
+                        "message": private_message,
+                        "code": 429,
+                        "metadata": { "error_type": "rate_limit_exceeded" }
+                    }
+                })
+            );
+            let completed = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "Unexpected replay" },
+                        "finish_reason": "stop"
+                    }]
+                })
+            );
+            let (base_url, requests, server) =
+                start_responses_fixture(vec![failed, completed]).await;
+            let mut request = reasoning_fixture_request();
+            replace_provider_endpoint(&mut request, &base_url);
+            let mut deadlines = request.provider_target().deadlines();
+            deadlines.max_connect_retries = u8::from(partial_tool);
+            replace_provider_deadlines(&mut request, deadlines);
+            let mut sink = RecordingLlmEventSink::default();
+
+            let error = OpenAiCompatClient::new(None)
+                .stream_chat(request, CancellationToken::new(), &mut sink)
+                .await
+                .expect_err("an in-stream rate limit must fail without replay");
+            server.abort();
+
+            let failure = error.provider_failure().expect("typed generation failure");
+            assert_eq!(failure.kind, ProviderFailureKind::Generation);
+            assert_eq!(failure.phase, ProviderPhase::LastProgress);
+            assert_eq!(failure.status, None);
+            assert_eq!(failure.code.as_deref(), Some("429"));
+            assert!(failure.message.contains(private_message));
+            let public = error.public_message();
+            assert!(public.contains("利用上限"));
+            assert!(!public.contains("HTTP"));
+            assert!(!public.contains("429"));
+            assert!(!public.contains(private_message));
+            assert_eq!(requests.lock().expect("request capture").len(), 1);
+            assert!(
+                !sink
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, LlmEvent::Finished { .. }))
+            );
+            if partial_tool {
+                assert!(
+                    sink.events
+                        .iter()
+                        .any(|event| matches!(event, LlmEvent::ToolCallStart { .. }))
+                );
+                assert!(
+                    sink.events
+                        .iter()
+                        .any(|event| matches!(event, LlmEvent::ToolCallArgsDelta { .. }))
+                );
+            } else {
+                assert!(sink.events.is_empty());
+            }
+            assert!(matches!(
+                sink.phases.last(),
+                Some(ProviderPhaseEvent {
+                    phase: ProviderPhase::ProviderTerminal,
+                    terminal_status: Some(ProviderTerminalStatus::Failed),
+                    failure: Some(terminal_failure),
+                    ..
+                }) if terminal_failure.kind == ProviderFailureKind::Generation
+                    && terminal_failure.status.is_none()
+                    && terminal_failure.code.as_deref() == Some("429")
+            ));
+        }
+    }
+
+    fn rate_limit_frames(api_mode: ProviderApiMode, code: Value) -> (String, String) {
+        match api_mode {
+            ProviderApiMode::ChatCompletions => (
+                format!("data: {}\n\n", json!({ "error": { "code": code } })),
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({ "choices": [{ "index": 0, "delta": { "content": "Recovered." }, "finish_reason": "stop" }] })
+                ),
+            ),
+            ProviderApiMode::Responses => (
+                responses_sse([json!({ "type": "response.failed", "response": {
+                    "id": "resp_limited", "error": { "code": code }
+                } })]),
+                responses_sse([json!({ "type": "response.completed", "response": {
+                    "id": "resp_recovered", "output": [{ "type": "message", "id": "msg_recovered",
+                    "role": "assistant", "content": [{ "type": "output_text", "text": "Recovered." }] }]
+                } })]),
+            ),
+        }
+    }
+
+    fn rate_limit_request(base_url: &str, api_mode: ProviderApiMode) -> ChatRequest {
+        let mut request = match api_mode {
+            ProviderApiMode::ChatCompletions => {
+                let mut request = reasoning_fixture_request();
+                replace_provider_endpoint(&mut request, base_url);
+                request
+            }
+            ProviderApiMode::Responses => responses_fixture_request(base_url, Vec::new()),
+        };
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                request_timeout_ms: 10_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 1,
+            },
+        );
+        request
+    }
+
+    fn assert_single_logical_request_with_attempts(sink: &RecordingLlmEventSink, attempts: u16) {
+        let starts: Vec<_> = sink
+            .phases
+            .iter()
+            .filter(|event| event.phase == ProviderPhase::AttemptStarted)
+            .map(|event| event.attempt)
+            .collect();
+        assert_eq!(starts, (1..=attempts).collect::<Vec<_>>());
+        assert!(
+            sink.phases
+                .iter()
+                .all(|event| event.request_id == sink.phases[0].request_id)
+        );
+        assert_eq!(
+            sink.phases
+                .iter()
+                .filter(|event| event.phase == ProviderPhase::ProviderTerminal)
+                .count(),
+            1
+        );
+        assert!(
+            sink.phases
+                .windows(2)
+                .all(|events| events[0].elapsed_ms <= events[1].elapsed_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn early_stream_rate_limit_retries_with_one_logical_request() {
+        for (api_mode, code) in [
+            (ProviderApiMode::ChatCompletions, json!(429)),
+            (
+                ProviderApiMode::ChatCompletions,
+                json!("rate_limit_exceeded"),
+            ),
+            (ProviderApiMode::Responses, json!(429)),
+            (ProviderApiMode::Responses, json!("429")),
+            (ProviderApiMode::Responses, json!("rate_limit_exceeded")),
+        ] {
+            let (failed, completed) = rate_limit_frames(api_mode, code);
+            let metadata = match api_mode {
+                ProviderApiMode::ChatCompletions => format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }]
+                    })
+                ),
+                ProviderApiMode::Responses => responses_sse([json!({
+                    "type": "response.created", "response": { "id": "resp_limited", "output": [], "usage": null }
+                })]),
+            };
+            let failed = format!("{metadata}{failed}");
+            let (base_url, requests, server) =
+                start_responses_fixture(vec![failed, completed]).await;
+            let mut sink = RecordingLlmEventSink::default();
+            let summary = OpenAiCompatClient::new(None)
+                .stream_chat(
+                    rate_limit_request(&base_url, api_mode),
+                    CancellationToken::new(),
+                    &mut sink,
+                )
+                .await
+                .expect("early rate limit must use the retry quota");
+            server.abort();
+            assert_eq!(summary.finish_reason, FinishReason::Stop);
+            assert_eq!(concatenated_text(&sink.events), "Recovered.");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0], requests[1]);
+            assert_single_logical_request_with_attempts(&sink, 2);
+            assert_eq!(
+                sink.phases
+                    .iter()
+                    .filter(|event| event.phase == ProviderPhase::FirstProgress
+                        && event.failure.is_none())
+                    .count(),
+                2
+            );
+            assert!(sink.phases.iter().all(|event| event.failure.is_none()));
+            assert_eq!(
+                sink.events
+                    .iter()
+                    .filter(|event| matches!(event, LlmEvent::Finished { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_rate_limit_retries_but_retains_http_failure_diagnostics() {
+        for api_mode in [ProviderApiMode::ChatCompletions, ProviderApiMode::Responses] {
+            let (_, completed) = rate_limit_frames(api_mode, json!("429"));
+            let (base_url, requests, server) = start_status_sequence_fixture(vec![
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "{\"error\":{\"message\":\"slow down\"}}".into(),
+                ),
+                (StatusCode::OK, completed),
+            ])
+            .await;
+            let mut sink = RecordingLlmEventSink::default();
+            OpenAiCompatClient::new(None)
+                .stream_chat(
+                    rate_limit_request(&base_url, api_mode),
+                    CancellationToken::new(),
+                    &mut sink,
+                )
+                .await
+                .expect("HTTP 429 must use the same retry quota");
+            server.abort();
+            assert_eq!(requests.lock().unwrap().len(), 2);
+            assert_eq!(concatenated_text(&sink.events), "Recovered.");
+            assert_single_logical_request_with_attempts(&sink, 2);
+            assert!(sink.phases.iter().all(|event| event.failure.is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_and_stream_rate_limits_share_a_finite_retry_quota() {
+        let (failed, completed) = rate_limit_frames(ProviderApiMode::ChatCompletions, json!(429));
+        let (base_url, requests, server) = start_status_sequence_fixture(vec![
+            (StatusCode::TOO_MANY_REQUESTS, "limited".into()),
+            (StatusCode::OK, failed),
+            (StatusCode::OK, completed),
+        ])
+        .await;
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(None)
+            .stream_chat(
+                rate_limit_request(&base_url, ProviderApiMode::ChatCompletions),
+                CancellationToken::new(),
+                &mut sink,
+            )
+            .await
+            .expect_err("one shared retry must not become two nested quotas");
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(sink.events.is_empty());
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(failure.kind, ProviderFailureKind::Generation);
+        assert_eq!(failure.code.as_deref(), Some("429"));
+        assert_eq!(failure.attempt, 2);
+        assert_single_logical_request_with_attempts(&sink, 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_http_rate_limit_retains_http_status_and_final_attempt() {
+        let (base_url, requests, server) = start_status_sequence_fixture(vec![
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "{\"error\":{\"code\":\"rate_limit_exceeded\"}}".into(),
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "{\"error\":{\"code\":\"rate_limit_exceeded\"}}".into(),
+            ),
+        ])
+        .await;
+        let mut sink = RecordingLlmEventSink::default();
+        let error = OpenAiCompatClient::new(None)
+            .stream_chat(
+                rate_limit_request(&base_url, ProviderApiMode::ChatCompletions),
+                CancellationToken::new(),
+                &mut sink,
+            )
+            .await
+            .expect_err("exhausted HTTP 429 must remain an HTTP failure");
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(failure.kind, ProviderFailureKind::HttpStatus);
+        assert_eq!(failure.status, Some(429));
+        assert_eq!(failure.code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(failure.attempt, 2);
+        assert_single_logical_request_with_attempts(&sink, 2);
+        assert!(
+            sink.phases
+                .iter()
+                .filter(|event| event.phase != ProviderPhase::ProviderTerminal)
+                .all(|event| event.failure.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retry_backoff_obeys_cancellation_and_shared_deadline() {
+        for cancel_during_backoff in [false, true] {
+            for api_mode in [ProviderApiMode::ChatCompletions, ProviderApiMode::Responses] {
+                let (failed, completed) = rate_limit_frames(api_mode, json!("429"));
+                let (base_url, requests, server) =
+                    start_responses_fixture(vec![failed, completed]).await;
+                let mut request = rate_limit_request(&base_url, api_mode);
+                let mut deadlines = request.provider_target().deadlines();
+                deadlines.request_timeout_ms = 150;
+                replace_provider_deadlines(&mut request, deadlines);
+                let cancel = CancellationToken::new();
+                let task_cancel = cancel.clone();
+                let cancellation = tokio::spawn(async move {
+                    if cancel_during_backoff {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        task_cancel.cancel();
+                    }
+                });
+                let mut sink = RecordingLlmEventSink::default();
+                let result = OpenAiCompatClient::new(None)
+                    .stream_chat(request, cancel, &mut sink)
+                    .await;
+                cancellation.await.unwrap();
+                server.abort();
+                assert_eq!(requests.lock().unwrap().len(), 1);
+                assert!(sink.events.is_empty());
+                assert_single_logical_request_with_attempts(&sink, 1);
+                if cancel_during_backoff {
+                    assert_eq!(result.unwrap().finish_reason, FinishReason::Cancelled);
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().provider_failure().unwrap().kind,
+                        ProviderFailureKind::RequestTimeout
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_after_any_model_progress_does_not_replay() {
+        let chat_deltas = [
+            json!({ "content": "Partial" }),
+            json!({ "content": "\n<|im_start|>user" }),
+            json!({ "reasoning_content": "private-progress" }),
+            json!({ "reasoning": "private-progress" }),
+            json!({ "reasoning_details": [{ "type": "reasoning.text", "text": "private-progress" }] }),
+            json!({ "function_call": { "name": "read", "arguments": "{" } }),
+            json!({ "refusal": "Cannot proceed" }),
+            json!({ "tool_calls": [{ "index": 0, "id": "call_partial", "type": "function",
+                "function": { "name": "read", "arguments": "{\"path\":" } }] }),
+        ];
+        let mut prefixes = Vec::new();
+        for delta in chat_deltas {
+            prefixes.push((
+                ProviderApiMode::ChatCompletions,
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }]
+                    })
+                ),
+            ));
+        }
+        prefixes.push((ProviderApiMode::ChatCompletions, format!("data: {}\n\n", json!({
+            "choices": [], "usage": { "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11 }
+        }))));
+        for event in [
+            json!({ "type": "response.output_text.delta", "item_id": "msg_partial", "output_index": 0, "delta": "Partial" }),
+            json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_partial", "delta": "{\"path\":" }),
+            json!({ "type": "response.reasoning_text.delta", "delta": "private-progress" }),
+            json!({ "type": "response.reasoning_summary_text.delta", "delta": "summary-progress" }),
+        ] {
+            prefixes.push((ProviderApiMode::Responses, responses_sse([event])));
+        }
+        for (api_mode, prefix) in prefixes {
+            let (failed, completed) = rate_limit_frames(api_mode, json!("429"));
+            let (base_url, requests, server) =
+                start_responses_fixture(vec![format!("{prefix}{failed}"), completed]).await;
+            let mut sink = RecordingLlmEventSink::default();
+            let error = OpenAiCompatClient::new(None)
+                .stream_chat(
+                    rate_limit_request(&base_url, api_mode),
+                    CancellationToken::new(),
+                    &mut sink,
+                )
+                .await
+                .expect_err("model output, private progress and usage must prevent replay");
+            server.abort();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                error.provider_failure().unwrap().kind,
+                ProviderFailureKind::Generation
+            );
+            assert!(
+                !sink
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, LlmEvent::Finished { .. }))
+            );
+            assert!(!concatenated_text(&sink.events).contains("Recovered."));
+            assert_single_logical_request_with_attempts(&sink, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_rate_limit_and_model_data_frames_do_not_replay() {
+        let mut frames = Vec::new();
+        for delta in [
+            json!({ "content": "Partial" }),
+            json!({ "reasoning_content": "private-progress" }),
+            json!({ "reasoning_details": [{ "type": "reasoning.text", "text": "private-progress" }] }),
+            json!({ "function_call": { "name": "read", "arguments": "{" } }),
+            json!({ "refusal": "Cannot proceed" }),
+            json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "{" } }] }),
+        ] {
+            frames.push((
+                ProviderApiMode::ChatCompletions,
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": { "code": 429 }, "choices": [{ "index": 0, "delta": delta }]
+                    })
+                ),
+            ));
+        }
+        frames.push((ProviderApiMode::ChatCompletions, format!("data: {}\n\n", json!({
+            "error": { "code": 429 }, "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        }))));
+        for event in [
+            json!({ "type": "error", "error": { "code": 429 }, "usage": { "output_tokens": 1 } }),
+            json!({ "type": "error", "error": { "code": 429 }, "output": [{ "type": "message" }] }),
+            json!({ "type": "error", "error": { "code": 429 }, "delta": "Partial" }),
+            json!({ "type": "response.failed", "response": { "error": { "code": 429 }, "usage": { "output_tokens": 1 } } }),
+            json!({ "type": "response.failed", "response": { "error": { "code": 429 }, "output": [{ "type": "function_call" }] } }),
+        ] {
+            frames.push((ProviderApiMode::Responses, responses_sse([event])));
+        }
+        for (api_mode, failed) in frames {
+            let (_, completed) = rate_limit_frames(api_mode, json!(429));
+            let (base_url, requests, server) =
+                start_responses_fixture(vec![failed, completed]).await;
+            let mut sink = RecordingLlmEventSink::default();
+            let error = OpenAiCompatClient::new(None)
+                .stream_chat(
+                    rate_limit_request(&base_url, api_mode),
+                    CancellationToken::new(),
+                    &mut sink,
+                )
+                .await
+                .expect_err("data in the error frame itself must prevent replay");
+            server.abort();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                error.provider_failure().unwrap().kind,
+                ProviderFailureKind::Generation
+            );
+            assert_single_logical_request_with_attempts(&sink, 1);
+        }
+    }
+
+    #[test]
+    fn only_exact_rate_limit_errors_are_retryable() {
+        for (code, expected) in [
+            ("429", true),
+            ("rate_limit_exceeded", true),
+            ("429.0", false),
+            ("-429", false),
+            ("server_error", false),
+            ("rate_limit_exceeded_suffix", false),
+        ] {
+            assert_eq!(
+                super::is_rate_limit_error(&LlmError::ProviderGenerationFailed {
+                    response_id: None,
+                    code: Some(code.into()),
+                    message: "429 is mentioned in this message".into(),
+                }),
+                expected
+            );
+        }
+        for (status, expected) in [(429, true), (500, false), (503, false), (408, false)] {
+            assert_eq!(
+                super::is_rate_limit_error(&LlmError::ProviderRejected {
+                    status: Some(status),
+                    code: Some("rate_limit_exceeded".into()),
+                    param: None,
+                    message: "limited".into(),
+                }),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -5961,6 +7724,39 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    async fn start_status_sequence_fixture(
+        responses: Vec<(StatusCode, String)>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let responses = Arc::new(responses);
+        let next_response = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback(move |Json(request): Json<Value>| {
+            let recorded = recorded.clone();
+            let responses = responses.clone();
+            let next_response = next_response.clone();
+            async move {
+                recorded.lock().unwrap().push(request);
+                let index = next_response.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = responses
+                    .get(index)
+                    .cloned()
+                    .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, "unexpected retry".into()));
+                Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests, server)
     }
 
     async fn start_responses_fixture(

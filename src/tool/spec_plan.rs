@@ -347,6 +347,22 @@ mod tests {
     }
 
     #[test]
+    fn history_retrieval_is_advertised_and_routed_as_a_read_in_both_modes() {
+        let config = ResolvedConfig::default();
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        for mode in [ModeKind::Default, ModeKind::Plan] {
+            let plan = ToolSpecPlan::build(&step_for_config(mode, &config), &registry);
+            assert!(plan.tool_names().contains(&"read_history".into()));
+            assert_eq!(
+                plan.router()
+                    .validate_call_effect("read_history", &serde_json::json!({}), &config.mcp)
+                    .unwrap(),
+                ToolEffectClass::Read
+            );
+        }
+    }
+
+    #[test]
     fn every_agent_keeps_normal_and_collaboration_tools() {
         let mut config = ResolvedConfig::default();
         config.multi_agent.enabled = true;

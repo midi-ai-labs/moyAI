@@ -24,10 +24,10 @@ pub struct ProviderDeadlines {
 /// These limits are captured with the turn so live settings cannot change the request contract
 /// after admission. Text-token admission remains owned by `ContextManager`; this envelope covers
 /// the JSON, schema, stop-sequence, and image surfaces that token accounting cannot safely bound.
+/// Message counts remain diagnostic; long histories use token admission and the exact body limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRequestLimits {
     pub max_serialized_body_bytes: u64,
-    pub max_messages: usize,
     pub max_tools: usize,
     pub max_tool_schema_bytes: u64,
     pub max_extra_body_bytes: u64,
@@ -52,7 +52,6 @@ impl ProviderRequestLimits {
             // Eight images are admitted separately below. This body ceiling is intentionally
             // larger than the aggregate 40 MiB decoded-image budget after base64 expansion.
             max_serialized_body_bytes: 64 * MIB,
-            max_messages: 512,
             max_tools: 128,
             max_tool_schema_bytes: 2 * MIB,
             max_extra_body_bytes: 256 * 1024,

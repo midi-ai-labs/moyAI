@@ -19,7 +19,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.0 targets Windows x64 and pairs with moyAI Hub 0.1.0.** This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.0 release notes](docs/release/v3.0.0.md) for implemented changes, acceptance evidence and validation limits.
+**Desktop 3.0.0-rc.2 is a Windows x64 release candidate for use with moyAI Hub 0.1.0.** This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.0-rc.2 release notes](docs/release/v3.0.0-rc.2.md) for changes and limitations, and the package's release evidence for its exact tested build.
 
 ## Highlights
 
@@ -35,7 +35,7 @@ Documentation and explanatory comments use built-in writing guidance inspired by
 
 ## Quick Start
 
-For the 3.0.0 Windows package:
+For the 3.0.0-rc.2 Windows package:
 
 1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt for initial installation or a changed shared sandbox helper; cancelling stops before the user application is installed. Open **moyAI** from the Start menu without a startup UAC prompt. Portable use also requires the shared helper; follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
@@ -75,7 +75,13 @@ Global settings apply to future work; session settings can override the selected
 
 The optional global `model.compaction_budget_tokens` setting (`MOYAI_COMPACTION_BUDGET_TOKENS`) sets when automatic compaction starts. When omitted, moyAI uses its normal working context limit. An explicit value must be positive and no greater than the effective input limit derived from `context_window`; automatic compaction starts at the smaller of that value and the normal working limit. With `context_window = 131072`, setting `98304` starts automatic compaction at 98,304 estimated input tokens. This setting also applies to Main through Hub and shared execution; generation output limits belong to the LLM host.
 
+`model.max_retries` bounds automatic retries for connection-establishment failures and provider rate limits (HTTP 429 or SSE error code `429` / `rate_limit_exceeded`). A rate-limit retry uses the same endpoint and request only before any output, reasoning, tool-call data or usage has arrived. Retries share the existing request deadline and use bounded backoff; cancellation interrupts the wait. Partial generations and other provider errors are not replayed.
+
 The model can also call `compact_context` with its own concise working summary. moyAI keeps the latest user input and recent completed work, validates that the summary reduces the active context, and saves it through the existing conversation history. Original messages and tool results remain available. This design takes conceptual inspiration from [Context Language Models](https://github.com/facebookresearch/context-language-models) and is implemented within moyAI's own history and tool system.
+
+Automatic compaction uses a snapshot of completed active history, normally with one summary request. It replaces the previous checkpoint instead of appending a cumulative tool ledger. The restart instructions support writing, research, monitoring, data work and development without a fixed output format or compression ratio. Input selection respects complete tool-call/result groups and the full prepared-request budget; a rejected summary leaves the original history intact.
+
+The `read_history` tool retrieves public records from the current conversation, including records omitted from the active context. It can list or search bounded pages, then read an exact item in chunks. Follow `next_after` for search pages or `next` for item text. Retrieved records describe historical observations and operation states; they do not grant permission or prove that current files are unchanged. Other conversations, private reasoning and request diagnostics cannot be selected. A fork uses its own copied item IDs. Search its local history for copied records; an original record not copied into the fork is unavailable from that conversation.
 
 Approve supplies the separate, tool-free Guardian request in **Approve for me** mode. Its connection, model, API-key reference and timeouts can be configured independently. Leaving Approve unconfigured preserves the current Main connection for reviews. An explicit Approve selection stays independent of later Main changes; connection failures do not switch the reviewer to Main. Its response timeout bounds the entire review, including the latest user-turn generation lookup. Guardian receives the exact action and execution facts without conversation history. It reports a risk level: low or medium allows that action, high or unknown asks you to confirm, and critical refuses and stops the turn. This risk review does not independently enforce restrictions written in conversation text. Ask for approval and Full access do not contact the Approve model.
 
@@ -88,7 +94,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-The 3.0.0 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+The 3.0.0-rc.2 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
 On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
 
@@ -134,7 +140,7 @@ Windows native sandbox tests require an explicitly approved helper testhost. Fol
 
 Use the [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md) and [manual test entrypoint](tests/manual_ST/README.md) to select checks for the changed behavior. Real-window evidence and Live LLM behavior must be distinguished from fixture tests. Source ownership is visible in [src/](src/) and [the multi-PC design](docs/design/multi-device-session.md); implementation details belong with their code and tests rather than being duplicated here.
 
-The RC source has completed Manual ST Cases 1–7 and the restoration stages. The latest virtual WinA/WinB tests passed the automated execution, result-transfer and cleanup checks with both a scripted provider and a live LLM. These used Hub 0.1.0 at `f437c4fe0191e69f0ff7f0affa16eb191db305f3` on one Windows PC. Generated-code evaluation failures and Side Chat answer inaccuracies remain recorded; completion of the test sequence does not mean that every generated answer passed. Final 3.0.0 package acceptance results and artifact identities are recorded in the development workspace at `project_sandbox/release-3.0.0-20261016/RESULTS.md`. RC results remain separate evidence. Fresh-PC installation and physical multi-PC/LAN/Firewall checks have not been confirmed.
+Earlier 3.0.0 candidates were tested with Manual ST Cases 1–7, restoration stages, and virtual WinA/WinB execution and result transfer on one Windows PC. Those results, including generated-code evaluation failures and Side Chat answer inaccuracies, remain historical evidence. They do not establish acceptance of 3.0.0-rc.2. Results for this candidate are recorded separately in the development workspace at `project_sandbox/release-3.0.0-rc2-20261020/RESULTS.md` and in its release artifacts with the exact version, commit and binary identities. Fresh-PC installation and physical multi-PC/LAN/Firewall checks require separate evidence.
 
 Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner, cleanup and the sandbox helper, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
 

@@ -73,6 +73,7 @@ impl crate::llm::LlmClient for ChildThenAnswer {
                 reasoning_tokens: None,
             }),
             response_id: None,
+            continuation: None,
         })
     }
 }
@@ -410,6 +411,7 @@ impl crate::llm::LlmClient for ContextAnswer {
             finish_reason: FinishReason::Stop,
             usage: None,
             response_id: None,
+            continuation: None,
         })
     }
 }
@@ -1748,6 +1750,7 @@ impl crate::llm::LlmClient for RunningShellThenChild {
             finish_reason,
             usage: None,
             response_id: None,
+            continuation: None,
         })
     }
 }

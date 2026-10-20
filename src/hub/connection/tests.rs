@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Notify, Semaphore};
 
 const BOOTSTRAP: &str = "bootstrap-secret-01234567890123456789";
+const CHAT_REPLY: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hub response\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 
 struct ServerState {
     supports_delegated: AtomicBool,
@@ -27,6 +28,7 @@ struct ServerState {
     close_gate: Semaphore,
     closes_completed: AtomicUsize,
     gateway_requests: std::sync::Mutex<Vec<(Value, String, bool)>>,
+    chat_stream: std::sync::Mutex<String>,
     responses_stream: std::sync::Mutex<String>,
     reject_gateway_review: AtomicBool,
     hub_id: std::sync::Mutex<String>,
@@ -319,8 +321,9 @@ async fn gateway(
     }
     (
         [("content-type", "text/event-stream")],
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hub response\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-    ).into_response()
+        state.chat_stream.lock().unwrap().clone(),
+    )
+        .into_response()
 }
 
 async fn responses_gateway(
@@ -357,6 +360,7 @@ impl Server {
             close_gate: Semaphore::new(0),
             closes_completed: AtomicUsize::new(0),
             gateway_requests: Default::default(),
+            chat_stream: std::sync::Mutex::new(CHAT_REPLY.into()),
             responses_stream: Default::default(),
             reject_gateway_review: AtomicBool::new(false),
             hub_id: std::sync::Mutex::new("hub-test".into()),
@@ -395,7 +399,7 @@ impl Server {
             .route("/v1/requests/prepare", post(prepare))
             .route("/v1/turns/finish", post(close_turn))
             .route("/v1/turns/cancel", post(close_turn))
-            .route("/r/permit-1/v1/chat/completions", post(gateway))
+            .route("/r/{permit}/v1/chat/completions", post(gateway))
             .route("/r/permit-1/v1/responses", post(responses_gateway))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2346,6 +2350,131 @@ async fn hub_turns_use_fresh_grants_without_direct_credentials_or_ephemeral_diag
     route.finish().await;
     assert!(service.projection_now().active_main.is_none());
     assert_eq!(server.state.closes.lock().unwrap().len(), 1);
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn hub_chat_continuation_follows_the_prepared_lease_and_actual_model_across_permits() {
+    use crate::llm::{ModelMessage, ModelToolCall, ToolSchema};
+
+    const PRIVATE: &str = "private-hub-continuation-canary";
+    let server = Server::start(60_000).await;
+    *server.state.catalog_override.lock().unwrap() = json!({"models":[
+        {"id":"deep","label":"Deep","capabilities":["chat","tools"]},
+        {"id":"fast","label":"Fast","capabilities":["chat","tools"]}
+    ]});
+    let temp = tempfile::tempdir().unwrap();
+    let service = HubConnection::new(store(&temp));
+    let connected = connect_service(&service, &server).await;
+    let mut chosen = selection("deep");
+    chosen.allowed_model_ids.insert("fast".into());
+    chosen.required_capabilities.insert("tools".into());
+    chosen.wait_policy = HubWaitPolicy::AllowSelectedFallback;
+    let reviewed = service
+        .save_review(
+            HubReviewContext::Main,
+            chosen,
+            connected.hub_id.unwrap(),
+            connected.catalog.unwrap().revision,
+            connected.settings_revision,
+            connected.connection_generation,
+        )
+        .await
+        .unwrap();
+    enable(&service, reviewed, HubReviewContext::Main).await;
+    let route = service
+        .begin_turn(HubReviewContext::Main, CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let client = route.client();
+    let mut template = route_request();
+    template.model.capabilities.supports_tools = true;
+    template.tools = vec![ToolSchema {
+        name: "read".into(),
+        description: "Read a file.".into(),
+        input_schema: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+    }];
+    *server.state.prepare_response.lock().unwrap() = grant(&server, "deep");
+    *server.state.chat_stream.lock().unwrap() = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{
+            "reasoning_content":PRIVATE,
+            "tool_calls":[{"index":0,"id":"call-read","type":"function","function":{
+                "name":"read","arguments":"{\"path\":\"task.md\"}"
+            }}]
+        },"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})
+    );
+    let summary = client
+        .stream_chat(
+            template.clone(),
+            CancellationToken::new(),
+            &mut Output::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!format!("{summary:?}").contains(PRIVATE));
+    assert!(!serde_json::to_string(&summary).unwrap().contains(PRIVATE));
+    let continuation = summary.continuation.expect("successful tool continuation");
+    let mut followup = template;
+    followup.messages.extend([
+        ModelMessage::AssistantToolCalls {
+            content: None,
+            tool_calls: vec![ModelToolCall {
+                call_id: "call-read".into(),
+                tool_name: "read".into(),
+                arguments_json: "{\"path\":\"task.md\"}".into(),
+            }],
+            continuation: Some(continuation),
+        },
+        ModelMessage::Tool {
+            call_id: "call-read".into(),
+            tool_name: "read".into(),
+            result: "observed task".into(),
+            metadata: json!({}),
+        },
+    ]);
+    *server.state.chat_stream.lock().unwrap() = CHAT_REPLY.into();
+    for (index, lease, model, retained) in [
+        (2, "lease-1", "deep", true),
+        (3, "lease-2", "deep", false),
+        (4, "lease-1", "fast", false),
+    ] {
+        let permit = format!("permit-{index}");
+        let request_token = format!("request-token-01234567890123456789-{index}");
+        let mut prepared = grant(&server, model);
+        prepared["lease_id"] = json!(lease);
+        prepared["permit_id"] = json!(permit);
+        prepared["gateway_base_url"] = json!(format!("{}/r/{permit}/v1", server.endpoint));
+        prepared["request_token"] = json!(request_token);
+        *server.state.prepare_response.lock().unwrap() = prepared;
+        client
+            .stream_chat(
+                followup.clone(),
+                CancellationToken::new(),
+                &mut Output::default(),
+            )
+            .await
+            .unwrap();
+        let requests = server.state.gateway_requests.lock().unwrap();
+        let (body, bearer, direct_header) = requests.last().unwrap();
+        assert_eq!(body["model"], model);
+        assert_eq!(bearer, &format!("Bearer {request_token}"));
+        assert!(!direct_header);
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(
+            assistant.get("reasoning_content").and_then(Value::as_str),
+            retained.then_some(PRIVATE),
+            "continuation must follow the lease and actual model, not the changing permit URL"
+        );
+    }
+    assert_eq!(server.state.prepares.lock().unwrap().len(), 4);
+    route.finish().await;
     service.shutdown().await;
 }
 

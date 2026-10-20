@@ -21,6 +21,21 @@ impl AgentLoop {
             return self.reject_model_compaction(request, sink,
                 "Context compaction was not applied: there was no eligible completed history in the sampled context.");
         }
+        let summary = match request
+            .context
+            .checkpoint_with_source_records(&summary, &source_item_ids)
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                return self.reject_model_compaction(
+                    request,
+                    sink,
+                    &format!(
+                        "Context compaction was not applied: {error}. Original context is retained."
+                    ),
+                );
+            }
+        };
         let supports_images = request
             .turn
             .policy
@@ -45,9 +60,14 @@ impl AgentLoop {
                 supports_images,
             ));
         let before_request = current_status.active_context_tokens;
-        let after_request = before_request.saturating_sub(before).saturating_add(after);
-        if after >= before || after_request >= request.turn.policy.model.working_context_token_limit
-        {
+        let (_, usable) = compaction_checkpoint_budget(
+            before,
+            after,
+            before_request,
+            0,
+            request.turn.policy.model.working_context_token_limit,
+        );
+        if !usable {
             return self.reject_model_compaction(request, sink,
                 "Context compaction was not applied: the proposed notes did not reduce the input below its compaction threshold. Original context is retained.");
         }

@@ -61,11 +61,8 @@ use crate::tool::registry::ToolRegistry;
 const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
 const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
-// Generation policy is owned by the provider host, so a reasoning model may need materially more
-// decode headroom than a non-reasoning model before it emits the checkpoint text. Keep the first
-// semantic compaction source comfortably below the ordinary working boundary without splitting a
-// response/tool-output unit or changing any provider generation setting.
-const COMPACTION_SOURCE_TARGET_DIVISOR: u32 = 2;
+// This reserves planning space inside the input window; it is not an output
+// target or a generation override. Sampling and output limits remain host-owned.
 const COMPACTION_CHECKPOINT_RESERVE_TOKENS: usize = 1_800;
 const COMPACTION_PREFIX_SEARCH_MAX_EVALUATIONS: usize = usize::BITS as usize + 1;
 
@@ -473,6 +470,7 @@ impl AgentLoop {
         sink: &mut dyn RunEventSink,
     ) -> Result<shared::AgentRunOutcome, AgentError> {
         ensure_admission_active(&self.store, &request).await?;
+        request.context.clear_chat_continuations();
         let tool_services =
             self.tool_services_for_turn(&request.turn.resolved_config().runtime_config().mcp)?;
         let repo = self.store.session_repo();
@@ -691,6 +689,14 @@ impl AgentLoop {
                         Ok(false) => {
                             compaction_unavailable_at_revision =
                                 Some(request.context.revision().as_str().to_string());
+                            sink.emit(RunEvent::RecoverableRuntimeFeedback {
+                                session_id: request.session.session.id,
+                                feedback: crate::session::DurableRuntimeFeedback::new(
+                                    crate::session::DurableFeedbackSeverity::Warning,
+                                    crate::session::DurableFeedbackCategory::Context,
+                                    "Semantic compaction was unavailable, so the task continued with the existing history. If the context fills up, start a new task or reduce the request.",
+                                ),
+                            })?;
                         }
                         Err(error) => {
                             if let AgentError::Llm(llm_error) = &error
@@ -943,6 +949,13 @@ impl AgentLoop {
                 // response lineage (for example, output-limit and invalid-shape responses fail
                 // before this transaction).
                 last_model_response_id = Some(model_response_id);
+                if has_tool_calls
+                    && let Some(continuation) = response.continuation.clone()
+                {
+                    request
+                        .context
+                        .record_chat_continuation(model_response_id, continuation);
+                }
                 model_needs_follow_up = false;
                 must_sample_without_compaction = false;
                 can_drain_pending_input = false;
@@ -1573,7 +1586,7 @@ impl AgentLoop {
         let excluded_item_ids = excluded_item_id.into_iter().collect::<HashSet<_>>();
         let units = request
             .context
-            .semantic_compaction_units_excluding(&excluded_item_ids);
+            .automatic_compaction_units_excluding(&excluded_item_ids);
         if units.is_empty() {
             return Ok(false);
         }
@@ -1612,9 +1625,11 @@ impl AgentLoop {
                     .context
                     .compaction_user_messages_for_items(&selected_item_ids),
             );
-            let compaction_source_messages = request
-                .context
-                .model_messages_for_items(&selected_item_ids, supports_images);
+            let compaction_source_messages = request.context.compaction_source_messages_for_items(
+                &selected_item_ids,
+                &excluded_item_ids,
+                supports_images,
+            );
             let compaction_source_template = self
                 .chat_request(request, step, &compaction_source_messages, tool_plan, goal)?
                 .chat_request;
@@ -1635,6 +1650,14 @@ impl AgentLoop {
                     diagnostic,
                 } => {
                     required_prompt_gap = required_prompt_gap.max(prompt_gap);
+                    let text = request
+                        .context
+                        .checkpoint_with_source_records(&text, &selected_item_ids)
+                        .map_err(|error| {
+                            AgentError::Message(format!(
+                                "semantic compaction source records could not be preserved: {error}; canonical history was left unchanged"
+                            ))
+                        })?;
                     break (
                         selected_item_ids,
                         preserved_user_messages,
@@ -1725,34 +1748,20 @@ impl AgentLoop {
             ));
         let before_request_tokens =
             ContextWindowTokenStatus::for_request(request_template, 0).active_context_tokens;
-        let projected_request_tokens = before_request_tokens
-            .saturating_sub(before_context_tokens)
-            .saturating_add(after_context_tokens);
-        let provider_adjusted_projected_request_tokens =
-            projected_request_tokens.saturating_add(required_prompt_gap);
-        diagnostic.checkpoint_budget = Some(CompactionCheckpointBudget {
+        let (checkpoint_budget, usable) = compaction_checkpoint_budget(
             before_context_tokens,
             after_context_tokens,
             before_request_tokens,
-            projected_request_tokens,
-            provider_adjusted_projected_request_tokens,
-            observed_prompt_gap: required_prompt_gap,
-            working_context_token_limit: request.turn.policy.model.working_context_token_limit,
-        });
-        if after_context_tokens >= before_context_tokens
-            || provider_adjusted_projected_request_tokens
-                >= request.turn.policy.model.working_context_token_limit
-        {
+            required_prompt_gap,
+            request.turn.policy.model.working_context_token_limit,
+        );
+        diagnostic.checkpoint_budget = Some(checkpoint_budget);
+        if !usable {
             diagnostic.outcome = CompactionDiagnosticOutcome::CheckpointRejected;
             sink.record_compaction_diagnostic(&diagnostic);
-            return Err(AgentError::Message(format!(
-                "semantic compaction summary was rejected because it did not create a usable checkpoint \
-                 (context {before_context_tokens}->{after_context_tokens} estimated tokens, full request \
-                 {before_request_tokens}->{projected_request_tokens}, provider-adjusted projected request \
-                 {provider_adjusted_projected_request_tokens} with observed prompt gap {required_prompt_gap}, \
-                 working limit {}); canonical history was left unchanged",
-                request.turn.policy.model.working_context_token_limit
-            )));
+            // The caller keeps the original history and suppresses another
+            // attempt at this revision. A hard-boundary request cannot continue.
+            return Ok(false);
         }
         let event = RunEvent::CompactionCompleted {
             layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
@@ -1807,11 +1816,8 @@ impl AgentLoop {
         supports_images: bool,
     ) -> Result<CompactionUnitSelection, AgentError> {
         debug_assert!(!units.is_empty());
-        let working_limit = request.turn.policy.model.working_context_token_limit;
-        let source_target = working_limit
-            .checked_div(COMPACTION_SOURCE_TARGET_DIVISOR)
-            .unwrap_or_default()
-            .max(1);
+        let source_limit =
+            compaction_source_token_limit(request.turn.policy.model.effective_context_token_limit);
         let before_context_tokens = estimate_model_messages_tokens(
             &request
                 .context
@@ -1819,9 +1825,13 @@ impl AgentLoop {
         );
         let before_request_tokens =
             ContextWindowTokenStatus::for_request(request_template, 0).active_context_tokens;
-        // This is only a local projection reserve matching the checkpoint prompt's upper target.
-        // It is never serialized as an output cap or any other provider generation control.
         let checkpoint_reserve = "x".repeat(COMPACTION_CHECKPOINT_RESERVE_TOKENS * 4);
+        let actual_source_limit = request
+            .turn
+            .policy
+            .model
+            .effective_context_token_limit
+            .saturating_sub(COMPACTION_CHECKPOINT_RESERVE_TOKENS as u32);
         let mut projections = HashMap::<usize, CompactionPrefixProjection>::new();
         let mut projection_for = |unit_count| -> Result<CompactionPrefixProjection, AgentError> {
             if let Some(projection) = projections.get(&unit_count) {
@@ -1843,34 +1853,40 @@ impl AgentLoop {
             projections.insert(unit_count, projection);
             Ok(projection)
         };
-        let minimum_projected_safe_count = first_monotonic_prefix_count(
-            1,
+        let mut initial_count = compaction_prefix_count(
             units.len(),
-            &mut |unit_count| -> Result<bool, AgentError> {
-                let projection = projection_for(unit_count)?;
-                Ok(projection.after_context_tokens < before_context_tokens
-                    && projection.projected_request_tokens < working_limit)
+            source_limit.min(actual_source_limit),
+            actual_source_limit,
+            &mut |unit_count| {
+                projection_for(unit_count).map(|projection| projection.source_request_tokens)
             },
         )?;
-        let Some(minimum_projected_safe_count) = minimum_projected_safe_count else {
-            return Ok(CompactionUnitSelection {
-                initial_count: units.len(),
-            });
-        };
-        let largest_bounded_safe_count = last_monotonic_prefix_count(
-            minimum_projected_safe_count,
-            units.len(),
-            &mut |unit_count| -> Result<bool, AgentError> {
-                let projection = projection_for(unit_count)?;
-                Ok(projection.source_request_tokens <= source_target)
-            },
-        )?;
-        let mut initial_count = largest_bounded_safe_count.unwrap_or(minimum_projected_safe_count);
-        let final_projection = projection_for(initial_count)?;
-        if final_projection.after_context_tokens >= before_context_tokens
-            || final_projection.projected_request_tokens >= working_limit
-        {
-            initial_count = minimum_projected_safe_count;
+        if initial_count > 0 {
+            let working_limit = request.turn.policy.model.working_context_token_limit;
+            let useful = |projection: CompactionPrefixProjection| {
+                compaction_checkpoint_budget(
+                    before_context_tokens,
+                    projection.after_context_tokens,
+                    before_request_tokens,
+                    0,
+                    working_limit,
+                )
+                .1
+            };
+            if !useful(projection_for(initial_count)?) {
+                // A small earlier unit can fit the preferred budget without
+                // freeing enough room. Advance to the first useful complete
+                // prefix when it still fits the actual source-input boundary.
+                if let Some(count) =
+                    first_monotonic_prefix_count(initial_count + 1, units.len(), &mut |count| {
+                        projection_for(count).map(useful)
+                    })?
+                {
+                    if projection_for(count)?.source_request_tokens <= actual_source_limit {
+                        initial_count = count;
+                    }
+                }
+            }
         }
         Ok(CompactionUnitSelection { initial_count })
     }
@@ -1990,6 +2006,10 @@ impl AgentLoop {
         checkpoint_reserve: &str,
     ) -> Result<CompactionPrefixProjection, AgentError> {
         let selected_item_ids = flatten_compaction_unit_prefix(units, unit_count);
+        let checkpoint_reserve = request
+            .context
+            .checkpoint_with_source_records(checkpoint_reserve, &selected_item_ids)
+            .map_err(AgentError::Message)?;
         let preserved_user_messages = bounded_compaction_user_messages(
             &request
                 .context
@@ -2000,7 +2020,7 @@ impl AgentLoop {
                 request.session.session.id,
                 request.turn_id(),
                 preserved_user_messages,
-                checkpoint_reserve.to_string(),
+                checkpoint_reserve,
                 selected_item_ids.clone(),
                 excluded_item_ids,
                 supports_images,
@@ -2008,9 +2028,11 @@ impl AgentLoop {
         let projected_request_tokens = before_request_tokens
             .saturating_sub(before_context_tokens)
             .saturating_add(after_context_tokens);
-        let source_messages = request
-            .context
-            .model_messages_for_items(&selected_item_ids, supports_images);
+        let source_messages = request.context.compaction_source_messages_for_items(
+            &selected_item_ids,
+            excluded_item_ids,
+            supports_images,
+        );
         let source_template = self
             .chat_request(request, step, &source_messages, tool_plan, goal)?
             .chat_request;
@@ -2248,11 +2270,11 @@ impl AgentLoop {
                 "semantic compaction returned an empty summary".to_string(),
             ));
         }
-        compaction::validate_checkpoint_structure(&summary).map_err(|error| {
+        compaction::validate_checkpoint_body(&summary).map_err(|error| {
             diagnostic.outcome = CompactionDiagnosticOutcome::InvalidCheckpoint;
             sink.record_compaction_diagnostic(&diagnostic);
             AgentError::Message(format!(
-                "semantic compaction checkpoint failed structural review: {error}; canonical history was left unchanged"
+                "semantic compaction checkpoint failed validation: {error}; canonical history was left unchanged"
             ))
         })?;
         Ok(CompactionSummaryOutcome::Summary {
@@ -2987,6 +3009,69 @@ fn flatten_compaction_unit_prefix(
         .collect()
 }
 
+fn compaction_prefix_count<E>(
+    unit_count: usize,
+    preferred_limit: u32,
+    actual_limit: u32,
+    source_tokens: &mut impl FnMut(usize) -> Result<u32, E>,
+) -> Result<usize, E> {
+    if unit_count == 0 {
+        return Ok(0);
+    }
+    if source_tokens(unit_count)? <= preferred_limit {
+        return Ok(unit_count);
+    }
+    if let Some(count) =
+        last_monotonic_prefix_count(1, unit_count.saturating_sub(1), &mut |count| {
+            source_tokens(count).map(|tokens| tokens <= preferred_limit)
+        })?
+    {
+        return Ok(count);
+    }
+    // A complete first response may exceed preferred decode headroom while
+    // still fitting the actual input window. Try it once without splitting it.
+    Ok(if source_tokens(1)? <= actual_limit {
+        1
+    } else {
+        0
+    })
+}
+
+fn compaction_source_token_limit(effective_context_token_limit: u32) -> u32 {
+    // Leave room to generate both reasoning and public restart information.
+    // This plans the source boundary; it does not set an output target or cap.
+    let decode_headroom = (effective_context_token_limit / 5).min(20_000);
+    effective_context_token_limit.saturating_sub(decode_headroom)
+}
+
+fn compaction_checkpoint_budget(
+    before_context_tokens: u32,
+    after_context_tokens: u32,
+    before_request_tokens: u32,
+    observed_prompt_gap: u32,
+    working_context_token_limit: u32,
+) -> (CompactionCheckpointBudget, bool) {
+    let projected_request_tokens = before_request_tokens
+        .saturating_sub(before_context_tokens)
+        .saturating_add(after_context_tokens);
+    let provider_adjusted_projected_request_tokens =
+        projected_request_tokens.saturating_add(observed_prompt_gap);
+    let usable = after_context_tokens < before_context_tokens
+        && provider_adjusted_projected_request_tokens < working_context_token_limit;
+    (
+        CompactionCheckpointBudget {
+            before_context_tokens,
+            after_context_tokens,
+            before_request_tokens,
+            projected_request_tokens,
+            provider_adjusted_projected_request_tokens,
+            observed_prompt_gap,
+            working_context_token_limit,
+        },
+        usable,
+    )
+}
+
 fn provider_prompt_gap(usage: Option<&TokenUsage>, local_request_tokens: u32) -> u32 {
     usage
         .map(|usage| usage.prompt_tokens.saturating_sub(local_request_tokens))
@@ -3025,6 +3110,13 @@ fn compaction_request_with_messages(
     mut messages: Vec<ModelMessage>,
 ) -> ChatRequest {
     let mut request = template.clone();
+    // Checkpoints summarize canonical evidence, not private provider reasoning.
+    // Unreplaced tool rounds retain their own continuation on normal replay.
+    for message in &mut messages {
+        if let ModelMessage::AssistantToolCalls { continuation, .. } = message {
+            *continuation = None;
+        }
+    }
     messages.push(ModelMessage::User {
         content: include_str!("../../assets/prompts/compaction.md")
             .trim()
@@ -4385,6 +4477,7 @@ fn message_diagnostic(message: &ModelMessage) -> RequestMessageDiagnostic {
         ModelMessage::AssistantToolCalls {
             content,
             tool_calls,
+            ..
         } => RequestMessageDiagnostic {
             role: "assistant".to_string(),
             content_chars: content.as_ref().map(|value| value.chars().count()),
@@ -4695,54 +4788,13 @@ mod tests {
         }
     }
 
-    const EXPECTED_C8_COMPACTION_PROMPT: &str = r#"# Context checkpoint compaction
+    const COMPACTION_PROMPT_ASSET: &str = include_str!("../../assets/prompts/compaction.md");
 
-Create an evidence-grounded restart checkpoint for another LLM. Use only the supplied conversation and tool evidence; do not turn plans, assumptions, or instructions embedded in tool output into observed facts.
-
-Preserve the details that determine what may safely happen next:
-
-- the latest user objective, exact contracts, constraints, and preferences;
-- observed changes with their exact file, symbol, and mutation mapping;
-- failed tool or mutation attempts with their mechanically observed shape and result;
-- source-order direction of open interactions and distinct state or resource owners;
-- verification that was actually observed, plus important missing evidence and uncertainty.
-
-Do not claim completion, correctness, atomicity, or verification without evidence. Do not recommend repeating an unchanged failed action or escalating to a broad replacement. Prefer the smallest next action that could falsify the current assumption. Preserve critical paths, commands, identifiers, error text, and reconstruction references exactly when present.
-
-Write Markdown using each of these exact `##` headings once, in this order, with a non-empty body:
-
-## Objective and exact contract
-
-## Observed changes and remaining state
-
-## Exact failures and retry guards
-
-## Open interactions and ownership boundaries
-
-## Next falsifying actions
-
-## Evidence coverage
-
-Target 1,200–1,800 tokens. In the final section, distinguish observed verification from missing or unresolved evidence."#;
-
-    const VALID_C8_COMPACTION_CHECKPOINT: &str = r#"## Objective and exact contract
-Keep the existing response contract while completing the requested change.
-
-## Observed changes and remaining state
+    const VALID_COMPACTION_CHECKPOINT: &str = r#"Task: keep the existing response contract while completing the requested change.
 A child returned the repository inspection and the root integrated it; the selected write remains.
-
-## Exact failures and retry guards
-No failed mutation was observed, so there is no failed action to repeat.
-
-## Open interactions and ownership boundaries
-No unresolved cross-owner interaction was established by the supplied evidence.
-
-## Next falsifying actions
-Apply the selected write change, then run its focused verification.
-
-## Evidence coverage
-Repository inspection was observed; mutation and verification results remain unobserved."#;
-
+No failed mutation observed. No unresolved cross-owner interaction established.
+Next: Apply the selected write change, then run its focused verification.
+Repository inspection observed; mutation and verification results remain unobserved."#;
     struct CompactionFixtureBudget {
         read_output_chars: usize,
         working_limit: u32,
@@ -4763,6 +4815,20 @@ Repository inspection was observed; mutation and verification results remain uno
                 self.hard_limit,
             );
         }
+    }
+
+    fn scripted_read_call_with_total(call_id: &str, total_tokens: u32) -> ScriptedResponse {
+        let mut response = scripted_read_call(call_id);
+        response.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: total_tokens.saturating_sub(100),
+                completion_tokens: 100,
+                total_tokens,
+                reasoning_tokens: None,
+            }),
+        });
+        response
     }
 
     async fn compaction_fixture_budget(
@@ -4823,17 +4889,17 @@ Repository inspection was observed; mutation and verification results remain uno
             let reserve = local_request_projection_after_hypothetical_compaction(
                 &run,
                 2,
-                2,
+                1,
                 "x".repeat(COMPACTION_CHECKPOINT_RESERVE_TOKENS * 4),
                 CALIBRATION_FINAL,
             );
             let oversized = local_request_projection_after_hypothetical_compaction(
                 &run,
                 2,
-                2,
+                1,
                 format!(
                     "{}\n{}",
-                    VALID_C8_COMPACTION_CHECKPOINT,
+                    VALID_COMPACTION_CHECKPOINT,
                     "summary-padding".repeat(600)
                 ),
                 CALIBRATION_FINAL,
@@ -4858,7 +4924,10 @@ Repository inspection was observed; mutation and verification results remain uno
                 .checked_sub(expanded_source)
                 .expect("positive observed prompt gap");
             assert!(gap > 0);
-            assert!(expanded_source <= working_limit / COMPACTION_SOURCE_TARGET_DIVISOR);
+            assert!(
+                expanded_source
+                    < hard_limit.saturating_sub(COMPACTION_CHECKPOINT_RESERVE_TOKENS as u32)
+            );
             assert!(reserve + added + gap < working_limit);
             assert!(oversized + added + gap >= working_limit);
             assert!(source(&run.requests[1]) + added + gap < working_limit);
@@ -5160,9 +5229,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .cloned()
             .collect::<Vec<_>>();
         let context = context_manager::ContextManager::rehydrate(pre_final_history);
-        let units = context.semantic_compaction_units();
+        let units = context.automatic_compaction_units_excluding(&HashSet::new());
         assert!(selected_unit_count <= units.len());
         let selected_item_ids = flatten_compaction_unit_prefix(&units, selected_unit_count);
+        let checkpoint = context
+            .checkpoint_with_source_records(&checkpoint, &selected_item_ids)
+            .expect("hypothetical host records");
         let preserved_user_messages = bounded_compaction_user_messages(
             &context.compaction_user_messages_for_items(&selected_item_ids),
         );
@@ -5461,6 +5533,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["large_read"], false).await;
         let run = run_scripted_with_control_and_tool(
             config,
             vec![
@@ -5492,7 +5565,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 },
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(
-                        VALID_C8_COMPACTION_CHECKPOINT.to_string(),
+                        VALID_COMPACTION_CHECKPOINT.to_string(),
                     )],
                     finish_reason: FinishReason::Stop,
                 },
@@ -5516,7 +5589,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: budget.read_output_chars,
             }),
         )
         .await
@@ -5525,6 +5598,20 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
         assert_eq!(summary.status(), SessionStatus::Completed);
         assert_eq!(run.requests.len(), 5);
+        assert_eq!(
+            run.requests
+                .iter()
+                .filter(|request| request.tools.is_empty())
+                .count(),
+            1,
+            "one normal summary covers the useful settled prefix"
+        );
+        assert!(request_contains_model_call(
+            &run.requests[2],
+            "root_local_plan"
+        ));
+        assert!(request_contains_model_call(&run.requests[2], "large_read"));
+        assert!(!request_contains_model_call(&run.requests[3], "large_read"));
         assert!(request_tool_names(&run.requests[0]).contains(&"read".to_string()));
         assert!(request_tool_names(&run.requests[1]).contains(&"read".to_string()));
         assert!(run.requests[2].tools.is_empty(), "compaction is tool-less");
@@ -5584,6 +5671,75 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(first_request.system_prompt.matches(MARKER).count(), 1);
     }
 
+    #[tokio::test]
+    async fn chat_tool_continuation_reaches_next_request_without_entering_durable_history() {
+        const PRIVATE: &str = "private next-round continuation marker";
+        let run = run_scripted_internal_with_pending_steers(
+            ResolvedConfig::default(),
+            vec![
+                ScriptedOutcome::WithContinuation(
+                    ScriptedResponse {
+                        events: vec![
+                            LlmEvent::ToolCallStart {
+                                call_id: "list-state".into(),
+                                tool_name: "list".into(),
+                            },
+                            LlmEvent::ToolCallArgsDelta {
+                                call_id: "list-state".into(),
+                                delta: r#"{"path":"."}"#.into(),
+                            },
+                        ],
+                        finish_reason: FinishReason::ToolCall,
+                    },
+                    PRIVATE.into(),
+                ),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".into())],
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("run");
+        run.summary.expect("completed");
+        assert_eq!(run.requests.len(), 2);
+        assert!(run.requests[1].messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::AssistantToolCalls { continuation: Some(value), .. }
+                if value.reasoning_content() == PRIVATE
+        )));
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history");
+        for serialized in [
+            serde_json::to_string(&history).unwrap(),
+            serde_json::to_string(&run.events).unwrap(),
+            serde_json::to_string(&run.requests[1].messages).unwrap(),
+        ] {
+            assert!(!serialized.contains(PRIVATE));
+        }
+        assert!(
+            context_manager::ContextManager::rehydrate(history)
+                .model_messages(false)
+                .iter()
+                .all(|message| !matches!(
+                    message,
+                    ModelMessage::AssistantToolCalls {
+                        continuation: Some(_),
+                        ..
+                    }
+                ))
+        );
+    }
+
     struct ScriptedClient {
         outcomes: Mutex<Vec<ScriptedOutcome>>,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
@@ -5596,6 +5752,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
     enum ScriptedOutcome {
         Response(ScriptedResponse),
+        WithContinuation(ScriptedResponse, String),
         Error(LlmError),
     }
 
@@ -5607,11 +5764,20 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             _cancel: CancellationToken,
             sink: &mut dyn LlmEventSink,
         ) -> Result<LlmResponseSummary, LlmError> {
+            let continuation_scope = request.continuation_scope();
             self.requests.lock().expect("requests mutex").push(request);
-            let response = match self.outcomes.lock().expect("outcomes mutex").remove(0) {
-                ScriptedOutcome::Response(response) => response,
-                ScriptedOutcome::Error(error) => return Err(error),
-            };
+            let (response, continuation) =
+                match self.outcomes.lock().expect("outcomes mutex").remove(0) {
+                    ScriptedOutcome::Response(response) => (response, None),
+                    ScriptedOutcome::WithContinuation(response, private) => (
+                        response,
+                        Some(crate::llm::ChatToolContinuation::new(
+                            continuation_scope,
+                            private,
+                        )),
+                    ),
+                    ScriptedOutcome::Error(error) => return Err(error),
+                };
             let scripted_usage = response.events.iter().find_map(|event| match event {
                 LlmEvent::Finished { usage, .. } => Some(usage.clone()),
                 _ => None,
@@ -5637,6 +5803,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 sink.push(event)?;
             }
             Ok(LlmResponseSummary {
+                continuation,
                 finish_reason: response.finish_reason,
                 usage: scripted_usage.unwrap_or(Some(TokenUsage {
                     prompt_tokens: 10,
@@ -5834,11 +6001,6 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
     #[test]
     fn compaction_request_preserves_native_history_and_appends_checkpoint_prompt() {
-        assert_eq!(
-            include_str!("../../assets/prompts/compaction.md").trim(),
-            EXPECTED_C8_COMPACTION_PROMPT,
-            "the local checkpoint prompt must stay byte-for-byte equivalent after trimming to the C8 evidence-grounded contract"
-        );
         let mut template = compaction_request_template();
         template.system_prompt = "current system and world state".to_string();
         template.messages = vec![
@@ -5852,6 +6014,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ),
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: Some("I will check the directory again.".to_string()),
                 tool_calls: vec![ModelToolCall {
                     call_id: "call-list".to_string(),
@@ -5866,6 +6029,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 metadata: serde_json::Value::Null,
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: Some("The file update is complete.".to_string()),
                 tool_calls: vec![ModelToolCall {
                     call_id: "call-1".to_string(),
@@ -5880,6 +6044,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 metadata: serde_json::Value::Null,
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: Some(
                     "The write failed. Do not repeat that form unchanged; use apply_patch next."
                         .to_string(),
@@ -5904,9 +6069,30 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         }];
         template.tool_choice = Some(crate::llm::ProviderToolChoice::Required);
         template.parallel_tool_calls = true;
+        let private = crate::llm::ChatToolContinuation::new(
+            template.continuation_scope(),
+            "private analysis must not become checkpoint evidence".into(),
+        );
+        if let ModelMessage::AssistantToolCalls { continuation, .. } = &mut template.messages[2] {
+            *continuation = Some(private);
+        }
 
         let compact = compaction_request_with_messages(&template, template.messages.clone());
 
+        assert!(compact.messages.iter().all(|message| !matches!(
+            message,
+            ModelMessage::AssistantToolCalls {
+                continuation: Some(_),
+                ..
+            }
+        )));
+        assert!(matches!(
+            template.messages[2],
+            ModelMessage::AssistantToolCalls {
+                continuation: Some(_),
+                ..
+            }
+        ));
         assert_eq!(compact.system_prompt, "current system and world state");
         assert!(compact.tools.is_empty());
         assert!(compact.tool_choice.is_none());
@@ -5920,7 +6106,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ModelMessage::Tool { result: list_result, .. },
                 ModelMessage::AssistantToolCalls { tool_calls: write_calls, .. },
                 ModelMessage::Tool { result: write_result, .. },
-                ModelMessage::AssistantToolCalls { content: recovery, tool_calls: recovery_calls },
+                ModelMessage::AssistantToolCalls { content: recovery, tool_calls: recovery_calls, .. },
                 ModelMessage::Tool { result: recovery_read, .. },
                 ModelMessage::User { content: prompt },
             ] if user == "original task"
@@ -5932,13 +6118,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 && recovery.as_deref().is_some_and(|content| content.contains("use apply_patch next"))
                 && matches!(recovery_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
                 && recovery_read == "original contents"
-                && prompt == EXPECTED_C8_COMPACTION_PROMPT
+                && prompt == COMPACTION_PROMPT_ASSET.trim()
         ));
         let checkpoint_prompt = match compact.messages.last() {
             Some(ModelMessage::User { content }) => content,
             other => panic!("expected final checkpoint User prompt, got {other:?}"),
         };
-        assert_eq!(checkpoint_prompt, EXPECTED_C8_COMPACTION_PROMPT);
+        assert_eq!(checkpoint_prompt, COMPACTION_PROMPT_ASSET.trim());
 
         let prompt_only = compaction_request_with_messages(&template, Vec::new());
         assert_eq!(prompt_only.system_prompt, template.system_prompt);
@@ -5996,6 +6182,32 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(last, Some(LAST_BOUNDED));
         assert!(first_evaluations <= 20);
         assert!(last_evaluations <= 20);
+    }
+
+    #[test]
+    fn compaction_source_reserve_scales_without_setting_generation_limits() {
+        assert_eq!(compaction_source_token_limit(124_518), 104_518);
+        assert_eq!(compaction_source_token_limit(31_129), 24_904);
+        for limit in [0, 1, 64, 1_024, 7_782] {
+            let source_limit = compaction_source_token_limit(limit);
+            assert!(source_limit <= limit);
+            assert_eq!(limit - source_limit, limit / 5);
+        }
+    }
+
+    #[test]
+    fn compaction_prefix_keeps_atomic_units_and_refuses_actual_input_overflow() {
+        let select = |tokens: &[u32], preferred, actual| {
+            compaction_prefix_count(tokens.len(), preferred, actual, &mut |count| {
+                Ok::<u32, ()>(tokens[count - 1])
+            })
+            .unwrap()
+        };
+        assert_eq!(select(&[20, 40, 60], 60, 80), 3);
+        assert_eq!(select(&[20, 40, 60], 45, 80), 2);
+        assert_eq!(select(&[70, 95], 60, 80), 1);
+        assert_eq!(select(&[85, 95], 60, 80), 0);
+        assert_eq!(select(&[], 60, 80), 0);
     }
 
     #[test]
@@ -6169,12 +6381,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         } else {
             "Build and verify the distributed application"
         });
+        let budget = compaction_fixture_budget(&config, &["large-read"], false).await;
         let run = run_scripted_internal_with_prior_user_and_api_key_resolver(
             config,
             vec![
                 ScriptedOutcome::Response(scripted_read_call("large-read")),
                 ScriptedOutcome::Response(ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta(VALID_C8_COMPACTION_CHECKPOINT.into())],
+                    events: vec![LlmEvent::TextDelta(VALID_COMPACTION_CHECKPOINT.into())],
                     finish_reason: FinishReason::Stop,
                 }),
                 ScriptedOutcome::Response(ScriptedResponse {
@@ -6187,7 +6400,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
             None,
@@ -6202,10 +6415,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         run.summary.expect("shared run completes after compaction");
         assert_eq!(run.requests.len(), 3);
         assert!(run.requests[1].tools.is_empty(), "real compaction request");
-        assert!(run.requests[2].messages.iter().any(|message| matches!(
-            message,
-            ModelMessage::User { content } if content.contains("Another language model started")
-        )));
+        assert!(
+            run.requests[2]
+                .messages
+                .iter()
+                .any(context_manager::is_semantic_compaction_message)
+        );
         for request in &run.requests {
             assert_eq!(
                 request
@@ -6256,11 +6471,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     #[tokio::test]
     async fn automatic_compaction_warning_stays_display_only_and_next_request_ends_with_user_checkpoint()
      {
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const CHECKPOINT: &str = VALID_COMPACTION_CHECKPOINT;
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["large-read"], false).await;
         let run = run_scripted_with_control_tool_and_protocol_recording(
             config,
             vec![
@@ -6288,7 +6504,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: budget.read_output_chars,
             }),
         )
         .await
@@ -6347,8 +6563,8 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ModelMessage::Tool { result, .. },
                 ModelMessage::User { content: prompt },
             ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
-                && result.len() == 250_000
-                && prompt == EXPECTED_C8_COMPACTION_PROMPT
+                && result.len() == budget.read_output_chars
+                && prompt == COMPACTION_PROMPT_ASSET.trim()
         ));
         let (summary_message, retained_messages) = resumed
             .messages
@@ -6362,13 +6578,15 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ModelMessage::User { content },
             ] if content == "write hello.txt"
         ));
+        assert!(context_manager::is_semantic_compaction_message(
+            summary_message
+        ));
         assert!(matches!(
             summary_message,
             ModelMessage::User { content: summary }
-                if summary.contains("Another language model started")
-                    && summary.contains("child returned the repository inspection")
+                if summary.contains("child returned the repository inspection")
                     && summary.contains("Apply the selected write change")
-                    && !summary.contains("write hello.txt")
+                    && summary.contains("read_history")
         ));
         assert!(!resumed.messages.iter().any(|message| matches!(
             message,
@@ -6403,8 +6621,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 _ => None,
             })
             .expect("compaction checkpoint");
-        assert!(replacement_ids.contains(&user_id));
-        assert_eq!(preserved_user_messages, &["write hello.txt"]);
+        assert!(!replacement_ids.contains(&user_id));
+        assert!(
+            preserved_user_messages.is_empty(),
+            "newest real user remains raw"
+        );
     }
 
     #[tokio::test]
@@ -6441,9 +6662,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     finish_reason: FinishReason::ToolCall,
                 },
                 ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta(
-                        VALID_C8_COMPACTION_CHECKPOINT.to_string(),
-                    )],
+                    events: vec![LlmEvent::TextDelta(VALID_COMPACTION_CHECKPOINT.to_string())],
                     finish_reason: FinishReason::Stop,
                 },
                 ScriptedResponse {
@@ -6486,7 +6705,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn pre_turn_compaction_samples_the_new_explicit_user_only_after_the_checkpoint() {
+    async fn pre_turn_compaction_refuses_to_shorten_exact_user_input() {
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
@@ -6496,9 +6715,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             config,
             vec![
                 ScriptedOutcome::Response(ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta(
-                        VALID_C8_COMPACTION_CHECKPOINT.to_string(),
-                    )],
+                    events: vec![LlmEvent::TextDelta(VALID_COMPACTION_CHECKPOINT.to_string())],
                     finish_reason: FinishReason::Stop,
                 }),
                 ScriptedOutcome::Response(ScriptedResponse {
@@ -6517,33 +6734,20 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         )
         .await
         .expect("pre-turn compaction run");
-        run.summary
-            .expect("run completes after pre-turn compaction");
-
-        assert_eq!(run.requests.len(), 2);
-        let compact = &run.requests[0];
-        let sampled = &run.requests[1];
-        assert!(compact.tools.is_empty());
-        assert!(matches!(
-            compact.messages.last(),
-            Some(ModelMessage::User { content })
-                if content == EXPECTED_C8_COMPACTION_PROMPT
-        ));
-        assert!(compact.messages.iter().all(
-            |message| !matches!(message, ModelMessage::User { content } if content == "write hello.txt")
-        ));
-        assert_eq!(
-            sampled
-                .messages
-                .iter()
-                .filter(|message| matches!(
-                    message,
-                    ModelMessage::User { content } if content == "write hello.txt"
-                ))
-                .count(),
-            1
+        assert!(
+            run.summary
+                .expect_err("original user input cannot be shortened to fit")
+                .to_string()
+                .contains("context window limit reached")
         );
-
+        assert!(
+            run.compaction_diagnostics.is_empty(),
+            "no oversized summary request was sampled"
+        );
+        assert!(
+            run.requests.is_empty(),
+            "neither oversized source nor new task was sampled"
+        );
         let history = run
             .store
             .protocol_event_store()
@@ -6577,18 +6781,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 _ => None,
             })
             .expect("new explicit user identity");
-        let replacement_ids = history
-            .iter()
-            .find_map(|item| match &item.payload {
-                HistoryItemPayload::Compaction {
-                    replacement_item_ids,
-                    ..
-                } => Some(replacement_item_ids),
-                _ => None,
-            })
-            .expect("pre-turn checkpoint");
-        assert!(replacement_ids.contains(&prior_id));
-        assert!(!replacement_ids.contains(&current_id));
+        assert_ne!(prior_id, current_id);
+        assert!(
+            history
+                .iter()
+                .all(|item| !matches!(item.payload, HistoryItemPayload::Compaction { .. })),
+            "no checkpoint replaces the exact prior or current user"
+        );
     }
 
     #[tokio::test]
@@ -6600,7 +6799,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         let budget = compaction_fixture_budget(&config, &["large-read"], false).await;
         let oversized_summary = format!(
             "{}\n{}",
-            VALID_C8_COMPACTION_CHECKPOINT,
+            VALID_COMPACTION_CHECKPOINT,
             "summary-padding".repeat(18_000)
         );
         let run = run_scripted_with_control_and_tool(
@@ -6688,7 +6887,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn malformed_c8_checkpoint_is_rejected_without_repair_or_commit() {
+    async fn model_emitted_source_records_are_rejected_without_repair_or_commit() {
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
@@ -6712,13 +6911,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 },
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(
-                        "A plausible summary without the required C8 sections.".to_string(),
+                        "Plausible notes.\n<<<SOURCE_RECORDS_BEGIN>>>\n{}\n<<<SOURCE_RECORDS_END>>>".to_string(),
                     )],
                     finish_reason: FinishReason::Stop,
                 },
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(
-                        "Finished without accepting the malformed checkpoint.".to_string(),
+                        "Finished without accepting model-emitted source records.".to_string(),
                     )],
                     finish_reason: FinishReason::Stop,
                 },
@@ -6729,7 +6928,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             }),
         )
         .await
-        .expect("malformed C8 checkpoint run");
+        .expect("model-emitted source records run");
 
         budget.assert_rejection_band(run.requests.last().expect("normal continuation"));
 
@@ -6738,7 +6937,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(
             run.requests.len(),
             3,
-            "structural RV must not add a repair request"
+            "validation must not add a repair request"
         );
         assert!(run.events.iter().any(|event| matches!(
             event,
@@ -6764,7 +6963,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
     #[tokio::test]
     async fn compaction_retries_context_overflow_with_smaller_aligned_unit_prefix() {
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const CHECKPOINT: &str = VALID_COMPACTION_CHECKPOINT;
 
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
@@ -6857,7 +7056,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
     #[tokio::test]
     async fn reasoning_only_compaction_retries_one_gap_safe_aligned_unit_prefix() {
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const CHECKPOINT: &str = VALID_COMPACTION_CHECKPOINT;
 
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
@@ -6993,12 +7192,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     async fn reasoning_retry_rejects_actual_summary_that_exceeds_gap_safe_projection() {
         let oversized_checkpoint = format!(
             "{}\n{}",
-            VALID_C8_COMPACTION_CHECKPOINT,
+            VALID_COMPACTION_CHECKPOINT,
             "summary-padding".repeat(600)
         );
         assert!(estimate_text_tokens(&oversized_checkpoint) > COMPACTION_CHECKPOINT_RESERVE_TOKENS);
-        compaction::validate_checkpoint_structure(&oversized_checkpoint)
-            .expect("oversized checkpoint remains structurally valid");
+        compaction::validate_checkpoint_body(&oversized_checkpoint)
+            .expect("oversized free-form checkpoint remains valid");
 
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
@@ -7083,9 +7282,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .cloned()
             .collect::<Vec<_>>();
         let context = context_manager::ContextManager::rehydrate(pre_final_history);
-        let units = context.semantic_compaction_units();
-        assert_eq!(units.len(), 3, "user plus two completed tool responses");
-        let selected_item_ids = flatten_compaction_unit_prefix(&units, 2);
+        let units = context.automatic_compaction_units_excluding(&HashSet::new());
+        assert_eq!(
+            units.len(),
+            2,
+            "two completed tool responses; newest user remains raw"
+        );
+        let selected_item_ids = flatten_compaction_unit_prefix(&units, 1);
         let preserved_user_messages = bounded_compaction_user_messages(
             &context.compaction_user_messages_for_items(&selected_item_ids),
         );
@@ -7133,7 +7336,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
     #[tokio::test]
     async fn successful_initial_compaction_prompt_gap_reaches_commit_gate() {
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        let checkpoint = format!(
+            "{}\n{}",
+            VALID_COMPACTION_CHECKPOINT,
+            "known ".repeat(22_500)
+        );
         const SUCCESS_PROMPT_TOKENS: u32 = 63_000;
         const FINAL_TEXT: &str = "done without the unsafe initial checkpoint";
 
@@ -7160,7 +7367,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 second_read,
                 ScriptedResponse {
                     events: vec![
-                        LlmEvent::TextDelta(CHECKPOINT.to_string()),
+                        LlmEvent::TextDelta(checkpoint.clone()),
                         LlmEvent::Finished {
                             finish_reason: FinishReason::Stop,
                             usage: Some(TokenUsage {
@@ -7195,7 +7402,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             compact,
             "success-gap-read-oldest"
         ));
-        assert!(!request_contains_model_call(
+        assert!(request_contains_model_call(
             compact,
             "success-gap-read-newer"
         ));
@@ -7204,11 +7411,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
         assert!(prompt_gap > 0);
         let local_projection = local_request_projection_after_hypothetical_compaction(
-            &run,
-            3,
-            2,
-            CHECKPOINT.to_string(),
-            FINAL_TEXT,
+            &run, 3, 2, checkpoint, FINAL_TEXT,
         );
         assert!(local_projection < working_limit);
         assert!(
@@ -7233,7 +7436,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
     #[tokio::test]
     async fn successful_overflow_retry_prompt_gap_reaches_commit_gate() {
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const CHECKPOINT: &str = VALID_COMPACTION_CHECKPOINT;
         const SUCCESS_PROMPT_TOKENS: u32 = 63_000;
         const FINAL_TEXT: &str = "done without the unsafe overflow-retry checkpoint";
 
@@ -7315,7 +7518,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         let local_projection = local_request_projection_after_hypothetical_compaction(
             &run,
             4,
-            2,
+            1,
             CHECKPOINT.to_string(),
             FINAL_TEXT,
         );
@@ -7346,10 +7549,15 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             total_tokens: 37,
             reasoning_tokens: Some(17),
         };
+        let budget =
+            compaction_fixture_budget(&config, &["incomplete-compaction-read"], true).await;
         let run = run_scripted_internal_with_pending_steers(
             config,
             vec![
-                ScriptedOutcome::Response(scripted_read_call("incomplete-compaction-read")),
+                ScriptedOutcome::Response(scripted_read_call_with_total(
+                    "incomplete-compaction-read",
+                    budget.hard_continuation_total_tokens,
+                )),
                 ScriptedOutcome::Response(ScriptedResponse {
                     events: vec![LlmEvent::Finished {
                         finish_reason: FinishReason::Error,
@@ -7363,7 +7571,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 350_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
         )
@@ -7383,8 +7591,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .expect("goal")
             .expect("stored goal");
         assert_eq!(
-            goal.tokens_used, 52,
-            "ordinary generation 15 plus incomplete compaction 37 are each accounted once"
+            goal.tokens_used,
+            i64::from(budget.hard_continuation_total_tokens) + 37,
+            "ordinary reported generation plus incomplete compaction 37 are each accounted once"
         );
         let terminal = run
             .store
@@ -7430,11 +7639,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 empty_usage,
             ),
             (
-                "structural",
+                "source-records",
                 ScriptedResponse {
                     events: vec![
                         LlmEvent::TextDelta(
-                            "A summary without the required checkpoint structure.".to_string(),
+                            "Notes with a reserved <<<SOURCE_RECORDS_BEGIN>>> marker.".to_string(),
                         ),
                         LlmEvent::Finished {
                             finish_reason: FinishReason::Stop,
@@ -7443,7 +7652,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     ],
                     finish_reason: FinishReason::Stop,
                 },
-                "failed structural review",
+                "failed validation",
                 malformed_usage,
             ),
         ];
@@ -7453,15 +7662,17 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             config.model.context_window = 68_000;
             config.model.max_output_tokens = 512;
             config.session.overflow_margin_tokens = 128;
+            let call_id = format!("{label}-compaction-read");
+            let budget = compaction_fixture_budget(&config, &[&call_id], false).await;
             let run = run_scripted_with_control_and_tool(
                 config,
                 vec![
-                    scripted_read_call(&format!("{label}-compaction-read")),
+                    scripted_read_call_with_total(&call_id, budget.hard_continuation_total_tokens),
                     compaction_response,
                 ],
                 RunControl::new(),
                 Arc::new(LargeReadOutputTool {
-                    output_chars: 350_000,
+                    output_chars: budget.read_output_chars,
                 }),
             )
             .await
@@ -7620,22 +7831,14 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 72_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["invalid-read"], false).await;
         let run = run_scripted_internal_with_pending_steers(
             config,
             vec![
-                ScriptedOutcome::Response(ScriptedResponse {
-                    events: vec![
-                        LlmEvent::ToolCallStart {
-                            call_id: "invalid-read".to_string(),
-                            tool_name: "read".to_string(),
-                        },
-                        LlmEvent::ToolCallArgsDelta {
-                            call_id: "invalid-read".to_string(),
-                            delta: "{}".to_string(),
-                        },
-                    ],
-                    finish_reason: FinishReason::ToolCall,
-                }),
+                ScriptedOutcome::Response(scripted_read_call_with_total(
+                    "invalid-read",
+                    budget.hard_continuation_total_tokens,
+                )),
                 ScriptedOutcome::Error(LlmError::ProviderRejected {
                     status: Some(400),
                     code: Some("invalid_request".to_string()),
@@ -7648,7 +7851,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 350_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
         )
@@ -7844,8 +8047,8 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn automatic_compaction_bounds_source_to_oldest_semantic_prefix() {
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+    async fn automatic_compaction_covers_latest_settled_work_in_one_snapshot() {
+        const CHECKPOINT: &str = VALID_COMPACTION_CHECKPOINT;
 
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
@@ -7895,7 +8098,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(compact.tool_choice.is_none());
         assert!(!compact.parallel_tool_calls);
         assert!(request_contains_model_call(compact, "bounded-read-oldest"));
-        assert!(!request_contains_model_call(compact, "bounded-read-newer"));
+        assert!(request_contains_model_call(compact, "bounded-read-newer"));
         assert!(matches!(
             compact.messages.last(),
             Some(ModelMessage::User { content })
@@ -7906,7 +8109,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ModelMessage::User { content } if content.contains("[partial summary")
         )));
         assert!(!request_contains_model_call(resumed, "bounded-read-oldest"));
-        assert!(request_contains_model_call(resumed, "bounded-read-newer"));
+        assert!(!request_contains_model_call(resumed, "bounded-read-newer"));
         assert!(resumed.messages.iter().any(|message| {
             context_manager::is_semantic_compaction_message(message)
                 && matches!(
@@ -7914,7 +8117,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     ModelMessage::User { content }
                         if content.starts_with(
                             include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
-                        ) && content.ends_with(CHECKPOINT)
+                        ) && content.contains(CHECKPOINT)
                 )
         }));
 
@@ -7951,14 +8154,26 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             *layout,
             crate::protocol::CompactionLayout::UserAnchoredCheckpoint
         );
-        assert_eq!(preserved_user_messages, &["write hello.txt"]);
-        assert_eq!(durable_summary, CHECKPOINT);
-        assert!(replacement_item_ids.contains(&user_id));
+        assert!(
+            preserved_user_messages.is_empty(),
+            "newest real user remains raw"
+        );
+        let source_items = history
+            .iter()
+            .filter(|item| replacement_item_ids.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            durable_summary,
+            &compaction::checkpoint_with_history_reference(CHECKPOINT, &source_items)
+                .expect("exact host records")
+        );
+        assert!(!replacement_item_ids.contains(&user_id));
         for item_id in history_tool_unit_ids(&history, "bounded-read-oldest") {
             assert!(replacement_item_ids.contains(&item_id));
         }
         for item_id in history_tool_unit_ids(&history, "bounded-read-newer") {
-            assert!(!replacement_item_ids.contains(&item_id));
+            assert!(replacement_item_ids.contains(&item_id));
         }
         assert!(run.events.iter().any(|event| matches!(
             event,
@@ -8753,6 +8968,103 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             finish_reason: FinishReason::ToolCall,
         }
+    }
+
+    #[tokio::test]
+    async fn long_tool_history_within_context_completes_without_compaction_or_loss() {
+        const TOOL_ROUNDS: usize = 256;
+        const OUTPUT_CHARS: usize = 64;
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 1_000_000;
+        config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        let working_limit =
+            crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
+        let mut responses = (0..TOOL_ROUNDS)
+            .map(|index| scripted_read_call(&format!("long-tool-read-{index}")))
+            .collect::<Vec<_>>();
+        responses.push(ScriptedResponse {
+            events: vec![LlmEvent::TextDelta("long history completed".to_string())],
+            finish_reason: FinishReason::Stop,
+        });
+        let run = run_scripted_with_control_and_tool(
+            config,
+            responses,
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: OUTPUT_CHARS,
+            }),
+        )
+        .await
+        .expect("long tool history fixture");
+        let summary = run.summary.expect("long tool history completes");
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(summary.finish_reason(), FinishReason::Stop);
+        assert_eq!(summary.tool_call_count(), TOOL_ROUNDS);
+        assert_eq!(summary.failed_tool_count(), 0);
+        assert_eq!(summary.metrics().model_request_count, TOOL_ROUNDS + 1);
+        assert_eq!(run.requests.len(), TOOL_ROUNDS + 1);
+        assert!(run.compaction_diagnostics.is_empty());
+        for request in &run.requests {
+            assert!(
+                ContextWindowTokenStatus::for_request(request, 0).active_context_tokens
+                    < working_limit,
+                "long history remains below the existing token compaction threshold"
+            );
+        }
+
+        let final_request = run.requests.last().expect("final continuation");
+        let wire = crate::llm::request_diagnostics::http_request_wire_diagnostic(final_request)
+            .expect("complete long-history wire");
+        assert!(wire.input_count >= TOOL_ROUNDS * 2 + 2);
+        let retained_rounds = final_request
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    ModelMessage::AssistantToolCalls { .. } | ModelMessage::Tool { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_rounds.len(), TOOL_ROUNDS * 2);
+        for (index, pair) in retained_rounds.chunks_exact(2).enumerate() {
+            let (
+                ModelMessage::AssistantToolCalls { tool_calls, .. },
+                ModelMessage::Tool {
+                    call_id,
+                    tool_name,
+                    result,
+                    ..
+                },
+            ) = (pair[0], pair[1])
+            else {
+                panic!("each retained round has its native call/output pair");
+            };
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].call_id, format!("long-tool-read-{index}"));
+            assert_eq!(tool_calls[0].tool_name, "read");
+            assert_eq!(tool_calls[0].arguments_json, "{}");
+            assert_eq!(call_id, &tool_calls[0].call_id);
+            assert_eq!(tool_name, "read");
+            assert_eq!(result, &"x".repeat(OUTPUT_CHARS));
+        }
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("completed canonical history");
+        assert!(
+            !history
+                .iter()
+                .any(|item| matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| matches!(item.payload, HistoryItemPayload::ToolOutput { .. }))
+                .count(),
+            TOOL_ROUNDS
+        );
     }
 
     #[tokio::test]
@@ -9896,12 +10208,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     async fn auto_review_keeps_generation_after_compaction_without_reading_user_text() {
         const USER_SCOPE: &str =
             "GUARDIAN_COMPACTED_SCOPE: never mutate anything outside the current workspace.";
-        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const CHECKPOINT: &str = VALID_COMPACTION_CHECKPOINT;
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["guardian_compaction_read"], false).await;
         let run = run_scripted_internal_with_prior_user(
             config,
             vec![
@@ -9931,7 +10244,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
             Some(USER_SCOPE.to_string()),
@@ -12355,8 +12668,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.context_window = 131_072;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let budget = compaction_fixture_budget(&config, &["overflow-read"], false).await;
         let outcomes = vec![
-            ScriptedOutcome::Response(scripted_read_call("overflow-read")),
+            ScriptedOutcome::Response(scripted_read_call_with_total(
+                "overflow-read",
+                budget.hard_continuation_total_tokens,
+            )),
             ScriptedOutcome::Error(LlmError::ProviderRejected {
                 status: Some(400),
                 code: Some("context_length_exceeded".to_string()),
@@ -12372,7 +12689,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 530_000,
+                output_chars: budget.read_output_chars,
             })),
             false,
         )
@@ -12404,7 +12721,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(request_contains_model_call(compact, "overflow-read"));
         assert!(matches!(
             &compact.messages[compact.messages.len() - 2],
-            ModelMessage::Tool { result, .. } if result.len() == 530_000
+            ModelMessage::Tool { result, .. } if result.len() == budget.read_output_chars
         ));
         assert!(
             !run.events
@@ -12945,6 +13262,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ModelMessage::AssistantToolCalls {
                 content: None,
                 tool_calls,
+                ..
             } if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
         )));
 
@@ -12998,6 +13316,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ModelMessage::AssistantToolCalls {
                 content: Some(content),
                 tool_calls,
+                ..
             } if content == "\n \t\n"
                 && matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
         )));

@@ -3,7 +3,7 @@ import test from "node:test";
 import vm from "node:vm";
 import { trustedClick, trustedFocus } from "../scenarios/hub_browser_enrollment.mjs";
 
-function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = true, focusAfterTabs = null, disabledChecks = 0, missingChecks = 0, initialFocusIndex = null } = {}) {
+function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = true, focusAfterTabs = null, disabledChecks = 0, missingChecks = 0, initialFocusIndex = null, offscreen = null } = {}) {
   const target = { selector: "#older-versions > summary", identity: { tag: "DETAILS", detailsKey: "older-versions" } };
   const controls = Array.from({ length: count }, () => ({ disabled: false, closest: () => null }));
   const node = controls[targetIndex];
@@ -22,7 +22,11 @@ function fixture({ targetIndex = 130, count = 140, reachable = true, trusted = t
       keys.push(key); position = (position + (shift ? count - 1 : 1)) % count;
       document.activeElement = focusAfterTabs === null ? (reachable ? controls[position] : null) : (keys.length === focusAfterTabs ? node : null);
     },
-    observeExactTarget: async () => ({ observation: { center_in_viewport: true, center_in_scroll_clip: true, center_hit: true } }),
+    observeExactTarget: async () => ({ observation: {
+      center_in_viewport: offscreen !== "viewport" || document.activeElement === node,
+      center_in_scroll_clip: offscreen !== "scroll-clip" || document.activeElement === node,
+      center_hit: true,
+    } }),
     snapshotProbe: async (after = 0) => ({ found: true, sequence: events.length, dropped_through: 0, events: events.filter(event => event.sequence > after) }),
     click: async (locator, options) => {
       assert.equal(node.disabled, false, "pointer input must wait until the target is enabled");
@@ -59,33 +63,48 @@ test("Hub keyboard navigation walks back from later settings to the visible mess
   assert.deepEqual(f.keys, ["Tab"]);
 });
 
-test("Hub clicks only after native keyboard focus reaches the exact target", async () => {
-  const f = fixture();
+test("Hub clicks an on-screen exact target without requiring keyboard focus", async () => {
+  const f = fixture({ reachable: false });
   await trustedClick(f.input, f.cdp, f.target, f.sink);
-  assert.equal(f.keys.length, 131);
+  assert.equal(f.keys.length, 0);
   assert.equal(f.clicks.length, 1);
   assert.deepEqual(f.clicks[0], { locator: f.target, options: { stableHitSamples: 3 } });
   assert.equal(f.records[0][0], "hub-browser-desktop-trusted-click");
   assert.equal(f.records[0][1].probe.events.length, 3);
 });
 
-test("Hub focused clicks still reject untrusted pointer evidence", async () => {
+for (const offscreen of ["viewport", "scroll-clip"]) test(`Hub clicks reveal a target outside the ${offscreen} through keyboard navigation`, async () => {
+  const f = fixture({ offscreen });
+  await trustedClick(f.input, f.cdp, f.target, f.sink);
+  assert.equal(f.keys.length, 131);
+  assert.equal(f.clicks.length, 1);
+  assert.equal(f.records[0][1].probe.events.length, 3);
+});
+
+test("Hub clicks never dispatch a pointer when an off-screen target cannot be reached", async () => {
+  const f = fixture({ reachable: false, offscreen: "viewport" });
+  await assert.rejects(trustedClick(f.input, f.cdp, f.target, f.sink), error => error.code === "hub-browser-focus-unreachable");
+  assert.equal(f.clicks.length, 0);
+  assert.equal(f.records.length, 0);
+});
+
+test("Hub on-screen clicks still reject untrusted pointer evidence", async () => {
   const f = fixture({ trusted: false });
   await assert.rejects(trustedClick(f.input, f.cdp, f.target, f.sink), error => error.code === "event-probe-untrusted");
   assert.equal(f.records.length, 0);
 });
 
-test("Hub clicks wait for a temporarily disabled control before focus and pointer input", async () => {
+test("Hub clicks wait for a temporarily disabled control before pointer input", async () => {
   const f = fixture({ disabledChecks: 2 });
   await trustedClick(f.input, f.cdp, f.target, f.sink);
-  assert.equal(f.keys.length, 131);
+  assert.equal(f.keys.length, 0);
   assert.equal(f.clicks.length, 1);
 });
 
-test("a control inserted after an opener click is awaited before keyboard focus and pointer input", async () => {
+test("a control inserted after an opener click is awaited before pointer input", async () => {
   const f = fixture({ targetIndex: 2, count: 5, missingChecks: 2 });
   await trustedClick(f.input, f.cdp, f.target, f.sink);
-  assert.equal(f.keys.length, 3);
+  assert.equal(f.keys.length, 0);
   assert.equal(f.clicks.length, 1);
   assert.equal(f.records[0][1].probe.events.length, 3);
 });

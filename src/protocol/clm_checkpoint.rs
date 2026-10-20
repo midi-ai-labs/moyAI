@@ -207,6 +207,7 @@ mod tests {
             },
             ModelMessage::AssistantToolCalls {
                 content: None,
+                continuation: None,
                 tool_calls: vec![ModelToolCall {
                     call_id: "provider_call".into(),
                     tool_name: "read".into(),

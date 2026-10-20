@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { canonicalU64, canonicalUlid } from "../core/canonical_identity.mjs";
@@ -9,7 +10,7 @@ import {
 } from "../drivers/desktop_command_probe.mjs";
 import {
   SCRIPTED_PROVIDER_MODEL_ID,
-  SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT,
+  SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_PROMPT,
@@ -18,6 +19,7 @@ import {
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SENTINEL,
   SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT,
   createResponsesCompactionProviderScript,
+  responsesCompactionCheckpointReferences,
   startScriptedProvider,
 } from "../drivers/scripted_provider.mjs";
 import {
@@ -233,6 +235,8 @@ function acceptedFinalRow(row, retry) {
     && evidence?.matches === true
     && evidence.first_prompt_matches === true
     && evidence.checkpoint_matches === true
+    && canonicalUlid(evidence.checkpoint_references?.first_item_id)
+    && canonicalUlid(evidence.checkpoint_references?.last_item_id)
     && sha256Identity(evidence.checkpoint_sha256)
     && replay?.pass === true
     && replay.summarized_read_count === summarizedReadCount
@@ -555,8 +559,17 @@ export function responsesCompactionTerminalFailures(sample) {
     || assistants[0]?.body !== SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RESPONSE) {
     failures.push("final-assistant-not-exact");
   }
+  const checkpointBody = compactions[0]?.body?.startsWith("圧縮しました\n\n")
+    ? compactions[0].body.slice("圧縮しました\n\n".length)
+    : null;
+  const references = responsesCompactionCheckpointReferences(checkpointBody);
+  const replay = sample?.ledger?.at(-1)?.contract?.role_evidence;
+  const checkpointHash = references === null ? null : createHash("sha256")
+    .update(`${SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX}\n${checkpointBody}`, "utf8").digest("hex");
   if (compactions.length !== 1
-    || compactions[0]?.body !== `圧縮しました\n\n${SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT}`) {
+    || references === null
+    || !isDeepStrictEqual(references, replay?.checkpoint_references)
+    || checkpointHash !== replay?.checkpoint_sha256) {
     failures.push("canonical-compaction-not-exact");
   }
   if (summaries.length !== 1) failures.push("completed-work-summary-not-exact");

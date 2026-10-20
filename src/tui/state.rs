@@ -1384,6 +1384,7 @@ pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
         ToolName::List | ToolName::Glob | ToolName::InspectDirectory => "ファイル一覧の確認",
         ToolName::Grep => "ファイル内の検索",
         ToolName::Read => "ファイルの確認",
+        ToolName::ReadHistory => "会話履歴の確認",
         ToolName::ApplyPatch | ToolName::Write => "ファイルの更新",
         ToolName::Shell => "コマンド",
         ToolName::ShellStart => "継続コマンドの開始",

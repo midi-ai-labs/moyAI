@@ -154,6 +154,7 @@ fn append_input_items(message: &ModelMessage, input: &mut Vec<Value>) {
         ModelMessage::AssistantToolCalls {
             content,
             tool_calls,
+            ..
         } => {
             if let Some(content) = content.as_deref().filter(|content| !content.is_empty()) {
                 input.push(message_item(
@@ -1595,8 +1596,7 @@ impl ResponsesStreamAccumulator {
         let error = response.get("error");
         let code = error
             .and_then(|error| error.get("code"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+            .and_then(response_error_code);
         let message = error
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
@@ -1636,10 +1636,7 @@ impl ResponsesStreamAccumulator {
 
     fn error_terminal(&self, event: &Value) -> Result<ResponsesTerminal, LlmError> {
         let error = event.get("error").unwrap_or(event);
-        let code = error
-            .get("code")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let code = error.get("code").and_then(response_error_code);
         let message = error
             .get("message")
             .and_then(Value::as_str)
@@ -1650,6 +1647,14 @@ impl ResponsesStreamAccumulator {
             code,
             message,
         })
+    }
+}
+
+fn response_error_code(value: &Value) -> Option<String> {
+    match value {
+        Value::String(code) => Some(code.clone()),
+        Value::Number(code) if code.is_i64() || code.is_u64() => Some(code.to_string()),
+        _ => None,
     }
 }
 
@@ -1904,6 +1909,7 @@ mod tests {
                 content: "Already represented".to_string(),
             },
             ModelMessage::AssistantToolCalls {
+                continuation: None,
                 content: Some("I will inspect it.".to_string()),
                 tool_calls: vec![ModelToolCall {
                     call_id: "call_1".to_string(),
@@ -4659,6 +4665,36 @@ mod tests {
             .expect_err("incomplete malformed usage must be rejected");
         assert!(error.to_string().contains("usage"));
         assert!(incomplete_accumulator.terminal().is_none());
+    }
+
+    #[test]
+    fn response_failure_codes_preserve_only_strings_and_integers() {
+        for (value, expected) in [
+            (json!(429), Some("429")),
+            (json!("429"), Some("429")),
+            (json!("rate_limit_exceeded"), Some("rate_limit_exceeded")),
+            (json!(-429), Some("-429")),
+            (json!(u64::MAX), Some("18446744073709551615")),
+            (json!(429.0), None),
+            (json!(true), None),
+            (json!({ "code": 429 }), None),
+            (json!([429]), None),
+            (Value::Null, None),
+        ] {
+            for event in [
+                json!({ "type": "response.failed", "response": { "id": "resp_failed", "error": { "code": value.clone() } } }),
+                json!({ "type": "error", "error": { "code": value.clone() } }),
+            ] {
+                let terminal = ResponsesStreamAccumulator::default()
+                    .push_value(&event)
+                    .unwrap()
+                    .terminal;
+                let Some(ResponsesTerminal::Failed { code, .. }) = terminal else {
+                    panic!("expected failure");
+                };
+                assert_eq!(code.as_deref(), expected, "unexpected code for {event}");
+            }
+        }
     }
 
     #[test]

@@ -78,6 +78,7 @@ impl crate::llm::LlmClient for PublishThenAnswer {
             finish_reason,
             usage: None,
             response_id: None,
+            continuation: None,
         })
     }
 }
@@ -240,6 +241,7 @@ impl crate::llm::LlmClient for PublishBatch {
             finish_reason,
             usage: None,
             response_id: None,
+            continuation: None,
         })
     }
 }

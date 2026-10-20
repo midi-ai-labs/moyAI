@@ -34,7 +34,7 @@ pub struct OpenAiStreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct OpenAiMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +43,24 @@ pub struct OpenAiMessage {
     pub tool_calls: Option<Vec<OpenAiMessageToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl std::fmt::Debug for OpenAiMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiMessage")
+            .field("role", &self.role)
+            .field("content", &self.content)
+            .field("tool_calls", &self.tool_calls)
+            .field("tool_call_id", &self.tool_call_id)
+            .field(
+                "reasoning_content",
+                &self.reasoning_content.as_ref().map(|_| "<private>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -115,10 +133,21 @@ pub struct OpenAiChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct OpenAiDelta {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+    pub reasoning_content: Option<super::continuation::ReasoningFragment>,
+    pub reasoning: Option<super::continuation::ReasoningFragment>,
+    // Retain extensions so terminal metadata cannot hide additional output.
+    #[serde(flatten)]
+    pub additional_fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for OpenAiDelta {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpenAiDelta(<private>)")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,4 +184,46 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_wire_reasoning_is_serialized_but_never_debugged() {
+        let secret = "private-dto-canary";
+        let outbound = OpenAiMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some(secret.into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&outbound).unwrap()["reasoning_content"],
+            secret
+        );
+        assert!(!format!("{outbound:?}").contains(secret));
+        let inbound: OpenAiDelta = serde_json::from_value(
+            serde_json::json!({"reasoning_content": secret, "reasoning": secret}),
+        )
+        .unwrap();
+        assert!(!format!("{inbound:?}").contains(secret));
+    }
+
+    #[test]
+    fn unknown_chat_delta_fields_are_retained_without_debugging_their_values() {
+        let secret = "private-extension-canary";
+        let inbound: OpenAiDelta = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "reasoning_details": [{"text": secret}]
+        }))
+        .unwrap();
+        assert_eq!(
+            inbound.additional_fields["reasoning_details"][0]["text"],
+            secret
+        );
+        assert!(!format!("{inbound:?}").contains(secret));
+    }
 }

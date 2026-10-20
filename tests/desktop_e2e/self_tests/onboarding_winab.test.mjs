@@ -81,8 +81,8 @@ test("onboarding consumes a private child credential before preparation and keep
   } finally { delete process.env[name]; }
 });
 
-function modelPreparationFixture({ failKeyInput = false, deploymentPatch = {} } = {}) {
-  const fields = { "#logical-model": "" }, keyInputs = [], discoveries = [], registered = [], selectedStandards = [];
+function modelPreparationFixture({ failKeyInput = false, deploymentPatch = {}, initialKey = "", retainKeyAfterRegister = false, metadataTools = false, omitRequestedTools = false } = {}) {
+  const fields = { "#logical-model": "", "#api-key": initialKey }, keyInputs = [], discoveries = [], registered = [], selectedStandards = [];
   const snapshot = { store: { catalog: { models: [], team_default_model_id: null, team_default_side_model_id: null, team_default_approve_model_id: null } }, deployments: [] };
   let saveCount = 0;
   const locator = (selector, label = null) => ({
@@ -105,15 +105,17 @@ function modelPreparationFixture({ failKeyInput = false, deploymentPatch = {} } 
     setChecked: async value => { fields[selector] = value; },
     isEnabled: async () => true,
     click: async () => {
-      if (selector === "#discover") discoveries.push({ credential: fields["#api-key"] ?? null });
+      if (selector === "#discover") discoveries.push({ endpoint: fields["#endpoint"], credential: fields["#api-key"] || null });
       if (selector === "#register") {
         assert.equal(fields["#logical-model"], "", "each distinct provider model must create a new logical model");
         const id = `logical-${registered.length + 1}`;
         registered.push({ id, model: fields["#model"], tools: fields["#allow-tools"] });
-        snapshot.store.catalog.models.push({ id, label: fields["#label"], capabilities: fields["#allow-tools"] ? ["tools"] : [] });
+        snapshot.store.catalog.models.push({ id, label: fields["#label"], capabilities: metadataTools || fields["#allow-tools"] && !omitRequestedTools ? ["tools"] : [] });
+        const endpoint = new URL(fields["#endpoint"]);
+        endpoint.pathname = endpoint.pathname.replace(/\/+$/, "").replace(/(?:\/v1)+$/, "");
         snapshot.deployments.push({ deployment: { logical_model_id: id, enabled: true,
-          provider_model: fields["#model"], provider_profile: fields["#profile"], endpoint: "http://localhost:8119", ...deploymentPatch } });
-        fields["#api-key"] = "";
+          provider_model: fields["#model"], provider_profile: fields["#profile"], endpoint: endpoint.href.replace(/\/+$/, ""), ...deploymentPatch } });
+        if (!retainKeyAfterRegister) fields["#api-key"] = "";
       }
       if (selector === "#team-standard-save") {
         saveCount++;
@@ -134,7 +136,7 @@ test("public Hub preparation preserves the new-model default in closed options a
     assert.deepEqual(await prepareOnboardingHubModels({ ...scripted, providerBaseUrl, mainModel: "scripted-model" }),
       { main: "logical-1", side_chat: "logical-1", approve: null });
     assert.deepEqual(scripted.registered, [{ id: "logical-1", model: "scripted-model", tools: true }]);
-    assert.equal(scripted.keyInputs.length, 0);
+    assert.deepEqual(scripted.keyInputs, [""]);
     assert.equal(scripted.selectedStandards.length, 2);
     assert.equal(scripted.saves(), 1);
   }
@@ -157,6 +159,48 @@ test("public Hub preparation preserves the new-model default in closed options a
   assert.deepEqual(await prepareOnboardingHubModels({ ...three, providerBaseUrl, mainModel: "agent", sideModel: "side", approveModel: "approve" }),
     { main: "logical-1", side_chat: "logical-2", approve: "logical-3" });
   assert.deepEqual(three.registered.map(value => value.tools), [true, false, false]);
+});
+
+test("role providers isolate host credentials and share only the same endpoint, model and credential", async () => {
+  const providerBaseUrl = "https://cloud.invalid/api/v1", localUrl = "http://localhost:8119/v1";
+  const secret = "synthetic-main-host-key", otherSecret = "synthetic-other-host-key";
+  const local = { providerBaseUrl: localUrl, apiKey: null };
+  const fixture = modelPreparationFixture({ initialKey: "synthetic-stale-key", retainKeyAfterRegister: true });
+  const expected = await prepareOnboardingHubModels({ ...fixture, providerBaseUrl, mainModel: "same-model", sideModel: "same-model", approveModel: "same-model", apiKey: secret,
+    roleProviders: { side_chat: local, approve: { ...local, providerBaseUrl: `${localUrl}/` } } });
+  assert.deepEqual(expected, { main: "logical-1", side_chat: "logical-2", approve: "logical-2" });
+  assert.deepEqual(fixture.discoveries, [{ endpoint: providerBaseUrl, credential: secret }, { endpoint: localUrl, credential: null }]);
+  assert.deepEqual(fixture.keyInputs, [secret, ""], "an anonymous host must clear the prior host's key even if the form retains it");
+  assert.equal(fixture.saves(), 1);
+  assert.equal(JSON.stringify(expected).includes(secret), false);
+
+  const credentials = modelPreparationFixture();
+  assert.deepEqual(await prepareOnboardingHubModels({ ...credentials, providerBaseUrl: localUrl, mainModel: "same-model", sideModel: "same-model", approveModel: "same-model", apiKey: secret,
+    roleProviders: { side_chat: { providerBaseUrl: localUrl, apiKey: otherSecret }, approve: { providerBaseUrl: localUrl, apiKey: otherSecret } } }),
+  { main: "logical-1", side_chat: "logical-2", approve: "logical-2" });
+  assert.deepEqual(credentials.keyInputs, [secret, otherSecret]);
+});
+
+test("explicit role endpoints use their own credential or anonymous mode without inheriting the legacy key", async () => {
+  const fixture = modelPreparationFixture();
+  const secret = "synthetic-legacy-host-key", mainKey = "synthetic-explicit-main-key";
+  const expected = await prepareOnboardingHubModels({ ...fixture, providerBaseUrl: "http://legacy.invalid/v1", mainModel: "main", sideModel: "side", approveModel: "approve", apiKey: secret,
+    roleProviders: { main: { providerBaseUrl: "https://cloud.invalid/api/v1", apiKey: mainKey }, side_chat: { providerBaseUrl: "http://localhost:8119/v1" } } });
+  assert.deepEqual(fixture.discoveries, [
+    { endpoint: "https://cloud.invalid/api/v1", credential: mainKey },
+    { endpoint: "http://localhost:8119/v1", credential: null },
+    { endpoint: "http://legacy.invalid/v1", credential: secret },
+  ]);
+  assert.deepEqual(expected, { main: "logical-1", side_chat: "logical-2", approve: "logical-3" });
+});
+
+test("provider metadata may retain tools for auxiliary roles while Main must be tools-capable", async () => {
+  const options = { providerBaseUrl: "http://localhost:8119/v1", mainModel: "agent", sideModel: "chat", approveModel: "chat" };
+  const metadata = modelPreparationFixture({ metadataTools: true });
+  assert.deepEqual(await prepareOnboardingHubModels({ ...metadata, ...options }), { main: "logical-1", side_chat: "logical-2", approve: "logical-2" });
+  const missingMainTools = modelPreparationFixture({ omitRequestedTools: true });
+  await assert.rejects(prepareOnboardingHubModels({ ...missingMainTools, ...options }), /requested model and capabilities/);
+  assert.equal(missingMainTools.saves(), 0);
 });
 
 test("private key input errors discard the original value and cause, and registration mismatch stops before role save", async () => {

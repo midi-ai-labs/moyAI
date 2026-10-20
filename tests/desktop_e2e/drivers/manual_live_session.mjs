@@ -36,14 +36,21 @@ export function manualLiveSection(spec, heading, language = "text") {
 
 export function manualLivePrompt(spec) { return manualLiveSection(spec, "Canonical user request"); }
 
+export function normalizeManualLiveProviderBaseUrl(value) {
+  let url;
+  try { url = new URL(value); }
+  catch { throw new TypeError("manual scenario requires a credential-free HTTP(S) endpoint ending in /v1"); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash
+    || !/\/v1\/?$/u.test(url.pathname)) throw new TypeError("manual scenario requires a credential-free HTTP(S) endpoint ending in /v1");
+  return url.href.replace(/\/$/, "");
+}
+
 export function normalizeManualLiveOptions(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new TypeError("manual scenario requires explicit options");
   const allowed = new Set(["provider_base_url", "model", "api_key_env", "python_executable", "approval_mode",
-    "side_model", "side_api_key_env", "approve_model", "approve_api_key_env", "access_mode", "observation_timeout_ms"]);
+    "side_model", "side_api_key_env", "approve_model", "approve_api_key_env", "access_mode", "observation_timeout_ms", "context_window"]);
   if (Object.keys(raw).some(key => !allowed.has(key))) throw new TypeError("unknown manual scenario option");
-  const url = new URL(raw.provider_base_url);
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash
-    || !["/v1", "/v1/"].includes(url.pathname)) throw new TypeError("manual scenario requires a credential-free HTTP(S) /v1 endpoint");
+  const providerBaseUrl = normalizeManualLiveProviderBaseUrl(raw.provider_base_url);
   if (typeof raw.model !== "string" || !raw.model || raw.model !== raw.model.trim()
     || /[\u0000-\u001f\u007f]/u.test(raw.model) || Buffer.byteLength(raw.model) > 1024) throw new TypeError("manual scenario requires an exact bounded model ID");
   const apiKeyEnv = raw.api_key_env ?? "";
@@ -66,20 +73,26 @@ export function normalizeManualLiveOptions(raw) {
   if (!["stop", "operator"].includes(approvalMode)) throw new TypeError("approval_mode must be stop or operator");
   const accessMode = raw.access_mode === undefined ? "default" : raw.access_mode;
   if (!["default", "auto_review", "full_access"].includes(accessMode)) throw new TypeError("access_mode must be default, auto_review, or full_access");
+  const contextWindow = raw.context_window;
+  if (contextWindow !== undefined && (!Number.isInteger(contextWindow) || contextWindow < 1 || contextWindow > 4_294_967_295)) {
+    throw new TypeError("context_window must be a positive u32 number");
+  }
   const observationTimeoutMs = normalizeManualObservationTimeout(raw.observation_timeout_ms);
-  return Object.freeze({ providerBaseUrl: url.href.replace(/\/$/, ""), model: raw.model, apiKeyEnv,
+  return Object.freeze({ providerBaseUrl, model: raw.model, apiKeyEnv,
     pythonExecutable: raw.python_executable, approvalMode, accessMode, ...roles,
+    ...(contextWindow === undefined ? {} : { contextWindow }),
     ...(observationTimeoutMs === undefined ? {} : { observationTimeoutMs }) });
 }
 
 export function manualLiveFixtureConfig(options) {
   const roles = ["side", "approve"].filter(role => options[`${role}Model`] !== undefined).map(role =>
     `[${role === "side" ? "side_chat" : role}]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options[`${role}Model`])}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options[`${role}ApiKeyEnv`])}\n\n`).join("");
-  return `[model]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.model)}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options.apiKeyEnv)}\ncontext_window = 131072\n\n${roles}[permissions]\naccess_mode = ${JSON.stringify(options.accessMode ?? "default")}\n\n[multi_agent]\nenabled = false\n\n[docling]\nenabled = false\n\n[mcp]\nenabled = false\n`;
+  return `[model]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.model)}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options.apiKeyEnv)}\ncontext_window = ${options.contextWindow ?? 131072}\n\n${roles}[permissions]\naccess_mode = ${JSON.stringify(options.accessMode ?? "default")}\n\n[multi_agent]\nenabled = false\n\n[docling]\nenabled = false\n\n[mcp]\nenabled = false\n`;
 }
 
 function manualLiveConfiguredFields(options) {
   const fields = [["permissions.access_mode", options.accessMode ?? "default"]];
+  if (options.contextWindow !== undefined) fields.push(["model.context_window", String(options.contextWindow)]);
   for (const [role, model, key] of [["model", options.model, options.apiKeyEnv],
     ["side_chat", options.sideModel, options.sideApiKeyEnv], ["approve", options.approveModel, options.approveApiKeyEnv]]) {
     if (model === undefined) continue;

@@ -174,6 +174,10 @@ impl ToolRegistry {
         tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
         tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
         tools.insert(
+            "read_history".to_string(),
+            Arc::new(crate::tool::read_history::ReadHistoryTool),
+        );
+        tools.insert(
             "inspect_directory".to_string(),
             Arc::new(crate::tool::inspect_directory::InspectDirectoryTool),
         );
@@ -428,6 +432,10 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
     tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
     tools.insert(
+        "read_history".to_string(),
+        Arc::new(crate::tool::read_history::ReadHistoryTool),
+    );
+    tools.insert(
         "inspect_directory".to_string(),
         Arc::new(crate::tool::inspect_directory::InspectDirectoryTool),
     );
@@ -654,6 +662,7 @@ mod tests {
                 "inspect_directory",
                 "list",
                 "read",
+                "read_history",
                 "shell",
                 "shell_start",
                 "shell_status",

@@ -171,12 +171,22 @@ impl ProviderFailure {
                 "会話や添付資料の量が、このモデルで一度に扱える上限を超えています。依頼に含める内容を減らすか、より多くの内容を扱えるモデルを選んでください。"
                     .to_string()
             }
+            ProviderFailureKind::Generation
+                if matches!(self.code.as_deref(), Some("429" | "rate_limit_exceeded")) =>
+            {
+                "AIの接続先で利用回数などの上限に達しています。少し待ってからもう一度依頼してください。続く場合は、接続先の利用上限を確認してください。"
+                    .to_string()
+            }
             ProviderFailureKind::Generation => {
                 "AIが応答を作成できませんでした。接続先でモデルが正常に動いているか確認してから、もう一度依頼してください。"
                     .to_string()
             }
-            ProviderFailureKind::Protocol | ProviderFailureKind::Decode => {
+            ProviderFailureKind::Protocol => {
                 "AIからの応答を読み取れませんでした。設定の接続方式が、そのAIの接続方法に合っているか確認してください。"
+                    .to_string()
+            }
+            ProviderFailureKind::Decode => {
+                "AIからの応答を正常に読み取れませんでした。接続先の動作状況と通信状態を確認してから、もう一度依頼してください。"
                     .to_string()
             }
             ProviderFailureKind::Cancelled => "AIへの依頼を中止しました。".to_string(),
@@ -280,7 +290,7 @@ mod tests {
             ),
             (ProviderFailureKind::Generation, None, None, "モデルが正常"),
             (ProviderFailureKind::Protocol, None, None, "接続方式"),
-            (ProviderFailureKind::Decode, None, None, "接続方式"),
+            (ProviderFailureKind::Decode, None, None, "通信状態"),
             (ProviderFailureKind::Cancelled, None, None, "中止しました"),
             (
                 ProviderFailureKind::EventProjection,
@@ -310,6 +320,49 @@ mod tests {
             assert!(!public.contains(failure.request_id.as_str()));
             assert!(!public.contains("private-"));
             assert!(!public.contains("context_length_exceeded"));
+        }
+    }
+
+    #[test]
+    fn stream_rate_limit_public_message_uses_only_recognized_generation_codes() {
+        for (code, rate_limited) in [
+            ("429", true),
+            ("rate_limit_exceeded", true),
+            ("429.0", false),
+            ("true", false),
+            ("rate_limit_exceeded-private-suffix", false),
+        ] {
+            let failure = ProviderFailure {
+                request_id: ProviderRequestId::new(),
+                endpoint: "https://private-provider.example/private-route".to_string(),
+                phase: ProviderPhase::LastProgress,
+                attempt: 1,
+                elapsed_ms: 25,
+                kind: ProviderFailureKind::Generation,
+                status: None,
+                code: Some(code.to_string()),
+                message: "private-provider-message".to_string(),
+            };
+            let public = failure.public_message();
+            if rate_limited {
+                assert!(public.contains("利用上限"));
+            } else {
+                assert!(public.contains("モデルが正常"));
+            }
+            for private in [
+                "HTTP",
+                "429",
+                "rate_limit_exceeded",
+                "private-",
+                failure.request_id.as_str(),
+            ] {
+                assert!(
+                    !public.contains(private),
+                    "public message exposed {private}"
+                );
+            }
+            assert_eq!(failure.kind, ProviderFailureKind::Generation);
+            assert_eq!(failure.status, None);
         }
     }
 

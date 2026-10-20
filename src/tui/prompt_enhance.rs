@@ -172,6 +172,7 @@ mod tests {
                 finish_reason: self.finish,
                 usage: None,
                 response_id: None,
+                continuation: None,
             })
         }
     }

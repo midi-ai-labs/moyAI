@@ -267,6 +267,7 @@ mod tests {
                     content: "inspect the source".to_string(),
                 },
                 ModelMessage::AssistantToolCalls {
+                    continuation: None,
                     content: Some("I will inspect it.".to_string()),
                     tool_calls: vec![ModelToolCall {
                         call_id: "call-1".to_string(),

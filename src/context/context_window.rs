@@ -153,10 +153,17 @@ fn message_tokens(message: &ModelMessage) -> usize {
         ModelMessage::AssistantToolCalls {
             content,
             tool_calls,
+            continuation,
         } => content
             .as_deref()
             .map(estimate_text_tokens)
             .unwrap_or_default()
+            .saturating_add(
+                continuation
+                    .as_ref()
+                    .map(|value| estimate_text_tokens(value.reasoning_content()))
+                    .unwrap_or_default(),
+            )
             .saturating_add(
                 tool_calls
                     .iter()
@@ -437,6 +444,7 @@ mod tests {
                     content: "資料を精読して計画を更新してください".repeat(16),
                 },
                 ModelMessage::AssistantToolCalls {
+                    continuation: None,
                     content: None,
                     tool_calls: vec![ModelToolCall {
                         call_id: "呼出し一".to_string(),

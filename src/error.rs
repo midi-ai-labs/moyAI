@@ -132,7 +132,6 @@ pub enum CliPromptError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderRequestLimit {
     SerializedBodyBytes,
-    MessageCount,
     ToolCount,
     ToolSchemaBytes,
     ExtraBodyBytes,
@@ -171,7 +170,6 @@ impl std::fmt::Display for ProviderRequestLimit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::SerializedBodyBytes => "serialized body bytes",
-            Self::MessageCount => "message count",
             Self::ToolCount => "tool count",
             Self::ToolSchemaBytes => "tool schema bytes",
             Self::ExtraBodyBytes => "extra body bytes",

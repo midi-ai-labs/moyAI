@@ -65,11 +65,14 @@ export async function wait(label, sample, accept, timeoutMs = 30_000) {
     throw error;
   }
 }
-export async function trustedFocus(input, cdp, target) {
+async function waitForAvailableControl(cdp, target) {
   await wait("Desktop control is available", () => cdp.evaluate(`(() => {
     const nodes = document.querySelectorAll(${JSON.stringify(target.selector)});
     return nodes.length === 1 && !nodes[0].disabled && nodes[0].closest('[hidden]') === null;
   })()`), value => value === true, 10_000);
+}
+export async function trustedFocus(input, cdp, target) {
+  await waitForAvailableControl(cdp, target);
   // Keyboard navigation lets the product bring off-screen settings into view.
   // Completed histories can contain more than 100 controls. Allow one traversal
   // of the current document's potential tab stops, plus browser/reentry steps.
@@ -112,7 +115,12 @@ export async function trustedFocus(input, cdp, target) {
   if (!focused) throw new DesktopE2eError("harness", "hub-browser-focus-unreachable", "Desktop control cannot be reached by keyboard", { target, navigationBudget });
 }
 export async function trustedClick(input, cdp, target, sink) {
-  await trustedFocus(input, cdp, target);
+  await waitForAvailableControl(cdp, target);
+  const { observation } = await input.observeExactTarget(target);
+  // Only off-screen controls need keyboard navigation to reveal them. Pointer
+  // acquisition already verifies the exact visible, enabled, stable hit target.
+  if (observation.center_in_viewport === false || observation.center_in_scroll_clip === false)
+    await trustedFocus(input, cdp, target);
   const start = (await input.snapshotProbe()).sequence;
   await input.click(target, { stableHitSamples: 3 });
   const probe = assertTrustedProbeSequence(await input.snapshotProbe(start), { afterSequence: start, expected: [

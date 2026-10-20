@@ -7571,6 +7571,7 @@ fn response_summary(finish_reason: FinishReason) -> LlmResponseSummary {
             reasoning_tokens: None,
         }),
         response_id: None,
+        continuation: None,
     }
 }
 

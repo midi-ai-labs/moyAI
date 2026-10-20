@@ -85,8 +85,17 @@ const GREP_MAX_SKIP_DETAILS: usize = 64;
 const GREP_MAX_SKIP_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_DISCOVERY_CANDIDATES: usize = 4_096;
 const MIN_DISCOVERY_VISITS: usize = 128;
+const LIST_DISCOVERY_SCOPE_NOTICE: &str = "Discovery scope: workspace ignore rules (.gitignore within repositories when enabled) and hidden/depth options apply. Unlisted paths may still exist; use read with an exact file path to check a file.";
 const GREP_CURSOR_PREFIX: &str = "grep-v5:";
 const GREP_CURSOR_REGISTRY_DOMAIN: &str = "grep-v5";
+
+pub(super) fn with_discovery_scope(output: String) -> String {
+    if output.is_empty() {
+        LIST_DISCOVERY_SCOPE_NOTICE.to_string()
+    } else {
+        format!("{output}\n\n{LIST_DISCOVERY_SCOPE_NOTICE}")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -223,13 +232,13 @@ impl Tool for ListTool {
         ToolSpec {
             name: ToolName::List,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "List one bounded page of files and directories under a path.",
+            description: "List one bounded discovery page under a path. Workspace ignore rules (.gitignore within repositories when enabled) and hidden/depth options apply. Unlisted paths may still exist; use read with an exact file path to check a file.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1 },
-                    "include_hidden": { "type": "boolean" },
+                    "include_hidden": { "type": "boolean", "description": "Include hidden entries; workspace ignore rules still apply." },
                     "max_depth": { "type": "integer", "minimum": 1 },
                     "cursor": { "type": "string", "description": "Continuation returned by a previous list call with the same path and options." }
                 }
@@ -290,10 +299,11 @@ impl Tool for ListTool {
             },
         );
         let continuation = rendered.continuation.or(page.continuation);
+        let output_text = with_discovery_scope(rendered.output_text);
 
         Ok(ToolResult {
             title: format!("Listed {}", guarded.absolute),
-            output_text: rendered.output_text,
+            output_text,
             metadata: json!({
                 "root": guarded.absolute,
                 "entry_count": rendered.rendered_count,
@@ -485,7 +495,7 @@ impl Tool for GrepTool {
         ToolSpec {
             name: ToolName::Grep,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Search one bounded page of text files with a regex pattern.",
+            description: "Search one bounded page of text files with a regex pattern. Directory discovery applies workspace ignore rules; unlisted paths may still exist. Exact file paths are searched directly.",
             input_schema: json!({
                 "type": "object",
                 "required": ["pattern"],
@@ -582,7 +592,8 @@ impl Tool for GrepTool {
             .min(ctx.config().tool_output.max_lines.max(1));
         let candidate_limit = discovery_candidate_limit(limit);
 
-        let page = if internal_file.is_some() || search_root.absolute().is_file() {
+        let directory_discovery = internal_file.is_none() && !search_root.absolute().is_file();
+        let page = if !directory_discovery {
             single_file_page(search_root.absolute(), walk_cursor)?
         } else {
             let guarded = search_root.normal_guard().ok_or_else(|| {
@@ -734,9 +745,14 @@ impl Tool for GrepTool {
                 .transpose()?;
         }
 
+        let output_text = matches.join("\n");
         Ok(ToolResult {
             title: format!("Grep {}", input.pattern),
-            output_text: matches.join("\n"),
+            output_text: if directory_discovery {
+                with_discovery_scope(output_text)
+            } else {
+                output_text
+            },
             metadata: json!({
                 "match_count": matches.len(),
                 "scanned_file_count": scanned_files,
@@ -1109,13 +1125,18 @@ mod tests {
 
     use super::{
         GREP_CURSOR_PREFIX, GREP_MAX_SKIP_DETAIL_BYTES, GREP_MAX_SKIP_DETAILS, GrepCursorPosition,
-        GrepSkipReason, GrepSkipSummary, bounded_result_limit, compile_include_glob,
+        GrepSkipReason, GrepSkipSummary, ListTool, bounded_result_limit, compile_include_glob,
         decode_glob_cursor, decode_grep_cursor, encode_glob_cursor, encode_grep_cursor,
         glob_matches_path, glob_output_label, glob_workspace_relative_path, read_grep_candidate,
         search_query_digest, single_file_page, validate_grep_content_fence,
         validate_grep_resume_candidate,
     };
     use crate::config::ResolvedConfig;
+    use crate::runtime::RunControl;
+    use crate::tool::inspect_directory::InspectDirectoryTool;
+    use crate::tool::read::ReadTool;
+    use crate::tool::read_context::ReadToolContext;
+    use crate::tool::registry::Tool;
     use crate::workspace::traversal::{TraversalOptions, TraversalRegistry, walk_page};
     use crate::workspace::{AccessKind, PathGuard, WorkspaceDiscovery};
 
@@ -1192,6 +1213,206 @@ mod tests {
         let after = fs::metadata(path).expect("metadata after rewrite");
         assert_eq!(after.len(), before.len());
         assert_eq!(after.modified().expect("restored modified time"), modified);
+    }
+
+    #[tokio::test]
+    async fn filtered_list_keeps_ignored_templates_readable_and_explains_its_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("utf8 root");
+        fs::create_dir(root.join(".git")).expect("repository boundary");
+        fs::create_dir_all(root.join("examples/templates")).expect("template directory");
+        fs::create_dir(root.join("empty")).expect("empty directory");
+        fs::write(root.join(".gitignore"), "examples/templates/\n").expect("ignore rule");
+        fs::write(
+            root.join("examples/README.md"),
+            "Template fixtures live here.\n",
+        )
+        .expect("visible file");
+        let template = root.join("examples/templates/scenario.json");
+        fs::write(&template, "{\"fixture\":\"ignored-but-readable\"}\n").expect("ignored template");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("fixture workspace");
+        let list = ListTool
+            .execute_read(
+                serde_json::json!({"path": "examples", "include_hidden": true}),
+                ReadToolContext::published(&workspace, &config, RunControl::new()),
+            )
+            .await
+            .expect("filtered list");
+        assert!(template.is_file());
+        assert!(list.output_text.lines().any(|line| line == "README.md"));
+        assert!(!list.output_text.lines().any(|line| line == "templates/"));
+        assert_eq!(list.metadata["entry_count"], 1);
+        assert_eq!(list.metadata["truncated"], false);
+
+        let read = ReadTool
+            .execute_read(
+                serde_json::json!({"path": template}),
+                ReadToolContext::published(&workspace, &config, RunControl::new()),
+            )
+            .await
+            .expect("read exact ignored path");
+        assert!(read.output_text.contains("ignored-but-readable"));
+        assert_eq!(read.metadata["truncated"], false);
+        let empty = ListTool
+            .execute_read(
+                serde_json::json!({"path": "empty", "include_hidden": true}),
+                ReadToolContext::published(&workspace, &config, RunControl::new()),
+            )
+            .await
+            .expect("list empty directory");
+        assert_eq!(empty.metadata["entry_count"], 0);
+        assert_eq!(empty.metadata["truncated"], false);
+        for output in [&list.output_text, &empty.output_text] {
+            assert!(output.contains(".gitignore"));
+            assert!(output.contains("may still exist"));
+            assert!(output.contains("read"));
+            assert!(output.contains("exact file path"));
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_discovery_scope_keeps_ignored_files_readable_and_counts_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("utf8 root");
+        fs::create_dir(root.join(".git")).expect("repository boundary");
+        fs::create_dir(root.join("items")).expect("items");
+        fs::write(root.join(".gitignore"), "items/ignored.rs\n").expect("ignore rule");
+        fs::write(root.join("items/visible.rs"), "needle visible\n").expect("visible");
+        fs::write(root.join("items/ignored.rs"), "needle ignored\n").expect("ignored");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for tool in [&ListTool as &dyn Tool, &InspectDirectoryTool] {
+            let result = tool
+                .execute_read(
+                    serde_json::json!({"path": "items", "include_hidden": true}),
+                    ReadToolContext::published(&workspace, &config, RunControl::new()),
+                )
+                .await
+                .expect("filtered discovery");
+            assert_eq!(result.metadata["entry_count"], 1);
+            assert_eq!(result.metadata["truncated"], false);
+            assert!(result.output_text.contains("visible.rs"));
+            assert!(!result.output_text.contains("ignored.rs"));
+            assert!(result.output_text.contains(".gitignore"));
+            assert!(result.output_text.contains("may still exist"));
+        }
+        for (pattern, matches) in [("needle", 1), ("absent-pattern", 0)] {
+            let result = super::GrepTool
+                .execute_read(
+                    serde_json::json!({"path": "items", "pattern": pattern}),
+                    ReadToolContext::published(&workspace, &config, RunControl::new()),
+                )
+                .await
+                .expect("filtered grep");
+            assert_eq!(result.metadata["match_count"], matches);
+            assert_eq!(result.metadata["scanned_file_count"], 1);
+            assert_eq!(result.metadata["skipped_file_count"], 0);
+            assert_eq!(result.metadata["continuation"], serde_json::Value::Null);
+            assert_eq!(result.metadata["truncated"], false);
+            assert!(!result.output_text.contains("ignored.rs"));
+            assert!(result.output_text.contains(".gitignore"));
+            assert!(result.output_text.contains("exact file path"));
+        }
+        let ignored = serde_json::json!({"path": "items/ignored.rs"});
+        let read = ReadTool
+            .execute_read(
+                ignored,
+                ReadToolContext::published(&workspace, &config, RunControl::new()),
+            )
+            .await
+            .expect("exact ignored read");
+        assert!(read.output_text.contains("needle ignored"));
+        let exact = super::GrepTool
+            .execute_read(
+                serde_json::json!({"path": "items/ignored.rs", "pattern": "needle"}),
+                ReadToolContext::published(&workspace, &config, RunControl::new()),
+            )
+            .await
+            .expect("exact ignored grep");
+        assert_eq!(exact.metadata["match_count"], 1);
+        assert_eq!(exact.metadata["scanned_file_count"], 1);
+        assert_eq!(exact.metadata["skipped_file_count"], 0);
+        assert!(exact.output_text.contains("needle ignored"));
+        assert!(!exact.output_text.contains("Discovery scope:"));
+    }
+
+    #[tokio::test]
+    async fn directory_discovery_scope_does_not_consume_page_or_payload_budgets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("utf8 root");
+        fs::create_dir(root.join(".git")).expect("repository boundary");
+        fs::create_dir(root.join("items")).expect("items");
+        fs::create_dir(root.join("empty")).expect("empty");
+        fs::write(root.join("items/a.rs"), "needle a\n").expect("a");
+        fs::write(root.join("items/b.rs"), "needle b\n").expect("b");
+        let mut config = ResolvedConfig::default();
+        config.tool_output.max_lines = 1;
+        config.tool_output.max_bytes = 32;
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        for tool in [&ListTool as &dyn Tool, &InspectDirectoryTool] {
+            let empty = tool
+                .execute_read(
+                    serde_json::json!({"path": "empty"}),
+                    ReadToolContext::published(&workspace, &config, RunControl::new()),
+                )
+                .await
+                .expect("empty discovery");
+            assert_eq!(empty.metadata["entry_count"], 0);
+            assert_eq!(empty.metadata["truncated"], false);
+            assert!(empty.output_text.contains("may still exist"));
+            let mut cursor = serde_json::Value::Null;
+            for page_index in 0..2 {
+                let mut args = serde_json::json!({"path": "items", "limit": 1});
+                if !cursor.is_null() {
+                    args["cursor"] = cursor;
+                }
+                let result = tool
+                    .execute_read(
+                        args,
+                        ReadToolContext::published(&workspace, &config, RunControl::new()),
+                    )
+                    .await
+                    .expect("discovery page");
+                assert_eq!(result.metadata["entry_count"], 1);
+                assert_eq!(result.metadata["truncated"], page_index == 0);
+                cursor = result.metadata["continuation"].clone();
+                assert_eq!(cursor.is_null(), page_index == 1);
+                assert!(result.output_text.contains(".gitignore"));
+                assert!(
+                    result.output_text.len() <= 32 + super::LIST_DISCOVERY_SCOPE_NOTICE.len() + 2
+                );
+            }
+        }
+        let mut cursor = serde_json::Value::Null;
+        let mut total_matches = 0;
+        for _ in 0..4 {
+            let mut args = serde_json::json!({"path": "items", "pattern": "needle", "limit": 1});
+            if !cursor.is_null() {
+                args["cursor"] = cursor;
+            }
+            let result = super::GrepTool
+                .execute_read(
+                    args,
+                    ReadToolContext::published(&workspace, &config, RunControl::new()),
+                )
+                .await
+                .expect("grep page");
+            let matches = result.metadata["match_count"].as_u64().expect("count");
+            assert!(matches <= 1);
+            total_matches += matches;
+            assert_eq!(result.metadata["skipped_file_count"], 0);
+            assert!(result.output_text.contains(".gitignore"));
+            assert!(result.output_text.len() <= 32 + super::LIST_DISCOVERY_SCOPE_NOTICE.len() + 2);
+            cursor = result.metadata["continuation"].clone();
+            assert_eq!(result.metadata["truncated"], !cursor.is_null());
+            if cursor.is_null() {
+                break;
+            }
+        }
+        assert!(cursor.is_null());
+        assert_eq!(total_matches, 2);
     }
 
     #[test]

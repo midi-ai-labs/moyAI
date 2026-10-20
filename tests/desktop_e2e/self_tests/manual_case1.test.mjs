@@ -63,6 +63,35 @@ test("Case1 uses the current profile and local context budget with Default permi
   assert.doesNotMatch(config, /\[side_chat\]|\[approve\]/);
 });
 
+test("manual live accepts an explicit context capacity and verifies the effective fixture value", () => {
+  const defaults = normalizeManualCase1Options(RAW);
+  assert.equal(defaults.contextWindow, undefined);
+  const options = normalizeManualCase1Options({ ...RAW, context_window: 1_000_000 });
+  assert.equal(options.contextWindow, 1_000_000);
+  const config = manualCase1FixtureConfig(options);
+  assert.match(config, /\[model\][\s\S]*context_window = 1000000\n/);
+  assert.doesNotMatch(config, /temperature|top_p|top_k|max_tokens|thinking|reasoning|extra_body|request_timeout/);
+  const fields = [{ key: "permissions.access_mode", value: "default" },
+    { key: "model.base_url", value: RAW.provider_base_url }, { key: "model.model", value: RAW.model },
+    { key: "model.provider_profile", value: "openai_compatible" }, { key: "model.api_key_env", value: "" },
+    { key: "model.context_window", value: "1000000" }];
+  assert.deepEqual(manualLiveConfigurationFailures({ config_fields: fields }, options), []);
+  assert.deepEqual(manualLiveConfigurationFailures({ config_fields: fields.map(field =>
+    field.key === "model.context_window" ? { ...field, value: "131072" } : field) }, options),
+  [{ key: "model.context_window", expected: "1000000", actual: "131072" }]);
+  assert.deepEqual(manualLiveConfigurationFailures({ config_fields: fields.filter(field =>
+    field.key !== "model.context_window") }, defaults), []);
+});
+
+test("manual live context capacity is an optional positive u32 number", () => {
+  for (const value of [null, "1000000", true, 0, -1, 1.5, NaN, Infinity, 4_294_967_296]) {
+    assert.throws(() => normalizeManualCase1Options({ ...RAW, context_window: value }), /context_window/);
+  }
+  for (const value of [1, 4_294_967_295]) {
+    assert.equal(normalizeManualCase1Options({ ...RAW, context_window: value }).contextWindow, value);
+  }
+});
+
 test("manual live options bind independent Sub and Approve to explicit models and credential references", () => {
   const options = normalizeManualCase1Options({ ...RAW, api_key_env: "SHARED_TEST_KEY",
     side_model: "small-chat", side_api_key_env: "SHARED_TEST_KEY",

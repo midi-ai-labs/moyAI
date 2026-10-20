@@ -1,7 +1,10 @@
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+
+import { canonicalUlid } from "../core/canonical_identity.mjs";
 
 export const SCRIPTED_PROVIDER_MODEL_ID = "e2e/scripted-responses";
 export const SCRIPTED_PROVIDER_PROMPT = "return only MAIN_OK";
@@ -97,16 +100,10 @@ Resume from this checkpoint, retain complete read call/output units, and return 
 
 ## Evidence coverage
 The selected read units and smaller retry were observed; canonical commit, remaining context, and final GUI completion still require verification.`;
-export const SCRIPTED_PROVIDER_COMPACTION_HEADINGS = Object.freeze([
-  "## Objective and exact contract",
-  "## Observed changes and remaining state",
-  "## Exact failures and retry guards",
-  "## Open interactions and ownership boundaries",
-  "## Next falsifying actions",
-  "## Evidence coverage",
-]);
+export const SCRIPTED_PROVIDER_COMPACTION_PROMPT =
+  readFileSync(new URL("../../../assets/prompts/compaction.md", import.meta.url), "utf8").trim();
 export const SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX =
-  "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+  readFileSync(new URL("../../../assets/prompts/compaction_summary_prefix.md", import.meta.url), "utf8").trim();
 export const SCRIPTED_PROVIDER_RESPONSE_BEHAVIORS = Object.freeze([
   "complete",
   "hold_until_release",
@@ -2056,11 +2053,7 @@ function responsesCompactionReadPair(input, itemIndex, script, callIndex) {
 
 function compactionPromptText(item) {
   const text = exactInputText(item);
-  if (text === null || !text.startsWith("# Context checkpoint compaction\n")) return null;
-  const headings = Array.from(text.matchAll(/^## .+$/gmu), (match) => match[0]);
-  return JSON.stringify(headings) === JSON.stringify(SCRIPTED_PROVIDER_COMPACTION_HEADINGS)
-    ? text
-    : null;
+  return text === SCRIPTED_PROVIDER_COMPACTION_PROMPT ? text : null;
 }
 
 function responsesCompactionReadPrefix(
@@ -2113,14 +2106,28 @@ function responsesCompactionReadPrefix(
   };
 }
 
-function responsesCompactionCheckpointMessage(script) {
-  return `${SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX}\n${script.checkpointText}`;
+export function responsesCompactionCheckpointReferences(text, checkpointText = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT) {
+  const prefix = `${checkpointText}\n\n`;
+  if (typeof text !== "string" || !text.startsWith(prefix)) return null;
+  const match = /^Historical evidence in this conversation: first_item_id=([^;\s]+); last_item_id=([^;\s]+)\. Use read_history to retrieve original records\. These references do not establish success, approval, or verification\.$/u.exec(text.slice(prefix.length));
+  return match !== null && canonicalUlid(match[1]) && canonicalUlid(match[2])
+    ? { first_item_id: match[1], last_item_id: match[2] }
+    : null;
+}
+
+function responsesCompactionCheckpointInput(item, script) {
+  const text = exactInputText(item);
+  const prefix = `${SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX}\n`;
+  if (text === null || !text.startsWith(prefix)) return null;
+  const references = responsesCompactionCheckpointReferences(text.slice(prefix.length), script.checkpointText);
+  return references === null ? null : { text, references };
 }
 
 function responsesCompactionResumedInput(input, expectedPrompt, script) {
   const items = Array.isArray(input) ? input : [];
   const promptMatches = exactInputText(items[0]) === expectedPrompt;
-  const checkpointMatches = exactInputText(items[1]) === responsesCompactionCheckpointMessage(script);
+  const checkpoint = responsesCompactionCheckpointInput(items[1], script);
+  const checkpointMatches = checkpoint !== null;
   const pairItemCount = items.length - 2;
   const pairCount = pairItemCount >= 0 && pairItemCount % 2 === 0
     ? pairItemCount / 2
@@ -2158,8 +2165,9 @@ function responsesCompactionResumedInput(input, expectedPrompt, script) {
     input_item_types: items.map((item) => typeof item?.type === "string" ? item.type : null),
     first_prompt_matches: promptMatches,
     checkpoint_matches: checkpointMatches,
+    checkpoint_references: checkpoint?.references ?? null,
     checkpoint_sha256: checkpointMatches
-      ? sha256(Buffer.from(responsesCompactionCheckpointMessage(script), "utf8"))
+      ? sha256(Buffer.from(checkpoint.text, "utf8"))
       : null,
     remaining_read_count: pairCount,
     first_remaining_read_index: firstReadIndex,
@@ -2172,7 +2180,7 @@ function responsesCompactionRole(body, expectedPrompt, script) {
   const input = Array.isArray(body?.input) ? body.input : [];
   const inputSizeBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
   const hasTools = Array.isArray(body?.tools) && body.tools.length > 0;
-  if (hasTools && exactInputText(input[1]) === responsesCompactionCheckpointMessage(script)) {
+  if (hasTools && responsesCompactionCheckpointInput(input[1], script) !== null) {
     const resumed = responsesCompactionResumedInput(input, expectedPrompt, script);
     return {
       role: resumed.matches ? "resumed_final" : null,

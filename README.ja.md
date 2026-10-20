@@ -19,7 +19,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.0はWindows x64向けで、moyAI Hub 0.1.0と組み合わせて使います。** このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。実装内容・受入確認の証拠・検証上の制限は[3.0.0リリースノート](docs/release/v3.0.0.md)を参照してください。
+**Desktop 3.0.0-rc.2はWindows x64向けのリリース候補で、moyAI Hub 0.1.0と組み合わせて使います。** このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.0-rc.2リリースノート](docs/release/v3.0.0-rc.2.md)、実際に試験した版は配布物に対応する証跡を参照してください。
 
 ## できること
 
@@ -35,7 +35,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-3.0.0のWindows配布物では、次の順に進みます。
+3.0.0-rc.2のWindows配布物では、次の順に進みます。
 
 1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。初回導入または共通sandbox helperの更新時だけ別画面で管理者承認し、取り消すと利用者側アプリの導入前に中止します。以後はスタートメニューから **moyAI** を開き、起動ごとのUACはありません。インストールせず使う場合も共通helperが必要です。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
@@ -71,7 +71,13 @@ Hub設定がある場合は同じ欄にHubの接続情報を表示し、標準�
 
 自動圧縮を始める入力トークン数は、共通設定の `model.compaction_budget_tokens`（環境変数 `MOYAI_COMPACTION_BUDGET_TOKENS`）で指定できます。未指定なら通常の作業用上限を使います。正の値で、`context_window` から求めた実効入力上限以下にしてください。指定値と通常の作業用上限の小さい方で自動圧縮を始めます。`context_window = 131072`、設定値 `98304` の場合、入力の推定値が98,304トークンに達すると自動圧縮します。Hub経由のメインや共有実行にも適用し、生成量はAIホストで設定します。
 
+`model.max_retries` は、接続確立エラーと接続先の利用上限（HTTP 429、SSEのエラーコード `429` / `rate_limit_exceeded`）に対する自動再試行の回数を制限します。利用上限では、本文・推論・ツール呼出し・使用量をまだ受信していない場合だけ、同じ接続先へ同じ依頼を再送します。既存の要求期限を共有し、待機時間には上限を設け、取消で待機を中断します。生成途中や他のエラーでは再送しません。
+
 モデルは `compact_context` へ自分で作った短い作業要約を渡し、文脈を整理することもできます。moyAIは最新の利用者入力と直近の完了済み作業を保持し、文脈が減ることを確かめて既存の会話履歴へ保存します。元の発言やツール結果は残ります。[Context Language Models](https://github.com/facebookresearch/context-language-models)の考え方を参考に、moyAIの履歴・ツール構成に合わせて実装しています。
+
+自動圧縮は完了済みの有効履歴をまとめ、通常は1回の要約要求で前のチェックポイントを置き換えます。ツール記録を累積して付け足す方式は使いません。再開用の本文は、執筆・調査・監視・データ処理・開発に使える指示とし、出力形式や圧縮率を固定しません。圧縮対象はツール呼出しと結果の組を分断せず、要求全体の入力予算を確認します。要約を採用できない場合は元の履歴を保持します。
+
+`read_history` ツールは、圧縮で有効な入力から外れた記録も含め、現在の会話の公開履歴を取得します。件数を制限した一覧・検索の後、特定の記録を分割して読めます。検索は `next_after`、本文は `next` を使って続けます。取得した記録は過去の観測や操作状態であり、新しい許可や現在のファイル内容の証明にはなりません。他の会話・非公開の推論・要求診断は選択できません。分岐した会話ではコピー先のIDを使って検索し、コピーされていない元の記録は取得できません。
 
 ## CLI・TUI
 
@@ -82,7 +88,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-3.0.0配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.0-rc.2配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUACは不要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 
@@ -128,7 +134,7 @@ Windowsのnative sandbox試験には、明示的に起動承認したhelper test
 
 [GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-RCの元となる実装で、Manual ST Case1〜7と復元試験を実施しました。最新の仮想WinA/WinBでは、固定応答・実LLMの両方で実行・成果受渡し・終了処理の自動確認に通っています。組合せはHub 0.1.0（`f437c4fe0191e69f0ff7f0affa16eb191db305f3`）で、同じWindows PC上の試験です。生成コードの評価NGとSide Chat回答の精度不足は記録を保持しており、試験の実施完了を全回答の合格とは扱いません。正式3.0.0配布物の最終受入結果と識別情報は、開発workspaceの `project_sandbox/release-3.0.0-20261016/RESULTS.md` に記録します。RCの結果とは区別します。新規PCへの導入、物理別PC・LAN・Firewallは未確認です。
+以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.0-rc.2の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/release-3.0.0-rc2-20261020/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。新規PCへの導入、物理別PC・LAN・Firewallの確認には別の証跡が必要です。
 
 公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 

@@ -86,6 +86,20 @@ Case1〜Case7（Case5_2を含む）は、ケース全体の観測期限を既定
 npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --artifact-parent <absolute-task-root> --desktop-isolation fixture --scenario manual.case1 --scenario-config <absolute-scenario-config.json>
 ```
 
+release packageの通常Desktopとfreshな推論HubでCase5だけを行う任意経路は、次の共通entryを使う。task / package / configの3pathは絶対pathとし、configは`manual.case5`の項目にMain / Sub / Approveの明示model、各roleの認証環境変数名、`approval_mode: "operator"`を指定する。ケース全体の期限は設けず、`observation_timeout_ms`は省略する。stdinを保持し、既存の確認ownerとhashに一致する承認だけを返す。通常のuser-wide Desktop排他・installed sandbox helper・登録済みPCの資源policyを使い、fixture端末へ切り替えない。
+
+```powershell
+node tests/desktop_e2e/drivers/manual_case5_hub_runner.mjs --task-root <absolute-task-root> --package-root <absolute-release-package> --scenario-config <absolute-scenario-config.json> --capture-http-requests false
+```
+
+接続先は`https://host/api/v1`のようなprefix付きbase URLも受理する。Hub経由でSub / Approveの接続先をMainから分ける場合は、configのoptional `hub_side_provider_base_url` / `hub_approve_provider_base_url`へそれぞれ指定する。省略時はMainと同じ接続先で、認証は各roleの`api_key_env`参照だけを使う。同じendpoint・model・credentialのSub / Approveは同じ論理モデルを共有できる。Hub参加後の確認済み選択を正とし、準備用Direct設定へfallbackしない。
+
+モデルのcapacityに合わせた比較では、scenario configへoptionalの数値`context_window`（例: `1000000`、正のu32）を指定できる。省略時のfixtureは従来どおり131072で、通常環境の設定は変更しない。この値はfixtureの`model.context_window`へ渡し、起動時の実効設定と照合する。上記のfresh fixtureで明示するApprove設定はMainの値を継承し、独立したSub設定は131072のままとなる。Mainだけの変更とは扱わず、実際の各roleの入力量とcontext予算を比較結果へ記録する。Hub catalogからcapacityを自動取得する指定ではない。
+
+登録済みPCのHub / Runnerをこの試験が起動する場合は、共通の[installed runtime driver](../desktop_e2e/drivers/manual_case5_installed_runtime.ps1)へ`-Action Start`、絶対`-TaskRoot` / `-PackageRoot`、登録済みの`-ConfigPath` / `-DataPath` / `-HubData` / `-ProjectId`を渡す。終了時は同じ引数と`-Action Stop`で、記録したPID・path・起動時刻・Runner identityを照合して通常終了する。Config / Dataの文字列表記はDevice policyのpipe scopeとして保持し、試験ごとにcontroller一式を複製しない。
+
+実キー本文はprocess環境だけへ渡す。entryは起動前にメモリへ取得して環境変数から除き、通常のHub画面で設定する。`--capture-http-requests`は省略時も`false`で、完全なprepared wireが必要な比較だけ`true`を明示する。captureにはworkspace本文とprivate reasoningが含まれ得るため、task内原本を非公開で保持し、consoleや報告へ本文を転載しない。reasoningの報告はfieldの有無・長さ・hashに限定する。履歴が一部表示の場合はclosed canonical auditを必要として記録し、成果物の内容レビューと監査完了前は`manual_pending`を維持する。
+
 `case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。LM Studioはlifecycle未指定の後方互換`execution-owned` routeに加え、明示的な`provider_lifecycle: "external-unmanaged"`を受理する。external routeは既存のhost設定を変更せず、Main exact 1 loaded、Side unloaded、両variant、reported loaded context 131072以上、時刻・elapsedを除いたstable host fingerprintをpreflight／各checkpoint／final／quiesceでGET観測し、drift時にもload / unloadによる修復を行わない。`openai_compatible`はexternal-unmanagedのみで、credentialを埋め込まない`/v1` base URLのexact IDとmetadataがあればreported context capacityをpreflight、時点sample、cleanupで確認する。reported capacityがlocal budget 131072未満またはmetadata内で競合する場合はenvironment block、未報告または131072以上だが非exactの場合とexternal lifecycle / wire差分はcomparability deviationとして`RESULTS.md`へ明記する。
 
 Case5_2の`api_key_env`はMain認証、optional `side_api_key_env`はSide認証の環境変数名を設定する。Sideの指定がなければ認証なしとなる。同じキーを使う場合は、両方に同じ環境変数名を明示する。MainのheadersはSideへ継承しない。実キーはprocess環境にだけ設定し、fixtureやevidenceへ保存しない。access modeはspecどおり`auto_review`を維持し、既存Guardianの判断を試験対象とする。

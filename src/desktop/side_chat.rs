@@ -1879,6 +1879,7 @@ mod tests {
                 finish_reason: self.finish_reason,
                 usage: None,
                 response_id: None,
+                continuation: None,
             })
         }
     }

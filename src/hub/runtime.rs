@@ -838,6 +838,14 @@ impl LlmClient for HubRoutedClient {
             .map_err(|_| LlmError::Hub(HubError::InvalidCatalog))?;
             target.replace_request_limits(request.provider_target().request_limits());
             request.route_through_hub(target, request_token);
+            request.set_continuation_scope(crate::llm::ChatContinuationScope::hub(
+                self.route.hub_endpoint(),
+                &self.route.inner.catalog.hub_id,
+                &self.route.inner.catalog.revision.to_string(),
+                &lease_id,
+                &logical_model_id,
+                request.provider_target().api_mode(),
+            ));
             let model = self
                 .route
                 .inner
