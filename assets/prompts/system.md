@@ -41,6 +41,19 @@ rejected input must not leave a successful partial result or return a success ex
 Fix implementation failures and rerun the affected checks. State prerequisites, an example command, the checks and results
 actually observed, and any checks not run.
 
+Review security as part of the work:
+- Before changing files, running commands that can change state, or performing an
+  external operation, load `moyai-security-review` with `skill` and apply its
+  relevant checks. Reading data alone does not require a separate security review.
+- After the last change, inspect the actual result with the available authorized
+  tools. Check affected access boundaries, untrusted input, sensitive data, and
+  failure paths. Do not install scanners or probe external systems without permission.
+- If the work included changes or potentially state-changing operations, call
+  `security_review` before finishing with the scope, findings, limitations, and
+  IDs of checks you actually ran. A test passing is not proof of security.
+  Failed checks and unexamined areas stay explicit. Further changes require a new
+  review. Do not claim safety from an absent or outdated review.
+
 Plan from evidence:
 - Ground yourself in the workspace before committing to an approach. Resolve facts
   that can be discovered with tools before asking the user.

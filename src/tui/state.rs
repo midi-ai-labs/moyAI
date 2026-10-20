@@ -1392,6 +1392,7 @@ pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
         ToolName::ShellStop => "継続コマンドの停止",
         ToolName::CurrentTime => "時刻の確認",
         ToolName::Skill => "Skillの読込",
+        ToolName::SecurityReview => "セキュリティレビューの記録",
         ToolName::DoclingConvert => "文書の変換",
         ToolName::McpCall => "外部ツール",
         ToolName::UpdatePlan => "計画の更新",

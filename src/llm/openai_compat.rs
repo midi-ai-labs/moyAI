@@ -28,9 +28,9 @@ use crate::llm::{
     tool_surface_scoped_parallel_tool_calls_projection,
 };
 use crate::session::{FinishReason, TokenUsage};
-const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
+const RETRY_INITIAL_DELAY_MS: u64 = 10_000;
 const RETRY_BACKOFF_FACTOR: u64 = 2;
-const RETRY_MAX_DELAY_MS: u64 = 30_000;
+const RETRY_MAX_DELAY_MS: u64 = 300_000;
 const PROVIDER_FAILURE_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES: usize = 243;
 const PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES: usize = PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES * 4;
@@ -3620,9 +3620,19 @@ mod tests {
 
     #[test]
     fn connect_retry_backoff_is_bounded() {
-        assert_eq!(retry_delay_ms(1, None), 2_000);
-        assert_eq!(retry_delay_ms(2, None), 4_000);
-        assert_eq!(retry_delay_ms(u8::MAX, None), 30_000);
+        for (attempt, delay_ms) in [
+            (1, 10_000),
+            (2, 20_000),
+            (3, 40_000),
+            (4, 80_000),
+            (5, 160_000),
+            (6, 300_000),
+        ] {
+            assert_eq!(retry_delay_ms(attempt, None), delay_ms);
+        }
+        for attempt in 6..=u8::MAX {
+            assert_eq!(retry_delay_ms(attempt, None), 300_000);
+        }
     }
 
     #[test]
@@ -6131,7 +6141,7 @@ mod tests {
         replace_provider_deadlines(
             &mut request,
             ProviderDeadlines {
-                request_timeout_ms: 10_000,
+                request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 1,
             },

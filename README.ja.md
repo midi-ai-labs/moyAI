@@ -31,7 +31,9 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 - Hubで許可した複数PCを使うプロジェクト。左のプロジェクト一覧に `Hub` 印で表示し、いつもの入力欄から依頼します。AIはプロジェクト内で許可された実行PCを選択できます。
 - Desktop画面と独立して仕事を実行するWindows Runner。共有の会話・入力・公開した成果はHubへ保存します。
 
-文書の作成・編集と説明用コメントには、[yomiyasu](https://github.com/nanaism/yomiyasu)を参考にした文章基準を組み込んでいます。主張や技術条件を保ち、冗長な説明や不自然な言い回しを減らすようAIに指示します。設定やスキルのインストールは不要です。
+文章の新規執筆・編集と説明用コメントには、[yomiyasu](https://github.com/nanaism/yomiyasu)の編集原則を参考にしたmoyAI独自の文章指示を組み込んでいます。指定された読者・目的・ジャンルに合わせ、意味や条件を保ち、事実を述べる文章は提供された資料と照合するようAIに指示します。創作では、意図した語り口や曖昧さも保ちます。設定やスキルのインストールは不要です。
+
+セキュリティ確認には、OWASPを参考にした独自指示、組み込みSkill、実行記録との照合を使います。レビュー未実施や古い記録、残る問題は会話のfeedbackへ表示します。作業完了は安全認証ではありません。[確認工程と保証の範囲](docs/security-review.md)を参照してください。
 
 ## Quick Start
 
@@ -71,7 +73,7 @@ Hub設定がある場合は同じ欄にHubの接続情報を表示し、標準�
 
 自動圧縮を始める入力トークン数は、共通設定の `model.compaction_budget_tokens`（環境変数 `MOYAI_COMPACTION_BUDGET_TOKENS`）で指定できます。未指定なら通常の作業用上限を使います。正の値で、`context_window` から求めた実効入力上限以下にしてください。指定値と通常の作業用上限の小さい方で自動圧縮を始めます。`context_window = 131072`、設定値 `98304` の場合、入力の推定値が98,304トークンに達すると自動圧縮します。Hub経由のメインや共有実行にも適用し、生成量はAIホストで設定します。
 
-`model.max_retries` は、接続確立エラーと接続先の利用上限（HTTP 429、SSEのエラーコード `429` / `rate_limit_exceeded`）に対する自動再試行の回数を制限します。利用上限では、本文・推論・ツール呼出し・使用量をまだ受信していない場合だけ、同じ接続先へ同じ依頼を再送します。既存の要求期限を共有し、待機時間には上限を設け、取消で待機を中断します。生成途中や他のエラーでは再送しません。
+`model.max_retries` は、接続確立エラーと接続先の利用上限（HTTP 429、SSEのエラーコード `429` / `rate_limit_exceeded`）に対する自動再試行の回数を制限します。利用上限では、本文・推論・ツール呼出し・使用量をまだ受信していない場合だけ、同じ接続先へ同じ依頼を再送します。待機は10秒、20秒、40秒と倍増し、最大300秒です。既存の要求期限を共有し、取消で待機を中断します。生成途中や他のエラーでは再送しません。
 
 モデルは `compact_context` へ自分で作った短い作業要約を渡し、文脈を整理することもできます。moyAIは最新の利用者入力と直近の完了済み作業を保持し、文脈が減ることを確かめて既存の会話履歴へ保存します。元の発言やツール結果は残ります。[Context Language Models](https://github.com/facebookresearch/context-language-models)の考え方を参考に、moyAIの履歴・ツール構成に合わせて実装しています。
 
@@ -134,7 +136,7 @@ Windowsのnative sandbox試験には、明示的に起動承認したhelper test
 
 [GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.0-rc.2の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/release-3.0.0-rc2-20261020/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。新規PCへの導入、物理別PC・LAN・Firewallの確認には別の証跡が必要です。
+以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.0-rc.2の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/release-3.0.0-rc2-resume-20261021/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。新規PCへの導入、物理別PC・LAN・Firewallの確認には別の証跡が必要です。
 
 公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 

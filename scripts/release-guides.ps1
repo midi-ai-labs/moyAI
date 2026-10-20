@@ -70,6 +70,7 @@ function Copy-MoyaiReleaseGuides([string]$DesktopRoot, [string]$PackageRoot, [st
     }
     [IO.File]::WriteAllText((Join-Path $desktopGuides $name), $content, $utf8)
   }
+  Copy-Item -LiteralPath (Join-Path $DesktopRoot 'docs/security-review.md') -Destination (Join-Path $PackageRoot 'docs/security-review.md')
   if (-not $includeHub) { return }
   $hubGuides = Join-Path $PackageRoot 'hub/docs'
   New-Item -ItemType Directory -Force -Path $hubGuides | Out-Null

@@ -106,6 +106,106 @@ async fn retired_managed_receiver_rejects_even_a_verified_new_delegate() {
     drop(peer);
 }
 
+async fn receiver_approval_failure_diagnostics(
+    app: &App,
+    profile: &PublishProfile,
+    id: &str,
+    decision: ReviewDecision,
+    calls: &AtomicUsize,
+) -> String {
+    let posts = calls.load(Ordering::SeqCst);
+    match app
+        .store
+        .remote_job_store()
+        .get(&profile.id.0.to_string(), id.parse().unwrap())
+    {
+        Ok(Some(job)) => {
+            let terminal = match job.admitted_turn_id {
+                Some(turn) => app
+                    .store
+                    .session_repo()
+                    .durable_terminal_for_turn(job.session_id, turn)
+                    .await
+                    .map(|terminal| terminal.map(|terminal| terminal.outcome)),
+                None => Ok(None),
+            };
+            let provider_failure = job
+                .admitted_turn_id
+                .map(|turn| receiver_recorded_provider_failure(&app.store, job.session_id, turn));
+            format!(
+                "decision={decision:?}; fixture_posts={posts}; session_id={}; admitted_turn={:?}; canonical_terminal={terminal:?}; provider_failure={provider_failure:?}",
+                job.session_id, job.admitted_turn_id
+            )
+        }
+        Ok(None) => format!("decision={decision:?}; fixture_posts={posts}; job_record=missing"),
+        Err(error) => {
+            format!("decision={decision:?}; fixture_posts={posts}; job_lookup_error={error}")
+        }
+    }
+}
+
+fn receiver_recorded_provider_failure(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    turn_id: crate::protocol::TurnId,
+) -> String {
+    use rusqlite::OptionalExtension as _;
+
+    let diagnostic = (|| -> rusqlite::Result<String> {
+        let connection = rusqlite::Connection::open_with_flags(
+            store.paths().database_path.as_std_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM harness_runs
+             WHERE session_id = ?1 AND protocol_turn_id = ?2 LIMIT 2",
+        )?;
+        let runs = statement
+            .query_map(
+                rusqlite::params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let [run_id] = runs.as_slice() else {
+            return Ok(format!(
+                "expected one exact-turn harness run, found {}",
+                runs.len()
+            ));
+        };
+        connection
+            .query_row(
+                "SELECT json_object(
+                    'kind', json_extract(payload_json, '$.data.event.failure.kind'),
+                    'phase', json_extract(payload_json, '$.data.event.failure.phase'),
+                    'status', json_extract(payload_json, '$.data.event.failure.status'),
+                    'code', json_extract(payload_json, '$.data.event.failure.code'),
+                    'message', json_extract(payload_json, '$.data.event.failure.message'))
+                 FROM harness_events
+                 WHERE run_id = ?1
+                   AND json_extract(payload_json, '$.type') = 'generic'
+                   AND json_extract(payload_json, '$.data.kind') = 'provider_phase'
+                   AND json_extract(payload_json, '$.data.event.phase') = 'provider_terminal'
+                   AND json_type(payload_json, '$.data.event.failure') = 'object'
+                 ORDER BY sequence_no DESC LIMIT 1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|failure| failure.unwrap_or_else(|| "no recorded provider failure".into()))
+    })();
+    let mut text = diagnostic.unwrap_or_else(|error| format!("diagnostic read failed: {error}"));
+    const SUFFIX: &str = "...[truncated]";
+    if text.len() > 2048 {
+        let mut end = 2048 - SUFFIX.len();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(SUFFIX);
+    }
+    text
+}
+
 #[tokio::test]
 async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop() {
     for decision in [
@@ -135,7 +235,7 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+        let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |axum::Json(_request): axum::Json<Value>| {
             let command = command.clone(); let count = count.clone();
             async move {
                 let (delta, finish) = if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -158,7 +258,7 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
             .unwrap();
         let accepted = call(&dispatcher, "delegate_task", task("reviewed-request")).await;
         let id = accepted["job_id"].as_str().unwrap();
-        let pending = tokio::time::timeout(Duration::from_secs(10), async {
+        let pending = match tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(pending) = jobs.pending_approval() {
                     return pending;
@@ -167,7 +267,14 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
             }
         })
         .await
-        .unwrap();
+        {
+            Ok(pending) => pending,
+            Err(error) => panic!(
+                "receiver approval wait failed: {error}; {}",
+                receiver_approval_failure_diagnostics(&app, &profile, id, decision, calls.as_ref())
+                    .await
+            ),
+        };
         assert_eq!(pending.context.job_id.to_string(), id);
         assert_eq!(pending.context.profile_id, profile.id);
         let activity = jobs.activity_now();
@@ -206,7 +313,9 @@ async fn default_receiver_waits_for_local_approval_and_preserves_denial_and_stop
             } else {
                 "completed"
             },
-            "{finished}"
+            "{finished}; {}",
+            receiver_approval_failure_diagnostics(&app, &profile, id, decision, calls.as_ref())
+                .await
         );
         assert!(!jobs.answer_approval(
             pending.confirmation_id,

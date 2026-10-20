@@ -227,17 +227,56 @@ fn input_budget_never_retains_half_of_a_prior_side_exchange() {
     ];
     let recent_user = prior[2].clone();
     let recent_assistant = prior[3].clone();
+    let owner_session_id = SessionId::new();
+    let owner_body = "OWNER_EVIDENCE".repeat(15);
+    let owner_unit = input_budget_owner_unit(0, owner_body.clone(), 2);
+    let system_prompt = side_chat_system_prompt("");
+    let question = "CURRENT_QUESTION";
+    let required_messages = vec![
+        SideChatHistoryMessage::OwnerContext(render_owner_context(
+            owner_session_id,
+            Some(7),
+            false,
+            &[&owner_unit],
+            None,
+        )),
+        recent_user.clone(),
+        recent_assistant.clone(),
+        SideChatHistoryMessage::User(question.to_string()),
+    ];
+    let required_input = side_chat_input_budget(&system_prompt, &required_messages);
+    // Reserve one eighth of the context, subject to the consumer's bounds.
+    // The false envelope is one byte larger than the eventual truncated one.
+    let response_headroom = required_input.div_ceil(7).clamp(
+        SIDE_CHAT_MIN_RESPONSE_RESERVE_TOKENS,
+        SIDE_CHAT_MAX_RESPONSE_RESERVE_TOKENS,
+    );
+    let context_window = u32::try_from(required_input + response_headroom)
+        .expect("the bounded fixture context fits u32");
+    let total_tokens = usize::try_from(context_window).expect("fixture context fits usize");
+    let response_reserve = (total_tokens / 8).clamp(
+        SIDE_CHAT_MIN_RESPONSE_RESERVE_TOKENS,
+        SIDE_CHAT_MAX_RESPONSE_RESERVE_TOKENS,
+    );
+    let usable_input = total_tokens - response_reserve;
+    let old_pair_tokens = prior[..2]
+        .iter()
+        .map(SideChatHistoryMessage::budget_tokens)
+        .sum::<usize>();
+    assert!(required_input <= usable_input);
+    assert!(usable_input < required_input + old_pair_tokens);
+
     let prepared = build_prepared_side_chat_input(
-        SessionId::new(),
+        owner_session_id,
         Some(7),
-        vec![input_budget_owner_unit(0, "OWNER_EVIDENCE".repeat(15), 2)],
+        vec![owner_unit],
         1,
         false,
         prior,
         None,
-        "CURRENT_QUESTION",
-        side_chat_system_prompt(""),
-        4_096,
+        question,
+        system_prompt,
+        context_window,
     )
     .expect("an older pair can be dropped while the recent exchange remains complete");
     assert!(prepared.context.truncated);
@@ -246,8 +285,14 @@ fn input_budget_never_retains_half_of_a_prior_side_exchange() {
     assert_eq!(prepared.messages[2], recent_assistant);
     assert_eq!(
         prepared.messages[3],
-        SideChatHistoryMessage::User("CURRENT_QUESTION".to_string())
+        SideChatHistoryMessage::User(question.to_string())
     );
-    assert!(input_budget_owner_text(&prepared).contains("OWNER_EVIDENCE"));
-    assert_input_budget_text_headroom(&prepared, 3_584);
+    assert!(input_budget_owner_text(&prepared).contains(&owner_body));
+    assert!(!prepared.messages.iter().any(|message| matches!(
+        message,
+        SideChatHistoryMessage::User(text) | SideChatHistoryMessage::Assistant(text)
+            if text.starts_with("OLD_")
+    )));
+    assert!(side_chat_input_budget(&prepared.system_prompt, &prepared.messages) <= usable_input);
+    assert_input_budget_text_headroom(&prepared, usable_input);
 }

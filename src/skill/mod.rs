@@ -19,6 +19,24 @@ const MAX_SKILL_CACHE_WORKSPACES: usize = 16;
 const MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES: usize = 64;
 const MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES: usize = 16 * 1024;
 
+pub(crate) const BUILTIN_SECURITY_REVIEW_NAME: &str = "moyai-security-review";
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BuiltinSkill {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub content: &'static str,
+}
+
+pub(crate) fn builtin_skill(name: &str) -> Option<BuiltinSkill> {
+    name.eq_ignore_ascii_case(BUILTIN_SECURITY_REVIEW_NAME)
+        .then_some(BuiltinSkill {
+            name: BUILTIN_SECURITY_REVIEW_NAME,
+            description: "Review the security of the current work and record evidence before completion.",
+            content: include_str!("../../assets/skills/security-review.md"),
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredSkill {
     pub name: String,
@@ -301,15 +319,24 @@ pub fn render_available_skills(root: &Utf8Path) -> String {
 }
 
 pub fn render_available_skills_from_snapshot(snapshot: &SkillsSnapshot) -> String {
-    let skills = &snapshot.skills;
-    if skills.is_empty() {
-        return "No local skills are currently available.".to_string();
-    }
+    let builtin = builtin_skill(BUILTIN_SECURITY_REVIEW_NAME).expect("built-in security skill");
+    let skills = snapshot
+        .skills
+        .iter()
+        .filter(|skill| builtin_skill(&skill.name).is_none())
+        .collect::<Vec<_>>();
+    let total = skills.len() + 1;
     let header =
-        "Use the `skill` tool when the current task clearly matches one of these local skills:"
+        "Use the `skill` tool when the current task clearly matches one of these built-in or workspace skills:"
             .to_string();
-    let mut entries = Vec::new();
-    for skill in skills.iter().take(MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES) {
+    let mut entries = vec![format!(
+        "- {}: [built-in] {}",
+        builtin.name, builtin.description
+    )];
+    for skill in skills
+        .iter()
+        .take(MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES - entries.len())
+    {
         let entry = format!("- {}: {}", skill.name, skill.description);
         let prospective_bytes = header.len()
             + entries.iter().map(String::len).sum::<usize>()
@@ -322,17 +349,18 @@ pub fn render_available_skills_from_snapshot(snapshot: &SkillsSnapshot) -> Strin
         entries.push(entry);
     }
 
-    let mut omitted = skills.len().saturating_sub(entries.len());
-    let mut omission = (omitted > 0).then(|| skill_catalog_omission(skills.len(), omitted));
+    let mut omitted = total.saturating_sub(entries.len());
+    let mut omission = (omitted > 0).then(|| skill_catalog_omission(total, omitted));
     while omission.as_ref().is_some_and(|diagnostic| {
         rendered_skill_catalog_bytes(&header, &entries, Some(diagnostic))
             > MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES
     }) {
-        if entries.pop().is_none() {
+        if entries.len() <= 1 {
             break;
         }
+        entries.pop();
         omitted = omitted.saturating_add(1);
-        omission = Some(skill_catalog_omission(skills.len(), omitted));
+        omission = Some(skill_catalog_omission(total, omitted));
     }
 
     let mut lines = Vec::with_capacity(1 + entries.len() + usize::from(omission.is_some()));
@@ -691,9 +719,10 @@ mod tests {
         assert_eq!(rendered, render_available_skills_from_snapshot(&snapshot));
         assert!(rendered.len() <= MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
         assert!(rendered.contains("- skill-000: complete description 000"));
-        assert!(rendered.contains("- skill-063: complete description 063"));
-        assert!(!rendered.contains("skill-064"));
-        assert!(rendered.contains("included 64 of 70; omitted 6"));
+        assert!(rendered.contains(BUILTIN_SECURITY_REVIEW_NAME));
+        assert!(rendered.contains("- skill-062: complete description 062"));
+        assert!(!rendered.contains("skill-063"));
+        assert!(rendered.contains("included 64 of 71; omitted 7"));
     }
 
     #[test]
@@ -724,6 +753,78 @@ mod tests {
         assert!(rendered.len() <= MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
         assert!(!rendered.contains(&oversized_description));
         assert!(!rendered.contains("- later:"));
-        assert!(rendered.contains("included 0 of 2; omitted 2"));
+        assert!(rendered.contains(BUILTIN_SECURITY_REVIEW_NAME));
+        assert!(rendered.contains("included 1 of 3; omitted 2"));
+    }
+
+    #[test]
+    fn builtin_catalog_is_available_without_workspace_files_and_reserves_its_name() {
+        let root = Utf8Path::new("/fixture");
+        let mut snapshot = SkillsSnapshot {
+            workspace_root: root.to_path_buf(),
+            roots: Vec::new(),
+            skills: Vec::new(),
+        };
+        let builtin_only = render_available_skills_from_snapshot(&snapshot);
+        assert!(builtin_only.contains(BUILTIN_SECURITY_REVIEW_NAME));
+        assert_eq!(
+            builtin_only
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count(),
+            1
+        );
+
+        snapshot.skills.push(DiscoveredSkill {
+            name: BUILTIN_SECURITY_REVIEW_NAME.to_ascii_uppercase(),
+            description: "workspace replacement".to_string(),
+            path: root.join(SKILL_FILE_NAME),
+            base_dir: root.to_path_buf(),
+        });
+        assert_eq!(
+            render_available_skills_from_snapshot(&snapshot),
+            builtin_only
+        );
+        let loaded = builtin_skill(&snapshot.skills[0].name).expect("reserved built-in name");
+        assert_eq!(loaded.name, BUILTIN_SECURITY_REVIEW_NAME);
+        assert!(!loaded.content.contains("workspace replacement"));
+        assert!(builtin_skill("unregistered-skill").is_none());
+    }
+
+    #[test]
+    fn builtin_remains_visible_when_catalog_bytes_require_omitting_workspace_skills() {
+        let root = Utf8Path::new("/fixture");
+        let snapshot = SkillsSnapshot {
+            workspace_root: root.to_path_buf(),
+            roots: Vec::new(),
+            skills: (0..70)
+                .map(|index| DiscoveredSkill {
+                    name: format!("skill-{index:03}"),
+                    description: "確認".repeat(80),
+                    path: root.join(format!("skill-{index:03}/{SKILL_FILE_NAME}")),
+                    base_dir: root.join(format!("skill-{index:03}")),
+                })
+                .collect(),
+        };
+
+        let rendered = render_available_skills_from_snapshot(&snapshot);
+        let entries = rendered
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect::<Vec<_>>();
+        assert!(rendered.len() <= MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
+        assert!(entries[0].contains(BUILTIN_SECURITY_REVIEW_NAME));
+        assert!(entries.len() < MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES);
+        assert!(
+            entries
+                .iter()
+                .skip(1)
+                .all(|line| line.ends_with(&"確認".repeat(80)))
+        );
+        assert!(rendered.contains(&format!(
+            "included {} of 71; omitted {}",
+            entries.len(),
+            71 - entries.len()
+        )));
     }
 }

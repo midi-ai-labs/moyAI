@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+mod security_review;
 mod shared_archive;
 mod shared_runs;
+pub(crate) use security_review::{
+    MAX_SECURITY_REVIEW_CHECK_REFERENCE_BYTES, MAX_SECURITY_REVIEW_CHECKS, SecurityReviewCheck,
+    SecurityReviewEvidence, SecurityReviewState,
+};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};

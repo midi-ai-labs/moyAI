@@ -193,6 +193,7 @@ impl ToolRegistry {
             Arc::new(crate::tool::current_time::CurrentTimeTool),
         );
         tools.insert("skill".to_string(), Arc::new(crate::tool::skill::SkillTool));
+        insert_security_review_tool(&mut tools);
         tools.insert(
             "docling_convert".to_string(),
             Arc::new(crate::tool::docling_convert::DoclingConvertTool),
@@ -427,6 +428,8 @@ fn synchronize_team_tools(
 
 fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     insert_goal_tools(tools);
+    tools.insert("skill".to_string(), Arc::new(crate::tool::skill::SkillTool));
+    insert_security_review_tool(tools);
     tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
     tools.insert("glob".to_string(), Arc::new(crate::tool::search::GlobTool));
     tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
@@ -457,6 +460,13 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     tools.insert(
         "current_time".to_string(),
         Arc::new(crate::tool::current_time::CurrentTimeTool),
+    );
+}
+
+fn insert_security_review_tool(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    tools.insert(
+        "security_review".to_string(),
+        Arc::new(crate::tool::security_review::SecurityReviewTool),
     );
 }
 
@@ -663,10 +673,12 @@ mod tests {
                 "list",
                 "read",
                 "read_history",
+                "security_review",
                 "shell",
                 "shell_start",
                 "shell_status",
                 "shell_stop",
+                "skill",
                 "update_goal",
                 "update_plan",
                 "write"

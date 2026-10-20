@@ -5,6 +5,7 @@ pub mod context_manager;
 pub(crate) mod goal_steering;
 pub mod mode;
 mod model_compaction;
+mod security_review;
 pub mod shared;
 pub mod step_context;
 pub mod turn_context;
@@ -1010,6 +1011,16 @@ impl AgentLoop {
                             .is_empty()
                     {
                         continue;
+                    }
+                    let review_state = repo.security_review_state(
+                        request.session.session.id,
+                        request.turn_id(),
+                    )?;
+                    if let Some(feedback) = security_review::completion_feedback(&review_state) {
+                        sink.emit(RunEvent::RecoverableRuntimeFeedback {
+                            session_id: request.session.session.id,
+                            feedback,
+                        })?;
                     }
                     let terminal = DurableTurnTerminal {
                         outcome: crate::protocol::TurnTerminalOutcome::Completed,
@@ -2303,7 +2314,8 @@ impl AgentLoop {
             arguments,
             validation_error,
         } = call;
-        let metadata = serde_json::json!({});
+        // Classification is host-owned. Invalid calls below never execute.
+        let mut metadata = serde_json::json!({"security_effect": "read"});
 
         if let Some(error_text) = validation_error {
             let result_text = format!("invalid arguments for `{}`: {error_text}", call.tool_name);
@@ -2339,6 +2351,13 @@ impl AgentLoop {
             return Ok(ToolDispatchOutcome::Failed { result_text });
         }
 
+        if let Ok(effect) = registry.validate_call_effect(
+            &call.tool_name,
+            &arguments,
+            &request.turn.resolved_config().runtime_config().mcp,
+        ) {
+            metadata["security_effect"] = Value::String(effect.as_str().to_owned());
+        }
         renew_admission_lease(&self.store, request).await?;
         let mut permission_guardian = AgentPermissionGuardian {
             agent_loop: self,
@@ -4723,6 +4742,7 @@ mod tests {
     use super::*;
 
     include!("model_compaction_tests.rs");
+    include!("security_review_tests.rs");
 
     mod remote_wait;
 

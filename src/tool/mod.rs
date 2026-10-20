@@ -19,6 +19,7 @@ pub mod read_history;
 pub mod registry;
 pub(crate) mod sandbox_process;
 pub mod search;
+pub(crate) mod security_review;
 pub(crate) mod shared_delegate;
 pub(crate) mod shared_publish_artifact;
 pub(crate) mod shared_stop_service;
