@@ -1,6 +1,6 @@
 # Windows native sandbox testhost
 
-moyAI repositoryのルートから、既存の依存とruntimeを使って確認する。依存やruntimeを追加・downloadしない。通常のlocal SAM accountでログオンし、試験はmediumのPowerShellから実行する。固定serviceの初回導入・更新・削除だけは、管理者承認を受けた公式セットアップで行う。
+moyAI repositoryのルートから、既存の依存とruntimeを使って確認する。依存やruntimeを追加・downloadしない。対応するlocal SAM accountまたはActive Directory domain accountでログオンし、試験はmediumのPowerShellから実行する。ADの実機試験にはdomainに参加したPCと到達可能なdomain controllerが必要になる。固定serviceの初回導入・更新・削除だけは、管理者承認を受けた公式セットアップで行う。
 
 Windowsのworkspace-write試験は、実製品と同じ固定sandbox serviceを使う。通常ユーザーのPowerShellで、先にhelperとlibtestを同じsource・build profile・featuresからビルドし、compiler-artifactの`profile.test=true`、`target.kind=["lib"]`に対応する`executable`を明示して選ぶ。次はdebugの例であり、releaseで確認する場合は両コマンドに`--release`を付ける。必要なfeaturesも両コマンドに揃える。最新時刻のglobで実行ファイルを選ばない。
 
@@ -51,3 +51,15 @@ try {
 endpointはtest子processだけへ渡し、親PowerShellやmachine/user環境へ設定しない。追加のignored gateを動かす場合も、同じ生存testhostと明示した入力を使い、全test子processの終了を確認してから`stop`を書く。プロセス名で一括終了したり、SCMの設定を直接変更したりしない。testhost終了が未確認ならfixtureを保持する。起動中はhelperとruntimeがpinされるため、helper/libtestの再ビルド・置換はtesthostとその子の終了後に行う。
 
 serviceは最後のfamilyとJobの清算後に停止するが、登録と固定helperは残る。別のmoyAIやRunnerが使っているserviceを、試験の終了処理で停止・削除しない。PC共通helperの削除が必要な場合は、すべての利用を正常終了してから、管理者承認を受けた`Setup-Sandbox.ps1 -Uninstall`を明示実行する。導入・更新・削除、実callerの拒否、複数familyとRunnerの寿命は、上記の手順記載やビルド成功だけで検証済みとせず、実結果を別に記録する。
+
+## AD domain accountの確認
+
+通常の全体試験に加え、上記testhostが生存している間に次のignored testを、同じendpointを渡したlibtestの子processで実行する。
+
+```text
+tool::sandbox_process::windows::brokered::tests::identity::broker_preserves_domain_group_deny_and_standard_child_identity --exact --ignored --nocapture
+```
+
+このtestは実際のAD domain userと、そのtokenに有効な同一domainのgroupを要求する。対象groupに対するDENY ACEが制限付きchildにも適用され、control fileへの書き込み、caller User SID、fresh owner、medium integrity、restricted token、privilegeの検査を通ることを確認する。local accountでの実行はAD未確認として失敗させ、skipやPASSに置き換えない。
+
+ADのUPN解決またはKerberos S4Uが失敗した場合は、表示されたWindowsのエラーと、domain controllerへ到達できるかを確認する。名前解決・group membershipの読み取り・ADポリシーによる拒否を、通常tokenでの再実行やアプリの管理者起動で回避しない。ローカルfixtureの分類・payload試験とlocal SAMの実行成功は、実AD/DCでの合格とは分けて記録する。

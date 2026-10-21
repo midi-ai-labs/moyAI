@@ -1,4 +1,4 @@
-//! Local S4U token preparation for the privileged sandbox broker.
+//! Local and Active Directory S4U token preparation for the privileged sandbox broker.
 //!
 //! The caller handle is borrowed from the broker's authenticated client owner.
 //! This module does not authenticate IPC or accept additional normal groups.
@@ -99,6 +99,13 @@ unsafe extern "system" {
     ) -> i32;
     fn LsaDeregisterLogonProcess(handle: HANDLE) -> i32;
     fn LsaFreeReturnBuffer(buffer: *mut c_void) -> i32;
+    fn TranslateNameW(
+        account: *const u16,
+        account_format: i32,
+        desired_format: i32,
+        translated: *mut u16,
+        size: *mut u32,
+    ) -> u8;
 }
 
 #[link(name = "advapi32")]
@@ -221,6 +228,13 @@ pub struct CallerIdentity {
     pub user_name: String,
     pub domain_name: String,
     pub session_id: u32,
+    pub(crate) account_kind: CallerAccountKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallerAccountKind {
+    LocalSam,
+    ActiveDirectory,
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -376,6 +390,129 @@ fn utf16_z(value: &[u16]) -> Result<String, String> {
     String::from_utf16(&value[..end]).map_err(|error| format!("account name UTF-16: {error}"))
 }
 
+fn caller_account_kind(
+    user_sid: &str,
+    user_name: &str,
+    domain_name: &str,
+    computer_name: &str,
+) -> Result<CallerAccountKind, String> {
+    if user_name.is_empty()
+        || domain_name.is_empty()
+        || user_name.contains('\0')
+        || domain_name.contains('\0')
+    {
+        return Err("caller account lookup did not return a valid user and domain".into());
+    }
+    if capability_parts(user_sid).is_none() {
+        return Err(
+            "Sandbox helper supports local Windows users and Active Directory domain users; Microsoft Entra ID and other account types are not supported".into(),
+        );
+    }
+    if domain_name.eq_ignore_ascii_case(computer_name) {
+        return Ok(CallerAccountKind::LocalSam);
+    }
+    if ["AzureAD", "MicrosoftAccount", "NT AUTHORITY", "BUILTIN"]
+        .iter()
+        .any(|unsupported| domain_name.eq_ignore_ascii_case(unsupported))
+    {
+        return Err(
+            "Sandbox helper requires a local Windows account or an Active Directory domain account; this account provider is not supported".into(),
+        );
+    }
+    // Domain reachability is required when minting, not for the startup handshake.
+    Ok(CallerAccountKind::ActiveDirectory)
+}
+
+fn active_directory_upn(identity: &CallerIdentity) -> Result<String, String> {
+    let account = wide(&format!("{}\\{}", identity.domain_name, identity.user_name));
+    let mut length = 0;
+    let sized = unsafe { TranslateNameW(account.as_ptr(), 2, 8, null_mut(), &mut length) };
+    if sized == 0 && !matches!(unsafe { GetLastError() }, 122 | 234) {
+        return Err(win32_error(
+            "resolve Active Directory caller UPN (domain controller required)",
+        ));
+    }
+    if length < 2 || length > u32::from(u16::MAX) / 2 {
+        return Err("Active Directory caller UPN exceeds UNICODE_STRING capacity".into());
+    }
+    let mut translated = vec![0; length as usize];
+    if unsafe { TranslateNameW(account.as_ptr(), 2, 8, translated.as_mut_ptr(), &mut length) } == 0
+    {
+        return Err(win32_error(
+            "resolve Active Directory caller UPN (domain controller required)",
+        ));
+    }
+    let upn = utf16_z(&translated)?;
+    if upn.is_empty() {
+        return Err("Active Directory caller lookup returned an empty UPN".into());
+    }
+    Ok(upn)
+}
+
+fn s4u_logon_information(
+    principal: &str,
+    realm: Option<&str>,
+) -> Result<InformationBuffer, String> {
+    let encode = |value: &str| -> Result<Vec<u16>, String> {
+        if value.contains('\0') {
+            return Err("S4U account names must not contain a NUL character".into());
+        }
+        let encoded = wide(value);
+        if encoded.len() > usize::from(u16::MAX) / 2 {
+            return Err("S4U account name exceeds UNICODE_STRING capacity".into());
+        }
+        Ok(encoded)
+    };
+    if principal.is_empty() {
+        return Err("S4U principal must not be empty".into());
+    }
+    let name = encode(principal)?;
+    let domain = realm.map(encode).transpose()?;
+    let header = size_of::<S4uLogon>();
+    let total = header + (name.len() + domain.as_ref().map_or(0, Vec::len)) * 2;
+    let mut information = InformationBuffer::new(total);
+    let name_pointer = unsafe {
+        information
+            .pointer_mut()
+            .cast::<u8>()
+            .add(header)
+            .cast::<u16>()
+    };
+    let domain_string = if let Some(domain) = &domain {
+        let domain_pointer = unsafe { name_pointer.add(name.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(domain.as_ptr(), domain_pointer, domain.len()) };
+        UnicodeString {
+            length: ((domain.len() - 1) * 2) as u16,
+            maximum_length: (domain.len() * 2) as u16,
+            buffer: domain_pointer,
+        }
+    } else {
+        UnicodeString {
+            length: 0,
+            maximum_length: 0,
+            buffer: null_mut(),
+        }
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr(), name_pointer, name.len());
+        information
+            .pointer_mut()
+            .cast::<S4uLogon>()
+            .write(S4uLogon {
+                // MsV1_0S4ULogon and KerbS4ULogon share this submit value/layout.
+                message_type: 12,
+                flags: 0,
+                user_name: UnicodeString {
+                    length: ((name.len() - 1) * 2) as u16,
+                    maximum_length: (name.len() * 2) as u16,
+                    buffer: name_pointer,
+                },
+                domain_name: domain_string,
+            });
+    }
+    Ok(information)
+}
+
 pub fn caller_identity(caller: HANDLE) -> Result<CallerIdentity, String> {
     let user_sid = user_sid(caller)?;
     let sid = local_sid(&user_sid)?;
@@ -397,7 +534,7 @@ pub fn caller_identity(caller: HANDLE) -> Result<CallerIdentity, String> {
         return Err(win32_error("size caller account lookup"));
     }
     if name_length == 0 || domain_length == 0 {
-        return Err("caller account lookup did not return a local user and domain".into());
+        return Err("caller account lookup did not return a user and domain".into());
     }
     let mut name = vec![0; name_length as usize];
     let mut domain = vec![0; domain_length as usize];
@@ -427,14 +564,13 @@ pub fn caller_identity(caller: HANDLE) -> Result<CallerIdentity, String> {
         "read local computer name",
     )?;
     let computer = utf16_z(&computer)?;
-    if !domain_name.eq_ignore_ascii_case(&computer) {
-        return Err("only a local SAM caller is supported by this broker token factory".into());
-    }
+    let account_kind = caller_account_kind(&user_sid, &user_name, &domain_name, &computer)?;
     Ok(CallerIdentity {
         user_sid,
         user_name,
         domain_name,
         session_id: session_id(caller)?,
+        account_kind,
     })
 }
 
@@ -727,8 +863,20 @@ pub fn mint_token(
         }
     }
     let owner = local_sid(owner_sid)?;
+    let principal = match identity.account_kind {
+        CallerAccountKind::LocalSam => identity.user_name.clone(),
+        CallerAccountKind::ActiveDirectory => active_directory_upn(&identity)?,
+    };
+    let logon_information = s4u_logon_information(
+        &principal,
+        (identity.account_kind == CallerAccountKind::LocalSam).then_some("."),
+    )?;
     let mut process_bytes = b"moyAI sandbox broker\0".to_vec();
-    let mut package_bytes = b"MICROSOFT_AUTHENTICATION_PACKAGE_V1_0\0".to_vec();
+    let mut package_bytes = match identity.account_kind {
+        CallerAccountKind::LocalSam => b"MICROSOFT_AUTHENTICATION_PACKAGE_V1_0\0".as_slice(),
+        CallerAccountKind::ActiveDirectory => b"Kerberos\0".as_slice(),
+    }
+    .to_vec();
     let mut origin_bytes = b"moyAI workspace-write\0".to_vec();
     let lsa_string = |value: &mut Vec<u8>| LsaString {
         length: (value.len() - 1) as u16,
@@ -750,49 +898,14 @@ pub fn mint_token(
     check_status(
         unsafe { LsaLookupAuthenticationPackage(connection.0, &package_name, &mut package) },
         0,
-        "lookup local S4U package",
+        "lookup S4U authentication package",
     )?;
-
-    let name = wide(&identity.user_name);
-    let domain = wide(".");
-    let name_bytes = (name.len() - 1)
-        .checked_mul(2)
-        .ok_or("S4U user name length overflow")?;
-    if name_bytes > u16::MAX as usize - 2 {
-        return Err("S4U user name exceeds UNICODE_STRING capacity".into());
-    }
-    let header = size_of::<S4uLogon>();
-    let total = header + name.len() * 2 + domain.len() * 2;
-    let mut logon_information = InformationBuffer::new(total);
-    let name_pointer = unsafe {
-        logon_information
-            .pointer_mut()
-            .cast::<u8>()
-            .add(header)
-            .cast::<u16>()
+    let logon_stage = match identity.account_kind {
+        CallerAccountKind::LocalSam => "local S4U with fresh owner group",
+        CallerAccountKind::ActiveDirectory => {
+            "Active Directory Kerberos S4U (domain controller and user group-read access required)"
+        }
     };
-    let domain_pointer = unsafe { name_pointer.add(name.len()) };
-    unsafe {
-        std::ptr::copy_nonoverlapping(name.as_ptr(), name_pointer, name.len());
-        std::ptr::copy_nonoverlapping(domain.as_ptr(), domain_pointer, domain.len());
-        logon_information
-            .pointer_mut()
-            .cast::<S4uLogon>()
-            .write(S4uLogon {
-                message_type: 12,
-                flags: 0,
-                user_name: UnicodeString {
-                    length: name_bytes as u16,
-                    maximum_length: (name_bytes + 2) as u16,
-                    buffer: name_pointer,
-                },
-                domain_name: UnicodeString {
-                    length: 2,
-                    maximum_length: 4,
-                    buffer: domain_pointer,
-                },
-            });
-    }
     let groups = OneGroup {
         count: 1,
         group: SID_AND_ATTRIBUTES {
@@ -822,7 +935,7 @@ pub fn mint_token(
                 3,
                 package,
                 logon_information.pointer(),
-                total as u32,
+                logon_information.bytes as u32,
                 groups,
                 &source,
                 &mut profile,
@@ -838,9 +951,9 @@ pub fn mint_token(
             if !raw.is_null() {
                 unsafe { CloseHandle(raw) };
             }
-            check_status(status, substatus, "local S4U with fresh owner group")?;
+            check_status(status, substatus, logon_stage)?;
         }
-        let token = OwnedToken::from_raw(raw, "local S4U token handle")?;
+        let token = OwnedToken::from_raw(raw, "S4U token handle")?;
         if user_sid(token.raw())? != identity.user_sid {
             return Err("S4U returned a different caller User SID".into());
         }
@@ -1022,10 +1135,12 @@ pub fn mint_token(
 #[cfg(test)]
 mod tests {
     use super::{
-        SE_GROUP_DENY_ONLY, SE_GROUP_ENABLED, default_dacl_descriptor, groups_to_disable,
-        missing_deny_groups, sid_text, validate_capability_sids,
+        CallerAccountKind, S4uLogon, SE_GROUP_DENY_ONLY, SE_GROUP_ENABLED, caller_account_kind,
+        default_dacl_descriptor, groups_to_disable, missing_deny_groups, s4u_logon_information,
+        sid_text, validate_capability_sids,
     };
     use std::collections::HashSet;
+    use std::mem::size_of;
     use std::ptr::null_mut;
     use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce, GetSecurityDescriptorDacl};
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -1035,6 +1150,119 @@ mod tests {
     }
     const CALLER: &str = "S-1-5-21-100-200-300-1001";
     const OWNER: &str = "S-1-5-21-50-60-70-80";
+
+    #[test]
+    fn accepts_local_and_ad_domain_users_without_reclassifying_local_backed_accounts() {
+        assert_eq!(
+            caller_account_kind(CALLER, "alice", "workstation", "WORKSTATION").unwrap(),
+            CallerAccountKind::LocalSam
+        );
+        assert_eq!(
+            caller_account_kind(CALLER, "alice", "CORP", "WORKSTATION").unwrap(),
+            CallerAccountKind::ActiveDirectory
+        );
+    }
+
+    #[test]
+    fn rejects_cloud_providers_non_user_sid_namespaces_and_invalid_account_names() {
+        for sid in [
+            "S-1-12-1-1-2-3-4",
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-5-21-1-2-3",
+        ] {
+            assert!(caller_account_kind(sid, "alice", "CORP", "WORKSTATION").is_err());
+        }
+        for domain in [
+            "AzureAD",
+            "azuread",
+            "MicrosoftAccount",
+            "NT AUTHORITY",
+            "BUILTIN",
+        ] {
+            assert!(caller_account_kind(CALLER, "alice", domain, "WORKSTATION").is_err());
+        }
+        for (user, domain) in [
+            ("", "CORP"),
+            ("alice", ""),
+            ("alice\0bob", "CORP"),
+            ("alice", "CORP\0"),
+        ] {
+            assert!(caller_account_kind(CALLER, user, domain, "WORKSTATION").is_err());
+        }
+    }
+
+    #[test]
+    fn s4u_request_keeps_utf16_strings_contiguous_and_omits_unknown_ad_realm() {
+        for (principal, realm) in [
+            ("alice", Some(".")),
+            ("利用者@example.test", None),
+            ("alice", Some("部署.example")),
+        ] {
+            let information = s4u_logon_information(principal, realm).unwrap();
+            let logon = unsafe { &*information.pointer().cast::<S4uLogon>() };
+            assert_eq!(logon.message_type, 12);
+            assert_eq!(logon.flags, 0);
+            let expected: Vec<_> = principal.encode_utf16().collect();
+            assert_eq!(usize::from(logon.user_name.length), expected.len() * 2);
+            assert_eq!(logon.user_name.maximum_length, logon.user_name.length + 2);
+            assert_eq!(
+                logon.user_name.buffer.cast::<u8>(),
+                unsafe {
+                    information
+                        .pointer()
+                        .cast::<u8>()
+                        .add(size_of::<S4uLogon>())
+                }
+                .cast_mut()
+            );
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(logon.user_name.buffer, expected.len()) },
+                expected
+            );
+            assert_eq!(unsafe { *logon.user_name.buffer.add(expected.len()) }, 0);
+            if let Some(realm) = realm {
+                let expected_realm: Vec<_> = realm.encode_utf16().collect();
+                assert_eq!(
+                    usize::from(logon.domain_name.length),
+                    expected_realm.len() * 2
+                );
+                assert_eq!(
+                    logon.domain_name.maximum_length,
+                    logon.domain_name.length + 2
+                );
+                assert_eq!(logon.domain_name.buffer, unsafe {
+                    logon.user_name.buffer.add(expected.len() + 1)
+                });
+                assert_eq!(
+                    unsafe {
+                        std::slice::from_raw_parts(logon.domain_name.buffer, expected_realm.len())
+                    },
+                    expected_realm
+                );
+                assert_eq!(
+                    unsafe { *logon.domain_name.buffer.add(expected_realm.len()) },
+                    0
+                );
+            } else {
+                assert!(logon.domain_name.buffer.is_null());
+                assert_eq!(logon.domain_name.length, 0);
+                assert_eq!(logon.domain_name.maximum_length, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn s4u_request_rejects_empty_principal_embedded_nuls_and_oversized_unicode_strings() {
+        assert!(s4u_logon_information("", None).is_err());
+        assert!(s4u_logon_information("alice\0bob", None).is_err());
+        assert!(s4u_logon_information("alice", Some("CORP\0")).is_err());
+        let oversized = "x".repeat(usize::from(u16::MAX) / 2);
+        assert!(s4u_logon_information(&oversized, None).is_err());
+        assert!(s4u_logon_information("alice", Some(&oversized)).is_err());
+        let maximum = "x".repeat(usize::from(u16::MAX) / 2 - 1);
+        assert!(s4u_logon_information(&maximum, Some(&maximum)).is_ok());
+    }
 
     #[test]
     fn accepts_distinct_synthetic_capabilities() {

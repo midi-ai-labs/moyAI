@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.ja.md">日本語</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">Published v2.1.1</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.1">Download v3.0.1</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">License</a>
 </p>
@@ -19,7 +19,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.0-rc.2 is a Windows x64 release candidate for use with moyAI Hub 0.1.0.** This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.0-rc.2 release notes](docs/release/v3.0.0-rc.2.md) for changes and limitations, and the package's release evidence for its exact tested build.
+**Desktop 3.0.1 is a Windows x64 fix release for use with moyAI Hub 0.1.0.** This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.1 release notes](docs/release/v3.0.1.md) for changes and limitations, and the package's release evidence for its exact tested build.
 
 ## Highlights
 
@@ -37,7 +37,7 @@ Security review uses original guidance informed by OWASP, a built-in Skill, and 
 
 ## Quick Start
 
-For the 3.0.0-rc.2 Windows package:
+For the 3.0.1 Windows package:
 
 1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt for initial installation or a changed shared sandbox helper; cancelling stops before the user application is installed. Open **moyAI** from the Start menu without a startup UAC prompt. Portable use also requires the shared helper; follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
@@ -96,7 +96,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-The 3.0.0-rc.2 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+The 3.0.1 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
 On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
 
@@ -112,7 +112,7 @@ Windows x64 is the primary supported and verified deployment. Distribution needs
 
 **Ask for approval** and **Approve for me** share Windows workspace restrictions; the latter uses an AI reviewer for permission decisions. **Full access** runs approved processes with the current Windows user's authority. These restrictions are not a complete OS isolation boundary. Native process sandboxing is Windows-only; restricted process operations fail closed elsewhere. Unix updates/deletes may return a partial-commit error with a preserved backup, which must be reviewed.
 
-Administrator setup installs the fixed `MoyAISandbox` demand-start LocalSystem service under Windows Program Files. Only administrators and SYSTEM can change its executable and configuration; interactive users can query and start it. The app and Runner remain ordinary user processes. Installation does not approve individual tool operations or automatically rerun a failed restricted command with full access. The current sandbox supports local Windows SAM accounts. Unsupported account types and helper validation failures stop startup. Standard Python private-directory and pytest temporary-directory access inside the allowed workspace/TEMP must work without changing project files or requesting unrestricted execution; outside and other-effect restrictions remain separate checks.
+Administrator setup installs the fixed `MoyAISandbox` demand-start LocalSystem service under Windows Program Files. Only administrators and SYSTEM can change its executable and configuration; interactive users can query and start it. The app and Runner remain ordinary user processes. Installation does not approve individual tool operations or automatically rerun a failed restricted command with full access. The sandbox supports local Windows SAM accounts and Active Directory domain accounts. Domain-account restricted execution requires a domain-member PC, access to a domain controller and permission to read the user's group memberships. Microsoft Entra ID-only accounts remain unsupported. Unsupported account types and helper validation failures stop startup; domain lookup or authentication failures stop the operation without an unrestricted retry. Standard Python private-directory and pytest temporary-directory access inside the allowed workspace/TEMP must work without changing project files or requesting unrestricted execution; outside and other-effect restrictions remain separate checks.
 
 Start from an ordinary installation folder. Startup refuses a helper or bundled runtime reached through a junction, symbolic link or other reparse point; move the complete package to an ordinary folder if that check fails.
 
@@ -142,7 +142,7 @@ Windows native sandbox tests require an explicitly approved helper testhost. Fol
 
 Use the [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md) and [manual test entrypoint](tests/manual_ST/README.md) to select checks for the changed behavior. Real-window evidence and Live LLM behavior must be distinguished from fixture tests. Source ownership is visible in [src/](src/) and [the multi-PC design](docs/design/multi-device-session.md); implementation details belong with their code and tests rather than being duplicated here.
 
-Earlier 3.0.0 candidates were tested with Manual ST Cases 1–7, restoration stages, and virtual WinA/WinB execution and result transfer on one Windows PC. Those results, including generated-code evaluation failures and Side Chat answer inaccuracies, remain historical evidence. They do not establish acceptance of 3.0.0-rc.2. Results for this candidate are recorded separately in the development workspace at `project_sandbox/release-3.0.0-rc2-resume-20261021/RESULTS.md` and in its release artifacts with the exact version, commit and binary identities. Fresh-PC installation and physical multi-PC/LAN/Firewall checks require separate evidence.
+Earlier 3.0.0 candidates were tested with Manual ST Cases 1–7, restoration stages, and virtual WinA/WinB execution and result transfer on one Windows PC. Those results, including generated-code evaluation failures and Side Chat answer inaccuracies, remain historical evidence. They do not establish acceptance of 3.0.1. Results for this fix are recorded separately in the development workspace at `project_sandbox/release-3.0.1-ad-20261021/RESULTS.md` and in its release artifacts with the exact version, commit and binary identities. Actual Active Directory domain-account execution has not yet been verified against a domain controller. Fresh-PC installation and physical multi-PC/LAN/Firewall checks also require separate evidence.
 
 Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner, cleanup and the sandbox helper, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
 

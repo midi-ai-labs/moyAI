@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.md">English</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.1.1">公開済み v2.1.1</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.1">ダウンロード v3.0.1</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">ライセンス</a>
 </p>
@@ -19,7 +19,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.0-rc.2はWindows x64向けのリリース候補で、moyAI Hub 0.1.0と組み合わせて使います。** このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.0-rc.2リリースノート](docs/release/v3.0.0-rc.2.md)、実際に試験した版は配布物に対応する証跡を参照してください。
+**Desktop 3.0.1はWindows x64向けの修正版で、moyAI Hub 0.1.0と組み合わせて使います。** このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.1リリースノート](docs/release/v3.0.1.md)、実際に試験した版は配布物に対応する証跡を参照してください。
 
 ## できること
 
@@ -37,7 +37,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-3.0.0-rc.2のWindows配布物では、次の順に進みます。
+3.0.1のWindows配布物では、次の順に進みます。
 
 1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。初回導入または共通sandbox helperの更新時だけ別画面で管理者承認し、取り消すと利用者側アプリの導入前に中止します。以後はスタートメニューから **moyAI** を開き、起動ごとのUACはありません。インストールせず使う場合も共通helperが必要です。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
@@ -90,7 +90,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-3.0.0-rc.2配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.1配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUACは不要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 
@@ -106,7 +106,7 @@ WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUAC�
 
 「承認を求める」と「代理で承認」は同じWindowsの作業フォルダー保護を使い、後者はAIが操作の許可を審査します。「フルアクセス」は現在のWindows利用者の権限で実行します。これはOS全体の完全隔離を保証するものではありません。ネイティブなプロセス保護はWindowsのみで、他OSでは保護が必要なプロセス操作を拒否します。Unixの既存ファイル更新・削除は、バックアップを残した部分完了エラーになる場合があり、表示された保存先の確認が必要です。
 
-管理者による導入で、WindowsのProgram Files配下に固定のsandbox helperと、必要時にLocalSystemで開始する `MoyAISandbox` サービスを配置します。実行物と登録設定は管理者とSYSTEMだけが変更でき、通常利用者は照会と開始だけができます。通常アプリとRunnerは一般ユーザー権限のまま動作し、この導入で個々のtool操作を許可したり、失敗した制限付きcommandをフルアクセスで自動再実行したりしません。現在のsandboxはlocal Windows SAM accountを対象とし、非対応のaccount種別やhelperの検証失敗では起動を中止します。許可済みworkspace / TEMP内での標準Python private directoryとpytest一時directoryの利用は、project fileの変更や制限外実行の依頼なしに動作することが要件です。workspace外や別effectへの制限は別に確認します。
+管理者による導入で、WindowsのProgram Files配下に固定のsandbox helperと、必要時にLocalSystemで開始する `MoyAISandbox` サービスを配置します。実行物と登録設定は管理者とSYSTEMだけが変更でき、通常利用者は照会と開始だけができます。通常アプリとRunnerは一般ユーザー権限のまま動作し、この導入で個々のtool操作を許可したり、失敗した制限付きcommandをフルアクセスで自動再実行したりしません。sandboxはローカルWindows SAMアカウントとActive Directoryのドメインアカウントに対応します。ドメインアカウントでの制限付き実行には、PCのドメイン参加、ドメインコントローラーへの接続、利用者のグループ所属を読み取る権限が必要です。Microsoft Entra IDだけのアカウントは未対応です。非対応のアカウント種別やhelperの検証失敗では起動を中止し、ドメイン照会・認証の失敗では操作を中止します。許可済みworkspace / TEMP内での標準Python private directoryとpytest一時directoryの利用は、project fileの変更や制限外実行の依頼なしに動作することが要件です。workspace外や別effectへの制限は別に確認します。
 
 通常の配置フォルダーから起動してください。helperや同梱runtimeまでのpathにjunction・symbolic linkなどのreparse pointがある場合は起動を拒否するため、配布物全体を通常のフォルダーへ移してください。
 
@@ -136,7 +136,7 @@ Windowsのnative sandbox試験には、明示的に起動承認したhelper test
 
 [GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.0-rc.2の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/release-3.0.0-rc2-resume-20261021/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。新規PCへの導入、物理別PC・LAN・Firewallの確認には別の証跡が必要です。
+以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.1の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/release-3.0.1-ad-20261021/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。実際のドメインコントローラーとADアカウントを使う実行は未確認です。新規PCへの導入、物理別PC・LAN・Firewallの確認にも別の証跡が必要です。
 
 公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 

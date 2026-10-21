@@ -32,7 +32,7 @@ fn current_token() -> QueryToken {
     QueryToken(token)
 }
 
-fn interactive_attributes(token: HANDLE) -> u32 {
+fn token_groups(token: HANDLE) -> Vec<(String, u32)> {
     let mut needed = 0;
     assert_eq!(
         unsafe { GetTokenInformation(token, 2, null_mut(), 0, &mut needed) },
@@ -57,20 +57,22 @@ fn interactive_attributes(token: HANDLE) -> u32 {
             count,
         )
     };
-    let mut sid = null_mut();
-    let wide: Vec<_> = INTERACTIVE.encode_utf16().chain(Some(0)).collect();
-    assert_ne!(
-        unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) },
-        0
-    );
-    let attributes = entries
+    entries
         .iter()
-        .find(|entry| unsafe { EqualSid(entry.Sid, sid) } != 0)
-        .map(|entry| entry.Attributes);
-    unsafe {
-        LocalFree(sid);
-    }
-    attributes.expect("native gate needs an interactive caller, not a service/test SYSTEM token")
+        .map(|entry| {
+            let mut text = null_mut();
+            assert_ne!(unsafe { ConvertSidToStringSidW(entry.Sid, &mut text) }, 0);
+            let mut length = 0;
+            while unsafe { *text.add(length) } != 0 {
+                length += 1;
+            }
+            let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) });
+            unsafe {
+                LocalFree(text.cast());
+            }
+            (sid.unwrap(), entry.Attributes)
+        })
+        .collect()
 }
 
 // Preserve the complete original descriptor until the assertion scope ends.
@@ -82,7 +84,7 @@ struct DenyContentWrite {
     protected: bool,
 }
 impl DenyContentWrite {
-    fn install(path: &camino::Utf8Path) -> Self {
+    fn install(path: &camino::Utf8Path, denied_group: &str) -> Self {
         let file = OpenOptions::new()
             .access_mode(READ_CONTROL | WRITE_DAC)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -120,7 +122,7 @@ impl DenyContentWrite {
             protected: control & 0x1000 != 0,
         };
         let mut sid = null_mut();
-        let wide: Vec<_> = INTERACTIVE.encode_utf16().chain(Some(0)).collect();
+        let wide: Vec<_> = denied_group.encode_utf16().chain(Some(0)).collect();
         assert_ne!(
             unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) },
             0
@@ -273,19 +275,59 @@ $evidence=[pscustomobject]@{
 "#;
 
 #[test]
-#[ignore = "requires an approved broker testhost with a local SAM interactive standard-medium caller"]
+#[ignore = "requires an approved broker testhost with an interactive standard-medium caller"]
 fn broker_preserves_interactive_deny_and_standard_child_identity() {
     let caller = current_token();
-    let caller_user = crate::sandbox_broker::token::user_sid(caller.0).unwrap();
-    let caller_attributes = interactive_attributes(caller.0);
+    let caller_attributes = token_groups(caller.0)
+        .iter()
+        .find(|(sid, _)| sid == INTERACTIVE)
+        .map(|(_, attributes)| *attributes)
+        .expect("native gate needs an interactive caller, not a service/test SYSTEM token");
+    verify_group_deny_and_standard_child_identity(caller.0, INTERACTIVE, caller_attributes);
+}
+
+#[test]
+#[ignore = "requires an approved broker testhost logged on as an Active Directory domain user"]
+fn broker_preserves_domain_group_deny_and_standard_child_identity() {
+    use crate::sandbox_broker::token::{CallerAccountKind, caller_identity};
+
+    let caller = current_token();
+    let identity = caller_identity(caller.0).unwrap();
+    assert_eq!(
+        identity.account_kind,
+        CallerAccountKind::ActiveDirectory,
+        "AD native gate requires an Active Directory domain user; a local account is not evidence"
+    );
+    assert!(identity.user_sid.starts_with("S-1-5-21-"));
+    let (domain_sid, _) = identity.user_sid.rsplit_once('-').unwrap();
+    let domain_prefix = format!("{domain_sid}-");
+    let (denied_group, caller_attributes) = token_groups(caller.0)
+        .into_iter()
+        .find(|(sid, attributes)| {
+            sid.starts_with(&domain_prefix)
+                && sid != &identity.user_sid
+                && attributes & 4 != 0
+                && attributes & 16 == 0
+                && attributes & 0xc000_0000 == 0
+        })
+        .expect("AD native gate requires an enabled non-logon group from the caller's AD domain");
+    verify_group_deny_and_standard_child_identity(caller.0, &denied_group, caller_attributes);
+}
+
+fn verify_group_deny_and_standard_child_identity(
+    caller: HANDLE,
+    denied_group: &str,
+    caller_attributes: u32,
+) {
+    let caller_user = crate::sandbox_broker::token::user_sid(caller).unwrap();
     assert_ne!(
         caller_attributes & 4,
         0,
-        "INTERACTIVE must be enabled in the authenticated caller"
+        "the denied group must be enabled in the authenticated caller"
     );
     assert_eq!(caller_attributes & 16, 0);
     let (_fixture, root, profile) = fixture();
-    let denied = root.join("interactive-denied.txt");
+    let denied = root.join("group-denied.txt");
     let allowed = root.join("control.txt");
     std::fs::write(&denied, "sentinel").unwrap();
     std::fs::write(&allowed, "host-control").unwrap();
@@ -306,7 +348,7 @@ fn broker_preserves_interactive_deny_and_standard_child_identity() {
         String::from_utf8_lossy(&warmup.stderr.bytes)
     );
     assert!(warmup.process_tree_reaped && warmup.cleanup_errors.is_empty());
-    let deny = DenyContentWrite::install(&denied);
+    let deny = DenyContentWrite::install(&denied, denied_group);
     let error = std::fs::write(&denied, "host-must-not-write").unwrap_err();
     assert_eq!(error.raw_os_error(), Some(5));
     std::fs::write(&allowed, "unrelated-host-control").unwrap();
@@ -321,8 +363,9 @@ try {{ [IO.File]::WriteAllText('{}','child-must-not-write') }} catch {{
  $denialException=$_.Exception; while($null -ne $denialException.InnerException) {{ $denialException=$denialException.InnerException }};
  if(($denialException.HResult -band 65535) -ne 5) {{ throw }}; $denied=$true;
 }};
-if(-not $denied) {{ throw 'caller INTERACTIVE DENY was lost' }};
+if(-not $denied) {{ throw 'caller group DENY was lost' }};
 [IO.File]::WriteAllText('{}','restricted-control');
+$evidence | Add-Member -NotePropertyName denied_group_attributes -NotePropertyValue ([BrokerTokenEvidence]::Attributes('{denied_group}'));
 $evidence | ConvertTo-Json -Depth 4 -Compress;
 "#,
         literal(&denied),
@@ -351,6 +394,8 @@ $evidence | ConvertTo-Json -Depth 4 -Compress;
     assert_eq!(evidence["restricted"], true);
     let interactive = evidence["interactive_attributes"].as_u64().unwrap();
     assert!(interactive & 4 != 0 || interactive & 16 != 0);
+    let denied_group_attributes = evidence["denied_group_attributes"].as_u64().unwrap();
+    assert!(denied_group_attributes & 4 != 0 || denied_group_attributes & 16 != 0);
     let owner = evidence["owner_sid"].as_str().unwrap();
     assert_ne!(owner, caller_user);
     assert_ne!(owner, "S-1-1-0");
@@ -365,7 +410,9 @@ $evidence | ConvertTo-Json -Depth 4 -Compress;
         std::fs::read_to_string(&allowed).unwrap(),
         "restricted-control"
     );
-    println!("caller_interactive_attributes={caller_attributes}; child_token={evidence}");
+    println!(
+        "caller_denied_group={denied_group}; caller_group_attributes={caller_attributes}; child_token={evidence}"
+    );
     drop(deny);
     std::fs::write(&denied, "restored-host-write").unwrap();
     assert_eq!(
