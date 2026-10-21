@@ -165,6 +165,7 @@ test("pending session focus carries prompt interaction through the navigation po
     owner: sessionOwner,
     ownerChanged: true,
     durableSession: true,
+    promptValueUnchanged: true,
     focusPending: projectSelectionFocusPending,
   });
   assert.equal(initialTransition, remembered);
@@ -181,6 +182,7 @@ test("pending session focus carries prompt interaction through the navigation po
     owner: sessionOwner,
     ownerChanged: false,
     durableSession: true,
+    promptValueUnchanged: true,
     focusPending: projectSelectionFocusPending,
   });
   assert.notEqual(carried, null);
@@ -201,6 +203,7 @@ test("pending session focus carries prompt interaction through the navigation po
     owner: sessionOwner,
     ownerChanged: false,
     durableSession: true,
+    promptValueUnchanged: true,
     focusPending: false,
   });
   assert.deepEqual(
@@ -223,8 +226,44 @@ test("pending session focus carries prompt interaction through the navigation po
     owner: sessionOwner,
     ownerChanged: true,
     durableSession: false,
+    promptValueUnchanged: true,
     focusPending: true,
   }), null, "an unowned new-session composer must not inherit a durable session snapshot");
+});
+
+test("same-owner new-chat draft keeps its viewport through a changed render without inheriting reset drafts", () => {
+  const owner = "workspace\u0000quick-chat\u0000new";
+  const prompt = new FakePromptTarget(Array.from({ length: 28 }, (_, index) => `draft line ${index}`).join("\n"));
+  prompt.selectionStart = 17;
+  prompt.selectionEnd = 23;
+  prompt.scrollLeft = 4;
+  prompt.scrollTop = 201;
+  const snapshots = new Map([[owner, captureSessionInteractionSnapshot(new FakeScrollTarget(), prompt)]]);
+  const context = {
+    owner,
+    ownerChanged: false,
+    durableSession: false,
+    promptValueUnchanged: true,
+    focusPending: false,
+  };
+  const interaction = sessionPromptInteractionForRender(snapshots, context);
+  assert.notEqual(interaction, null, "a live draft does not require a saved session row");
+
+  // DOM movement and the temporary auto height can discard a retained editor's viewport.
+  prompt.scrollLeft = 0;
+  prompt.scrollTop = 0;
+  restoreSessionPromptInteraction(interaction!, prompt);
+  assert.deepEqual(
+    { left: prompt.scrollLeft, top: prompt.scrollTop, start: prompt.selectionStart, end: prompt.selectionEnd },
+    { left: 4, top: 201, start: 17, end: 23 },
+  );
+  assert.equal(prompt.focusCalls, 0, "viewport restoration does not reclaim focus from Settings");
+  assert.equal(sessionPromptInteractionForRender(snapshots, { ...context, promptValueUnchanged: false }), null,
+    "a replaced or cleared draft keeps its own caret and viewport");
+  assert.equal(sessionPromptInteractionForRender(snapshots, { ...context, ownerChanged: true }), null,
+    "returning to an unowned new-chat surface must not resurrect a previous draft interaction");
+  assert.equal(sessionPromptInteractionForRender(new Map(), context), null,
+    "first render has no live prompt interaction to restore");
 });
 
 test("completed owner-selection mutations request composer focus", () => {

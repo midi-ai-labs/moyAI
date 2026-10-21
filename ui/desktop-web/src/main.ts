@@ -1289,6 +1289,7 @@ function renderCommitted(
       owner: nextSessionInteractionOwner,
       ownerChanged: sessionInteractionOwnerChanged,
       durableSession: state.draft_target.sessionId !== null,
+      promptValueUnchanged: previousPrompt?.value === state.draft_prompt,
       focusPending: uiState.focusPromptAfterRender,
     },
   );
@@ -1501,7 +1502,8 @@ function renderCommitted(
     );
   }
   const sessionInteractionOwnsPromptSelection = state.draft_target.sessionId !== null
-    || sessionInteractionOwnerChanged;
+    || sessionInteractionOwnerChanged
+    || promptSessionInteraction !== null;
   const focusSnapshotIntent = createFocusSnapshotIntent(
     focusSnapshot,
     nextSettingsOwner,

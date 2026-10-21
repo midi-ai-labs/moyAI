@@ -24,6 +24,7 @@ export interface SessionPromptInteractionRenderContext {
   owner: string;
   ownerChanged: boolean;
   durableSession: boolean;
+  promptValueUnchanged: boolean;
   focusPending: boolean;
 }
 
@@ -372,14 +373,15 @@ export function restoreSessionPromptInteraction(
 }
 
 /**
- * Select the exact durable-session snapshot for every DOM replacement. Owner changes and pending
- * focus still determine focus behavior in main.ts; this snapshot only owns selection and scroll.
+ * Restore the exact session snapshot, or the live new-chat draft when its owner and value stay
+ * unchanged. Capture precedes DOM replacement and restore follows composer layout, since moving
+ * or temporarily expanding even a retained textarea can clamp its internal scroll position.
  */
 export function sessionPromptInteractionForRender(
   snapshots: ReadonlyMap<string, SessionInteractionSnapshot>,
   context: SessionPromptInteractionRenderContext,
 ): SessionInteractionSnapshot | null {
-  if (!context.durableSession) return null;
+  if (!context.durableSession && (context.ownerChanged || !context.promptValueUnchanged)) return null;
   return snapshots.get(context.owner) ?? null;
 }
 
