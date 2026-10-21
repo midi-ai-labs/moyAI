@@ -19104,6 +19104,7 @@ mod tests {
         publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
         run_terminal_event_notification_body, test_desktop_control_plane,
         transcript_markdown_file_name, unique_background_request_admission_open,
+        write_markdown_export_atomic,
     };
     use crate::cli::{EventRenderer as _, ReviewDecision};
     use crate::config::{ProviderProfile, ResolvedConfig};
@@ -19614,6 +19615,37 @@ mod tests {
 
         assert_ne!(fallback.as_path(), deleted_root);
         assert_ne!(fallback, hidden_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn markdown_export_atomic_supports_long_windows_paths_and_utf8_overwrite() {
+        let temp = tempfile::tempdir().expect("export fixture directory");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8 fixture path");
+        let mut parent = root.join("exports");
+        while parent.as_str().encode_utf16().count() < 220 {
+            parent.push("long-export-directory");
+        }
+        let path = parent.join(format!("{}-{}.md", "会話".repeat(24), SessionId::new()));
+        assert!(path.as_str().encode_utf16().count() > 260);
+
+        for markdown in [
+            "# 会話の保存\n\n元の内容。🗾\n",
+            "# 会話の更新\n\n新しい内容を UTF-8 で保存。✅\n",
+        ] {
+            write_markdown_export_atomic(&path, markdown).expect("atomic long-path export");
+            assert_eq!(
+                std::fs::read(path.as_std_path()).expect("exported bytes"),
+                markdown.as_bytes()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(parent.as_std_path())
+                .expect("export directory")
+                .count(),
+            1,
+            "successful overwrite must leave only the destination"
+        );
     }
 
     #[test]
@@ -20910,14 +20942,20 @@ pub(super) fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> R
         ));
     };
     std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
-    let mut temp =
-        NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
+    let parent = std::fs::canonicalize(parent.as_std_path()).map_err(|error| error.to_string())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("markdown export path must have a file name: {path}"))?;
+    let destination = parent.join(file_name);
+    // tempfile's Windows persist uses Win32 directly, so retain canonicalize's
+    // extended path prefix for both the temporary file and destination.
+    let mut temp = NamedTempFile::new_in(&parent).map_err(|error| error.to_string())?;
     temp.write_all(markdown.as_bytes())
         .map_err(|error| error.to_string())?;
     temp.as_file_mut()
         .sync_all()
         .map_err(|error| error.to_string())?;
-    temp.persist(path.as_std_path())
+    temp.persist(&destination)
         .map(|_| ())
         .map_err(|error| error.error.to_string())
 }
