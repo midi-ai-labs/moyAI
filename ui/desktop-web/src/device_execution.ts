@@ -36,6 +36,7 @@ export async function refreshDeviceExecution(context: ActionContext): Promise<vo
     if (serial !== local.executionSerial || context.getViewState()?.overlay !== "hub") return;
     acceptExecution(local, projection);
   } catch { if (serial === local.executionSerial) local.executionObservationError = "このPCの実行設定を確認できません。"; }
+  if (serial === local.executionSerial && context.getViewState()?.overlay === "hub") context.rerender(false);
 }
 export async function deviceExecutionAction(context: ActionContext, kind: string, value = ""): Promise<void> {
   const local = context.uiState.deviceNetwork, p = local.execution;

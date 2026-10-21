@@ -24,7 +24,7 @@
 
 Setup全体を「管理者として実行」しないでください。設定・履歴・ショートカット・接続ファイルの関連付けは元のWindows利用者が所有します。共通helperが欠けている、変更されている、またはアプリと版が合わない場合は起動を止め、配布物のSetupによる更新を案内します。起動時に利用者フォルダーからSYSTEM用実行物をコピーし直すことはありません。
 
-3.0.1では、ローカルWindowsアカウントに加え、Active DirectoryのドメインアカウントでログオンしたPCも対象にします。ADアカウントで制限付きコマンドを実行するには、PCがドメインに参加し、ドメインコントローラーへ接続でき、共通helperが利用者のグループ所属を読み取れる必要があります。名前解決・認証・ドメインポリシーの条件を満たせない場合は操作を中止します。社内LANへの接続や必要なVPN、ドメインの権限設定は社内管理者へ確認してください。Microsoft Entra IDだけのアカウントは未対応です。AD環境での実機確認状況は[3.0.1リリースノート](https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.1)を参照してください。
+3.0.1以降は、ローカルWindowsアカウントに加え、Active DirectoryのドメインアカウントでログオンしたPCも対象です。ADアカウントで制限付きコマンドを実行するには、PCがドメインに参加し、ドメインコントローラーへ接続でき、共通helperが利用者のグループ所属を読み取れる必要があります。名前解決・認証・ドメインポリシーの条件を満たせない場合は操作を中止します。社内LANへの接続や必要なVPN、ドメインの権限設定は社内管理者へ確認してください。Microsoft Entra IDだけのアカウントは未対応です。AD環境での実機確認状況は[3.0.2リリースノート](https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.2)を参照してください。
 
 完了できなかった場合も表示は残ります。原因と「次の操作」を確認してから閉じてください。解消しない場合は、表示全体と導入先を社内の配布担当へ伝えます。設定や履歴を初期化する必要はありません。
 
@@ -104,7 +104,7 @@ Windowsへのサインイン時にRunnerやHubを自動起動する設定も、�
 `scripts/package-release.ps1` は既定で閉域用の同梱ランタイムを要求します。配布許諾を確認した**展開済みx64固定版WebView2のディレクトリー**を `-WebView2FixedRuntimePath`、**app-local再配布用のx64 VC++ DLLディレクトリー**を `-VcRuntimePath` に指定します。VC++資材のDLLは直下の `vcruntime140.dll`、`vcruntime140_1.dll`、`msvcp140.dll` の3本に限定します。別のDLLや不足があればpackage作成前に拒否し、余分なDLLを黙ってコピー・除外しません。システムにあるDLLを自動採取しません。必要な配布元のライセンス・通知類は資材ディレクトリーとともに保管・提供してください。
 
 ```powershell
-.\scripts\package-release.ps1 -Version 3.0.1 `
+.\scripts\package-release.ps1 -Version 3.0.2 `
   -WebView2FixedRuntimePath C:\release-inputs\WebView2-x64 `
   -VcRuntimePath C:\release-inputs\VC143.CRT-x64 `
   -ManualGuiStResultsPath C:\evidence\desktop-results.md

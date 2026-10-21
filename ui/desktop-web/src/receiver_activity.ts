@@ -69,12 +69,12 @@ export async function refreshReceiverActivity(context: ActionContext): Promise<v
     if (serial !== local.receiverSerial) return;
     local.receiverActivity = projection;
     local.receiverError = "";
-    context.rerender();
+    context.rerender(false);
   } catch {
     if (serial === local.receiverSerial) {
       if (local.receiverActivity) local.receiverActivity = { ...local.receiverActivity, unavailable: true };
       local.receiverError = "このPCの実行状況を確認できません。";
-      context.rerender();
+      context.rerender(false);
     }
   }
 }

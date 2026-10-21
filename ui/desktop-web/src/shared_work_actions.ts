@@ -31,7 +31,7 @@ export async function refreshSharedWork(context: ActionContext): Promise<void> {
     }
     local.error = "";
   } catch { if (serial === local.serial) local.error = "Hubのプロジェクトを確認できません。接続の復帰後に自動で更新します。"; }
-  finally { local.polling = false; context.rerender(); }
+  finally { local.polling = false; context.rerender(false); }
 }
 export async function sharedWorkAction(context: ActionContext, kind: string, value = "", expectedParticipation?: number): Promise<void> {
   const local = context.uiState.sharedWork;

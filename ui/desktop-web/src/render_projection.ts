@@ -88,10 +88,10 @@ export interface DesktopRenderLocalPresentation {
 /**
  * The complete immutable input identity for a Desktop render pass.
  *
- * `view` is the reconciled TypeScript view projection. `comparisonKey` owns
- * automatic invalidation and intentionally ignores only the Rust ordering
- * revision. The model does not become a second state owner: it is a snapshot of
- * the values already owned by Rust or UiLocalState.
+ * `view` is the reconciled TypeScript view projection. `view` and `local` retain
+ * complete immutable snapshots of values owned by Rust or UiLocalState.
+ * `comparisonKey` owns automatic invalidation and excludes ordering counters
+ * and observation timestamps that do not affect the displayed content.
  */
 export interface DesktopRenderModel {
   readonly view: Readonly<DesktopViewState>;
@@ -173,7 +173,7 @@ export function createDesktopRenderModel(
   const localSnapshot = snapshotLocalPresentation(local);
   const comparisonKey = JSON.stringify({
     view: renderRelevantView satisfies RenderRelevantView,
-    local: localSnapshot,
+    local: renderRelevantLocal(localSnapshot),
   });
   return Object.freeze({
     view: viewSnapshot,
@@ -182,7 +182,7 @@ export function createDesktopRenderModel(
   });
 }
 
-/** True for the first model or when any render input except revision changed. */
+/** True for the first model or when display-relevant input changed. */
 export function desktopRenderModelChanged(
   previous: DesktopRenderModel | null,
   next: DesktopRenderModel,
@@ -201,6 +201,28 @@ export function desktopRenderRequired(
   forceRender: boolean,
 ): boolean {
   return forceRender || desktopRenderModelChanged(previous, next);
+}
+
+function renderRelevantLocal(local: Readonly<DesktopRenderLocalPresentation>) {
+  const shared = local.sharedWork.projection;
+  const { revision: _sharedRevision, observed_at_ms: _sharedObserved, ...sharedContent } = shared ?? {};
+  const receiver = local.deviceNetwork.receiverActivity;
+  const origin = local.deviceNetwork.originWork;
+  // Keep complete snapshots for commands and error timestamps. Successful
+  // observation times and the shared reader's ordering counter change on polls.
+  return {
+    ...local,
+    sharedWork: { ...local.sharedWork, projection: shared ? sharedContent : null },
+    deviceNetwork: {
+      ...local.deviceNetwork,
+      receiverActivity: receiver
+        ? { ...receiver, observed_at_ms: receiver.unavailable ? receiver.observed_at_ms : null }
+        : null,
+      originWork: origin
+        ? { ...origin, observed_at_ms: local.deviceNetwork.originError ? origin.observed_at_ms : 0 }
+        : null,
+    },
+  };
 }
 
 function snapshotLocalPresentation(

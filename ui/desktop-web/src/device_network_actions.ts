@@ -126,7 +126,7 @@ export async function refreshDeviceNetworkJobs(context: ActionContext): Promise<
     if (serial !== local.jobsSerial || context.getViewState()?.overlay !== "hub") return;
     local.jobsError = "経路と停止状況を取得できません。表示は最後に確認した状態です。";
   }
-  context.rerender();
+  context.rerender(false);
 }
 export async function stopDeviceNetworkJob(context: ActionContext, key: string): Promise<void> {
   const local = context.uiState.deviceNetwork;

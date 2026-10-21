@@ -23,7 +23,7 @@ async function loadList(context: ActionContext): Promise<void> {
   const local = context.uiState.mcpHistory;
   const request = beginAsyncTransaction(local.listRequest, target(local), "single-flight", (token, value) => ({ token, ...value }));
   if (!request) return;
-  if (!local.loaded) context.rerender();
+  if (!local.loaded) context.rerender(false);
   try {
     const page = await command<McpHistoryPage>("mcp_history_list", { direction: request.direction, offset: request.offset, anchor: request.anchor });
     if (!asyncTransactionIsCurrent(local.listRequest, request) || !stillVisible(context, request)) return;
@@ -37,7 +37,7 @@ async function loadList(context: ActionContext): Promise<void> {
       local.error = "履歴を取得できませんでした。表示中の内容は前回取得した記録です。「更新」で再試行できます。";
     }
   } finally {
-    if (clearAsyncTransaction(local.listRequest, request) && stillVisible(context, request)) context.rerender();
+    if (clearAsyncTransaction(local.listRequest, request) && stillVisible(context, request)) context.rerender(false);
   }
 }
 async function loadDetail(context: ActionContext): Promise<void> {
@@ -45,7 +45,7 @@ async function loadDetail(context: ActionContext): Promise<void> {
   if (!local.selectedId) return;
   const request = beginAsyncTransaction(local.detailRequest, target(local, local.selectedId), "single-flight", (token, value) => ({ token, ...value }));
   if (!request) return;
-  if (!local.detail) context.rerender();
+  if (!local.detail) context.rerender(false);
   try {
     const detail = await command<McpHistoryDetail>("mcp_history_detail", { direction: request.direction, id: request.id });
     if (!asyncTransactionIsCurrent(local.detailRequest, request) || !stillVisible(context, request)) return;
@@ -57,7 +57,7 @@ async function loadDetail(context: ActionContext): Promise<void> {
       local.detailError = "詳細を取得できませんでした。対象の記録を確認して「更新」で再試行してください。";
     }
   } finally {
-    if (clearAsyncTransaction(local.detailRequest, request) && stillVisible(context, request)) context.rerender();
+    if (clearAsyncTransaction(local.detailRequest, request) && stillVisible(context, request)) context.rerender(false);
   }
 }
 

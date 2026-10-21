@@ -70,7 +70,7 @@ export async function refreshOriginWork(context: ActionContext): Promise<void> {
   if (local.projection?.enrollment !== "active") {
     if (local.originWork) {
       local.originError = "Hubに接続できないため、この会話の別PCの状態を確認できません。";
-      context.rerender();
+      context.rerender(false);
     }
     return;
   }
@@ -91,7 +91,7 @@ export async function refreshOriginWork(context: ActionContext): Promise<void> {
       local.originError = "別PCの仕事とアプリの状態を確認できません。Hubへの接続を確認してください。";
     }
   } finally {
-    if (serial === local.originSerial) { local.originPending = false; context.rerender(); }
+    if (serial === local.originSerial) { local.originPending = false; context.rerender(false); }
   }
 }
 

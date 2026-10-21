@@ -136,7 +136,7 @@ export interface ActionContext {
   getRenderModel: () => DesktopRenderModel | null;
   acceptProjection: (state: DesktopWebState, render?: boolean, settingsAction?: SettingsActionFocusContinuation) => void;
   waitForInteractionIdle: () => Promise<void>;
-  rerender: () => void;
+  rerender: (forceRender?: boolean) => void;
   mutate: (
     name: string,
     args?: Record<string, unknown>,

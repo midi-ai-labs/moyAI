@@ -335,8 +335,8 @@ const eventContext: ActionContext = {
     : null,
   acceptProjection: (state: DesktopWebState, forceRender = true, settingsAction) => acceptState(state, forceRender, null, false, null, null, settingsAction ?? null),
   waitForInteractionIdle: () => interactionLifecycle.whenIdle(),
-  rerender: () => {
-    if (currentState) acceptState(currentState, true);
+  rerender: (forceRender = true) => {
+    if (currentState) acceptState(currentState, forceRender);
   },
   mutate,
   insertCommandFromPalette,
@@ -842,9 +842,17 @@ function applyStateUpdate(update: StateUpdate): void {
   }
   if (
     interactionLifecycle.defer(
-      { ...update, forceRender: true },
+      update,
       update.state === currentState,
-      update.forceRender,
+      update.forceRender || (
+        interactionLifecycle.active
+        && update.state === currentState
+        && desktopRenderRequired(
+          lastRenderedModel,
+          buildDesktopRenderModel(projectViewState(update.state, uiState)),
+          false,
+        )
+      ),
     )
   ) return;
   const previousProjection = currentState;
