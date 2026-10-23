@@ -32,6 +32,8 @@ pub mod single_instance;
 #[cfg(feature = "tauri-desktop")]
 pub mod startup;
 #[cfg(feature = "tauri-desktop")]
+pub mod startup_report;
+#[cfg(feature = "tauri-desktop")]
 pub mod state;
 #[cfg(feature = "tauri-desktop")]
 pub mod tauri_app;
@@ -49,4 +51,4 @@ pub use args::quick_chat_workspace_directory;
 #[cfg(feature = "tauri-desktop")]
 pub use single_instance::DesktopInstanceGuard;
 #[cfg(feature = "tauri-desktop")]
-pub use tauri_app::run;
+pub use tauri_app::{run, run_with_startup_report};

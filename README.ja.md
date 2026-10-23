@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.md">English</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.2">ダウンロード v3.0.2</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.3">ダウンロード v3.0.3</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">ライセンス</a>
 </p>
@@ -19,7 +19,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.2はWindows x64向けの修正版で、moyAI Hub 0.1.0と組み合わせて使います。** このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.2リリースノート](docs/release/v3.0.2.md)、実際に試験した版は配布物に対応する証跡を参照してください。
+**Desktop 3.0.3はWindows x64向けの修正版で、moyAI Hub 0.1.0と組み合わせて使います。** SetupでmoyAIを起動し、初期画面の描画完了を確認します。起動に失敗した場合は、エラーと診断ログの保存先を表示します。このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.3リリースノート](docs/release/v3.0.3.md)、実際に試験した版は配布物に対応する証跡を参照してください。
 
 ## できること
 
@@ -37,9 +37,9 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-3.0.2のWindows配布物では、次の順に進みます。
+3.0.3のWindows配布物では、次の順に進みます。
 
-1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。初回導入または共通sandbox helperの更新時だけ別画面で管理者承認し、取り消すと利用者側アプリの導入前に中止します。以後はスタートメニューから **moyAI** を開き、起動ごとのUACはありません。インストールせず使う場合も共通helperが必要です。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
+1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。初回導入または共通sandbox helperの更新時だけ別画面で管理者承認し、取り消すと利用者側アプリの導入前に中止します。Setupが **moyAI** を起動し、初期画面の表示を確認します。開いた画面から利用準備を進め、次回からはスタートメニューで開きます。起動に失敗した場合や60秒以内に表示を確認できなかった場合は、結果と診断ログの保存先を表示し、起動中のアプリは強制終了しません。インストールせず使う場合も共通helperが必要です。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
 
    | 目的 | 選ぶ項目 |
@@ -90,7 +90,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-3.0.2配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.3配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUACは不要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 
@@ -136,7 +136,7 @@ Windowsのnative sandbox試験には、明示的に起動承認したhelper test
 
 [GUI自動試験](tests/desktop_e2e/GUI_AUTOMATION.md)と[手動試験](tests/manual_ST/README.md)に入口があります。実画面・実際のLLMによる確認と、試験用データによる検証は区別します。実装の詳細は[src](src/)と[複数PCの設計](docs/design/multi-device-session.md)、対応するテストを参照してください。
 
-以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.2の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/release-3.0.2-redraw-20261021/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。AD環境からHubを使った動作報告はありますが、ADのtokenとグループに対するアクセス拒否を確かめる専用試験は未確認です。新規PCへの導入、物理別PC・LAN・Firewallの確認にも別の証跡が必要です。
+以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持し、3.0.3の受入確認へ流用しません。今回の結果は、開発workspaceの `project_sandbox/setup-startup-check-20261023/`、`project_sandbox/release-3.0.3-startup-20261023/RESULTS.md` と、版・commit・バイナリの識別情報を付けた配布証跡へ別に記録します。Windows 10 2016 LTSBで報告された起動失敗の原因は未確定で、このOSでの実機確認も未実施です。AD環境からHubを使った動作報告はありますが、ADのtokenとグループに対するアクセス拒否を確かめる専用試験は未確認です。新規PCへの導入、物理別PC・LAN・Firewallの確認にも別の証跡が必要です。
 
 公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 

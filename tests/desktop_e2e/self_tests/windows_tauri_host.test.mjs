@@ -35,6 +35,16 @@ test("cold and duplicate activation use the same bounded fixture argv without sh
   }
 });
 
+test("startup report argv belongs to the execution logs and preserves paths with spaces", () => {
+  const context = { paths: { workspace: "C:\\fixture\\workspace", logs: "C:\\fixture\\logs" } };
+  const report = "C:\\fixture\\logs\\startup report 日本語.json";
+  assert.deepEqual(desktopLaunchArguments(context, null, "preferences", report), ["--startup-report", report]);
+  assert.deepEqual(desktopLaunchArguments(context, null, "workspace", report), ["--dir", context.paths.workspace, "--startup-report", report]);
+  for (const value of ["report.json", "C:\\fixture\\logs", "C:\\fixture\\logs2\\report.json", "C:\\fixture\\logs\\..\\report.json", report + "\0"]) {
+    assert.throws(() => desktopLaunchArguments(context, null, "preferences", value), /startupReportPath/);
+  }
+});
+
 test("scenario environment permits only bounded product config overrides", () => {
   assert.deepEqual(normalizeScenarioEnvironment({
     MOYAI_BASE_URL: "http://127.0.0.1:43111",

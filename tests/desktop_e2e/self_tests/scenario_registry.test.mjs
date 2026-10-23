@@ -35,6 +35,7 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.deepEqual(scenarioIds, [
     "shell.baseline",
     "shell.about",
+    "shell.startup-report",
     "shell.single-instance",
     "hub.join-config-cold",
     "hub.join-config-warm",

@@ -1,5 +1,6 @@
 [
   "desktop_state",
+  "desktop_startup_ready",
   "submit_prompt",
   "prepare_latest_message_edit",
   "cancel_run",

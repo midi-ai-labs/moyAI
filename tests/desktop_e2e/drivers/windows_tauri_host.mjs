@@ -77,17 +77,28 @@ export function normalizeScenarioEnvironment(value) {
   return normalized;
 }
 
-export function desktopLaunchArguments(context, joinConfigPath = null, startupTarget = "workspace") {
+export function desktopLaunchArguments(context, joinConfigPath = null, startupTarget = "workspace", startupReportPath = null) {
   if (!["workspace", "preferences"].includes(startupTarget)) throw new TypeError("startupTarget must be workspace or preferences");
   const args = startupTarget === "workspace" ? ["--dir", context.paths.workspace] : [];
-  if (joinConfigPath === null || joinConfigPath === undefined) return args;
-  if (typeof joinConfigPath !== "string" || joinConfigPath.includes("\0") || joinConfigPath.length > 32767
-    || !path.win32.isAbsolute(joinConfigPath)) throw new TypeError("joinConfigPath must be a bounded absolute Windows path");
-  const relative = path.win32.relative(context.paths.workspace, joinConfigPath);
-  if (!relative || relative === ".." || relative.startsWith("..\\") || path.win32.isAbsolute(relative)) {
-    throw new TypeError("joinConfigPath must belong to the scenario workspace");
+  if (joinConfigPath !== null && joinConfigPath !== undefined) {
+    if (typeof joinConfigPath !== "string" || joinConfigPath.includes("\0") || joinConfigPath.length > 32767
+      || !path.win32.isAbsolute(joinConfigPath)) throw new TypeError("joinConfigPath must be a bounded absolute Windows path");
+    const relative = path.win32.relative(context.paths.workspace, joinConfigPath);
+    if (!relative || relative === ".." || relative.startsWith("..\\") || path.win32.isAbsolute(relative)) {
+      throw new TypeError("joinConfigPath must belong to the scenario workspace");
+    }
+    args.push("--join-config", joinConfigPath);
   }
-  return [...args, "--join-config", joinConfigPath];
+  if (startupReportPath !== null && startupReportPath !== undefined) {
+    if (typeof startupReportPath !== "string" || startupReportPath.includes("\0") || startupReportPath.length > 32767
+      || !path.win32.isAbsolute(startupReportPath)) throw new TypeError("startupReportPath must be a bounded absolute Windows path");
+    const relative = path.win32.relative(context.paths.logs, startupReportPath);
+    if (!relative || relative === ".." || relative.startsWith("..\\") || path.win32.isAbsolute(relative)) {
+      throw new TypeError("startupReportPath must belong to the execution logs");
+    }
+    args.push("--startup-report", startupReportPath);
+  }
+  return args;
 }
 
 export function selectActiveCleanupDriver(currentDriver, initialDriver, { restartBegan }) {
@@ -258,7 +269,7 @@ export class WindowsTauriHost {
     this.#stderrHandle = await open(stderr, "wx");
     this.#logPaths.push(stdout, stderr);
     this.#launchEnvironment = desktopLaunchEnvironment({ context, scenarioEnvironment: normalizeScenarioEnvironment(scenario.environment), processTemp });
-    const launchArguments = desktopLaunchArguments(context, scenario.joinConfigPath, scenario.startupTarget);
+    const launchArguments = desktopLaunchArguments(context, scenario.joinConfigPath, scenario.startupTarget, scenario.startupReportPath);
     this.#desktop = spawn(context.binary, launchArguments, {
       cwd: context.paths.workspace,
       env: this.#launchEnvironment,
@@ -380,7 +391,7 @@ export class WindowsTauriHost {
     if (activeDriver === null || this.#desktop === null) {
       throw new DesktopE2eError("harness", "restart-owner-missing", "Desktop restart requires an attached live generation");
     }
-    desktopLaunchArguments(nextContext, scenario.joinConfigPath, scenario.startupTarget);
+    desktopLaunchArguments(nextContext, scenario.joinConfigPath, scenario.startupTarget, scenario.startupReportPath);
     this.#restartBegan = true;
     const previous = {
       generation: this.#generation,

@@ -31,8 +31,36 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Threading;
+using System.Text;
 public static class ActivationFixture {
+  private static string Quote(string value) { return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n") + "\""; }
   public static void Main(string[] arguments) {
+    if (arguments.Length == 2 && arguments[0] == "--startup-report") {
+      Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
+      Console.SetError(new StreamWriter(Console.OpenStandardError(), new UTF8Encoding(false)) { AutoFlush = true });
+      string folder = AppDomain.CurrentDomain.BaseDirectory;
+      string modePath = Path.Combine(folder, "startup-mode.txt");
+      string mode = File.Exists(modePath) ? File.ReadAllText(modePath).Trim() : "ready";
+      int processId = Process.GetCurrentProcess().Id;
+      string logFolder = Path.GetDirectoryName(arguments[1]);
+      File.WriteAllLines(Path.Combine(logFolder, "startup-activation.txt"), new string[] { processId.ToString(), Directory.GetCurrentDirectory(), Environment.GetEnvironmentVariable("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") });
+      Console.WriteLine("fixture stdout \u65e5\u672c\u8a9e");
+      if (mode == "exit-zero") return;
+      if (mode == "exit-seven") { Environment.Exit(7); return; }
+      if (mode == "partial") { File.WriteAllText(arguments[1], "{\"schema\":1,"); Thread.Sleep(200); }
+      if (mode != "timeout") {
+        bool failed = mode == "error" || mode == "live-error";
+        string message = failed ? "fixture startup failed\r\n\u539f\u56e0: runtime & path" : "fixture ready";
+        string json = "{\"schema\":" + (mode == "bad-schema" ? "2" : "1") + ",\"status\":\"" + (failed ? "error" : "ready") + "\",\"process_id\":" + (mode == "bad-pid" ? processId + 1 : processId) + ",\"exit_code\":" + (failed ? "7" : "0") + ",\"message\":" + Quote(message) + "}";
+        if (failed) Console.Error.WriteLine(message);
+        File.WriteAllText(arguments[1], json, new UTF8Encoding(false));
+        if (failed && mode != "live-error") { Environment.Exit(7); return; }
+      }
+      string stop = Path.Combine(logFolder, "startup-stop-" + processId + ".txt");
+      DateTime deadline = DateTime.UtcNow.AddSeconds(20);
+      while (!File.Exists(stop) && DateTime.UtcNow < deadline) Thread.Sleep(20);
+      return;
+    }
     if (arguments.Length == 1 && arguments[0] == "--worker") {
       File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "worker-started.txt"), "started");
       Thread.Sleep(10000);
@@ -157,16 +185,22 @@ function Write-FixtureManifest([string]$Version, [switch]$DesktopOnly) {
     runtime=@{webview2='system-installed'; visual_cpp='system-installed'}; files=$files}
   Write-MoyaiUtf8 (Join-Path $package 'deployment.json') ($manifest | ConvertTo-Json -Depth 8)
 }
-function Invoke-FixtureSetup([string[]]$Extra = @(), [switch]$Shortcuts) {
+function Invoke-FixtureSetup([string[]]$Extra = @(), [switch]$Shortcuts, [switch]$VerifyStartup, [int]$ExpectedExitCode = 0) {
   [string[]]$shortcutOptions = @()
   if (-not $Shortcuts) { $shortcutOptions = @('-NoShortcuts') }
-  $previousErrorPreference = $ErrorActionPreference
+  if (-not $VerifyStartup) { $shortcutOptions += '-SkipStartupCheck' }
+  $outputRoot = Join-Path $EvidenceRoot ('setup-output-' + [Guid]::NewGuid().ToString('N'))
+  $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + (Join-Path $package 'scripts/Setup-moyAI.ps1') + '"'), '-InstallRoot', ('"' + $destination + '"')) + $shortcutOptions + $Extra
+  # Native pipelines wait for inherited output handles in the live Desktop child.
+  # Files and the exact setup parent handle let this test observe Setup returning.
+  $setupProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -RedirectStandardOutput ($outputRoot + '.stdout.txt') -RedirectStandardError ($outputRoot + '.stderr.txt') -PassThru
   try {
-    $ErrorActionPreference = 'Continue'
-    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'scripts/Setup-moyAI.ps1') -InstallRoot $destination @shortcutOptions @Extra 2>&1 | ForEach-Object { $_.ToString() } | Out-String
-    $setupExitCode = $LASTEXITCODE
-  } finally { $ErrorActionPreference = $previousErrorPreference }
-  if ($setupExitCode -ne 0) { throw "Setup failed: $output" }
+    $null = $setupProcess.Handle
+    if (-not $setupProcess.WaitForExit(90000)) { throw 'Fixture setup parent did not finish within its deadline.' }
+    $setupExitCode = $setupProcess.ExitCode
+  } finally { $setupProcess.Dispose() }
+  $output = (Get-Content -LiteralPath ($outputRoot + '.stdout.txt') -Raw) + (Get-Content -LiteralPath ($outputRoot + '.stderr.txt') -Raw)
+  if ($setupExitCode -ne $ExpectedExitCode) { throw "Unexpected setup exit $setupExitCode (expected $ExpectedExitCode): $output" }
   $script:lastSetupOutput = $output
 }
 Write-FixtureManifest '1.0-fixture'
@@ -237,7 +271,85 @@ Invoke-FixtureSetup
 Assert-That (Test-Path -LiteralPath (Join-Path $destination 'installation.json')) 'first installation writes an installation receipt'
 Assert-That ($lastSetupOutput.Contains('導入が完了しました') -and $lastSetupOutput.Contains((Join-Path $destination 'Start-moyAI.cmd')) -and $lastSetupOutput.Contains('チームの仕事をこのPCで実行する') -and $lastSetupOutput.Contains('参加承認や最初の仕事の準備完了とは別')) 'successful setup shows the next launcher, role-based actions and remaining team preparation in Japanese'
 Write-MoyaiUtf8 (Join-Path $EvidenceRoot 'setup-success.txt') $lastSetupOutput
-Assert-That (-not (Test-Path -LiteralPath (Join-Path $destination 'app/bin/activation.txt'))) 'setup does not automatically launch the application'
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $destination 'app/bin/startup-activation.txt'))) 'explicit SkipStartupCheck installs without launching the application'
+Assert-That ($lastSetupOutput.Contains('起動確認は省略しました')) 'central deployment explicitly reports that Desktop startup was not verified'
+# Real generated child processes exercise startup reports without opening product state.
+function Stop-FixtureStartup([string]$Root, $Result) {
+  if ($null -eq $Result.process_id) { return }
+  $child = Get-Process -Id $Result.process_id -ErrorAction SilentlyContinue
+  if ($null -eq $child) { return }
+  try {
+    Assert-That ($child.Path -ieq (Resolve-MoyaiChild $Root 'app/bin/moyai-desktop.exe')) 'startup fixture cleanup owns the exact launched executable'
+    $logRoot = if ($Result.PSObject.Properties.Name -contains 'log_root') { $Result.log_root } else { Split-Path -Parent $Result.startup_report }
+    Write-MoyaiUtf8 (Join-Path $logRoot ("startup-stop-$($Result.process_id).txt")) 'stop fixture'
+    Assert-That ($child.WaitForExit(5000)) 'startup fixture exits cooperatively after its exact stop marker'
+  } finally { $child.Dispose() }
+}
+$startupRoot = Join-Path $EvidenceRoot 'startup & 日本語'
+New-Item -ItemType Directory -Path (Join-Path $startupRoot 'app/bin') -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $package 'app/bin/moyai-desktop.exe') -Destination (Join-Path $startupRoot 'app/bin/moyai-desktop.exe')
+$startupManifest = [pscustomobject]@{version='startup-fixture'; runtime=[pscustomobject]@{webview2='system-installed'; visual_cpp='system-installed'}}
+$previousStartupWebview = [Environment]::GetEnvironmentVariable('WEBVIEW2_BROWSER_EXECUTABLE_FOLDER', 'Process')
+try {
+  $env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = 'fixture inherited value'
+  foreach ($mode in @('ready', 'partial', 'error', 'live-error', 'exit-zero', 'exit-seven', 'bad-pid', 'bad-schema', 'timeout')) {
+    Write-MoyaiUtf8 (Join-Path $startupRoot 'app/bin/startup-mode.txt') $mode
+    $result = $null
+    try {
+      $result = Test-MoyaiDesktopStartup $startupRoot $startupManifest -TimeoutMilliseconds $(if ($mode -eq 'timeout') { 250 } else { 5000 })
+      $diagnostic = Get-Content -LiteralPath (Join-Path $result.log_root 'diagnostic.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+      Assert-That ($diagnostic.windows_build -gt 0 -and $diagnostic.webview2_path -and $diagnostic.webview2_version -and $diagnostic.process_id -eq $result.process_id) "startup $mode records OS build, selected runtime version and exact process"
+      Assert-That ($env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER -ceq 'fixture inherited value') "startup $mode restores the launcher's inherited runtime environment"
+      if ($mode -in @('ready', 'partial')) {
+        Assert-That ($result.status -ceq 'ready' -and $null -eq $result.exit_code -and $null -ne (Get-Process -Id $result.process_id -ErrorAction SilentlyContinue)) "startup $mode accepts a complete exact-process report while leaving Desktop running"
+        $launchContext = @(Get-Content -LiteralPath (Join-Path $result.log_root 'startup-activation.txt') -Encoding UTF8)
+        Assert-That ($launchContext[1].TrimEnd('\') -ieq (Join-Path $startupRoot 'app/bin') -and $launchContext[2] -ceq $diagnostic.webview2_path) "startup $mode launches with the normal Desktop directory and selected WebView2"
+      } elseif ($mode -eq 'error') {
+        Assert-That ($result.status -ceq 'error' -and $diagnostic.reported_exit_code -eq 7 -and ($null -eq $result.exit_code -or $result.exit_code -eq 7) -and $result.message.Contains('原因: runtime & path')) 'startup error preserves the reported failure code and multiline Unicode cause'
+        Assert-That ((Get-Content -LiteralPath (Join-Path $result.log_root 'stderr.txt') -Raw -Encoding UTF8).Contains('原因: runtime & path') -and (Test-Path -LiteralPath (Join-Path $result.log_root 'startup-report.json'))) 'startup error saves stderr and the child report as UTF-8 evidence'
+      } elseif ($mode -eq 'live-error') {
+        Assert-That ($result.status -ceq 'error' -and $null -eq $result.exit_code -and $diagnostic.reported_exit_code -eq 7 -and $result.message.Contains('通知された終了コード: 7') -and $result.message.Contains('稼働中') -and $null -ne (Get-Process -Id $result.process_id -ErrorAction SilentlyContinue)) 'an error report from a live child separates its reported code from the actual exit status and identifies the running process'
+      } elseif ($mode -eq 'timeout') {
+        Assert-That ($result.status -ceq 'timeout' -and $null -ne (Get-Process -Id $result.process_id -ErrorAction SilentlyContinue) -and $result.message.Contains('強制終了していません')) 'startup timeout is not success and does not stop the exact launched process'
+      } else {
+        Assert-That ($result.status -ceq 'error') "startup $mode never counts process presence or an unmatched report as successful startup"
+        if ($mode -eq 'exit-zero') { Assert-That ($result.exit_code -eq 0) 'zero exit without a ready report remains a startup failure with its actual code' }
+        if ($mode -eq 'exit-seven') { Assert-That ($result.exit_code -eq 7) 'early nonzero exit without a ready report retains its actual Windows process exit code' }
+      }
+    } finally { if ($null -ne $result) { Stop-FixtureStartup $startupRoot $result } }
+  }
+  $brokenRuntime = [pscustomobject]@{version='missing-runtime-fixture'; runtime=[pscustomobject]@{webview2='bundled-fixed'; visual_cpp='system-installed'}}
+  $result = Test-MoyaiDesktopStartup $startupRoot $brokenRuntime
+  Assert-That ($result.status -ceq 'error' -and $null -eq $result.process_id -and $result.message.Contains('WebView2') -and (Test-Path -LiteralPath (Join-Path $result.log_root 'diagnostic.json'))) 'runtime recheck failure before process creation still returns the actual cause and saved diagnostic location'
+  $missingExecutableRoot = Join-Path $EvidenceRoot 'missing startup executable'
+  New-Item -ItemType Directory -Path (Join-Path $missingExecutableRoot 'app/bin') -Force | Out-Null
+  $result = Test-MoyaiDesktopStartup $missingExecutableRoot $startupManifest
+  Assert-That ($result.status -ceq 'error' -and $null -eq $result.process_id -and $result.message -and (Test-Path -LiteralPath (Join-Path $result.log_root 'diagnostic.json'))) 'process creation failure still returns its full cause and saved diagnostic location'
+} finally { [Environment]::SetEnvironmentVariable('WEBVIEW2_BROWSER_EXECUTABLE_FOLDER', $previousStartupWebview, 'Process') }
+$mainDestination = $destination
+try {
+  $destination = Join-Path $EvidenceRoot 'verified install'
+  Invoke-FixtureSetup -VerifyStartup
+  $verifiedLog = Get-ChildItem -LiteralPath ($destination + '-setup-logs') -Directory | Select-Object -First 1
+  $verifiedResult = Get-Content -LiteralPath (Join-Path $verifiedLog.FullName 'diagnostic.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  try {
+    Assert-That ($lastSetupOutput.Contains('導入が完了しました') -and $lastSetupOutput.Contains('初期画面の描画完了') -and $verifiedResult.status -ceq 'ready') 'default Setup confirms the real child report before declaring installation complete'
+    Assert-That ($null -ne (Get-Process -Id $verifiedResult.process_id -ErrorAction SilentlyContinue)) 'Setup returns while the verified Desktop remains open'
+  } finally { Stop-FixtureStartup $destination $verifiedResult }
+  Invoke-FixtureSetup -Extra @('-Uninstall')
+  Assert-That (Test-Path -LiteralPath (Join-Path $verifiedLog.FullName 'diagnostic.json')) 'uninstall preserves startup diagnostics outside the package inventory'
+  Invoke-FixtureSetup
+  Assert-That (Test-Path -LiteralPath (Join-Path $destination 'installation.json')) 'retained startup diagnostics do not prevent reinstalling into the same destination after uninstall'
+  Write-MoyaiUtf8 (Join-Path $package 'app/bin/startup-mode.txt') 'error'
+  Write-FixtureManifest '1.0-fixture'
+  $destination = Join-Path $EvidenceRoot 'failed startup install'
+  Invoke-FixtureSetup -VerifyStartup -ExpectedExitCode 1
+  Assert-That ((Test-Path -LiteralPath (Join-Path $destination 'installation.json')) -and $lastSetupOutput.Contains('配置は完了しましたが、起動確認') -and $lastSetupOutput.Contains('原因: runtime & path') -and $lastSetupOutput.Contains('診断ログ:') -and -not $lastSetupOutput.Contains('導入が完了しました')) 'failed startup returns failure with the full cause and log location while retaining the installed application'
+} finally {
+  Remove-Item -LiteralPath (Join-Path $package 'app/bin/startup-mode.txt') -ErrorAction SilentlyContinue
+  Write-FixtureManifest '1.0-fixture'
+  $destination = $mainDestination
+}
 function New-FakeClassesKey($Store = $null, [string]$Path = '') {
   if ($null -eq $Store) { $Store = @{Nodes=@{''=@{Values=@{}; Kinds=@{}}}; Writes=[Collections.Generic.List[string]]::new(); Deleted=[Collections.Generic.List[string]]::new(); Reads=@{}; RacePath=$null} }
   $key = [pscustomobject]@{Store=$Store; Path=$Path}
@@ -489,6 +601,6 @@ foreach ($expectedExit in @(0, 7)) {
     $wrapperProcess.Dispose()
   }
 }
-Write-MoyaiUtf8 (Join-Path $EvidenceRoot 'RESULTS.md') ("# Deployment focused tests`n`n" + ($checks -join "`n") + "`n`nOnly a generated argument-recording fixture and inert cmd wrapper were launched; no product executable was launched. Autostart and dedicated connection-file association tests used isolated fake registry owners; subprocess packages override registry openers and never open the real user's Run, Classes, or UserChoice keys. Setup created and removed actual WScript shortcuts only in an isolated fixture folder. Existing system runtimes were used for prerequisite checking. Fresh-PC, bundled-runtime execution, Explorer/ShellExecute association resolution, and Start-menu GUI launch remain separate validation.`n")
+Write-MoyaiUtf8 (Join-Path $EvidenceRoot 'RESULTS.md') ("# Deployment focused tests`n`n" + ($checks -join "`n") + "`n`nOnly generated activation/startup-report fixtures and an inert cmd wrapper were launched; no product executable was launched. Startup fixtures covered ready, partial JSON, error, zero exit without a report, wrong PID/schema and timeout, including actual Setup success/failure and retained diagnostics. Autostart and dedicated connection-file association tests used isolated fake registry owners; subprocess packages override registry openers and never open the real user's Run, Classes, or UserChoice keys. Setup created and removed actual WScript shortcuts only in an isolated fixture folder. Existing system runtimes were used for prerequisite checking. Fresh-PC, bundled-runtime execution, Explorer/ShellExecute association resolution, and Start-menu GUI launch remain separate validation.`n")
 $checks | Write-Output
 Write-Output "evidence=$EvidenceRoot"

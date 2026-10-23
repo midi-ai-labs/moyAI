@@ -220,6 +220,7 @@ import {
   type PermissionReviewDecision,
 } from "./decision_state";
 import { escapeHtml, humanizeError } from "./utils";
+import { createStartupReadyNotification } from "./startup_ready";
 import {
   configMutationPending,
 } from "./config_mutation";
@@ -267,6 +268,9 @@ let splashDismissed = false;
 let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
+const notifyStartupReady = createStartupReadyNotification(() => {
+  void command<void>("desktop_startup_ready").catch(reportError);
+});
 const THREAD_END_THRESHOLD_PX = 96;
 const uiState = createUiLocalState();
 let pendingHistoryPrepend: PendingHistoryPrepend | null = null;
@@ -1825,6 +1829,7 @@ function renderCommitted(
       ? (result) => postRenderFocusResultHandlers.forEach((handler) => handler(result))
       : undefined,
   );
+  notifyStartupReady();
 }
 
 function schedulePostRenderFocus(

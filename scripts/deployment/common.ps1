@@ -143,6 +143,99 @@ function Write-MoyaiUtf8([string]$Path, [string]$Content) {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Test-MoyaiDesktopStartup([string]$Root, $Manifest, [int]$TimeoutMilliseconds = 60000) {
+  $installRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+  $parent = Split-Path -Parent $installRoot
+  $logs = Resolve-MoyaiChild $parent ((Split-Path -Leaf $installRoot) + '-setup-logs')
+  Assert-MoyaiRegularPath $parent $logs
+  $logRoot = Join-Path $logs ('setup-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '-' + [Guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+  $reportPath = Join-Path $logRoot 'startup-report.json'
+  $stdoutPath = Join-Path $logRoot 'stdout.txt'
+  $stderrPath = Join-Path $logRoot 'stderr.txt'
+  $diagnosticPath = Join-Path $logRoot 'diagnostic.json'
+  $diagnostic = [ordered]@{
+    schema = 1; started_at_utc = [DateTime]::UtcNow.ToString('o'); finished_at_utc = $null
+    product_version = $Manifest.version; os_version = [Environment]::OSVersion.Version.ToString()
+    windows_build = [Environment]::OSVersion.Version.Build
+    webview2_mode = $Manifest.runtime.webview2; webview2_path = $null; webview2_version = $null
+    visual_cpp_mode = $Manifest.runtime.visual_cpp
+    executable = Resolve-MoyaiChild $Root 'app/bin/moyai-desktop.exe'
+    process_id = $null; exit_code = $null; reported_exit_code = $null; status = 'error'; message = ''
+    startup_report = $reportPath; stdout = $stdoutPath; stderr = $stderrPath
+  }
+  $process = $null
+  $previousWebview = [Environment]::GetEnvironmentVariable('WEBVIEW2_BROWSER_EXECUTABLE_FOLDER', 'Process')
+  try {
+    $webview = Test-MoyaiRuntime $Root $Manifest
+    $diagnostic.webview2_path = $webview
+    $diagnostic.webview2_version = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $webview 'msedgewebview2.exe')).FileVersion
+    $env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = $webview
+    $process = Start-Process -FilePath $diagnostic.executable -ArgumentList @('--startup-report', ('"' + $reportPath + '"')) -WorkingDirectory (Split-Path -Parent $diagnostic.executable) -WindowStyle Normal -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+    # Retain the process handle before an early exit so Windows PowerShell 5.1 keeps its exit code.
+    $null = $process.Handle
+    $diagnostic.process_id = $process.Id
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+      $hasExited = $process.HasExited
+      $report = $null
+      if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
+        # The child creates its report once. An empty or partial JSON write is pending.
+        try { $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+      }
+      if ($null -ne $report) {
+        $fields = @($report.PSObject.Properties.Name)
+        if (@('schema', 'status', 'process_id', 'exit_code', 'message') | Where-Object { $_ -notin $fields }) { throw '起動結果の通知に必要な項目がありません。' }
+        if (($report.schema -isnot [int] -and $report.schema -isnot [long]) -or $report.schema -ne 1 -or ($report.process_id -isnot [int] -and $report.process_id -isnot [long]) -or $report.process_id -ne $process.Id -or $report.status -cnotin @('ready', 'error') -or $report.message -isnot [string] -or ($report.exit_code -isnot [int] -and $report.exit_code -isnot [long])) { throw '起動結果の通知を確認できません。形式または起動したプロセスと一致しません。' }
+        $diagnostic.reported_exit_code = $report.exit_code
+        if ($report.status -ceq 'error') {
+          if ($report.exit_code -eq 0) { throw '起動失敗の通知に終了コードがありません。' }
+          throw $report.message
+        }
+        if ($report.exit_code -ne 0) { throw '初期画面の表示完了通知に不正な終了コードがあります。' }
+        if ($process.HasExited) { throw "初期画面の表示通知後にアプリが終了しました。終了コード: $($process.ExitCode)" }
+        $diagnostic.status = 'ready'
+        $diagnostic.message = '初期画面の描画完了を確認しました。moyAIは開いたままです。'
+        break
+      }
+      if ($hasExited) {
+        $process.WaitForExit()
+        throw "初期画面の描画完了を確認する前にアプリが終了しました。終了コード: $($process.ExitCode)"
+      }
+      if ($watch.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+        $diagnostic.status = 'timeout'
+        throw "初期画面の描画完了通知を時間内に受け取れませんでした。PID $($process.Id) のアプリは強制終了していません。画面とタスクトレイを確認してください。後から画面が表示された場合は、moyAIのメニューまたはタスクトレイから「終了」し、アプリが終了したことを確認してからセットアップをやり直してください。"
+      }
+      Start-Sleep -Milliseconds 50
+    }
+  } catch {
+    $diagnostic.message = $_.Exception.Message
+  } finally {
+    [Environment]::SetEnvironmentVariable('WEBVIEW2_BROWSER_EXECUTABLE_FOLDER', $previousWebview, 'Process')
+    if ($null -ne $process) {
+      if ($process.HasExited) { $process.WaitForExit(); $diagnostic.exit_code = $process.ExitCode }
+      $process.Dispose()
+    }
+    $diagnostic.finished_at_utc = [DateTime]::UtcNow.ToString('o')
+    try { Write-MoyaiUtf8 $diagnosticPath ($diagnostic | ConvertTo-Json -Depth 5) }
+    catch {
+      $diagnostic.status = 'error'
+      $diagnostic.message += "`n診断ログを保存できませんでした。対象: $diagnosticPath`n詳細: $($_.Exception.Message)"
+    }
+  }
+  $detail = $diagnostic.message
+  if ($diagnostic.status -cne 'ready' -and $null -ne $diagnostic.process_id) {
+    if ($null -ne $diagnostic.reported_exit_code) { $detail += "`n通知された終了コード: $($diagnostic.reported_exit_code)" }
+    if ($null -ne $diagnostic.exit_code) { $detail += "`n実際の終了コード: $($diagnostic.exit_code) / PID $($diagnostic.process_id)" }
+    else { $detail += "`nPID $($diagnostic.process_id) のプロセスは稼働中です。強制終了していません。" }
+  }
+  if ($diagnostic.status -cne 'ready' -and (Test-Path -LiteralPath $stderrPath -PathType Leaf)) {
+    $stderr = Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8
+    if ($stderr) { $detail += "`n`n$stderr" }
+  }
+  return [pscustomobject]@{status=$diagnostic.status; message=$detail; log_root=$logRoot; process_id=$diagnostic.process_id; exit_code=$diagnostic.exit_code}
+}
+
 function Get-MoyaiShortcutFolder {
   return Join-Path ([Environment]::GetFolderPath('Programs')) 'moyAI'
 }

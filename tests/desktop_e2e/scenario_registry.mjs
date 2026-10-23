@@ -1,5 +1,6 @@
 import { scenario as shellBaseline } from "./scenarios/shell_baseline.mjs";
 import { createShellAboutScenario } from "./scenarios/shell_about.mjs";
+import { createShellStartupReportScenario } from "./scenarios/shell_startup_report.mjs";
 import { createShellSingleInstanceScenario } from "./scenarios/shell_single_instance.mjs";
 import { createColdJoinConfigScenario, createWarmJoinConfigScenario } from "./scenarios/hub_join_config.mjs";
 import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
@@ -74,6 +75,7 @@ import { createHistoryTerminalReconcileScenario } from "./scenarios/history_term
 const factories = new Map([
   [shellBaseline.id, () => shellBaseline],
   ["shell.about", createShellAboutScenario],
+  ["shell.startup-report", createShellStartupReportScenario],
   ["shell.single-instance", createShellSingleInstanceScenario],
   ["hub.join-config-cold", createColdJoinConfigScenario],
   ["hub.join-config-warm", createWarmJoinConfigScenario],

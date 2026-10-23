@@ -37,6 +37,7 @@ use super::query::{
     load_latest_session_detail,
 };
 use super::side_chat::{SideChatQuoteRequest, SideChatQuoteSourceKind};
+use super::startup_report::StartupReport;
 use super::state::{DesktopOverlay, DesktopStatusCode};
 use super::web_model::{
     DesktopAgentExecutionProjection, DesktopAgentInterruptTarget, DesktopWebState,
@@ -63,6 +64,7 @@ macro_rules! desktop_command_manifest {
     ($consumer:ident) => {
         $consumer! {
             desktop_state,
+            desktop_startup_ready,
             submit_prompt,
             prepare_latest_message_edit,
             cancel_run,
@@ -405,6 +407,14 @@ unsafe extern "system" {
 }
 
 pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
+    run_with_startup_report(app, args, Arc::new(StartupReport::default())).await
+}
+
+pub async fn run_with_startup_report(
+    app: App,
+    args: DesktopArgs,
+    startup_report: Arc<StartupReport>,
+) -> Result<(), AppRunError> {
     let mut controller = DesktopController::new(app, args).await?;
     let hub_path = crate::config::loader::global_config_path()
         .map_err(|_| AppRunError::Message("failed to resolve Hub settings directory".into()))?
@@ -467,6 +477,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             });
         }))
         .manage(shared)
+        .manage(startup_report)
         .manage(hub_connection)
         .manage(mcp_publish)
         .manage(remote_jobs)
@@ -1870,6 +1881,11 @@ fn validate_session_archive_loaded_status(
         ));
     }
     Ok(())
+}
+
+#[tauri::command]
+fn desktop_startup_ready(report: State<'_, Arc<StartupReport>>) -> Result<(), String> {
+    report.ready().map(|_| ())
 }
 
 #[tauri::command]

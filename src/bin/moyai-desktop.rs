@@ -1,12 +1,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use clap::Parser;
 use moyai::app::AppBootstrap;
 use moyai::cli::CliCommand;
 use moyai::cli::parse::DesktopArgs as CliDesktopArgs;
+use moyai::desktop::startup_report::StartupReport;
 use moyai::desktop::{self, DesktopArgs};
 
 #[derive(Debug, Parser)]
@@ -25,24 +27,63 @@ struct DesktopLauncherArgs {
     /// Review a public Hub connection file before requesting device admission.
     #[arg(long = "join-config", value_name = "FILE")]
     join_config: Option<Utf8PathBuf>,
+    /// Report the initial screen result to a new setup-owned JSON file.
+    #[arg(long = "startup-report", value_name = "FILE")]
+    startup_report: Option<Utf8PathBuf>,
 }
 
 fn main() -> ExitCode {
-    match run_desktop_launcher() {
-        Ok(()) => ExitCode::SUCCESS,
+    let args = DesktopLauncherArgs::parse();
+    let report = match args.startup_report.as_ref() {
+        Some(path) => match StartupReport::create(path.as_std_path()) {
+            Ok(report) => Arc::new(report),
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(4);
+            }
+        },
+        None => Arc::new(StartupReport::default()),
+    };
+    if args.startup_report.is_some() {
+        let panic_report = report.clone();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ =
+                panic_report.error(101, &format!("moyAIの起動中にエラーが発生しました: {info}"));
+            previous_hook(info);
+        }));
+    }
+    match run_desktop_launcher(args, report.clone()) {
+        Ok(()) => match report.error(4, "初期画面の表示を確認する前にmoyAIが終了しました。")
+        {
+            Ok(true) => ExitCode::from(4),
+            Ok(false) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(4)
+            }
+        },
         Err((code, message)) => {
+            if let Err(error) = report.error(code, &message) {
+                eprintln!("{error}");
+            }
             eprintln!("{message}");
             ExitCode::from(code)
         }
     }
 }
 
-fn run_desktop_launcher() -> Result<(), (u8, String)> {
-    run_on_current_thread()
+fn run_desktop_launcher(
+    args: DesktopLauncherArgs,
+    report: Arc<StartupReport>,
+) -> Result<(), (u8, String)> {
+    run_on_current_thread(args, report)
 }
 
-fn run_on_current_thread() -> Result<(), (u8, String)> {
-    let args = DesktopLauncherArgs::parse();
+fn run_on_current_thread(
+    args: DesktopLauncherArgs,
+    report: Arc<StartupReport>,
+) -> Result<(), (u8, String)> {
     if let Some(path) = &args.join_config {
         let cwd = std::env::current_dir()
             .ok()
@@ -70,12 +111,14 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         return Ok(());
     };
     let _sandbox_broker = moyai::sandbox_broker::start().map_err(|error| {
-        let _ = rfd::MessageDialog::new()
-            .set_title("moyAI")
-            .set_description(&error)
-            .set_level(rfd::MessageLevel::Error)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+        if args.startup_report.is_none() {
+            let _ = rfd::MessageDialog::new()
+                .set_title("moyAI")
+                .set_description(&error)
+                .set_level(rfd::MessageLevel::Error)
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+        }
         (4, error)
     })?;
     let command = CliCommand::Desktop(CliDesktopArgs {
@@ -94,7 +137,7 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         let app = AppBootstrap::build(&command)
             .await
             .map_err(|error| (3, error.to_string()))?;
-        desktop::run(
+        desktop::run_with_startup_report(
             app,
             DesktopArgs {
                 directory: args.directory,
@@ -102,6 +145,7 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
                 continue_last: args.continue_last,
                 global_config_existed_at_launch,
             },
+            report,
         )
         .await
         .map_err(|error| (4, error.to_string()))
