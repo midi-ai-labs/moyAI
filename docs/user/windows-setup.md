@@ -125,4 +125,6 @@ Hub SHA256: <Hub実行ファイルの64文字SHA256>
 
 Hub同梱時は、同じHubソースの `docs` から準備・受信許可・Web管理の3ガイドも `hub/docs` へ同梱し、この導入手順とのリンクを配布物内で解決します。既定の参照元は隣の `moyAI-Hub/docs` です。別の配置でビルドした場合は `-HubDocumentationPath` を指定してください。必要なガイドが欠けている場合はビルド前に中止します。Desktop単体の配布にはHubソースを要求せず、Hub手順の参照先は公式リポジトリーになります。
 
+Hubの初期設定ファイル `web-management.json` も、実行ファイルと同じ `hub/bin` へ同梱します。既定の参照元は `-HubDocumentationPath` の親フォルダーにある同名ファイルです。外部のビルド入力など別の配置を使う場合は `-HubWebSettingsPath` を指定してください。ファイルがなければビルド前に中止します。初期値は固定ポート9080・他端末向け公開OFFです。初回起動前に同梱ファイルの `settings.local_port` を変更でき、起動に成功した後はHubの保存先にある設定を使います。既存の保存設定は同梱ファイルで上書きしません。
+
 未公開の診断packageのみ既存の `-SkipManualGuiStGate` を使えます。同梱資材の存在・x64形式・checksumの検査はfresh PCの実行証拠ではありません。実ランタイムを用いた新PC導入、実Desktop、同梱Hub、最初の仕事、更新後の保持を別途確認します。package manifestの `fresh_pc_verified` は、このスクリプトだけでは常に `false` です。
