@@ -13,6 +13,7 @@ param(
   [string]$HubBuildIdentityPath = '',
   [string]$HubCompatibilityResultsPath = '',
   [string]$HubDocumentationPath = '',
+  [string]$HubWebSettingsPath = '',
   [switch]$SkipManualGuiStGate,
   [switch]$SkipBuild,
   [switch]$AllowDirtySource
@@ -195,7 +196,7 @@ try {
 
   $hubIdentity = $null
   $hubCompatibilityVerified = $false
-  if ($HubBinaryPath -or $HubBuildIdentityPath -or $HubCompatibilityResultsPath) {
+  if ($HubBinaryPath -or $HubBuildIdentityPath -or $HubCompatibilityResultsPath -or $HubWebSettingsPath) {
     if (-not $HubBinaryPath -or -not $HubBuildIdentityPath -or -not (Test-Path -LiteralPath $HubBinaryPath -PathType Leaf) -or -not (Test-Path -LiteralPath $HubBuildIdentityPath -PathType Leaf)) { throw 'A Hub bundle requires both -HubBinaryPath and -HubBuildIdentityPath.' }
     $hubIdentity = Get-Content -LiteralPath $HubBuildIdentityPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $hubIdentity.version -or $hubIdentity.git_commit -notmatch '^[a-f0-9]{40}$' -or $hubIdentity.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Hub identity requires version, git_commit, sha256, and source_clean.' }
@@ -204,6 +205,8 @@ try {
     if (-not $AllowDirtySource -and $hubIdentity.source_clean -ne $true) { throw 'A published Hub bundle requires a clean Hub source identity.' }
     if (-not $HubDocumentationPath) { $HubDocumentationPath = Join-Path (Split-Path -Parent $repoRoot) 'moyAI-Hub/docs' }
     Assert-MoyaiHubReleaseGuides $HubDocumentationPath
+    if (-not $HubWebSettingsPath) { $HubWebSettingsPath = Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'web-management.json' }
+    if (-not (Test-Path -LiteralPath $HubWebSettingsPath -PathType Leaf)) { throw 'Hub initial Web settings are missing. Supply -HubWebSettingsPath with web-management.json from the matching Hub source.' }
     if ($HubCompatibilityResultsPath) {
       $hubResults = Get-Content -LiteralPath $HubCompatibilityResultsPath -Raw -Encoding UTF8
       foreach ($marker in @('Desktop Hub Gate: PASS', "Desktop Git Commit: $commit", "Hub Git Commit: $($hubIdentity.git_commit)", "Hub SHA256: $($hubIdentity.sha256)")) {
@@ -379,6 +382,7 @@ try {
   }
   if ($hubIdentity) {
     Copy-RequiredFile $HubBinaryPath (Join-Path $releaseRoot 'hub\bin\moyai-hub.exe')
+    Copy-RequiredFile $HubWebSettingsPath (Join-Path $releaseRoot 'hub\bin\web-management.json')
     Copy-RequiredFile $HubBuildIdentityPath (Join-Path $releaseRoot 'hub\build-identity.json')
     if ($HubCompatibilityResultsPath) { Copy-RequiredFile $HubCompatibilityResultsPath (Join-Path $releaseRoot 'docs\release\desktop-hub-results.md') }
   }
