@@ -387,6 +387,7 @@ try {
     if ($HubCompatibilityResultsPath) { Copy-RequiredFile $HubCompatibilityResultsPath (Join-Path $releaseRoot 'docs\release\desktop-hub-results.md') }
   }
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
+  Copy-RequiredFile (Join-Path $repoRoot "README.en.md") (Join-Path $releaseRoot "README.en.md")
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
   Copy-RequiredFile (Join-Path $repoRoot "config.example.toml") (Join-Path $releaseRoot "config.example.toml")

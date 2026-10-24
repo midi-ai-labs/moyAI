@@ -13,11 +13,11 @@ function Update-MoyaiReleaseGuideLinks([string]$PackageRoot, [string]$DesktopSou
   $hubRepository = 'https://github.com/midi-ai-labs/moyAI-Hub'
   foreach ($guide in Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Filter '*.md') {
     $relative = $guide.FullName.Substring($PackageRoot.TrimEnd('\', '/').Length + 1).Replace('\', '/')
-    if (-not ($relative -in @('README.md', 'README.ja.md', 'RELEASE_NOTES.md') -or $relative.StartsWith('docs/') -or $relative.StartsWith('hub/docs/'))) { continue }
+    if (-not ($relative -in @('README.md', 'README.en.md', 'README.ja.md', 'RELEASE_NOTES.md') -or $relative.StartsWith('docs/') -or $relative.StartsWith('hub/docs/'))) { continue }
     # Imported acceptance evidence is hashed as supplied; never rewrite its bytes.
     if ($relative.StartsWith('docs/release/')) { continue }
     $content = Get-Content -LiteralPath $guide.FullName -Raw -Encoding UTF8
-    if ($relative -in @('README.md', 'README.ja.md')) {
+    if ($relative -in @('README.md', 'README.en.md', 'README.ja.md')) {
       $content = $content.Replace('src="logo/', 'src="app/logo/')
       $content = [regex]::Replace($content, '\]\(docs/release/[^)]+\.md\)', '](RELEASE_NOTES.md)')
     }

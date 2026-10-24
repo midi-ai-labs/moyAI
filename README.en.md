@@ -1,0 +1,163 @@
+<p align="center">
+  <img src="logo/moyai_3d_logo.png" alt="moyAI logo" width="520">
+</p>
+
+<h1 align="center">moyAI</h1>
+
+<p align="center"><strong>A coding agent for local LLMs and private networks.</strong></p>
+
+<p align="center">
+  <a href="README.md">日本語</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.3">Download v3.0.3</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#license">License</a>
+</p>
+
+<p align="center"><img src="logo/moyai-screenshot-sample.jpg" alt="moyAI Desktop screenshot" width="920"></p>
+
+<p align="center">Desktop 3.0.3 startup screen.</p>
+
+## What Is moyAI?
+
+moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
+
+**Desktop 3.0.3 is a Windows x64 maintenance release.** Setup now opens moyAI and confirms that its initial screen has rendered. Startup failures show an error and diagnostic log location. This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.3 release notes](docs/release/v3.0.3.md) for changes and limitations, and the package's release evidence for its exact tested build.
+
+## Desktop and Hub
+
+| Product | Role | Download |
+| --- | --- | --- |
+| moyAI Desktop (this repository) | Enter requests, review conversations and outputs, and execute work on a PC. Personal use can start without Hub. | [Latest Desktop release](https://github.com/midi-ai-labs/moyAI/releases/latest) |
+| [moyAI Hub](https://github.com/midi-ai-labs/moyAI-Hub) | Manage AI connections, participating PCs, shared projects, conversations and outputs. Use it to share work across PCs. | [Latest Hub release](https://github.com/midi-ai-labs/moyAI-Hub/releases/latest) |
+
+For team use, an administrator [prepares Hub](https://github.com/midi-ai-labs/moyAI-Hub/blob/HEAD/docs/team-preparation.md), then each PC follows the [Desktop joining guide](docs/user/getting-started.md#チームで使う). Hub management opens in a web browser. A PC that only sends requests does not need Hub installed.
+
+## Highlights
+
+- Local projects and quick chats, file attachments, visible tool activity, outputs and saved conversation history.
+- A separate, tool-free Side Chat for questions about the main conversation and selected content.
+- Three operation modes: ask for approval, AI review of approvals, and full access. Windows workspace restrictions apply in the first two modes; see [permission limits](#permissions-and-platform-limits).
+- Recursive subagents, progress plans, long-conversation compaction and Markdown conversation export.
+- Local project instructions and Skills; optional external HTTP MCP tools and Docling for documents.
+- Hub projects for work across approved PCs. They appear with a `Hub` badge in the project list, and requests use the same chat interface. The AI can select among the project's permitted execution PCs.
+- A Windows Runner that executes jobs independently of the Desktop window. Hub stores shared conversations, inputs and published results.
+
+New prose, revisions and explanatory comments use moyAI's own built-in writing guidance, informed by the editing principles of [yomiyasu](https://github.com/nanaism/yomiyasu). It asks the AI to respect the requested reader, purpose and genre, preserve meaning and conditions, and check factual writing against provided sources while retaining deliberate voice and ambiguity in creative work. No setup or skill installation is required.
+
+Security review uses original guidance informed by OWASP, a built-in Skill, and checks against actual operation records. Missing or outdated reviews and remaining findings appear in conversation feedback. Task completion is not a security certification; see [the review workflow and its limits](docs/security-review.md).
+
+## Quick Start
+
+For the 3.0.3 Windows package:
+
+1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt for initial installation or a changed shared sandbox helper; cancelling stops before the user application is installed. Setup opens **moyAI** and checks that its initial screen appears. Continue in the opened window; use the Start menu for later launches. If startup fails or remains unconfirmed after 60 seconds, Setup shows the result and diagnostic log location and leaves the app running if it has not exited. Portable use also requires the shared helper; follow the [Windows setup guide](docs/user/windows-setup.md).
+2. Choose your role in the first-use screen:
+
+   | Purpose | Entry |
+   | --- | --- |
+   | Work on this PC | 自分のPCで使う |
+   | Send requests to a team project | チームに参加する |
+   | Let this PC execute team work | チームの仕事をこのPCで実行する |
+   | Prepare a Hub | チーム環境を用意する |
+
+3. For personal use, enter your AI endpoint and model, select the approval mode and save. Add a project folder or start a chat.
+4. For team use, open the administrator's `hub-config.moyai-join`. The administrator approves the PC and assigns its project roles. Each execution PC also permits execution and registers a local folder for each project. A PC that only sends requests needs neither a local model nor an execution folder.
+5. Open the project and send a normal request. Review any approval request, the answer and the output files.
+
+Team access does not require a moyAI username/password. Every PC has its own ID and key, even when Windows usernames match. Hub membership alone does not grant access to every project.
+
+Closing the Desktop window leaves it in the system tray; launching it again shows the existing window. **終了** in the application or tray menu gracefully stops the connected local Runner's work and retained apps, waits for the Runner process to exit, then exits Desktop. Hub is managed separately. A Desktop crash or lost display connection does not stop Runner.
+
+After a normal restart, Desktop restores the last local project folder and conversation, including when Git was initialized in that conversation's folder. Explicit `--dir`, `--session`, or `--continue-last` options take priority. If the saved folder or conversation is unavailable, Desktop explains the problem so you can choose another project; it does not recreate missing folders.
+
+See [getting started](docs/user/getting-started.md), [Windows installation and updates](docs/user/windows-setup.md), [first-use recovery](docs/desktop-first-use.md), and [Hub project operation](docs/shared-work-desktop.md).
+
+The published v2.1.1 ZIP uses `bin/moyai-desktop.exe`; it does not use the new Setup layout.
+
+## Configuration
+
+The user-wide Windows configuration is `%APPDATA%\midi-ai-labs\moyai\config\config.toml`. Existing user settings take precedence over defaults.
+
+Use **設定 → AIの接続** for Main, Sub (Side Chat), and Approve (permission review). Without Hub configuration, enter the endpoint and connection type: LM Studio Responses or OpenAI-compatible Chat Completions, such as oMLX. Load the model list or enter a model ID. API credentials, when required, are referenced by environment-variable name rather than saved as secret text.
+
+When Hub is configured, this screen shows the Hub connection and lets you choose the standard or another registered model independently for Main, Sub, and Approve. Hub administrators can save a standard model for each role. Shared Runner jobs capture the executing PC's Main and Approve selections when work starts. Hub outages do not automatically switch to manual settings.
+
+**接続設定をリセット** works without a Hub response. It preserves local conversations, files and manual AI settings, and lets you join a replacement Hub.
+
+Global settings apply to future work; session settings can override the selected local Main conversation. Side Chat has its own global connection and optional API-key environment-variable reference. To share Main's key, enter the same variable name explicitly in Side Chat settings. Existing Side conversations retain their captured connection and reference until closed. `context_window` controls moyAI's local accounting and compaction; model loading, sampling and generation output limits belong to the LLM host. See [config.example.toml](config.example.toml) and [Hub model integration](docs/hub-integration.md).
+
+The optional global `model.compaction_budget_tokens` setting (`MOYAI_COMPACTION_BUDGET_TOKENS`) sets when automatic compaction starts. When omitted, moyAI uses its normal working context limit. An explicit value must be positive and no greater than the effective input limit derived from `context_window`; automatic compaction starts at the smaller of that value and the normal working limit. With `context_window = 131072`, setting `98304` starts automatic compaction at 98,304 estimated input tokens. This setting also applies to Main through Hub and shared execution; generation output limits belong to the LLM host.
+
+`model.max_retries` bounds automatic retries for connection-establishment failures and provider rate limits (HTTP 429 or SSE error code `429` / `rate_limit_exceeded`). A rate-limit retry uses the same endpoint and request only before any output, reasoning, tool-call data or usage has arrived. Retry waits are 10, 20, 40 seconds and so on, doubling up to a 300-second cap. Retries share the existing request deadline; cancellation interrupts the wait. Partial generations and other provider errors are not replayed.
+
+The model can also call `compact_context` with its own concise working summary. moyAI keeps the latest user input and recent completed work, validates that the summary reduces the active context, and saves it through the existing conversation history. Original messages and tool results remain available. This design takes conceptual inspiration from [Context Language Models](https://github.com/facebookresearch/context-language-models) and is implemented within moyAI's own history and tool system.
+
+Automatic compaction uses a snapshot of completed active history, normally with one summary request. It replaces the previous checkpoint instead of appending a cumulative tool ledger. The restart instructions support writing, research, monitoring, data work and development without a fixed output format or compression ratio. Input selection respects complete tool-call/result groups and the full prepared-request budget; a rejected summary leaves the original history intact.
+
+The `read_history` tool retrieves public records from the current conversation, including records omitted from the active context. It can list or search bounded pages, then read an exact item in chunks. Follow `next_after` for search pages or `next` for item text. Retrieved records describe historical observations and operation states; they do not grant permission or prove that current files are unchanged. Other conversations, private reasoning and request diagnostics cannot be selected. A fork uses its own copied item IDs. Search its local history for copied records; an original record not copied into the fork is unavailable from that conversation.
+
+Approve supplies the separate, tool-free Guardian request in **Approve for me** mode. Its connection, model, API-key reference and timeouts can be configured independently. Leaving Approve unconfigured preserves the current Main connection for reviews. An explicit Approve selection stays independent of later Main changes; connection failures do not switch the reviewer to Main. Its response timeout bounds the entire review, including the latest user-turn generation lookup. Guardian receives the exact action and execution facts without conversation history. It reports a risk level: low or medium allows that action, high or unknown asks you to confirm, and critical refuses and stops the turn. This risk review does not independently enforce restrictions written in conversation text. Ask for approval and Full access do not contact the Approve model.
+
+## CLI and TUI
+
+```bash
+moyai run --dir /path/to/workspace "Inspect this project and summarize its main modules."
+moyai tui --dir /path/to/workspace
+moyai desktop --dir /path/to/workspace
+moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+```
+
+The 3.0.3 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+
+On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
+
+## Project Instructions
+
+Project instructions can come from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md` and local `SKILL.md` files. Files and tools remain subject to the selected workspace and permission mode. Existing files are the source of project state; rejoining a Hub project does not need a special history-restoration procedure.
+
+External MCP tools remain configurable. The retired manual moyAI-to-moyAI publishing workflow is not the setup route for new shared work; use Hub projects. Saved legacy records remain available through [MCP history](docs/mcp-history-guide.md).
+
+## Permissions and Platform Limits
+
+Windows x64 is the primary supported and verified deployment. Distribution needs WebView2 and Visual C++ runtimes, either bundled or installed by the organization. Setup does not download prerequisites; target PCs do not need Rust, Node or a development server.
+
+**Ask for approval** and **Approve for me** share Windows workspace restrictions; the latter uses an AI reviewer for permission decisions. **Full access** runs approved processes with the current Windows user's authority. These restrictions are not a complete OS isolation boundary. Native process sandboxing is Windows-only; restricted process operations fail closed elsewhere. Unix updates/deletes may return a partial-commit error with a preserved backup, which must be reviewed.
+
+Administrator setup installs the fixed `MoyAISandbox` demand-start LocalSystem service under Windows Program Files. Only administrators and SYSTEM can change its executable and configuration; interactive users can query and start it. The app and Runner remain ordinary user processes. Installation does not approve individual tool operations or automatically rerun a failed restricted command with full access. The sandbox supports local Windows SAM accounts and Active Directory domain accounts. Domain-account restricted execution requires a domain-member PC, access to a domain controller and permission to read the user's group memberships. Microsoft Entra ID-only accounts remain unsupported. Unsupported account types and helper validation failures stop startup; domain lookup or authentication failures stop the operation without an unrestricted retry. Standard Python private-directory and pytest temporary-directory access inside the allowed workspace/TEMP must work without changing project files or requesting unrestricted execution; outside and other-effect restrictions remain separate checks.
+
+Start from an ordinary installation folder. Startup refuses a helper or bundled runtime reached through a junction, symbolic link or other reparse point; move the complete package to an ordinary folder if that check fails.
+
+Stop and editing a request do not undo files already written or applications already started. Only the latest user message can be edited and resent. Text edits keep the original images and attachments; to change them, send a new request. A shared job's accepted cancellation is not proof that its process has stopped.
+
+Runner operates while its Windows user is logged in. Desktop and independently started Runner, including logon autostart, use the installed helper without UAC and retain their own lifetime leases. The helper stops when unused; it does not run Runner itself as a Windows service. Shared-helper updates and its explicit machine-wide removal require administrator approval and reject an in-use service. Per-user app uninstall retains the helper for other users. Automatic Hub root-CA replacement and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
+
+## Development and Verification
+
+```bash
+npm ci
+npm run build:desktop-web
+cargo build
+```
+
+Relevant checks:
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-features
+cargo test -- --test-threads=1
+npm run test:desktop-web
+npm run verify:gui -- --suite smoke
+```
+
+Windows native sandbox tests require an explicitly approved helper testhost. Follow the [Windows sandbox test guide](docs/testing-windows-sandbox.md) to build and run the matching libtest.
+
+Use the [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md) and [manual test entrypoint](tests/manual_ST/README.md) to select checks for the changed behavior. Real-window evidence and Live LLM behavior must be distinguished from fixture tests. Source ownership is visible in [src/](src/) and [the multi-PC design](docs/design/multi-device-session.md); implementation details belong with their code and tests rather than being duplicated here.
+
+Earlier 3.0.0 candidates were tested with Manual ST Cases 1–7, restoration stages, and virtual WinA/WinB execution and result transfer on one Windows PC. Those results, including generated-code evaluation failures and Side Chat answer inaccuracies, remain historical evidence. They do not establish acceptance of 3.0.3. Results for this fix are recorded separately in the development workspace at `project_sandbox/setup-startup-check-20261023/` and `project_sandbox/release-3.0.3-startup-20261023/RESULTS.md`, and in its release artifacts with the exact version, commit and binary identities. The reported startup failure on Windows 10 2016 LTSB has no confirmed cause, and this release has not been verified on that OS. AD domain usage with Hub has been reported; a controlled AD token and group-deny acceptance test remains unverified. Fresh-PC installation and physical multi-PC/LAN/Firewall checks also require separate evidence.
+
+Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner, cleanup and the sandbox helper, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
+
+## License
+
+Original moyAI code is licensed under [MIT](LICENSE). Copyright (c) 2026 Hideyoshi Takahashi. `midi-ai-labs` is this personal project's GitHub namespace.

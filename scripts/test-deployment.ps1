@@ -145,6 +145,11 @@ Write-MoyaiUtf8 (Join-Path $package 'README.md') '<img src="logo/preview.png">
 [Test](tests/manual_ST/README.md)
 [Native sandbox](docs/testing-windows-sandbox.md)
 [Design](docs/design/multi-device-session.md)'
+Write-MoyaiUtf8 (Join-Path $package 'README.en.md') '<img src="logo/preview.png">
+[日本語](README.md)
+[Notes](docs/release/v1.0.md)
+[Source](src/)'
+Write-MoyaiUtf8 (Join-Path $package 'README.ja.md') '[日本語README](README.md)'
 Write-MoyaiUtf8 (Join-Path $package 'docs/runner-local.md') '[Native sandbox](testing-windows-sandbox.md)'
 New-Item -ItemType Directory -Path (Join-Path $package 'app/logo') -Force | Out-Null
 Write-MoyaiUtf8 (Join-Path $package 'app/logo/preview.png') 'inert image fixture'
@@ -165,11 +170,13 @@ $importedEvidenceHash = (Get-FileHash -LiteralPath $importedEvidence).Hash
 Update-MoyaiReleaseGuideLinks $package $hubSourceCommit $hubSourceCommit
 Assert-That ((Get-FileHash -LiteralPath $importedEvidence).Hash -ceq $importedEvidenceHash) 'imported acceptance evidence retains its exact original bytes and checksum'
 $readme = Get-Content -LiteralPath (Join-Path $package 'README.md') -Raw -Encoding UTF8
+$englishReadme = Get-Content -LiteralPath (Join-Path $package 'README.en.md') -Raw -Encoding UTF8
 $notes = Get-Content -LiteralPath (Join-Path $package 'RELEASE_NOTES.md') -Raw -Encoding UTF8
 $integration = Get-Content -LiteralPath (Join-Path $package 'docs/hub-integration.md') -Raw -Encoding UTF8
 $runnerGuide = Get-Content -LiteralPath (Join-Path $package 'docs/runner-local.md') -Raw -Encoding UTF8
 Assert-That ($readme.Contains("/blob/$hubSourceCommit/docs/testing-windows-sandbox.md)") -and $runnerGuide.Contains("/blob/$hubSourceCommit/docs/testing-windows-sandbox.md)")) 'native sandbox test instructions link to the packaged Desktop source identity from README and Runner guides'
 Assert-That ($readme.Contains('src="app/logo/preview.png"') -and $readme.Contains('](RELEASE_NOTES.md)') -and $notes.Contains('](docs/user/getting-started.md)')) 'README images, release-note entry and release-note links follow the package layout'
+Assert-That ($englishReadme.Contains('src="app/logo/preview.png"') -and $englishReadme.Contains('](RELEASE_NOTES.md)') -and $englishReadme.Contains("/moyAI/tree/$hubSourceCommit/src/") -and $englishReadme.Contains('](README.md)')) 'English README uses the package image and release-note layout while retaining its Japanese README link'
 Assert-That ($readme.Contains('](docs/security-review.md)') -and $notes.Contains('](docs/security-review.md)') -and (Test-Path -LiteralPath (Join-Path $package 'docs/security-review.md') -PathType Leaf)) 'README and release notes link to the bundled security review guide'
 Assert-That ($readme.Contains("/moyAI/tree/$hubSourceCommit/src/") -and $readme.Contains("/moyAI/blob/$hubSourceCommit/tests/manual_ST/README.md") -and $integration.Contains("/moyAI/blob/$hubSourceCommit/docs/design/multi-device-session.md")) 'Desktop source, tests and design references use the packaged source commit'
 Assert-That ($integration.Contains('](../hub/docs/firewall.md)') -and $integration.Contains("/moyAI-Hub/blob/$hubSourceCommit/docs/gateway.md") -and -not $integration.Contains('](../../')) 'Hub operation links stay local and development-only references do not escape the package'
