@@ -149,8 +149,10 @@ Hub Git Commit: <Hubの40文字commit>
 Hub SHA256: <Hub実行ファイルの64文字SHA256>
 ```
 
-Hub同梱時は、同じHubソースの `docs` から準備・受信許可・Web管理の3ガイドも `hub/docs` へ同梱します。同じ製品内の手順は配布物内で解決し、DesktopとHubをまたぐ参照は個別導入後も使えるよう、対応commitの公式URLへ変換します。既定の参照元は隣の `moyAI-Hub/docs` です。別の配置でビルドした場合は `-HubDocumentationPath` を指定してください。必要なガイドが欠けている場合はビルド前に中止します。Desktop単体の配布にはHubソースを要求せず、Hub手順の参照先は公式リポジトリーになります。
+Hub同梱時は、同じHubソースまたは配布物の `docs` から準備・受信許可・Web管理・Windows導入の4ガイドも `hub/docs` へ同梱します。同じ製品内の手順は配布物内で解決し、DesktopとHubをまたぐ参照は個別導入後も使えるよう、対応commitの公式URLへ変換します。既定の参照元は隣の `moyAI-Hub/docs` です。正式Hub配布物など別の配置を使う場合は `-HubDocumentationPath` を指定してください。必要なガイドが欠けている場合はビルド前に中止します。Desktop単体の配布にはHubソースを要求せず、Hub手順の参照先は公式リポジトリーになります。
 
-Hubの初期設定ファイル `web-management.json` も、展開した配布物の `hub/bin` へ同梱し、SetupがHub本体と同じ固定配置へ置きます。既定の参照元は `-HubDocumentationPath` の親フォルダーにある同名ファイルです。別の配置なら `-HubWebSettingsPath` を指定します。HubのSetup・起動用スクリプトも同じソースの `scripts` から同梱し、別配置なら `-HubSetupScriptsPath` を指定します。必要な資材がなければビルド前に中止します。初期値は固定ポート9080・他端末向け公開OFFです。変更する場合はSetupの `-WebPort` を指定し、既存設定がある場合は指定しなければ保持します。Program Files内のテンプレートを手編集する必要はありません。
+Hubの初期設定ファイル `web-management.json` も、展開した配布物の `hub/bin` へ同梱し、SetupがHub本体と同じ固定配置へ置きます。既定の参照元は `-HubDocumentationPath` の親フォルダーにある同名ファイルです。別の配置なら `-HubWebSettingsPath` を指定します。HubのSetup・起動用スクリプトは、同じ親フォルダーからソース版と正式配布物の配置を判定して同梱します。`-HubSetupScriptsPath` を指定する場合は、ソースの `scripts` フォルダー、またはCMDが直下、PowerShellが `scripts` 配下にある正式Hub配布物のrootを渡します。必要な資材がなければビルド前に中止します。初期値は固定ポート9080・他端末向け公開OFFです。変更する場合はSetupの `-WebPort` を指定し、既存設定がある場合は指定しなければ保持します。Program Files内のテンプレートを手編集する必要はありません。
+
+GUIとDesktop／Hubの受入結果本文は、ZIP内の `docs/release/manual-gui-st-results.md` と `docs/release/desktop-hub-results.md` にそのままコピーします。公開用の入力には、秘密情報・本人の履歴・個人profileの指紋・内部IPを含まない専用の結果文書を使ってください。ZIP外のmanifestにある `artifacts` と受入結果の `results_file` は、そのmanifestの場所を基準にした相対参照です。`package_copy` など配布物内の参照は、展開した製品rootを基準にします。ローカル入力の絶対pathは公開manifestに記録しません。
 
 未公開の診断packageのみ既存の `-SkipManualGuiStGate` を使えます。同梱資材の存在・x64形式・checksumの検査はfresh PCの実行証拠ではありません。実ランタイムを用いた新PC導入、実Desktop、同梱Hub、最初の仕事、更新後の保持を別途確認します。package manifestの `fresh_pc_verified` は、このスクリプトだけでは常に `false` です。

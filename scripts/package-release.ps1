@@ -215,10 +215,8 @@ try {
     if (-not (Test-Path -LiteralPath $HubCleanupBinaryPath -PathType Leaf)) { throw 'Hub bundle requires moyai-cleanup-hub.exe from the matching Hub build. Supply -HubCleanupBinaryPath.' }
     Assert-MoyaiX64Pe $HubCleanupBinaryPath
     if ($hubIdentity.PSObject.Properties.Name -notcontains 'cleanup_sha256' -or $hubIdentity.cleanup_sha256 -cnotmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $HubCleanupBinaryPath -Algorithm SHA256).Hash -ine $hubIdentity.cleanup_sha256) { throw 'Hub cleanup does not match its build identity checksum. Use the executable and cleanup from the same Hub release.' }
-    if (-not $HubSetupScriptsPath) { $HubSetupScriptsPath = Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'scripts' }
-    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Setup-Hub.ps1', 'Start-Hub.cmd', 'Stop-Hub.cmd')) {
-      if (-not (Test-Path -LiteralPath (Join-Path $HubSetupScriptsPath $name) -PathType Leaf)) { throw "Hub setup resource is missing: $name. Supply -HubSetupScriptsPath from the matching Hub source." }
-    }
+    if (-not $HubSetupScriptsPath) { $HubSetupScriptsPath = (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName }
+    $hubSetupResources = Resolve-MoyaiHubSetupResources $HubSetupScriptsPath
     if (-not $HubThirdPartyNoticesPath) { $HubThirdPartyNoticesPath = Join-Path (Split-Path -Parent $HubBinaryPath) 'THIRD_PARTY_NOTICES.txt' }
     if (-not (Test-Path -LiteralPath $HubThirdPartyNoticesPath -PathType Leaf) -or [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $HubThirdPartyNoticesPath -Raw -Encoding UTF8))) { throw 'Hub third-party notices are missing. Supply -HubThirdPartyNoticesPath from the matching Hub release.' }
     if ($HubCompatibilityResultsPath) {
@@ -404,8 +402,8 @@ try {
     Copy-RequiredFile $HubBuildIdentityPath (Join-Path $releaseRoot 'hub\build-identity.json')
     Copy-RequiredFile (Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'LICENSE') (Join-Path $releaseRoot 'hub\LICENSE')
     Copy-RequiredFile $HubThirdPartyNoticesPath (Join-Path $releaseRoot 'hub\THIRD_PARTY_NOTICES.txt')
-    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Start-Hub.cmd', 'Stop-Hub.cmd')) { Copy-RequiredFile (Join-Path $HubSetupScriptsPath $name) (Join-Path $releaseRoot "hub\$name") }
-    Copy-RequiredFile (Join-Path $HubSetupScriptsPath 'Setup-Hub.ps1') (Join-Path $releaseRoot 'hub\scripts\Setup-Hub.ps1')
+    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Start-Hub.cmd', 'Stop-Hub.cmd')) { Copy-RequiredFile (Join-Path $hubSetupResources.command_root $name) (Join-Path $releaseRoot "hub\$name") }
+    Copy-RequiredFile $hubSetupResources.powershell_path (Join-Path $releaseRoot 'hub\scripts\Setup-Hub.ps1')
     if ($HubCompatibilityResultsPath) { Copy-RequiredFile $HubCompatibilityResultsPath (Join-Path $releaseRoot 'docs\release\desktop-hub-results.md') }
   }
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
@@ -463,6 +461,7 @@ try {
   $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
   Write-Utf8File $zipShaPath "$zipHash  $(Split-Path -Leaf $zipPath)"
 
+  $publicPaths = Get-MoyaiReleasePublicPaths $releaseName ([bool]$manualGuiStResultsResolved)
   $manifest = [ordered]@{
     name = $releaseName
     version = $Version
@@ -492,17 +491,17 @@ try {
       fresh_pc_verified = $false
     }
     artifacts = [ordered]@{
-      directory = $releaseRoot
-      zip = $zipPath
+      directory = $publicPaths.directory
+      zip = $publicPaths.zip
       zip_sha256 = $zipHash
-      zip_sha256_file = $zipShaPath
+      zip_sha256_file = $publicPaths.zip_sha256_file
     }
     gates = [ordered]@{
       manual_gui_st = [ordered]@{
         required = -not $SkipManualGuiStGate
-        results_file = if ($manualGuiStResultsResolved) { $manualGuiStResultsResolved } else { $null }
+        results_file = $publicPaths.manual_results
         results_sha256 = $manualGuiStResultsSha256
-        package_copy = if ($manualGuiStResultsResolved) { "docs/release/manual-gui-st-results.md" } else { $null }
+        package_copy = $publicPaths.manual_package_copy
       }
     }
   }

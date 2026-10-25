@@ -105,6 +105,7 @@ Write-MoyaiUtf8 (Join-Path $guideSource 'docs/user/getting-started.md') '# Start
 Write-MoyaiUtf8 (Join-Path $guideSource 'docs/security-review.md') '# Security review
 A review record is not a safety guarantee.'
 Write-MoyaiUtf8 (Join-Path $hubGuideSource 'team-preparation.md') '# Team
+[Setup](windows-setup.md)
 [Firewall](firewall.md)
 [Management](web-management.md)
 [Update](../../moyAI/docs/user/windows-setup.md#update)'
@@ -114,11 +115,15 @@ Write-MoyaiUtf8 (Join-Path $hubGuideSource 'web-management.md') '# Management
 [Implementation](../src/host_process/launch.rs)
 [Source directory](../src/web_admin/)
 [Tests](../tests/browser/README.md)'
+Write-MoyaiUtf8 (Join-Path $hubGuideSource 'windows-setup.md') '# Hub setup
+[Preparation](team-preparation.md)
+[Desktop update](../../moyAI/docs/user/windows-setup.md#update)
+[Implementation](../src/host_process/launch.rs)'
 $guideHashes = @(Get-ChildItem -LiteralPath $guideSource -Recurse -File | Get-FileHash | ForEach-Object { $_.Hash })
 $hubSourceCommit = '1234567890123456789012345678901234567890'
 Copy-MoyaiReleaseGuides $guideSource $package $hubGuideSource $hubSourceCommit $hubSourceCommit
 $packagedGuides = @(Get-ChildItem -LiteralPath (Join-Path $package 'docs'), (Join-Path $package 'hub/docs') -Recurse -File -Filter '*.md')
-Assert-That ($packagedGuides.Count -eq 6) 'Hub bundle contains Desktop entry and security guides and all three Hub operation guides'
+Assert-That ($packagedGuides.Count -eq 7) 'Hub bundle contains Desktop entry and security guides and all four Hub operation guides'
 foreach ($guide in $packagedGuides) {
   foreach ($link in [regex]::Matches((Get-Content -LiteralPath $guide.FullName -Raw -Encoding UTF8), '\]\(([^)]+)\)')) {
     $target = $link.Groups[1].Value.Split('#')[0]
@@ -129,6 +134,8 @@ foreach ($guide in $packagedGuides) {
 }
 $managementGuide = Get-Content -LiteralPath (Join-Path $package 'hub/docs/web-management.md') -Raw -Encoding UTF8
 Assert-That ($managementGuide.Contains("/blob/$hubSourceCommit/src/host_process/launch.rs") -and $managementGuide.Contains("/tree/$hubSourceCommit/src/web_admin/") -and $managementGuide.Contains("/blob/$hubSourceCommit/tests/browser/README.md")) 'Hub implementation references point to the bundled Hub source identity online'
+$hubSetupGuide = Get-Content -LiteralPath (Join-Path $package 'hub/docs/windows-setup.md') -Raw -Encoding UTF8
+Assert-That ($hubSetupGuide.Contains("/blob/$hubSourceCommit/docs/user/windows-setup.md#update") -and $hubSetupGuide.Contains("/blob/$hubSourceCommit/src/host_process/launch.rs")) 'Hub setup guide receives the same cross-component and source link rewriting'
 $hubPreparation = Get-Content -LiteralPath (Join-Path $package 'hub/docs/team-preparation.md') -Raw -Encoding UTF8
 $desktopPreparation = Get-Content -LiteralPath (Join-Path $package 'docs/user/windows-setup.md') -Raw -Encoding UTF8
 Assert-That ($hubPreparation.Contains("https://github.com/midi-ai-labs/moyAI/blob/$hubSourceCommit/docs/user/windows-setup.md#update") -and $desktopPreparation.Contains("https://github.com/midi-ai-labs/moyAI-Hub/blob/$hubSourceCommit/docs/team-preparation.md")) 'cross-component guide links stay valid after independent machine installation'
@@ -139,6 +146,12 @@ Assert-That ($standaloneSetup.Contains('](https://github.com/midi-ai-labs/moyAI-
 Assert-That ((Get-Content -LiteralPath (Join-Path $standaloneGuides 'docs/security-review.md') -Raw -Encoding UTF8) -ceq (Get-Content -LiteralPath (Join-Path $guideSource 'docs/security-review.md') -Raw -Encoding UTF8)) 'Desktop-only packaging retains the security review guide'
 Assert-Fails { Copy-MoyaiReleaseGuides $guideSource (Join-Path $EvidenceRoot 'missing-Hub-guides') (Join-Path $EvidenceRoot 'no-Hub-checkout') $hubSourceCommit $hubSourceCommit } 'Hub bundle rejects missing operation guides'
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $EvidenceRoot 'missing-Hub-guides'))) 'missing Hub guides fail before any guide output is written'
+$missingSetupGuides = Join-Path $EvidenceRoot 'Hub guides without setup'
+New-Item -ItemType Directory -Path $missingSetupGuides | Out-Null
+foreach ($name in @('team-preparation.md', 'firewall.md', 'web-management.md')) { Copy-Item -LiteralPath (Join-Path $hubGuideSource $name) -Destination (Join-Path $missingSetupGuides $name) }
+$missingSetupOutput = Join-Path $EvidenceRoot 'missing-Hub-setup-output'
+Assert-Fails { Copy-MoyaiReleaseGuides $guideSource $missingSetupOutput $missingSetupGuides $hubSourceCommit $hubSourceCommit } 'Hub bundle rejects a missing Windows setup guide'
+Assert-That (-not (Test-Path -LiteralPath $missingSetupOutput)) 'missing Hub setup guide fails before output is created'
 $guideHashesAfter = @(Get-ChildItem -LiteralPath $guideSource -Recurse -File | Get-FileHash | ForEach-Object { $_.Hash })
 Assert-That (($guideHashes -join ',') -ceq ($guideHashesAfter -join ',')) 'packaging preserves source guide contents and repository-relative links'
 Write-MoyaiUtf8 (Join-Path $package 'README.md') '<img src="logo/preview.png">

@@ -1,6 +1,6 @@
 # Build-time guide layout. Source guides keep their repository-relative links.
 function Assert-MoyaiHubReleaseGuides([string]$HubDocumentationPath) {
-  foreach ($name in @('team-preparation.md', 'firewall.md', 'web-management.md')) {
+  foreach ($name in @('team-preparation.md', 'firewall.md', 'web-management.md', 'windows-setup.md')) {
     $path = Join-Path $HubDocumentationPath $name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
       throw "Hub bundle guide is missing: $path. Supply -HubDocumentationPath with the matching Hub docs directory."
@@ -74,7 +74,7 @@ function Copy-MoyaiReleaseGuides([string]$DesktopRoot, [string]$PackageRoot, [st
   if (-not $includeHub) { return }
   $hubGuides = Join-Path $PackageRoot 'hub/docs'
   New-Item -ItemType Directory -Force -Path $hubGuides | Out-Null
-  foreach ($name in @('team-preparation.md', 'firewall.md', 'web-management.md')) {
+  foreach ($name in @('team-preparation.md', 'firewall.md', 'web-management.md', 'windows-setup.md')) {
     $content = Get-Content -LiteralPath (Join-Path $HubDocumentationPath $name) -Raw -Encoding UTF8
     # The components can be installed separately; their relative locations differ
     # from the unpacked ZIP. Only links within a component stay local.
