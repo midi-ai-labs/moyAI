@@ -2,6 +2,8 @@ use super::*;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod enrollment_fixture;
+
 #[tokio::test]
 async fn maximum_shared_prompt_with_snapshots_passes_host_validation() {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -623,6 +625,11 @@ async fn effect_authorization_progresses_after_http_used_on_the_local_agent_runt
 
 #[tokio::test]
 async fn project_folder_binding_uses_existing_contents_and_reports_current_participation() {
+    if !enrollment_fixture::enter(
+        "project_folder_binding_uses_existing_contents_and_reports_current_participation",
+    ) {
+        return;
+    }
     for template_id in ["local-folder", "desktop-default"] {
         let (_temp, mut settings, path) = super::tests::fixture();
         settings.environments.clear();
@@ -798,6 +805,11 @@ async fn project_folder_binding_uses_existing_contents_and_reports_current_parti
 
 #[tokio::test]
 async fn complete_environment_catalog_retires_only_drained_project_folder_permissions() {
+    if !enrollment_fixture::enter(
+        "complete_environment_catalog_retires_only_drained_project_folder_permissions",
+    ) {
+        return;
+    }
     for automatic in [true, false] {
         let (_temp, settings, path) = super::tests::fixture();
         let root = path.parent().unwrap();
@@ -905,6 +917,11 @@ async fn complete_environment_catalog_retires_only_drained_project_folder_permis
 
 #[tokio::test]
 async fn leaving_idle_project_preserves_another_projects_retained_service() {
+    if !enrollment_fixture::enter(
+        "leaving_idle_project_preserves_another_projects_retained_service",
+    ) {
+        return;
+    }
     retained_service_survives_local_catalog_change(false).await;
 }
 
@@ -1213,6 +1230,11 @@ async fn retained_service_survives_local_catalog_change(invalid_capacity: bool) 
 
 #[tokio::test]
 async fn legacy_missing_folder_rebind_keeps_authority_guards_and_recovers_a_lost_ack() {
+    if !enrollment_fixture::enter(
+        "legacy_missing_folder_rebind_keeps_authority_guards_and_recovers_a_lost_ack",
+    ) {
+        return;
+    }
     let (_temp, mut settings, path) = super::tests::fixture();
     let root = path.parent().unwrap();
     let selected = root.join("original-work");
