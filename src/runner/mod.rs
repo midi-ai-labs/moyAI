@@ -294,6 +294,7 @@ impl Execution {
 impl RunnerHost {
     /// Open the ordinary local store once. No Hub registration, network listener, or elevation.
     pub async fn open() -> Result<Self, RunnerError> {
+        crate::user_data::prepare_default_profile().map_err(RunnerError::new)?;
         ConfigLoader::ensure_default_global_config()
             .map_err(|e| RunnerError::new(e.to_string()))?;
         let paths = StoragePaths::discover().map_err(|e| RunnerError::new(e.to_string()))?;

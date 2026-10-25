@@ -2,7 +2,6 @@ use std::fs::{File, OpenOptions};
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
-use directories_next::ProjectDirs;
 use fs2::FileExt;
 
 use crate::error::StorageError;
@@ -124,10 +123,9 @@ impl StoragePaths {
                 truncation_dir,
             });
         }
-        let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
-            .ok_or_else(|| StorageError::Message("failed to resolve data directory".to_string()))?;
-        let data_dir = Utf8PathBuf::from_path_buf(dirs.data_dir().to_path_buf())
-            .map_err(|_| StorageError::Message("data directory is not valid UTF-8".to_string()))?;
+        let data_dir = crate::user_data::DesktopPaths::discover()
+            .map_err(StorageError::Message)?
+            .data;
         let truncation_dir = data_dir.join("truncation");
         let database_path = data_dir.join("moyai.sqlite3");
         Ok(Self {

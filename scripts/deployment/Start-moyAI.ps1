@@ -8,12 +8,21 @@ try {
   if ($CheckOnly) { Write-Output '必要な実行環境の検査に通りました。まだアプリは起動していません。最初の仕事が実行できるかは、接続と利用準備の後に確認してください。'; exit 0 }
   if ($TeamManagement) {
     $executable = Join-Path $packageRoot 'hub/bin/moyai-hub.exe'
-    if (-not $manifest.hub -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'この配布物にはチーム管理用のHubが含まれていません。管理者はHub同梱版を導入するか、既存の管理PCでHubを開いてください。仕事を依頼するだけのPCにはHubは不要です。' }
+    $machineHub = $false
+    if (Get-Command Read-MoyaiInstalledComponent -ErrorAction SilentlyContinue) {
+      $hub = Read-MoyaiInstalledComponent 'Hub'
+      if ($null -ne $hub) { $executable = Join-Path $hub.install_root 'moyai-hub.exe'; $machineHub = $true }
+    }
+    if ((-not $machineHub -and -not $manifest.hub) -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Hubが導入されていません。Setup-Hub.cmd、またはHub同梱版のSetup-moyAI.cmdでHubを導入してください。仕事を依頼するだけのPCにはHubは不要です。' }
     # --launch exits after opening management; its Hub/Gateway children keep running.
     # PowerShell -Wait would wait for that entire process tree and never finish normally.
     $process = Start-Process -FilePath $executable -ArgumentList '--launch' -WorkingDirectory (Split-Path -Parent $executable) -WindowStyle Hidden -PassThru
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { throw "チーム管理用のHubを起動できませんでした。管理者にHubの保存先と稼働状況の確認を依頼してください。保存データの初期化は不要です。詳細: 終了コード $($process.ExitCode)" }
+    try {
+      $null = $process.Handle
+      $process.WaitForExit()
+      $exitCode = $process.ExitCode
+      if ($null -eq $exitCode -or $exitCode -ne 0) { throw "チーム管理用のHubを起動できませんでした。管理者にHubの保存先と稼働状況の確認を依頼してください。保存データの初期化は不要です。詳細: 終了コード $exitCode" }
+    } finally { $process.Dispose() }
   } else {
     $env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = $webview
     $executable = Join-Path $packageRoot 'app/bin/moyai-desktop.exe'

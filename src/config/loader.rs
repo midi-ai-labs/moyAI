@@ -3,7 +3,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use directories_next::ProjectDirs;
 use fs2::FileExt;
 
 use crate::cli::RunArgs;
@@ -239,10 +238,9 @@ pub fn global_config_path() -> Result<Utf8PathBuf, ConfigError> {
     if let Ok(value) = env::var(GLOBAL_CONFIG_PATH_ENV) {
         return Ok(Utf8PathBuf::from(value));
     }
-    let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
-        .ok_or_else(|| ConfigError::Message("failed to resolve config directory".to_string()))?;
-    let config_dir = Utf8PathBuf::from_path_buf(dirs.config_dir().to_path_buf())
-        .map_err(|_| ConfigError::Message("config directory is not valid UTF-8".to_string()))?;
+    let config_dir = crate::user_data::DesktopPaths::discover()
+        .map_err(ConfigError::Message)?
+        .config;
     Ok(config_dir.join("config.toml"))
 }
 

@@ -2,7 +2,6 @@ use std::fs;
 use std::io::Write;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use directories_next::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -118,14 +117,11 @@ fn persist_desktop_preferences_tempfile(path: &Utf8Path, text: &str) -> Result<(
         .map_err(|error| error.error.to_string())
 }
 
-fn preferences_path() -> Result<Utf8PathBuf, String> {
+pub(crate) fn preferences_path() -> Result<Utf8PathBuf, String> {
     if let Ok(value) = std::env::var(DESKTOP_PREFS_ENV) {
         return Ok(Utf8PathBuf::from(value));
     }
-    let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
-        .ok_or_else(|| "failed to resolve desktop preferences directory".to_string())?;
-    let config_dir = Utf8PathBuf::from_path_buf(dirs.config_dir().to_path_buf())
-        .map_err(|_| "desktop preferences directory is not valid UTF-8".to_string())?;
+    let config_dir = crate::user_data::DesktopPaths::discover()?.config;
     Ok(config_dir.join("desktop.toml"))
 }
 

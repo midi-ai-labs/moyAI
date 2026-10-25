@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StorageError;
@@ -12,6 +12,76 @@ use crate::storage::session_repo::mutation_blocker_for_project_in_connection;
 #[derive(Clone)]
 pub struct SqliteProjectRepository {
     connection: Arc<Mutex<Connection>>,
+}
+
+/// Read the existing project's purpose without opening or migrating a Store.
+/// Only the product's exact, non-Git temporary workspaces are reset data.
+pub(crate) fn cleanup_preserved_workspace_roots(
+    connection: &Connection,
+    data: &Utf8Path,
+) -> Result<Vec<Utf8PathBuf>, StorageError> {
+    let columns = connection
+        .prepare("PRAGMA table_info(projects)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !columns.iter().any(|name| name == "root_path")
+        || !columns.iter().any(|name| name == "vcs_kind")
+    {
+        return Err(StorageError::Message(
+            "保存済みプロジェクトの作業フォルダーを確認できません。データは削除していません。"
+                .into(),
+        ));
+    }
+    let purpose = if columns.iter().any(|name| name == "remote_temp_profile_id") {
+        " WHERE remote_temp_profile_id IS NULL"
+    } else {
+        ""
+    };
+    let mut statement =
+        connection.prepare(&format!("SELECT root_path,vcs_kind FROM projects{purpose}"))?;
+    let projects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let internal = crate::user_data::internal_desktop_project_roots(data);
+    let mut preserved = Vec::new();
+    for (root, vcs_kind) in projects {
+        let root = Utf8PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err(StorageError::Message(format!(
+                "保存済みプロジェクトの作業フォルダーが絶対パスではありません。削除していません: {root}"
+            )));
+        }
+        let mut temporary = false;
+        if vcs_kind == "none" {
+            for path in &internal {
+                if crate::workspace::PathGuard::security_path_is_within(&root, path)
+                    .map_err(|error| StorageError::Message(error.to_string()))?
+                    && crate::workspace::PathGuard::security_path_is_within(path, &root)
+                        .map_err(|error| StorageError::Message(error.to_string()))?
+                {
+                    temporary = match std::fs::symlink_metadata(root.join(".git")) {
+                        Ok(_) => false,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(error) => {
+                            return Err(StorageError::Message(format!(
+                                "作業フォルダーのGit状態を確認できません。削除していません: {root}: {error}"
+                            )));
+                        }
+                    };
+                    break;
+                }
+            }
+        }
+        if !temporary {
+            preserved.push(root);
+        }
+    }
+    Ok(preserved)
 }
 
 impl SqliteProjectRepository {

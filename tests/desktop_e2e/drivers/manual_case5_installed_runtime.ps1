@@ -19,7 +19,8 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ConfigPath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DataPath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$HubData,
-    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ProjectId
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ProjectId,
+    [string]$HubRoot = ''
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -33,7 +34,7 @@ $TaskRoot = [IO.Path]::GetFullPath($TaskRoot)
 $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
 $runtimeRoot = Join-Path $TaskRoot 'normal-runtime'
 $statePath = Join-Path $runtimeRoot 'owned-normal-hosts.json'
-$hubExe = Join-Path $PackageRoot 'hub/bin/moyai-hub.exe'
+$hubExe = if ($HubRoot) { Join-Path ([IO.Path]::GetFullPath($HubRoot)) 'moyai-hub.exe' } else { Join-Path $PackageRoot 'hub/bin/moyai-hub.exe' }
 $runnerExe = Join-Path $PackageRoot 'app/bin/moyai-runner.exe'
 # ConfigPath/DataPath are the installed Device policy's pipe scope. Keep their exact strings.
 # The system registry is observed for its hash; this driver never changes it.

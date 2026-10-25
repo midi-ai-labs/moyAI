@@ -48,6 +48,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), (u8, String)> {
     let command = parse_cli().map_err(|error| (2, error.to_string()))?;
+    let default_profile = match &command {
+        CliCommand::SchemaExport(_) | CliCommand::ContractSnapshot(_) => false,
+        CliCommand::ReplayRun(args) => args.data_dir.is_none(),
+        CliCommand::ReplayReport(args) => args.data_dir.is_none(),
+        _ => true,
+    };
+    if default_profile {
+        moyai::user_data::prepare_default_profile().map_err(|error| (3, error))?;
+    }
     let command = hydrate_run_prompt(command).map_err(|error| (2, error))?;
     match command {
         CliCommand::Run(_)

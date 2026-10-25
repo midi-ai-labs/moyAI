@@ -22,7 +22,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.4はWindows x64向けの修正版です。** 接続リセット後に残った共有実行登録でローカルの依頼が停止する問題を修正し、cleanupに日本語の削除確認と結果表示を加えました。moyAI Hub 1.0.0と組み合わせて使えます。このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.4リリースノート](docs/release/v3.0.4.md)、実際に試験した版は配布物に対応する証跡を参照してください。
+**Desktop 3.0.4はWindows x64向けの修正版です。** 古い共有実行登録でローカルの依頼が停止する問題を修正し、DesktopとHubの導入先・保存先・初期化の手順を整理しました。moyAI Hub 1.0.1と組み合わせて使います。このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。公開済みv2.1.1のZIPは従来の配置と機能です。変更内容と制限は[3.0.4リリースノート](docs/release/v3.0.4.md)、実際に試験した版は配布物に対応する証跡を参照してください。
 
 ## DesktopとHub
 
@@ -51,7 +51,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 3.0.4のWindows配布物では、次の順に進みます。
 
-1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。初回導入または共通sandbox helperの更新時だけ別画面で管理者承認し、取り消すと利用者側アプリの導入前に中止します。Setupが **moyAI** を起動し、初期画面の表示を確認します。開いた画面から利用準備を進め、次回からはスタートメニューで開きます。起動に失敗した場合や60秒以内に表示を確認できなかった場合は、結果と診断ログの保存先を表示し、起動中のアプリは強制終了しません。インストールせず使う場合も共通helperが必要です。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
+1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。実行ファイルをProgram Filesへ配置する際は、別画面で管理者承認します。Setupが **moyAI** を通常権限で起動し、初期画面の表示を確認します。開いた画面から利用準備を進め、次回からはスタートメニューで開きます。起動に失敗した場合や60秒以内に表示を確認できなかった場合は、結果と診断ログの保存先を表示し、起動中のアプリは強制終了しません。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
 
    | 目的 | 選ぶ項目 |
@@ -73,7 +73,7 @@ Desktopの×ボタンを押すとトレイに入り、仕事は続きます。�
 
 ## 設定
 
-Windowsの共通設定は `%APPDATA%\midi-ai-labs\moyai\config\config.toml` です。保存済みの利用者設定を製品の初期値で上書きしません。
+Windowsの共通設定は `%LOCALAPPDATA%\midi-ai-labs\moyai-data\desktop\config\config.toml` です。会話履歴などは同じ `desktop` の `data`、Hubの保存データは兄弟の `hub` へ保存します。既定保存先の旧データは、停止状態を確認して移行します。保存済みの利用者設定を製品の初期値で上書きしません。
 
 **設定 → AIの接続** でMain（メイン）、Sub（サイドチャット）、Approve（承認）の接続を設定します。Hub設定がない場合は、接続方式・URL・モデルを入力します。LM Studio Responses、oMLXなどのOpenAI互換Chat Completionsに対応し、モデル一覧の取得とモデルIDの直接入力ができます。API認証が必要な場合は、秘密情報そのものではなく、それを保持する環境変数名を指定します。
 
@@ -126,7 +126,7 @@ WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUAC�
 
 停止や発言の編集は、作成済みファイルや起動済みアプリを元に戻しません。編集・再送できるのは最新の発言だけです。本文を編集しても元の画像や添付は保持します。添付を変更する場合は、新しい依頼として送ってください。停止要求の受付と、実プロセスの停止確認は別です。
 
-RunnerはWindows利用者のログオン中に動作します。Desktopと、ログオン時自動起動を含む独立Runnerは、UACなしで導入済みhelperを使い、それぞれlifetime leaseを保持します。利用がなくなるとhelperは停止しますが、Runner自体をWindows serviceとして動かすわけではありません。共通helperの更新・明示的なPC全体からの削除だけ管理者承認が必要で、サービス稼働中は拒否します。利用者別アプリの削除では、他の利用者のために共通helperを残します。HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
+RunnerはWindows利用者のログオン中に動作します。Desktopと、ログオン時自動起動を含む独立Runnerは、UACなしで導入済みhelperを使い、それぞれlifetime leaseを保持します。利用がなくなるとhelperは停止しますが、Runner自体をWindows serviceとして動かすわけではありません。Desktop／Hub本体の導入・更新・削除と、共通helperの更新・削除には管理者承認が必要です。サービス稼働中は共通helperの更新・削除を拒否します。共通helperは、アンインストール画面で明示的に選択した場合だけ削除します。HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
 
 ## 開発・検証
 

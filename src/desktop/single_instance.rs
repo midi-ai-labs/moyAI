@@ -2,7 +2,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use directories_next::ProjectDirs;
 use fs2::FileExt;
 
 use crate::storage::maintenance::DESKTOP_INSTANCE_LOCK as LOCK_FILE_NAME;
@@ -20,6 +19,7 @@ impl DesktopInstanceGuard {
     /// Acquires the Desktop lease, or asks the already-running Desktop to
     /// restore its main window and returns `None` to stop this launch.
     pub fn acquire_or_notify() -> Result<Option<Self>, String> {
+        crate::user_data::prepare_desktop_profile()?;
         // Keep the management UI available if an old publication cannot yet be
         // released. Its projection reports the remaining retirement evidence.
         if let Err(error) = crate::runner::operations::retire_reset_resources().map(drop) {
@@ -95,10 +95,7 @@ fn desktop_lock_path() -> Result<Utf8PathBuf, String> {
     if std::env::var_os("MOYAI_DESKTOP_E2E_ROOT").is_some() {
         return Err("Isolated Desktop fixtures require a desktop-e2e build".into());
     }
-    let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
-        .ok_or_else(|| "failed to resolve the moyAI data directory".to_string())?;
-    let data_dir = Utf8PathBuf::from_path_buf(dirs.data_dir().to_path_buf())
-        .map_err(|_| "moyAI data directory is not valid UTF-8".to_string())?;
+    let data_dir = crate::user_data::DesktopPaths::discover()?.data;
     Ok(data_dir.join(LOCK_FILE_NAME))
 }
 

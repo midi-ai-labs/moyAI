@@ -27,6 +27,15 @@ test("Hub Case5 runner requires explicit portable paths and rejects ambiguous CL
   assert.throws(() => parseManualCase5HubRunnerArguments(["--task-root", root]), /absolute/);
 });
 
+test("Hub Case5 accepts a separately installed Hub through an explicit absolute root", () => {
+  const hubRoot = path.join(root, "machine", "Hub");
+  assert.deepEqual(parseManualCase5HubRunnerArguments([
+    "--task-root", root, "--package-root", argumentsValue.packageRoot,
+    "--scenario-config", argumentsValue.scenarioConfigPath, "--hub-root", hubRoot,
+  ]), { ...argumentsValue, hubRoot });
+  assert.throws(() => normalizeManualCase5HubArguments({ ...argumentsValue, hubRoot: "relative" }), /absolute/);
+});
+
 test("Hub Case5 keeps explicit role credentials, operator owner and no case deadline", () => {
   const options = normalizeManualCase5HubConfiguration(configuration);
   assert.equal(options.observationTimeoutMs, undefined);

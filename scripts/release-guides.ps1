@@ -36,7 +36,6 @@ function Update-MoyaiReleaseGuideLinks([string]$PackageRoot, [string]$DesktopSou
     $content = [regex]::Replace($content, '\]\(\.\./\.\./moyAI-Hub/docs/([^)]+)\)', {
       param($match)
       $path = $match.Groups[1].Value
-      if ($HubSourceCommit -and $path -in @('team-preparation.md', 'firewall.md', 'web-management.md')) { return "](../hub/docs/$path)" }
       if ($HubSourceCommit) { return "]($hubRepository/blob/$HubSourceCommit/docs/$path)" }
       return "]($hubRepository)"
     })
@@ -51,11 +50,12 @@ function Update-MoyaiReleaseGuideLinks([string]$PackageRoot, [string]$DesktopSou
   }
 }
 
-function Copy-MoyaiReleaseGuides([string]$DesktopRoot, [string]$PackageRoot, [string]$HubDocumentationPath, [string]$HubSourceCommit) {
+function Copy-MoyaiReleaseGuides([string]$DesktopRoot, [string]$PackageRoot, [string]$HubDocumentationPath, [string]$HubSourceCommit, [string]$DesktopSourceCommit = '') {
   $hubRepository = 'https://github.com/midi-ai-labs/moyAI-Hub'
   $includeHub = -not [string]::IsNullOrWhiteSpace($HubSourceCommit)
   if ($includeHub) {
     Assert-MoyaiHubReleaseGuides $HubDocumentationPath
+    if ($DesktopSourceCommit -cnotmatch '^[a-f0-9]{40}$') { throw 'Hub operation guides require the matching Desktop source commit.' }
   }
   $utf8 = [Text.UTF8Encoding]::new($false)
   $desktopGuides = Join-Path $PackageRoot 'docs/user'
@@ -63,7 +63,7 @@ function Copy-MoyaiReleaseGuides([string]$DesktopRoot, [string]$PackageRoot, [st
   foreach ($name in @('windows-setup.md', 'getting-started.md')) {
     $content = Get-Content -LiteralPath (Join-Path $DesktopRoot "docs/user/$name") -Raw -Encoding UTF8
     if ($includeHub) {
-      $content = $content.Replace('../../../moyAI-Hub/docs/', '../../hub/docs/')
+      $content = $content.Replace('../../../moyAI-Hub/docs/', "$hubRepository/blob/$HubSourceCommit/docs/")
     } else {
       # A Desktop-only source checkout does not need a sibling Hub repository.
       $content = [regex]::Replace($content, '\]\(\.\./\.\./\.\./moyAI-Hub/docs/[^)]+\)', "]($hubRepository)")
@@ -76,7 +76,9 @@ function Copy-MoyaiReleaseGuides([string]$DesktopRoot, [string]$PackageRoot, [st
   New-Item -ItemType Directory -Force -Path $hubGuides | Out-Null
   foreach ($name in @('team-preparation.md', 'firewall.md', 'web-management.md')) {
     $content = Get-Content -LiteralPath (Join-Path $HubDocumentationPath $name) -Raw -Encoding UTF8
-    $content = $content.Replace('../../moyAI/docs/user/windows-setup.md', '../../docs/user/windows-setup.md')
+    # The components can be installed separately; their relative locations differ
+    # from the unpacked ZIP. Only links within a component stay local.
+    $content = $content.Replace('../../moyAI/docs/user/windows-setup.md', "https://github.com/midi-ai-labs/moyAI/blob/$DesktopSourceCommit/docs/user/windows-setup.md")
     # Implementation references stay online; operational guides stay in the ZIP.
     $content = [regex]::Replace($content, '\]\(\.\./((?:src|tests)/[^)]+)\)', {
       param($match)

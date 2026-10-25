@@ -1,6 +1,7 @@
 ﻿Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'runtime-access.ps1')
 . (Join-Path $PSScriptRoot 'sandbox-service.ps1')
+if ((Test-Path -LiteralPath (Join-Path $PSScriptRoot 'component-install.ps1')) -and -not (Get-Command Read-MoyaiComponentManifest -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'component-install.ps1') }
 
 function Resolve-MoyaiChild([string]$Root, [string]$Relative) {
   if ([string]::IsNullOrWhiteSpace($Relative) -or [IO.Path]::IsPathRooted($Relative) -or $Relative.Contains(':')) {
@@ -146,7 +147,12 @@ function Write-MoyaiUtf8([string]$Path, [string]$Content) {
 function Test-MoyaiDesktopStartup([string]$Root, $Manifest, [int]$TimeoutMilliseconds = 60000) {
   $installRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
   $parent = Split-Path -Parent $installRoot
-  $logs = Resolve-MoyaiChild $parent ((Split-Path -Leaf $installRoot) + '-setup-logs')
+  $machineRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'moyAI/Desktop'
+  if ($installRoot -ieq $machineRoot) {
+    $parent = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'midi-ai-labs/moyai-data/installations'
+    [void](New-Item -ItemType Directory -Path $parent -Force)
+    $logs = Resolve-MoyaiChild $parent 'desktop-setup-logs'
+  } else { $logs = Resolve-MoyaiChild $parent ((Split-Path -Leaf $installRoot) + '-setup-logs') }
   Assert-MoyaiRegularPath $parent $logs
   $logRoot = Join-Path $logs ('setup-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '-' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
@@ -442,8 +448,16 @@ namespace MoyaiDeployment {
   [MoyaiDeployment.Associations]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
 }
 
+function Get-MoyaiUserInstallationReceiptPath([string]$Root) {
+  $machineRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'moyAI/Desktop'
+  if ([IO.Path]::GetFullPath($Root).TrimEnd('\','/') -ieq $machineRoot) {
+    return Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'midi-ai-labs/moyai-data/installations/desktop.json'
+  }
+  return Resolve-MoyaiChild $Root 'installation.json'
+}
+
 function Set-MoyaiJoinFileAssociation([string]$Root, $RegistryKey = $null, $DefaultOverrides = $null) {
-  $receiptPath = Resolve-MoyaiChild $Root 'installation.json'
+  $receiptPath = Get-MoyaiUserInstallationReceiptPath $Root
   $receipt = Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
   $manifest = Read-MoyaiDeployment $Root -VerifyHashes
   $owned = Test-MoyaiJoinFileReceipt $Root $receipt $manifest

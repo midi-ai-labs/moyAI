@@ -125,6 +125,7 @@ fn main() {
 
 #[cfg(windows)]
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    moyai::user_data::prepare_default_profile()?;
     use moyai::runner::{RunnerHost, windows};
     let command = match args.command {
         Command::Serve {

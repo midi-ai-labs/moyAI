@@ -461,6 +461,21 @@ pub async fn run_with_startup_report(
     let mut context = tauri::generate_context!();
     context.config_mut().identifier =
         super::single_instance::desktop_identifier().map_err(AppRunError::Message)?;
+    #[cfg(windows)]
+    {
+        let webview_data = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(
+                crate::user_data::DesktopPaths::discover()
+                    .map_err(AppRunError::Message)?
+                    .cache
+                    .join("webview")
+                    .into_std_path_buf(),
+            );
+        for window in &mut context.config_mut().app.windows {
+            window.data_directory = Some(webview_data.clone());
+        }
+    }
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             restore_main_window(app);

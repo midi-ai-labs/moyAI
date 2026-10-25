@@ -5,6 +5,7 @@ use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::user_data::internal_desktop_project_roots;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::app::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
@@ -20790,18 +20791,6 @@ fn normalize_image_attachment_path(base: &Utf8Path, input: &str) -> Result<Utf8P
 
 fn is_quick_chat_workspace_path(path: &Utf8Path) -> bool {
     quick_chat_workspace_directory().as_deref() == Some(path)
-}
-
-fn internal_desktop_project_roots(data_dir: &Utf8Path) -> Vec<Utf8PathBuf> {
-    [
-        "quick-chat-workspace",
-        "desktop-workspace",
-        "desktop-workspace-after-delete",
-        "desktop-workspace-after-delete-2",
-    ]
-    .into_iter()
-    .map(|name| data_dir.join(name))
-    .collect()
 }
 
 #[cfg(feature = "tauri-desktop")]

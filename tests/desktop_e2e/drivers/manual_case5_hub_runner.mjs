@@ -24,9 +24,9 @@ import { canonicalUlid } from '../core/canonical_identity.mjs';
 
 export function normalizeManualCase5HubArguments(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some(key => !['taskRoot', 'packageRoot', 'scenarioConfigPath', 'captureHttpRequests'].includes(key))) throw new TypeError('Expected taskRoot, packageRoot, scenarioConfigPath and optional captureHttpRequests');
+    || Object.keys(value).some(key => !['taskRoot', 'packageRoot', 'hubRoot', 'scenarioConfigPath', 'captureHttpRequests'].includes(key))) throw new TypeError('Expected taskRoot, packageRoot, scenarioConfigPath and optional hubRoot/captureHttpRequests');
   if (value.captureHttpRequests !== undefined && typeof value.captureHttpRequests !== 'boolean') throw new TypeError('captureHttpRequests must be boolean');
-  const paths = Object.fromEntries(['taskRoot', 'packageRoot', 'scenarioConfigPath'].map(name => {
+  const paths = Object.fromEntries(['taskRoot', 'packageRoot', 'scenarioConfigPath', ...(value.hubRoot === undefined ? [] : ['hubRoot'])].map(name => {
     const candidate = value[name];
     if (typeof candidate !== 'string' || !path.isAbsolute(candidate) || candidate.includes('\0')) throw new TypeError(`${name} must be an absolute path`);
     return [name, path.resolve(candidate)];
@@ -87,14 +87,14 @@ export function manualCase5HubTerminalReady(s) {
 }
 
 export async function runManualCase5HubRunner(value) {
-  const { taskRoot, packageRoot, scenarioConfigPath, captureHttpRequests = false } = normalizeManualCase5HubArguments(value);
+  const { taskRoot, packageRoot, hubRoot, scenarioConfigPath, captureHttpRequests = false } = normalizeManualCase5HubArguments(value);
   const configBytes = await readFile(scenarioConfigPath);
   const raw = JSON.parse(configBytes.toString('utf8'));
   const options = normalizeManualCase5HubConfiguration(raw);
   const fixture_source = options.fixtureSource;
   const credentials = takeManualCase5HubCredentials(options);
-  const hubBinary = path.join(packageRoot, 'hub/bin/moyai-hub.exe');
-  const [hubBytes, hubIdentityBytes] = await Promise.all([readFile(hubBinary), readFile(path.join(packageRoot, 'hub/build-identity.json'))]);
+  const hubBinary = hubRoot ? path.join(hubRoot, 'moyai-hub.exe') : path.join(packageRoot, 'hub/bin/moyai-hub.exe');
+  const [hubBytes, hubIdentityBytes] = await Promise.all([readFile(hubBinary), readFile(path.join(hubRoot ?? path.join(packageRoot, 'hub'), 'build-identity.json'))]);
   const hubSha256 = createHash('sha256').update(hubBytes).digest('hex');
   const hubIdentity = validateManualCase5HubBuild(JSON.parse(hubIdentityBytes.toString('utf8')), hubSha256);
   const base = createManualCase5Scenario(options.scenarioRaw);
@@ -116,7 +116,7 @@ export async function runManualCase5HubRunner(value) {
     async prepare(args) {
       await base.prepare(args);
       baseline = await manualLiveGeneratedFiles(context, sink, 'case5/baseline-hub', outputs);
-      resource = await startHubBrowserResource({ ...args, options: { hubBinary: path.join(packageRoot, 'hub/bin/moyai-hub.exe'), headed: true } });
+      resource = await startHubBrowserResource({ ...args, options: { hubBinary, headed: true } });
       const expected = await prepareOnboardingHubModels({ page: resource.page, hub: resource.hub, providerBaseUrl: options.providerBaseUrl,
         mainModel: options.model, sideModel: options.sideModel, approveModel: options.approveModel, apiKey: credentials.main,
         roleProviders: { side_chat: { providerBaseUrl: options.sideProviderBaseUrl, apiKey: credentials.side_chat },
@@ -262,7 +262,7 @@ export async function runManualCase5HubRunner(value) {
 }
 
 export function parseManualCase5HubRunnerArguments(argv) {
-  const names = new Map([['--task-root', 'taskRoot'], ['--package-root', 'packageRoot'], ['--scenario-config', 'scenarioConfigPath'], ['--capture-http-requests', 'captureHttpRequests']]);
+  const names = new Map([['--task-root', 'taskRoot'], ['--package-root', 'packageRoot'], ['--hub-root', 'hubRoot'], ['--scenario-config', 'scenarioConfigPath'], ['--capture-http-requests', 'captureHttpRequests']]);
   const value = {};
   for (let index = 0; index < argv.length; index += 2) {
     const name = names.get(argv[index]);

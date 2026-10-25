@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
+mod profile_maintenance;
 mod retirement;
+pub(crate) use profile_maintenance::{ProfileMaintenanceGuard, relocated};
 pub(crate) use retirement::{
-    RetirementGuard, prepare_user_data_reset, reset_publication_pending, retire_reset_resources,
+    RetirementGuard, reset_publication_pending, retire_reset_resources,
     retire_reset_resources_for_profile,
 };
 

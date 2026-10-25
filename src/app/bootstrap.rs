@@ -28,6 +28,7 @@ enum WorkspaceRootMode {
 
 impl AppBootstrap {
     pub async fn build(command: &CliCommand) -> Result<App, AppBootstrapError> {
+        crate::user_data::prepare_default_profile().map_err(AppBootstrapError::Message)?;
         let start_dir = command_directory(command)?;
         let run_args = match command {
             CliCommand::Run(args) => Some(args),

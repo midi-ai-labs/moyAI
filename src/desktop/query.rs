@@ -15,6 +15,7 @@ use crate::session::{
     SessionStatus, ToolCallStatus,
 };
 use crate::tui::state::{AppState, RunProgressPhase, RunStatus, TranscriptKind};
+use crate::user_data::internal_desktop_project_roots;
 use crate::workspace::project::project_display_name;
 
 #[cfg(test)]
@@ -259,18 +260,6 @@ fn build_project_rows(
         .position(|project| project.project_id == current_project_id)
         .unwrap_or(rows.len());
     (rows, selected)
-}
-
-fn internal_desktop_project_roots(data_dir: &camino::Utf8Path) -> Vec<camino::Utf8PathBuf> {
-    [
-        "quick-chat-workspace",
-        "desktop-workspace",
-        "desktop-workspace-after-delete",
-        "desktop-workspace-after-delete-2",
-    ]
-    .into_iter()
-    .map(|name| data_dir.join(name))
-    .collect()
 }
 
 fn format_project_row(project: &ProjectRecord) -> String {

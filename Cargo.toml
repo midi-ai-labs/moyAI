@@ -27,6 +27,10 @@ name = "moyai-desktop"
 path = "src/bin/moyai-desktop.rs"
 required-features = ["tauri-desktop"]
 
+[[bin]]
+name = "moyai-cleanup-desktop"
+path = "src/bin/moyai-cleanup-desktop.rs"
+
 [dependencies]
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["multipart"] }

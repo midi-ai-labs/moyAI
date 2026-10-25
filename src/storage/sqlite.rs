@@ -165,6 +165,14 @@ pub struct StorageMaintenanceReport {
 
 impl SqliteStore {
     pub fn open(paths: &StoragePaths) -> Result<Self, StorageError> {
+        Self::open_after_profile_check(paths, crate::user_data::assert_store_access_allowed)
+    }
+
+    fn open_after_profile_check(
+        paths: &StoragePaths,
+        check: impl FnOnce(&camino::Utf8Path) -> Result<(), String>,
+    ) -> Result<Self, StorageError> {
+        check(&paths.data_dir).map_err(StorageError::Message)?;
         // Participate before creating files; an explicit cleanup holds the
         // exclusive counterpart until it has finished removing its data.
         let _publication = crate::runtime::resource_admission::PublicationGuard::acquire()
@@ -1816,6 +1824,63 @@ mod tests {
     use crate::session::SessionId;
 
     use super::*;
+
+    #[test]
+    fn store_open_checks_pending_and_retired_profiles_before_creating_storage() {
+        let temporary = crate::user_data::test_directory();
+        let root = camino::Utf8Path::from_path(temporary.path()).unwrap();
+        let known = crate::user_data::DesktopPaths::at(root.join("new/desktop"));
+        let old = root.join("old/moyai");
+        let records = known.root.parent().unwrap().join("migrations");
+        fs::create_dir_all(&records).unwrap();
+        let pending = records.join("desktop.pending.json");
+        fs::write(&pending, "{}").unwrap();
+        let storage = |data: camino::Utf8PathBuf| StoragePaths {
+            database_path: data.join("moyai.sqlite3"),
+            truncation_dir: data.join("truncation"),
+            data_dir: data,
+        };
+        // Exercise the public constructor's owner flow with isolated known
+        // roots, so no test needs to change the real Windows profile.
+        for data in [known.data.clone(), old.join("data")] {
+            let paths = storage(data.clone());
+            assert!(
+                SqliteStore::open_after_profile_check(&paths, |selected| {
+                    crate::user_data::assert_store_access_at(selected, &known, &[old.clone()])
+                })
+                .is_err()
+            );
+            assert!(!data.exists());
+        }
+        let custom = storage(root.join("custom/data"));
+        let opened = SqliteStore::open_after_profile_check(&custom, |selected| {
+            crate::user_data::assert_store_access_at(selected, &known, &[old.clone()])
+        })
+        .unwrap();
+        assert!(custom.database_path.exists());
+        drop(opened);
+        fs::remove_file(pending).unwrap();
+        fs::write(
+            records.join("desktop.json"),
+            "{\"version\":1,\"state\":\"reset\"}",
+        )
+        .unwrap();
+        let retired = storage(old.join("data"));
+        assert!(
+            SqliteStore::open_after_profile_check(&retired, |selected| {
+                crate::user_data::assert_store_access_at(selected, &known, &[old.clone()])
+            })
+            .is_err()
+        );
+        assert!(!retired.data_dir.exists());
+        let current = storage(known.data.clone());
+        let opened = SqliteStore::open_after_profile_check(&current, |selected| {
+            crate::user_data::assert_store_access_at(selected, &known, &[old])
+        })
+        .unwrap();
+        assert!(current.database_path.exists());
+        drop(opened);
+    }
 
     #[cfg(unix)]
     fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {

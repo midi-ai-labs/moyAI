@@ -116,7 +116,7 @@ Write-MoyaiUtf8 (Join-Path $hubGuideSource 'web-management.md') '# Management
 [Tests](../tests/browser/README.md)'
 $guideHashes = @(Get-ChildItem -LiteralPath $guideSource -Recurse -File | Get-FileHash | ForEach-Object { $_.Hash })
 $hubSourceCommit = '1234567890123456789012345678901234567890'
-Copy-MoyaiReleaseGuides $guideSource $package $hubGuideSource $hubSourceCommit
+Copy-MoyaiReleaseGuides $guideSource $package $hubGuideSource $hubSourceCommit $hubSourceCommit
 $packagedGuides = @(Get-ChildItem -LiteralPath (Join-Path $package 'docs'), (Join-Path $package 'hub/docs') -Recurse -File -Filter '*.md')
 Assert-That ($packagedGuides.Count -eq 6) 'Hub bundle contains Desktop entry and security guides and all three Hub operation guides'
 foreach ($guide in $packagedGuides) {
@@ -129,12 +129,15 @@ foreach ($guide in $packagedGuides) {
 }
 $managementGuide = Get-Content -LiteralPath (Join-Path $package 'hub/docs/web-management.md') -Raw -Encoding UTF8
 Assert-That ($managementGuide.Contains("/blob/$hubSourceCommit/src/host_process/launch.rs") -and $managementGuide.Contains("/tree/$hubSourceCommit/src/web_admin/") -and $managementGuide.Contains("/blob/$hubSourceCommit/tests/browser/README.md")) 'Hub implementation references point to the bundled Hub source identity online'
+$hubPreparation = Get-Content -LiteralPath (Join-Path $package 'hub/docs/team-preparation.md') -Raw -Encoding UTF8
+$desktopPreparation = Get-Content -LiteralPath (Join-Path $package 'docs/user/windows-setup.md') -Raw -Encoding UTF8
+Assert-That ($hubPreparation.Contains("https://github.com/midi-ai-labs/moyAI/blob/$hubSourceCommit/docs/user/windows-setup.md#update") -and $desktopPreparation.Contains("https://github.com/midi-ai-labs/moyAI-Hub/blob/$hubSourceCommit/docs/team-preparation.md")) 'cross-component guide links stay valid after independent machine installation'
 $standaloneGuides = Join-Path $EvidenceRoot 'desktop-only-guides'
 Copy-MoyaiReleaseGuides $guideSource $standaloneGuides (Join-Path $EvidenceRoot 'no-Hub-checkout') ''
 $standaloneSetup = Get-Content -LiteralPath (Join-Path $standaloneGuides 'docs/user/windows-setup.md') -Raw -Encoding UTF8
 Assert-That ($standaloneSetup.Contains('](https://github.com/midi-ai-labs/moyAI-Hub)') -and -not $standaloneSetup.Contains('../../../moyAI-Hub/') -and -not (Test-Path -LiteralPath (Join-Path $standaloneGuides 'hub'))) 'Desktop-only packaging needs no Hub checkout and links to the official Hub repository'
 Assert-That ((Get-Content -LiteralPath (Join-Path $standaloneGuides 'docs/security-review.md') -Raw -Encoding UTF8) -ceq (Get-Content -LiteralPath (Join-Path $guideSource 'docs/security-review.md') -Raw -Encoding UTF8)) 'Desktop-only packaging retains the security review guide'
-Assert-Fails { Copy-MoyaiReleaseGuides $guideSource (Join-Path $EvidenceRoot 'missing-Hub-guides') (Join-Path $EvidenceRoot 'no-Hub-checkout') $hubSourceCommit } 'Hub bundle rejects missing operation guides'
+Assert-Fails { Copy-MoyaiReleaseGuides $guideSource (Join-Path $EvidenceRoot 'missing-Hub-guides') (Join-Path $EvidenceRoot 'no-Hub-checkout') $hubSourceCommit $hubSourceCommit } 'Hub bundle rejects missing operation guides'
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $EvidenceRoot 'missing-Hub-guides'))) 'missing Hub guides fail before any guide output is written'
 $guideHashesAfter = @(Get-ChildItem -LiteralPath $guideSource -Recurse -File | Get-FileHash | ForEach-Object { $_.Hash })
 Assert-That (($guideHashes -join ',') -ceq ($guideHashesAfter -join ',')) 'packaging preserves source guide contents and repository-relative links'
@@ -179,7 +182,7 @@ Assert-That ($readme.Contains('src="app/logo/preview.png"') -and $readme.Contain
 Assert-That ($englishReadme.Contains('src="app/logo/preview.png"') -and $englishReadme.Contains('](RELEASE_NOTES.md)') -and $englishReadme.Contains("/moyAI/tree/$hubSourceCommit/src/") -and $englishReadme.Contains('](README.md)')) 'English README uses the package image and release-note layout while retaining its Japanese README link'
 Assert-That ($readme.Contains('](docs/security-review.md)') -and $notes.Contains('](docs/security-review.md)') -and (Test-Path -LiteralPath (Join-Path $package 'docs/security-review.md') -PathType Leaf)) 'README and release notes link to the bundled security review guide'
 Assert-That ($readme.Contains("/moyAI/tree/$hubSourceCommit/src/") -and $readme.Contains("/moyAI/blob/$hubSourceCommit/tests/manual_ST/README.md") -and $integration.Contains("/moyAI/blob/$hubSourceCommit/docs/design/multi-device-session.md")) 'Desktop source, tests and design references use the packaged source commit'
-Assert-That ($integration.Contains('](../hub/docs/firewall.md)') -and $integration.Contains("/moyAI-Hub/blob/$hubSourceCommit/docs/gateway.md") -and -not $integration.Contains('](../../')) 'Hub operation links stay local and development-only references do not escape the package'
+Assert-That ($integration.Contains("/moyAI-Hub/blob/$hubSourceCommit/docs/firewall.md") -and $integration.Contains("/moyAI-Hub/blob/$hubSourceCommit/docs/gateway.md") -and -not $integration.Contains('](../../')) 'cross-component Hub links use the matching source and development-only references do not escape the package'
 Write-MoyaiUtf8 (Join-Path $standaloneGuides 'docs/hub-integration.md') '[Gateway](../../moyAI-Hub/docs/gateway.md)'
 Update-MoyaiReleaseGuideLinks $standaloneGuides $hubSourceCommit ''
 Assert-That ((Get-Content -LiteralPath (Join-Path $standaloneGuides 'docs/hub-integration.md') -Raw -Encoding UTF8).Contains('](https://github.com/midi-ai-labs/moyAI-Hub)')) 'Desktop-only secondary Hub guide links also need no sibling checkout'

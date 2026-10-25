@@ -22,7 +22,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.4 is a Windows x64 maintenance release.** It fixes local requests blocked by a shared execution registration left after a connection reset, and adds Japanese confirmation and result dialogs to cleanup. It supports moyAI Hub 1.0.0. This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.4 release notes](docs/release/v3.0.4.md) for changes and limitations, and the package's release evidence for its exact tested build.
+**Desktop 3.0.4 is a Windows x64 maintenance release.** It fixes local requests blocked by an obsolete shared execution registration and gives Desktop and Hub consistent installation, data and reset locations. It pairs with moyAI Hub 1.0.1. This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.4 release notes](docs/release/v3.0.4.md) for changes and limitations, and the package's release evidence for its exact tested build.
 
 ## Desktop and Hub
 
@@ -51,7 +51,7 @@ Security review uses original guidance informed by OWASP, a built-in Skill, and 
 
 For the 3.0.4 Windows package:
 
-1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt for initial installation or a changed shared sandbox helper; cancelling stops before the user application is installed. Setup opens **moyAI** and checks that its initial screen appears. Continue in the opened window; use the Start menu for later launches. If startup fails or remains unconfirmed after 60 seconds, Setup shows the result and diagnostic log location and leaves the app running if it has not exited. Portable use also requires the shared helper; follow the [Windows setup guide](docs/user/windows-setup.md).
+1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt to install the executable files under Program Files. Setup opens **moyAI** as the original standard user and checks that its initial screen appears. Continue in the opened window; use the Start menu for later launches. If startup fails or remains unconfirmed after 60 seconds, Setup shows the result and diagnostic log location and leaves the app running if it has not exited. Follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
 
    | Purpose | Entry |
@@ -77,7 +77,7 @@ The published v2.1.1 ZIP uses `bin/moyai-desktop.exe`; it does not use the new S
 
 ## Configuration
 
-The user-wide Windows configuration is `%APPDATA%\midi-ai-labs\moyai\config\config.toml`. Existing user settings take precedence over defaults.
+The user-wide Windows configuration is `%LOCALAPPDATA%\midi-ai-labs\moyai-data\desktop\config\config.toml`. Conversation data lives in the sibling `desktop\data` directory; Hub data lives in `moyai-data\hub`. Existing default profiles migrate only after confirming that they are no longer in use. Existing user settings take precedence over defaults.
 
 Use **設定 → AIの接続** for Main, Sub (Side Chat), and Approve (permission review). Without Hub configuration, enter the endpoint and connection type: LM Studio Responses or OpenAI-compatible Chat Completions, such as oMLX. Load the model list or enter a model ID. API credentials, when required, are referenced by environment-variable name rather than saved as secret text.
 
@@ -130,7 +130,7 @@ Start from an ordinary installation folder. Startup refuses a helper or bundled 
 
 Stop and editing a request do not undo files already written or applications already started. Only the latest user message can be edited and resent. Text edits keep the original images and attachments; to change them, send a new request. A shared job's accepted cancellation is not proof that its process has stopped.
 
-Runner operates while its Windows user is logged in. Desktop and independently started Runner, including logon autostart, use the installed helper without UAC and retain their own lifetime leases. The helper stops when unused; it does not run Runner itself as a Windows service. Shared-helper updates and its explicit machine-wide removal require administrator approval and reject an in-use service. Per-user app uninstall retains the helper for other users. Automatic Hub root-CA replacement and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
+Runner operates while its Windows user is logged in. Desktop and independently started Runner, including logon autostart, use the installed helper without UAC and retain their own lifetime leases. The helper stops when unused; it does not run Runner itself as a Windows service. Desktop/Hub installation, updates and removal, and shared-helper updates and removal require administrator approval. Shared-helper changes reject an in-use service. Uninstall removes the shared helper only when explicitly selected. Automatic Hub root-CA replacement and fresh-PC/physical multi-PC release acceptance are not implied by local automated tests. Model quality and tool support depend on the selected provider. See [shared Runner operation](docs/runner-shared.md), [local Runner operation](docs/runner-local.md) and [managed commands](docs/managed-shell-guide.md).
 
 ## Development and Verification
 

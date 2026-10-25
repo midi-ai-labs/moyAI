@@ -3,7 +3,14 @@
   [switch]$Uninstall,
   [switch]$CheckOnly,
   [switch]$NoShortcuts,
-  [switch]$SkipStartupCheck
+  [switch]$SkipStartupCheck,
+  [string[]]$Components = @(),
+  [switch]$ResetDesktopData,
+  [switch]$ResetHubData,
+  [switch]$RemoveSharedRuntime,
+  [switch]$Interactive,
+  [Nullable[int]]$WebPort = $null,
+  [string]$HubDataDir = ''
 )
 $ErrorActionPreference = 'Stop'
 $startupCheckAttempted = $false
@@ -11,6 +18,17 @@ try {
   . (Join-Path $PSScriptRoot 'common.ps1')
   Assert-MoyaiUserSetup
   $sourceRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\', '/')
+  $sourceManifestPath = Join-Path $sourceRoot 'deployment.json'
+  if (Test-Path -LiteralPath $sourceManifestPath -PathType Leaf) {
+    $candidateManifest = Get-Content -LiteralPath $sourceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($candidateManifest.PSObject.Properties.Name -contains 'components') {
+      if ($PSBoundParameters.ContainsKey('InstallRoot')) { throw '新しい配布物の導入先はProgram Files配下のmoyAIです。-InstallRootは指定せずに実行してください。' }
+      $InstallRoot = (Get-MoyaiComponentLocation 'Desktop').parent
+      Invoke-MoyaiComponentUserSetup -SourceRoot $sourceRoot -Components $Components -Uninstall:$Uninstall -CheckOnly:$CheckOnly -NoShortcuts:$NoShortcuts -SkipStartupCheck:$SkipStartupCheck -ResetDesktopData:$ResetDesktopData -ResetHubData:$ResetHubData -RemoveSharedRuntime:$RemoveSharedRuntime -Interactive:$Interactive -WebPort $WebPort -HubDataDir $HubDataDir
+      exit 0
+    }
+  }
+  if ($Components.Count -or $ResetDesktopData -or $ResetHubData -or $RemoveSharedRuntime -or $Interactive) { throw '製品別の導入・初期化には新しいcomponent配布物を使ってください。' }
   $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
   if ($InstallRoot -eq [IO.Path]::GetPathRoot($InstallRoot) -or $InstallRoot -eq $env:USERPROFILE -or $InstallRoot -eq $env:LOCALAPPDATA) { throw '導入先にはmoyAI専用のフォルダーを指定してください。通常は導入先を指定せず、Setup-moyAI.cmdを開いてください。' }
   Assert-MoyaiRegularPath (Split-Path -Parent $InstallRoot) $InstallRoot

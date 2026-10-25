@@ -26,4 +26,5 @@ pub mod storage;
 pub mod system_prompt;
 pub mod tool;
 pub mod tui;
+pub mod user_data;
 pub mod workspace;

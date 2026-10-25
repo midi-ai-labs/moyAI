@@ -2,7 +2,6 @@ use std::fs;
 use std::process::ExitCode;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use directories_next::ProjectDirs;
 
 fn main() -> ExitCode {
     match cleanup_command(&std::env::args().skip(1).collect::<Vec<_>>()) {
@@ -13,7 +12,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(CleanupCommand::Version) => {
-            println!("moyai-cleanup {}", env!("CARGO_PKG_VERSION"));
+            println!("moyai-cleanup-desktop {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         Ok(CleanupCommand::Preview) => {
@@ -81,7 +80,7 @@ fn cleanup_command(args: &[String]) -> Result<CleanupCommand, String> {
 }
 
 fn cleanup_help() -> &'static str {
-    "Usage: moyai-cleanup\n       moyai-cleanup --preview\n       moyai-cleanup --reset-user-data --confirm-delete\n\nWithout arguments on Windows, asks for confirmation in a Japanese dialog before resetting data.\nOn other platforms, shows the affected AppData directories without deleting files.\nReset permanently deletes config, device and human credentials, history, and cached results.\nClose Desktop and Runner and back up needed data before an explicit reset.\nNormal updates and uninstall do not require a reset. Hub data and project folders are not reset.\n\nOptions:\n  --preview                         Show targets without changing files\n  --reset-user-data --confirm-delete Permanently delete the displayed AppData targets\n  -h, --help                        Print help\n  -V, --version                     Print version"
+    "Usage: moyai-cleanup-desktop\n       moyai-cleanup-desktop --preview\n       moyai-cleanup-desktop --reset-user-data --confirm-delete\n\nWithout arguments on Windows, asks for confirmation in Japanese, then keeps the result in a console until a key is pressed.\nThe moyai-cleanup compatibility executable uses the same Desktop-only scope.\nReset deletes Desktop settings, credentials, history and cache, including the old default directories, after checking existing owners and retiring this user's publication. Hub data, installed modules and project folders are preserved.\nCustom config/data/preferences outside these targets are rejected.\n\nOptions:\n  --preview                         Show targets without changing files\n  --reset-user-data --confirm-delete Permanently delete the displayed Desktop targets\n  -h, --help                        Print help\n  -V, --version                     Print version"
 }
 
 fn cleanup_preview(targets: &[Utf8PathBuf]) -> String {
@@ -113,13 +112,21 @@ struct CleanupReport {
 fn remove_user_data(targets: &[Utf8PathBuf]) -> Result<CleanupReport, String> {
     for target in targets {
         assert_cleanup_target(target)?;
+        moyai::user_data::assert_regular_tree(target)?;
     }
     let _reset = moyai::runner::operations::prepare_user_data_reset(targets)
         .map_err(|error| error.message)?;
-    remove_checked_targets(targets)
+    let report = remove_checked_targets(targets)?;
+    moyai::user_data::finish_cleanup()?;
+    Ok(report)
 }
 
 fn remove_checked_targets(targets: &[Utf8PathBuf]) -> Result<CleanupReport, String> {
+    // Check every boundary before deleting the first directory.
+    for target in targets {
+        assert_cleanup_target(target)?;
+        moyai::user_data::assert_regular_tree(target)?;
+    }
     let mut removed = Vec::new();
     let mut missing = Vec::new();
     for target in targets {
@@ -179,14 +186,14 @@ fn interactive_result(result: &Result<InteractiveOutcome, String>) -> (String, b
         ),
         Ok(InteractiveOutcome::Completed(report)) if report.removed.is_empty() => (
             format!(
-                "初期化が完了しました。\n対象の保存先に削除するデータはありませんでした。\n\n確認した保存先:\n{}",
+                "Desktop cleanupが正常に完了しました。\n対象の保存先に削除するデータはありませんでした。\n\n確認した保存先:\n{}",
                 display_targets(&report.missing)
             ),
             false,
         ),
         Ok(InteractiveOutcome::Completed(report)) => {
             let mut message = format!(
-                "初期化が完了しました。\n\n削除した保存先:\n{}",
+                "Desktop cleanupが正常に完了しました。\n\n削除した保存先:\n{}",
                 display_targets(&report.removed)
             );
             if !report.missing.is_empty() {
@@ -209,8 +216,7 @@ fn interactive_result(result: &Result<InteractiveOutcome, String>) -> (String, b
 #[cfg(windows)]
 fn run_interactive() -> ExitCode {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
-        MB_SETFOREGROUND, MB_YESNO,
+        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO,
     };
     let result = cleanup_targets().and_then(|targets| {
         interactive_cleanup(
@@ -227,24 +233,33 @@ fn run_interactive() -> ExitCode {
         )
     });
     let (message, failed) = interactive_result(&result);
-    if let Err(error) = message_box(
-        "moyAI 初期化の結果",
-        &message,
-        MB_OK
-            | MB_SETFOREGROUND
-            | if failed {
-                MB_ICONERROR
-            } else {
-                MB_ICONINFORMATION
-            },
-    ) {
-        eprintln!("{error}\n{message}");
-        return ExitCode::from(1);
-    }
+    println!("{message}\n\n終了するにはキーを押してください。");
+    wait_for_key();
     if failed {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_key() {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    let _ = std::io::stdout().flush();
+    if crossterm::terminal::enable_raw_mode().is_ok() {
+        loop {
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        let _ = crossterm::terminal::disable_raw_mode();
+    } else {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
     }
 }
 
@@ -272,20 +287,7 @@ fn message_box(title: &str, message: &str, style: u32) -> Result<i32, String> {
 }
 
 fn cleanup_targets() -> Result<Vec<Utf8PathBuf>, String> {
-    let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
-        .ok_or_else(|| "failed to resolve moyAI AppData directory".to_string())?;
-    let candidates = [dirs.config_dir(), dirs.data_dir(), dirs.cache_dir()];
-    let mut targets = Vec::new();
-    for candidate in candidates {
-        let path = Utf8PathBuf::from_path_buf(candidate.to_path_buf())
-            .map_err(|_| "moyAI AppData directory is not valid UTF-8".to_string())?;
-        let root = moyai_appdata_root(&path)
-            .ok_or_else(|| format!("failed to resolve moyAI AppData root from {path}"))?;
-        if !targets.iter().any(|existing| existing == &root) {
-            targets.push(root);
-        }
-    }
-    Ok(targets)
+    moyai::user_data::cleanup_targets()
 }
 
 fn cleanup_report(removed: &[Utf8PathBuf], missing: &[Utf8PathBuf]) -> String {
@@ -311,14 +313,18 @@ fn cleanup_report(removed: &[Utf8PathBuf], missing: &[Utf8PathBuf]) -> String {
 
 fn assert_cleanup_target(path: &Utf8Path) -> Result<(), String> {
     let normalized = path.as_str().replace('/', "\\").to_ascii_lowercase();
-    if normalized.ends_with("\\midi-ai-labs\\moyai") {
+    if normalized.ends_with("\\midi-ai-labs\\moyai-data\\desktop")
+        || normalized.ends_with("\\midi-ai-labs\\moyai")
+        || normalized.ends_with("\\local.moyai.desktop")
+    {
         return Ok(());
     }
     Err(format!(
-        "refusing to clean unexpected path `{path}`; expected a midi-ai-labs\\moyai AppData directory"
+        "refusing to clean unexpected path `{path}`; expected the Desktop data directory or a legacy Desktop AppData directory"
     ))
 }
 
+#[cfg(test)]
 fn moyai_appdata_root(path: &Utf8Path) -> Option<Utf8PathBuf> {
     path.ancestors()
         .find(|ancestor| {
@@ -343,6 +349,18 @@ mod tests {
             ))
             .is_ok()
         );
+        assert!(
+            assert_cleanup_target(Utf8Path::new(
+                "C:/Users/example/AppData/Local/midi-ai-labs/moyai-data/desktop"
+            ))
+            .is_ok()
+        );
+        for path in [
+            "C:/Users/example/AppData/Local/midi-ai-labs/moyai-data",
+            "C:/Users/example/AppData/Local/midi-ai-labs/moyai-data/hub",
+        ] {
+            assert!(assert_cleanup_target(Utf8Path::new(path)).is_err());
+        }
     }
 
     #[test]
@@ -394,9 +412,9 @@ mod tests {
         fs::create_dir_all(&fixture_root).unwrap();
         let temporary = tempfile::tempdir_in(&fixture_root).unwrap();
         let fixture = Utf8Path::from_path(temporary.path()).unwrap();
-        let saved = fixture.join("Roaming/midi-ai-labs/moyai");
+        let saved = fixture.join("Local/midi-ai-labs/moyai-data/desktop");
         let missing = fixture.join("Local/midi-ai-labs/moyai");
-        let hub = fixture.join("Hub");
+        let hub = fixture.join("Local/midi-ai-labs/moyai-data/hub");
         let workspace = fixture.join("workspace");
         for directory in [
             saved.join("config"),

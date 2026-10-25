@@ -118,47 +118,6 @@ fn retire_reset_resources_at(
     retire_at(directory, config, data, sid, None)
 }
 
-pub(crate) fn prepare_user_data_reset(
-    targets: &[Utf8PathBuf],
-) -> Result<RetirementGuard, RunnerError> {
-    if targets.is_empty() || targets.iter().any(|path| !path.is_absolute()) {
-        return Err(error(
-            "User-data reset requires explicit absolute target directories",
-        ));
-    }
-    let config = crate::config::loader::global_config_path().map_err(error)?;
-    let data = crate::storage::StoragePaths::discover()
-        .map_err(error)?
-        .data_dir;
-    if !targets
-        .iter()
-        .any(|target| within(&config, target).unwrap_or(false))
-        || !targets
-            .iter()
-            .any(|target| within(&data, target).unwrap_or(false))
-    {
-        return Err(error(
-            "The active config/data profile is outside the approved cleanup targets",
-        ));
-    }
-    validate_profile_data(&data)?;
-    let directory = registry_directory()?;
-    let registry = Registry::open_at(&directory, false)?;
-    for entry in &registry.entries {
-        if targets
-            .iter()
-            .any(|target| within(&entry.config_path, target).unwrap_or(false))
-            && entry.config_path != config
-        {
-            return Err(error(
-                "Another profile is published inside these cleanup targets; retire it from its own profile first",
-            ));
-        }
-    }
-    drop(registry);
-    retire_at(&directory, &config, &data, &operator_sid()?, Some(targets))
-}
-
 fn validate_profile_data(data: &Utf8Path) -> Result<(), RunnerError> {
     if !data.is_absolute() {
         return Err(error(
@@ -173,10 +132,9 @@ fn validate_profile_data(data: &Utf8Path) -> Result<(), RunnerError> {
     }
     #[cfg(not(test))]
     {
-        let dirs = directories_next::ProjectDirs::from("net", "midi-ai-labs", "moyai")
-            .ok_or_else(|| error("The default data directory is unavailable"))?;
-        let expected = Utf8Path::from_path(dirs.data_dir())
-            .ok_or_else(|| error("The default data directory must be UTF-8"))?;
+        let expected = crate::user_data::DesktopPaths::discover()
+            .map_err(error)?
+            .data;
         if data != expected {
             return Err(error(
                 "A legacy publication does not identify this custom data directory; its execution evidence cannot be inferred",

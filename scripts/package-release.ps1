@@ -14,6 +14,9 @@ param(
   [string]$HubCompatibilityResultsPath = '',
   [string]$HubDocumentationPath = '',
   [string]$HubWebSettingsPath = '',
+  [string]$HubCleanupBinaryPath = '',
+  [string]$HubSetupScriptsPath = '',
+  [string]$HubThirdPartyNoticesPath = '',
   [switch]$SkipManualGuiStGate,
   [switch]$SkipBuild,
   [switch]$AllowDirtySource
@@ -126,6 +129,7 @@ function Remove-ReleaseOutputDirectory([string]$OutputRootPath, [string]$Path, [
 $repoRoot = Resolve-RepoRoot
 . (Join-Path $repoRoot 'scripts\deployment\common.ps1')
 . (Join-Path $repoRoot 'scripts\release-guides.ps1')
+. (Join-Path $repoRoot 'scripts\release-components.ps1')
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
   $OutputRoot = Join-Path (Split-Path -Parent $repoRoot) "project_sandbox\releases"
 }
@@ -196,7 +200,7 @@ try {
 
   $hubIdentity = $null
   $hubCompatibilityVerified = $false
-  if ($HubBinaryPath -or $HubBuildIdentityPath -or $HubCompatibilityResultsPath -or $HubWebSettingsPath) {
+  if ($HubBinaryPath -or $HubBuildIdentityPath -or $HubCompatibilityResultsPath -or $HubWebSettingsPath -or $HubCleanupBinaryPath -or $HubSetupScriptsPath -or $HubThirdPartyNoticesPath) {
     if (-not $HubBinaryPath -or -not $HubBuildIdentityPath -or -not (Test-Path -LiteralPath $HubBinaryPath -PathType Leaf) -or -not (Test-Path -LiteralPath $HubBuildIdentityPath -PathType Leaf)) { throw 'A Hub bundle requires both -HubBinaryPath and -HubBuildIdentityPath.' }
     $hubIdentity = Get-Content -LiteralPath $HubBuildIdentityPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $hubIdentity.version -or $hubIdentity.git_commit -notmatch '^[a-f0-9]{40}$' -or $hubIdentity.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Hub identity requires version, git_commit, sha256, and source_clean.' }
@@ -207,6 +211,16 @@ try {
     Assert-MoyaiHubReleaseGuides $HubDocumentationPath
     if (-not $HubWebSettingsPath) { $HubWebSettingsPath = Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'web-management.json' }
     if (-not (Test-Path -LiteralPath $HubWebSettingsPath -PathType Leaf)) { throw 'Hub initial Web settings are missing. Supply -HubWebSettingsPath with web-management.json from the matching Hub source.' }
+    if (-not $HubCleanupBinaryPath) { $HubCleanupBinaryPath = Join-Path (Split-Path -Parent $HubBinaryPath) 'moyai-cleanup-hub.exe' }
+    if (-not (Test-Path -LiteralPath $HubCleanupBinaryPath -PathType Leaf)) { throw 'Hub bundle requires moyai-cleanup-hub.exe from the matching Hub build. Supply -HubCleanupBinaryPath.' }
+    Assert-MoyaiX64Pe $HubCleanupBinaryPath
+    if ($hubIdentity.PSObject.Properties.Name -notcontains 'cleanup_sha256' -or $hubIdentity.cleanup_sha256 -cnotmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $HubCleanupBinaryPath -Algorithm SHA256).Hash -ine $hubIdentity.cleanup_sha256) { throw 'Hub cleanup does not match its build identity checksum. Use the executable and cleanup from the same Hub release.' }
+    if (-not $HubSetupScriptsPath) { $HubSetupScriptsPath = Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'scripts' }
+    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Setup-Hub.ps1', 'Start-Hub.cmd', 'Stop-Hub.cmd')) {
+      if (-not (Test-Path -LiteralPath (Join-Path $HubSetupScriptsPath $name) -PathType Leaf)) { throw "Hub setup resource is missing: $name. Supply -HubSetupScriptsPath from the matching Hub source." }
+    }
+    if (-not $HubThirdPartyNoticesPath) { $HubThirdPartyNoticesPath = Join-Path (Split-Path -Parent $HubBinaryPath) 'THIRD_PARTY_NOTICES.txt' }
+    if (-not (Test-Path -LiteralPath $HubThirdPartyNoticesPath -PathType Leaf) -or [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $HubThirdPartyNoticesPath -Raw -Encoding UTF8))) { throw 'Hub third-party notices are missing. Supply -HubThirdPartyNoticesPath from the matching Hub release.' }
     if ($HubCompatibilityResultsPath) {
       $hubResults = Get-Content -LiteralPath $HubCompatibilityResultsPath -Raw -Encoding UTF8
       foreach ($marker in @('Desktop Hub Gate: PASS', "Desktop Git Commit: $commit", "Hub Git Commit: $($hubIdentity.git_commit)", "Hub SHA256: $($hubIdentity.sha256)")) {
@@ -282,7 +296,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
       throw "Desktop web release build failed with exit code $LASTEXITCODE"
     }
-    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-runner --bin moyai-cleanup --bin moyai-sandbox
+    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-runner --bin moyai-cleanup --bin moyai-cleanup-desktop --bin moyai-sandbox
     if ($LASTEXITCODE -ne 0) {
       throw "Rust release build failed with exit code $LASTEXITCODE"
     }
@@ -318,6 +332,7 @@ try {
   $desktopExe = Join-Path $repoRoot "target\release\moyai-desktop.exe"
   $runnerExe = Join-Path $repoRoot "target\release\moyai-runner.exe"
   $cleanupExe = Join-Path $repoRoot "target\release\moyai-cleanup.exe"
+  $desktopCleanupExe = Join-Path $repoRoot "target\release\moyai-cleanup-desktop.exe"
   $sandboxExe = Join-Path $repoRoot "target\release\moyai-sandbox.exe"
   if (-not (Test-Path -LiteralPath $cliExe -PathType Leaf)) {
     throw "release CLI binary not found: $cliExe"
@@ -331,6 +346,7 @@ try {
   if (-not (Test-Path -LiteralPath $cleanupExe -PathType Leaf)) {
     throw "release cleanup binary not found: $cleanupExe"
   }
+  if (-not (Test-Path -LiteralPath $desktopCleanupExe -PathType Leaf)) { throw "release Desktop cleanup binary not found: $desktopCleanupExe" }
   if (-not (Test-Path -LiteralPath $sandboxExe -PathType Leaf)) {
     throw "release sandbox helper binary not found: $sandboxExe"
   }
@@ -361,10 +377,11 @@ try {
   Copy-RequiredFile $runnerExe (Join-Path $releaseRoot "app\bin\moyai-runner.exe")
   Copy-RequiredFile $sandboxExe (Join-Path $releaseRoot "app\bin\moyai-sandbox.exe")
   Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup.exe")
-  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1')) {
+  Copy-RequiredFile $desktopCleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup-desktop.exe")
+  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1', 'component-install.ps1', 'Setup-Component.ps1')) {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$script") (Join-Path $releaseRoot "scripts\$script")
   }
-  foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd')) {
+  foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd', 'Uninstall-moyAI.cmd')) {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$launcher") (Join-Path $releaseRoot $launcher)
   }
   if ($RuntimeMode -eq 'Bundled') {
@@ -382,8 +399,13 @@ try {
   }
   if ($hubIdentity) {
     Copy-RequiredFile $HubBinaryPath (Join-Path $releaseRoot 'hub\bin\moyai-hub.exe')
+    Copy-RequiredFile $HubCleanupBinaryPath (Join-Path $releaseRoot 'hub\bin\moyai-cleanup-hub.exe')
     Copy-RequiredFile $HubWebSettingsPath (Join-Path $releaseRoot 'hub\bin\web-management.json')
     Copy-RequiredFile $HubBuildIdentityPath (Join-Path $releaseRoot 'hub\build-identity.json')
+    Copy-RequiredFile (Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'LICENSE') (Join-Path $releaseRoot 'hub\LICENSE')
+    Copy-RequiredFile $HubThirdPartyNoticesPath (Join-Path $releaseRoot 'hub\THIRD_PARTY_NOTICES.txt')
+    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Start-Hub.cmd', 'Stop-Hub.cmd')) { Copy-RequiredFile (Join-Path $HubSetupScriptsPath $name) (Join-Path $releaseRoot "hub\$name") }
+    Copy-RequiredFile (Join-Path $HubSetupScriptsPath 'Setup-Hub.ps1') (Join-Path $releaseRoot 'hub\scripts\Setup-Hub.ps1')
     if ($HubCompatibilityResultsPath) { Copy-RequiredFile $HubCompatibilityResultsPath (Join-Path $releaseRoot 'docs\release\desktop-hub-results.md') }
   }
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
@@ -391,7 +413,7 @@ try {
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
   Copy-RequiredFile (Join-Path $repoRoot "config.example.toml") (Join-Path $releaseRoot "config.example.toml")
-  Copy-MoyaiReleaseGuides $repoRoot $releaseRoot $HubDocumentationPath $(if ($hubIdentity) { $hubIdentity.git_commit } else { '' })
+  Copy-MoyaiReleaseGuides $repoRoot $releaseRoot $HubDocumentationPath $(if ($hubIdentity) { $hubIdentity.git_commit } else { '' }) $commit
   foreach ($runnerGuide in @('runner-local.md', 'runner-shared.md', 'shared-work-desktop.md', 'desktop-first-use.md', 'hub-device-network-guide.md', 'hub-integration.md', 'mcp-history-guide.md', 'managed-shell-guide.md')) {
     Copy-RequiredFile (Join-Path $repoRoot "docs\$runnerGuide") (Join-Path $releaseRoot "docs\$runnerGuide")
   }
@@ -414,15 +436,17 @@ try {
     desktop = $buildIdentity
     hub = $hubIdentity
     hub_compatibility_verified = $hubCompatibilityVerified
+    components = [ordered]@{ Desktop = [ordered]@{ version = $Version } }
     machine_sandbox = [ordered]@{ service='MoyAISandbox'; setup='scripts/Setup-Sandbox.ps1' }
     runtime = [ordered]@{
       webview2 = if ($RuntimeMode -eq 'Bundled') { 'bundled-fixed' } else { 'system-installed' }
       visual_cpp = if ($RuntimeMode -eq 'Bundled') { 'app-local' } else { 'system-installed' }
     }
     files = @(Get-ChildItem -LiteralPath $releaseRoot -Recurse -File | Sort-Object FullName | ForEach-Object {
-      [ordered]@{path=(Get-RelativePathForRelease $releaseRoot $_.FullName).Replace('\', '/'); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+      Get-MoyaiReleaseComponentFile $releaseRoot $_.FullName ([bool]$hubIdentity)
     })
   }
+  if ($hubIdentity) { $deployment.components['Hub'] = [ordered]@{ version = $hubIdentity.version } }
   Write-Utf8File (Join-Path $releaseRoot 'deployment.json') ($deployment | ConvertTo-Json -Depth 8)
   [void](Read-MoyaiDeployment $releaseRoot -VerifyHashes)
 

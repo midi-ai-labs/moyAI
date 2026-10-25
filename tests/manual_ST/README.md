@@ -10,6 +10,8 @@
 - scenario の user-visible requirement: 各 `spec.md`
 - run固有の結果とfailure: 必須のtask-local `RESULTS.md`。親orchestration workspaceに `docs/logs/worklog.md` がある場合だけ判断概要も追記する
 
+Program Filesへ製品別に導入したDesktop/HubのCase5は、runnerの `--package-root` にDesktop導入先、`--hub-root` にHub導入先を明示する。対応する通常runtime driverのStart/Stopにも同じ `-HubRoot` を渡す。従来の展開済み同梱配布物は引き続き `hub/bin` を使い、検証対象を暗黙に別のHubへ切り替えない。
+
 現行 `src/harness/` が保存する runtime evidence は利用できるが、harness internal state や旧 classifier を final oracle にしない。合否は実 GUI 操作、workspace output、外部 verification、transcript / protocol evidence で判定する。
 
 各caseはscenario intentとproduct predicateを所有する。launch、port、process ledger、deadline、evidence writer、verdict、cleanupは `tests/desktop_e2e/` の共通ownerへ委ね、caseや実行ごとにRun番号付きscript一式を複製しない。未対応driverが必要な場合は、case内の一時helperではなく共通adapterとそのqualificationを先に追加する。
