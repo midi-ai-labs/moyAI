@@ -37,7 +37,7 @@ async function request(context: ActionContext, pending: NonNullable<DeviceNetwor
     }
     else if (pending === "reset") {
       local.resetConfirmed = false;
-      local.notice = "このPCの接続設定をリセットしました。手動でAIを設定するか、新しいHubの接続ファイルを読み込めます。履歴と成果物、以前の仕事の未確認記録は保持しています。";
+      local.notice = projection.error ? "" : "このPCの接続設定をリセットしました。手動でAIを設定するか、新しいHubの接続ファイルを読み込めます。履歴と成果物、以前の仕事の未確認記録は保持しています。";
     }
   } catch (error) {
     if (!current()) return;

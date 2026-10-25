@@ -1203,6 +1203,15 @@ impl RunService {
         if request.agent_context.is_some() {
             return self.execute_run_inner(request, renderer, prompt).await;
         }
+        // An earlier connection reset may have retired the identity while an
+        // older build left its machine registration behind. Reconcile it before
+        // taking the shared execution lease; current publications stay in force.
+        tokio::task::spawn_blocking(|| {
+            crate::runner::operations::retire_reset_resources().map(drop)
+        })
+        .await
+        .map_err(|_| AppRunError::Message("共有実行登録の終了状態を確認できません。".into()))?
+        .map_err(|error| AppRunError::Message(error.message))?;
         let publication = crate::runtime::resource_admission::PublicationGuard::acquire()
             .map_err(|e| AppRunError::Message(e.to_string()))?;
         let resource = crate::runner::shared::external::LocalResourceLease::acquire(

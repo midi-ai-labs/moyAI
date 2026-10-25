@@ -5,7 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use directories_next::ProjectDirs;
 use fs2::FileExt;
 
-const LOCK_FILE_NAME: &str = "desktop-instance.lock";
+use crate::storage::maintenance::DESKTOP_INSTANCE_LOCK as LOCK_FILE_NAME;
 
 /// A process-scoped lease that must be held for the complete Desktop lifetime.
 ///
@@ -20,6 +20,16 @@ impl DesktopInstanceGuard {
     /// Acquires the Desktop lease, or asks the already-running Desktop to
     /// restore its main window and returns `None` to stop this launch.
     pub fn acquire_or_notify() -> Result<Option<Self>, String> {
+        // Keep the management UI available if an old publication cannot yet be
+        // released. Its projection reports the remaining retirement evidence.
+        if let Err(error) = crate::runner::operations::retire_reset_resources().map(drop) {
+            eprintln!("共有実行登録の終了確認が必要です: {}", error.message);
+        }
+        // A cleanup owns publication exclusively while it checks existing owners
+        // and removes data. Acquire before creating a new lifetime lease so a
+        // concurrent startup cannot recreate that data under the cleanup.
+        let _publication = crate::runtime::resource_admission::PublicationGuard::acquire()
+            .map_err(|error| error.message)?;
         let lock_path = desktop_lock_path()?;
         let identifier = desktop_identifier()?;
         match Self::try_acquire_at(&lock_path) {

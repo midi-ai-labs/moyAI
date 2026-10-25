@@ -545,6 +545,32 @@ pub fn remove_autostart_after_reset() -> Result<(), RunnerError> {
     super::autostart::remove_adjacent_runner()
 }
 
+/// Keeps existing publication, execution-journal and startup owners excluded
+/// until its caller has completed retirement or explicit user-data removal.
+pub struct ResourceRetirementGuard {
+    _inner: crate::runtime::resource_admission::RetirementGuard,
+}
+
+pub fn retire_reset_resources() -> Result<ResourceRetirementGuard, RunnerError> {
+    crate::runtime::resource_admission::retire_reset_resources()
+        .map(|_inner| ResourceRetirementGuard { _inner })
+}
+
+pub(crate) fn retire_reset_resources_for_profile(
+    config: &Utf8Path,
+    data: &Utf8Path,
+) -> Result<ResourceRetirementGuard, RunnerError> {
+    crate::runtime::resource_admission::retire_reset_resources_for_profile(config, data)
+        .map(|_inner| ResourceRetirementGuard { _inner })
+}
+
+pub fn prepare_user_data_reset(
+    targets: &[Utf8PathBuf],
+) -> Result<ResourceRetirementGuard, RunnerError> {
+    crate::runtime::resource_admission::prepare_user_data_reset(targets)
+        .map(|_inner| ResourceRetirementGuard { _inner })
+}
+
 /// Launch the adjacent product Runner in the current OS account, without a shell or elevation.
 pub fn launch() -> Result<(), RunnerError> {
     launch_process().map(|_| ())

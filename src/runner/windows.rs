@@ -239,8 +239,21 @@ pub struct LocalListener {
 
 impl LocalListener {
     pub fn bind() -> Result<Self, RunnerError> {
+        Self::bind_in(None)
+    }
+
+    /// Reserve the existing startup namespace while its profile is retired.
+    /// FIRST_PIPE_INSTANCE rejects a live host and prevents competing startup.
+    pub(crate) fn reserve_for_config(config: &camino::Utf8Path) -> Result<Self, RunnerError> {
+        Self::bind_in(Some(config))
+    }
+
+    fn bind_in(config: Option<&camino::Utf8Path>) -> Result<Self, RunnerError> {
         let identity = current_identity()?;
-        let name = wide(&pipe_name(&identity));
+        let name = wide(&match config {
+            Some(config) => pipe_name_in(&identity, config.as_str()),
+            None => pipe_name(&identity),
+        });
         // Explicit protected DACL: only this user. Token comparison below additionally rejects
         // another logon session, reduced group/privilege rights, and mismatched integrity.
         let descriptor = wide(&format!("D:P(A;;GA;;;{})", identity.user));

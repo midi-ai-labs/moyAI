@@ -64,6 +64,24 @@ test("offline reset needs local confirmation only and sends the exact connection
   });
 });
 
+test("reset with unconfirmed execution keeps its warning after reload without a recovery notice", async () => {
+  const projection = deviceProjection({ revision: "4", generation: "8", hub_url: "", device_id: null,
+    enrollment: "unconfigured", can_join: false, error: "reset_execution_unconfirmed" });
+  await withContext(async name => {
+    if (name === "device_execution_projection") return { revision: "1", state: "unconnected", projects: [], review: null, unknown_attempts: [] };
+    if (name === "device_network_jobs") return { incoming: [], outgoing: [] };
+    return projection;
+  }, async ({ context, local }) => {
+    local.resetConfirmed = true;
+    await resetDeviceNetwork(context);
+    assert.equal(local.notice, "");
+    assert.equal(local.projection?.error, "reset_execution_unconfirmed");
+    await loadDeviceNetwork(context);
+    assert.equal(local.notice, "");
+    assert.equal(local.projection?.error, "reset_execution_unconfirmed");
+  });
+});
+
 test("legacy target deletion distinguishes same-named IDs and never reenables a retired peer", async () => {
   const calls: Record<string, unknown>[] = [];
   await withContext(async (_name, args) => {

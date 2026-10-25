@@ -279,8 +279,8 @@ impl AppBootstrap {
                 config.clone(),
             )
             .with_remote_jobs(remote_jobs.clone());
-            Some(crate::device_network::DeviceNetworkService::new(
-                config_path.with_file_name("device-network"),
+            Some(crate::device_network::DeviceNetworkService::new_for_config(
+                config_path,
                 store.clone(),
                 config.clone(),
                 remote_jobs,
@@ -458,6 +458,107 @@ mod tests {
         DurableTurnTerminal, NewSession, RunEvent, SessionProviderConnection, SessionSelector,
         SessionStartRequest, SessionStatus,
     };
+
+    #[test]
+    fn custom_global_config_filename_keeps_unreleased_publication_visible_after_reset() {
+        let parent = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("project_sandbox/local-resource-retirement/custom-config");
+        std::fs::create_dir_all(&parent).unwrap();
+        let temporary = tempfile::tempdir_in(parent).unwrap();
+        let root = Utf8Path::from_path(temporary.path()).unwrap();
+        let config = root.join("config/chosen-models.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::create_dir(root.join("workspace")).unwrap();
+        std::fs::create_dir(root.join("resource-policy")).unwrap();
+        std::fs::write(&config, "").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::bootstrap::tests::custom_config_file_retirement_projection_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOYAI_CONFIG_PATH", &config)
+            .env("MOYAI_DATA_DIR", root.join("data"))
+            .env("MOYAI_TEST_RESOURCE_REGISTRY", root.join("resource-policy"))
+            .env(
+                "MOYAI_CUSTOM_CONFIG_PROBE_WORKSPACE",
+                root.join("workspace"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Dedicated child: isolate an explicitly selected config filename and resource policy"]
+    async fn custom_config_file_retirement_projection_probe() {
+        use crate::runtime::resource_admission::{PublishedRoot, set_test_registry};
+        let config_path = crate::config::loader::global_config_path().unwrap();
+        let policy = Utf8PathBuf::from(std::env::var("MOYAI_TEST_RESOURCE_REGISTRY").unwrap());
+        set_test_registry(policy.clone());
+        let workspace =
+            Utf8PathBuf::from(std::env::var("MOYAI_CUSTOM_CONFIG_PROBE_WORKSPACE").unwrap());
+        let paths = StoragePaths::discover().unwrap();
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = StoreBundle::new(sqlite);
+        let process = AppBootstrap::create_process_runtime(store).await.unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let mut config = ResolvedConfig::default();
+        config.device_network = crate::device_network::SharedHubConfig {
+            hub_url: "https://127.0.0.1:1".into(),
+            ca_certificate_pem: params.self_signed(&key).unwrap().pem(),
+        };
+        let app =
+            AppBootstrap::rebuild_for_directory_as_workspace_root_with_process_runtime_and_config(
+                &workspace, process, config,
+            )
+            .await
+            .unwrap();
+        let network = app.device_network.as_ref().unwrap();
+        let mut reset = crate::device_network::reset::ResetState::default();
+        reset.retire(Some("retired-hub"), Some("retired-device"));
+        reset.pending = false;
+        reset
+            .save(&config_path.with_file_name("device-network"))
+            .unwrap();
+        let entry = PublishedRoot {
+            hub_id: "retired-hub".into(),
+            device_id: "retired-device".into(),
+            environment_id: String::new(),
+            directory: Utf8PathBuf::new(),
+            config_path,
+            scope: crate::runner::shared::ResourceScope::Device,
+            operator_sid: crate::runtime::resource_admission::operator_sid().unwrap(),
+        };
+        let policy_file = policy.join("registry.json");
+        let before_policy = serde_json::to_vec(&vec![entry]).unwrap();
+        std::fs::write(&policy_file, &before_policy).unwrap();
+        let before = network.projection_now();
+        let after = network
+            .reset_local(&before.revision, &before.generation, |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(after.error.as_deref(), Some("reset_execution_unconfirmed"));
+        assert_eq!(before.error.as_deref(), Some("reset_execution_unconfirmed"));
+        assert_eq!(
+            network.projection_now().error.as_deref(),
+            Some("reset_execution_unconfirmed")
+        );
+        assert_eq!(std::fs::read(policy_file).unwrap(), before_policy);
+        network.shutdown().await;
+    }
 
     #[tokio::test]
     async fn rebuilt_app_keeps_existing_device_runtime_alive_for_non_desktop_tools() {

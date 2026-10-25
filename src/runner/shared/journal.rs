@@ -9,8 +9,30 @@ use ulid::Ulid;
 use super::super::RunnerError;
 use super::{Assignment, EnvironmentMapping, Report, ReportOutcome, SharedSettings};
 
+const LEGACY_FILE_NAME: &str = "runner-shared.sqlite3";
+
+pub(crate) fn identity_file_name(hub: &str, device: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let key = format!("{:x}", Sha256::digest(format!("{hub}|{device}").as_bytes()));
+    format!("runner-shared-{key}.sqlite3")
+}
+
+pub(crate) fn owns_file_name(name: &str) -> bool {
+    name == LEGACY_FILE_NAME
+        || name
+            .strip_prefix("runner-shared-")
+            .and_then(|name| name.strip_suffix(".sqlite3"))
+            .is_some_and(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 pub(crate) struct Journal {
     db: Connection,
+    _lock: File,
+}
+
+pub(crate) struct RetirementJournalGuard {
+    pub hub_id: Option<String>,
+    pub device_id: Option<String>,
     _lock: File,
 }
 
@@ -74,13 +96,85 @@ impl Entry {
 }
 
 impl Journal {
+    /// Keep the existing owner lock through retirement, without keeping SQLite
+    /// open when an explicitly approved cleanup subsequently removes its files.
+    pub(crate) fn lock_for_retirement(
+        path: &Utf8Path,
+    ) -> Result<RetirementJournalGuard, RunnerError> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .map_err(error)?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+            RunnerError::new("A Runner still owns its journal; stop it before retiring resources")
+        })?;
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(error)?;
+        let version: u32 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(error)?;
+        if version == 0 {
+            let objects: u64 = db
+                .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+                .map_err(error)?;
+            if objects == 0 {
+                return Ok(RetirementJournalGuard {
+                    hub_id: None,
+                    device_id: None,
+                    _lock: lock,
+                });
+            }
+        }
+        if version != 1 {
+            return Err(RunnerError::new(
+                "The Runner journal version cannot prove safe resource retirement",
+            ));
+        }
+        let (hub_id, device_id): (String, String) = db
+            .query_row(
+                "SELECT hub_id,device_id FROM runner_identity WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(error)?;
+        let missing_phase: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runner_attempts WHERE json_type(entry_json,'$.phase') IS NOT 'text')",
+            [],
+            |row| row.get(0),
+        ).map_err(error)?;
+        if missing_phase {
+            return Err(RunnerError::new(
+                "The Runner journal has an unclassified execution record",
+            ));
+        }
+        let journal = Self { db, _lock: lock };
+        if !journal.active()?.is_empty()
+            || !journal.retained_services()?.is_empty()
+            || !journal.unsettled_checkpoints("")?.is_empty()
+        {
+            return Err(RunnerError::new(
+                "Runner work, retained applications, or checkpoints still need settlement before resource retirement",
+            ));
+        }
+        let Self { db, _lock } = journal;
+        drop(db);
+        Ok(RetirementJournalGuard {
+            hub_id: Some(hub_id),
+            device_id: Some(device_id),
+            _lock,
+        })
+    }
+
     /// Preserve the legacy journal in place. A different identity gets a separate
     /// file, so unresolved old work never becomes a new Hub's recovery input.
     pub(crate) fn path_for(
         data: &Utf8Path,
         settings: &SharedSettings,
     ) -> Result<Utf8PathBuf, RunnerError> {
-        let legacy = data.join("runner-shared.sqlite3");
+        let legacy = data.join(LEGACY_FILE_NAME);
         if !legacy.exists() {
             return Ok(legacy);
         }
@@ -109,12 +203,7 @@ impl Journal {
         if identity == (settings.hub_id.clone(), settings.device_id.clone()) {
             return Ok(legacy);
         }
-        use sha2::{Digest, Sha256};
-        let key = format!(
-            "{:x}",
-            Sha256::digest(format!("{}|{}", settings.hub_id, settings.device_id).as_bytes())
-        );
-        Ok(data.join(format!("runner-shared-{key}.sqlite3")))
+        Ok(data.join(identity_file_name(&settings.hub_id, &settings.device_id)))
     }
 
     pub(crate) fn open(path: &Utf8Path, settings: &SharedSettings) -> Result<Self, RunnerError> {
@@ -625,4 +714,116 @@ impl Journal {
 
 fn error(error: impl std::fmt::Display) -> RunnerError {
     RunnerError::new(format!("Runner journal unavailable: {error}"))
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::super::tests::{assignment, fixture};
+
+    #[test]
+    fn journal_path_owner_recognizes_legacy_and_identity_paths() {
+        let (_temp, settings, path) = fixture();
+        let data = path.parent().unwrap();
+        let legacy = Journal::path_for(data, &settings).unwrap();
+        assert!(owns_file_name(legacy.file_name().unwrap()));
+        drop(Journal::open(&legacy, &settings).unwrap());
+        let mut next = settings.clone();
+        next.device_id = "another-device".into();
+        let dedicated = Journal::path_for(data, &next).unwrap();
+        assert_ne!(legacy, dedicated);
+        assert!(owns_file_name(dedicated.file_name().unwrap()));
+    }
+    use super::*;
+
+    #[test]
+    fn retirement_holds_the_existing_journal_owner_until_released() {
+        let (_temp, settings, path) = fixture();
+        let journal = Journal::open(&path, &settings).unwrap();
+        assert!(Journal::lock_for_retirement(&path).is_err());
+        drop(journal);
+        let clearance = Journal::lock_for_retirement(&path).unwrap();
+        assert_eq!(clearance.hub_id.as_deref(), Some(settings.hub_id.as_str()));
+        assert_eq!(
+            clearance.device_id.as_deref(),
+            Some(settings.device_id.as_str())
+        );
+        assert!(Journal::open(&path, &settings).is_err());
+        drop(clearance);
+        Journal::open(&path, &settings).unwrap();
+    }
+
+    #[test]
+    fn every_unsettled_phase_blocks_retirement() {
+        for phase in [
+            Phase::Intent,
+            Phase::Executing,
+            Phase::ReportPending,
+            Phase::Uncertain,
+        ] {
+            let (_temp, settings, path) = fixture();
+            let mut journal = Journal::open(&path, &settings).unwrap();
+            let mut entry = journal
+                .intent(assignment(), settings.environments[0].clone())
+                .unwrap();
+            entry.phase = phase;
+            journal.save(&entry).unwrap();
+            drop(journal);
+            assert!(Journal::lock_for_retirement(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn settled_work_still_requires_retained_process_and_checkpoint_settlement() {
+        for checkpoint in [false, true] {
+            let (_temp, settings, path) = fixture();
+            let mut journal = Journal::open(&path, &settings).unwrap();
+            let mut entry = journal
+                .intent(assignment(), settings.environments[0].clone())
+                .unwrap();
+            entry.phase = Phase::Settled;
+            if checkpoint {
+                entry.local_checkpoint = Some(serde_json::json!({"version":1}));
+            } else {
+                entry.retained_service = Some(crate::tool::shell::RetainedService {
+                    service_id: Ulid::new(),
+                    expires_at_ms: None,
+                    retain_after_turn: true,
+                });
+                entry.service_uncertain_ack = true;
+            }
+            journal.save(&entry).unwrap();
+            drop(journal);
+            assert!(Journal::lock_for_retirement(&path).is_err());
+            let mut journal = Journal::open(&path, &settings).unwrap();
+            if checkpoint {
+                journal
+                    .acknowledge_checkpoint_settlement(&mut entry)
+                    .unwrap();
+            } else {
+                journal.service_stopped(&mut entry).unwrap();
+            }
+            drop(journal);
+            Journal::lock_for_retirement(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn unclassified_or_unknown_version_journals_are_not_drain_evidence() {
+        for classified in [false, true] {
+            let (_temp, settings, path) = fixture();
+            drop(Journal::open(&path, &settings).unwrap());
+            let db = Connection::open(&path).unwrap();
+            if classified {
+                db.pragma_update(None, "user_version", 2).unwrap();
+            } else {
+                db.execute(
+                    "INSERT INTO runner_attempts VALUES('missing-phase',1,'{}')",
+                    [],
+                )
+                .unwrap();
+            }
+            drop(db);
+            assert!(Journal::lock_for_retirement(&path).is_err());
+        }
+    }
 }

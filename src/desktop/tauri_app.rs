@@ -443,8 +443,8 @@ pub async fn run_with_startup_report(
                 controller.app.config.clone(),
             )
             .with_remote_jobs(remote_jobs.clone());
-            let device_network = DeviceNetworkService::new(
-                config_path.with_file_name("device-network"),
+            let device_network = DeviceNetworkService::new_for_config(
+                config_path,
                 controller.app.store.clone(),
                 controller.state.global_config().clone(),
                 remote_jobs.clone(),
@@ -4526,7 +4526,9 @@ async fn device_network_reset(
     let mut projection = result.map_err(|error| error.to_string())?;
     service.update_runtime_config(controller.state.global_config().clone());
     drop(controller);
-    if crate::runner::operations::remove_autostart_after_reset().is_err() {
+    if crate::runner::operations::remove_autostart_after_reset().is_err()
+        && projection.error.is_none()
+    {
         projection.error = Some("reset_autostart_unconfirmed".into());
     }
     Ok(projection)

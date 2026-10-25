@@ -40,8 +40,8 @@ impl DeviceNetworkService {
         self.inner.state.lock().unwrap().shared.clone()
     }
 
-    /// Reset only this PC. No old Hub request, remote settlement or process-drain
-    /// acknowledgement is a precondition. The durable retirement fences old Runners.
+    /// Fence the old identity locally even when its Hub is unavailable. Releasing
+    /// the machine publication additionally requires the existing owners to drain.
     pub async fn reset_local(
         &self,
         revision: &str,
@@ -112,7 +112,21 @@ impl DeviceNetworkService {
         commit(&SharedHubConfig::default())?;
         reset.pending = false;
         reset.save(&self.inner.directory)?;
-        Ok(self.projection_now())
+        let config = self.inner.config_path.clone();
+        let data = self.inner.store.paths().data_dir.clone();
+        let retired = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            crate::runner::windows::shutdown_existing_for_config(&config)?;
+            crate::runner::operations::retire_reset_resources_for_profile(&config, &data).map(drop)
+        })
+        .await;
+        let mut projection = self.projection_now();
+        if !matches!(retired, Ok(Ok(()))) {
+            // The credential reset remains committed. An unconfirmed execution
+            // owner must keep blocking private reuse rather than look recovered.
+            projection.error = Some("reset_execution_unconfirmed".into());
+        }
+        Ok(projection)
     }
 
     fn clear_local_registration(&self) -> Result<(), DeviceError> {

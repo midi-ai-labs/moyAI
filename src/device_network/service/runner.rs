@@ -3,11 +3,12 @@ use super::*;
 
 impl DeviceNetworkService {
     pub(crate) fn for_runner_transport(
-        directory: Utf8PathBuf,
+        config_path: Utf8PathBuf,
         process: crate::app::AppProcessRuntime,
         config: ResolvedConfig,
         client: DeviceClient,
     ) -> Result<Self, DeviceError> {
+        let directory = config_path.with_file_name("device-network");
         let store = process.store();
         let jobs = RemoteJobService::new(process).map_err(|_| DeviceError::Unavailable)?;
         let publish = PublishService::new(
@@ -15,7 +16,7 @@ impl DeviceNetworkService {
             store.clone(),
             config.clone(),
         );
-        let service = Self::new(directory, store, config, jobs, publish);
+        let service = Self::new_for_config(config_path, store, config, jobs, publish);
         {
             let mut state = service
                 .inner

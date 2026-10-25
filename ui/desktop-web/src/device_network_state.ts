@@ -336,6 +336,7 @@ export function deviceNetworkError(error: unknown): string {
     confirmation_required: "公開対象と実行権限を確認して、確認欄を選択してください。",
     reset_incomplete: "前回の接続リセットを完了できていません。「接続設定をリセット」をもう一度実行してください。旧Hubへの自動接続は停止しています。",
     reset_autostart_unconfirmed: "接続設定はリセットしました。Windowsサインイン時の起動設定は解除を確認できませんでしたが、旧Hubの仕事は受け付けません。",
+    reset_execution_unconfirmed: "接続設定はリセットしました。以前の共有実行の停止を確認できないため、このPCの共有登録は残しています。実行中の仕事・保持中のアプリ・停止を確認できない処理を確認してから、もう一度リセットしてください。",
     connection_required: "先にHubへの参加・接続を完了してください。",
     read_tools_only: "読み取りtoolの公開対象です。エージェントへのタスク委任には使えません。",
     not_available_or_not_allowed: "相手の受付・接続、またはHubの許可を確認できません。最新情報を取得してください。",

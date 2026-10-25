@@ -165,6 +165,10 @@ pub struct StorageMaintenanceReport {
 
 impl SqliteStore {
     pub fn open(paths: &StoragePaths) -> Result<Self, StorageError> {
+        // Participate before creating files; an explicit cleanup holds the
+        // exclusive counterpart until it has finished removing its data.
+        let _publication = crate::runtime::resource_admission::PublicationGuard::acquire()
+            .map_err(|error| StorageError::Message(error.message))?;
         std::fs::create_dir_all(&paths.data_dir)?;
         std::fs::create_dir_all(&paths.truncation_dir)?;
         let connection = Connection::open(&paths.database_path)?;

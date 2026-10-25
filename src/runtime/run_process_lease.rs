@@ -12,6 +12,8 @@ pub struct RunProcessLease {
 
 impl RunProcessLease {
     pub fn try_acquire(data_dir: &Utf8Path, session_id: SessionId) -> Result<Self, StorageError> {
+        let _publication = super::resource_admission::PublicationGuard::acquire()
+            .map_err(|error| StorageError::Message(error.message))?;
         let lease_dir = data_dir.join("run-leases");
         std::fs::create_dir_all(&lease_dir)?;
         let lease_path = lease_dir.join(format!("{session_id}.lock"));

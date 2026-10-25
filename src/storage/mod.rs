@@ -9,6 +9,7 @@ use crate::error::StorageError;
 use crate::runtime::{ActiveRunRegistry, RunProcessLease};
 
 pub mod change_repo;
+pub(crate) mod maintenance;
 pub mod migration;
 pub mod permission_retry_fence;
 pub mod project_repo;

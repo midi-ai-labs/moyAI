@@ -1,7 +1,7 @@
 //! Hub-managed execution with a local durable start journal and explicit environment authority.
 mod data;
 pub mod external;
-mod journal;
+pub(crate) mod journal;
 #[cfg(all(test, windows))]
 pub(super) mod process_fixture;
 mod progress;
@@ -21,7 +21,46 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{ExecutionOutcome, LocalRunRequest, RunnerError, RunnerHost, SharedExecution};
+pub(crate) use journal::RetirementJournalGuard;
 use journal::{Entry, Journal, Phase};
+
+pub(crate) fn lock_journals_for_retirement(
+    data: &camino::Utf8Path,
+) -> Result<Vec<RetirementJournalGuard>, RunnerError> {
+    let entries = match std::fs::read_dir(data) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(RunnerError::new(error.to_string())),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| RunnerError::new(error.to_string()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !journal::owns_file_name(name) {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| RunnerError::new(error.to_string()))?
+            .is_file()
+        {
+            return Err(RunnerError::new("Runner journal must be an ordinary file"));
+        }
+        paths.push(
+            camino::Utf8PathBuf::from_path_buf(entry.path())
+                .map_err(|_| RunnerError::new("Runner journal path must be UTF-8"))?,
+        );
+        if paths.len() > 1024 {
+            return Err(RunnerError::new("Runner journal retirement bound exceeded"));
+        }
+    }
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| Journal::lock_for_retirement(path))
+        .collect()
+}
 use transport::{SharedClient, TransportError};
 
 pub(super) const MAX_SHARED_LABEL_BYTES: usize = 1024;

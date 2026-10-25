@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
+mod retirement;
+pub(crate) use retirement::{
+    RetirementGuard, prepare_user_data_reset, reset_publication_pending, retire_reset_resources,
+    retire_reset_resources_for_profile,
+};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PublishedRoot {
     pub hub_id: String,
@@ -99,7 +105,11 @@ struct Registry {
 impl Registry {
     fn open(write: bool) -> Result<Self, RunnerError> {
         let directory = registry_directory()?;
-        ensure_directory(&directory)?;
+        Self::open_at(&directory, write)
+    }
+
+    fn open_at(directory: &Utf8Path, write: bool) -> Result<Self, RunnerError> {
+        ensure_directory(directory)?;
         let lock = if write {
             let lock = OpenOptions::new()
                 .create(true)
@@ -148,7 +158,10 @@ impl Registry {
 }
 pub(crate) fn register(settings: &SharedSettings) -> Result<(), RunnerError> {
     let config_path = crate::config::loader::global_config_path().map_err(error)?;
+    let publication_read = PublicationGuard::acquire()?;
+    retirement::validate_registration_identity(&config_path, settings)?;
     let registry = Registry::open(false)?;
+    retirement::validate_replacement_identity(&config_path, settings, &registry.entries)?;
     let sid = operator_sid()?;
     let old = registry
         .entries
@@ -160,9 +173,13 @@ pub(crate) fn register(settings: &SharedSettings) -> Result<(), RunnerError> {
     if unchanged {
         return Ok(());
     }
+    drop(registry);
+    drop(publication_read);
     let publication = publication_file()?;
     fs2::FileExt::try_lock_exclusive(&publication).map_err(|_|error("Local moyAI work is still active; drain it before changing published resource registration"))?;
+    retirement::validate_registration_identity(&config_path, settings)?;
     let mut registry = Registry::open(true)?;
+    retirement::validate_replacement_identity(&config_path, settings, &registry.entries)?;
     for previous in &registry.entries {
         if previous.config_path != config_path
             && (matches!(previous.scope, ResourceScope::Device)

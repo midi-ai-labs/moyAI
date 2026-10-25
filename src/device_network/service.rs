@@ -391,6 +391,7 @@ pub(super) struct DeviceNetworkInner {
     pub settings: DeviceSettingsStore,
     pub identity: DeviceIdentityStore,
     pub directory: Utf8PathBuf,
+    pub config_path: Utf8PathBuf,
     pub store: StoreBundle,
     pub jobs: RemoteJobService,
     pub publish: PublishService,
@@ -543,6 +544,29 @@ impl DeviceNetworkService {
         jobs: RemoteJobService,
         publish: PublishService,
     ) -> Self {
+        let config_path = directory.with_file_name("config.toml");
+        Self::new_with_config_path(directory, config_path, store, config, jobs, publish)
+    }
+
+    pub(crate) fn new_for_config(
+        config_path: Utf8PathBuf,
+        store: StoreBundle,
+        config: ResolvedConfig,
+        jobs: RemoteJobService,
+        publish: PublishService,
+    ) -> Self {
+        let directory = config_path.with_file_name("device-network");
+        Self::new_with_config_path(directory, config_path, store, config, jobs, publish)
+    }
+
+    fn new_with_config_path(
+        directory: Utf8PathBuf,
+        config_path: Utf8PathBuf,
+        store: StoreBundle,
+        config: ResolvedConfig,
+        jobs: RemoteJobService,
+        publish: PublishService,
+    ) -> Self {
         let settings_store = DeviceSettingsStore::new(directory.join("device.json"));
         let identity_store = DeviceIdentityStore::new(directory.join("identity.json"));
         let (mut settings, mut error) = match settings_store.load() {
@@ -621,6 +645,7 @@ impl DeviceNetworkService {
                 settings: settings_store,
                 identity: identity_store,
                 directory: directory.clone(),
+                config_path,
                 store: store.clone(),
                 jobs,
                 publish,
@@ -681,6 +706,9 @@ impl DeviceNetworkService {
         }
     }
     pub fn projection_now(&self) -> DeviceNetworkProjection {
+        let reset_publication_pending =
+            crate::runtime::resource_admission::reset_publication_pending(&self.inner.config_path)
+                .unwrap_or(true);
         let state = self
             .inner
             .state
@@ -785,7 +813,11 @@ impl DeviceNetworkService {
             can_leave: !state.closing
                 && state.status != "pending"
                 && state.settings.device_id.is_some(),
-            error: state.error.map(|error| error.to_string()),
+            error: if reset_publication_pending {
+                Some("reset_execution_unconfirmed".into())
+            } else {
+                state.error.map(|error| error.to_string())
+            },
         }
     }
     pub fn polling_required(&self) -> bool {

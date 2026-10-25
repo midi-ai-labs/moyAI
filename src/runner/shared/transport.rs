@@ -156,7 +156,7 @@ impl SharedClient {
         )
         .map_err(|e| RunnerError::new(e.to_string()))?;
         let network = crate::device_network::DeviceNetworkService::for_runner_transport(
-            directory,
+            config_path,
             host.inner.process.clone(),
             config,
             client.clone(),
