@@ -233,9 +233,9 @@ fn prepare_with_relocation(
         return Err(format!(
             "Desktopの新旧両方の保存先にデータがあります。古いデータを再読込・統合せずに中止しました。新保存先: {}。旧保存先: {}。旧版を終了し、保存先を確認してください。",
             paths.root,
-            legacy_roots
+            moves
                 .iter()
-                .map(|path| path.as_str())
+                .map(|(source, _)| source.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -534,6 +534,78 @@ fn remove_empty_tree(path: &Utf8Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn migrated_webview_normal_profile_survives_cold_restart_and_recreated_old_cache_is_preserved()
+    {
+        let temp = crate::user_data::test_directory();
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let paths = DesktopPaths::at(root.join("new/desktop"));
+        let old = root.join("old/moyai");
+        let webview = root.join("old/local.moyai.desktop");
+        fs::create_dir_all(&webview).unwrap();
+        fs::create_dir_all(root.join("machine")).unwrap();
+        fs::write(webview.join("Local State"), b"saved browser state").unwrap();
+        let profile = (old.join("config/config.toml"), old.join("data"));
+        prepare_with(
+            &paths,
+            &[old.clone()],
+            &profile,
+            Some(&webview),
+            |profiles, targets| {
+                ProfileMaintenanceGuard::for_test(&root.join("machine"), profiles, targets)
+                    .map_err(|error| error.message)
+            },
+        )
+        .unwrap();
+        let current = crate::user_data::resolve_webview_directory(&paths, None).unwrap();
+        assert_eq!(current, paths.cache.join("webview"));
+        assert_eq!(
+            fs::read(current.join("Local State")).unwrap(),
+            b"saved browser state"
+        );
+        // The normal consumer has no WEBVIEW2 override. Its next write must stay
+        // in the migrated profile so the following ordinary startup can reopen it.
+        fs::write(current.join("new storage"), b"normal launch state").unwrap();
+        prepare_with(&paths, &[old.clone()], &profile, Some(&webview), |_, _| {
+            panic!("A cold restart must not attempt another migration")
+        })
+        .unwrap();
+        assert!(!webview.exists());
+        assert_eq!(
+            fs::read(current.join("new storage")).unwrap(),
+            b"normal launch state"
+        );
+        let explicit = root.join("isolated/webview");
+        assert_eq!(
+            crate::user_data::resolve_webview_directory(
+                &paths,
+                Some(explicit.clone().into_std_path_buf().into_os_string())
+            )
+            .unwrap(),
+            explicit
+        );
+
+        // Data created by an older/broken consumer is a real conflict even when
+        // migration has a completion marker. Never merge or delete its storage.
+        fs::create_dir_all(&webview).unwrap();
+        fs::write(webview.join("Local State"), b"recreated browser state").unwrap();
+        let failure = prepare_with(&paths, &[old], &profile, Some(&webview), |_, _| {
+            panic!("A conflicting browser profile must stop before maintenance")
+        })
+        .unwrap_err();
+        assert!(failure.contains(webview.as_str()));
+        assert_eq!(
+            fs::read(webview.join("Local State")).unwrap(),
+            b"recreated browser state"
+        );
+        assert_eq!(
+            fs::read(current.join("Local State")).unwrap(),
+            b"saved browser state"
+        );
+        assert!(!marker_paths(&paths).unwrap().1.exists());
+    }
 
     #[tokio::test]
     async fn migrated_projects_keep_canonical_identity_and_history_after_cold_bootstrap() {

@@ -138,9 +138,7 @@ pub fn prepare_desktop_profile() -> Result<(), String> {
             std::env::var("MOYAI_DESKTOP_PREFS_PATH")
                 .map(Utf8PathBuf::from)
                 .unwrap_or_else(|_| paths.config.join("desktop.toml")),
-            std::env::var("WEBVIEW2_USER_DATA_FOLDER")
-                .map(Utf8PathBuf::from)
-                .unwrap_or_else(|_| paths.cache.join("webview")),
+            desktop_webview_directory()?,
         ];
         migration::check_explicit_profile(
             &paths,
@@ -150,6 +148,25 @@ pub fn prepare_desktop_profile() -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn desktop_webview_directory() -> Result<Utf8PathBuf, String> {
+    resolve_webview_directory(
+        &DesktopPaths::discover()?,
+        std::env::var_os("WEBVIEW2_USER_DATA_FOLDER"),
+    )
+}
+
+#[cfg(windows)]
+fn resolve_webview_directory(
+    paths: &DesktopPaths,
+    explicit: Option<std::ffi::OsString>,
+) -> Result<Utf8PathBuf, String> {
+    match explicit {
+        Some(path) => utf8(&std::path::PathBuf::from(path)),
+        None => Ok(paths.cache.join("webview")),
+    }
 }
 
 /// The compatibility cleanup executable uses this same product-specific scope.

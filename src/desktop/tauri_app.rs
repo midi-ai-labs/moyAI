@@ -462,20 +462,11 @@ pub async fn run_with_startup_report(
     context.config_mut().identifier =
         super::single_instance::desktop_identifier().map_err(AppRunError::Message)?;
     #[cfg(windows)]
-    {
-        let webview_data = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER")
-            .map(std::path::PathBuf::from)
-            .unwrap_or(
-                crate::user_data::DesktopPaths::discover()
-                    .map_err(AppRunError::Message)?
-                    .cache
-                    .join("webview")
-                    .into_std_path_buf(),
-            );
-        for window in &mut context.config_mut().app.windows {
-            window.data_directory = Some(webview_data.clone());
-        }
-    }
+    let webview_data = crate::user_data::desktop_webview_directory()
+        .map_err(AppRunError::Message)?
+        .into_std_path_buf();
+    #[cfg(windows)]
+    let startup_windows = take_windows_startup_configs(&mut context.config_mut().app.windows);
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             restore_main_window(app);
@@ -501,7 +492,16 @@ pub async fn run_with_startup_report(
         .manage(DesktopExitGate::default())
         .manage(device_network)
         .manage(managed_shells.clone())
-        .setup(|app| {
+        .setup(move |app| {
+            #[cfg(windows)]
+            for window in &startup_windows {
+                // The pinned Tauri runtime does not copy WindowConfig's data
+                // directory into its WebView attributes. Pass it to the actual
+                // builder so ordinary launches use the migrated browser data.
+                tauri::WebviewWindowBuilder::from_config(app, window)?
+                    .data_directory(webview_data.clone())
+                    .build()?;
+            }
             install_tray(app.handle())?;
             let network = app.state::<DeviceNetworkService>().inner().clone();
             let attention_network = network.downgrade();
@@ -552,6 +552,23 @@ pub async fn run_with_startup_report(
         .run(context);
     managed_shells.shutdown().await;
     result.map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
+}
+
+#[cfg(windows)]
+fn take_windows_startup_configs(
+    configured: &mut [tauri::utils::config::WindowConfig],
+) -> Vec<tauri::utils::config::WindowConfig> {
+    configured
+        .iter_mut()
+        .filter_map(|window| {
+            if !window.create {
+                return None;
+            }
+            let startup = window.clone();
+            window.create = false;
+            Some(startup)
+        })
+        .collect()
 }
 
 async fn handle_join_config_activation(
@@ -6925,6 +6942,30 @@ mod tests {
     use super::*;
 
     const TEST_ADMISSION_REVISION: u64 = 7;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_startup_builds_configured_windows_once_with_their_original_attributes() {
+        let main = tauri::utils::config::WindowConfig {
+            title: "configured desktop".into(),
+            width: 1560.0,
+            height: 960.0,
+            decorations: false,
+            ..Default::default()
+        };
+        let expected = serde_json::to_value(&main).unwrap();
+        let disabled = tauri::utils::config::WindowConfig {
+            label: "on-demand".into(),
+            create: false,
+            ..Default::default()
+        };
+        let mut configured = vec![main, disabled];
+        let startup = take_windows_startup_configs(&mut configured);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(serde_json::to_value(&startup[0]).unwrap(), expected);
+        assert!(configured.iter().all(|window| !window.create));
+        assert!(take_windows_startup_configs(&mut configured).is_empty());
+    }
 
     #[test]
     fn origin_full_stop_requires_canonical_revision_and_exact_live_local_target() {
