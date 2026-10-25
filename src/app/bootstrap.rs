@@ -225,7 +225,7 @@ impl AppBootstrap {
             WorkspaceRootMode::RemoteTemp(id) => Some(*id),
             _ => None,
         };
-        let workspace = match root_mode {
+        let mut workspace = match root_mode {
             WorkspaceRootMode::Discover => WorkspaceDiscovery::discover(start_dir, &config)?,
             WorkspaceRootMode::FixedToStart | WorkspaceRootMode::RemoteTemp(_) => {
                 WorkspaceDiscovery::discover_fixed_root(start_dir, &config)?
@@ -235,7 +235,7 @@ impl AppBootstrap {
             }
         };
         let project_name = project_display_name(&workspace.root);
-        if let Some(profile_id) = remote_temp_profile {
+        let project = if let Some(profile_id) = remote_temp_profile {
             store
                 .project_repo()
                 .upsert_remote_temp_project(
@@ -244,11 +244,11 @@ impl AppBootstrap {
                     &project_name,
                     profile_id,
                 )
-                .await?;
+                .await?
         } else {
             store
                 .project_repo()
-                .upsert_project(
+                .open_project_for_root(
                     workspace.project_id,
                     &workspace.root,
                     &project_name,
@@ -257,8 +257,9 @@ impl AppBootstrap {
                         crate::workspace::VcsKind::None => "none",
                     },
                 )
-                .await?;
-        }
+                .await?
+        };
+        workspace.project_id = project.id;
 
         let process_runtime = if let Some(process_runtime) = process_runtime {
             process_runtime
@@ -360,7 +361,10 @@ async fn restore_run_session_directory(
                 .map_err(AppBootstrapError::from)?,
         )
     } else if run_args.continue_last {
-        let workspace = WorkspaceDiscovery::discover(&start_dir, &ResolvedConfig::default())?;
+        let mut workspace = WorkspaceDiscovery::discover(&start_dir, &ResolvedConfig::default())?;
+        if let Some(project) = store.project_repo().project_for_root(&workspace.root)? {
+            workspace.project_id = project.id;
+        }
         store
             .session_repo()
             .latest_session(workspace.project_id)
@@ -730,6 +734,106 @@ mod tests {
                 "restoring a session must not grant access to its parent project"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_and_cli_continue_last_reuse_a_saved_root_identity_after_its_path_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let workspace_root = root.join("new-workspace");
+        // CLI continues from its discovered project. Pin this fixture's Git
+        // root so a repository containing the test TEMP cannot own it instead.
+        std::fs::create_dir_all(workspace_root.join(".git")).unwrap();
+        let discovered =
+            WorkspaceDiscovery::discover(&workspace_root, &ResolvedConfig::default()).unwrap();
+        assert!(crate::workspace::PathGuard::same_path_identity(
+            &discovered.root,
+            &workspace_root
+        ));
+        let data = root.join("data");
+        let paths = StoragePaths {
+            database_path: data.join("moyai.sqlite3"),
+            truncation_dir: data.join("truncation"),
+            data_dir: data,
+        };
+        let sqlite = SqliteStore::open(&paths).unwrap();
+        sqlite.migrate().unwrap();
+        let store = StoreBundle::new(sqlite);
+        let canonical_id =
+            crate::session::ProjectId::from_stable_input(root.join("old-workspace").as_str());
+        store
+            .project_repo()
+            .upsert_project(canonical_id, &workspace_root, "saved", "git")
+            .await
+            .unwrap();
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: canonical_id,
+                title: "saved chat".into(),
+                cwd: workspace_root.clone(),
+                model: "model".into(),
+                base_url: "http://127.0.0.1:1234".into(),
+                access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .unwrap();
+        let args = RunArgs {
+            prompt: None,
+            session_id: None,
+            continue_last: true,
+            title: None,
+            directory: Some(workspace_root.clone()),
+            model_override: None,
+            provider_connection_override: Default::default(),
+            output_mode: crate::cli::OutputMode::Human,
+            show_reasoning_summary: false,
+            review_uncommitted: false,
+            review_branch: None,
+            active_file: None,
+            open_tabs: Vec::new(),
+            visible_files: Vec::new(),
+            image_paths: Vec::new(),
+        };
+        let restored = restore_run_session_directory(workspace_root.clone(), Some(&args), &store)
+            .await
+            .unwrap();
+        assert_eq!(restored.session_id, Some(session.id));
+        assert_eq!(restored.project_root, Some(workspace_root.clone()));
+        assert_eq!(restored.directory, workspace_root);
+        let process = AppBootstrap::create_process_runtime(store.clone())
+            .await
+            .unwrap();
+        for mode in [
+            WorkspaceRootMode::Discover,
+            WorkspaceRootMode::FixedToStart,
+            WorkspaceRootMode::Stored(workspace_root.clone()),
+        ] {
+            let app = AppBootstrap::build_with_resolved_config(
+                &workspace_root,
+                store.clone(),
+                mode,
+                ResolvedConfig::default(),
+                Some(process.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(app.workspace.project_id, canonical_id);
+            assert_eq!(
+                app.session_service
+                    .resolve_session_for_workspace(&SessionSelector::Latest, &app.workspace)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                session.id
+            );
+        }
+        assert_eq!(
+            store.project_repo().list_projects(10).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

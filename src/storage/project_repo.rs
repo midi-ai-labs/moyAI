@@ -14,6 +14,56 @@ pub struct SqliteProjectRepository {
     connection: Arc<Mutex<Connection>>,
 }
 
+fn project_for_root_in_connection(
+    connection: &Connection,
+    root: &Utf8Path,
+) -> Result<Option<ProjectRecord>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id,root_path,display_name,vcs_kind,created_at_ms,updated_at_ms FROM projects",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut matched = None;
+    for row in rows {
+        let (id, path, display_name, vcs_kind, created_at_ms, updated_at_ms) = row?;
+        let path = Utf8PathBuf::from(path);
+        if !crate::workspace::PathGuard::same_path_identity(root, &path) {
+            continue;
+        }
+        if !crate::workspace::PathGuard::security_path_is_within(root, &path)
+            .map_err(|error| StorageError::Message(error.to_string()))?
+            || !crate::workspace::PathGuard::security_path_is_within(&path, root)
+                .map_err(|error| StorageError::Message(error.to_string()))?
+        {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(StorageError::Message(format!(
+                "workspace root `{root}` has multiple saved project owners; preserve their histories and choose the intended project"
+            )));
+        }
+        matched = Some(ProjectRecord {
+            id: id.parse().map_err(|error| {
+                StorageError::Message(format!("invalid stored project identity: {error}"))
+            })?,
+            root_path: path,
+            display_name,
+            vcs_kind,
+            created_at_ms,
+            updated_at_ms,
+        });
+    }
+    Ok(matched)
+}
+
 /// Read the existing project's purpose without opening or migrating a Store.
 /// Only the product's exact, non-Git temporary workspaces are reset data.
 pub(crate) fn cleanup_preserved_workspace_roots(
@@ -88,6 +138,28 @@ impl SqliteProjectRepository {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
     }
+
+    pub(crate) fn project_for_root(
+        &self,
+        root: &Utf8Path,
+    ) -> Result<Option<ProjectRecord>, StorageError> {
+        project_for_root_in_connection(
+            &self.connection.lock().expect("sqlite mutex poisoned"),
+            root,
+        )
+    }
+
+    /// A root discovered at startup may have a saved identity from before its
+    /// product-owned data directory moved. Reuse that owner atomically.
+    pub(crate) async fn open_project_for_root(
+        &self,
+        id: ProjectId,
+        root_path: &Utf8Path,
+        display_name: &str,
+        vcs_kind: &str,
+    ) -> Result<ProjectRecord, StorageError> {
+        self.upsert_project_with_purpose(id, root_path, display_name, vcs_kind, None, true)
+    }
     /// Internal temporary workspaces acquire their purpose atomically with project creation.
     /// A normal upsert preserves purpose; it can never promote an ordinary project.
     pub(crate) async fn upsert_remote_temp_project(
@@ -97,7 +169,14 @@ impl SqliteProjectRepository {
         display_name: &str,
         profile_id: ulid::Ulid,
     ) -> Result<ProjectRecord, StorageError> {
-        self.upsert_project_with_purpose(id, root_path, display_name, "none", Some(profile_id))
+        self.upsert_project_with_purpose(
+            id,
+            root_path,
+            display_name,
+            "none",
+            Some(profile_id),
+            true,
+        )
     }
 
     fn upsert_project_with_purpose(
@@ -107,10 +186,20 @@ impl SqliteProjectRepository {
         display_name: &str,
         vcs_kind: &str,
         remote_temp_profile_id: Option<ulid::Ulid>,
+        reuse_root_owner: bool,
     ) -> Result<ProjectRecord, StorageError> {
         let now = SystemClock.now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = if reuse_root_owner {
+            project_for_root_in_connection(&transaction, root_path)?
+        } else {
+            None
+        };
+        let id = saved.as_ref().map_or(id, |project| project.id);
+        let root_path = saved
+            .as_ref()
+            .map_or(root_path, |project| project.root_path.as_path());
         let existing_id_for_root = transaction
             .query_row(
                 "SELECT id FROM projects WHERE root_path = ?1",
@@ -187,7 +276,7 @@ impl ProjectRepository for SqliteProjectRepository {
         display_name: &str,
         vcs_kind: &str,
     ) -> Result<ProjectRecord, StorageError> {
-        self.upsert_project_with_purpose(id, root_path, display_name, vcs_kind, None)
+        self.upsert_project_with_purpose(id, root_path, display_name, vcs_kind, None, false)
     }
 
     async fn get_project(&self, id: ProjectId) -> Result<ProjectRecord, StorageError> {
@@ -481,6 +570,88 @@ mod tests {
     fn project_repo_fixture() -> (SqliteProjectRepository, camino::Utf8PathBuf) {
         let (store, data_dir) = project_store_fixture();
         (store.project_repo(), data_dir)
+    }
+
+    #[tokio::test]
+    async fn opening_saved_root_reuses_canonical_identity_without_changing_its_purpose() {
+        let (repo, root) = project_repo_fixture();
+        let owner = ProjectId::new();
+        let profile = ulid::Ulid::new();
+        repo.upsert_remote_temp_project(owner, &root, "temporary", profile)
+            .await
+            .unwrap();
+        let reopened = repo
+            .open_project_for_root(ProjectId::new(), &root, "reopened", "none")
+            .await
+            .unwrap();
+        assert_eq!(reopened.id, owner);
+        assert!(repo.list_projects(10).await.unwrap().is_empty());
+        assert!(
+            repo.upsert_remote_temp_project(
+                ProjectId::new(),
+                &root,
+                "other receiver",
+                ulid::Ulid::new()
+            )
+            .await
+            .is_err()
+        );
+
+        let ordinary = root.join("ordinary");
+        std::fs::create_dir_all(&ordinary).unwrap();
+        let ordinary_owner = ProjectId::new();
+        repo.upsert_project(ordinary_owner, &ordinary, "ordinary", "none")
+            .await
+            .unwrap();
+        assert!(
+            repo.upsert_remote_temp_project(
+                ProjectId::new(),
+                &ordinary,
+                "must not promote",
+                profile
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(repo.list_projects(10).await.unwrap()[0].id, ordinary_owner);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn saved_root_slash_alias_reuses_identity_and_ambiguous_owners_are_rejected() {
+        let (repo, root) = project_repo_fixture();
+        let alias = Utf8PathBuf::from(root.as_str().replace('\\', "/"));
+        assert_ne!(root.as_str(), alias.as_str());
+        let owner = ProjectId::new();
+        repo.upsert_project(owner, &alias, "saved", "none")
+            .await
+            .unwrap();
+        let reopened = repo
+            .open_project_for_root(ProjectId::new(), &root, "reopened", "none")
+            .await
+            .unwrap();
+        assert_eq!(reopened.id, owner);
+        assert_eq!(reopened.root_path, alias);
+        assert_eq!(repo.list_projects(10).await.unwrap().len(), 1);
+
+        // Older raw-string callers could persist a second owner for the same
+        // Windows directory. Opening it must not choose or merge histories.
+        repo.upsert_project(ProjectId::new(), &root, "second owner", "none")
+            .await
+            .unwrap();
+        let error = repo
+            .open_project_for_root(ProjectId::new(), &root, "must not commit", "none")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple saved project owners"));
+        assert!(repo.project_for_root(&root).is_err());
+        let projects = repo.list_projects(10).await.unwrap();
+        assert_eq!(projects.len(), 2);
+        assert!(
+            projects
+                .iter()
+                .all(|project| project.display_name != "must not commit")
+        );
     }
 
     #[tokio::test]

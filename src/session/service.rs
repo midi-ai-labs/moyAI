@@ -1932,7 +1932,11 @@ pub(crate) fn normalize_session_cwd_for_project(
     if project_vcs_kind == "git" {
         let discovered = WorkspaceDiscovery::discover(&normalized, &ResolvedConfig::default())
             .map_err(|error| SessionError::Message(error.to_string()))?;
-        if discovered.project_id != project_id {
+        if !PathGuard::security_path_is_within(&discovered.root, project_root)
+            .map_err(|error| SessionError::Message(error.to_string()))?
+            || !PathGuard::security_path_is_within(project_root, &discovered.root)
+                .map_err(|error| SessionError::Message(error.to_string()))?
+        {
             return Err(SessionError::Message(format!(
                 "session workspace directory `{cwd}` resolves to project {}, not stored project {project_id}",
                 discovered.project_id

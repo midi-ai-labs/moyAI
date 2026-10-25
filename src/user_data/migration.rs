@@ -535,6 +535,182 @@ fn remove_empty_tree(path: &Utf8Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn migrated_projects_keep_canonical_identity_and_history_after_cold_bootstrap() {
+        use crate::app::AppBootstrap;
+        use crate::config::ResolvedConfig;
+        use crate::protocol::{ModeKind, ProtocolEventStore};
+        use crate::session::{
+            NewSession, ProjectRepository, SessionProviderConnection, SessionRepository,
+            SessionSelector, SessionStartRequest,
+        };
+        use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+        use crate::workspace::{VcsKind, WorkspaceDiscovery};
+
+        for git in [false, true] {
+            let temp = crate::user_data::test_directory();
+            let root = Utf8Path::from_path(temp.path()).unwrap();
+            let paths = DesktopPaths::at(root.join("new/desktop"));
+            let old = root.join("old/moyai");
+            let old_workspace = old.join("data/quick-chat-workspace");
+            fs::create_dir_all(old.join("config")).unwrap();
+            fs::create_dir_all(&old_workspace).unwrap();
+            fs::create_dir_all(root.join("machine")).unwrap();
+            fs::write(old.join("config/config.toml"), "").unwrap();
+            fs::write(
+                old_workspace.join("saved-result.txt"),
+                "preserved workspace file",
+            )
+            .unwrap();
+            if git {
+                fs::create_dir(old_workspace.join(".git")).unwrap();
+            }
+            let old_paths = StoragePaths {
+                data_dir: old.join("data"),
+                database_path: old.join("data/moyai.sqlite3"),
+                truncation_dir: old.join("data/truncation"),
+            };
+            let sqlite = SqliteStore::open(&old_paths).unwrap();
+            sqlite.migrate().unwrap();
+            let store = StoreBundle::new(sqlite);
+            let workspace = if git {
+                WorkspaceDiscovery::discover(&old_workspace, &ResolvedConfig::default()).unwrap()
+            } else {
+                WorkspaceDiscovery::discover_fixed_root(&old_workspace, &ResolvedConfig::default())
+                    .unwrap()
+            };
+            let project_id = workspace.project_id;
+            store
+                .project_repo()
+                .upsert_project(
+                    project_id,
+                    &workspace.root,
+                    "saved project",
+                    if git { "git" } else { "none" },
+                )
+                .await
+                .unwrap();
+            let saved = store
+                .session_repo()
+                .create_session(NewSession {
+                    project_id,
+                    title: "saved chat".into(),
+                    cwd: workspace.cwd,
+                    model: "model".into(),
+                    base_url: "http://127.0.0.1:1234".into(),
+                    access_mode: crate::config::AccessMode::Default,
+                    provider_connection: None,
+                })
+                .await
+                .unwrap();
+            store
+                .protocol_event_store()
+                .set_collaboration_mode(saved.id, ModeKind::Plan)
+                .unwrap();
+            let history = serde_json::to_value(
+                store
+                    .protocol_event_store()
+                    .list_history_items_for_session(saved.id)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!history.as_array().unwrap().is_empty());
+            drop(store);
+            prepare_with(
+                &paths,
+                &[old.clone()],
+                &(old.join("config/config.toml"), old.join("data")),
+                None,
+                |profiles, targets| {
+                    ProfileMaintenanceGuard::for_test(&root.join("machine"), profiles, targets)
+                        .map_err(|error| error.message)
+                },
+            )
+            .unwrap();
+
+            let new_workspace = paths.data.join("quick-chat-workspace");
+            let new_paths = StoragePaths {
+                data_dir: paths.data.clone(),
+                database_path: paths.data.join("moyai.sqlite3"),
+                truncation_dir: paths.data.join("truncation"),
+            };
+            let sqlite = SqliteStore::open(&new_paths).unwrap();
+            sqlite.migrate().unwrap();
+            let store = StoreBundle::new(sqlite);
+            let config = ResolvedConfig::default();
+            let app = AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+                &new_workspace,
+                store,
+                config,
+            )
+            .await
+            .unwrap();
+            assert_eq!(app.workspace.project_id, project_id);
+            assert_eq!(
+                app.workspace.vcs,
+                if git { VcsKind::Git } else { VcsKind::None }
+            );
+            assert_eq!(
+                app.store
+                    .project_repo()
+                    .list_projects(10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fs::read_to_string(new_workspace.join("saved-result.txt")).unwrap(),
+                "preserved workspace file"
+            );
+            let current = app.session_service.get_session(saved.id).await.unwrap();
+            assert_eq!(current.project_id, project_id);
+            assert!(crate::workspace::PathGuard::same_path_identity(
+                &current.cwd,
+                &new_workspace
+            ));
+            assert_eq!(
+                serde_json::to_value(
+                    app.store
+                        .protocol_event_store()
+                        .list_history_items_for_session(saved.id)
+                        .unwrap()
+                )
+                .unwrap(),
+                history
+            );
+            for selector in [
+                SessionSelector::ById(saved.id),
+                SessionSelector::Latest,
+                SessionSelector::New,
+            ] {
+                let creates_session = matches!(selector, SessionSelector::New);
+                let resumed = app
+                    .session_service
+                    .start_or_resume(
+                        SessionStartRequest {
+                            selector,
+                            title: None,
+                            cwd: app.workspace.cwd.clone(),
+                            model: app.config.model.model.clone(),
+                            base_url: app.config.model.base_url.clone(),
+                            access_mode: app.config.permissions.access_mode,
+                            provider_connection: Some(
+                                SessionProviderConnection::from_model_config(&app.config.model),
+                            ),
+                        },
+                        app.workspace.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resumed.session.project_id, project_id);
+                if !creates_session {
+                    assert_eq!(resumed.session.id, saved.id);
+                }
+            }
+        }
+    }
+
     #[test]
     fn failed_reference_restore_preserves_moved_data_pending_and_blocks_both_startup_paths() {
         let temp = crate::user_data::test_directory();

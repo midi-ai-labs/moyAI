@@ -116,7 +116,7 @@ Windowsの利用者データは `%LOCALAPPDATA%\midi-ai-labs\moyai-data` に集�
 | `desktop\cache` | Desktopのキャッシュ |
 | `hub` | Hubの設定・DB・資格・ログ |
 
-従来のRoaming側のDesktop／Hub保存先は、通常ユーザーでの起動準備時に停止状態を確認して移行します。使用中、移行が未完了、新旧両方にデータがある場合は上書き・自動統合せず、保存先を表示して中止します。実際のプロジェクト作業フォルダーは移動・削除しません。`MOYAI_CONFIG_PATH`、`MOYAI_DATA_DIR`、Hubの `--data-dir` などによる独自配置は維持します。Desktop用cleanupは既定の製品別範囲に入らない独自config/data/preferences指定を検出すると、削除せず拒否します。Hub用cleanupは `--data-dir` で保存先を明示でき、Hubの保存先であることと停止状態を検証してから削除します。
+従来のRoaming側のDesktop／Hub保存先は、通常ユーザーでの起動準備時に停止状態を確認して移行します。使用中、移行が未完了、新旧両方にデータがある場合は上書き・自動統合せず、保存先を表示して中止します。製品の保存先の外にある作業フォルダーは移動・削除しません。旧製品の保存先の中に作業フォルダーを登録している場合は、ファイルと既存の会話を保持して新保存先へ移し、参照先を更新します。`MOYAI_CONFIG_PATH`、`MOYAI_DATA_DIR`、Hubの `--data-dir` などによる独自配置は維持します。Desktop用cleanupは既定の製品別範囲に入らない独自config/data/preferences指定を検出すると、削除せず拒否します。Hub用cleanupは `--data-dir` で保存先を明示でき、Hubの保存先であることと停止状態を検証してから削除します。
 
 対象の一覧だけを確認する場合は `--preview` を指定します。コマンドから確認画面なしで初期化する場合は、バックアップと対象確認後に `--reset-user-data --confirm-delete` の両方を指定します。Desktop・CLI・Runner・保持中のアプリを終了してから実行してください。稼働中、または共有実行の停止・清算を確認できない場合は、保存データを削除せず中止します。通常の再接続・更新・アンインストールには使いません。
 
