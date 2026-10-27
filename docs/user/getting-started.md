@@ -1,6 +1,6 @@
 # moyAIを使い始める
 
-Desktop 3.0.4の手順です。公開済みv2.1.1を使う場合は、その配布物のREADMEを参照してください。Windowsへの導入・更新は[専用手順](windows-setup.md)にまとめています。
+Desktop 3.0.5の手順です。公開済みv2.1.1を使う場合は、その配布物のREADMEを参照してください。Windowsへの導入・更新は[専用手順](windows-setup.md)にまとめています。
 
 ## 使い方を選ぶ
 

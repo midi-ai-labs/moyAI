@@ -48,6 +48,15 @@ function Copy-RequiredFile([string]$Source, [string]$Destination) {
   Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
+function Copy-RequiredCommandFile([string]$Source, [string]$Destination) {
+  if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+    throw "required file not found: $Source"
+  }
+  $content = [IO.File]::ReadAllText($Source, [Text.UTF8Encoding]::new($false, $true))
+  $content = $content.Replace("`r`n", "`n").Replace("`r", "`n").Replace("`n", "`r`n")
+  Write-Utf8File $Destination $content
+}
+
 function Get-CargoPackageVersion {
   $insidePackage = $false
   foreach ($line in Get-Content -LiteralPath "Cargo.toml" -Encoding UTF8) {
@@ -380,7 +389,7 @@ try {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$script") (Join-Path $releaseRoot "scripts\$script")
   }
   foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd', 'Uninstall-moyAI.cmd')) {
-    Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$launcher") (Join-Path $releaseRoot $launcher)
+    Copy-RequiredCommandFile (Join-Path $repoRoot "scripts\deployment\$launcher") (Join-Path $releaseRoot $launcher)
   }
   if ($RuntimeMode -eq 'Bundled') {
     New-Item -ItemType Directory -Path (Join-Path $releaseRoot 'runtime\webview2') -Force | Out-Null
@@ -402,7 +411,7 @@ try {
     Copy-RequiredFile $HubBuildIdentityPath (Join-Path $releaseRoot 'hub\build-identity.json')
     Copy-RequiredFile (Join-Path (Get-Item -LiteralPath $HubDocumentationPath).Parent.FullName 'LICENSE') (Join-Path $releaseRoot 'hub\LICENSE')
     Copy-RequiredFile $HubThirdPartyNoticesPath (Join-Path $releaseRoot 'hub\THIRD_PARTY_NOTICES.txt')
-    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Start-Hub.cmd', 'Stop-Hub.cmd')) { Copy-RequiredFile (Join-Path $hubSetupResources.command_root $name) (Join-Path $releaseRoot "hub\$name") }
+    foreach ($name in @('Setup-Hub.cmd', 'Uninstall-Hub.cmd', 'Start-Hub.cmd', 'Stop-Hub.cmd')) { Copy-RequiredCommandFile (Join-Path $hubSetupResources.command_root $name) (Join-Path $releaseRoot "hub\$name") }
     Copy-RequiredFile $hubSetupResources.powershell_path (Join-Path $releaseRoot 'hub\scripts\Setup-Hub.ps1')
     if ($HubCompatibilityResultsPath) { Copy-RequiredFile $HubCompatibilityResultsPath (Join-Path $releaseRoot 'docs\release\desktop-hub-results.md') }
   }

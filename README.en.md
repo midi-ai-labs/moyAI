@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.md">日本語</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.4">Download v3.0.4</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.5">Download v3.0.5</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">License</a>
@@ -22,7 +22,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.4 is a Windows x64 maintenance release.** It fixes local requests blocked by an obsolete shared execution registration and gives Desktop and Hub consistent installation, data and reset locations. It pairs with moyAI Hub 1.0.1. This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. The published v2.1.1 ZIP has its original layout and behavior. See the [3.0.4 release notes](docs/release/v3.0.4.md) for changes and limitations, and the package's release evidence for its exact tested build.
+**Desktop 3.0.5 is a Windows x64 maintenance release.** It corrects the line endings of packaged Windows command files, including the bundled Hub launcher. It pairs with moyAI Hub 1.0.2. This Windows package requires WebView2 and the x64 VC++ runtime to be installed on the PC. Runtime verification was not performed for this release. See the [3.0.5 release notes](docs/release/v3.0.5.md) for changes and limitations. The published v2.1.1 ZIP has its original layout and behavior.
 
 ## Desktop and Hub
 
@@ -49,7 +49,7 @@ Security review uses original guidance informed by OWASP, a built-in Skill, and 
 
 ## Quick Start
 
-For the 3.0.4 Windows package:
+For the 3.0.5 Windows package:
 
 1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt to install the executable files under Program Files. Setup opens **moyAI** as the original standard user and checks that its initial screen appears. Continue in the opened window; use the Start menu for later launches. If startup fails or remains unconfirmed after 60 seconds, Setup shows the result and diagnostic log location and leaves the app running if it has not exited. Follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
@@ -108,7 +108,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-The 3.0.4 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+The 3.0.5 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
 On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
 
@@ -154,7 +154,7 @@ Windows native sandbox tests require an explicitly approved helper testhost. Fol
 
 Use the [GUI automation guide](tests/desktop_e2e/GUI_AUTOMATION.md) and [manual test entrypoint](tests/manual_ST/README.md) to select checks for the changed behavior. Real-window evidence and Live LLM behavior must be distinguished from fixture tests. Source ownership is visible in [src/](src/) and [the multi-PC design](docs/design/multi-device-session.md); implementation details belong with their code and tests rather than being duplicated here.
 
-Earlier 3.0.0 candidates were tested with Manual ST Cases 1–7, restoration stages, and virtual WinA/WinB execution and result transfer on one Windows PC. Those results, including generated-code evaluation failures and Side Chat answer inaccuracies, remain historical evidence. They do not establish acceptance of 3.0.4. Records for this fix and its verification are in the development workspace at `project_sandbox/local-submit-diagnosis-20261025/RESULTS.md`. Consult distribution verification records with exact version, commit and binary identities for the checks performed and conditions that remain unverified. The reported startup failure on Windows 10 2016 LTSB has no confirmed cause, and this release has not been verified on that OS. AD domain usage with Hub has been reported; a controlled AD token and group-deny acceptance test remains unverified. Fresh-PC installation and physical multi-PC/LAN/Firewall checks also require separate evidence.
+Earlier 3.0.0 candidates were tested with Manual ST Cases 1–7, restoration stages, and virtual WinA/WinB execution and result transfer on one Windows PC. Those results, including generated-code evaluation failures and Side Chat answer inaccuracies, remain historical evidence. Records for the 3.0.4 fix and its verification are in the development workspace at `project_sandbox/local-submit-diagnosis-20261025/RESULTS.md`. Runtime verification was not performed for 3.0.5. The reported startup failure on Windows 10 2016 LTSB has no confirmed cause, and this release has not been verified on that OS. AD domain usage with Hub has been reported; a controlled AD token and group-deny acceptance test remains unverified. Fresh-PC installation and physical multi-PC/LAN/Firewall checks also require separate evidence.
 
 Release packaging uses `scripts/package-release.ps1` from a clean release commit. It rebuilds Desktop, CLI, Runner, cleanup and the sandbox helper, requires version/commit-specific manual GUI evidence, and checks the exact Hub binary when bundled. Runtime inputs and commands are in [Windows packaging](docs/user/windows-setup.md#配布を作る担当者向け). Publish the ZIP with its manifest and SHA256 sidecar only after the packaged applications pass acceptance.
 
