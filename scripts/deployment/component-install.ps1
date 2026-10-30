@@ -749,6 +749,31 @@ function Select-MoyaiUninstallOptions([string[]]$Components,[bool]$ResetDesktopD
     } finally { $form.Dispose() }
 }
 
+function Start-MoyaiHub([string]$Executable, [string[]]$Arguments) {
+    # This path is outside the profile: creating a launch log must not make a
+    # fresh current profile appear populated before legacy data is migrated.
+    $logRoot=Join-Path (Split-Path -Parent (Get-MoyaiComponentUserReceiptPath 'Hub')) 'logs'
+    [void](New-Item -ItemType Directory -Path $logRoot -Force)
+    $logBase=Join-Path $logRoot ('hub-launch-'+[Guid]::NewGuid().ToString('N'))
+    $stdout=$logBase+'.stdout.log'; $stderr=$logBase+'.stderr.log'
+    $process=Start-Process -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory (Split-Path -Parent $Executable) -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    try {
+        $null=$process.Handle
+        $process.WaitForExit()
+        $exitCode=$process.ExitCode
+        if ($null -eq $exitCode -or $exitCode -ne 0) {
+            $stream=[IO.File]::OpenRead($stderr)
+            try {
+                [void]$stream.Seek([Math]::Max(0,$stream.Length-8192),[IO.SeekOrigin]::Begin)
+                $reader=[IO.StreamReader]::new($stream,[Text.Encoding]::UTF8)
+                try { $details=$reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
+            } finally { $stream.Dispose() }
+            throw "Hubの配置は完了していますが、起動処理を完了できませんでした。終了コード: $exitCode`n$details`n起動エラーログ: $stderr`n起動結果: $stdout"
+        }
+        Remove-Item -LiteralPath $stdout,$stderr -ErrorAction SilentlyContinue
+    } finally { $process.Dispose() }
+}
+
 function Invoke-MoyaiComponentUserSetup(
     [string]$SourceRoot,[string[]]$Components=@(),[switch]$Uninstall,[switch]$CheckOnly,[switch]$NoShortcuts,[switch]$SkipStartupCheck,
     [switch]$ResetDesktopData,[switch]$ResetHubData,[switch]$RemoveSharedRuntime,[switch]$Interactive,[Nullable[int]]$WebPort=$null,[string]$HubDataDir=''
@@ -848,9 +873,7 @@ function Invoke-MoyaiComponentUserSetup(
                 $arguments='--launch'
                 if($null -ne $WebPort) { $arguments+=' --web-port '+$WebPort }
                 if($HubDataDir) { $arguments+=' --data-dir '+(ConvertTo-MoyaiSetupArgument $HubDataDir) }
-                $process=Start-Process -FilePath (Join-Path $root 'moyai-hub.exe') -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden -PassThru
-                $null=$process.Handle; $process.WaitForExit()
-                try { if($process.ExitCode -ne 0) { throw "Hubの起動を完了できませんでした。終了コード: $($process.ExitCode)" } } finally { $process.Dispose() }
+                Start-MoyaiHub (Join-Path $root 'moyai-hub.exe') @($arguments)
             }
         }
     }
