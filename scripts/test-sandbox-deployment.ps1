@@ -121,6 +121,31 @@ Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
 Assert-That ($null -eq $script:service -and -not (Test-Path -LiteralPath $location.root) -and (Get-Content -LiteralPath $sentinel -Raw) -ceq 'profile/history/device policy sentinel') 'explicit machine removal deletes only owned payload and service'
 Assert-That ((Get-Content -LiteralPath $legacySentinel -Raw) -ceq 'previous transient helper evidence') 'install, update and explicit removal preserve the legacy Sandbox directory'
 
+foreach($damage in @('helper','directory','parent','service')) {
+    New-Case
+    Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+    $location=Get-MoyaiSandboxLocation
+    if($damage -eq 'service') { $script:service=$null }
+    else {
+        Remove-Item -LiteralPath $location.helper
+        if($damage -in @('directory','parent')) {
+            Remove-Item -LiteralPath (Join-Path $location.root 'installation.json')
+            Remove-Item -LiteralPath $location.root
+            if($damage -eq 'parent') {
+                Remove-Item -LiteralPath (Join-Path $location.parent 'sandbox-setup.lock')
+                Remove-Item -LiteralPath $location.parent
+            }
+            $script:failDelete=$true
+            Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall } 'missing-directory service deletion failure is reported'
+            Assert-That ($null -ne $script:service -and $script:service.Start -eq 3) 'failed deletion restores demand-start even when the payload directory was already absent'
+        }
+    }
+    Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
+    Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root)) "uninstall completes with an already missing $damage"
+    Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
+    Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root)) "repeated uninstall after missing $damage is a successful no-op"
+}
+
 New-Case
 foreach($name in @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')) { Write-MoyaiUtf8 (Join-Path $script:source "app/bin/$name") ('inert '+$name) }
 Write-FixtureManifest 'app-local'

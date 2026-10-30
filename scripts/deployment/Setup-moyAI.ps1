@@ -22,7 +22,7 @@ try {
   $sourceRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\', '/')
   if (Test-MoyaiCloudDistribution $sourceRoot) {
     Write-Output '配布物をローカルへ取得・照合しています。完了するまでお待ちください。'
-    $preparedSource = New-MoyaiDistributionSource $sourceRoot
+    $preparedSource = New-MoyaiDistributionSource $sourceRoot -ForUninstall:$Uninstall
     $sourceRoot = $preparedSource.root
   }
   $sourceManifestPath = Join-Path $sourceRoot 'deployment.json'

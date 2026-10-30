@@ -59,6 +59,25 @@ $read=[MoyaiDistribution.Source]::Read((Join-Path $package 'app/bin/moyai-deskto
 try { Fails { [IO.File]::WriteAllText((Join-Path $package 'app/bin/moyai-desktop.exe'),'race') } 'A source held for copying cannot be overwritten during preparation' } finally { $read.Dispose(); $pin.Dispose() }
 Check ((Get-Content -LiteralPath (Join-Path $package 'app/bin/moyai-desktop.exe') -Raw) -ceq 'changed') 'Source files are preserved'
 
+# Removal needs verified control files, but must not hydrate an absent app image.
+$appImage=Join-Path $package 'app/bin/moyai-desktop.exe'
+Remove-Item -LiteralPath $appImage
+Fails { New-MoyaiDistributionSource $package } 'Installation still rejects an absent app image'
+$partial=New-MoyaiDistributionSource $package -ForUninstall
+try {
+  Check ($partial.manifest.uninstall_only -and $partial.manifest.files.Count -eq 3) 'Removal stages only the remaining verified control files'
+  Check (-not(Test-Path -LiteralPath (Join-Path $partial.root 'app/bin/moyai-desktop.exe'))) 'Removal does not require or reconstruct missing application files'
+} finally { Remove-MoyaiDistributionSource $partial }
+$control=Join-Path $package 'scripts/Setup-Component.ps1'
+$originalControl=[IO.File]::ReadAllText($control)
+[IO.File]::WriteAllText($control,'changed control')
+Fails { New-MoyaiDistributionSource $package -ForUninstall } 'Removal refuses a changed control script'
+Remove-Item -LiteralPath $control
+Fails { New-MoyaiDistributionSource $package -ForUninstall } 'Removal refuses a missing required control script'
+[IO.File]::WriteAllText($control,$originalControl)
+[IO.File]::WriteAllText($appImage,'changed')
+Check (@(Get-ChildItem -LiteralPath (Join-Path (Get-MoyaiComponentUserRoot Desktop) 'cache/distribution')).Count -eq 0) 'Partial removal preparation leaves no staging after success or refusal'
+
 # Run the production handoff against real staged files. Only the privileged
 # installation and installed-component lookup are substituted by this fixture.
 $script:installedFixture=$null; $script:installCount=0; $script:cancelInstall=$false

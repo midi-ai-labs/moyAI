@@ -164,6 +164,8 @@ Assert-That ((Test-Path -LiteralPath (Join-Path $legacy 'app/bin/moyai-desktop.e
 $script:oldStartupProjection=$null; $script:oldAssociationSelected=$false
 function Remove-MoyaiAutostart($Root,$Receipt,$Manifest) { $script:oldStartupProjection=$Manifest }
 function Remove-MoyaiJoinFileAssociation { $script:oldAssociationSelected=$true }
+function Get-MoyaiShortcutFolder { Join-Path $EvidenceRoot 'shortcuts' }
+function Remove-MoyaiShortcuts { $script:oldShortcutsSelected=$true }
 Move-MoyaiLegacyDesktopRegistrations
 Assert-That ($script:oldAssociationSelected -and @($script:oldStartupProjection.files).Count -eq 1 -and $script:oldStartupProjection.files[0].path -ceq 'app/bin/moyai-desktop.exe') 'Desktop registration migration leaves legacy Hub autostart outside its selected scope'
 Move-MoyaiLegacyDesktopRegistrations -IncludeHub
@@ -173,8 +175,10 @@ function Get-MoyaiLegacyRegistrationReference($Root) { Find-MoyaiLegacyRegistrat
 $preserved=@(Remove-MoyaiLegacyUserModules -IncludeHub -ForUpdate)
 Assert-That ((Test-Path -LiteralPath (Join-Path $legacy 'hub/bin/moyai-hub.exe')) -and ($preserved -join "`n").Contains('custom Hub startup')) 'update keeps an old module still referenced by a preserved custom startup command'
 Assert-That ($null -eq (Find-MoyaiLegacyRegistrationReference $legacy @([pscustomobject]@{name='other';command=('"'+$legacy+'-other\moyai-hub.exe"')}))) 'reference detection does not mistake a similarly named installation for the selected root'
+$script:oldStartupProjection=$null; $script:oldAssociationSelected=$false; $script:oldShortcutsSelected=$false
 Remove-MoyaiLegacyUserModules -IncludeHub
 Assert-That (-not(Test-Path -LiteralPath $legacy)) 'explicit combined legacy cleanup removes only the inventoried old module bundle'
+Assert-That ($script:oldShortcutsSelected -and $script:oldAssociationSelected -and @($script:oldStartupProjection.files).Count -eq 2) 'combined legacy uninstall retires owned startup, association and shortcut entries before payload deletion'
 Assert-That ((Get-MoyaiComponentUserReceiptPath 'Desktop') -notlike ((Get-MoyaiComponentUserRoot 'Desktop')+'\*')) 'installer metadata lives outside the Desktop data leaf and cannot block first data migration'
 $operation=[Guid]::NewGuid().ToString('N')
 Write-MoyaiComponentResult $operation ('1'*64) @('Hub') $false 1 'fixture: destination is busy; retained exact path' @('retained fixture directory')

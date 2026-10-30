@@ -76,7 +76,7 @@ function Test-MoyaiCloudDistribution([string]$Root) {
   return $false
 }
 
-function New-MoyaiDistributionSource([string]$SourceRoot) {
+function New-MoyaiDistributionSource([string]$SourceRoot, [switch]$ForUninstall) {
   Initialize-MoyaiDistributionNative
   $SourceRoot=[IO.Path]::GetFullPath($SourceRoot)
   $source=$SourceRoot
@@ -121,11 +121,18 @@ function New-MoyaiDistributionSource([string]$SourceRoot) {
         foreach($file in $inventory.files) {
           [void](Resolve-MoyaiComponentChild $root $file.path)
           if($seen.ContainsKey($file.path) -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw '配布物の一覧に重複または不正な照合値があります。' }
-          $seen[$file.path]=$true; $entries+=@($file)
+          $seen[$file.path]=$true
+          if($ForUninstall -and (-not(Test-MoyaiRemovalSourceFile $file.path) -or -not(Test-Path -LiteralPath (Resolve-MoyaiComponentChild $SourceRoot $file.path) -PathType Leaf))) { continue }
+          $entries+=@($file)
         }
       } elseif((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ine $entry.sha256) {
         throw ('同期中または変更されたファイルです: '+$entry.path)
       }
+    }
+    if($ForUninstall) {
+      $inventory.files=@($entries | Where-Object { $_.path -cne 'deployment.json' })
+      $inventory | Add-Member NoteProperty uninstall_only $true -Force
+      Write-MoyaiComponentJson (Join-Path $root 'deployment.json') $inventory
     }
     $prepared.manifest=Read-MoyaiComponentManifest $root
     return $prepared

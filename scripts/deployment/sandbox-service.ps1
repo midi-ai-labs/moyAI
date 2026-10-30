@@ -250,7 +250,7 @@ function Get-MoyaiSandboxPayload([string]$SourceRoot, $Manifest) {
     return @($result | Sort-Object name)
 }
 
-function Read-MoyaiSandboxInstallation($Location) {
+function Read-MoyaiSandboxInstallation($Location, [switch]$AllowMissingFiles) {
     Assert-MoyaiSandboxProtectedPath $Location.parent
     Assert-MoyaiSandboxProtectedPath $Location.root
     $receiptPath = Join-Path $Location.root 'installation.json'
@@ -263,6 +263,7 @@ function Read-MoyaiSandboxInstallation($Location) {
         if ($file.name -cne [IO.Path]::GetFileName($file.name) -or $file.name -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$' -or -not $names.Add($file.name) -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid installed sandbox payload inventory.' }
         if ($file.name -ine 'moyai-sandbox.exe' -and [IO.Path]::GetExtension($file.name) -ine '.dll') { throw 'Unexpected executable in sandbox inventory.' }
         $path = Join-Path $Location.root $file.name
+        if($AllowMissingFiles -and -not(Test-Path -LiteralPath $path)) { continue }
         Assert-MoyaiSandboxProtectedPath $path
         if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $file.sha256) { throw 'Installed sandbox payload differs from its protected inventory.' }
     }
@@ -272,7 +273,7 @@ function Read-MoyaiSandboxInstallation($Location) {
         foreach ($name in @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')) { if (-not $names.Contains($name)) { throw 'Installed sandbox runtime is incomplete.' } }
     } elseif ($receipt.visual_cpp -ne 'system-installed' -or $names.Count -ne 2) { throw 'Installed sandbox runtime mode is inconsistent.' }
     $entries = @(Get-ChildItem -LiteralPath $Location.root -Force)
-    if ($entries.Count -ne $names.Count) { throw 'Sandbox directory contains unowned entries; no files were removed.' }
+    if (-not $AllowMissingFiles -and $entries.Count -ne $names.Count) { throw 'Sandbox directory contains unowned entries; no files were removed.' }
     foreach ($entry in $entries) { if ($entry.PSIsContainer -or -not $names.Contains($entry.Name)) { throw 'Sandbox directory contains an unexpected entry.' }; Assert-MoyaiSandboxProtectedPath $entry.FullName }
     return $receipt
 }
@@ -356,7 +357,6 @@ function Remove-MoyaiSandboxPayloadDirectory([string]$Path, $Files) {
     Assert-MoyaiSandboxProtectedPath $Path
     $expected = @('installation.json') + @($Files | ForEach-Object { $_.name })
     $entries = @(Get-ChildItem -LiteralPath $Path -Force)
-    if ($entries.Count -ne $expected.Count) { throw 'Sandbox cleanup found an unexpected file. The directory was retained.' }
     foreach ($entry in $entries) { if ($entry.PSIsContainer -or $entry.Name -notin $expected) { throw 'Sandbox cleanup found an unowned entry.' }; Assert-MoyaiSandboxProtectedPath $entry.FullName }
     foreach ($entry in $entries) { Remove-Item -LiteralPath $entry.FullName }
     Remove-Item -LiteralPath $Path
@@ -379,7 +379,7 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
     if (-not $Uninstall) { $pins = New-MoyaiSandboxSourcePins $SourceRoot $manifest }
     try {
     if (-not (Test-Path -LiteralPath $location.parent)) {
-        if ($Uninstall) { throw 'No machine sandbox installation exists.' }
+        if ($Uninstall -and $null -eq (Get-MoyaiSandboxService)) { Write-Output 'PC共通sandbox helperは既に削除されています。'; return }
         [void](New-Item -ItemType Directory -Path $location.parent)
         Set-MoyaiSandboxProtection $location.parent $true
     }
@@ -390,14 +390,27 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
     try {
         $service = Get-MoyaiSandboxService -Security
         $exists = Test-Path -LiteralPath $location.root
-        if (($null -ne $service) -ne $exists) { throw 'Sandbox service and protected installation are inconsistent; no replacement was performed.' }
+        if (-not $Uninstall -and (($null -ne $service) -ne $exists)) { throw 'Sandbox service and protected installation are inconsistent; no replacement was performed.' }
         $old = $null
-        if ($exists) {
+        if($Uninstall -and $null -ne $service) {
             Assert-MoyaiSandboxService $service $location -Security
-            $old = Read-MoyaiSandboxInstallation $location
+            if($service.State -ne 1) { throw '共通サービスが使用中です。すべてのDesktop/Runnerを正常終了してから再実行してください。' }
+        }
+        if ($exists) {
+            if($null -ne $service) { Assert-MoyaiSandboxService $service $location -Security }
+            $old = Read-MoyaiSandboxInstallation $location -AllowMissingFiles:$Uninstall
             if (-not $Uninstall -and (Test-MoyaiSandboxPayloadMatch $old $payload $manifest.runtime.visual_cpp)) { return }
-            if ($service.State -ne 1) { throw 'Close all moyAI Desktop and Runner instances before updating/removing the sandbox helper. No process will be forced to stop.' }
-        } elseif ($Uninstall) { throw 'No machine sandbox installation exists.' }
+            if ($null -ne $service -and $service.State -ne 1) { throw 'Close all moyAI Desktop and Runner instances before updating/removing the sandbox helper. No process will be forced to stop.' }
+        }
+        if($Uninstall -and $null -eq $service) {
+            if($exists) {
+                foreach($process in @(Get-Process -ErrorAction SilentlyContinue)) { if($process.Path -and $process.Path.StartsWith($location.root+'\',[StringComparison]::OrdinalIgnoreCase)) { throw '共通helperの実行ファイルが使用中です。終了してから再実行してください。' } }
+                if($null -ne (Get-MoyaiSandboxService)) { throw '削除中にサービス登録が変わりました。再実行してください。' }
+                Remove-MoyaiSandboxPayloadDirectory $location.root $old.files
+            }
+            Write-Output 'PC共通sandbox helperは削除済みです。残っていた所有ファイルの整理も完了しました。'
+            return
+        }
         Set-MoyaiSandboxParentAccess $location.parent
         $command = '"' + $location.helper + '" --service'
         $stage = Join-Path $location.parent ('SandboxService.stage-' + [Guid]::NewGuid().ToString('N'))
@@ -421,20 +434,19 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
                 Set-MoyaiSandboxProtection (Join-Path $stage 'installation.json') $false
                 Set-MoyaiSandboxProtection $stage $true
             }
-            if ($exists) {
+            if ($exists -or ($Uninstall -and $null -ne $service)) {
                 Set-MoyaiSandboxService $command 4
                 $disabled = $true
                 $stopped = Get-MoyaiSandboxService -Security
                 Assert-MoyaiSandboxService $stopped $location -Disabled -Security
                 if ($stopped.State -ne 1) { throw 'Sandbox began running during setup. Close Desktop/Runner and try again; no files were replaced.' }
-                Move-Item -LiteralPath $location.root -Destination $backup
-                $movedOld = $true
+                if($exists) { Move-Item -LiteralPath $location.root -Destination $backup; $movedOld = $true }
             }
             if ($Uninstall) {
                 Remove-MoyaiSandboxService
                 $removed = $true
                 $disabled = $false
-                Remove-MoyaiSandboxPayloadDirectory $backup $old.files
+                if($movedOld) { Remove-MoyaiSandboxPayloadDirectory $backup $old.files }
                 Write-Output 'PC共通sandbox helperを削除しました。利用者の設定・会話・作業フォルダーは変更していません。'
                 return
             }
@@ -457,7 +469,7 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
                 if ($created) { Remove-MoyaiSandboxService; $created = $false }
                 if ($movedNew) { Move-Item -LiteralPath $location.root -Destination $stage; $movedNew = $false }
                 if ($movedOld) { Move-Item -LiteralPath $backup -Destination $location.root; $movedOld = $false }
-                if ($exists -and $disabled) { Set-MoyaiSandboxService $command 3; $disabled = $false }
+                if ($null -ne $service -and $disabled) { Set-MoyaiSandboxService $command 3; $disabled = $false }
             } catch { throw "Sandbox setup failed and rollback requires administrator inspection. Protected staging/backup files were retained. $($_.Exception.Message)" }
             throw $failure
         }

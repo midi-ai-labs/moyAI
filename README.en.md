@@ -22,7 +22,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.6 is a Windows x64 maintenance release.** Cloud Files packages are prepared locally before installation or Desktop launch. Runner startup errors retain their cause, and Desktop setup no longer installs Hub by default. The bundled edition includes moyAI Hub 1.0.3 and requires installed WebView2 and x64 VC++ runtimes. See the [3.0.6 release notes](docs/release/v3.0.6.md) for verification scope and limitations.
+**Desktop 3.0.6 is a Windows x64 maintenance release.** Cloud Files packages are prepared locally before installation or Desktop launch. Runner startup errors retain their cause, and Desktop setup no longer installs Hub by default. Uninstall tolerates missing payload files and preserves the application if a requested data reset fails. The bundled edition includes moyAI Hub 1.0.4 and requires installed WebView2 and x64 VC++ runtimes. See the [3.0.6 release notes](docs/release/v3.0.6.md) for verification scope and limitations.
 
 ## Desktop and Hub
 

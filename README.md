@@ -22,7 +22,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.6はWindows x64向けの修正版です。** OneDrive配布物のローカル導入・起動、Runner起動エラーの診断、DesktopとHubのSetup分離に対応しました。Hub同梱版はmoyAI Hub 1.0.3を含みます。WebView2とx64 VC++ runtimeが導入済みのPC向けです。確認範囲と制限は[3.0.6リリースノート](docs/release/v3.0.6.md)を参照してください。
+**Desktop 3.0.6はWindows x64向けの修正版です。** OneDrive配布物のローカル導入・起動、Runner起動エラーの診断、DesktopとHubのSetup分離に対応しました。一部ファイルが欠けた環境のアンインストールと、初期化失敗時の本体保持も改善しました。Hub同梱版はmoyAI Hub 1.0.4を含みます。WebView2とx64 VC++ runtimeが導入済みのPC向けです。確認範囲と制限は[3.0.6リリースノート](docs/release/v3.0.6.md)を参照してください。
 
 ## DesktopとHub
 
