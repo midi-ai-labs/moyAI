@@ -6,7 +6,8 @@ try {
   . (Join-Path $PSScriptRoot 'distribution-source.ps1')
   $launchArguments=@()
   if($DesktopArguments) {
-    $launchArguments=@([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($DesktopArguments)) | ConvertFrom-Json)
+    $decodedArguments=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($DesktopArguments)) | ConvertFrom-Json
+    $launchArguments=@($decodedArguments)
     foreach($argument in $launchArguments) { if($argument -isnot [string]) { throw '起動引数が不正です。' } }
   }
   if(Test-MoyaiCloudDistribution $packageRoot) {

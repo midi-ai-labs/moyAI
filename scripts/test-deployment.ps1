@@ -442,7 +442,8 @@ Assert-That ($launched.ExitCode -eq 0 -and $received.Count -eq 2 -and $received[
 Remove-Item -LiteralPath $record
 $forwarded=@('--dir',($destination+'\'),'--session','01ARZ3NDEKTSV4RRFFQ69G5FAV')
 $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $forwarded -Compress)))
-$launched=Start-Process -FilePath $fixedPowerShell -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "'+$launchScript+'" -DesktopArguments '+$encoded+' -WorkingDirectory "'+$destination+'"') -WindowStyle Hidden -Wait -PassThru
+$launched=Start-Process -FilePath $fixedPowerShell -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "'+$launchScript+'" -DesktopArguments '+$encoded+' -WorkingDirectory "'+$destination+'"') -WindowStyle Hidden -PassThru
+if(-not $launched.WaitForExit(20000)) { $launched.Kill(); throw 'Fixture Desktop handoff did not finish within its deadline.' }
 $deadline=[DateTime]::UtcNow.AddSeconds(5)
 while(-not(Test-Path -LiteralPath $record) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
 $received=@(Get-Content -LiteralPath $record -Encoding UTF8)
