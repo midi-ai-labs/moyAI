@@ -56,6 +56,13 @@ try {
   $message=''; try { New-MoyaiDistributionSource $root | Out-Null } catch { $message=$_.Exception.Message }
   Check ($message.Contains('unavailable.bin') -and $message.Contains('ダウンロード完了')) 'Unavailable cloud content reports its path and download guidance'
   Check (@(Get-ChildItem -LiteralPath (Join-Path (Get-MoyaiComponentUserRoot Desktop) 'cache/distribution')).Count -eq 0) 'Cloud copy failure leaves no staged executable'
+  Remove-Item -LiteralPath (Join-Path $root 'app/bin/moyai-desktop.exe')
+  $removal=New-MoyaiDistributionSource $root -ForUninstall
+  try {
+    Check ($removal.manifest.uninstall_only -and $removal.manifest.files.Count -eq 3) 'Cloud removal needs only verified control scripts despite missing and unavailable application payload'
+    Check (-not(Test-MoyaiCloudDistribution $removal.root)) 'Cloud removal control files are copied to ordinary local files'
+  } finally { Remove-MoyaiDistributionSource $removal }
+  Check (@(Get-ChildItem -LiteralPath (Join-Path (Get-MoyaiComponentUserRoot Desktop) 'cache/distribution')).Count -eq 0) 'Cloud removal releases its local staging'
 } finally { [Runtime.InteropServices.Marshal]::ThrowExceptionForHR([MoyaiCloudFixture]::CfUnregisterSyncRoot($root)) }
 $checks | ForEach-Object { "PASS: $_" }
 Write-MoyaiComponentJson (Join-Path $EvidenceRoot 'results.json') @{checks=$checks;windows_cloud_files=$true;real_onedrive_sync=$false;sync_root_unregistered=$true}
