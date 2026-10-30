@@ -18,9 +18,13 @@ namespace MoyaiDistribution {
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFile(string path,uint access,uint share,IntPtr security,uint mode,uint flags,IntPtr template);
   [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandleEx(SafeFileHandle file,int kind,out Tag tag,uint size);
   [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle file,out Info info);
+  [DllImport("ntdll.dll")] static extern sbyte RtlSetThreadPlaceholderCompatibilityMode(sbyte mode);
   public static bool IsCloud(uint tag) { return (tag & 0xffff0fffU) == 0x9000001aU; }
   static Tag Inspect(SafeFileHandle file) {
-   Tag tag; if(!GetFileInformationByHandleEx(file,9,out tag,8)) throw new Win32Exception(); return tag;
+   var previous=RtlSetThreadPlaceholderCompatibilityMode(2);
+   if(previous<0) throw new IOException("Cloud placeholder attributes could not be exposed.");
+   try { Tag tag; if(!GetFileInformationByHandleEx(file,9,out tag,8)) throw new Win32Exception(); return tag; }
+   finally { RtlSetThreadPlaceholderCompatibilityMode(previous); }
   }
   public static SafeFileHandle Pin(string path,bool directory) {
    var file=CreateFile(path,directory?0x81U:0x80U,directory?3U:1U,IntPtr.Zero,3,0x02200000U,IntPtr.Zero);

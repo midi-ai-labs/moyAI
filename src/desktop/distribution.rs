@@ -6,11 +6,34 @@ fn cloud_tag(tag: u32) -> bool {
 }
 
 #[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlSetThreadPlaceholderCompatibilityMode(mode: i8) -> i8;
+}
+
+#[cfg(windows)]
+struct PlaceholderMode(i8);
+
+#[cfg(windows)]
+impl Drop for PlaceholderMode {
+    fn drop(&mut self) {
+        unsafe { RtlSetThreadPlaceholderCompatibilityMode(self.0) };
+    }
+}
+
+#[cfg(windows)]
 fn cloud_source(path: &std::path::Path) -> Result<bool, String> {
     use std::fs::OpenOptions;
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::*;
 
+    // Windows can disguise Cloud Files as ordinary files for compatibility.
+    // Inspect on this synchronous thread only, restoring its mode on all exits.
+    let previous = unsafe { RtlSetThreadPlaceholderCompatibilityMode(2) };
+    if previous < 0 {
+        return Err("配布物のクラウド属性を確認できません。".into());
+    }
+    let _mode = PlaceholderMode(previous);
     let mut cloud = false;
     for ancestor in path.ancestors() {
         let file = OpenOptions::new()
@@ -138,5 +161,20 @@ mod tests {
     #[test]
     fn ordinary_executable_is_not_redirected() {
         assert!(!cloud_source(&std::env::current_exe().unwrap()).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated hydrated Windows Cloud Files fixture"]
+    fn disguised_cloud_file_is_detected_and_thread_mode_is_restored() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("MOYAI_TEST_CLOUD_FILE").expect("provide a real Cloud Files fixture"),
+        );
+        let previous = unsafe { RtlSetThreadPlaceholderCompatibilityMode(1) };
+        assert!(previous >= 0);
+        let _restore = PlaceholderMode(previous);
+        assert!(cloud_source(&path).unwrap());
+        assert_eq!(unsafe { RtlSetThreadPlaceholderCompatibilityMode(1) }, 1);
+        assert!(cloud_source(&path.join("does-not-exist")).is_err());
+        assert_eq!(unsafe { RtlSetThreadPlaceholderCompatibilityMode(1) }, 1);
     }
 }
