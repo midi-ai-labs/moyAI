@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.en.md">English</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.5">ダウンロード v3.0.5</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.6">ダウンロード v3.0.6</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">ライセンス</a>
@@ -22,7 +22,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.5はWindows x64向けの修正版です。** 同梱Hubの起動スクリプトを含むWindowsコマンドファイルの改行形式を修正しました。moyAI Hub 1.0.2と組み合わせて使います。このWindows配布物はWebView2とx64 VC++ runtimeが導入済みのPC向けです。今回の版の実動作確認は行っていません。変更内容と制限は[3.0.5リリースノート](docs/release/v3.0.5.md)を参照してください。公開済みv2.1.1のZIPは従来の配置と機能です。
+**Desktop 3.0.6はWindows x64向けの修正版です。** OneDrive配布物のローカル導入・起動、Runner起動エラーの診断、DesktopとHubのSetup分離に対応しました。Hub同梱版はmoyAI Hub 1.0.3を含みます。WebView2とx64 VC++ runtimeが導入済みのPC向けです。確認範囲と制限は[3.0.6リリースノート](docs/release/v3.0.6.md)を参照してください。
 
 ## DesktopとHub
 
@@ -49,7 +49,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-3.0.5のWindows配布物では、次の順に進みます。
+3.0.6のWindows配布物では、次の順に進みます。
 
 1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。実行ファイルをProgram Filesへ配置する際は、別画面で管理者承認します。Setupが **moyAI** を通常権限で起動し、初期画面の表示を確認します。開いた画面から利用準備を進め、次回からはスタートメニューで開きます。起動に失敗した場合や60秒以内に表示を確認できなかった場合は、結果と診断ログの保存先を表示し、起動中のアプリは強制終了しません。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
@@ -104,7 +104,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-3.0.5配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.6配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUACは不要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 

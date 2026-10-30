@@ -34,6 +34,19 @@ struct DesktopLauncherArgs {
 
 fn main() -> ExitCode {
     let args = DesktopLauncherArgs::parse();
+    match desktop::distribution::handoff_if_cloud() {
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(error) => {
+            let _ = rfd::MessageDialog::new()
+                .set_title("moyAIの起動")
+                .set_description(&error)
+                .set_level(rfd::MessageLevel::Error)
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+            return ExitCode::from(4);
+        }
+    }
     let report = match args.startup_report.as_ref() {
         Some(path) => match StartupReport::create(path.as_std_path()) {
             Ok(report) => Arc::new(report),

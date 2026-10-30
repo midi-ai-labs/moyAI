@@ -2,6 +2,103 @@ use super::*;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
+#[test]
+#[ignore = "Dedicated startup process; isolated profile, no effects"]
+fn startup_process_fixture() {
+    let config = crate::config::loader::global_config_path().unwrap();
+    let root = config.parent().unwrap();
+    crate::runtime::resource_admission::set_test_registry(root.join("resources"));
+    let listener = LocalListener::bind().unwrap();
+    std::fs::write(root.join("bound"), "bound").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    if std::env::var("MOYAI_TEST_STARTUP_FAILURE").is_ok() {
+        eprintln!("fixture: sandbox payload version mismatch");
+        std::process::exit(7);
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let host = runtime.block_on(RunnerHost::open()).unwrap();
+    listener.serve(host.clone(), &runtime).unwrap();
+    runtime.block_on(host.wait_shutdown()).unwrap();
+}
+
+#[test]
+fn startup_waits_for_identity_and_preserves_child_failure() {
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../project_sandbox/runner-startup");
+    std::fs::create_dir_all(&base).unwrap();
+    for fail in [true, false] {
+        let directory = tempfile::tempdir_in(&base).unwrap();
+        let root = camino::Utf8Path::from_path(directory.path()).unwrap();
+        let config = root.join("config.toml");
+        std::fs::write(&config, "[model]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"startup-fixture\"\nprovider_profile = \"openai_compatible\"\n").unwrap();
+        let path = root.join("runner.log");
+        std::fs::write(&path, "old unrelated error\n").unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runner::windows::tests::startup_process_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOYAI_CONFIG_PATH", &config)
+            .env("MOYAI_DATA_DIR", root.join("data"))
+            .env_remove("MOYAI_SANDBOX_ENDPOINT")
+            .env_remove("MOYAI_TEST_STARTUP_FAILURE")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        if fail {
+            command.env("MOYAI_TEST_STARTUP_FAILURE", "1");
+        }
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        if fail {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("bound").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The previous startup path returned this pipe error directly,
+            // losing the actual initialization failure written by the child.
+            let transport = request_for_config(&RunnerCommand::Identity, &config).unwrap_err();
+            assert!(
+                !transport
+                    .message
+                    .contains("sandbox payload version mismatch")
+            );
+        }
+        let result = crate::runner::operations::wait_for_startup(
+            Some(child),
+            &config,
+            &path,
+            offset,
+            Duration::from_secs(12),
+        );
+        if fail {
+            let error = result.unwrap_err();
+            assert!(
+                error.message.contains("sandbox payload version mismatch"),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains(path.as_str()));
+            assert!(!error.message.contains("old unrelated error"));
+        } else {
+            let identity = result.unwrap();
+            assert_eq!(identity.process_id, pid);
+            shutdown_existing_for_config(&config).unwrap();
+        }
+    }
+}
+
 struct OwnedHost(Child);
 impl Drop for OwnedHost {
     fn drop(&mut self) {

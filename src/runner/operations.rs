@@ -704,38 +704,72 @@ fn launch_process() -> Result<std::process::Child, RunnerError> {
 pub(crate) fn ensure_started() -> Result<super::RunnerIdentity, RunnerError> {
     #[cfg(windows)]
     {
-        let mut child = if !super::windows::endpoint_present()? {
+        let config = crate::config::loader::global_config_path().map_err(error)?;
+        let log = crate::storage::StoragePaths::discover()
+            .map_err(error)?
+            .data_dir
+            .join("runner.log");
+        let offset = std::fs::metadata(&log)
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let child = if !super::windows::endpoint_present()? {
             Some(launch_process()?)
         } else {
             None
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
-        loop {
-            if super::windows::endpoint_present()? {
-                return match super::windows::request(&super::RunnerCommand::Identity)? {
-                    super::RunnerResponse::Identity { identity } => Ok(identity),
-                    _ => Err(RunnerError::new(
-                        "Unexpected execution host identity response",
-                    )),
-                };
-            }
-            if let Some(child) = &mut child {
-                if let Some(status) = child.try_wait().map_err(error)? {
-                    return Err(RunnerError::new(format!(
-                        "Execution host could not start ({status}); see runner.log"
-                    )));
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(RunnerError::new(
-                    "Execution host startup is still unconfirmed; see runner.log",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        wait_for_startup(
+            child,
+            &config,
+            &log,
+            offset,
+            std::time::Duration::from_secs(12),
+        )
     }
     #[cfg(not(windows))]
     {
         Err(RunnerError::new("Desktop execution supports Windows only"))
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn wait_for_startup(
+    mut child: Option<std::process::Child>,
+    config: &Utf8Path,
+    log: &Utf8Path,
+    offset: u64,
+    timeout: std::time::Duration,
+) -> Result<super::RunnerIdentity, RunnerError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let failure = match super::windows::startup_identity(config, deadline) {
+            Ok(identity) => return Ok(identity),
+            Err(failure) => failure,
+        };
+        if let Some(child) = &mut child {
+            if let Some(status) = child.try_wait().map_err(error)? {
+                let detail = startup_log_since(log, offset).unwrap_or_default();
+                return Err(RunnerError::new(format!(
+                    "実行機能が起動中に終了しました（{status}）。\n{detail}\n起動ログ: {log}"
+                )));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RunnerError::new(format!(
+                "実行機能の準備完了を確認できませんでした。\n詳細: {}\n起動ログ: {log}",
+                failure.message
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn startup_log_since(path: &Utf8Path, offset: u64) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(offset.max(length.saturating_sub(4096))))?;
+    let mut bytes = Vec::new();
+    file.take(4096).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
 }

@@ -9,6 +9,7 @@ pub mod async_ops;
 mod attention;
 #[cfg(feature = "tauri-desktop")]
 pub mod composer_state;
+pub mod distribution;
 #[cfg(feature = "tauri-desktop")]
 pub mod join_config;
 #[cfg(feature = "tauri-desktop")]

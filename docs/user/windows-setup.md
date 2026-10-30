@@ -16,9 +16,15 @@
 ## 導入して開く
 
 1. 社内の信頼できる配布元から一式を受け取り、ZIPをフォルダーごと展開します。配布元が示すZIPのSHA256も確認します。
-2. `Setup-moyAI.cmd` を通常の権限で開きます。別画面で管理者承認し、Desktopを `%ProgramFiles%\moyAI\Desktop`、Hub同梱版ではHubを `%ProgramFiles%\moyAI\Hub` へ配置します。Hub単体版の `Setup-Hub.cmd` も同じHub配置を使います。ショートカット・関連付け・起動確認は、最初にSetupを開いたWindows利用者で行います。ダウンロードは行いません。
+2. `Setup-moyAI.cmd` を通常の権限で開きます。別画面で管理者承認し、Desktopを `%ProgramFiles%\moyAI\Desktop` へ配置します。Hub同梱版でも、この操作ではHubを導入しません。Hubを管理するPCだけ、配布フォルダーの `Setup-Hub.cmd` を実行し、`%ProgramFiles%\moyAI\Hub` へ配置します。Hub単体版も同じ配置です。ショートカット・関連付け・起動確認は、最初にSetupを開いたWindows利用者で行います。
 3. 配置後、セットアップが通常の権限でmoyAIを起動します。初期画面の描画完了をアプリから受け取ると、起動確認の成功と導入完了を表示します。moyAIの画面は開いたまま使えます。セットアップの画面は任意のキーを押して閉じます。次回からは**Windowsのスタートメニューの「moyAI」**を開きます。
 4. 初回画面では上の表に合った入口を選びます。通常起動時の管理者承認はありません。起動確認では、PC参加・プロジェクトでの用途指定・仕事の実行準備までは確認しません。
+
+OneDriveの同期フォルダーに展開した場合、Setupは配布物を通常のローカルフォルダーへ読み出してSHA-256を照合し、その内容から導入します。オンラインのみのファイルはWindowsが同期元から取得するため、OneDriveの接続が必要です。取得できないファイルや照合に失敗したファイルがあれば、対象と理由を表示して導入を止めます。通常のリンクやジャンクションを配布物として受け入れることはありません。
+
+同期フォルダーから `Start-moyAI.cmd` や `app/bin/moyai-desktop.exe` を開いた場合も、ローカルに導入した同じ内容のDesktopへ引き継ぎます。未導入または内容が異なる場合はセットアップを行うため、管理者承認が必要です。ZIPは実行ファイルだけでなく全体を展開してください。OneDriveの組織ポリシーや実際の同期環境での検証状況は[3.0.6リリースノート](../release/v3.0.6.md)を参照してください。
+
+このPCだけで使う場合、Hub本体と共有実行用Runnerの起動は不要です。以前の共有実行登録が残っていて接続エラーになる場合は、登録したDesktopの「moyAI Hub」→「PCの接続」→「接続設定をリセット」を使います。Hub接続、共有実行の同意、Hub経由のモデル選択を解除し、会話履歴・手動のAI設定・作業フォルダーは残します。未清算の仕事がある場合は解除完了を確認できるまでローカル実行を止めます。Runnerに接続できないだけでは、共有登録を自動的に無視しません。
 
 管理者が導入する共通helperは、WindowsのProgram Files配下の `moyAI\SandboxService\moyai-sandbox.exe` と、手動開始の `MoyAISandbox` サービスです。LocalSystemで必要時だけ起動し、利用がなくなれば停止します。Windows起動時の自動開始には設定しません。実行物・登録設定は管理者とSYSTEMだけが変更でき、通常利用者はサービスの照会と開始だけができます。Desktop・CLI・Runner・Hubの通常起動にUACは不要です。Hubの共通配置はWindowsサービス化や、Windows利用者間の保存データ共有を意味しません。画面と仕事のコマンドは通常の利用者の権限で動作し、許可された場所への書込み制限と、操作ごとの確認は引き続き適用します。旧方式の `moyAI\Sandbox` など、所有や未使用を確認できない配置は残し、場所と理由を表示します。
 
@@ -76,7 +82,7 @@ Program Filesの実行物を更新・削除する際は管理者承認が必要�
 
 Hubの管理画面からWindowsの受信許可を追加した場合は、アンインストールや設置先の移動の前に、元のHubのネットワークを稼働させた状態で「表示中の既存ルールを解除」を実行し、解除を確認してからHubを停止します。SetupはFirewallルールを解除しません。詳しくはHubの[受信許可の手順](../../../moyAI-Hub/docs/firewall.md)を参照してください。
 
-`Setup-moyAI.cmd -Uninstall -Components Desktop` はDesktopだけ、`-Components Hub` はHubだけを削除します。Hub単体版では `Setup-Hub.cmd -Uninstall` を使います。導入記録と内容が一致するファイルを取り除き、変更・追加されたファイルは場所と理由を表示して残します。保存データと作業フォルダーは既定で保持します。
+`Setup-moyAI.cmd -Uninstall` はDesktopだけを削除します。Hubは配布フォルダーの `Setup-Hub.cmd -Uninstall` を使います。従来の `Setup-moyAI.cmd -Components Desktop` / `-Components Hub` による明示選択も使えます。導入記録と内容が一致するファイルを取り除き、変更・追加されたファイルは場所と理由を表示して残します。保存データと作業フォルダーは既定で保持します。
 
 `Uninstall-moyAI.cmd` のダブルクリック、または `-Uninstall -Interactive` で、削除と初期化の範囲を確認画面から選びます。Hubには `Uninstall-Hub.cmd` もあります。非対話では `-ResetDesktopData`、`-ResetHubData` を追加すると、元のWindows利用者の対応する保存データも初期化します。他のWindows利用者のAppDataは削除しません。共通実行補助サービスも削除する場合は、全員が利用を終了したことを確認し、`-RemoveSharedRuntime` を明示します。管理者承認を取り消した場合は保存データを初期化しません。
 
@@ -132,7 +138,7 @@ Windowsの利用者データは `%LOCALAPPDATA%\midi-ai-labs\moyai-data` に集�
 `scripts/package-release.ps1` は既定で閉域用の同梱ランタイムを要求します。配布許諾を確認した**展開済みx64固定版WebView2のディレクトリー**を `-WebView2FixedRuntimePath`、**app-local再配布用のx64 VC++ DLLディレクトリー**を `-VcRuntimePath` に指定します。VC++資材のDLLは直下の `vcruntime140.dll`、`vcruntime140_1.dll`、`msvcp140.dll` の3本に限定します。別のDLLや不足があればpackage作成前に拒否し、余分なDLLを黙ってコピー・除外しません。システムにあるDLLを自動採取しません。必要な配布元のライセンス・通知類は資材ディレクトリーとともに保管・提供してください。
 
 ```powershell
-.\scripts\package-release.ps1 -Version 3.0.5 `
+.\scripts\package-release.ps1 -Version 3.0.6 `
   -WebView2FixedRuntimePath C:\release-inputs\WebView2-x64 `
   -VcRuntimePath C:\release-inputs\VC143.CRT-x64 `
   -ManualGuiStResultsPath C:\evidence\desktop-results.md

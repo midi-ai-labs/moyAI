@@ -9,7 +9,7 @@ $package = Join-Path $EvidenceRoot 'package'
 $destination = Join-Path $EvidenceRoot 'installed'
 $shortcutFolder = Join-Path $EvidenceRoot 'isolated Start menu'
 New-Item -ItemType Directory -Path (Join-Path $package 'scripts'), (Join-Path $package 'app/bin'), (Join-Path $package 'hub/bin') -Force | Out-Null
-foreach ($name in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Setup-moyAI.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deployment/$name") -Destination (Join-Path $package "scripts/$name") }
+foreach ($name in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Setup-moyAI.ps1', 'Start-moyAI.ps1', 'distribution-source.ps1', 'component-install.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deployment/$name") -Destination (Join-Path $package "scripts/$name") }
 # Subprocess fixtures never open actual logon/association registry keys, even read-only.
 $fixtureCommon = Join-Path $package 'scripts/common.ps1'
 [IO.File]::WriteAllText($fixtureCommon, ((Get-Content -LiteralPath $fixtureCommon -Raw -Encoding UTF8) + "`nfunction Open-MoyaiRunKey([bool]`$Writable) { return `$null }`nfunction Open-MoyaiClassesKey([bool]`$Writable) { return `$null }`nfunction Get-MoyaiJoinFileDefaultOverrides { throw 'Fixture attempted to read actual registry defaults.' }`n"), [Text.UTF8Encoding]::new($true))
@@ -17,6 +17,7 @@ $fixtureCommon = Join-Path $package 'scripts/common.ps1'
 # The machine installation transaction has its own isolated SCM fixture tests.
 [IO.File]::AppendAllText($fixtureCommon, "function Ensure-MoyaiSandboxInstallation([string]`$SourceRoot, `$Manifest, [switch]`$CheckOnly) { }`n", [Text.UTF8Encoding]::new($false))
 [IO.File]::AppendAllText($fixtureCommon, "function Assert-MoyaiUserSetup { }`n", [Text.UTF8Encoding]::new($false))
+[IO.File]::AppendAllText($fixtureCommon, "function Read-MoyaiInstalledComponent([string]`$Component) { return `$null }`n", [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Start-moyAI.cmd') -Destination (Join-Path $package 'Start-moyAI.cmd')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deployment/Setup-moyAI.cmd') -Destination (Join-Path $package 'Setup-moyAI.cmd')
 Write-MoyaiUtf8 (Join-Path $package 'app/bin/moyai-runner.exe') 'inert deployment fixture; never execute'
@@ -250,7 +251,7 @@ New-Item -ItemType Directory -Path $missingPackage | Out-Null
 try { Read-MoyaiDeployment $missingPackage; throw 'Expected missing manifest failure.' }
 catch { Assert-That ($_.Exception.Message.Contains('展開し直してください') -and $_.Exception.Message.Contains((Join-Path $missingPackage 'deployment.json'))) 'missing package inventory gives Japanese recovery advice and exact location' }
 New-Item -ItemType Directory -Path (Join-Path $missingPackage 'scripts') | Out-Null
-foreach ($name in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Start-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $package "scripts/$name") -Destination (Join-Path $missingPackage "scripts/$name") }
+foreach ($name in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Start-moyAI.ps1', 'distribution-source.ps1', 'component-install.ps1')) { Copy-Item -LiteralPath (Join-Path $package "scripts/$name") -Destination (Join-Path $missingPackage "scripts/$name") }
 # CheckOnly suppresses the native error dialog, but exercises the real error presentation.
 $previousErrorPreference = $ErrorActionPreference
 try {
@@ -439,10 +440,18 @@ while (-not (Test-Path -LiteralPath $record) -and [DateTime]::UtcNow -lt $deadli
 $received = @(Get-Content -LiteralPath $record -Encoding UTF8)
 Assert-That ($launched.ExitCode -eq 0 -and $received.Count -eq 2 -and $received[0] -ceq '--join-config' -and $received[1] -ceq $joinFile) 'association launch forwarding preserves spaces, Unicode, ampersand and literal dollar characters as one file argument'
 Remove-Item -LiteralPath $record
+$forwarded=@('--dir',($destination+'\'),'--session','01ARZ3NDEKTSV4RRFFQ69G5FAV')
+$encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $forwarded -Compress)))
+$launched=Start-Process -FilePath $fixedPowerShell -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "'+$launchScript+'" -DesktopArguments '+$encoded+' -WorkingDirectory "'+$destination+'"') -WindowStyle Hidden -Wait -PassThru
+$deadline=[DateTime]::UtcNow.AddSeconds(5)
+while(-not(Test-Path -LiteralPath $record) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+$received=@(Get-Content -LiteralPath $record -Encoding UTF8)
+Assert-That ($launched.ExitCode -eq 0 -and ($received -join "`n") -ceq ($forwarded -join "`n")) 'Desktop executable handoff preserves structured arguments including a trailing directory separator'
+Remove-Item -LiteralPath $record
 # The launcher must wait only for --launch, not the long-running Hub child.
 $hubBin = Join-Path $destination 'hub/bin'
 $hubStart = Start-Process -FilePath $fixedPowerShell -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $launchScript + '" -TeamManagement') -WindowStyle Hidden -PassThru
-$hubStart.WaitForExit()
+if(-not $hubStart.WaitForExit(20000)) { $hubStart.Kill(); throw 'Fixture Hub launcher did not finish within its deadline.' }
 Assert-That ($hubStart.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $hubBin 'worker-started.txt')) -and -not (Test-Path -LiteralPath (Join-Path $hubBin 'worker-finished.txt'))) 'Hub launcher returns after management opens while its server child continues running'
 $deadline = [DateTime]::UtcNow.AddSeconds(15)
 while (-not (Test-Path -LiteralPath (Join-Path $hubBin 'worker-finished.txt')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }

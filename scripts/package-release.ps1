@@ -385,7 +385,7 @@ try {
   Copy-RequiredFile $sandboxExe (Join-Path $releaseRoot "app\bin\moyai-sandbox.exe")
   Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup.exe")
   Copy-RequiredFile $desktopCleanupExe (Join-Path $releaseRoot "app\maintenance\moyai-cleanup-desktop.exe")
-  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1', 'component-install.ps1', 'Setup-Component.ps1')) {
+  foreach ($script in @('common.ps1', 'runtime-access.ps1', 'sandbox-service.ps1', 'Setup-Sandbox.ps1', 'Start-moyAI.ps1', 'Setup-moyAI.ps1', 'distribution-source.ps1', 'component-install.ps1', 'Setup-Component.ps1')) {
     Copy-RequiredFile (Join-Path $repoRoot "scripts\deployment\$script") (Join-Path $releaseRoot "scripts\$script")
   }
   foreach ($launcher in @('Start-moyAI.cmd', 'Setup-moyAI.cmd', 'Uninstall-moyAI.cmd')) {
@@ -405,6 +405,7 @@ try {
     }
   }
   if ($hubIdentity) {
+    Copy-RequiredCommandFile (Join-Path $repoRoot 'scripts/deployment/Setup-Hub.cmd') (Join-Path $releaseRoot 'Setup-Hub.cmd')
     Copy-RequiredFile $HubBinaryPath (Join-Path $releaseRoot 'hub\bin\moyai-hub.exe')
     Copy-RequiredFile $HubCleanupBinaryPath (Join-Path $releaseRoot 'hub\bin\moyai-cleanup-hub.exe')
     Copy-RequiredFile $HubWebSettingsPath (Join-Path $releaseRoot 'hub\bin\web-management.json')

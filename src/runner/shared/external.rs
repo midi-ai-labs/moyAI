@@ -624,7 +624,7 @@ impl LocalResourceLease {
                 super::super::windows::request_for_config(&RunnerCommand::Identity, &target)
                     .map_err(|error| {
                         RunnerError::new(format!(
-                            "このPCに登録された共有実行機能に接続できません。共有実行を設定したDesktopの「moyAI Hub」→「PCの接続」で実行状態を確認してください。\n詳細: {}",
+                            "このPCには共有実行の登録が残っていますが、実行機能に接続できません。共有実行を続ける場合は、登録したDesktopの「moyAI Hub」→「PCの接続」で実行状態を確認してください。この端末内だけで使う場合は、同じ画面の「接続設定をリセット」を実行してください。会話履歴と作業フォルダーは残ります。\n詳細: {}",
                             error.message
                         ))
                     })?

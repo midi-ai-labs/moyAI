@@ -14,14 +14,22 @@
 )
 $ErrorActionPreference = 'Stop'
 $startupCheckAttempted = $false
+$preparedSource = $null
 try {
   . (Join-Path $PSScriptRoot 'common.ps1')
+  . (Join-Path $PSScriptRoot 'distribution-source.ps1')
   Assert-MoyaiUserSetup
   $sourceRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\', '/')
+  if (Test-MoyaiCloudDistribution $sourceRoot) {
+    Write-Output '配布物をローカルへ取得・照合しています。完了するまでお待ちください。'
+    $preparedSource = New-MoyaiDistributionSource $sourceRoot
+    $sourceRoot = $preparedSource.root
+  }
   $sourceManifestPath = Join-Path $sourceRoot 'deployment.json'
   if (Test-Path -LiteralPath $sourceManifestPath -PathType Leaf) {
     $candidateManifest = Get-Content -LiteralPath $sourceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($candidateManifest.PSObject.Properties.Name -contains 'components') {
+      if (-not $PSBoundParameters.ContainsKey('Components') -and -not $RemoveSharedRuntime) { $Components = @('Desktop') }
       if ($PSBoundParameters.ContainsKey('InstallRoot')) { throw '新しい配布物の導入先はProgram Files配下のmoyAIです。-InstallRootは指定せずに実行してください。' }
       $InstallRoot = (Get-MoyaiComponentLocation 'Desktop').parent
       Invoke-MoyaiComponentUserSetup -SourceRoot $sourceRoot -Components $Components -Uninstall:$Uninstall -CheckOnly:$CheckOnly -NoShortcuts:$NoShortcuts -SkipStartupCheck:$SkipStartupCheck -ResetDesktopData:$ResetDesktopData -ResetHubData:$ResetHubData -RemoveSharedRuntime:$RemoveSharedRuntime -Interactive:$Interactive -WebPort $WebPort -HubDataDir $HubDataDir
@@ -151,4 +159,6 @@ try {
   $heading = if ($startupCheckAttempted) { 'アプリの配置は完了しましたが、起動確認を完了できませんでした。' } else { 'セットアップを完了できませんでした。' }
   [Console]::Error.WriteLine("$heading`n`n$($_.Exception.Message)`n`n導入先: $InstallRoot`n解消しない場合は、この表示全体を社内の配布担当へ伝えてください。")
   exit 1
+} finally {
+  if ($null -ne $preparedSource) { Remove-MoyaiDistributionSource $preparedSource }
 }

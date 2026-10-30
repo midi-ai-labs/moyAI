@@ -482,8 +482,16 @@ impl RunnerConnection {
         &self,
         command: &RunnerCommand,
     ) -> Result<Result<RunnerResponse, RunnerError>, RunnerError> {
-        let bytes = serde_json::to_vec(command).map_err(|e| RunnerError::new(e.to_string()))?;
         let deadline = Instant::now() + IO_DEADLINE;
+        self.exchange_until(command, deadline)
+    }
+
+    fn exchange_until(
+        &self,
+        command: &RunnerCommand,
+        deadline: Instant,
+    ) -> Result<Result<RunnerResponse, RunnerError>, RunnerError> {
+        let bytes = serde_json::to_vec(command).map_err(|e| RunnerError::new(e.to_string()))?;
         write_frame(self.pipe.0, &bytes, deadline)?;
         let response = read_frame(self.pipe.0, deadline)?;
         let _ = write_frame(self.pipe.0, b"received", deadline);
@@ -497,9 +505,16 @@ fn connect_for_config(
     config: &camino::Utf8Path,
     expected: Option<&RunnerServer>,
 ) -> Result<RunnerConnection, RunnerError> {
+    connect_for_config_until(config, expected, Instant::now() + Duration::from_secs(2))
+}
+
+fn connect_for_config_until(
+    config: &camino::Utf8Path,
+    expected: Option<&RunnerServer>,
+    connect_deadline: Instant,
+) -> Result<RunnerConnection, RunnerError> {
     let identity = current_identity()?;
     let name = wide(&pipe_name_in(&identity, config.as_str()));
-    let connect_deadline = Instant::now() + Duration::from_secs(2);
     let pipe = loop {
         let remaining = connect_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero()
@@ -568,6 +583,25 @@ fn connect_for_config(
             process_id: server_pid,
         },
     })
+}
+
+/// Read-only handshake within the caller's startup deadline. Effect requests
+/// retain their original transport and are never retried by startup recovery.
+pub(crate) fn startup_identity(
+    config: &camino::Utf8Path,
+    deadline: Instant,
+) -> Result<super::RunnerIdentity, RunnerError> {
+    let connection = connect_for_config_until(
+        config,
+        None,
+        deadline.min(Instant::now() + Duration::from_secs(2)),
+    )?;
+    match connection.exchange_until(&RunnerCommand::Identity, deadline)?? {
+        RunnerResponse::Identity { identity } => Ok(identity),
+        _ => Err(RunnerError::new(
+            "Unexpected execution host identity response",
+        )),
+    }
 }
 
 /// Uses the same config + Windows user/logon/token scope as normal local IPC.
