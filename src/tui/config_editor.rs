@@ -186,6 +186,7 @@ impl ConfigEditorState {
                 .key
                 .redacted_input_preserves_configured(&field.value, &value)
             {
+                seen.remove(field.key.label());
                 continue;
             }
             field.dirty = field.value != value;
@@ -202,9 +203,19 @@ impl ConfigEditorState {
                     field.key == profile && Some(&field.value) != previous_profile.as_ref()
                 }
             });
-            if changed && seen.contains(credential.label()) {
-                if let Some(field) = self.fields.iter_mut().find(|field| field.key == credential) {
-                    field.dirty = true;
+            if changed {
+                // Reentering a private value grants it to the new connection,
+                // even when its text matches the previous connection's value.
+                for field in &mut self.fields {
+                    let belongs_to_connection = field.key == credential
+                        || url == ConfigField::BaseUrl
+                            && matches!(
+                                field.key,
+                                ConfigField::ExtraHeadersJson | ConfigField::ExtraBodyJson
+                            );
+                    if belongs_to_connection && seen.contains(field.key.label()) {
+                        field.dirty = true;
+                    }
                 }
             }
         }
@@ -537,6 +548,11 @@ fn prepare_config_section_update(
             }
             if let Some(approve) = &editor.imported_approve {
                 base.approve = Some(approve.clone());
+            }
+            if base.approve.is_none() && !approve_values.is_empty() {
+                // These edits were explicit relative to the original Main.
+                // Equality with the newly saved Main must not erase ownership.
+                base.approve = Some(ApproveConfig::from_model(&base.model));
             }
             let resolved = build_resolved_config_from_field_values(&base, &approve_values)?;
             if let Some(approve) = resolved.approve {
@@ -988,6 +1004,66 @@ mod tests {
             load_saved_config(&path).approve.as_ref().unwrap().model,
             "later-judge"
         );
+    }
+
+    #[test]
+    fn simultaneous_main_and_approve_edits_keep_an_independent_equal_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+        let base = approval_save_fixture(&path);
+        assert!(base.approve.is_none());
+        let editor = ConfigEditorState::from_config_values(
+            &base,
+            vec![
+                ("model.model".into(), "same-new-model".into()),
+                ("approve.model".into(), "same-new-model".into()),
+            ],
+        )
+        .unwrap();
+        let applied = editor.build_resolved_config(&base).unwrap();
+        assert_eq!(applied.approve.as_ref().unwrap().model, "same-new-model");
+        save_config_sections_resolved(&path, &editor).unwrap();
+        let saved = load_saved_config(&path);
+        assert_eq!(saved.approve, applied.approve);
+        let later = ConfigEditorState::from_config_values(
+            &saved,
+            vec![("model.model".into(), "later-main".into())],
+        )
+        .unwrap();
+        save_config_sections_resolved(&path, &later).unwrap();
+        assert_eq!(
+            load_saved_config(&path).approve.unwrap().model,
+            "same-new-model"
+        );
+    }
+
+    #[test]
+    fn connection_edits_keep_explicitly_reentered_headers_but_not_redacted_placeholders() {
+        for (connection_key, connection_value) in [
+            ("model.base_url", "https://new.example.test/v1"),
+            ("model.provider_profile", "lm_studio"),
+        ] {
+            for input in [None, Some(""), Some(r#"{"X-Fixture":"same-secret"}"#)] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).unwrap();
+                std::fs::write(&path, "[model]\nbase_url='https://old.example.test/v1'\nprovider_profile='openai_compatible'\n[model.extra_headers]\nX-Fixture='same-secret'\n").unwrap();
+                let base = load_saved_config(&path);
+                let mut values = vec![(connection_key.into(), connection_value.into())];
+                if let Some(value) = input {
+                    values.push(("model.extra_headers_json".into(), value.into()));
+                }
+                let editor = ConfigEditorState::from_config_values(&base, values).unwrap();
+                let applied = editor.build_resolved_config(&base).unwrap();
+                let expected = if input.is_some_and(|value| !value.is_empty()) {
+                    base.model.extra_headers.clone()
+                } else {
+                    Default::default()
+                };
+                assert_eq!(applied.model.extra_headers, expected);
+                save_config_sections_resolved(&path, &editor).unwrap();
+                assert_eq!(load_saved_config(&path).model.extra_headers, expected);
+            }
+        }
     }
 
     fn shared_hub_config() -> crate::device_network::SharedHubConfig {

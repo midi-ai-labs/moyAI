@@ -25,12 +25,14 @@ export function initialHubEntryReady(value, workspace) {
 }
 
 export function initialHubShellReady(value, { workspace, deviceId, modelId }) {
-  const p = value?.p, selection = p?.hub?.main_review?.selection;
+  const p = value?.p;
   return p?.workspace_path === workspace && p.overlay === 'none' && p.startup?.initial_setup_required === false
     && p.startup.action_overlay === 'none' && p.device_network?.enrollment === 'active'
     && p.device_network.device_id === deviceId && p.hub?.status === 'connected'
-    && p.hub.main_mode === 'hub' && p.hub.main_confirmation === 'confirmed'
-    && selection?.preferred_model_id === modelId && isDeepStrictEqual(selection.allowed_model_ids, [modelId])
+    && ['main', 'side_chat', 'approve'].every(role => p.hub[`${role}_mode`] === 'hub'
+      && p.hub[`${role}_confirmation`] === 'confirmed' && p.hub[`${role}_uses_default`] === true
+      && p.hub[`${role}_review`]?.selection?.preferred_model_id === modelId
+      && isDeepStrictEqual(p.hub[`${role}_review`]?.selection?.allowed_model_ids, [modelId]))
     && p.run_status_key === 'idle' && p.busy === false && p.navigation_loading === false
     && p.navigation_admission_open === true && p.background_mutation_pending === false
     && p.pending_async_operations?.length === 0 && p.provider_loading === false && p.can_submit === true
@@ -141,6 +143,13 @@ export function createInitialSetupHubScenario(options = {}, preferencesFailure =
         await page.locator('#model-rows tr').filter({ hasText:'Initial Hub Main' }).waitFor();
         const models = (await hub.command('hub_snapshot')).store.catalog.models;
         if (models.length !== 1 || models[0].label !== 'Initial Hub Main') throw failure('Expected one browser-registered model', { models });
+        for (const id of ['team-standard-model', 'team-standard-side-model', 'team-standard-approve-model']) {
+          await page.locator(`#${id}`).selectOption(models[0].id);
+        }
+        await page.locator('#team-standard-save').click();
+        await wait('Hub saves each role default', () => hub.command('hub_snapshot'), snapshot =>
+          ['team_default_model_id', 'team_default_side_model_id', 'team_default_approve_model_id']
+            .every(key => snapshot.store.catalog[key] === models[0].id));
         await page.locator('nav a[href="#device-network"]').click();
         await page.locator('#network-ip').fill('127.0.0.1'); await page.locator('#network-port').fill(String(hub.networkPort));
         await page.locator('#network-start').click(); await page.locator('#network-stop').waitFor();
@@ -200,9 +209,18 @@ export function createInitialSetupHubScenario(options = {}, preferencesFailure =
         if (resource.pageErrors().length) throw failure('Hub browser raised an unhandled error', resource.pageErrors());
         await resource.screenshot('initial-hub-browser-approved');
         await captureScenarioScreenshot({ cdp, sink, name:'initial-hub-completed-shell', owner:OWNER });
+        await trustedClick(input, cdp, action('show-config', 'aside.sidebar'), sink);
+        const settings = await wait('All three model controls display the saved Hub default', () => cdp.evaluate(`(() => {
+          const roles=['main','side_chat','approve'];
+          return roles.map(role => ({ role, choice:document.querySelector('#ai-'+role+'-model')?.value,
+            saveDisabled:document.querySelector('[data-action="hub-save-'+(role==='side_chat'?'side':role)+'"]')?.disabled }));
+        })()`), rows => rows.length === 3 && rows.every(row => row.choice === ':hub-default' && row.saveDisabled === true));
+        await trustedClick(input, cdp, { selector:'.settings-nav a[href="#settings-approve"]', identity:{ tag:'A', href:'#settings-approve' } }, sink);
+        await captureScenarioScreenshot({ cdp, sink, name:'initial-hub-approve-default', owner:OWNER });
+        await trustedClick(input, cdp, action('close-overlay', '.settings-modal'), sink);
         await sink.record('initial-hub-complete', { command, device_id:enrolled.network.device_id, request_id:enrolled.requestId,
-          model_id:models[0].id, shell, config:{ path:context.paths.config_file, size_bytes:configStat.size },
-          provider_requests:provider.requests, scope:'Initial Hub button, native public config import, browser approval and Main shell; no generation, restart, Side route or physical peer.' },
+          model_id:models[0].id, shell, settings, config:{ path:context.paths.config_file, size_bytes:configStat.size },
+          provider_requests:provider.requests, scope:'Initial Hub button, native public config import, browser approval, all three role defaults and Main shell; no generation, restart or physical peer.' },
           { phase:'executing', owner:OWNER });
         return { acquisition:'pass', oracle:'pass', manual:'pending' };
       } finally { await settleProbes(); }

@@ -646,8 +646,7 @@ impl HubConnection {
     }
 
     /// Adopt the authenticated device model session without exposing its credentials.
-    /// Existing model reviews survive; Main and Side without a review use their Hub defaults.
-    /// Approve remains Main-compatible until an explicit selection is saved.
+    /// Existing model reviews survive; each unconfigured role adopts its available Hub default.
     pub(crate) async fn connect_device(
         &self,
         endpoint: &str,
@@ -696,7 +695,7 @@ impl HubConnection {
                     }
                 }
             }
-            for context in [HubReviewContext::Main, HubReviewContext::SideChat] {
+            for context in HubReviewContext::ALL {
                 if context.review(&proposed).is_none() {
                     if let Some(review) = recommendations[context.index()].clone() {
                         client.review(context, &review).await?;
@@ -704,9 +703,7 @@ impl HubConnection {
                         match context {
                             HubReviewContext::Main => proposed.main_uses_default = true,
                             HubReviewContext::SideChat => proposed.side_chat_uses_default = true,
-                            HubReviewContext::Approve => {
-                                unreachable!("explicit Approve save is required")
-                            }
+                            HubReviewContext::Approve => proposed.approve_uses_default = true,
                         }
                         confirmed[context.index()] = Some(review);
                     }

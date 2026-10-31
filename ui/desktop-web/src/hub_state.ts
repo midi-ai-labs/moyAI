@@ -335,6 +335,10 @@ export function hubSaveFeedback(state: HubPresentation, context: HubContext): st
     }
     return "別の設定変更が反映されています。「最新情報を取得」で保存内容を確認してください。入力した選択は保持しています。";
   }
+  if (!draft.dirty && !state.projection[`${context}_review`]
+    && !hubRecommendedSelection(state.projection, context)) {
+    return "Hubにこの用途で利用できる標準モデルがありません。Hub管理画面で標準モデルと接続先の有効状態を確認するか、この画面でモデルを選択してください。";
+  }
   const invalid = hubSelectionError(draft, state.projection.catalog);
   if (invalid) return invalid;
   if (hubDraftHasChanges(state, context)) return "未保存の変更があります。";
@@ -451,6 +455,9 @@ export function editHubField(state: HubUiState, field: string, value: string, ch
   if (key === "wait" && (value === "wait_for_preferred" || value === "allow_selected_fallback")) draft.selection.wait_policy = value;
   if (key === "affinity") draft.affinityText = value;
   if (key === "capabilities") draft.capabilitiesText = value;
+  // Returning to the saved selection ends the edit, so a later reconnect can
+  // advance its target. Unchanged fields must not clear other outstanding edits.
+  draft.dirty = hubDraftHasChanges(state, context);
 }
 export function hubErrorText(code: string | null | undefined): string {
   const messages: Record<string, string> = {

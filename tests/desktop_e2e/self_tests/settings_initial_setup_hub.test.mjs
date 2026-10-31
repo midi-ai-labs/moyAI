@@ -16,8 +16,9 @@ function entry() {
 function shell() {
   const run = { workspacePath:workspace, sessionId:null, expectedState:{ kind:'idle' } };
   return { p:{ workspace_path:workspace, overlay:'none', startup:{ initial_setup_required:false, action_overlay:'none' },
-    device_network:{ enrollment:'active', device_id:'device-1' }, hub:{ status:'connected', main_mode:'hub', main_confirmation:'confirmed',
-      main_review:{ selection:{ preferred_model_id:'model-1', allowed_model_ids:['model-1'] } } },
+    device_network:{ enrollment:'active', device_id:'device-1' }, hub:{ status:'connected',
+      ...Object.fromEntries(['main','side_chat','approve'].flatMap(role => [[`${role}_mode`,'hub'],[`${role}_confirmation`,'confirmed'],
+        [`${role}_uses_default`,true],[`${role}_review`,{ selection:{ preferred_model_id:'model-1', allowed_model_ids:['model-1'] } }]])) },
     run_status_key:'idle', busy:false, navigation_loading:false, navigation_admission_open:true,
     background_mutation_pending:false, pending_async_operations:[], provider_loading:false, can_submit:true, run_target:run },
     prompt:{ count:1, enabled:true, center_hit:true }, composerRunTarget:structuredClone(run), wizardCount:0, blockingDialogs:0, visibleErrors:[] };
@@ -48,7 +49,7 @@ test('Initial Hub entry rejects other setup step, owner and unavailable actual b
   ]) { const value = entry(); mutate(value); assert.equal(initialHubEntryReady(value, workspace), false); }
 });
 
-test('Initial Hub completion requires exact approved device and Main selection with a settled actual shell', () => {
+test('Initial Hub completion requires exact approved device and all role defaults with a settled actual shell', () => {
   const expected = { workspace, deviceId:'device-1', modelId:'model-1' };
   assert.equal(initialHubShellReady(shell(), expected), true);
   for (const mutate of [
@@ -58,6 +59,10 @@ test('Initial Hub completion requires exact approved device and Main selection w
     v => { v.p.hub.main_review.selection.allowed_model_ids.push('other'); },
     v => { v.p.hub.main_confirmation = 'review_required'; },
     v => { v.p.hub.main_mode = 'direct'; },
+    v => { v.p.hub.side_chat_review = null; },
+    v => { v.p.hub.approve_review = null; },
+    v => { v.p.hub.approve_uses_default = false; },
+    v => { v.p.hub.approve_confirmation = 'unconfirmed'; },
     v => { v.p.pending_async_operations = ['config-save']; },
     v => { v.composerRunTarget.sessionId = 'old'; },
     v => { v.prompt.enabled = false; }, v => { v.prompt.center_hit = false; },

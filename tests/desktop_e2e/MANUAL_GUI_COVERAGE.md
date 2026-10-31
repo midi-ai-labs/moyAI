@@ -1,6 +1,6 @@
 # Desktop GUI 操作・目視確認ランブック
 
-この文書は実 Tauri / WebView2 の moyAI Desktop を繰り返し検証する手順であり、実行結果ではない。[actions.ts](../../ui/desktop-web/src/actions.ts) の操作入口を下表へ対応させている。2026-09-22に統一AI設定・接続リセットと退役済み入口を同期した。表の存在は実行済みという意味ではない。ラベル、可用条件、保存先の正本は current Rust / TypeScript と近傍 tests とし、変更時は該当行も更新する。
+この文書は実 Tauri / WebView2 の moyAI Desktop を繰り返し検証する手順であり、実行結果ではない。2026-10-31に[actions.ts](../../ui/desktop-web/src/actions.ts)の全操作入口、共有チャット、実行PC設定、初回の利用方法、Approve、動的な入力を照合し直した。`gui_coverage.mjs`の自己テストが公開操作の欠落・廃止済み操作の残存・case ID重複・期待結果の欠落を検出する。表の存在は実行済みという意味ではない。ラベル、可用条件、保存先の正本は current Rust / TypeScript と近傍 tests とし、変更時は該当行も更新する。
 
 共通 driver・起動・入力・終了・証跡の正本は [Desktop E2E README](README.md)。Hub の管理画面は通常ブラウザーで別に検証し、[Hub Web管理 GUI試験の範囲](../../../moyAI-Hub/tests/browser/coverage.md) と対応させる。Hub の Playwright 成功や Desktop の TypeScript unit test を、Desktop 実画面の目視合格へ読み替えない。次ターン予約・新しい MCP 診断機能の実装は本手順の前提にしない。既存の診断ボタンは確認対象である。
 
@@ -132,6 +132,10 @@
 | C19 | `apply-session-config` | Global draft有効 / 不正 / pending | 複数分類を編集しUI sessionに適用 | 全設定を一貫して一時適用。global保存とは区別し、不正値の一部だけ適用しない |
 | C20 | `save-global-config` | Global draft有効 / 不正 / pending | 保存し他画面→戻る→再起動 | ファイル保存・effective・表示が一致。二度押し競合なし。エラーはdraftを保持 |
 | C21 | `check-docling-readiness` | enabled / disabled、clean / dirty、応答正常 / 不通 | 接続確認しChecking→結果を観測。接続先を変え再確認 | 保存済み/初回draftの検査対象を区別。未保存の通常設定で旧接続の成功を新値の結果として表示しない |
+| C22 | `initial-setup-personal` | 新規 / 選択済み / 入力後 | 自分のPCで使うを選び次へ、戻る | 個人利用の手順・入力を表示し、Hub参加・Runner起動を無断で必須にしない |
+| C23 | `initial-setup-team` | 新規 / import取消 / 参加待ち | チームに参加するを選び接続設定を読込 | 参加申請・承認待ち・復旧の段階が読め、旧方式の秘密鍵入力へ戻らない |
+| C24 | `initial-setup-execution` | 新規 / 未承認 / 実行権限未設定 | チームの仕事をこのPCで実行するを選択 | Hub参加、作業場所、実行許可を区別。選択だけで共有実行を開始しない |
+| C25 | `initial-setup-hosting` | 新規 / Hub未導入 / 導入済 | チーム環境を用意するを選択し案内を確認 | 管理PC向けの準備が明示され、一般参加PCへHub導入を強制しない |
 
 ### I: 画像入力
 
@@ -147,7 +151,7 @@
 
 ### A: 権限・受入側承認
 
-自動補助: `permission.restart-guardian`, `permission.restart-guardian-chat`, `permission.temp-escalation`, `manual.permission-*`。自動reviewの成否と人の承認ボタン操作は別の証拠である。
+自動補助: `permission.restart-guardian`, `permission.restart-guardian-chat`, `permission.temp-write`, `manual.permission-*`。自動reviewの成否と人の承認ボタン操作は別の証拠である。
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
@@ -216,6 +220,9 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | U08 | `hub-save-main` | Main dirty / 実行中 / stale | Mainモデルを保存、共有仕事を投入 | Main確認値だけ保存。Runnerは受付時の選択を使用し、Sideを変更しない |
 | U09 | `hub-save-side` | Side選択有効 / 不正、Mainとは別revision | Sideを確認保存 | Sideだけ保存・再確認を確定し、Mainの選択やbaselineは不変 |
 | U10 | 接続中断と復旧 | Hub停止 / 復旧 | AI欄を開いたままHubを停止・再開 | 再接続待ちを表示し、手入力先へ切り替えない |
+| U13 | `hub-save-approve` | 未設定 / 標準 / 個別 / dirty / stale / 保存中 | Approve選択を保存し画面を開いたまま案内・再表示・再起動を確認 | Approveだけ保存。独立設定後にMain継承案内を残さず、Main/Subの個別値を保持 |
+| U14 | `hub-tab-models` | Hub接続画面 / 初回 / 保存中 | AIの接続への入口を選択 | 現行の統一設定へ到達。未保存・処理中の対象を無断で切り替えない |
+| U15 | モデル変更の取消と再接続 | 3用途それぞれ標準/個別、未保存の有無 | A→B→A、Hub通信停止・再開、B→保存。別caseでBを残して再接続 | 差分なしは後続更新を受け取り再変更を保存できる。真の未保存差分は保持して競合を説明 |
 | U11 | 実行中の選択 | Main/Side/共有仕事実行中 | 設定表示と次依頼を比較 | 実行中の経路を後から変更せず、新しい保存値は次の依頼へ適用 |
 
 ### N: Hub参加、実行PC設定、旧仕事の保守
@@ -228,13 +235,66 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | N02 | `device-network-refresh` | pending / active / stopped / disconnected | Hubブラウザーで承認・停止・再許可後、最新情報 / 再接続 | 正しい端末状態を反映し入力・detailsを維持。単なる接続中表示を受付ONと混同しない |
 | N03 | `device-network-join` | 申請未完 / 不通復旧 / pending | 到達可能へ戻して再試行、重ねて押す | 同じ申請を追跡し不要な重複登録をしない。失効/管理者停止の理由と可能な対処を区別 |
 | N04 | `device-network-diagnose-hub` | 接続成功 / 不通 / 未設定 | Hub接続を診断しdetails展開のままpoll | 保存済Hubの到達・認証結果を表示。detailsの反復開閉なし、FWを自動変更しない |
-| N10 | `device-network-stop-job` | incoming / outgoing active、到達不可 / terminal | 対象jobの停止、別jobの状態も確認 | 対象だけ停止要求→確認。到達不能は未確認を残し、Mainや別peerを誤停止しない |
-| N11 | `device-network-artifacts` | terminal job、記録あり / 0件 / peer不通 | 成果物details→確認。別jobへ切替 | job/version/記録されたfile変更が一致。任意shellファイル全体を同期済と見せず、0件/取得不能を説明 |
-| N12 | `device-network-export-artifacts` | 確認済版あり / なし / 版変化 | 保存先OS picker取消→新folderへ保存→同じ場所で再試行 | 取消は確認内容保持。確認版の新folderとreceiptを表示。既存同名folderを上書きせず、元projectへ自動適用しない |
 | N13 | `device-network-leave` | member、確認未 / 済、active jobあり | 一時解除detailsでcheckbox→解除。再接続する | ID・公開対象・権限・利用先を保持。再接続は同一端末、受付再開は手動。実行中の禁止理由を示す |
 
 | N14 | `device-network-delete-peer` | 旧保存先あり / Hub一覧に不在 / 実行中 | 詳細で対象ID・公開先を確認し取消→削除→再起動 | 指定した保存先だけ削除し、履歴・進行中job・他peer・Hub権限を保持 |
 | N15 | `device-execution-prepare` / `device-execution-enable` | 承認済 / 未割当 / 再登録 | 保存先をnative pickerで選び権限を確認 | 準備とHub用途割当を区別。リセット前の同意を新Hubへ転用しない |
+| N16 | `device-network-diagnose-gateway` | 接続済 / 未承認 / 不通 / dirty | AIへの接続診断を実行、接続先変更後に再確認 | 保存済みの対象への結果を表示。診断はモデル選択の保存や権限変更を兼ねない |
+
+旧job用の停止・成果確認・書き出しは公開action登録から外れているため、現行操作の合格数へ含めない。過去データの読取互換性と、現行の共有成果物操作（Q23〜Q24）、MCP履歴操作を区別する。旧rendererの存在だけで到達可能と扱わない。
+
+### E: このPCの実行機能・プロジェクト作業場所
+
+自動補助: `settings.device-execution`、`settings.project-folder-recovery`、`settings.shared-work-continuation`。UAC、本人同意、native picker、再起動後のサービスは別の実施状態を記録する。
+
+| Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
+|---|---|---|---|---|
+| E01 | `bind-project-folder` | 割当済 / フォルダーなし / 移動済 / picker取消 | 作業フォルダーを選び再表示・再起動、取消も試す | 対象プロジェクトの既存場所だけ更新。別プロジェクトや元ファイルを削除しない |
+| E02 | `request-execution-project-leave` | 実行専用参加 / 未参加 / 仕事あり | 離脱を選び対象と影響を読む | 対象参加世代に対する確認を表示。確認前には離脱しない |
+| E03 | `confirm-execution-project-leave` | 確認中 / 再参加で世代変更 / pending | 確定し旧確認の再操作も試す | 現在の対象だけ離脱。古い確認や連打で別参加を解除しない |
+| E04 | `cancel-execution-project-leave` | 離脱確認中 | 取消して再表示 | 同意・作業場所・参加状態を保持 |
+| E05 | `device-execution-pause` | 実行可能 / 一時停止 / 仕事中 | 一時停止してHubからの見え方を確認 | 新規受付と既存実行の扱いを区別し、停止完了を偽表示しない |
+| E06 | `device-execution-resume` | 停止中 / Hub不通 / 同意不足 | 再開して再読込 | 必要条件が揃うと受付を再開。失敗は原因と再操作を表示 |
+| E07 | `device-execution-install-autostart` | 未登録 / 登録済 / 権限拒否 | 自動起動を設定して再表示・ログイン後を確認 | 指定した実行機能だけ登録。重複や別ユーザーへの誤登録なし |
+| E08 | `device-execution-remove-autostart` | 登録済 / 既に欠損 | 自動起動を解除し再表示・ログイン後を確認 | 登録解除と今動いている仕事の停止を混同しない |
+| E09 | `device-execution-reconcile` | 起動途中 / pipe失敗 / 実行中 / 停止中 | 状態を再確認して復旧後に再操作 | 同じ実行回の状態・失敗を示し、別Runnerや別Hubへ勝手に切替えない |
+| E10 | `receiver-stop` | 受信作業中 / 承認待ち / 停止済 | このPCの受信作業を停止 | 対象の停止要求→停止確認。ローカルMainや別PCの無関係な仕事を止めない |
+| E11 | `receiver-service-stop` | 受信アプリ稼働 / 既に終了 / 切断 | このPCのアプリを停止 | 受信側アプリの終了を確認。依頼元への通知失敗と実停止を区別 |
+| E12 | `origin-stop-apps` | 会話のアプリあり / 0件 / 停止中 | 当該会話の起動中アプリを停止 | 選択会話だけに作用し、処理中の別会話を保持 |
+| E13 | `origin-stop-all` | 会話に仕事・アプリあり / 停止中 | 会話の実行をすべて停止 | 仕事とアプリの停止状況を区別し、未確認があれば残す |
+
+### Q: Hubプロジェクト・共有チャット・承認・成果物
+
+自動補助: `settings.shared-work-continuation`、`settings.project-folder-recovery`、`onboarding.win-a-to-win-b`。各シナリオが実際に取得した操作だけを結果へ対応させる。表のすべてが自動化済みとは扱わない。
+
+| Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
+|---|---|---|---|---|
+| Q01 | `edit-local-message` | ローカル最新完了依頼 / 実行中 / 古い依頼 | 編集を選び入力→再送 | 元の会話を保持して新しい分岐へ送信。共有編集と混同しない |
+| Q02 | `show-shared-work` / `open-hub-project` | 未参加 / 許可済 / 許可なし / 別project | railと一覧から開き、戻る | 選んだprojectと参加範囲を表示し、他projectの入力を誤送信しない |
+| Q03 | `shared-request-leave-project` | 参加済 / 仕事あり / 離脱済 | 離脱確認を開く | 対象projectと参加世代・影響を表示し、確認前に解除しない |
+| Q04 | `shared-request-delete-conversation` | 選択会話 / 仕事あり / 別project | 削除確認を開く | 対象会話のタイトル・範囲を明示し、別会話へ確認を流用しない |
+| Q05 | `shared-confirm-confirmation` | 確認中 / 世代更新 / pending | 確定、再参加後の古い確認、連打 | 現在の参加・会話だけ変更。競合を説明し古い対象を操作しない |
+| Q06 | `shared-cancel-confirmation` | 削除/離脱確認中 | 取消して一覧へ戻る | 保存済みデータと参加状態を保持 |
+| Q07 | `shared-select-conversation` | 一覧あり / 空 / draft / 取得中 | 会話A→B→A | 正しい履歴・仕事・draftが復元し、遅いA応答がBを上書きしない |
+| Q08 | `shared-start-rename-conversation` | 対象あり / 取得中 | 名前変更を開始 | 対象タイトルを入力欄へ表示し、操作対象を保持 |
+| Q09 | `shared-save-rename-conversation` | 有効名 / 空白 / 長文 / pending | 日本語名を保存→再表示 | 対象会話だけ変更。無効入力・失敗は入力を保持 |
+| Q10 | `shared-cancel-rename-conversation` | 名前編集中 | 取消し再表示 | 元のタイトルを保持し、別会話のdraftを消さない |
+| Q11 | `shared-start-revise` | 最新依頼 / 実行中 / 古い仕事 | 送信済み依頼を編集 | 許可された最新仕事だけ編集し、元文を保持 |
+| Q12 | `shared-save-revise` | 有効draft / 空 / 最新仕事更新 / pending | 修正文を再送 | 同じ会話へ一度だけ新仕事を作り、古い対象の再送を拒否 |
+| Q13 | `shared-cancel-revise` | 依頼編集中 | 取消して履歴を確認 | 未送信の編集だけ終了し、元仕事と本文を保持 |
+| Q14 | `shared-refresh` / `shared-reconnect` | 接続済 / 不通 / 復旧 / draft | 最新情報・再接続後に再操作 | 対象・draftを保持し、旧世代の遅延応答を適用しない |
+| Q15 | `shared-open-management` | 許可あり / 権限なし / Hub停止 | 管理画面へのリンクを開く | 指定Hubの管理先へ案内し、認証情報を通常URLやログへ露出しない |
+| Q16 | `shared-new-conversation` | 空 / 前の会話あり / draft / pending | 新しい共有チャットを選び送信 | projectを保持し前の会話と別の会話になる。入力保持/破棄は表示と一致 |
+| Q17 | `shared-detail` | 最新/過去job / 削除済 / 取得中 | 履歴から仕事を選択 | 選択jobの状態・結果だけを表示し、最新の送信先を誤認させない |
+| Q18 | `shared-retry-submission` | 送信失敗 / 応答喪失 / pending | 再試行しHub側の仕事を確認 | 同一送信の確認と新規送信を区別し、重複仕事を作らない |
+| Q19 | `shared-cancel` / `shared-stop` / `shared-stop-service` / `shared-stop-conversation` | 受付/実行/承認待ち/アプリ稼働/terminal | 各表示された停止を別caseで実行 | 仕事、承認待ち、アプリ、会話全体の範囲が表示と一致。未確認を完了扱いしない |
+| Q20 | `shared-next-environments` | 候補あり / 最終page / 切断 | 次の実行環境を表示 | 同一projectの許可範囲だけ表示し重複・欠落を防ぐ |
+| Q21 | `shared-import` | 未設定 / 既存Hub / OS選択取消 / 不正file | 接続設定を読込、取消・不正も試す | 取消は変更0。有効な設定だけ参加へ進み、既存権限を新Hubへ流用しない |
+| Q22 | `shared-approve` / `shared-deny` / `shared-reconfirm-approval` | 承認待ち / 失効 / 再接続 / 他人対象 | 許可・拒否・再確認を別caseで実行 | 表示した対象・内容・世代にだけ決定。失効した承認を再利用しない |
+| Q23 | `shared-prepare-sample` / `shared-upload-inputs` / `shared-remove-input` | 空draft / 既存入力 / picker取消 / file不正 | サンプル準備、追加・削除を行い送信前後を比較 | 選んだ入力と本文だけ更新。取消・失敗で既存入力を失わず、未送信で仕事を開始しない |
+| Q24 | `shared-save-asset` / `shared-import-asset` | 成果あり / 0件 / 失効 / 保存先競合 | native保存先を取消→保存、取り込みを別caseで操作 | 表示jobの成果だけ扱う。保存と作業場所への取り込みを区別し、秘密・任意pathを露出しない |
+| Q25 | `shared-transcript-next` / `shared-history-next` | 履歴0件/複数page / 別会話へ移動 | 次pageを読み、会話を切替 | 同一会話の順序を保持し、旧応答を別会話へ追加しない |
+| Q26 | `shared-inbox-open` / `shared-inbox-next` / `shared-inbox-latest` | 未処理あり/なし / 古い項目 / page末尾 | 受信一覧を開き、次page・最新へ戻る | 対象project/会話/承認状態を正しく表示し、通知だけで承認や送信をしない |
 
 ### M: MCP履歴
 
@@ -263,11 +323,11 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | Case | 対象 / 状態 | 具体的な操作 | 合格条件 |
 |---|---|---|---|
 | X01 | Main / Side / 検索 / review / settingsのIME | 日本語IMEで未確定→候補変換→Enter確定→再編集。Main/SideではCtrl+Enterも未確定中・確定後に試す | 確定用Enterが送信/選択へ漏れない。日本語・絵文字・改行・paste・選択範囲を保持 |
-| X02 | OS pickerの全consumer | project追加、workspace参照、画像、通常TOML、初回TOML、初回Hub、端末Hub共通設定、MCP履歴保存、委任成果物書出しを個別に開く。各取消→成功→不正/保存不能。pickerを使わないtranscript・session履歴の直接保存はH01/H02で扱う | native dialogの所有windowが正しく、取消後に操作を再開。取消は変更0、成功の対象・ファイル・保存先が一致。folder pickerの1件PASSを全consumerへ流用しない |
+| X02 | OS pickerの全consumer | project追加、workspace参照、画像、通常TOML、初回TOML、初回Hub、端末Hub共通設定、実行場所、共有projectの既存作業folder・新規作成先、共有入力ファイル、共有成果の保存・取り込み、MCP履歴保存を個別に開く。各取消→成功→不正/保存不能。pickerを使わないtranscript・session履歴の直接保存はH01/H02で扱う | native dialogの所有windowが正しく、取消後に操作を再開。取消は変更0、成功の対象・ファイル・保存先が一致。folder pickerの1件PASSを全consumerへ流用しない。旧委任成果書出しcommandは現行GUI入口がないため実行対象へ数えない |
 | X03 | 全modalのbackdrop / focus trap | 下のoverlay表の各画面で内部余白・外側・Tab循環・Esc・明示閉じるを試す | 下表の保持/取消に従い、背面buttonを発火しない。二段確認は背面inert、閉じた後にfocusが行方不明にならない |
-| X04 | 全設定field・分類リンク | GlobalのMain、入力上限/モデル機能、Side、権限、エージェント、ツール、ファイル、詳細、現在のチャット、ウィンドウを順に移動。表示された全fieldをキー単位で記録し、種類ごとに下記matrixを適用 | 到達不能fieldなし。label/help/継承/dirty/エラーを表示し、変更を指定scopeへ保存。画面の項目一覧をtask evidenceへ保存し、分類を開いただけで全項目PASSにしない |
+| X04 | 全設定field・分類リンク | GlobalのMain、入力上限/モデル機能、Sub、Approve、権限、エージェント、ツール、ファイル、詳細、現在のチャット、ウィンドウを順に移動。表示された全fieldをキー単位で記録し、種類ごとに下記matrixを適用 | 到達不能fieldなし。label/help/継承/dirty/エラーを表示し、変更を指定scopeへ保存。画面の項目一覧をtask evidenceへ保存し、分類を開いただけで全項目PASSにしない |
 | X05 | Directモデル一覧 | profileとURLをA→B→A。0件、削除済保存ID、読込失敗、古い応答を作り、Main / Side / 初回 / Sessionを比較 | 接続先と候補が一致。保存済だが候補外のIDは状態として説明し、存在する候補へ偽装しない。外部ホストのload/unloadを勝手に変更しない |
-| X06 | Hubモデルfield・差分 | Main/Side別に標準モデル・明示モデルのDDDWを変更。Hub側で追加/削除/機能改訂し再取得 | 各contextのbefore/after・未保存・再確認が明確。old response、poll、tab移動でdraft/focus/detailsが戻らない |
+| X06 | Hubモデルfield・差分 | Main/Sub/Approve別に標準モデル・明示モデルのDDDWを変更。Hub側で追加/削除/機能改訂し再取得 | 各contextのbefore/after・未保存・再確認が明確。old response、poll、tab移動でdraft/focus/detailsが戻らない。未設定から保存した後の継承案内も閉じずに確認 |
 | X09 | MCP活動表示 | 受入待機→実行→承認→停止→終端、複数受入、状態取得不能。Main同時実行中にchat切替 | 赤系共通indicatorと文言/件数が一致。全終了で消え、取得不能は「何も実行なし」と見せない。Mainの青表示と同時に識別可能 |
 | X10 | MCP履歴の大量/長文/エラー | page超の行、空方向、長いID/path、Markdown code/table/長文、本文省略、peer不通を表示。本文途中でpoll・方向切替 | 一覧はbounded、本文・page・選択の対応が正しい。読書位置/details保持、拡張子等の文字が欠けず、停止要求/確認/最終観測を区別 |
 | X11 | Main履歴rail / details / scroll | streaming中は末尾と途中を交互に読む。User/Assistant/tool/work/error/usage等のdetails、rail hover/移動、以前のページを操作 | 読んでいる位置を強制的に末尾へ戻さず、末尾追従は意図どおり。canonical化後の重複・欠落・順序逆転なし |
@@ -278,6 +338,23 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | X16 | 実端末連係 | 実Hub browserでA/Bを承認しプロジェクトの操作PC/実行PCに指定。Bで保存先・実行権限を確認。Aから依頼しAで承認、Bで実行、Aで回答と成果、Hubで仕事を確認 | 人が毎回@端末を打つ前提にせず許可・対象・経路を識別。GUI選択と実行先が一致し、同じtaskを両端/Hubで追える。物理LAN/FWは別証拠 |
 
 ### overlayごとの外側クリック契約
+
+固定action以外の入力・選択は、次の対象も各caseへ結び付ける。件数は固定せず、実画面で表示されたキー・ID・選択肢を記録する。
+
+| 機能群 | 入力・表示・到達経路 | 確認する結果 |
+|---|---|---|
+| 共通設定53 field | 下のfield一覧、カテゴリ、details、候補select、検証文、dirty表示 | 直接編集→検証→保存→再表示→再起動。操作したkeyだけを実施済みとして集計 |
+| チャット個別6 field | URL、接続方式、API key参照、モデル、入力上限、権限 | 対象会話・継承・適用・取消・別会話への非波及。共通設定保存とは別結果 |
+| Hubモデル3用途 | 標準/個別/候補欠落、比較表示、モデルのプロンプトdetails | 用途別保存、標準への追従、未保存・再接続・失効。手動AI設定のfieldへ混ぜない |
+| PC接続と実行設定 | 接続file、表示名、作業場所、実行許可、解除確認、診断details | 本人同意・割当・準備・受付の段階を区別。自動起動や解除はE/N case |
+| 共有チャットのdraft | 本文、名前変更、依頼編集、添付、実行環境候補、履歴page | project/会話の切替と更新をまたいで保持。IME・取消・送信の一回性 |
+| 承認・実行状態 | Main/Side/共有の対象、差分・ツール内容、入力候補、許可/拒否/停止 | 表示中の内容・権限と決定の対象が一致。再接続・世代変更後の旧承認を拒否 |
+| 一般HTTP MCP | serverの追加/編集/有効切替/削除、接続診断、エラーdetails | ID・URL・ヘッダー・保存先、秘密非表示、取消・失敗・dirtyの保持 |
+| メニュー・パレット・検索 | キー入力、候補選択、検索filter、行menu、workspace候補 | 全入口が同じactionと対象へ到達。disabled・空候補・旧結果・Esc |
+| 履歴・成果物・引用 | rail、details、Markdown、code、リンク、画像、選択範囲、外部保存 | 現在の会話との対応・読書位置・引用元を保持。保存先と副作用を記録 |
+| ウィンドウ・ペイン | drag、最小化、最大化、tray、opacity、zoom、狭幅、DPI、scroll | ネイティブとWebViewを区別。キーボードfocus・可読性・再表示を確認 |
+
+初回setup、通常の手入力設定、Hub管理中、現在のチャットは別surfaceとして扱う。表示されないfieldは理由付き適用外とし、config全53項目の編集とHubモデル3選択を足して一括PASSにはしない。
 
 | overlay | 外側クリック | 明示閉じる / Esc と追加確認 |
 |---|---|---|
@@ -301,6 +378,68 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | model / URL | profileとの組合せ、別endpoint、0件/不通/旧応答、候補外保存値。Main/Side/Hubを混同しない |
 | scope / 継承 | global既定、個別override、継承へ戻す、一時適用とfile保存、S1↔S2、再起動 |
 | subsection / details / tooltip | 全分類へ到達、開閉・scroll、long help、keyboard focus、poll中保持、狭幅 |
+
+### 設定fieldの全件対応
+
+以下は操作計画であり合格一覧ではない。計画の正本は[settings_control_plan.mjs](scenarios/settings_control_plan.mjs)。実GUIではRustの公開descriptorと全件照合してから編集する。型・境界値・必須/任意は実行時descriptorを使い、初回は最後に選んだ値だけの保存、共通設定はenum/boolean各値の保存を別々に記録する。Hub管理中は手入力接続の編集が禁止されるため、U列の3用途モデル選択を使う。
+
+| field key | 入力種別 | 初回の検査step | 基本の自動操作計画 |
+|---|---|---|---|
+| `model.base_url` | url | provider | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.model` | model | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.system_prompt` | prompt | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.provider_profile` | enum | provider | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.api_key_env` | env | provider | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.api_key_env` | env | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.base_url` | url | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.model` | model | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.system_prompt` | prompt | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.provider_profile` | enum | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.context_window` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.request_timeout_ms` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.connect_timeout_ms` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `side_chat.max_retries` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.base_url` | url | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.model` | model | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.provider_profile` | enum | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.api_key_env` | env | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.context_window` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.request_timeout_ms` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.connect_timeout_ms` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `approve.max_retries` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `permissions.access_mode` | enum | permissions | 共通・初回の直接編集／保存／再表示／再起動 |
+| `multi_agent.enabled` | boolean | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `multi_agent.mode` | enum | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `multi_agent.max_concurrent_agents` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `multi_agent.max_concurrent_model_requests` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.context_window` | integer | provider | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.compaction_budget_tokens` | integer | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.request_timeout_ms` | integer | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.connect_timeout_ms` | integer | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.max_retries` | integer | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.supports_tools` | boolean | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.supports_images` | boolean | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.parallel_tool_calls` | boolean | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.max_parallel_predictions` | integer | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `model.extra_headers_json` | headers | model | 共通・初回の直接編集／保存／再表示／再起動 |
+| `shell.hide_windows` | boolean | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `inspection.default_max_depth` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `inspection.default_max_entries_per_dir` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `inspection.max_extensions_reported` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `inspection.include_hidden_by_default` | boolean | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `file_guard.max_inline_read_bytes` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `file_guard.large_file_warning_bytes` | integer | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `file_guard.blocked_read_extensions` | extensions | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `file_guard.structured_document_extensions` | extensions | finish | 共通・初回の直接編集／保存／再表示／再起動 |
+| `docling.enabled` | boolean | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+| `docling.base_url` | url | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+| `docling.timeout_ms` | integer | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+| `docling.api_key_env` | env | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+| `docling.headers_json` | headers | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+| `mcp.enabled` | boolean | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+| `mcp.servers_json` | servers | tools | 共通・初回の直接編集／保存／再表示／再起動 |
+
+上表の基本操作に加え、空欄と継承、Approveの独立化、接続変更時のAPI参照解除、入力整理上限とcompaction budgetの組合せを個別caseにする。秘密JSONの公開投影は非表示であるため、configuredだけの一致を内容の完全一致と扱わない。実行中・pending・保存失敗・競合・IME・DPIの未実施状態を結果に残す。
 
 ## 5. 自動判定と目視結果の記録
 

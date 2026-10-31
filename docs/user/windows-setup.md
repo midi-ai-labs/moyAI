@@ -142,7 +142,7 @@ Windowsの利用者データは `%LOCALAPPDATA%\midi-ai-labs\moyai-data` に集�
 `scripts/package-release.ps1` は既定で閉域用の同梱ランタイムを要求します。配布許諾を確認した**展開済みx64固定版WebView2のディレクトリー**を `-WebView2FixedRuntimePath`、**app-local再配布用のx64 VC++ DLLディレクトリー**を `-VcRuntimePath` に指定します。VC++資材のDLLは直下の `vcruntime140.dll`、`vcruntime140_1.dll`、`msvcp140.dll` の3本に限定します。別のDLLや不足があればpackage作成前に拒否し、余分なDLLを黙ってコピー・除外しません。システムにあるDLLを自動採取しません。必要な配布元のライセンス・通知類は資材ディレクトリーとともに保管・提供してください。
 
 ```powershell
-.\scripts\package-release.ps1 -Version 3.0.6 `
+.\scripts\package-release.ps1 -Version 3.0.7 `
   -WebView2FixedRuntimePath C:\release-inputs\WebView2-x64 `
   -VcRuntimePath C:\release-inputs\VC143.CRT-x64 `
   -ManualGuiStResultsPath C:\evidence\desktop-results.md

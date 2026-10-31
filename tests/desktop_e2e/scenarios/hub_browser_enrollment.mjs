@@ -162,6 +162,26 @@ async function finishModelCommandObservation(cdp, sink) {
   await sink.record("hub-model-command-observation", { rows, capacity:96 }, { phase:"executing", owner:OWNER });
 }
 
+async function chooseModel(input, cdp, name, modelId, sink) {
+  const section = name === "main" ? "provider" : name === "side_chat" ? "side-chat" : "approve";
+  const href = `#settings-${section}`;
+  await trustedClick(input, cdp, { selector: `.settings-nav a[href="${href}"]`, identity: { tag: "A", href } }, sink);
+  const target = byId(`ai-${name}-model`, "SELECT");
+  const values = await cdp.evaluate(`Array.from(document.querySelector(${JSON.stringify(target.selector)}).options).filter(o => !o.disabled).map(o => o.value)`);
+  const index = values.indexOf(modelId);
+  if (index < 0) throw fail("Registered model is absent from dropdown", { name, modelId });
+  await trustedClick(input, cdp, target, sink); await input.pressKey("Home");
+  for (let i = 0; i < index; i++) await input.pressKey("ArrowDown");
+  await input.pressKey("Enter");
+  await wait("Model dropdown retains the chosen model", () => cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.value`), value => value === modelId);
+}
+
+async function waitModelSaveState(cdp, name, enabled) {
+  const route = name === "side_chat" ? "side" : name;
+  await wait(`Desktop ${name} model save is ${enabled ? "enabled" : "disabled"}`, () => cdp.evaluate(
+    `document.querySelector('[data-ai-connection="${name}"] button[data-action="hub-save-${route}"]')?.disabled`), value => value === !enabled);
+}
+
 export function createHubBrowserEnrollmentScenario(options = {}) {
   const settings = normalizeHubBrowserOptions(options);
   const state = { resource: null, input: null, nativeOwner: null, nativeCandidate: null, nativeBefore: null,
@@ -227,14 +247,7 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         return [name, matches[0].id];
       }));
       for (const name of ["main", "side_chat", "approve"]) {
-        const target = byId(`ai-${name}-model`, "SELECT");
-        const values = await cdp.evaluate(`Array.from(document.querySelector(${JSON.stringify(target.selector)}).options).filter(o => !o.disabled).map(o => o.value)`);
-        const index = values.indexOf(selected[name]);
-        if (index < 0) throw fail("Registered model is absent from dropdown", { name });
-        await trustedClick(input, cdp, target, sink); await input.pressKey("Home");
-        for (let i = 0; i < index; i++) await input.pressKey("ArrowDown");
-        await input.pressKey("Enter");
-        await wait("Model dropdown retains the chosen model", () => cdp.evaluate(`document.querySelector(${JSON.stringify(target.selector)})?.value`), value => value === selected[name]);
+        await chooseModel(input, cdp, name, selected[name], sink);
         const route = name === "side_chat" ? "side" : name;
         await sink.record("hub-model-before-save", { context: name, hub: await invokeDesktopCommand(cdp, "hub_projection"),
           form: await cdp.evaluate(`(() => { const form = document.querySelector('[data-ai-connection="${name}"]'); return { text: form?.innerText, buttons: [...(form?.querySelectorAll('button') ?? [])].map(button => ({action:button.dataset.action,disabled:button.disabled})), value: form?.querySelector('select')?.value }; })()`),
@@ -243,6 +256,41 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         await trustedClick(input, cdp, action(`hub-save-${route}`, `[data-ai-connection="${name}"]`), sink);
         await wait(`Desktop ${name} saves an independent explicit model`, () => invokeDesktopCommand(cdp, "hub_projection"), value => value[`${name}_confirmation`] === "confirmed"
           && value[`${name}_uses_default`] === false && value[`${name}_review`]?.selection.preferred_model_id === selected[name]);
+        if (name === "approve") await wait("Saved Approve removes its inheritance notice without closing Settings",
+          () => cdp.evaluate(`Boolean(document.querySelector('[data-settings-passive="ai-approve-inheritance"]'))`), value => !value);
+      }
+      for (const name of ["main", "side_chat", "approve"]) {
+        const alternative = selected[name === "main" ? "side_chat" : "main"];
+        await chooseModel(input, cdp, name, alternative, sink);
+        await waitModelSaveState(cdp, name, true);
+        await chooseModel(input, cdp, name, selected[name], sink);
+        await waitModelSaveState(cdp, name, false);
+      }
+      const beforeReconnect = await invokeDesktopCommand(cdp, "hub_projection");
+      await page.locator('nav a[href="#device-network"]').click();
+      await page.locator("#network-stop").click();
+      await wait("Hub network stops without closing Desktop settings", () => hub.observeNetwork(), value => !value.server.running);
+      await wait("Desktop observes the stopped Hub", () => cdp.evaluate(`document.querySelector('#ai-main-model')?.disabled`), value => value === true, 45_000);
+      await page.locator("#network-start").click();
+      await wait("Hub network restarts on the same saved endpoint", () => hub.observeNetwork(), value => value.server.running);
+      const afterReconnect = await wait("Desktop reconnects without an explicit model refresh", () => invokeDesktopCommand(cdp, "hub_projection"),
+        value => BigInt(value.connection_generation) > BigInt(beforeReconnect.connection_generation)
+          && independentSelectionsAccepted(value, selected.main, selected.side_chat, selected.approve), 45_000);
+      await wait("Reconnected settings display three editable models", () => cdp.evaluate(`['main','side_chat','approve'].every(name => document.querySelector('#ai-'+name+'-model')?.disabled === false)`), Boolean);
+      await sink.record("hub-model-reverted-reconnect", { before: beforeReconnect, after: afterReconnect, explicit_model_refresh: false }, { phase: "executing", owner: OWNER });
+      for (const name of ["main", "side_chat", "approve"]) {
+        const route = name === "side_chat" ? "side" : name;
+        const alternative = selected[name === "main" ? "side_chat" : "main"];
+        for (const modelId of [alternative, selected[name]]) {
+          await chooseModel(input, cdp, name, modelId, sink);
+          await waitModelSaveState(cdp, name, true);
+          if (modelId === alternative) await captureScenarioScreenshot({ cdp, sink, name: `hub-model-${name}-after-reconnect`, owner: OWNER });
+          await trustedClick(input, cdp, action(`hub-save-${route}`, `[data-ai-connection="${name}"]`), sink);
+          const saved = await wait(`Desktop ${name} saves after reverting and reconnecting`, () => invokeDesktopCommand(cdp, "hub_projection"),
+            value => value[`${name}_confirmation`] === "confirmed" && value[`${name}_uses_default`] === false
+              && value[`${name}_review`]?.selection.preferred_model_id === modelId);
+          await sink.record("hub-model-after-reconnect-saved", { context: name, model_id: modelId, review: saved[`${name}_review`] }, { phase: "executing", owner: OWNER });
+        }
       }
       const accepted = await wait("Desktop Main, Sub and Approve independently use Hub selections", () => invokeDesktopCommand(cdp, "hub_projection"), value => independentSelectionsAccepted(value, selected.main, selected.side_chat, selected.approve)
         && value.approve_review.selection.required_capabilities.length === 0);
@@ -290,6 +338,8 @@ export function createHubBrowserEnrollmentScenario(options = {}) {
         text_only_approve: true, form: restoredForm }, { phase: "executing", owner: OWNER });
       await captureScenarioScreenshot({ cdp, sink, name: "hub-browser-cold-model-selection", owner: OWNER });
       await trustedClick(input, cdp, action("close-overlay", ".settings-modal"), sink);
+      await wait("Cold Settings closes before the next sidebar action", () => observeConnectedShell(cdp),
+        value => connectedShellAccepted(value, selected.main, selected.side_chat, selected.approve));
       await trustedClick(input, cdp, action("show-hub", "aside.sidebar"), sink);
       await trustedClick(input, cdp, byId("hub-tab-devices"), sink);
       const sharedShortcut = await wait("Connected device panel has rendered its shared-work shortcut", async () =>

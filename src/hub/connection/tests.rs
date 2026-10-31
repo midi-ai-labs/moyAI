@@ -1161,7 +1161,7 @@ async fn enable(
 }
 
 #[tokio::test]
-async fn role_defaults_are_independent_and_approve_requires_explicit_selection() {
+async fn role_defaults_are_adopted_independently_and_preserve_saved_choices() {
     let server = Server::start(60_000).await;
     let mut side = selection("fast");
     side.required_capabilities.clear();
@@ -1224,20 +1224,7 @@ async fn role_defaults_are_independent_and_approve_requires_explicit_selection()
             .preferred_model_id,
         "fast"
     );
-    assert!(connected.approve_review.is_none());
-    assert!(!connected.approve_uses_default);
-    let approved = service
-        .save_review_with_source(
-            HubReviewContext::Approve,
-            selection("deep"),
-            connected.hub_id.unwrap(),
-            connected.catalog.as_ref().unwrap().revision,
-            connected.settings_revision,
-            connected.connection_generation,
-            true,
-        )
-        .await
-        .unwrap();
+    let approved = connected;
     assert_eq!(
         approved
             .approve_review
@@ -1257,7 +1244,36 @@ async fn role_defaults_are_independent_and_approve_requires_explicit_selection()
             .is_empty()
     );
     assert!(approved.approve_uses_default);
+    assert_eq!(
+        approved.approve_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert!(approved.main_uses_default && approved.side_chat_uses_default);
+    let mut current = approved;
+    for (context, model) in [
+        (HubReviewContext::Main, "fast"),
+        (HubReviewContext::SideChat, "deep"),
+        (HubReviewContext::Approve, "deep"),
+    ] {
+        current = save(&service, &current, context, model).await.unwrap();
+    }
+    let saved = store(&temp).load().unwrap();
     service.shutdown().await;
+    let reopened = HubConnection::new(store(&temp));
+    let http = crate::device_network::ManagedHubHttp::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    let reconnected = reopened
+        .connect_device(&server.endpoint, http, true, None)
+        .await
+        .unwrap();
+    assert_eq!(reconnected.main_review, saved.main_review);
+    assert_eq!(reconnected.side_chat_review, saved.side_chat_review);
+    assert_eq!(reconnected.approve_review, saved.approve_review);
+    assert!(!reconnected.main_uses_default);
+    assert!(!reconnected.side_chat_uses_default);
+    assert!(!reconnected.approve_uses_default);
+    reopened.shutdown().await;
 }
 
 #[tokio::test]

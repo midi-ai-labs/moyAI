@@ -381,6 +381,9 @@ async fn automatic_join_reuses_a_lost_request_and_reopens_pending_before_approva
     assert_eq!(models.main_mode, crate::hub::HubRouteMode::Hub);
     assert_eq!(models.side_chat_mode, crate::hub::HubRouteMode::Hub);
     assert!(models.main_uses_default && models.side_chat_uses_default);
+    // The legacy Hub receipt has no Approve default; do not invent one.
+    assert!(models.approve_review.is_none());
+    assert!(!models.approve_uses_default);
     assert_eq!(
         serde_json::to_value(models.main_confirmation).unwrap(),
         serde_json::json!("confirmed")

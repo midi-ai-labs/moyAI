@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.md">日本語</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.6">Download v3.0.6</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.7">Download v3.0.7</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">License</a>
@@ -22,7 +22,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.6 is a Windows x64 maintenance release.** Cloud Files packages are prepared locally before installation or Desktop launch. Runner startup errors retain their cause, and Desktop setup no longer installs Hub by default. Uninstall tolerates missing payload files and preserves the application if a requested data reset fails. The bundled edition includes moyAI Hub 1.0.4 and requires installed WebView2 and x64 VC++ runtimes. See the [3.0.6 release notes](docs/release/v3.0.6.md) for verification scope and limitations.
+**Desktop 3.0.7 is a Windows x64 settings fix release.** It initializes unset Main, Sub and Approve selections with the available Hub default, restores model saving after reconnection, and fixes persistence of explicit Approve settings and reentered headers. The GUI audit inventory has also been updated. The bundled edition includes moyAI Hub 1.0.4 and requires installed WebView2 and x64 VC++ runtimes. See the [3.0.7 release notes](docs/release/v3.0.7.md) for verification scope and limitations.
 
 ## Desktop and Hub
 
@@ -49,7 +49,7 @@ Security review uses original guidance informed by OWASP, a built-in Skill, and 
 
 ## Quick Start
 
-For the 3.0.6 Windows package:
+For the 3.0.7 Windows package:
 
 1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt to install the executable files under Program Files. Setup opens **moyAI** as the original standard user and checks that its initial screen appears. Continue in the opened window; use the Start menu for later launches. If startup fails or remains unconfirmed after 60 seconds, Setup shows the result and diagnostic log location and leaves the app running if it has not exited. Follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
@@ -81,7 +81,7 @@ The user-wide Windows configuration is `%LOCALAPPDATA%\midi-ai-labs\moyai-data\d
 
 Use **設定 → AIの接続** for Main, Sub (Side Chat), and Approve (permission review). Without Hub configuration, enter the endpoint and connection type: LM Studio Responses or OpenAI-compatible Chat Completions, such as oMLX. Load the model list or enter a model ID. API credentials, when required, are referenced by environment-variable name rather than saved as secret text.
 
-When Hub is configured, this screen shows the Hub connection and lets you choose the standard or another registered model independently for Main, Sub, and Approve. Hub administrators can save a standard model for each role. Shared Runner jobs capture the executing PC's Main and Approve selections when work starts. Hub outages do not automatically switch to manual settings.
+When Hub is configured, this screen shows the Hub connection and lets you choose the standard or another registered model independently for Main, Sub, and Approve. Hub administrators can save a standard model for each role. On initial connection, each unconfigured role adopts its available Hub standard model. Reconnecting preserves existing individual selections. Shared Runner jobs capture the executing PC's Main and Approve selections when work starts. Hub outages do not automatically switch to manual settings.
 
 **接続設定をリセット** works without a Hub response. It preserves local conversations, files and manual AI settings, and lets you join a replacement Hub.
 
@@ -108,7 +108,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-The 3.0.6 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+The 3.0.7 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
 On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
 

@@ -28,7 +28,9 @@ export async function observeFieldControls(cdp, scope = "global") {
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     const panel = document.querySelector(${JSON.stringify(SCOPE[scope])});
     const visible = el => Boolean(el?.isConnected && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0 && getComputedStyle(el).visibility !== 'hidden');
+    const sessionTriggers = [...document.querySelectorAll(${JSON.stringify(SHOW_SESSION.selector)})];
     return { projection, panel: visible(panel), step: panel?.dataset.currentStep ?? null,
+      session_trigger_ready: sessionTriggers.length === 1 && visible(sessionTriggers[0]) && !sessionTriggers[0].disabled,
       dirty: panel?.querySelector('.dirty-badge')?.classList.contains('visible') ?? false,
       controls: [...(panel?.querySelectorAll('input.settings-control, textarea.settings-control, select.settings-control, .session-settings-control') ?? [])].map(el => ({
         key: el.dataset.configKey ?? el.dataset.sessionSetting, tag: el.tagName, id: el.id, type: el.type,
@@ -92,7 +94,7 @@ async function focusThroughTab(input, cdp, locator) {
 
 async function acquireControl(input, cdp, scope, key, { modelSelect = false } = {}) {
   if (scope === "global") {
-    const section = /^side_chat\./.test(key) ? "side-chat" : /^permissions\./.test(key) ? "permissions"
+    const section = /^side_chat\./.test(key) ? "side-chat" : /^approve\./.test(key) ? "approve" : /^permissions\./.test(key) ? "permissions"
       : /^multi_agent\./.test(key) ? "agents" : /^(shell|docling|mcp)\./.test(key) ? "tools"
         : /^(inspection|file_guard)\./.test(key) ? "files"
           : ["model.connect_timeout_ms", "model.max_retries", "model.max_parallel_predictions", "model.extra_headers_json"].includes(key) ? "advanced"
@@ -113,6 +115,30 @@ async function acquireControl(input, cdp, scope, key, { modelSelect = false } = 
   return { control, locator };
 }
 
+async function revealGlobalEditor(input, scope, locator) {
+  if (scope !== "global") return;
+  let previous = null, stable = 0;
+  const settled = await waitForObservation({ label: "Settings focus and selection scroll settles", timeoutMs: 1500, pollMs: 75,
+    retrySampleErrors: false, sample: () => input.observeScrollContainer(locator, `${GLOBAL} .settings-content`),
+    accept: value => {
+      const geometry = JSON.stringify([value.observation.scroll_top, value.observation.target.rect, value.observation.target.scroll_clip]);
+      stable = geometry === previous ? stable + 1 : 1; previous = geometry;
+      return stable >= 3;
+    } });
+  const geometry = settled.value.observation.target;
+  // Selection can scroll a textarea's first line into view after Tab has settled.
+  // Reveal its centre only after those input operations, without changing focus.
+  if (geometry.center_in_scroll_clip === false) {
+      const start = (await input.snapshotProbe()).sequence;
+      const delta = geometry.center.y - (geometry.scroll_clip.top + geometry.scroll_clip.bottom) / 2;
+      const wheel = await input.scrollContainer(locator, { containerSelector: `${GLOBAL} .settings-content`,
+        deltaY: Math.sign(delta) * Math.min(Math.ceil(Math.abs(delta)), 1000) });
+      await input.waitForTrustedProbeSequence({ afterSequence: start, expected: [{ type: "wheel",
+        identity: wheel.before.observation.container.identity, deltaX: 0, deltaY: wheel.parameters.deltaY, deltaMode: 0 }] });
+      await input.resolveExactTarget(locator, { stableHitSamples: 3 });
+  }
+}
+
 async function replace(input, cdp, scope, key, value) {
   const { locator, control } = await acquireControl(input, cdp, scope, key);
   if (control.tag === "SELECT") {
@@ -125,12 +151,14 @@ async function replace(input, cdp, scope, key, value) {
     const events = probe.events.filter(event => ["keydown", "keyup", "input", "change"].includes(event.type));
     if (!events.length || events.some(event => !event.isTrusted)) throw failure("settings-select-input-untrusted", "Native select did not receive trusted input", { key, probe });
   } else if (control.type === "checkbox") {
+    await revealGlobalEditor(input, scope, { selector: `${SCOPE[scope]} label[for="${control.id}"]`, identity: { tag: "LABEL", configKey: key } });
     if (control.value !== value) await trustedToggleFocusedSettingsCheckbox(input, locator);
   } else {
     await input.keyDown("Control");
     try { await input.pressKey("a"); } finally { await input.keyUp("Control"); }
     if (value === "") await input.pressKey("Backspace");
     else {
+      await revealGlobalEditor(input, scope, locator);
       const start = (await input.snapshotProbe()).sequence;
       await input.insertText(locator, value);
       assertTrustedTextInsertion(await input.snapshotProbe(start), { afterSequence: start, identity: locator.identity, text: value });
@@ -180,6 +208,12 @@ async function openGlobal(input, cdp) {
   return wait(cdp, "global", "Global Settings opens", surface => surface.panel && surface.projection.overlay === "config");
 }
 
+async function openSession(input, cdp) {
+  // The command projection can settle before the next UI poll renders its entry.
+  await wait(cdp, "session", "Session Settings entry is rendered", surface => surface.session_trigger_ready);
+  await click(input, SHOW_SESSION);
+}
+
 async function globalSaveAndReopen(input, cdp, expected, commands, sink, owner) {
   const before = (await commands.snapshot()).sequence;
   await activate(input, cdp, "global", "save-global-config");
@@ -213,10 +247,23 @@ async function exerciseGlobal({ input, cdp, commands, context, sink, owner, prov
     const values = row.options ?? ["false", "true"];
     for (const value of values) {
       await replace(input, cdp, "global", row.key, value);
+      if (row.key.endsWith(".provider_profile") && expected.get(row.key) !== value) {
+        const role = row.key.split(".")[0];
+        const credentialKeys = role === "model" ? ["model.api_key_env", "model.extra_headers_json"] : [`${role}.api_key_env`];
+        // A connection change deliberately revokes the old credential grant.
+        // Explicitly reenter fixture credentials after changing the connection.
+        for (const key of credentialKeys) await replace(input, cdp, "global", key, expected.get(key));
+      }
       expected.set(row.key, value);
       await globalSaveAndReopen(input, cdp, expected, commands, sink, owner);
       await sink.record("settings-option-saved-reopened", { scope: "global", key: row.key, value }, { phase: "executing", owner });
     }
+  }
+  for (const row of SETTINGS_CONTROL_PLAN.filter(row => row.inheritedEmpty)) {
+    await replace(input, cdp, "global", row.key, "");
+    expected.set(row.key, "");
+    await globalSaveAndReopen(input, cdp, expected, commands, sink, owner);
+    await sink.record("settings-inherited-empty-saved", { key: row.key }, { phase: "executing", owner });
   }
   const bytesBeforeDiscard = await readFile(context.paths.config_file);
   for (const row of ordered.filter(row => row.key !== "docling.enabled")) {
@@ -232,6 +279,7 @@ async function exerciseGlobal({ input, cdp, commands, context, sink, owner, prov
   await captureScenarioScreenshot({ cdp, sink, name: "settings-field-controls-saved", owner });
   await activate(input, cdp, "global", "close-overlay");
   await wait(cdp, "global", "Field audit finishes at the idle shell", surface => !surface.panel && surface.projection.overlay === "none");
+  return { persistedFields: expected };
 }
 
 async function exerciseInitial({ input, cdp, commands, context, sink, owner, provider }) {
@@ -278,6 +326,7 @@ async function exerciseInitial({ input, cdp, commands, context, sink, owner, pro
   await sink.record("settings-initial-all-fields-saved", { keys: [...expected.keys()], saved_file_bytes: (await readFile(context.paths.config_file)).length,
     draft_options_selected: true, all_options_persisted: false, final_values_saved_reopened: true, calls }, { phase: "executing", owner });
   await activate(input, cdp, "global", "close-overlay");
+  return { persistedFields: expected };
 }
 
 function sessionValuesMatch(surface, expected) {
@@ -296,7 +345,7 @@ async function sessionSaveAndReopen(input, cdp, expected, commands, sink, owner)
   if (calls.filter(call => call.command === "apply_session_settings").length !== 1) throw failure("settings-session-apply-count", "One Session Apply must produce one command", calls);
   if ((await observeFieldControls(cdp, "session")).panel) await activate(input, cdp, "session", "close-overlay");
   await wait(cdp, "session", "Session Settings closes cleanly", surface => !surface.panel && surface.projection.overlay === "none");
-  await click(input, SHOW_SESSION);
+  await openSession(input, cdp);
   await wait(cdp, "session", "Session Settings reopens saved fields", surface => surface.panel && sessionValuesMatch(surface, expected));
   await sink.record("settings-session-fields-saved-reopened", { values: [...expected], calls }, { phase: "executing", owner });
 }
@@ -312,7 +361,7 @@ async function exerciseSession({ input, cdp, commands, context, sink, owner, pro
     && JSON.stringify(surface.projection.transcript_rows).includes(ROOT_RESPONSE), 90_000);
   const requestCount = provider.requestLedger.length;
   if (!requestCount) throw failure("settings-session-root-request-missing", "Session setup must use its declared scripted request", {});
-  await click(input, SHOW_SESSION);
+  await openSession(input, cdp);
   const first = await wait(cdp, "session", "Session Settings opens", surface => surface.panel);
   const globalConfigBefore = await readFile(context.paths.config_file);
   const baseline = new Map(SESSION_CONTROL_PLAN.map(row => [row.key, first.projection.session_settings[row.projectionKey]]));
@@ -331,6 +380,9 @@ async function exerciseSession({ input, cdp, commands, context, sink, owner, pro
   for (const row of SESSION_CONTROL_PLAN.filter(row => row.kind === "enum")) {
     for (const value of row.options) {
       await replace(input, cdp, "session", row.key, value);
+      if (row.key === "provider-profile" && expected.get(row.key) !== value) {
+        await replace(input, cdp, "session", "api-key-env", expected.get("api-key-env"));
+      }
       expected.set(row.key, value);
       await sessionSaveAndReopen(input, cdp, expected, commands, sink, owner);
     }
@@ -346,6 +398,7 @@ async function exerciseSession({ input, cdp, commands, context, sink, owner, pro
   await activate(input, cdp, "session", "close-overlay");
   await sink.record("settings-session-control-audit", { controls: SESSION_CONTROL_PLAN.map(row => row.key), global_config_bytes_unchanged: true,
     initial_root_provider_requests: requestCount, field_edit_provider_requests: 0, inheritance_reapplied: true }, { phase: "executing", owner });
+  return { sessionFields: expected, sessionTarget: first.projection.session_settings.target };
 }
 
 function createScenario(scope, options = {}) {
@@ -371,7 +424,39 @@ function createScenario(scope, options = {}) {
       try {
         await input.installProbe(); await commands.install();
         const exercise = options.exercise ?? { global: exerciseGlobal, initial: exerciseInitial, session: exerciseSession }[scope];
-        await exercise({ ...args, scenario: this, input, cdp, commands, context, sink, owner, provider });
+        const audit = await exercise({ ...args, scenario: this, input, cdp, commands, context, sink, owner, provider });
+        if (audit?.persistedFields || audit?.sessionFields) {
+          const bytes = await readFile(context.paths.config_file);
+          await input.cleanup(); await commands.remove();
+          const restarted = await args.host.restart({ context, scenario: this, sink, driver: cdp, phase: "executing" });
+          await acquireInteractiveShell({ context, driver: restarted.driver, sink }, { evidenceOwner: owner, screenshotStem: `${id}-restarted` });
+          const nextInput = new WebviewInput(restarted.driver, { probeId: `${id}-restart` });
+          await nextInput.installProbe();
+          try {
+            if (audit.sessionFields) {
+              await openSession(nextInput, restarted.driver);
+              const restored = await wait(restarted.driver, "session", "All session fields survive restart on the same root",
+                surface => sessionValuesMatch(surface, audit.sessionFields)
+                  && surface.projection.session_settings.target?.rootSessionId === audit.sessionTarget.rootSessionId
+                  && surface.projection.session_settings.target?.workspacePath === audit.sessionTarget.workspacePath);
+              await sink.record("settings-session-fields-restarted", { keys: [...audit.sessionFields.keys()], restart: restarted.restart,
+                session: restored.projection.session_settings }, { phase: "executing", owner });
+            } else {
+              const restored = await openGlobal(nextInput, restarted.driver);
+              assertSettingsInventory(restored.projection.config_fields);
+              if (!expectedFieldsMatch(restored, audit.persistedFields) || !expectedEditorsMatch(restored, audit.persistedFields)) {
+                throw failure("settings-all-fields-restart-mismatch", "All committed fields must survive Desktop restart", { restored });
+              }
+              await sink.record("settings-all-fields-restarted", { keys: [...audit.persistedFields.keys()], restart: restarted.restart,
+                fields: restored.projection.config_fields }, { phase: "executing", owner });
+            }
+            if (!(await readFile(context.paths.config_file)).equals(bytes)) {
+              throw failure("settings-restart-wrote-config", "Restart must preserve the saved config file bytes", {});
+            }
+            await captureScenarioScreenshot({ cdp: restarted.driver, sink, name: `${id}-restored`, owner });
+            await activate(nextInput, restarted.driver, audit.sessionFields ? "session" : "global", "close-overlay");
+          } finally { await nextInput.cleanup(); }
+        }
         if (scope !== "session" && provider.requestLedger.some(row => !options.catalogRequests || !["models", "lm_studio_models"].includes(row.route))) throw failure("settings-audit-unrequested-network", "Settings must not start undeclared provider/Docling/MCP requests", provider.requestLedger);
         acceptedLedger = structuredClone(provider.requestLedger);
         return { acquisition: "pass", oracle: "pass", manual: "not_required" };

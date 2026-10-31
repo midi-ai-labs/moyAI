@@ -52,7 +52,7 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
     <div data-settings-passive="ai-${context}-model-prompts">${(catalog?.models ?? []).filter(model => draft.selection.allowed_model_ids.includes(model.id) && model.system_prompt).map(model => `<details class="hub-model-prompt" data-details-key="hub-${context}-prompt-${escapeHtml(model.id)}"><summary>${escapeHtml(model.label)}のシステムプロンプト</summary><pre>${escapeHtml(model.system_prompt ?? "")}</pre></details>`).join("")}</div>
     <p id="ai-${context}-feedback" class="hub-help" data-settings-passive="ai-${context}-feedback" role="status">${escapeHtml(feedback || hubErrorText(projection?.error))}</p>
     <div class="hub-connection-actions"><button data-action="hub-save-${context === "side_chat" ? "side" : context}" ${hubCanSave(state, context) ? "" : "disabled"}>${state.pending === context ? "保存しています…" : "モデル選択を保存"}</button><button data-action="hub-refresh" ${state.pending ? "disabled" : ""}>最新情報を取得</button></div>
-    ${inheritsMain ? '<p class="hub-help" data-settings-passive="ai-approve-inheritance">Approveは未設定のため、Mainのモデルを使います。Approve用のモデルを選択・保存すると、Mainと別に承認を審査します。</p>' : ""}
+    ${context === "approve" ? `<div data-settings-passive="ai-approve-inheritance-slot">${inheritsMain ? '<p class="hub-help" data-settings-passive="ai-approve-inheritance">Approveは未設定のため、Mainのモデルを使います。Approve用のモデルを選択・保存すると、Mainと別に承認を審査します。</p>' : ""}</div>` : ""}
     <p class="hub-help">Main・Sub・Approveは別々に保存します。共有仕事には、実行するPCのMainのモデル選択を使います。</p>
   </div>`;
 }

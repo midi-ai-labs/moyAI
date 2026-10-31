@@ -16,7 +16,7 @@ export const GUI_SUITES = Object.freeze({
   regression: Object.freeze([...smoke,
     "navigation.menu-entry-controls", "navigation.palette-entry-controls",
     "navigation.workspace-controls", "navigation.modal-keyboard-controls", "navigation.external-sidebar-stop",
-    "settings.initial-field-controls", "settings.session-field-controls", "settings.temporary-apply-controls",
+    "settings.field-controls", "settings.initial-field-controls", "settings.session-field-controls", "settings.temporary-apply-controls",
     "side-chat.session", "provider.chat-tool-continuation", "provider.responses-progress",
   ]),
 });

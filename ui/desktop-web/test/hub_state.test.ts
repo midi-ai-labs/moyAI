@@ -29,6 +29,17 @@ function projection(overrides: Partial<HubProjection> = {}): HubProjection {
   };
 }
 
+test("missing role defaults explain the Hub setup instead of rejecting an untouched empty choice", () => {
+  const state = createHubUiState();
+  acceptHubProjection(state, projection());
+  for (const role of ["main", "side_chat", "approve"] as const) {
+    assert.equal(hubCanSave(state, role), false);
+    assert.match(hubSaveFeedback(state, role), /標準モデル.*ありません/);
+    assert.doesNotMatch(hubSaveFeedback(state, role), /利用候補のモデルを1つ以上/);
+  }
+  assert.match(renderManagedAiConnection(state, "approve"), /Mainのモデルを使います/);
+});
+
 test("join/default confirmation retires the resolved Hub form error without changing the model dropdown", () => {
   for (const context of ["connection", "main", "side_chat"] as const) {
     const local = createHubUiState();
@@ -383,6 +394,100 @@ test("stale draft guidance distinguishes settings changes from catalog and conne
   assert.doesNotMatch(hubSaveFeedback(state, "main"), /モデル情報が更新/);
   acceptHubProjection(state, projection({ settings_revision: "2", connection_generation: "2" }));
   assert.match(hubSaveFeedback(state, "main"), /接続状態が変わりました/);
+});
+
+function savedRoleSelections(usesDefault = false): HubProjection {
+  const saved = projection();
+  for (const role of ["main", "side_chat", "approve"] as const) {
+    const selection = { allowed_model_ids: ["model-a"], preferred_model_id: "model-a",
+      required_capabilities: [], wait_policy: "wait_for_preferred" as const, affinity_turns: 1 };
+    saved[`${role}_review`] = { hub_id: "hub-a", reviewed_revision: "7", selection };
+    saved[`${role}_confirmation`] = "confirmed";
+    saved[`${role}_uses_default`] = usesDefault;
+    saved[`recommended_${role}_selection`] = structuredClone(selection);
+  }
+  return saved;
+}
+
+function advanceHubOwner(saved: HubProjection, owner: "connection" | "catalog" | "settings"): HubProjection {
+  const newer = structuredClone(saved);
+  if (owner === "connection") newer.connection_generation = "2";
+  if (owner === "catalog") newer.catalog!.revision = "8";
+  if (owner === "settings") newer.settings_revision = "2";
+  return newer;
+}
+
+test("Approve inheritance owns a stable region through unset, edited and saved states", () => {
+  const local = createHubUiState();
+  acceptHubProjection(local, projection());
+  const unset = renderManagedAiConnection(local, "approve");
+  assert.match(unset, /data-settings-passive="ai-approve-inheritance-slot"/);
+  assert.match(unset, /Approveは未設定/);
+  editHubField(local, "approve:choice", "model-a", false);
+  assert.doesNotMatch(renderManagedAiConnection(local, "approve"), /Approveは未設定/);
+  acceptHubProjection(local, savedRoleSelections(), { refreshTargets: true });
+  const saved = renderManagedAiConnection(local, "approve");
+  assert.match(saved, /data-settings-passive="ai-approve-inheritance-slot"/);
+  assert.doesNotMatch(saved, /Approveは未設定/);
+});
+
+test("reverting a role choice allows its next edit after passive owner updates", () => {
+  for (const role of ["main", "side_chat", "approve"] as const) {
+    for (const usesDefault of [false, true]) {
+      for (const owner of ["connection", "catalog", "settings"] as const) {
+        const state = createHubUiState(), saved = savedRoleSelections(usesDefault);
+        acceptHubProjection(state, saved);
+        editHubField(state, `${role}:choice`, "model-b", false);
+        assert.equal(hubCanSave(state, role), true);
+        editHubField(state, `${role}:choice`, usesDefault ? ":hub-default" : "model-a", false);
+        assert.equal(hubDraftHasChanges(state, role), false);
+        assert.equal(hubCanSave(state, role), false);
+        const newer = advanceHubOwner(saved, owner);
+        acceptHubProjection(state, newer);
+        editHubField(state, `${role}:choice`, "model-b", false);
+        assert.equal(hubCanSave(state, role), true, `${role}/${usesDefault}/${owner}`);
+        assert.equal(hubDraftTargetIsCurrent(state, role), true);
+        assert.deepEqual(state.projection![`${role}_review`], saved[`${role}_review`]);
+      }
+    }
+  }
+});
+
+test("unreverted choices and explicit/default source changes keep their original conflict target", () => {
+  for (const role of ["main", "side_chat", "approve"] as const) {
+    for (const choice of ["model-b", "model-a"]) {
+      for (const owner of ["connection", "catalog", "settings"] as const) {
+        const state = createHubUiState(), saved = savedRoleSelections(true);
+        acceptHubProjection(state, saved);
+        editHubField(state, `${role}:choice`, choice, false);
+        assert.equal(hubDraftHasChanges(state, role), true, "an explicit choice differs even when its model matches the default");
+        const target = structuredClone(state.drafts[role].target);
+        acceptHubProjection(state, advanceHubOwner(saved, owner));
+        assert.equal(hubCanSave(state, role), false);
+        assert.deepEqual(state.drafts[role].target, target);
+        assert.equal(hubModelChoice(state, role), choice);
+      }
+    }
+  }
+});
+
+test("reverting one field does not discard another invalid field or its conflict target", () => {
+  for (const role of ["main", "side_chat", "approve"] as const) {
+    const state = createHubUiState(), saved = savedRoleSelections();
+    acceptHubProjection(state, saved);
+    editHubField(state, `${role}:affinity`, "invalid", false);
+    editHubField(state, `${role}:capabilities`, "tools", false);
+    editHubField(state, `${role}:capabilities`, "", false);
+    const target = structuredClone(state.drafts[role].target);
+    acceptHubProjection(state, advanceHubOwner(saved, "connection"));
+    assert.equal(state.drafts[role].affinityText, "invalid");
+    assert.deepEqual(state.drafts[role].target, target);
+    assert.equal(hubDraftHasChanges(state, role), true);
+    assert.equal(hubCanSave(state, role), false);
+    editHubField(state, `${role}:affinity`, "1", false);
+    editHubField(state, `${role}:choice`, "model-b", false);
+    assert.equal(hubCanSave(state, role), true);
+  }
 });
 
 test("authentication feedback keeps the managed connection readonly without credential inputs", () => {

@@ -150,6 +150,7 @@ export function validateConfigInput(
   if (
     field.key === "model.base_url"
     || field.key === "side_chat.base_url"
+    || field.key === "approve.base_url"
     || field.key === "docling.base_url"
   ) {
     const validation = validateProviderBaseUrl(value);

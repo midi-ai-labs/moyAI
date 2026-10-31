@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.en.md">English</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.6">ダウンロード v3.0.6</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.7">ダウンロード v3.0.7</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">ライセンス</a>
@@ -22,7 +22,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.6はWindows x64向けの修正版です。** OneDrive配布物のローカル導入・起動、Runner起動エラーの診断、DesktopとHubのSetup分離に対応しました。一部ファイルが欠けた環境のアンインストールと、初期化失敗時の本体保持も改善しました。Hub同梱版はmoyAI Hub 1.0.4を含みます。WebView2とx64 VC++ runtimeが導入済みのPC向けです。確認範囲と制限は[3.0.6リリースノート](docs/release/v3.0.6.md)を参照してください。
+**Desktop 3.0.7はWindows x64向けの設定修正版です。** 初回Hub接続時のMain・Sub・Approveの標準モデル設定、再接続後のモデル保存、Approveや追加ヘッダーの保存を修正しました。GUI監査一覧も更新しています。Hub同梱版はmoyAI Hub 1.0.4を含みます。WebView2とx64 VC++ runtimeが導入済みのPC向けです。確認範囲と制限は[3.0.7リリースノート](docs/release/v3.0.7.md)を参照してください。
 
 ## DesktopとHub
 
@@ -49,7 +49,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-3.0.6のWindows配布物では、次の順に進みます。
+3.0.7のWindows配布物では、次の順に進みます。
 
 1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。実行ファイルをProgram Filesへ配置する際は、別画面で管理者承認します。Setupが **moyAI** を通常権限で起動し、初期画面の表示を確認します。開いた画面から利用準備を進め、次回からはスタートメニューで開きます。起動に失敗した場合や60秒以内に表示を確認できなかった場合は、結果と診断ログの保存先を表示し、起動中のアプリは強制終了しません。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
@@ -77,7 +77,7 @@ Windowsの共通設定は `%LOCALAPPDATA%\midi-ai-labs\moyai-data\desktop\config
 
 **設定 → AIの接続** でMain（メイン）、Sub（サイドチャット）、Approve（承認）の接続を設定します。Hub設定がない場合は、接続方式・URL・モデルを入力します。LM Studio Responses、oMLXなどのOpenAI互換Chat Completionsに対応し、モデル一覧の取得とモデルIDの直接入力ができます。API認証が必要な場合は、秘密情報そのものではなく、それを保持する環境変数名を指定します。
 
-Hub設定がある場合は同じ欄にHubの接続情報を表示し、Main・Sub・Approveそれぞれで標準モデルまたは登録済みモデルを選びます。Hub管理者は用途ごとの標準モデルを保存できます。共有Runnerは仕事を始めるときに、実行PCのMainとApproveの選択を読み取って使います。Hub停止中に手入力の接続先へ自動で切り替わりません。
+Hub設定がある場合は同じ欄にHubの接続情報を表示し、Main・Sub・Approveそれぞれで標準モデルまたは登録済みモデルを選びます。初回接続時は、未設定の用途に利用可能な「Hubの標準モデル」を設定します。既存の個別選択は再接続しても保持します。Hub管理者は用途ごとの標準モデルを保存できます。共有Runnerは仕事を始めるときに、実行PCのMainとApproveの選択を読み取って使います。Hub停止中に手入力の接続先へ自動で切り替わりません。
 
 **接続設定をリセット** はHubが応答しなくても使えます。手入力のAI設定・ローカル会話・成果を保持して、別Hubへ登録し直せます。
 
@@ -104,7 +104,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-3.0.6配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.7配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUACは不要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 

@@ -100,14 +100,16 @@ test("all public unconfigured Approve values derive from their planned Main valu
   assert.throws(() => manualSuiteConfigPlan({ ...before, config_fields: rows.filter(row => row.key !== "model.max_retries") }, []), /no public field/);
 });
 
-test("configured Approve remains independent and unmapped changes still fail", () => {
+test("configured Approve remains independent and its qualified controls can change", () => {
   const before = { ...projection([field("model.request_timeout_ms", "30000"), field("approve.request_timeout_ms", "60000")]), approve_model_configured: true };
   const plan = manualSuiteConfigPlan(before, [{ key: "model.request_timeout_ms", value: "31000" }, { key: "approve.request_timeout_ms", value: "60000" }]);
   const saved = { ...before, config_fields: [field("model.request_timeout_ms", "31000"), before.config_fields[1]] };
   assert.deepEqual(manualSuiteConfigFailures(saved, plan), []);
   assert.deepEqual(manualSuiteConfigFailures({ ...saved, approve_model_configured: false }, plan), ["approve_model_configured"]);
   assert.deepEqual(manualSuiteConfigFailures({ ...saved, config_fields: [saved.config_fields[0], field("approve.request_timeout_ms", "31000")] }, plan), ["approve.request_timeout_ms"]);
-  assert.throws(() => manualSuiteConfigPlan(before, [{ key: "approve.request_timeout_ms", value: "61000" }]), /qualified Settings control/);
+  const approveEdit = manualSuiteConfigPlan(before, [{ key: "approve.request_timeout_ms", value: "61000" }]);
+  assert.deepEqual(approveEdit.changes, [{ key: "approve.request_timeout_ms", value: "61000" }]);
+  assert.deepEqual(manualSuiteConfigFailures({ ...before, config_fields: [before.config_fields[0], field("approve.request_timeout_ms", "61000")] }, approveEdit), []);
 });
 
 test("a no-op cannot accept incorrect inherited Approve values without GUI dispatch", async () => {

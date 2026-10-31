@@ -71,8 +71,8 @@ test("scenario factories share lifecycle contract and separate GUI surfaces", ()
     assert.equal(scenario.id, id);
     for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) assert.equal(typeof scenario[method], "function");
   }
-  assert.equal(new Set(SETTINGS_CONTROL_PLAN.map(row => row.key)).size, 43);
-  assert.equal(SETTINGS_CONTROL_PLAN.filter(row => row.kind === "enum").reduce((sum, row) => sum + row.options.length, 0), 13);
+  assert.equal(new Set(SETTINGS_CONTROL_PLAN.map(row => row.key)).size, 53);
+  assert.equal(SETTINGS_CONTROL_PLAN.filter(row => row.kind === "enum").reduce((sum, row) => sum + row.options.length, 0), 17);
   assert.equal(SETTINGS_CONTROL_PLAN.filter(row => row.kind === "boolean").length, 8);
   assert.equal(SESSION_CONTROL_PLAN.length, 6);
 });

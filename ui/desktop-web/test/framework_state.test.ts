@@ -3086,6 +3086,14 @@ test("frontend provider URL validation mirrors the Rust ProviderEndpoint boundar
     assert.equal(view.provider_apply_enabled, false, invalid);
     assert.equal(paletteActions(view).some((action) => action.id === "load-provider-models"), false, invalid);
   }
+  for (const key of ["model.base_url", "side_chat.base_url", "approve.base_url"]) {
+    const field = { key, value: "", env_override: null, value_type: "string" as const,
+      required: true, min_value: null, max_value: null, options: [] };
+    assert.equal(validateConfigInput(field, "https://example.test/v1").ok, true, key);
+    for (const invalid of ["https://example.test/v1?key=secret", "https://example.test/#fragment", "https://user:secret@example.test/v1"]) {
+      assert.equal(validateConfigInput(field, invalid).ok, false, `${key}: ${invalid}`);
+    }
+  }
   const systemPromptField = {
     key: "model.system_prompt",
     value: "",

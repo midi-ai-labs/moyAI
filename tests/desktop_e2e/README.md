@@ -62,7 +62,7 @@ API keyが必要な既存接続では、`upstreamCredentialFile` に同endpoint�
 
 認証が必要なlive接続では、config直下の `upstreamApiKeyEnv` に試験専用の子process環境変数名だけを指定する。キー本文はcommand line・config・証拠へ書かない。scenarioはHub・browser・Desktopの起動前に値を非公開のメモリへ取り出してその環境変数を除去し、公開Hub画面のAPI key欄から通常のモデル取得・登録を行う。入力操作の失敗にキー本文や元の例外を含めない。
 
-同じlive接続先でSub／Approveに別モデルを使う場合は、config直下の `sideModel`／`approveModel` にprovider model IDを指定する。同じIDは一度だけ登録し、Mainはtools有効、Mainと異なる補助モデルはtools無効で登録する。Main／Sideの標準モデルは公開Hub画面で明示保存し、Bの採用をHubの論理model IDと照合する。Side省略時はMainと同じモデルを使い、Approve標準は指定した場合だけ設定する。Approveは自動採用されないため、指定時はBのAI接続画面でも明示保存する。固定応答でもMain／Sideの標準用途を保存する。CSV試験で実行するLLM作業はMainであり、Sub／Approveの設定採用と推論品質を区別する。
+同じlive接続先でSub／Approveに別モデルを使う場合は、config直下の `sideModel`／`approveModel` にprovider model IDを指定する。同じIDは一度だけ登録し、Mainはtools有効、Mainと異なる補助モデルはtools無効で登録する。Main／Sideの標準モデルは公開Hub画面で明示保存し、Bの採用をHubの論理model IDと照合する。Side省略時はMainと同じモデルを使い、Approve標準は指定した場合だけ設定する。初回接続では未設定の各用途に利用可能な標準モデルを採用する。Approve指定時は、個別選択への変更も確認するためBのAI接続画面で明示保存する。固定応答でもMain／Sideの標準用途を保存する。CSV試験で実行するLLM作業はMainであり、Sub／Approveの設定採用と推論品質を区別する。
 
 承認ボタンが移動前の画面外にある場合は、画面内の承認通知リンクを実際に操作し、同じ承認IDのボタンへ到達できることを確認する。移動前の観測は保持し、リンク操作前後の画像と位置・hit判定を保存する。通知が存在するだけでは合格にせず、リンクや移動先が遮られている場合も失敗とする。
 
@@ -160,6 +160,10 @@ Windowsの初期adapterは、製品binaryをtest pluginで変更しない外部b
 
 - self-test（unit / Windows helper）: `npm run test:desktop-e2e-harness`。Windowsでは実machine admission mutexの排他・解放確認を含むため、actual GUI executionのcleanup完了後に直列実行する。GUI操作を含まないことを、GUI試験と同時実行可能という意味にしない。
 - actual shell baseline: `npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root>`
+
+GUIの操作一覧は [MANUAL_GUI_COVERAGE.md](MANUAL_GUI_COVERAGE.md) で管理する。公開actionと一覧の対応、廃止済みaction、case重複、シナリオ参照切れは `self_tests/gui_coverage.test.mjs` が検査する。入力欄、メニュー、OS dialog、IMEなどaction一覧だけでは数えられない操作は同文書の横断表で確認する。一覧と自己テストは計画の整合性を示し、実GUI実行の合格とは分ける。
+
+`settings.field-controls` と `settings.initial-field-controls` は、実Desktopが返した53項目のkey・型・選択肢を計画と照合してから、直接編集、入力の負例、保存、再表示、アプリ再起動後の復元を確認する。共通設定ではenum/booleanの全候補の保存と、compaction budgetを空欄へ戻す保存も行う。初回設定の全候補選択は最終値の保存とは区別する。`settings.session-field-controls` は個別6項目と同じroot sessionの再起動復元を扱う。秘密JSONの公開投影は非表示・configuredの確認であり、内容の完全一致とは扱わない。各runの実行結果・目視判定・未実施状態を別途記録する。
 - About の version / codename: 上記commandへ `--scenario shell.about` を追加する。trusted Help → About → OK、Rust projection と可視 metadata、dialog focus、閉じた後の shell を確認する。version は current `package.json` と照合し、LYNX codename を確認する。
 - LYNX の画面と入力操作: 上記commandへ `--scenario shell.lynx` を追加する。待機中・実行中の会話領域と入力欄の実測配置、長い日本語入力、Refresh 後の同一入力ノード・フォーカス・選択位置、Settings の draft と dirty close guard、右ドロワー開閉を確認する。実送信は一件の scripted provider 要求を保持し、画面と Rust の実行対象および送信済み入力のクリアが連続して一致してから、未送信の長文を入力する。実行中 polling による内容・フォーカス・選択位置・ノードの保持と、trusted Stop 後の待機・再要求ゼロを判定する。キー送信前はクリック後の画面更新を待ち、同じ対象にフォーカスが連続してあることを取得するが、失敗した入力は再実行しない。1100×720 は CDP の WebView viewport emulation であり native resize ではない。native IME、多数一覧、添付操作はこの scenario の対象外である。
 - Hub 接続と確認設定: `hub.browser-enrollment` で実Hubへの参加承認と統一AI欄のMain/Sub/Approve別モデル確認、保存と再起動後の復元を行う。Approveにはtools機能のないモデルを使う。`onboarding.win-a-to-win-b` はHubだけでAIを登録し、実行PCにAIのURL・モデルを手入力せずに共有仕事と成果返却まで確認する。
@@ -319,7 +323,7 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 共通native path helperは既存fileを選ぶ `open`、execution配下の既存folderを選ぶ `directory`、execution配下の既存parentへ新fileを保存する `save_new` の意図を明示する。対象HWND・controlの照合とfile名のreadbackを経て確認buttonを一度だけ押し、別意図のdelivery evidenceや上書き確認への暗黙fallbackを受理しない。
 
-`hub.browser-enrollment` は実Hubを公開CLIからisolated data directoryで起動し、headed Edge/Chromeのモデル登録・ネットワーク開始・共通設定download・端末承認と、実Desktopのnative pickerによるimport・Main/Sub/Approve別モデル選択/保存を通す。Approve用の登録モデルはtools機能を持たない。実Desktopを終了・再起動し、3種類の保存済みreviewと画面のモデル選択が復元されることを確認する。管理側のmutationはブラウザーGUI、Desktop側は実Tauri上のtrusted WebView inputと、下記の検証済みnative picker control入力を使う。起動・port・終了はHub側の単一 `tests/browser/hub_server.mjs` を再利用する。既定は隣の `moyAI-Hub` checkoutとEdgeで、必要な場合だけscenario configにabsolute `hubRepository` / `hubBinary`、`browserChannel`（`msedge`/`chrome`/`chromium`）、`headed`を指定する。通常のDesktopシナリオはHub checkoutやPlaywrightをロードしない。
+`hub.browser-enrollment` は実Hubを公開CLIからisolated data directoryで起動し、headed Edge/Chromeのモデル登録・ネットワーク開始・共通設定download・端末承認と、実Desktopのnative pickerによるimport・Main/Sub/Approve別モデル選択/保存を通す。Approve用の登録モデルはtools機能を持たない。3用途でモデルを変更して保存値へ戻した後、Hub管理画面から通信を停止・再開する。Desktopの明示更新なしに再接続を待ち、再変更した選択を保存できることを確認する。実Desktopを終了・再起動し、3種類の保存済みreviewと画面のモデル選択が復元されることを確認する。管理側のmutationはブラウザーGUI、Desktop側は実Tauri上のtrusted WebView inputと、下記の検証済みnative picker control入力を使う。起動・port・終了はHub側の単一 `tests/browser/hub_server.mjs` を再利用する。既定は隣の `moyAI-Hub` checkoutとEdgeで、必要な場合だけscenario configにabsolute `hubRepository` / `hubBinary`、`browserChannel`（`msedge`/`chrome`/`chromium`）、`headed`を指定する。通常のDesktopシナリオはHub checkoutやPlaywrightをロードしない。
 
 `output.history-navigation` は小さなscripted providerでtool実行中を保持し、「会話履歴の詳細へ」をpointerで操作する。既存detailsが開き、canonical destinationへfocus/scrollが移ることを確認し、未送信日本語draft・選択範囲・同じeditorを保持したまま周期更新を配送する。完了後は実行中専用の出力ボタンが消え、会話内の同じcanonical履歴の開示をTab/Enterで操作できることを確認する。Main送信1回、停止0回、Side送信0回と固定応答を照合する。typed Rust draftと編集中のTypeScript draftは別に比較する。画面の目視は `manual_pending` としてexecutionに紐付くreviewへ残す。
 
