@@ -7,6 +7,7 @@ import { createShellLynxScenario } from "./scenarios/shell_lynx.mjs";
 import { createShellManagedLifecycleScenario } from "./scenarios/shell_managed_lifecycle.mjs";
 import { createHubOfflineResetScenario } from "./scenarios/hub_offline_reset.mjs";
 import { createHubBrowserEnrollmentScenario } from "./scenarios/hub_browser_enrollment.mjs";
+import { createHubModelPropagationScenario } from "./scenarios/hub_model_propagation.mjs";
 import { createHubJoinRetryControlsScenario } from "./scenarios/hub_join_retry_controls.mjs";
 import { createOutputHistoryNavigationScenario } from "./scenarios/output_history_navigation.mjs";
 import { createReviewControlsScenario } from "./scenarios/review_controls.mjs";
@@ -82,6 +83,7 @@ const factories = new Map([
   ["shell.lynx", createShellLynxScenario],
   ["shell.managed-lifecycle", createShellManagedLifecycleScenario],
   ["hub.browser-enrollment", createHubBrowserEnrollmentScenario],
+  ["hub.model-propagation", createHubModelPropagationScenario],
   ["hub.offline-reset", createHubOfflineResetScenario],
   ["settings.shared-work", createSharedWorkEntryScenario],
   ["settings.shared-work-isolation", createSharedWorkIsolationScenario],
@@ -182,6 +184,7 @@ const configurableScenarios = new Set([
   "navigation.external-sidebar-stop",
   "navigation.external-palette-rejoin",
   "hub.browser-enrollment",
+  "hub.model-propagation",
   "hub.offline-reset",
   "hub.join-retry-controls",
   "manual.case1",

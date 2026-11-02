@@ -111,11 +111,48 @@ fn retire_reset_resources_at(
     data: &Utf8Path,
     sid: &str,
 ) -> Result<RetirementGuard, RunnerError> {
-    if !reset_publication_pending_at(directory, config)? {
+    let registry = Registry::open_at(directory, false)?;
+    let retired =
+        crate::device_network::reset::ResetState::load(&config.with_file_name("device-network"))
+            .map_err(error)?;
+    if !registry
+        .entries
+        .iter()
+        .any(|entry| entry.config_path == config)
+    {
         return Ok(RetirementGuard::empty());
     }
+    let current = current_enrollment(config)?;
+    if !registry
+        .entries
+        .iter()
+        .any(|entry| entry.config_path == config && retired_or_replaced(entry, &retired, &current))
+    {
+        return Ok(RetirementGuard::empty());
+    }
+    drop(registry);
     validate_profile_data(data)?;
     retire_at(directory, config, data, sid, None)
+}
+
+fn current_enrollment(
+    config: &Utf8Path,
+) -> Result<crate::device_network::DeviceSettings, RunnerError> {
+    crate::device_network::DeviceSettingsStore::new(
+        config.with_file_name("device-network").join("device.json"),
+    )
+    .load()
+    .map_err(error)
+}
+
+fn retired_or_replaced(
+    entry: &PublishedRoot,
+    retired: &crate::device_network::reset::ResetState,
+    current: &crate::device_network::DeviceSettings,
+) -> bool {
+    retired.retired(&entry.hub_id, &entry.device_id)
+        || matches!((&current.hub_id, &current.device_id), (Some(hub), Some(device))
+            if hub != &entry.hub_id || device != &entry.device_id)
 }
 
 fn validate_profile_data(data: &Utf8Path) -> Result<(), RunnerError> {
@@ -182,12 +219,19 @@ fn retire_at(
     let reset_directory = config.with_file_name("device-network");
     let mut reset =
         crate::device_network::reset::ResetState::load(&reset_directory).map_err(error)?;
+    // Re-enrollment may replace the credential owner without an older build
+    // retiring its publication. Cached startup already rejects that old identity.
+    // Re-read under exclusion; process/journal proof below is still mandatory.
+    let current = if cleanup {
+        crate::device_network::DeviceSettings::default()
+    } else {
+        current_enrollment(config)?
+    };
     let selected = registry
         .entries
         .iter()
         .filter(|entry| {
-            entry.config_path == config
-                && (cleanup || reset.retired(&entry.hub_id, &entry.device_id))
+            entry.config_path == config && (cleanup || retired_or_replaced(entry, &reset, &current))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -205,20 +249,9 @@ fn retire_at(
     }
     #[cfg(windows)]
     {
-        // IPC scopes hash the raw path spelling after lowercasing, whereas
-        // Windows path equality also accepts alternate separators. Keep both
-        // the published host and fresh current-profile startup excluded.
-        let scopes = std::iter::once(config.as_str())
-            .chain(selected.iter().map(|entry| entry.config_path.as_str()))
-            .map(str::to_lowercase)
-            .collect::<std::collections::BTreeSet<_>>();
-        for scope in scopes {
-            guard
-                ._runner_startup
-                .push(crate::runner::windows::LocalListener::reserve_for_config(
-                    Utf8Path::new(&scope),
-                )?);
-        }
+        guard._runner_startup = crate::runner::windows::LocalListener::reserve_for_configs(
+            std::iter::once(config).chain(selected.iter().map(|entry| entry.config_path.as_path())),
+        )?;
     }
     guard._journals = crate::runner::shared::lock_journals_for_retirement(data)?;
     // Old registry rows did not store data_dir. A matching durable journal in
@@ -341,6 +374,114 @@ mod tests {
         fn recover(&self) -> Result<RetirementGuard, RunnerError> {
             retire_reset_resources_at(&self.registry, &self.config, &self.data, "owner")
         }
+
+        fn enroll(&self, hub: &str, device: &str) -> Utf8PathBuf {
+            let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+                .unwrap()
+                .cert;
+            let device = crate::device_network::DeviceSettings {
+                hub_id: Some(hub.into()),
+                device_id: Some(device.into()),
+                certificate_pem: Some(certificate.pem()),
+                certificate_sha256: Some("a".repeat(64)),
+                expires_at_ms: Some("9999999999999".into()),
+                ..Default::default()
+            };
+            let path = self
+                .config
+                .with_file_name("device-network")
+                .join("device.json");
+            crate::device_network::DeviceSettingsStore::new(path.clone())
+                .save(&device)
+                .unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn reenrollment_retires_only_settled_previous_identity_and_preserves_hub_credentials() {
+        let fixture = Fixture::new();
+        let old = fixture.entry("old-hub", "old-device");
+        fixture.seed(vec![old], false);
+        fixture.journal("old-hub", "old-device");
+        let path = fixture.enroll("new-hub", "new-device");
+        let credentials = std::fs::read(&path).unwrap();
+        let _guard = fixture.recover().unwrap();
+        assert!(
+            fixture.read().is_empty(),
+            "old publication must not keep blocking a newly enrolled local-only Desktop"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), credentials);
+        assert!(
+            fixture
+                .data
+                .join(crate::runner::shared::journal::identity_file_name(
+                    "old-hub",
+                    "old-device"
+                ))
+                .is_file()
+        );
+        assert!(
+            validate_registration_identity(
+                &fixture.config,
+                &SharedSettings {
+                    version: 1,
+                    hub_id: "old-hub".into(),
+                    device_id: "old-device".into(),
+                    environments: vec![],
+                    resource_scope: ResourceScope::Device,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reenrollment_does_not_infer_quiescence_from_missing_or_locked_evidence() {
+        let fixture = Fixture::new();
+        let old = fixture.entry("hub", "old-device");
+        fixture.seed(vec![old.clone()], false);
+        fixture.enroll("hub", "new-device");
+        assert!(fixture.recover().is_err());
+        assert_eq!(fixture.read(), vec![old.clone()]);
+        let path = fixture.journal("hub", "old-device");
+        let owner = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner).unwrap();
+        assert!(fixture.recover().is_err());
+        assert_eq!(fixture.read(), vec![old.clone()]);
+        drop(owner);
+        let mut foreign = old;
+        foreign.operator_sid = "another-user".into();
+        fixture.seed(vec![foreign.clone()], false);
+        assert!(fixture.recover().is_err());
+        assert_eq!(fixture.read(), vec![foreign]);
+    }
+
+    #[test]
+    fn reenrollment_keeps_current_and_other_profile_publications() {
+        let fixture = Fixture::new();
+        let current = fixture.entry("hub", "device");
+        let mut other = fixture.entry("other-hub", "other-device");
+        other.config_path = fixture.root.join("other/config.toml");
+        fixture.seed(vec![current.clone(), other.clone()], false);
+        let path = fixture.enroll("hub", "device");
+        fixture.recover().unwrap();
+        assert_eq!(fixture.read(), vec![current.clone(), other.clone()]);
+        std::fs::remove_file(&path).unwrap();
+        fixture.recover().unwrap();
+        assert_eq!(fixture.read(), vec![current.clone(), other.clone()]);
+        std::fs::write(path, b"invalid settings").unwrap();
+        assert!(fixture.recover().is_err());
+        assert_eq!(fixture.read(), vec![current, other.clone()]);
+        fixture.seed(vec![other.clone()], false);
+        fixture.recover().unwrap();
+        assert_eq!(fixture.read(), vec![other]);
     }
 
     #[test]
@@ -440,8 +581,10 @@ mod tests {
         assert_eq!(entry.config_path, fixture.config);
         fixture.seed(vec![entry.clone()], true);
         fixture.journal("hub", "device");
-        let old_namespace =
-            crate::runner::windows::LocalListener::reserve_for_config(&entry.config_path).unwrap();
+        let old_namespace = crate::runner::windows::LocalListener::reserve_for_configs([entry
+            .config_path
+            .as_path()])
+        .unwrap();
         assert!(fixture.recover().is_err());
         assert_eq!(fixture.read(), vec![entry]);
         drop(old_namespace);

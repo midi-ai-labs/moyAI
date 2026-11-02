@@ -162,7 +162,7 @@ async function finishModelCommandObservation(cdp, sink) {
   await sink.record("hub-model-command-observation", { rows, capacity:96 }, { phase:"executing", owner:OWNER });
 }
 
-async function chooseModel(input, cdp, name, modelId, sink) {
+export async function chooseModel(input, cdp, name, modelId, sink) {
   const section = name === "main" ? "provider" : name === "side_chat" ? "side-chat" : "approve";
   const href = `#settings-${section}`;
   await trustedClick(input, cdp, { selector: `.settings-nav a[href="${href}"]`, identity: { tag: "A", href } }, sink);

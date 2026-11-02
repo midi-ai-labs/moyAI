@@ -206,7 +206,7 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 
 ### U: Hubモデル接続・割当
 
-自動補助: `hub.browser-enrollment`、`hub.offline-reset`、`onboarding.win-a-to-win-b`。実Hub、実Desktop、Runnerの役割を確認する。live providerを指定しない実行は推論品質の証拠ではない。旧token入力やDirect/Hub切替の独立画面は通常導線から退役している。
+自動補助: `hub.browser-enrollment`、`hub.model-propagation`、`hub.offline-reset`、`onboarding.win-a-to-win-b`。Hubでの変更からDesktopへの自動取得・確認・次の要求までを[結合監査](HUB_DESKTOP_COVERAGE.md)で分ける。live providerを指定しない実行は推論品質の証拠ではない。旧token入力やDirect/Hub切替の独立画面は通常導線から退役している。
 
 | Case | action ID | 状態 | 操作手順 | 期待する画面・結果 |
 |---|---|---|---|---|
@@ -223,6 +223,7 @@ H07 の具体的な再現: `current_time` を一度完了し次の応答を保�
 | U13 | `hub-save-approve` | 未設定 / 標準 / 個別 / dirty / stale / 保存中 | Approve選択を保存し画面を開いたまま案内・再表示・再起動を確認 | Approveだけ保存。独立設定後にMain継承案内を残さず、Main/Subの個別値を保持 |
 | U14 | `hub-tab-models` | Hub接続画面 / 初回 / 保存中 | AIの接続への入口を選択 | 現行の統一設定へ到達。未保存・処理中の対象を無断で切り替えない |
 | U15 | モデル変更の取消と再接続 | 3用途それぞれ標準/個別、未保存の有無 | A→B→A、Hub通信停止・再開、B→保存。別caseでBを残して再接続 | 差分なしは後続更新を受け取り再変更を保存できる。真の未保存差分は保持して競合を説明 |
+| U16 | Hub側からのモデル変更 | Desktop接続済み、3用途の標準/個別/未保存 | Hubで標準・表示名・指示・有効状態を変更し、Desktopの更新を押さずに観察。その後に確認保存し次の指示を送る | catalog取得、画面反映、保存値、次の実要求を別に照合。個別設定・入力中の選択を保持し、確認前は送信不可。確認後の接続先と指示が一致。現行の表示名編集は配置名だけであり、Desktopの論理モデル名への反映を合格扱いしない |
 | U11 | 実行中の選択 | Main/Side/共有仕事実行中 | 設定表示と次依頼を比較 | 実行中の経路を後から変更せず、新しい保存値は次の依頼へ適用 |
 
 ### N: Hub参加、実行PC設定、旧仕事の保守

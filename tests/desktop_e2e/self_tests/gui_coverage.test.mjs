@@ -34,3 +34,12 @@ test('runbook automation references identify current scenarios', async () => {
     .flatMap(line => [...line.matchAll(/`([a-z][a-z0-9.-]+)`/g)].map(match => match[1]));
   assert.deepEqual(references.filter(id => !scenarioIds.includes(id)), []);
 });
+
+test('Hub integration audit lists the registered connection and shared-work scenarios once', async () => {
+  const doc = await readFile(new URL('../HUB_DESKTOP_COVERAGE.md', import.meta.url), 'utf8');
+  const listed = [...doc.matchAll(/^\| `([a-z][a-z0-9.-]+)` \|/gm)].map(match => match[1]);
+  const current = scenarioIds.filter(id => id.startsWith('hub.')
+    || /^settings\.(shared-work(?:-.*)?|project-folder-recovery|device-execution|initial-setup-hub(?:-.*)?)$/.test(id)
+    || ['onboarding.win-a-to-win-b', 'project.four-device-acceptance'].includes(id));
+  assert.deepEqual(listed.sort(), current.sort());
+});

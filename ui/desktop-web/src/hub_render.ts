@@ -30,7 +30,7 @@ export function renderManagedAiConnection(local: HubPresentation | undefined, co
   const status = enrollment === "pending" ? "PCの参加承認を待っています。"
     : projection?.status !== "connected" ? "Hubへの再接続を待っています。保存済みのモデル選択は保持しています。"
       : !catalog?.models.length ? "Hubにモデルが登録されていません。管理画面でモデルを追加してください。"
-        : route ? "実行中の仕事は現在のモデルで続けます。終了後に選択を変更できます。"
+        : route ? "応答中のAIは開始時のモデルを使います。Hubで設定が変わると、次のAIへの要求（承認後の続行を含む）は再確認まで停止します。終了後に選択を変更できます。"
           : "Hubが提供するモデルを選びます。接続先と接続方式はHubで管理します。";
   const feedback = state.error && (!state.errorContext || state.errorContext === context || state.errorContext === "connection")
     ? state.error : hubErrorText(projection?.error) || hubSaveFeedback(state, context);

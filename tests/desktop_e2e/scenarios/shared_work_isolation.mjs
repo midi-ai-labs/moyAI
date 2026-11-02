@@ -162,6 +162,28 @@ export function createSharedWorkIsolationScenario(options = {}) {
         const geometry = { a: await layout(a), b: await layout(b) };
         await sink.record("shared-isolation-main-layout", geometry, { phase: "executing", owner: OWNER });
         if (!sharedMainFillsShell(geometry.a) || !sharedMainFillsShell(geometry.b)) throw failure("The Hub project leaves an unused column beside the main conversation", geometry);
+        const bDraft="B keeps its own unsent request while A is edited.";
+        await trustedClick(b.input,b.driver,byId("shared-prompt","TEXTAREA"),b.sink);
+        await b.input.insertText(byId("shared-prompt","TEXTAREA"),bDraft);
+        await page.locator('nav a[href="#shared-administration"]').click();
+        await page.locator('[data-sa-tab="projects"]').click();
+        await page.locator(`[data-sa-operation="save_project"][data-sa-id=${JSON.stringify(expectedA.project_id)}]`).click();
+        expectedA.project_label="変更後の A プロジェクト";
+        await page.locator("#shared-admin-label").fill(expectedA.project_label);
+        await page.locator("#shared-admin-overview").fill("Hubで更新したA専用の概要。");
+        await save();
+        await wait("Project rename automatically reaches A without changing B",async()=>({a:await observe(a),b:await observe(b)}),
+          value=>personalProjectAccepted(value.a,expectedA) && personalProjectAccepted(value.b,expectedB));
+        await page.getByText("既存の利用者・権限（詳細）",{exact:true}).click();
+        await page.locator('[data-sa-tab="users"]').click();
+        await page.locator(`[data-sa-operation="update_user"][data-sa-id=${JSON.stringify(expectedA.user_id)}]`).click();
+        expectedA.display_name="変更後の A 利用者";
+        await page.locator("#shared-admin-display_name").fill(expectedA.display_name); await save();
+        await wait("User rename reaches the live Desktop principal, preserving B",async()=>({a:await observe(a),b:await observe(b)}),
+          value=>personalProjectAccepted(value.a,expectedA) && personalProjectAccepted(value.b,expectedB));
+        if(await b.driver.evaluate('document.querySelector("#shared-prompt")?.value')!==bDraft) throw failure("Unrelated Hub edits discarded B's input");
+        await captureScenarioScreenshot({cdp:a.driver,sink:a.sink,name:"shared-isolation-live-project-rename",owner:OWNER});
+        await sink.record("shared-isolation-live-edits",{project:expectedA.project_label,user:expectedA.display_name,b_draft_preserved:true},{phase:"executing",owner:OWNER});
         await page.locator('nav a[href="#shared-administration"]').click();
         await page.locator('[data-sa-tab="projects"]').click();
         await page.locator(`[data-sa-operation="save_project"][data-sa-id=${JSON.stringify(expectedA.project_id)}]`).click();

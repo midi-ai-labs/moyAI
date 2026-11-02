@@ -4,6 +4,14 @@
 
 全GUI監査の操作・状態別手順は [MANUAL_GUI_COVERAGE.md](MANUAL_GUI_COVERAGE.md) を参照する。scenarioの実行成功、手動の直接操作、画像の目視は別々に記録し、未確認状態を残す。
 
+Hub側の操作がDesktop/Runnerへ反映する境界は [HUB_DESKTOP_COVERAGE.md](HUB_DESKTOP_COVERAGE.md) で管理する。通常の `smoke` / `regression` はHub結合セットを含まない。Hub browserのprotocol fixture、実Desktop、独立Runner、物理別PCを区別し、必要な結合scenarioを明示して実行する。
+
+`hub.model-propagation` はHubの表示名・標準・指示・無効化・削除を実画面から変更し、接続済みDesktopの自動取得、3用途の選択肢、入力中draft、保存済み個別選択を確認する。Main/Sub/Approveの実Gateway要求を一時的に応答待ちにし、変更前の経路で完了すること、再確認後の要求に新しい経路と指示を使うことを照合する。Approveは実Guardian判定と試験フォルダー内への限定した書込を通す。設定変更後の未確認のMain続行は拒否し、結果と再確認の案内を残す。生成内容は固定応答で、実LLMの推論品質は対象外。
+
+隔離Desktopでの同シナリオは、Hub認証と最初のローカル生成の前後でRunnerが未起動であることも確認する。Desktopの隣に現行の`moyai-runner.exe`を置く。scenario configに`"previousPublication": true`を指定すると、隔離した資源台帳へ旧Hub・端末IDの登録と空の旧実行記録だけを用意する。実画面で新Hubに認証した後、Main生成が成功し、旧登録だけが整理され、現在の認証と旧実行記録が保持されることを確認する。実ユーザーのProgramDataや共有実行許可は変更しない。
+
+同scenarioに `liveProvider: { provider_base_url, model }` を指定すると、固定応答による変更試験の後に、その実モデルを隔離HubへGUIで登録して3用途の短い生成を追加する。認証が必要な場合は、指定先とprofileが一致するHubのcredential JSONへの絶対pathを `upstreamCredentialFile` に渡す。キーを設定JSONやcommand lineへ転記しない。Main/Subの実Assistant回答、Approveの独立したGuardian要求と試験フォルダー内のファイル1個への効果を照合し、準備済み要求本文だけを送信成功とは数えない。要求captureは試験root内に保存される。この短い確認はモデル品質・長時間運転の評価ではない。
+
 通常開発では `npm run verify:gui -- --suite smoke` を単体試験と手動確認の間の自動GUI段階として使う。広い回帰、CI、判定と証跡の読み方は [GUI_AUTOMATION.md](GUI_AUTOMATION.md) を参照する。
 
 ## 背景

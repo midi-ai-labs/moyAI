@@ -193,6 +193,10 @@ fn pipe_name(identity: &Identity) -> String {
     pipe_name_in(identity, &config_scope)
 }
 fn pipe_name_in(identity: &Identity, config_scope: &str) -> String {
+    legacy_pipe_name_in(identity, &config_scope.replace('/', "\\"))
+}
+
+fn legacy_pipe_name_in(identity: &Identity, config_scope: &str) -> String {
     let value = format!(
         "{}:{}:{}:{}:{}",
         identity.user,
@@ -205,6 +209,54 @@ fn pipe_name_in(identity: &Identity, config_scope: &str) -> String {
         r"\\.\pipe\moyai-runner-{:x}",
         Sha256::digest(value.as_bytes())
     )
+}
+
+// Earlier hosts hashed the spelling of the path. Keep their exact endpoints
+// reachable during an upgrade, but use one separator form for every new host.
+fn config_pipe_names(identity: &Identity, config: &camino::Utf8Path) -> Vec<String> {
+    let mut names = vec![pipe_name_in(identity, config.as_str())];
+    let mut legacy = vec![legacy_pipe_name_in(identity, config.as_str())];
+    if let Ok(current) = crate::config::loader::global_config_path()
+        && current == config
+    {
+        legacy.push(legacy_pipe_name_in(identity, current.as_str()));
+    }
+    for name in legacy {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn pipe_present(name: &str) -> Result<bool, RunnerError> {
+    let name = wide(name);
+    if unsafe { WaitNamedPipeW(name.as_ptr(), 0) } != 0 {
+        return Ok(true);
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY => Ok(true),
+        _ => Err(last_error()),
+    }
+}
+
+fn existing_pipe_name(
+    identity: &Identity,
+    config: &camino::Utf8Path,
+) -> Result<Option<String>, RunnerError> {
+    let mut present = None;
+    for name in config_pipe_names(identity, config) {
+        if pipe_present(&name)? {
+            if present.is_some() {
+                return Err(RunnerError::new(
+                    "同じ設定の実行機能が複数起動しています。DesktopとRunnerを終了してから開き直してください。",
+                ));
+            }
+            present = Some(name);
+        }
+    }
+    Ok(present)
 }
 
 pub fn endpoint_name() -> Result<String, RunnerError> {
@@ -220,15 +272,7 @@ pub(crate) fn endpoint_present() -> Result<bool, RunnerError> {
 }
 
 fn endpoint_present_for_config(config: &camino::Utf8Path) -> Result<bool, RunnerError> {
-    let name = wide(&pipe_name_in(&current_identity()?, config.as_str()));
-    if unsafe { WaitNamedPipeW(name.as_ptr(), 0) } != 0 {
-        return Ok(true);
-    }
-    match unsafe { GetLastError() } {
-        ERROR_FILE_NOT_FOUND => Ok(false),
-        ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY => Ok(true),
-        _ => Err(last_error()),
-    }
+    Ok(existing_pipe_name(&current_identity()?, config)?.is_some())
 }
 
 /// Bind before opening the store: FIRST_PIPE_INSTANCE prevents competing Runner startup recovery.
@@ -239,21 +283,43 @@ pub struct LocalListener {
 
 impl LocalListener {
     pub fn bind() -> Result<Self, RunnerError> {
-        Self::bind_in(None)
+        let config = crate::config::loader::global_config_path()
+            .map_err(|error| RunnerError::new(error.to_string()))?;
+        Self::bind_for_config(&config)
     }
 
-    /// Reserve the existing startup namespace while its profile is retired.
-    /// FIRST_PIPE_INSTANCE rejects a live host and prevents competing startup.
-    pub(crate) fn reserve_for_config(config: &camino::Utf8Path) -> Result<Self, RunnerError> {
-        Self::bind_in(Some(config))
-    }
-
-    fn bind_in(config: Option<&camino::Utf8Path>) -> Result<Self, RunnerError> {
+    fn bind_for_config(config: &camino::Utf8Path) -> Result<Self, RunnerError> {
         let identity = current_identity()?;
-        let name = wide(&match config {
-            Some(config) => pipe_name_in(&identity, config.as_str()),
-            None => pipe_name(&identity),
-        });
+        let names = config_pipe_names(&identity, config);
+        let listener = Self::bind_name(identity, &names[0])?;
+        for legacy in &names[1..] {
+            if pipe_present(legacy)? {
+                return Err(RunnerError::new(
+                    "旧版の実行機能が起動しています。DesktopとRunnerを終了してから開き直してください。",
+                ));
+            }
+        }
+        Ok(listener)
+    }
+
+    /// Reserve canonical and published legacy namespaces once per name. Holding
+    /// these handles fences old and new startup while data is retired or moved.
+    pub(crate) fn reserve_for_configs<'a>(
+        configs: impl IntoIterator<Item = &'a camino::Utf8Path>,
+    ) -> Result<Vec<Self>, RunnerError> {
+        let identity = current_identity()?;
+        let names = configs
+            .into_iter()
+            .flat_map(|config| config_pipe_names(&identity, config))
+            .collect::<std::collections::BTreeSet<_>>();
+        names
+            .into_iter()
+            .map(|name| Self::bind_name(identity.clone(), &name))
+            .collect()
+    }
+
+    fn bind_name(identity: Identity, name: &str) -> Result<Self, RunnerError> {
+        let name = wide(name);
         // Explicit protected DACL: only this user. Token comparison below additionally rejects
         // another logon session, reduced group/privilege rights, and mismatched integrity.
         let descriptor = wide(&format!("D:P(A;;GA;;;{})", identity.user));
@@ -514,7 +580,10 @@ fn connect_for_config_until(
     connect_deadline: Instant,
 ) -> Result<RunnerConnection, RunnerError> {
     let identity = current_identity()?;
-    let name = wide(&pipe_name_in(&identity, config.as_str()));
+    let name = existing_pipe_name(&identity, config)?.ok_or_else(|| {
+        RunnerError::new("Local Runner is unavailable; start moyai-runner serve first")
+    })?;
+    let name = wide(&name);
     let pipe = loop {
         let remaining = connect_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero()

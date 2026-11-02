@@ -115,14 +115,72 @@ struct ShutdownFixture {
     host: OwnedHost,
 }
 
+#[test]
+fn config_separator_alias_reaches_the_same_live_runner() {
+    let fixture = ShutdownFixture::start(Some("ack"));
+    let alias = camino::Utf8PathBuf::from(fixture.config.as_str().replace('\\', "/"));
+    assert_eq!(alias, fixture.config);
+    let RunnerResponse::Identity { identity } =
+        request_for_config(&RunnerCommand::Identity, &alias).unwrap()
+    else {
+        panic!("runner identity");
+    };
+    assert_eq!(identity.process_id, fixture.host.0.id());
+    assert!(LocalListener::bind_for_config(&alias).is_err());
+    assert!(LocalListener::reserve_for_configs([alias.as_path()]).is_err());
+    shutdown_existing_for_config(&alias).unwrap();
+}
+
+#[test]
+fn previous_path_spelling_remains_reachable_without_starting_a_second_runner() {
+    let mut fixture = ShutdownFixture::start(Some("legacy_alias"));
+    let identity = current_identity().unwrap();
+    assert_ne!(
+        pipe_name_in(&identity, fixture.config.as_str()),
+        legacy_pipe_name_in(&identity, fixture.config.as_str())
+    );
+    assert!(endpoint_present_for_config(&fixture.config).unwrap());
+    assert!(LocalListener::bind_for_config(&fixture.config).is_err());
+    assert!(LocalListener::reserve_for_configs([fixture.config.as_path()]).is_err());
+    shutdown_existing_for_config(&fixture.config).unwrap();
+    assert!(fixture.host.0.try_wait().unwrap().is_some());
+    assert!(!endpoint_present_for_config(&fixture.config).unwrap());
+}
+
+#[test]
+fn maintenance_reserves_aliases_once_and_keeps_legacy_names_excluded() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = camino::Utf8PathBuf::from_path_buf(directory.path().join("config.toml")).unwrap();
+    let alias = camino::Utf8PathBuf::from(config.as_str().replace('\\', "/"));
+    let other = config.with_file_name("other.toml");
+    let guards =
+        LocalListener::reserve_for_configs([config.as_path(), alias.as_path(), config.as_path()])
+            .unwrap();
+    assert!(LocalListener::bind_for_config(&config).is_err());
+    assert!(LocalListener::bind_for_config(&alias).is_err());
+    assert!(
+        LocalListener::bind_name(
+            current_identity().unwrap(),
+            &legacy_pipe_name_in(&current_identity().unwrap(), alias.as_str())
+        )
+        .is_err()
+    );
+    assert!(LocalListener::bind_for_config(&other).is_ok());
+    drop(guards);
+    assert!(LocalListener::bind_for_config(&config).is_ok());
+}
+
 impl ShutdownFixture {
     fn start(exit_mode: Option<&str>) -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../project_sandbox/desktop-runner-shutdown");
         std::fs::create_dir_all(&base).unwrap();
         let directory = tempfile::tempdir_in(base).unwrap();
-        let config =
+        let mut config =
             camino::Utf8PathBuf::from_path_buf(directory.path().join("config.toml")).unwrap();
+        if exit_mode == Some("legacy_alias") {
+            config = camino::Utf8PathBuf::from(config.as_str().replace('\\', "/"));
+        }
         std::fs::write(&config, "[model]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"shutdown-fixture\"\nprovider_profile = \"openai_compatible\"\n").unwrap();
         let log = std::fs::File::create(directory.path().join("runner.log")).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -168,7 +226,11 @@ impl ShutdownFixture {
             {
                 return fixture;
             }
-            assert!(fixture.host.0.try_wait().unwrap().is_none());
+            assert!(
+                fixture.host.0.try_wait().unwrap().is_none(),
+                "{}",
+                std::fs::read_to_string(fixture.directory.path().join("runner.log")).unwrap()
+            );
             assert!(Instant::now() < deadline, "fixture readiness deadline");
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -287,7 +349,14 @@ fn shutdown_delayed_process_fixture() {
     if mode == "dynamic_shared" {
         crate::runner::shared::process_fixture::prepare_endpoint_change_configuration();
     }
-    let listener = LocalListener::bind().unwrap();
+    let listener = if mode == "legacy_alias" {
+        let identity = current_identity().unwrap();
+        let config = crate::config::loader::global_config_path().unwrap();
+        let name = legacy_pipe_name_in(&identity, config.as_str());
+        LocalListener::bind_name(identity, &name).unwrap()
+    } else {
+        LocalListener::bind().unwrap()
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -306,7 +375,7 @@ fn shutdown_delayed_process_fixture() {
             .unwrap();
         assert!(runtime.block_on(host.inner.shared_worker.lock()).is_some());
     }
-    if mode == "ack" || mode == "dynamic_shared" {
+    if mode == "ack" || mode == "dynamic_shared" || mode == "legacy_alias" {
         listener.serve(host.clone(), &runtime).unwrap();
     } else {
         assert_eq!(mode, "lost_ack");

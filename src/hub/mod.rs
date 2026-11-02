@@ -419,7 +419,9 @@ pub enum HubError {
     DifferentHub,
     #[error("Hub catalog revision moved backwards")]
     RevisionRollback,
-    #[error("Review and explicitly save the current Hub catalog before continuing")]
+    #[error(
+        "Hubのモデル設定が変更されたため、次のAIへの要求を停止しました。設定のMain・Sub・Approveで「最新情報を取得」し、モデル選択を確認・保存してください。実行済みの処理は元に戻りません。確認後に続きを依頼できます。"
+    )]
     ReviewRequired,
     #[error("Choose a nonempty model set, preferred model and valid affinity")]
     InvalidSelection,

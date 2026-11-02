@@ -45,6 +45,8 @@ Main/Sub/Approveの比較元は最後に確認・保存した公開catalogで、
 
 更新時に既に開始したmodel requestは元targetで終了させるが、次のmodel requestには新permitを出さない。同じuser turnのtool loop・retry・compactionも確認待ちになり、中断理由と結果を履歴へ残す。lease保持ではこのgateを迂回できない。
 
+Hub管理画面の「表示名」は公開catalogの論理モデル名を変更し、同じモデルを共有する全登録先とDesktopのMain/Sub/Approveの選択肢へ反映する。「登録先の名前」は選んだdeploymentだけの表示名で、モデルID・接続先・別deployment名を変更しない。旧管理クライアントが論理モデル名を送らない編集では、既存の論理名を保持する。
+
 端末接続の再登録が必要な一覧更新は、Main/Sub・子agent・Approveの最後の実行scopeが終わるまで保留する。その間も既存のheartbeatを継続し、終了後に同じownerが最新一覧を取得する。接続中の表示だけを残してheartbeatを終了したり、別の再試行timerを持ったりしない。
 
 ### モデル単位のシステムプロンプト
@@ -98,6 +100,6 @@ local保存後にHubへそのcontextのreviewを通知する。両方の成功�
 
 現在の回帰は `src/hub/connection/tests.rs`、Hub catalog/queue/gateway tests、DesktopのAI設定testsを参照する。Main/Sub/Approve独立保存、旧schema、遅延応答、review更新、子context、Approve捕捉・清算、Hub失敗時の非fallbackを対象にする。
 
-[2026-09-23の実装結果](../../project_sandbox/multi-device-session-20260923/RESULTS.md) と [Live GUI結果](../../project_sandbox/live-gui-winab-20260923/RESULTS.md) は、対象sourceの回帰と実oMLXによる仮想WinA/Bの仕事・成果保存を記録する。Main/Sideの全状態、物理多端末でのreview更新競合・FIFO公平性・長時間運転、配布版の受入を一括合格にする証拠ではない。残件は [TODO](../../TODO_RECOMMENDATION.md) に集約する。
+[Hub/Desktop結合監査](../tests/desktop_e2e/HUB_DESKTOP_COVERAGE.md) で、現行の観点、試験入口、未確認の条件を管理する。実行結果は対象sourceと構成を明記した各タスクの `RESULTS.md` を参照する。固定応答の成功を実LLM品質へ、同一Windows上の隔離端末を物理別PCへ外挿しない。review更新競合・FIFO公平性・長時間運転・配布版の受入は、該当する証拠がある範囲だけを合格とする。
 
 HubとDesktop/Runnerは独立したbuild/packageを持ち、隣接checkoutやRust/npmを配布先の実行条件にしない。Hub/Runnerの明示的なログオン開始は実装済みだが、Windows serviceによる無人運用・HAは対象外。正式配布はpackageと実GUI・配布binaryの検証を別途通す。

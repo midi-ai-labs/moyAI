@@ -96,17 +96,12 @@ impl ProfileMaintenanceGuard {
         let mut runners = Vec::new();
         #[cfg(windows)]
         {
-            let scopes = profiles
-                .iter()
-                .map(|(config, _)| config.as_str())
-                .chain(selected.iter().map(|entry| entry.config_path.as_str()))
-                .map(str::to_lowercase)
-                .collect::<std::collections::BTreeSet<_>>();
-            for scope in scopes {
-                runners.push(crate::runner::windows::LocalListener::reserve_for_config(
-                    Utf8Path::new(&scope),
-                )?);
-            }
+            runners.extend(crate::runner::windows::LocalListener::reserve_for_configs(
+                profiles
+                    .iter()
+                    .map(|(config, _)| config.as_path())
+                    .chain(selected.iter().map(|entry| entry.config_path.as_path())),
+            )?);
         }
         for (config, data) in profiles {
             user_data.push(

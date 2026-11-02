@@ -280,7 +280,12 @@ export function createFourDeviceAcceptanceScenario(options = {}) {
         }
         await page.locator(`[data-sa-operation="save_project"][data-sa-id="${projectId}"]`).click();
         const overview = projectOverview(environments, settings.roleMapping); await page.locator("#shared-admin-overview").fill(overview); await saveExecutionProject(page, sink, label);
+        await page.locator('nav a[href="#shared-administration"]').click();
+        await page.locator('[data-sa-tab="projects"]').click();
+        await page.locator(`[data-sa-operation="save_project"][data-sa-id="${projectId}"]`).click();
+        if(await page.locator("#shared-admin-overview").inputValue()!==overview) throw fail("Project definition did not survive save and reopen");
         await state.resource.screenshot("four-device-project-definition");
+        await page.locator("#shared-admin-close").click();
         for (const pc of [a, d]) await openProject(pc, projectId);
         await verifyHubModelPromptSettings({ pc: a, expectedPrompt: MODEL_PROMPT, owner: OWNER });
         const dExecution = await projection(d, "device_execution_projection");
@@ -301,7 +306,12 @@ export function createFourDeviceAcceptanceScenario(options = {}) {
         await openSharedJob(a.input, a.driver, a.sink, rootId);
         const completed = await projection(a);
         const retained = await wait("All three environments retain their actual service capacity", () => projection(a), p => ["api", "worker", "database"].every(role => p.status?.environments.some(env => env.id === environments[role].environment_id && env.occupied >= 1)), 30000);
-        await inspectForeign(a, d, rootId); await checkpoint(a, "completed-services-retained");
+        await inspectForeign(a, d, rootId);
+        await wait("The executing Desktop reflects completed approval and its retained service", () => projection(a, "receiver_activity_projection"),
+          p => !p.unavailable && p.attempts.every(attempt => attempt.local_state !== "waiting_approval") && p.retained_services.length > 0);
+        await wait("The rendered execution status no longer shows the completed approval as pending", () => a.driver.evaluate('document.querySelector(".receiver-activity")?.innerText'),
+          text => typeof text === "string" && text.includes("保持") && !text.includes("承認待ち"));
+        await checkpoint(a, "completed-services-retained");
         let application = null;
         if (live) {
           const manifestAsset = completed.assets.filter(row => row.kind === "artifact" && row.name === "acceptance.json").sort((left, right) => right.version - left.version)[0];
@@ -347,6 +357,7 @@ export function createFourDeviceAcceptanceScenario(options = {}) {
         await wait("Origin A shows its original completed work", () => projection(a), p => p.detail?.id === rootId);
         await wait("Origin A's execution view observes the completed release", () => projection(a, "receiver_activity_projection"),
           p => !p.unavailable && p.attempts.length === 0 && p.retained_services.length === 0);
+        await wait("Origin A's screen removes the released execution status", () => a.driver.evaluate('document.querySelector(".receiver-activity") === null'), Boolean);
         await checkpoint(a, "origin-a-stopped");
         await record("four-device-acceptance-complete", { mode: live ? "live-application" : "scripted-control-only", project_id: projectId, root_id: rootId, independent_root_id: dRootId,
           application: application ? { manifest: application.manifest, checks: application.checkpoints, process_owners: application.owners } : "NOT_RUN: scripted control qualification does not prove application development",
