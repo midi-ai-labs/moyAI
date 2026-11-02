@@ -350,7 +350,7 @@ export function initialSetupHostingUnavailableReady(value) {
     && surface.wizard?.current_step === "start"
     && surface.visible_fatal_count === 0
     && notice?.visible === true && notice.details_open === false
-    && notice.text.includes("Hub同梱版を導入") && notice.text.includes("既存の管理PCでHubを起動")
+    && notice.text.includes("Hub単体版のSetup-Hub.cmdで導入") && notice.text.includes("既存の管理PCでHubを起動")
     && sameValue(notice.purposes?.map(row => row.action).sort(), ["initial-setup-hosting", "initial-setup-personal", "initial-setup-team"])
     && notice.purposes.every(row => row.enabled);
 }

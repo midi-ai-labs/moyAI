@@ -26,6 +26,7 @@ function New-Case {
     foreach ($name in @('common.ps1','runtime-access.ps1','sandbox-service.ps1','Setup-Sandbox.ps1','Start-moyAI.ps1','Setup-moyAI.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deployment/$name") -Destination (Join-Path $script:source "scripts/$name") }
     foreach ($name in @('moyai-desktop.exe','moyai-runner.exe','moyai-sandbox.exe')) { Write-MoyaiUtf8 (Join-Path $script:source "app/bin/$name") ('inert fixture ' + $name) }
     $script:service=$null; $script:calls=[Collections.Generic.List[string]]::new(); $script:failEnable=$false; $script:failDelete=$false; $script:raceStart=$false; $script:elevationCount=0; $script:protections=@{}; $script:corruptCopy=$false
+    $script:clientRunning=$false; $script:failStop=$false
     Write-FixtureManifest 'system-installed'
 }
 function Write-FixtureManifest([string]$Runtime) {
@@ -37,6 +38,8 @@ function Write-FixtureManifest([string]$Runtime) {
     $script:manifest=Read-MoyaiDeployment $script:source -VerifyHashes
 }
 function Get-MoyaiSandboxLocation { [pscustomobject]@{parent=$script:machine;root=(Join-Path $script:machine 'SandboxService');helper=(Join-Path $script:machine 'SandboxService/moyai-sandbox.exe');service='MoyAISandbox'} }
+function Get-MoyaiComponentLocation([string]$Component) { [pscustomobject]@{parent=$script:machine;root=(Join-Path $script:machine $Component);component=$Component} }
+function Assert-MoyaiComponentStopped([string]$Root) { Assert-MoyaiSandboxRegularPath $Root }
 function Assert-MoyaiSandboxAdministrator { $script:calls.Add('administrator-checked') }
 function Assert-MoyaiSandboxProtectedPath([string]$Path) {
     Assert-MoyaiSandboxRegularPath $Path
@@ -60,6 +63,8 @@ function Set-MoyaiSandboxService([string]$Command,[uint32]$Start,[switch]$Create
 }
 function Set-MoyaiSandboxServiceSecurity([string]$Sddl) { $script:calls.Add('security'); $script:service.Sddl=$Sddl }
 function Remove-MoyaiSandboxService { $script:calls.Add('delete'); if ($script:failDelete) { $script:failDelete=$false; throw 'Injected delete failure.' }; $script:service=$null }
+function Assert-MoyaiSandboxClientsStopped { if($script:clientRunning){throw 'A client still owns work.'} }
+function Stop-MoyaiSandboxService { $script:calls.Add('stop'); if($script:failStop){throw 'Stop timed out.'}; $script:service.State=1 }
 function Invoke-MoyaiSandboxElevation([string]$SourceRoot,$Manifest) { $script:elevationCount++; throw 'Simulated user cancellation; no process was started.' }
 
 New-Case
@@ -101,12 +106,20 @@ Ensure-MoyaiSandboxInstallation $script:source $script:manifest
 Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'second inert helper'
 Write-FixtureManifest 'system-installed'
 $oldHash=(Get-FileHash -LiteralPath $location.helper).Hash
-Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source } 'running service prevents update'
-Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall } 'running service prevents machine uninstall'
-Assert-That ((Get-FileHash -LiteralPath $location.helper).Hash -ceq $oldHash -and $script:service.State -eq 4) 'running-service rejection preserves payload and does not stop the process'
+$script:clientRunning=$true
+Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source } 'a live client prevents update'
+Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall } 'a live client prevents machine uninstall'
+Assert-That ((Get-FileHash -LiteralPath $location.helper).Hash -ceq $oldHash -and $script:service.State -eq 4) 'live-client rejection preserves payload and does not stop work'
+$script:clientRunning=$false; $script:failStop=$true
+Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source } 'stop timeout prevents payload replacement'
+Assert-That ((Get-FileHash -LiteralPath $location.helper).Hash -ceq $oldHash -and $script:service.Start -eq 3) 'stop timeout preserves old files and restores start mode'
+$script:failStop=$false
 $script:service.State=1; $script:raceStart=$true
-Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source } 'a start racing setup is rejected after disabling new starts'
-Assert-That ((Get-FileHash -LiteralPath $location.helper).Hash -ceq $oldHash -and $script:service.State -eq 4 -and $script:service.Start -eq 3) 'racing start retains running process and old payload, and restores demand-start configuration'
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+Assert-That ((Get-FileHash -LiteralPath $location.helper).Hash -cne $oldHash -and $script:service.State -eq 1 -and $script:service.Start -eq 3) 'a start racing setup is stopped after disabling starts before replacement'
+$oldHash=(Get-FileHash -LiteralPath $location.helper).Hash
+Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'third inert helper'
+Write-FixtureManifest 'system-installed'
 $script:service.State=1; $script:failEnable=$true
 Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source } 'injected final service configuration failure propagates'
 Assert-That ((Get-FileHash -LiteralPath $location.helper).Hash -ceq $oldHash -and $script:service.Start -eq 3) 'failed update restores old payload and demand-start configuration together'
@@ -120,6 +133,38 @@ $sentinel=Join-Path $script:caseRoot 'user-data.txt'; Write-MoyaiUtf8 $sentinel 
 Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
 Assert-That ($null -eq $script:service -and -not (Test-Path -LiteralPath $location.root) -and (Get-Content -LiteralPath $sentinel -Raw) -ceq 'profile/history/device policy sentinel') 'explicit machine removal deletes only owned payload and service'
 Assert-That ((Get-Content -LiteralPath $legacySentinel -Raw) -ceq 'previous transient helper evidence') 'install, update and explicit removal preserve the legacy Sandbox directory'
+
+foreach($damage in @('helper','directory','parent','service','empty','disabled')) {
+    New-Case
+    Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+    $location=Get-MoyaiSandboxLocation
+    if($damage -eq 'service') { $script:service=$null }
+    elseif($damage -eq 'disabled') { $script:service.Start=4 }
+    else {
+        Remove-Item -LiteralPath $location.helper
+        if($damage -in @('directory','parent','empty')) {
+            Remove-Item -LiteralPath (Join-Path $location.root 'installation.json')
+            if($damage -ne 'empty'){Remove-Item -LiteralPath $location.root}
+            if($damage -eq 'parent') {
+                Remove-Item -LiteralPath (Join-Path $location.parent 'sandbox-setup.lock')
+                Remove-Item -LiteralPath $location.parent
+            }
+        }
+    }
+    Assert-That (Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed "partial $damage installation reaches the repair transaction"
+    Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+    Assert-That (-not(Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed) "setup repairs $damage without a prior uninstall"
+    $before=$script:calls.Count
+    Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+    Assert-That ($script:calls.Count -eq $before+1) "repeated setup after $damage needs no SCM mutation"
+    Assert-That (@(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.previous-*').Count -eq 0) "successful $damage repair removes its owned old modules"
+}
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$script:service.State=4
+Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
+Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath (Get-MoyaiSandboxLocation).root)) 'uninstall stops a residual service and removes its registration and payload'
 
 foreach($damage in @('helper','directory','parent','service')) {
     New-Case
@@ -144,6 +189,38 @@ foreach($damage in @('helper','directory','parent','service')) {
     Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root)) "uninstall completes with an already missing $damage"
     Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
     Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root)) "repeated uninstall after missing $damage is a successful no-op"
+}
+
+foreach($failure in @('publication','enable','none','unchanged-helper')) {
+    New-Case
+    Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+    $helper=Get-MoyaiSandboxLocation
+    $helperHash=(Get-FileHash -LiteralPath $helper.helper).Hash
+    $component=Get-MoyaiComponentLocation 'Desktop'
+    $stage=Join-Path $script:machine '.Desktop.stage-fixture'
+    foreach($directory in @($component.root,$stage)) {
+        [void](New-Item -ItemType Directory -Path $directory)
+        Write-MoyaiUtf8 (Join-Path $directory 'app.exe') $(if($directory -eq $stage){'new Desktop'}else{'old Desktop'})
+        $hash=(Get-FileHash -LiteralPath (Join-Path $directory 'app.exe')).Hash.ToLowerInvariant()
+        Write-MoyaiComponentJson (Join-Path $directory 'machine-component.json') @{schema=1;product='moyai-machine-component';component='Desktop';install_root=$component.root;source_manifest_sha256=('1'*64);files=@(@{path='app.exe';sha256=$hash})}
+    }
+    $context=[pscustomobject]@{location=$component;stage=$stage;old=(Read-MoyaiInstalledComponent 'Desktop');backup=$null;published=$false}
+    if($failure -ne 'unchanged-helper') {
+        Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'new helper for paired update'
+        Write-FixtureManifest 'system-installed'
+    }
+    if($failure -eq 'publication') { Write-MoyaiUtf8 (Join-Path $stage 'app.exe') 'injected corrupt copy' }
+    $script:failEnable=$failure -eq 'enable'
+    $invoke={Invoke-MoyaiMachineSandboxSetup $script:source -ComponentContext $context -PublishComponent {param($state) Publish-MoyaiComponentPayload $state} -RestoreComponent {param($state) Restore-MoyaiComponentPayload $state}}
+    if($failure -in @('publication','enable')) {
+        Assert-Fails $invoke "$failure failure is reported during a paired update"
+        Assert-That ((Get-Content -LiteralPath (Join-Path $component.root 'app.exe') -Raw) -ceq 'old Desktop' -and (Get-FileHash -LiteralPath $helper.helper).Hash -ceq $helperHash -and $script:service.Start -eq 3) "$failure failure restores both the old Desktop and matching helper"
+    } else {
+        & $invoke | Out-Null
+        Assert-That ((Get-Content -LiteralPath (Join-Path $component.root 'app.exe') -Raw) -ceq 'new Desktop' -and $script:service.Start -eq 3) "$failure paired update publishes Desktop and enables the matching helper"
+        [void](Remove-MoyaiComponentPayload $context.backup $context.old)
+        Assert-That (-not(Test-Path -LiteralPath $context.backup)) "$failure successful pair can retire the old Desktop payload"
+    }
 }
 
 New-Case

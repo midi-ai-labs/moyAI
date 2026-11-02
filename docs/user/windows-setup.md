@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | WinAから仕事を依頼し、結果を見る | チームに参加する | 管理者から接続ファイルを受け取り、[チームへの参加手順](getting-started.md#チームで使う)を進めます。このPCのAI・モデル設定とHub本体は不要です。 |
 | WinBで仕事を実行する | チームの仕事をこのPCで実行する | 管理者から接続ファイルを受け取り、PCの参加を申請します。AIはHubの設定を使い、必要なら「AIの接続」でモデルを選択します。承認後に[保存先と操作の許可](../shared-work-desktop.md)を設定します。Hub管理者がこのPCをプロジェクトへ割り当てます。 |
-| チームのHubを管理する | チーム環境を用意する | Hub同梱版を使い、[管理者の準備手順](../../../moyAI-Hub/docs/team-preparation.md)で接続・PCの参加許可・プロジェクトを設定します。 |
+| チームのHubを管理する | チーム環境を用意する | Hub単体版を導入し、[管理者の準備手順](../../../moyAI-Hub/docs/team-preparation.md)で接続・PCの参加許可・プロジェクトを設定します。 |
 | このPCだけで個人の仕事をする | 自分のPCで使う | 利用するAIの接続先とモデルを設定します。Hubへの参加は不要です。 |
 
 最初の仕事には、管理者によるPCの参加許可とプロジェクトの操作PC・実行PCの指定、WinBの実行設定が必要です。インストール後にWinAだけを操作しても、これらの準備は完了しません。
@@ -16,7 +16,7 @@
 ## 導入して開く
 
 1. 社内の信頼できる配布元から一式を受け取り、ZIPをフォルダーごと展開します。配布元が示すZIPのSHA256も確認します。
-2. `Setup-moyAI.cmd` を通常の権限で開きます。別画面で管理者承認し、Desktopを `%ProgramFiles%\moyAI\Desktop` へ配置します。Hub同梱版でも、この操作ではHubを導入しません。Hubを管理するPCだけ、配布フォルダーの `Setup-Hub.cmd` を実行し、`%ProgramFiles%\moyAI\Hub` へ配置します。Hub単体版も同じ配置です。ショートカット・関連付け・起動確認は、最初にSetupを開いたWindows利用者で行います。
+2. `Setup-moyAI.cmd` を通常の権限で開きます。別画面で管理者承認し、Desktopを `%ProgramFiles%\moyAI\Desktop` へ配置します。Desktop配布物にはHub本体を含みません。Hubを管理するPCだけ、Hub単体版の `Setup-Hub.cmd` を実行し、`%ProgramFiles%\moyAI\Hub` へ配置します。ショートカット・関連付け・起動確認は、最初にSetupを開いたWindows利用者で行います。
 3. 配置後、セットアップが通常の権限でmoyAIを起動します。初期画面の描画完了をアプリから受け取ると、起動確認の成功と導入完了を表示します。moyAIの画面は開いたまま使えます。セットアップの画面は任意のキーを押して閉じます。次回からは**Windowsのスタートメニューの「moyAI」**を開きます。
 4. 初回画面では上の表に合った入口を選びます。通常起動時の管理者承認はありません。起動確認では、PC参加・プロジェクトでの用途指定・仕事の実行準備までは確認しません。
 
@@ -58,7 +58,7 @@ Hubを導入すると「チーム環境を用意する」からHubの管理画�
 
 ## 更新・アンインストール
 
-更新前に、仕事を実行するPCで新しい仕事の受付を一時停止し、実行中の仕事が終わり、停止を確認できない処理がないことを確認します。その後、次の表に従って今回更新するアプリを終了してください。共通helperも更新する場合は、別の導入先や別Windows利用者を含め、このPCのすべてのmoyAI Desktop・CLI・Runnerを終了します。サービスが動いている間、共通helperの更新・削除は拒否します。
+更新前に、仕事を実行するPCで新しい仕事の受付を一時停止し、実行中の仕事が終わり、停止を確認できない処理がないことを確認します。その後、次の表に従って今回更新するアプリを終了してください。共通helperも更新する場合は、別の導入先や別Windows利用者を含め、このPCのすべてのmoyAI Desktop・CLI・Runnerを終了します。アプリ終了後も共通サービスが残っていれば、Setupが通常停止し、停止完了を待って更新・削除します。
 
 | セットアップに表示されるもの | 終了する方法 |
 | --- | --- |
@@ -76,7 +76,9 @@ Hubを導入すると「チーム環境を用意する」からHubの管理画�
 
 新しいZIPを**既存の導入先の外**へ展開し、新しい `Setup-moyAI.cmd` を実行します。まだアプリが動いていれば、セットアップは名前・PID・実行ファイルの場所と終了手順を表示して中止します。セットアップが仕事やアプリを強制停止することはありません。表示されたアプリの終了を確認してから、同じセットアップを開き直してください。
 
-DesktopとHubは別の導入記録を持ちます。`-Components Desktop` はDesktopだけ、`-Components Hub` はHubだけを更新します。指定しない場合は配布物に含まれる製品を対象にします。Desktopだけの更新で既存Hubを削除することはありません。
+Setupは共通サービスの登録・配置・権限を検証します。正規のサービス登録だけが残った状態、登録だけが消えた状態、記録にあるファイルの欠損、空の配置フォルダー、更新途中の無効化からは再導入できます。実行中のDesktop・CLI・Runnerがなければ、残った共通サービスを通常停止し、停止完了後に置き換えます。停止失敗時は旧ファイルを保持します。同名の別サービス、権限の不整合、内容を確認できないファイルは自動削除せず理由を表示します。
+
+DesktopとHubは別の導入記録を持ちます。`-Components Desktop` はDesktopだけ、`-Components Hub` はHubだけを更新します。`Setup-moyAI.cmd` は指定しなければDesktop、Hub単体版の `Setup-Hub.cmd` はHubだけを対象にします。Desktopだけの更新で既存Hubを削除することはありません。
 
 新しいアプリ一式を検査してから導入先を入れ替えます。既定のexeパスは更新しても変わりません。旧モジュールは導入記録と一致するファイルを整理し、追加・変更されたファイルは場所と理由を表示して保持します。従来の利用者別配置や `moyAI.previous-*` も、所有と未使用を確認できる範囲だけを整理します。旧バイナリーへの起動切替が、移行済みデータとの互換性を保証するわけではありません。
 
@@ -115,6 +117,8 @@ Windowsへのサインイン時にRunnerやHubを自動起動する設定も、�
 
 旧名 `moyai-cleanup.exe` もDesktop用と同じ削除範囲です。導入情報と移行完了の記録は共通rootの `installations`／`migrations` に分けて保持し、初期化後に旧保存先から履歴や資格を再取込みしません。
 
+Desktopの初期化では、過去の実行記録が欠けている、空になっている、または登録と一致しない場合も、Desktop・CLI・Runnerの停止を確認して、対象利用者の既定保存先に対応する共有実行登録を解除します。残っている実行記録に未清算の仕事がある場合や、停止・所有者を確認できない場合は中止します。ProgramDataの `moyAI-resource-admission` は他の利用者や別の保存先の登録も含むため、フォルダー全体を手動削除しないでください。通常の更新・保存先移行・接続設定だけのリセットでは、欠損した実行記録を無視しません。
+
 通常のプロジェクトが削除対象フォルダーの中に登録されている場合は、作業ファイルを保護するため初期化を中止し、その場所を表示します。Quick Chatなどが内部に保存した結果は初期化対象ですが、その内部フォルダーがGitプロジェクトになっている場合も削除しません。
 
 ## 保存先と旧版からの移行
@@ -152,19 +156,8 @@ Windowsの利用者データは `%LOCALAPPDATA%\midi-ai-labs\moyai-data` に集�
 
 既設の社内ランタイムを前提にする場合は、明示的に `-RuntimeMode Installed` を使います。これはランタイムがない新PCで動くという証拠にはなりません。どちらも開発用Rust・Nodeを利用先へ要求しません。
 
-Hubを同梱する場合は `-HubBinaryPath`、`-HubBuildIdentityPath` を渡します。隣接する `moyai-cleanup-hub.exe` も必要で、別配置なら `-HubCleanupBinaryPath` を指定します。第三者通知 `THIRD_PARTY_NOTICES.txt` も同じHub配布物から同梱し、別配置なら `-HubThirdPartyNoticesPath` を指定します。Hub build identity JSONには `version`、40文字の `git_commit`、本体の小文字 `sha256`、cleanupの `cleanup_sha256`、`source_clean` を記録します。配布スクリプトは実際のファイルのhashを照合し、`deployment.json` にDesktopとHubのidentityを記録します。**identity記録だけで互換性確認済みにはしません。** 公開用には `-HubCompatibilityResultsPath` の実際の組合せ試験結果に次の完全一致行も必要です。
+Desktopの配布スクリプトはDesktop専用のZIPを作り、Hub本体・Hub用Setup・Hub用cleanupを含めません。HubはmoyAI-Hubリポジトリーの `scripts/package-release.py` で別に作成します。DesktopのHub接続機能と、旧同梱版の導入記録を読む互換性は保持します。両製品の組合せ試験では、独立した配布物の実行ファイルを指定してください。
 
-```text
-Desktop Hub Gate: PASS
-Desktop Git Commit: <Desktopの40文字commit>
-Hub Git Commit: <Hubの40文字commit>
-Hub SHA256: <Hub実行ファイルの64文字SHA256>
-```
+GUI受入結果はZIP内の `docs/release/manual-gui-st-results.md` にコピーします。公開用の入力には、秘密情報・本人の履歴・内部IPを含まない専用の結果文書を使ってください。ZIP外のmanifestにある `artifacts` と受入結果の `results_file` はmanifestからの相対参照です。`package_copy` は展開した製品rootからの相対参照です。
 
-Hub同梱時は、同じHubソースまたは配布物の `docs` から準備・受信許可・Web管理・Windows導入の4ガイドも `hub/docs` へ同梱します。同じ製品内の手順は配布物内で解決し、DesktopとHubをまたぐ参照は個別導入後も使えるよう、対応commitの公式URLへ変換します。既定の参照元は隣の `moyAI-Hub/docs` です。正式Hub配布物など別の配置を使う場合は `-HubDocumentationPath` を指定してください。必要なガイドが欠けている場合はビルド前に中止します。Desktop単体の配布にはHubソースを要求せず、Hub手順の参照先は公式リポジトリーになります。
-
-Hubの初期設定ファイル `web-management.json` も、展開した配布物の `hub/bin` へ同梱し、SetupがHub本体と同じ固定配置へ置きます。既定の参照元は `-HubDocumentationPath` の親フォルダーにある同名ファイルです。別の配置なら `-HubWebSettingsPath` を指定します。HubのSetup・起動用スクリプトは、同じ親フォルダーからソース版と正式配布物の配置を判定して同梱します。`-HubSetupScriptsPath` を指定する場合は、ソースの `scripts` フォルダー、またはCMDが直下、PowerShellが `scripts` 配下にある正式Hub配布物のrootを渡します。必要な資材がなければビルド前に中止します。初期値は固定ポート9080・他端末向け公開OFFです。変更する場合はSetupの `-WebPort` を指定し、既存設定がある場合は指定しなければ保持します。Program Files内のテンプレートを手編集する必要はありません。
-
-GUIとDesktop／Hubの受入結果本文は、ZIP内の `docs/release/manual-gui-st-results.md` と `docs/release/desktop-hub-results.md` にそのままコピーします。公開用の入力には、秘密情報・本人の履歴・個人profileの指紋・内部IPを含まない専用の結果文書を使ってください。ZIP外のmanifestにある `artifacts` と受入結果の `results_file` は、そのmanifestの場所を基準にした相対参照です。`package_copy` など配布物内の参照は、展開した製品rootを基準にします。ローカル入力の絶対pathは公開manifestに記録しません。
-
-未公開の診断packageのみ既存の `-SkipManualGuiStGate` を使えます。同梱資材の存在・x64形式・checksumの検査はfresh PCの実行証拠ではありません。実ランタイムを用いた新PC導入、実Desktop、同梱Hub、最初の仕事、更新後の保持を別途確認します。package manifestの `fresh_pc_verified` は、このスクリプトだけでは常に `false` です。
+未公開の診断packageのみ既存の `-SkipManualGuiStGate` を使えます。同梱資材の存在・x64形式・checksumの検査はfresh PCの実行証拠ではありません。実ランタイムを用いた新PC導入、実Desktop、別配布のHub、最初の仕事、更新後の保持を別途確認します。package manifestの `fresh_pc_verified` は、このスクリプトだけでは常に `false` です。

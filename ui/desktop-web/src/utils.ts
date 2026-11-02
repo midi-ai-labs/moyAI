@@ -306,7 +306,7 @@ export function humanizeError(error: unknown): HumanError {
     case "team_setup_unavailable":
       return {
         title: "チーム管理を起動できません",
-        hint: "Hub同梱版を導入するか、既存の管理PCでHubを起動してください。このPCの個人設定やチーム参加は引き続き利用できます。",
+        hint: "Hub単体版のSetup-Hub.cmdで導入するか、既存の管理PCでHubを起動してください。このPCの個人設定やチーム参加は引き続き利用できます。",
         details,
       };
     case "unknown":

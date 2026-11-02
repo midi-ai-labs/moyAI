@@ -173,7 +173,7 @@ test("Initial Setup rejects a visible enabled primary action with wrapped or ove
 test("missing Hub guidance must be normally visible while every initial purpose remains actionable", () => {
   const value = {
     surface: { projection: { overlay: "initial_setup", startup: { initial_setup_required: true, onboarding_intent: "hosting" } }, wizard: { current_step: "start" }, visible_fatal_count: 0 },
-    notice: { visible: true, details_open: false, text: "Hub同梱版を導入するか、既存の管理PCでHubを起動してください。", purposes: ["personal", "team", "hosting"].map(kind => ({ action: `initial-setup-${kind}`, enabled: true })) },
+    notice: { visible: true, details_open: false, text: "Hub単体版のSetup-Hub.cmdで導入するか、既存の管理PCでHubを起動してください。", purposes: ["personal", "team", "hosting"].map(kind => ({ action: `initial-setup-${kind}`, enabled: true })) },
   };
   assert.equal(initialSetupHostingUnavailableReady(value), true);
   assert.equal(initialSetupHostingUnavailableReady({ ...value, notice: { ...value.notice, text: "技術詳細を参照" } }), false);

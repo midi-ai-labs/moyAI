@@ -100,14 +100,17 @@ fn bundled_hub(desktop: &Path) -> Result<PathBuf, String> {
     if bin.file_name().is_none_or(|name| name != "bin")
         || app.file_name().is_none_or(|name| name != "app")
     {
-        return Err("チーム管理を含むmoyAI配布物をセットアップしてください。既存のHubは管理PCから起動できます。".into());
+        return Err(
+            "Hub単体版のSetup-Hub.cmdで導入してください。既存のHubは管理PCから起動できます。"
+                .into(),
+        );
     }
     let root = app
         .parent()
         .ok_or("Desktop installation path is unavailable")?;
     let hub = root.join("hub/bin/moyai-hub.exe");
     if !hub.is_file() {
-        return Err("この配布物にチーム管理用Hubがありません。Hub同梱版をセットアップするか、既存の管理PCでHubを起動してください。保存済みデータの初期化は不要です。".into());
+        return Err("この配布物にチーム管理用Hubがありません。Hub単体版のSetup-Hub.cmdで導入するか、既存の管理PCでHubを起動してください。保存済みデータの初期化は不要です。".into());
     }
     regular_installation_file(&hub)?;
     Ok(hub)
@@ -147,7 +150,7 @@ mod tests {
     fn resolves_only_the_bundled_hub_and_reports_missing_component() {
         let root = tempfile::tempdir().unwrap();
         let desktop = root.path().join("app/bin/moyai-desktop.exe");
-        assert!(bundled_hub(&desktop).unwrap_err().contains("同梱版"));
+        assert!(bundled_hub(&desktop).unwrap_err().contains("Hub単体版"));
         let hub = root.path().join("hub/bin/moyai-hub.exe");
         std::fs::create_dir_all(hub.parent().unwrap()).unwrap();
         std::fs::write(&hub, b"fixture").unwrap();

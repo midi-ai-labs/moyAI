@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.en.md">English</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.7">ダウンロード v3.0.7</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.8">ダウンロード v3.0.8</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">ライセンス</a>
@@ -22,7 +22,7 @@
 
 moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエージェントです。外部のOpenAI互換LLMサーバーへ接続し、プロジェクトを調べ、ファイルを編集し、コマンドを実行します。会話と成果も保存します。LLMサーバーやモデルの起動・終了・ダウンロードは行いません。
 
-**Desktop 3.0.7はWindows x64向けの設定・Hub連携修正版です。** 初回Hub接続時のMain・Sub・Approveの標準モデル設定、再接続後のモデル保存、Approveや追加ヘッダーの保存を修正しました。Runnerの設定パス表記差と再参加前の旧共有登録にも対応し、GUI監査・Hubとの結合試験を拡充しています。Hub同梱版はmoyAI Hub 1.0.5を含みます。WebView2とx64 VC++ runtimeが導入済みのPC向けです。確認範囲と制限は[3.0.7リリースノート](docs/release/v3.0.7.md)を参照してください。
+**Desktop 3.0.8はWindowsの再導入・cleanup修正版です。** 残った共通サービスや一部ファイル欠損からの再導入、停止を確認した古い共有実行登録の初期化に対応しました。Desktop配布物にはHub本体を含めず、Hubは管理するPCだけに単体版を導入します。WebView2とx64 VC++ runtimeが導入済みのPC向けです。[3.0.8リリースノート](docs/release/v3.0.8.md)を参照してください。
 
 ## DesktopとHub
 
@@ -49,7 +49,7 @@ moyAIは、Desktop・CLI・TUIから使えるRust製のコーディングエー�
 
 ## Quick Start
 
-3.0.7のWindows配布物では、次の順に進みます。
+3.0.8のWindows配布物では、次の順に進みます。
 
 1. ZIP全体を展開して `Setup-moyAI.cmd` を通常の権限で実行します。実行ファイルをProgram Filesへ配置する際は、別画面で管理者承認します。Setupが **moyAI** を通常権限で起動し、初期画面の表示を確認します。開いた画面から利用準備を進め、次回からはスタートメニューで開きます。起動に失敗した場合や60秒以内に表示を確認できなかった場合は、結果と診断ログの保存先を表示し、起動中のアプリは強制終了しません。[Windows導入手順](docs/user/windows-setup.md)を参照してください。
 2. 初回画面で目的を選びます。
@@ -104,7 +104,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-3.0.7配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
+3.0.8配布物の実行ファイルは `app/bin/` にあります。CLI・TUI・DesktopはRustの共通実装と利用者設定を使います。引数の詳細は `moyai --help` と各コマンドのヘルプで確認してください。
 
 WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUACは不要です。help・versionや実行を始めないmetadata commandではsandbox helperを起動しません。
 
@@ -126,7 +126,7 @@ WindowsのRunとTUIは、導入済みsandbox helperを使い、起動時のUAC�
 
 停止や発言の編集は、作成済みファイルや起動済みアプリを元に戻しません。編集・再送できるのは最新の発言だけです。本文を編集しても元の画像や添付は保持します。添付を変更する場合は、新しい依頼として送ってください。停止要求の受付と、実プロセスの停止確認は別です。
 
-RunnerはWindows利用者のログオン中に動作します。Desktopと、ログオン時自動起動を含む独立Runnerは、UACなしで導入済みhelperを使い、それぞれlifetime leaseを保持します。利用がなくなるとhelperは停止しますが、Runner自体をWindows serviceとして動かすわけではありません。Desktop／Hub本体の導入・更新・削除と、共通helperの更新・削除には管理者承認が必要です。サービス稼働中は共通helperの更新・削除を拒否します。共通helperは、アンインストール画面で明示的に選択した場合だけ削除します。HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
+RunnerはWindows利用者のログオン中に動作します。Desktopと、ログオン時自動起動を含む独立Runnerは、UACなしで導入済みhelperを使い、それぞれlifetime leaseを保持します。利用がなくなるとhelperは停止しますが、Runner自体をWindows serviceとして動かすわけではありません。Desktop／Hub本体の導入・更新・削除と、共通helperの更新・削除には管理者承認が必要です。実行中のDesktop・CLI・Runnerがなければ、Setupが残った共通helperを通常停止して更新・削除します。共通helperは、アンインストール画面で明示的に選択した場合だけ削除します。HubのルートCAの自動入替、初期状態のPC・物理別PCでの正式配布受入は、ローカル自動試験の成功だけでは確認できません。モデルの回答品質とツール対応は接続先に依存します。[共有Runner](docs/runner-shared.md)、[ローカルRunner](docs/runner-local.md)、[継続コマンド](docs/managed-shell-guide.md)も参照してください。
 
 ## 開発・検証
 
@@ -152,7 +152,7 @@ Windowsのnative sandbox試験には、明示的に起動承認したhelper test
 
 以前の3.0.0候補では、Manual ST Case1〜7と復元試験、同じWindows PC上の仮想WinA/WinBによる実行・成果受渡しを試験しました。生成コードの評価NGとSide Chat回答の精度不足を含め、当時の結果は過去の証跡として保持しています。3.0.4の修正と検証の記録は、開発workspaceの `project_sandbox/local-submit-diagnosis-20261025/RESULTS.md` にあります。3.0.5の実動作確認は行っていません。Windows 10 2016 LTSBで報告された起動失敗の原因は未確定で、このOSでの実機確認も未実施です。AD環境からHubを使った動作報告はありますが、ADのtokenとグループに対するアクセス拒否を確かめる専用試験は未確認です。新規PCへの導入、物理別PC・LAN・Firewallの確認にも別の証跡が必要です。
 
-公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hub同梱時は実バイナリの組合せ証跡を確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
+公開配布はcleanな確定commitから `scripts/package-release.ps1` で作成します。Desktop・CLI・Runner・cleanup・sandbox helperを再ビルドし、版とcommitに対応する手動GUI証跡、Hubは別配布物の実バイナリとの組合せを確認します。資材と引数は[配布を作る担当者向け](docs/user/windows-setup.md#配布を作る担当者向け)を参照してください。配布物の実動作確認後に、ZIP・manifest・SHA256を公開します。
 
 ## License
 

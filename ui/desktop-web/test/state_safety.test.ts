@@ -533,7 +533,7 @@ test("team setup failure has visible installation guidance without promoting arb
   const diagnostic = "private process stderr: a-token-or-private-path";
   const human = humanizeError({ kind: "internal", category: "runtime", code: "team_setup_unavailable", message: diagnostic });
   assert.equal(human.title, "チーム管理を起動できません");
-  assert.match(human.hint, /Hub同梱版を導入/);
+  assert.match(human.hint, /Hub単体版のSetup-Hub\.cmdで導入/);
   assert.match(human.hint, /既存の管理PCでHubを起動/);
   assert.ok(!human.hint.includes(diagnostic));
   assert.equal(human.details, diagnostic);

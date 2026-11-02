@@ -84,6 +84,26 @@ Copy-Item -LiteralPath (Join-Path $package 'hub/bin/moyai-hub.exe') -Destination
 Invoke-MoyaiMachineComponent $package @('Hub') -Uninstall -ExpectedManifestSha256 $manifest.validated_manifest_sha256
 Assert-That (-not(Test-Path -LiteralPath $hub)) 'repeated uninstall can finish after partial removal'
 Assert-That ((Get-FileHash -LiteralPath (Join-Path $desktop 'sentinel.txt')).Hash -ceq $desktopHash) 'Hub update and uninstall preserve Desktop bytes'
+[void](New-Item -ItemType Directory -Path $hub)
+Invoke-MoyaiMachineComponent $package @('Hub') -Uninstall -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
+Assert-That (-not(Test-Path -LiteralPath $hub)) 'uninstall removes an already empty validated component directory'
+[void](New-Item -ItemType Directory -Path $hub)
+Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
+Assert-That (Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe')) 'setup accepts a verified empty component directory after manual deletion'
+Remove-Item -LiteralPath (Join-Path $hub 'moyai-hub.exe')
+Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
+Assert-That (Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe')) 'setup repairs a partially removed component without resetting its sibling'
+$savedRead=${function:Read-MoyaiInstalledComponent}
+function Read-MoyaiInstalledComponent($Component,[switch]$AllowMissingFiles,[switch]$VerifyHashes) {
+    if($VerifyHashes){throw 'Injected final placement validation failure'}
+    & $savedRead $Component -AllowMissingFiles:$AllowMissingFiles
+}
+$oldHubHash=(Get-FileHash -LiteralPath (Join-Path $hub 'moyai-hub.exe')).Hash
+Assert-Fails { Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 } 'failed final placement validation rejects the update'
+Assert-That ((Get-FileHash -LiteralPath (Join-Path $hub 'moyai-hub.exe')).Hash -ceq $oldHubHash) 'failed placement validation restores the previous component'
+Set-Item Function:Read-MoyaiInstalledComponent $savedRead
+Invoke-MoyaiMachineComponent $package @('Hub') -Uninstall -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
+Assert-That (@(Get-ChildItem -LiteralPath $machine -Directory -Filter '.Hub.stage-*').Count -eq 0) 'later maintenance removes only the inventoried stage retained after a failed update'
 $bad=Get-Content -LiteralPath (Join-Path $package 'deployment.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $bad.files[0].install_path='../Desktop/sentinel.txt'
 Write-MoyaiComponentJson (Join-Path $package 'deployment.json') $bad
@@ -199,10 +219,11 @@ $script:removalOrder=[Collections.Generic.List[string]]::new()
 function Get-MoyaiSandboxLocation { [pscustomobject]@{parent=$machine;root=(Join-Path $machine 'SandboxService');service='MoyAISandbox'} }
 function Get-MoyaiSandboxService([switch]$Security) { $script:serviceFixture }
 function Assert-MoyaiSandboxService { }
+function Assert-MoyaiSandboxClientsStopped { if($script:serviceFixture.State -ne 1){throw 'A live application owns work.'} }
 function Read-MoyaiSandboxInstallation { [pscustomobject]@{files=@()} }
 function Invoke-MoyaiMachineSandboxSetup($Root,[switch]$Uninstall) { if(-not $Uninstall){throw 'Unexpected fixture installation'}; $script:removalOrder.Add('service'); $script:serviceFixture=$null }
 $beforeShared=(Get-FileHash -LiteralPath $cleanupPath).Hash
-Assert-Fails { Invoke-MoyaiMachineComponent $package @('Desktop','Hub') -Uninstall -RemoveSharedRuntime -ExpectedManifestSha256 $manifest.validated_manifest_sha256 } 'running shared service refuses combined removal before touching selected payload'
+Assert-Fails { Invoke-MoyaiMachineComponent $package @('Desktop','Hub') -Uninstall -RemoveSharedRuntime -ExpectedManifestSha256 $manifest.validated_manifest_sha256 } 'live applications refuse combined removal before touching selected payload'
 Assert-That ((Get-FileHash -LiteralPath $cleanupPath).Hash -ceq $beforeShared -and $script:removalOrder.Count -eq 0) 'shared-service preflight rejection preserves application bytes'
 $realRemovePayload=${function:Remove-MoyaiComponentPayload}
 function Remove-MoyaiComponentPayload($Root,$Receipt) { $script:removalOrder.Add('payload'); & $realRemovePayload $Root $Receipt }

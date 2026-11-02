@@ -175,7 +175,10 @@ function Read-MoyaiInstalledComponent([ValidateSet('Desktop','Hub')][string]$Com
     if (-not (Test-Path -LiteralPath $location.root)) { return $null }
     Assert-MoyaiSandboxProtectedPath $location.root
     $path = Join-Path $location.root 'machine-component.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "導入記録のないフォルダーを保持しました: $($location.root)" }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if ($AllowMissingFiles -and @(Get-ChildItem -LiteralPath $location.root -Force).Count -eq 0) { return $null }
+        throw "導入記録のないフォルダーを保持しました: $($location.root)"
+    }
     Assert-MoyaiSandboxProtectedPath $path
     $receipt = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($receipt.schema -ne 1 -or $receipt.product -cne 'moyai-machine-component' -or $receipt.component -cne $Component -or $receipt.install_root -ine $location.root -or $receipt.source_manifest_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw "導入記録が配置と一致しません: $path" }
@@ -197,6 +200,36 @@ function Assert-MoyaiComponentStopped([string]$Root, [object[]]$Processes = @(Ge
     $boundary=[IO.Path]::GetFullPath($Root).TrimEnd('\','/') + '\'
     foreach ($process in $Processes) {
         if ($process.Path -and $process.Path.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { throw "この導入先のアプリが起動中です。正常終了してから再実行してください。PID $($process.Id): $($process.Path)" }
+    }
+}
+
+function Publish-MoyaiComponentPayload($Transaction) {
+    $location=$Transaction.location
+    Assert-MoyaiComponentStopped $location.root
+    if($null -eq $Transaction.old -and (Test-Path -LiteralPath $location.root)) {
+        if(@(Get-ChildItem -LiteralPath $location.root -Force).Count -ne 0) { throw '導入先の内容が確認後に変更されました。再実行してください。' }
+        Remove-Item -LiteralPath $location.root
+    }
+    if(Test-Path -LiteralPath $location.root) {
+        $backup=Join-Path $location.parent ($location.component+'.previous-'+[Guid]::NewGuid().ToString('N'))
+        Move-Item -LiteralPath $location.root -Destination $backup
+        $Transaction.backup=$backup
+    }
+    Move-Item -LiteralPath $Transaction.stage -Destination $location.root
+    $Transaction.published=$true
+    [void](Read-MoyaiInstalledComponent $location.component -VerifyHashes)
+}
+
+function Restore-MoyaiComponentPayload($Transaction) {
+    $location=$Transaction.location
+    if($Transaction.published) {
+        Assert-MoyaiComponentStopped $location.root
+        Move-Item -LiteralPath $location.root -Destination $Transaction.stage
+        $Transaction.published=$false
+    }
+    if($Transaction.backup -and -not(Test-Path -LiteralPath $location.root)) {
+        Move-Item -LiteralPath $Transaction.backup -Destination $location.root
+        $Transaction.backup=$null
     }
 }
 
@@ -232,7 +265,7 @@ function Remove-MoyaiComponentPayload([string]$Root, $Receipt) {
 function Remove-MoyaiMachineLegacyModules([string[]]$Components,[switch]$SharedRuntime) {
     $parent=(Get-MoyaiComponentLocation 'Desktop').parent
     foreach($component in $Components) {
-        foreach($candidate in @(Get-ChildItem -LiteralPath $parent -Directory -Filter ($component+'.previous-*'))) {
+        foreach($candidate in @(Get-ChildItem -LiteralPath $parent -Directory | Where-Object { $_.Name.StartsWith($component+'.previous-',[StringComparison]::OrdinalIgnoreCase) -or $_.Name.StartsWith('.'+$component+'.stage-',[StringComparison]::OrdinalIgnoreCase) })) {
             try {
                 Assert-MoyaiSandboxProtectedPath $candidate.FullName
                 Assert-MoyaiComponentStopped $candidate.FullName
@@ -248,15 +281,18 @@ function Remove-MoyaiMachineLegacyModules([string[]]$Components,[switch]$SharedR
     if($SharedRuntime) {
         $legacy=Join-Path $parent 'Sandbox'
         if(Test-Path -LiteralPath $legacy) { Write-Output "旧Sandboxを保持しました。現在の導入記録だけでは所有ファイルと参照元を確認できません: $legacy" }
-        foreach($candidate in @(Get-ChildItem -LiteralPath $parent -Directory -Filter 'SandboxService.previous-*')) {
+        foreach($candidate in @(Get-ChildItem -LiteralPath $parent -Directory | Where-Object { $_.Name.StartsWith('SandboxService.previous-',[StringComparison]::OrdinalIgnoreCase) -or $_.Name.StartsWith('SandboxService.stage-',[StringComparison]::OrdinalIgnoreCase) })) {
             try {
                 Assert-MoyaiSandboxProtectedPath $candidate.FullName
                 Assert-MoyaiComponentStopped $candidate.FullName
-                $receipt=Get-Content -LiteralPath (Join-Path $candidate.FullName 'installation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+                $receiptPath=Join-Path $candidate.FullName 'installation.json'
+                Assert-MoyaiSandboxProtectedPath $receiptPath
+                $receipt=Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 if($receipt.schema -ne 1 -or $receipt.product -cne 'moyai-machine-sandbox' -or $receipt.service -cne 'MoyAISandbox' -or $receipt.install_root -cne (Get-MoyaiSandboxLocation).root) { throw '共通サービスの旧導入記録を確認できません。' }
                 foreach($file in $receipt.files) {
                     if($file.name -cne [IO.Path]::GetFileName($file.name) -or $file.name -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$' -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw '旧導入記録のファイル一覧が不正です。' }
                     $path=Join-Path $candidate.FullName $file.name
+                    if(-not(Test-Path -LiteralPath $path)) { continue }
                     Assert-MoyaiSandboxProtectedPath $path
                     if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $file.sha256) { throw '旧実行ファイルが導入記録と一致しません。' }
                 }
@@ -316,19 +352,15 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                 $sandbox=Get-MoyaiSandboxLocation
                 $service=Get-MoyaiSandboxService -Security
                 if($null -ne $service) {
-                    Assert-MoyaiSandboxService $service $sandbox -Security
+                    Assert-MoyaiSandboxService $service $sandbox -AllowDisabled -Security
                     if(Test-Path -LiteralPath $sandbox.root) { [void](Read-MoyaiSandboxInstallation $sandbox -AllowMissingFiles) }
-                    if($service.State -ne 1) { throw '共通サービスが使用中です。すべてのDesktop/Runnerを正常終了してから削除してください。アプリはまだ削除していません。' }
+                    Assert-MoyaiSandboxClientsStopped
                 } elseif(Test-Path -LiteralPath $sandbox.root) { [void](Read-MoyaiSandboxInstallation $sandbox -AllowMissingFiles) }
             }
             if($null -ne $BeforeRemoval) {
                 if(-not $Uninstall) { throw '削除前処理はアンインストール専用です。' }
                 & $BeforeRemoval
                 foreach($component in $Components) { Assert-MoyaiComponentStopped (Get-MoyaiComponentLocation $component).root }
-            }
-            if(-not $Uninstall -and $Components -ccontains 'Desktop') {
-                . (Join-Path $SourceRoot 'scripts/common.ps1')
-                Invoke-MoyaiMachineSandboxSetup $SourceRoot -ExpectedManifestSha256 $ExpectedManifestSha256
             }
             if($RemoveSharedRuntime) {
                 # The canonical service transaction disables new starts and checks
@@ -342,7 +374,13 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                     if($null -ne $old) {
                         $removal=Remove-MoyaiComponentPayload $location.root $old
                         foreach($path in $removal.retained) { Write-Output "追加・変更されたファイルを保持しました: $path" }
-                    } else { Write-Output "既に削除されています: $component" }
+                    } else {
+                        if(Test-Path -LiteralPath $location.root) {
+                            if(@(Get-ChildItem -LiteralPath $location.root -Force).Count -ne 0) { throw '削除対象の内容が確認後に変更されました。再実行してください。' }
+                            Remove-Item -LiteralPath $location.root
+                        }
+                        Write-Output "既に削除されています: $component"
+                    }
                     continue
                 }
                 $stage=Join-Path $parent ('.'+$component+'.stage-'+[Guid]::NewGuid().ToString('N'))
@@ -372,17 +410,24 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                 Write-MoyaiComponentJson (Join-Path $stage 'machine-component.json') $receipt
                 Set-MoyaiComponentTreeOwner $stage
                 Set-MoyaiSandboxProtection $stage $true
-                $backup=$null
-                if(Test-Path -LiteralPath $location.root) { $backup=Join-Path $parent ($component+'.previous-'+[Guid]::NewGuid().ToString('N')); Move-Item -LiteralPath $location.root -Destination $backup }
-                try { Move-Item -LiteralPath $stage -Destination $location.root }
-                catch { if($backup -and -not(Test-Path -LiteralPath $location.root)) { Move-Item -LiteralPath $backup -Destination $location.root }; throw }
+                $transaction=[pscustomobject]@{location=$location;stage=$stage;old=$old;backup=$null;published=$false}
+                # Finish copying and checking the new application before stopping
+                # its shared helper. Source/download failures leave the old install usable.
+                if($component -ceq 'Desktop') {
+                    . (Join-Path $SourceRoot 'scripts/common.ps1')
+                    Invoke-MoyaiMachineSandboxSetup $SourceRoot -ExpectedManifestSha256 $ExpectedManifestSha256 -ComponentContext $transaction -PublishComponent {param($context) Publish-MoyaiComponentPayload $context} -RestoreComponent {param($context) Restore-MoyaiComponentPayload $context}
+                } else {
+                    try { Publish-MoyaiComponentPayload $transaction }
+                    catch { Restore-MoyaiComponentPayload $transaction; throw }
+                }
+                $backup=$transaction.backup
                 if($backup) {
                     $removal=Remove-MoyaiComponentPayload $backup $old
                     foreach($path in $removal.retained) { Write-Output "追加・変更された旧配置ファイルを保持しました: $path" }
                 }
                 Write-Output "導入が完了しました: $component $($receipt.version) / $($location.root)"
             }
-            Remove-MoyaiMachineLegacyModules $Components -SharedRuntime:$RemoveSharedRuntime
+            Remove-MoyaiMachineLegacyModules $Components -SharedRuntime:($RemoveSharedRuntime -or (-not $Uninstall -and $Components -ccontains 'Desktop'))
         } finally { $lock.Dispose() }
         if($Uninstall -and $RemoveSharedRuntime) { Remove-MoyaiEmptyMachineParent }
     } finally { Close-MoyaiSandboxSourcePins $pins }
