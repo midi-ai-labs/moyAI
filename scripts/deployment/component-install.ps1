@@ -383,6 +383,9 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                     }
                     continue
                 }
+                # The elevated entry starts in a fresh process. Load runtime and
+                # helper functions before preparing the Desktop payload.
+                if($component -ceq 'Desktop') { . (Join-Path $SourceRoot 'scripts/common.ps1') }
                 $stage=Join-Path $parent ('.'+$component+'.stage-'+[Guid]::NewGuid().ToString('N'))
                 [void](New-Item -ItemType Directory -Path $stage)
                 Set-MoyaiSandboxProtection $stage $true -Private
@@ -414,7 +417,6 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                 # Finish copying and checking the new application before stopping
                 # its shared helper. Source/download failures leave the old install usable.
                 if($component -ceq 'Desktop') {
-                    . (Join-Path $SourceRoot 'scripts/common.ps1')
                     Invoke-MoyaiMachineSandboxSetup $SourceRoot -ExpectedManifestSha256 $ExpectedManifestSha256 -ComponentContext $transaction -PublishComponent {param($context) Publish-MoyaiComponentPayload $context} -RestoreComponent {param($context) Restore-MoyaiComponentPayload $context}
                 } else {
                     try { Publish-MoyaiComponentPayload $transaction }
