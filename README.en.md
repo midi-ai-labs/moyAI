@@ -89,7 +89,7 @@ Global settings apply to future work; session settings can override the selected
 
 The optional global `model.compaction_budget_tokens` setting (`MOYAI_COMPACTION_BUDGET_TOKENS`) sets when automatic compaction starts. When omitted, moyAI uses its normal working context limit. An explicit value must be positive and no greater than the effective input limit derived from `context_window`; automatic compaction starts at the smaller of that value and the normal working limit. With `context_window = 131072`, setting `98304` starts automatic compaction at 98,304 estimated input tokens. This setting also applies to Main through Hub and shared execution; generation output limits belong to the LLM host.
 
-`model.max_retries` bounds automatic retries for connection-establishment failures and provider rate limits (HTTP 429 or SSE error code `429` / `rate_limit_exceeded`). A rate-limit retry uses the same endpoint and request only before any output, reasoning, tool-call data or usage has arrived. Retry waits are 10, 20, 40 seconds and so on, doubling up to a 300-second cap. Retries share the existing request deadline; cancellation interrupts the wait. Partial generations and other provider errors are not replayed.
+`model.max_retries` bounds automatic retries for connection-establishment failures and provider rate limits (HTTP 429 or SSE error code `429` / `rate_limit_exceeded`). A rate-limit retry uses the same endpoint and request only before any output, reasoning, tool-call data or usage has arrived. For a direct HTTP 429 with a valid `Retry-After`, moyAI waits for the specified number of seconds or until the HTTP date. Zero and past dates allow an immediate retry. Other retry waits start at 10 seconds and double up to 300 seconds. Retries share the existing request deadline; cancellation interrupts the wait. Partial generations and other provider errors are not replayed.
 
 The model can also call `compact_context` with its own concise working summary. moyAI keeps the latest user input and recent completed work, validates that the summary reduces the active context, and saves it through the existing conversation history. Original messages and tool results remain available. This design takes conceptual inspiration from [Context Language Models](https://github.com/facebookresearch/context-language-models) and is implemented within moyAI's own history and tool system.
 
@@ -114,9 +114,11 @@ On Windows, Run and TUI use the installed sandbox helper without startup UAC. He
 
 ## Project Instructions
 
-Project instructions can come from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md` and local `SKILL.md` files. Files and tools remain subject to the selected workspace and permission mode. Existing files are the source of project state; rejoining a Hub project does not need a special history-restoration procedure.
+Project instructions can come from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md` and local `SKILL.md` files. The model-visible Skill list reserves names first and uses the remaining space for descriptions, up to 64 skills including the built-in skill and 16 KiB in total. Files and tools remain subject to the selected workspace and permission mode. Existing files are the source of project state; rejoining a Hub project does not need a special history-restoration procedure.
 
-External MCP tools remain configurable. The retired manual moyAI-to-moyAI publishing workflow is not the setup route for new shared work; use Hub projects. Saved legacy records remain available through [MCP history](docs/mcp-history-guide.md).
+Stopping an external HTTP MCP tool sends the server a cancellation notification for the in-flight request ID. The server decides whether it can interrupt the operation. The retired manual moyAI-to-moyAI publishing workflow is not the setup route for new shared work; use Hub projects. Saved legacy records remain available through [MCP history](docs/mcp-history-guide.md).
+
+When ordinary shell output exceeds its limit, moyAI retains the beginning and end of stdout and stderr separately and reports the omitted byte count. The saved preview artifact contains the captured output.
 
 ## Permissions and Platform Limits
 

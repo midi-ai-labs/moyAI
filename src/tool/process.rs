@@ -454,10 +454,7 @@ impl Drop for WindowsJob {
 }
 
 fn empty_pipe_output() -> BoundedPipeOutput {
-    BoundedPipeOutput {
-        bytes: Vec::new(),
-        truncated: false,
-    }
+    BoundedPipeOutput::default()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -2395,8 +2395,7 @@ mod windows {
         maximum: usize,
     ) -> std::thread::JoinHandle<(BoundedPipeOutput, Option<String>)> {
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let mut truncated = false;
+            let mut capture = crate::tool::truncate::PipeCapture::new(maximum);
             let mut error = None;
             let mut buffer = [0u8; 8 * 1024];
             loop {
@@ -2420,12 +2419,9 @@ mod windows {
                 if read == 0 {
                     break;
                 }
-                let chunk = &buffer[..read as usize];
-                let remaining = maximum.saturating_sub(bytes.len());
-                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                truncated |= chunk.len() > remaining;
+                capture.append(&buffer[..read as usize]);
             }
-            (BoundedPipeOutput { bytes, truncated }, error)
+            (capture.finish(), error)
         })
     }
 
@@ -2529,10 +2525,7 @@ mod windows {
     }
 
     fn empty_output() -> BoundedPipeOutput {
-        BoundedPipeOutput {
-            bytes: Vec::new(),
-            truncated: false,
-        }
+        BoundedPipeOutput::default()
     }
 
     #[cfg(test)]
@@ -2598,6 +2591,18 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn native_pipe_drains_large_writes_and_preserves_both_ends() {
+            let (reader, writer) = super::create_pipe_pair("output").unwrap();
+            let input = [b"HEAD".as_slice(), &vec![b'x'; 100_000], b"TAIL!"].concat();
+            let reader = super::read_pipe_bounded(reader, 9);
+            super::write_pipe(writer, input).join().unwrap().unwrap();
+            let (output, error) = reader.join().unwrap();
+            assert_eq!(error, None);
+            assert_eq!(output.bytes, b"HEADTAIL!");
+            assert_eq!(output.omitted_bytes, Some(100_000));
+        }
+
         use std::collections::HashMap;
 
         use super::{
@@ -4329,7 +4334,7 @@ mod integration_tests {
                     "-NoProfile".to_string(),
                     "-NonInteractive".to_string(),
                     "-Command".to_string(),
-                    "$chunk='x' * 8192; 1..32 | ForEach-Object { [Console]::Out.Write($chunk); [Console]::Error.Write($chunk) }; exit 7".to_string(),
+                    "$chunk='x' * 8192; [Console]::Out.Write('out:'); [Console]::Error.Write('err:'); 1..32 | ForEach-Object { [Console]::Out.Write($chunk); [Console]::Error.Write($chunk) }; [Console]::Out.Write('done'); [Console]::Error.Write('fail'); exit 7".to_string(),
                 ],
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
@@ -4348,6 +4353,10 @@ mod integration_tests {
         assert!(output.stderr.truncated);
         assert_eq!(output.stdout.bytes.len(), 1_024);
         assert_eq!(output.stderr.bytes.len(), 1_024);
+        assert!(output.stdout.bytes.starts_with(b"out:") && output.stdout.bytes.ends_with(b"done"));
+        assert!(output.stderr.bytes.starts_with(b"err:") && output.stderr.bytes.ends_with(b"fail"));
+        assert_eq!(output.stdout.omitted_bytes, Some(32 * 8192 + 8 - 1024));
+        assert_eq!(output.stderr.omitted_bytes, output.stdout.omitted_bytes);
         assert!(
             output.cleanup_errors.is_empty(),
             "{:?}",

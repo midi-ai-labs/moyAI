@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use eventsource_stream::{EventStreamError, Eventsource};
@@ -125,7 +125,10 @@ impl OpenAiCompatClient {
             {
                 return result;
             }
-            let delay = retry_delay_ms(sink.attempt.min(u16::from(u8::MAX)) as u8, None);
+            let delay = sink.retry_after.map_or_else(
+                || Duration::from_millis(retry_delay_ms(sink.attempt)),
+                |(received, delay)| delay.saturating_sub(received.elapsed()),
+            );
             if !sleep_retry_delay_until_deadline(delay, &cancel, &deadline).await {
                 if cancel.is_cancelled() {
                     return Ok(LlmResponseSummary {
@@ -582,6 +585,12 @@ impl OpenAiCompatClient {
                     if response.status().is_success() {
                         return Ok(Some(StartedResponse { response }));
                     }
+                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                        let received = Instant::now();
+                        trace.retry_after =
+                            retry_after_delay(response.headers(), SystemTime::now())
+                                .map(|delay| (received, delay));
+                    }
                     let Some(failure) =
                         parse_response_failure_until_cancelled(response, cancel, deadline).await?
                     else {
@@ -598,7 +607,7 @@ impl OpenAiCompatClient {
                     if should_retry_transport_error(&error)
                         && attempt <= u16::from(deadlines.max_connect_retries) =>
                 {
-                    let delay = retry_delay_ms(attempt.min(u16::from(u8::MAX)) as u8, None);
+                    let delay = Duration::from_millis(retry_delay_ms(attempt));
                     if !sleep_retry_delay_until_deadline(delay, cancel, deadline).await {
                         if cancel.is_cancelled() {
                             return Ok(None);
@@ -625,6 +634,7 @@ struct ProviderTraceSink<'a> {
     last_progress_elapsed_ms: Option<u64>,
     failure_origin: Option<ProviderTraceFailureOrigin>,
     replay_blocked: bool,
+    retry_after: Option<(Instant, Duration)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,6 +655,7 @@ impl<'a> ProviderTraceSink<'a> {
             last_progress_elapsed_ms: None,
             failure_origin: None,
             replay_blocked: false,
+            retry_after: None,
         }
     }
 
@@ -661,6 +672,7 @@ impl<'a> ProviderTraceSink<'a> {
 
     fn begin_attempt(&mut self, attempt: u16) -> Result<(), LlmError> {
         self.attempt = attempt;
+        self.retry_after = None;
         self.first_progress_seen = false;
         self.last_progress_elapsed_ms = None;
         self.phase(ProviderPhase::AttemptStarted)
@@ -1408,16 +1420,15 @@ fn stream_missing_tool_name_error(delta_index: usize) -> LlmError {
 }
 
 async fn sleep_retry_delay_until_deadline(
-    delay_ms: u64,
+    delay: Duration,
     cancel: &CancellationToken,
     deadline: &OperationDeadline,
 ) -> bool {
-    let delay = Duration::from_millis(delay_ms);
     let sleep_for = deadline
         .remaining()
         .map_or(delay, |remaining| remaining.min(delay));
     if sleep_for.is_zero() {
-        return false;
+        return !cancel.is_cancelled() && deadline.remaining().is_none_or(|left| !left.is_zero());
     }
     tokio::select! {
         biased;
@@ -1521,11 +1532,20 @@ fn responses_frame_has_model_data(frame: &Value) -> bool {
         })
 }
 
-fn retry_delay_ms(attempt: u8, header_delay_ms: Option<u64>) -> u64 {
-    if let Some(delay) = header_delay_ms {
-        return delay.min(RETRY_MAX_DELAY_MS);
+fn retry_after_delay(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() {
+        return None;
     }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or_default())
+}
 
+fn retry_delay_ms(attempt: u16) -> u64 {
     let pow = RETRY_BACKOFF_FACTOR.saturating_pow(u32::from(attempt.saturating_sub(1)));
     (RETRY_INITIAL_DELAY_MS.saturating_mul(pow)).min(RETRY_MAX_DELAY_MS)
 }
@@ -2461,7 +2481,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use axum::body::{Body, Bytes};
     use axum::extract::State;
@@ -2470,14 +2490,15 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use futures_util::StreamExt;
+    use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::{
         ChatStreamAccumulator, OpenAiCompatClient, PartialToolCall, ProviderStreamBudget,
         ProviderStreamBudgetStage, is_complete_chatml_artifact_sequence, parse_finish_reason,
-        resolve_finish_reason, retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
-        to_usage, validate_streamed_tool_calls,
+        resolve_finish_reason, retry_after_delay, retry_delay_ms, to_openai_request,
+        to_openai_request_with_reasoning, to_usage, validate_streamed_tool_calls,
     };
     use crate::config::model::{
         ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
@@ -3628,11 +3649,42 @@ mod tests {
             (5, 160_000),
             (6, 300_000),
         ] {
-            assert_eq!(retry_delay_ms(attempt, None), delay_ms);
+            assert_eq!(retry_delay_ms(attempt), delay_ms);
         }
         for attempt in 6..=u8::MAX {
-            assert_eq!(retry_delay_ms(attempt, None), 300_000);
+            assert_eq!(retry_delay_ms(attempt.into()), 300_000);
         }
+    }
+
+    #[test]
+    fn http_retry_after_parses_delta_and_absolute_time() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let cases = [
+            ("0".into(), Some(0)),
+            ("3600".into(), Some(3600)),
+            (
+                httpdate::fmt_http_date(now + Duration::from_secs(41)),
+                Some(41),
+            ),
+            (
+                httpdate::fmt_http_date(now - Duration::from_secs(1)),
+                Some(0),
+            ),
+            ("-1".into(), None),
+            ("0.5".into(), None),
+            ("later".into(), None),
+        ];
+        let mut headers = HeaderMap::new();
+        for (value, expected) in cases {
+            headers.insert("retry-after", HeaderValue::from_str(&value).unwrap());
+            assert_eq!(
+                retry_after_delay(&headers, now),
+                expected.map(Duration::from_secs)
+            );
+        }
+        headers.insert("retry-after", HeaderValue::from_static("0"));
+        headers.append("retry-after", HeaderValue::from_static("2"));
+        assert_eq!(retry_after_delay(&headers, now), None);
     }
 
     #[test]
@@ -6239,6 +6291,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_http_retry_after_controls_both_wire_modes_under_one_deadline() {
+        for mode in [ProviderApiMode::ChatCompletions, ProviderApiMode::Responses] {
+            for (header, should_retry) in [
+                ("0", true),
+                ("1", true),
+                ("Thu, 01 Jan 1970 00:00:00 GMT", true),
+                ("60", false),
+                ("invalid", false),
+            ] {
+                let (_, completed) = rate_limit_frames(mode, json!("429"));
+                let (base_url, requests, server) = start_status_sequence_with_retry_after(vec![
+                    (StatusCode::TOO_MANY_REQUESTS, Some(header), "{}".into()),
+                    (StatusCode::OK, None, completed),
+                ])
+                .await;
+                let mut request = rate_limit_request(&base_url, mode);
+                let mut deadlines = request.provider_target().deadlines();
+                deadlines.request_timeout_ms = if should_retry { 4_000 } else { 250 };
+                replace_provider_deadlines(&mut request, deadlines);
+                let mut sink = RecordingLlmEventSink::default();
+                let started = std::time::Instant::now();
+                let result = OpenAiCompatClient::new(None)
+                    .stream_chat(request, CancellationToken::new(), &mut sink)
+                    .await;
+                server.abort();
+                let seen = requests.lock().unwrap();
+                if should_retry {
+                    result.unwrap();
+                    assert_eq!(concatenated_text(&sink.events), "Recovered.");
+                    assert_eq!(seen.len(), 2);
+                    assert_eq!(seen[0], seen[1]);
+                    if header == "1" {
+                        assert!(started.elapsed() >= Duration::from_secs(1));
+                    }
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().provider_failure().unwrap().kind,
+                        ProviderFailureKind::RequestTimeout
+                    );
+                    assert_eq!(seen.len(), 1);
+                }
+                assert_single_logical_request_with_attempts(&sink, seen.len() as u16);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn http_rate_limit_retries_but_retains_http_failure_diagnostics() {
         for api_mode in [ProviderApiMode::ChatCompletions, ProviderApiMode::Responses] {
             let (_, completed) = rate_limit_frames(api_mode, json!("429"));
@@ -7739,6 +7838,15 @@ mod tests {
     async fn start_status_sequence_fixture(
         responses: Vec<(StatusCode, String)>,
     ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        start_status_sequence_with_retry_after(
+            responses.into_iter().map(|(s, b)| (s, None, b)).collect(),
+        )
+        .await
+    }
+
+    async fn start_status_sequence_with_retry_after(
+        responses: Vec<(StatusCode, Option<&'static str>, String)>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
         let responses = Arc::new(responses);
@@ -7750,15 +7858,18 @@ mod tests {
             async move {
                 recorded.lock().unwrap().push(request);
                 let index = next_response.fetch_add(1, Ordering::SeqCst);
-                let (status, body) = responses
-                    .get(index)
-                    .cloned()
-                    .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, "unexpected retry".into()));
-                Response::builder()
+                let (status, retry_after, body) = responses.get(index).cloned().unwrap_or((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    "unexpected retry".into(),
+                ));
+                let mut reply = Response::builder()
                     .status(status)
-                    .header(CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(body))
-                    .unwrap()
+                    .header(CONTENT_TYPE, "text/event-stream");
+                if let Some(retry_after) = retry_after {
+                    reply = reply.header("retry-after", retry_after);
+                }
+                reply.body(Body::from(body)).unwrap()
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

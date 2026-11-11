@@ -326,63 +326,63 @@ pub fn render_available_skills_from_snapshot(snapshot: &SkillsSnapshot) -> Strin
         .filter(|skill| builtin_skill(&skill.name).is_none())
         .collect::<Vec<_>>();
     let total = skills.len() + 1;
-    let header =
-        "Use the `skill` tool when the current task clearly matches one of these built-in or workspace skills:"
-            .to_string();
-    let mut entries = vec![format!(
-        "- {}: [built-in] {}",
+    let header = format!(
+        "Use the `skill` tool when the current task clearly matches one of these built-in or workspace skills:\n- {}: [built-in] {}",
         builtin.name, builtin.description
-    )];
-    for skill in skills
-        .iter()
-        .take(MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES - entries.len())
-    {
-        let entry = format!("- {}: {}", skill.name, skill.description);
-        let prospective_bytes = header.len()
-            + entries.iter().map(String::len).sum::<usize>()
-            + entries.len()
-            + 1
-            + entry.len();
-        if prospective_bytes > MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES {
+    );
+    let mut remaining = MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES - header.len();
+    let all_names_fit = total <= MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES
+        && skills
+            .iter()
+            .map(|skill| "\n- ".len() + skill.name.len())
+            .sum::<usize>()
+            <= remaining;
+    let mut lines = vec![header];
+    let mut descriptions = Vec::new();
+    for skill in skills {
+        if lines.len() == MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES {
             break;
         }
-        entries.push(entry);
-    }
-
-    let mut omitted = total.saturating_sub(entries.len());
-    let mut omission = (omitted > 0).then(|| skill_catalog_omission(total, omitted));
-    while omission.as_ref().is_some_and(|diagnostic| {
-        rendered_skill_catalog_bytes(&header, &entries, Some(diagnostic))
-            > MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES
-    }) {
-        if entries.len() <= 1 {
-            break;
+        let name_bytes = "\n- ".len() + skill.name.len();
+        let omitted = total - lines.len() - 1;
+        let notice_bytes = if all_names_fit {
+            0
+        } else {
+            1 + skill_catalog_omission(total, omitted).len()
+        };
+        if name_bytes + notice_bytes <= remaining {
+            remaining -= name_bytes;
+            descriptions.push((lines.len(), skill.description.as_str()));
+            lines.push(format!("- {}", skill.name));
         }
-        entries.pop();
-        omitted = omitted.saturating_add(1);
-        omission = Some(skill_catalog_omission(total, omitted));
     }
-
-    let mut lines = Vec::with_capacity(1 + entries.len() + usize::from(omission.is_some()));
-    lines.push(header);
-    lines.extend(entries);
-    if let Some(diagnostic) = omission {
-        lines.push(diagnostic);
+    let omitted = total - lines.len();
+    if omitted > 0 {
+        let notice = skill_catalog_omission(total, omitted);
+        remaining -= 1 + notice.len();
+        lines.push(notice);
+    }
+    // Allocate short descriptions first so unused space can go to longer ones.
+    descriptions.sort_by_key(|(_, description)| description.len());
+    let count = descriptions.len();
+    for (position, (line, description)) in descriptions.into_iter().enumerate() {
+        let allowance = remaining / (count - position);
+        let text = crate::tool::truncate::clip_text_with_ellipsis(
+            description,
+            allowance.saturating_sub(2),
+        );
+        if !text.is_empty() {
+            remaining -= 2 + text.len();
+            lines[line].push_str(": ");
+            lines[line].push_str(&text);
+        }
     }
     lines.join("\n")
 }
 
-fn rendered_skill_catalog_bytes(header: &str, entries: &[String], omission: Option<&str>) -> usize {
-    header.len()
-        + entries.iter().map(String::len).sum::<usize>()
-        + omission.map_or(0, str::len)
-        + entries.len()
-        + usize::from(omission.is_some())
-}
-
 fn skill_catalog_omission(total: usize, omitted: usize) -> String {
     format!(
-        "[Skill catalog bounded: included {} of {total}; omitted {omitted}. Limits: {} complete entries and {} UTF-8 bytes.]",
+        "[Skill catalog bounded: included {} of {total}; omitted {omitted}. Limits: {} names and {} UTF-8 bytes.]",
         total.saturating_sub(omitted),
         MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES,
         MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES
@@ -698,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn model_visible_catalog_uses_a_deterministic_complete_entry_prefix() {
+    fn model_visible_catalog_preserves_order_and_counts_the_builtin_toward_the_limit() {
         let root = Utf8Path::new("/fixture");
         let skills = (0..70)
             .map(|index| DiscoveredSkill {
@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn model_visible_catalog_never_truncates_an_oversized_entry() {
+    fn model_visible_catalog_reserves_later_names_and_short_descriptions() {
         let root = Utf8Path::new("/fixture");
         let oversized_description = "x".repeat(MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
         let snapshot = SkillsSnapshot {
@@ -741,7 +741,7 @@ mod tests {
                 },
                 DiscoveredSkill {
                     name: "later".to_string(),
-                    description: "must remain after the omitted prefix".to_string(),
+                    description: "short description".to_string(),
                     path: root.join(format!("later/{SKILL_FILE_NAME}")),
                     base_dir: root.join("later"),
                 },
@@ -752,9 +752,40 @@ mod tests {
 
         assert!(rendered.len() <= MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
         assert!(!rendered.contains(&oversized_description));
-        assert!(!rendered.contains("- later:"));
+        assert!(rendered.contains("- oversized: "));
+        assert!(rendered.contains("- later: short description"));
         assert!(rendered.contains(BUILTIN_SECURITY_REVIEW_NAME));
-        assert!(rendered.contains("included 1 of 3; omitted 2"));
+        assert!(!rendered.contains("omitted 2"));
+        let mut oversized_name = snapshot;
+        oversized_name.skills[0].name = "界".repeat(MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
+        let rendered = render_available_skills_from_snapshot(&oversized_name);
+        assert!(rendered.contains("- later: short description"));
+        assert!(rendered.contains("included 2 of 3; omitted 1"));
+    }
+
+    #[test]
+    fn model_visible_catalog_can_use_the_entire_byte_budget_for_a_complete_name() {
+        let root = Utf8Path::new("/fixture");
+        let mut snapshot = SkillsSnapshot {
+            workspace_root: root.to_owned(),
+            roots: vec![],
+            skills: vec![],
+        };
+        let header = render_available_skills_from_snapshot(&snapshot);
+        let name = "n".repeat(MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES - header.len() - "\n- ".len());
+        snapshot.skills.push(DiscoveredSkill {
+            name,
+            description: "description".into(),
+            path: root.join(SKILL_FILE_NAME),
+            base_dir: root.to_owned(),
+        });
+        let exact = render_available_skills_from_snapshot(&snapshot);
+        assert_eq!(exact.len(), MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
+        assert!(exact.ends_with(&snapshot.skills[0].name));
+        snapshot.skills[0].name.push('n');
+        let omitted = render_available_skills_from_snapshot(&snapshot);
+        assert!(omitted.contains("included 1 of 2; omitted 1"));
+        assert!(!omitted.contains("nnnn"));
     }
 
     #[test]
@@ -792,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_remains_visible_when_catalog_bytes_require_omitting_workspace_skills() {
+    fn builtin_and_workspace_names_remain_visible_when_descriptions_share_the_byte_limit() {
         let root = Utf8Path::new("/fixture");
         let snapshot = SkillsSnapshot {
             workspace_root: root.to_path_buf(),
@@ -814,12 +845,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rendered.len() <= MAX_MODEL_VISIBLE_SKILL_CATALOG_BYTES);
         assert!(entries[0].contains(BUILTIN_SECURITY_REVIEW_NAME));
-        assert!(entries.len() < MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES);
+        assert_eq!(entries.len(), MAX_MODEL_VISIBLE_SKILL_CATALOG_ENTRIES);
         assert!(
             entries
                 .iter()
                 .skip(1)
-                .all(|line| line.ends_with(&"確認".repeat(80)))
+                .all(|line| line.contains(": 確認") && line.ends_with("..."))
         );
         assert!(rendered.contains(&format!(
             "included {} of 71; omitted {}",

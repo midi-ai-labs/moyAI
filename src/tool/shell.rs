@@ -23,7 +23,7 @@ use crate::tool::registry::Tool;
 use crate::tool::sandbox_process::{
     SandboxedProcessRequest, captured_process_environment, execute_workspace_write_observed,
 };
-use crate::tool::truncate::clip_text_with_ellipsis;
+use crate::tool::truncate::{BoundedPipeOutput, clip_text_with_ellipsis};
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, GuardedPath, PathGuard};
 
@@ -137,7 +137,7 @@ impl Tool for ShellTool {
         )
         .await?;
         effect_admission.finish_started_effect()?;
-        let merged_output = format_shell_output_for_display(
+        let sections = shell_output_sections(
             &input.command,
             &output.stdout,
             &output.stderr,
@@ -145,8 +145,9 @@ impl Tool for ShellTool {
             output.timed_out,
             output.cancelled,
         );
-        let preview = ctx.services.truncator.preview(
-            merged_output,
+        let preview = ctx.services.truncator.preview_shell(
+            &sections,
+            [output.stdout_omitted_bytes, output.stderr_omitted_bytes],
             &ctx.config.tool_output,
             &ctx.services.storage_paths,
         )?;
@@ -167,6 +168,8 @@ impl Tool for ShellTool {
                 "effect_started": output.effect_started,
                 "stdout_capture_truncated": output.stdout_truncated,
                 "stderr_capture_truncated": output.stderr_truncated,
+                "stdout_capture_omitted_bytes": output.stdout_omitted_bytes,
+                "stderr_capture_omitted_bytes": output.stderr_omitted_bytes,
                 "truncated": preview.truncated,
                 "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled && !output.cleanup_failed,
                 "cleanup_failed": output.cleanup_failed,
@@ -349,18 +352,18 @@ fn shell_requested_elevation(input: &ShellInput) -> Result<bool, ToolError> {
     Ok(requested)
 }
 
-fn format_shell_output_for_display(
+fn shell_output_sections(
     command: &str,
     stdout: &str,
     stderr: &str,
     exit_code: Option<i32>,
     timed_out: bool,
     cancelled: bool,
-) -> String {
+) -> [String; 3] {
     [
-        format!("Command: {}", command.trim()),
         format!(
-            "Exit code: {}{}",
+            "Command: {}\n\nExit code: {}{}",
+            command.trim(),
             exit_code
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -389,7 +392,6 @@ fn format_shell_output_for_display(
             }
         ),
     ]
-    .join("\n\n")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -403,6 +405,8 @@ pub(crate) struct CommandOutput {
     cleanup_failed: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    stdout_omitted_bytes: Option<u64>,
+    stderr_omitted_bytes: Option<u64>,
 }
 
 fn classify_shell_sandbox_failure_hint(
@@ -457,6 +461,8 @@ async fn execute_shell_command(
             cleanup_failed: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_omitted_bytes: None,
+            stderr_omitted_bytes: None,
         });
     }
     let family = configured_shell_family(shell);
@@ -561,6 +567,8 @@ async fn execute_shell_command_observed(
             cleanup_failed: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_omitted_bytes: None,
+            stderr_omitted_bytes: None,
         });
     }
     let arguments = shell_arguments(family, command_text);
@@ -611,8 +619,8 @@ async fn execute_shell_command_observed(
         let completed = completed.ok_or_else(|| {
             ToolError::Message("no shell program candidate could be launched".to_string())
         })?;
-        let stdout = captured_shell_text(&completed.stdout.bytes, completed.stdout.truncated);
-        let mut stderr = captured_shell_text(&completed.stderr.bytes, completed.stderr.truncated);
+        let stdout = captured_shell_text(&completed.stdout);
+        let mut stderr = captured_shell_text(&completed.stderr);
         let cleanup_error = completed.cleanup_error();
         if let Some(cleanup_error) = &cleanup_error {
             if !stderr.is_empty() {
@@ -630,6 +638,8 @@ async fn execute_shell_command_observed(
             cleanup_failed: cleanup_error.is_some(),
             stdout_truncated: completed.stdout.truncated,
             stderr_truncated: completed.stderr.truncated,
+            stdout_omitted_bytes: completed.stdout.omitted_bytes,
+            stderr_omitted_bytes: completed.stderr.omitted_bytes,
         });
     }
 
@@ -689,8 +699,8 @@ async fn execute_shell_command_observed(
     let cleanup_error = completed.cleanup_error();
     let stdout_capture = completed.stdout;
     let stderr_capture = completed.stderr;
-    let stdout = captured_shell_text(&stdout_capture.bytes, stdout_capture.truncated);
-    let mut stderr = captured_shell_text(&stderr_capture.bytes, stderr_capture.truncated);
+    let stdout = captured_shell_text(&stdout_capture);
+    let mut stderr = captured_shell_text(&stderr_capture);
     for message in [
         timed_out.then_some("command timed out"),
         cancelled.then_some("command cancelled by user"),
@@ -716,6 +726,8 @@ async fn execute_shell_command_observed(
         cleanup_failed: execution_error.is_some() || cleanup_error.is_some(),
         stdout_truncated: stdout_capture.truncated,
         stderr_truncated: stderr_capture.truncated,
+        stdout_omitted_bytes: stdout_capture.omitted_bytes,
+        stderr_omitted_bytes: stderr_capture.omitted_bytes,
     })
 }
 
@@ -848,9 +860,39 @@ fn apply_captured_shell_environment(
     command.envs(environment);
 }
 
-fn captured_shell_text(bytes: &[u8], truncated: bool) -> String {
-    let mut text = decode_shell_bytes_for_display(bytes);
-    if truncated {
+fn captured_shell_text(output: &BoundedPipeOutput) -> String {
+    if let Some(omitted) = output.omitted_bytes {
+        let (head, tail) = output.bytes.split_at(output.bytes.len() / 2);
+        // A retained split may cut a UTF-8 character at either edge of the gap.
+        let head_end = match std::str::from_utf8(head) {
+            Ok(_) => Some(head.len()),
+            Err(error) if error.error_len().is_none() => Some(error.valid_up_to()),
+            Err(_) => None,
+        };
+        let tail_start = tail
+            .iter()
+            .take(3)
+            .take_while(|&&b| b & 0xc0 == 0x80)
+            .count();
+        let (head, tail, omitted) = if let Some(end) = head_end
+            && std::str::from_utf8(&tail[tail_start..]).is_ok()
+        {
+            (
+                &head[..end],
+                &tail[tail_start..],
+                omitted + (head.len() - end + tail_start) as u64,
+            )
+        } else {
+            (head, tail, omitted)
+        };
+        return format!(
+            "{}\n[shell stream capture truncated: {omitted} bytes omitted]\n{}",
+            decode_shell_bytes_for_display(head),
+            decode_shell_bytes_for_display(tail)
+        );
+    }
+    let mut text = decode_shell_bytes_for_display(&output.bytes);
+    if output.truncated {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
@@ -2858,14 +2900,15 @@ mod tests {
 
     #[test]
     fn shell_output_is_factual_without_retry_coaching() {
-        let output = super::format_shell_output_for_display(
+        let output = super::shell_output_sections(
             "Get-Process",
             "powershell 123",
             "error",
             Some(1),
             false,
             false,
-        );
+        )
+        .join("\n\n");
         assert!(output.contains("Exit code: 1"));
         assert!(output.contains("Stdout:\npowershell 123"));
         assert!(!output.contains("Recovery:"));
@@ -2893,6 +2936,8 @@ mod tests {
             cleanup_failed: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_omitted_bytes: None,
+            stderr_omitted_bytes: None,
         };
         let signature = "PermissionError: [WinError 5] Access is denied: 'C:\\Temp\\moyai-sandbox-effect-ABC\\pytest'";
 
@@ -4517,7 +4562,27 @@ mod tests {
 
         assert!(output.effect_started);
         assert!(output.stdout_truncated);
-        assert!(output.stdout.ends_with("[shell stream capture truncated]"));
+        assert!(output.stdout.starts_with("START"));
+        assert!(output.stdout.ends_with("FINAL"));
+        assert!(output.stdout.contains("2026 bytes omitted"));
+        assert_eq!(output.stdout_omitted_bytes, Some(2026));
+    }
+
+    #[test]
+    fn shell_capture_handles_split_utf8_and_legacy_broker_prefixes() {
+        let mut capture = crate::tool::truncate::PipeCapture::new(8);
+        capture.append("始🙂中🙂終".as_bytes());
+        let text = super::captured_shell_text(&capture.finish());
+        assert_eq!(
+            text,
+            "始\n[shell stream capture truncated: 11 bytes omitted]\n終"
+        );
+        let legacy =
+            serde_json::from_value(serde_json::json!({"bytes":[65],"truncated":true})).unwrap();
+        assert_eq!(
+            super::captured_shell_text(&legacy),
+            "A\n[shell stream capture truncated]"
+        );
     }
 
     #[cfg(windows)]
@@ -4980,11 +5045,11 @@ mod tests {
 
     #[cfg(windows)]
     fn large_output_command() -> &'static str {
-        "[Console]::Out.Write(('x' * 2048))"
+        "[Console]::Out.Write('START' + ('x' * 2048) + 'FINAL')"
     }
 
     #[cfg(not(windows))]
     fn large_output_command() -> &'static str {
-        "yes x | head -c 2048 | tr -d '\\n'"
+        "printf START; printf '%02048d' 0; printf FINAL"
     }
 }

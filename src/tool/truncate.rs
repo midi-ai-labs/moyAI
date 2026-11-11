@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Write as _;
 
@@ -11,10 +12,59 @@ use crate::tool::TruncatedToolOutput;
 #[derive(Debug, Clone, Default)]
 pub struct ToolTruncator;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BoundedPipeOutput {
     pub bytes: Vec<u8>,
     pub truncated: bool,
+    /// Older brokers return only a prefix when truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_bytes: Option<u64>,
+}
+
+pub(crate) struct PipeCapture {
+    limit: usize,
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: u64,
+}
+
+impl PipeCapture {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total: 0,
+        }
+    }
+
+    pub(crate) fn append(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
+        let head_capacity = self.limit / 2;
+        let head_len = (head_capacity - self.head.len()).min(chunk.len());
+        self.head.extend_from_slice(&chunk[..head_len]);
+        let rest = &chunk[head_len..];
+        let tail_capacity = self.limit - head_capacity;
+        if rest.len() >= tail_capacity {
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - tail_capacity..]);
+        } else {
+            let overflow = self.tail.len().saturating_sub(tail_capacity - rest.len());
+            self.tail.drain(..overflow);
+            self.tail.extend(rest);
+        }
+    }
+
+    pub(crate) fn finish(self) -> BoundedPipeOutput {
+        let mut bytes = self.head;
+        bytes.extend(self.tail);
+        let omitted = self.total - bytes.len() as u64;
+        BoundedPipeOutput {
+            bytes,
+            truncated: omitted > 0,
+            omitted_bytes: (omitted > 0).then_some(omitted),
+        }
+    }
 }
 
 pub(crate) async fn read_pipe_bounded<T>(
@@ -24,26 +74,48 @@ pub(crate) async fn read_pipe_bounded<T>(
 where
     T: AsyncRead + Unpin,
 {
-    let mut stored = Vec::with_capacity(max_bytes.min(8 * 1024));
-    let mut truncated = false;
+    let mut capture = PipeCapture::new(max_bytes);
     let mut chunk = [0_u8; 8 * 1024];
     loop {
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
             break;
         }
-        let remaining = max_bytes.saturating_sub(stored.len());
-        let retained = remaining.min(read);
-        stored.extend_from_slice(&chunk[..retained]);
-        truncated |= retained < read;
+        capture.append(&chunk[..read]);
     }
-    Ok(BoundedPipeOutput {
-        bytes: stored,
-        truncated,
-    })
+    Ok(capture.finish())
 }
 
 impl ToolTruncator {
+    pub(crate) fn preview_shell(
+        &self,
+        sections: &[String; 3],
+        [stdout_omitted, stderr_omitted]: [Option<u64>; 2],
+        limits: &ToolOutputConfig,
+        paths: &StoragePaths,
+    ) -> Result<TruncatedToolOutput, ToolError> {
+        let mut output = self.preview_chunks(sections, "\n\n", limits, paths)?;
+        if let Some(path) = &output.truncated_output_path {
+            // Share the preview between the command, stdout and stderr. Short
+            // sections leave their unused allowance to the longer ones.
+            let bytes = shell_section_budgets(
+                sections.each_ref().map(String::len),
+                limits.max_bytes.saturating_sub(4),
+            );
+            let lines = shell_section_budgets(
+                sections.each_ref().map(|s| s.lines().count()),
+                limits.max_lines.saturating_sub(2),
+            );
+            let capture_omitted = [None, stdout_omitted, stderr_omitted];
+            let parts: [String; 3] = std::array::from_fn(|i| {
+                shell_section_preview(&sections[i], bytes[i], lines[i], capture_omitted[i])
+            });
+            output.preview_text =
+                format!("{}\nCaptured output saved to: {path}", parts.join("\n\n"));
+        }
+        Ok(output)
+    }
+
     pub fn preview(
         &self,
         text: String,
@@ -110,6 +182,52 @@ impl ToolTruncator {
             internal_file_lease: Some(internal_file_lease),
         })
     }
+}
+
+fn shell_section_budgets(needed: [usize; 3], mut available: usize) -> [usize; 3] {
+    let mut order = [0, 1, 2];
+    order.sort_by_key(|&i| needed[i]);
+    let mut budgets = [0; 3];
+    for (rank, i) in order.into_iter().enumerate() {
+        budgets[i] = needed[i].min(available / (3 - rank));
+        available -= budgets[i];
+    }
+    budgets
+}
+
+fn shell_section_preview(
+    text: &str,
+    bytes: usize,
+    lines: usize,
+    capture_omitted: Option<u64>,
+) -> String {
+    if text.len() <= bytes && text.lines().count() <= lines {
+        return text.to_owned();
+    }
+    let head_budget = bytes / 2;
+    let head = &text[..text.floor_char_boundary(head_budget.min(text.len()))];
+    let tail = utf8_suffix_within_bytes(text, bytes - head_budget);
+    let head_lines = lines / 2;
+    let tail_lines = lines - head_lines;
+    let head = if head_lines == 0 {
+        ""
+    } else {
+        head.match_indices('\n')
+            .nth(head_lines - 1)
+            .map_or(head, |(end, _)| &head[..end])
+    };
+    let tail = if tail_lines == 0 {
+        ""
+    } else {
+        tail.rmatch_indices('\n')
+            .nth(tail_lines - 1)
+            .map_or(tail, |(start, _)| &tail[start + 1..])
+    };
+    let omitted = text.len() - head.len() - tail.len();
+    let capture = capture_omitted
+        .map(|n| format!(", {n} source bytes omitted during capture"))
+        .unwrap_or_default();
+    format!("{head}\n[preview truncated: {omitted} display bytes omitted{capture}]\n{tail}")
 }
 
 fn append_segment(
@@ -256,8 +374,39 @@ mod tests {
             .expect("read bounded output");
         write.await.expect("join fixture writer");
 
-        assert_eq!(output.bytes, b"0123");
+        assert_eq!(output.bytes, b"0189");
+        assert_eq!(output.omitted_bytes, Some(6));
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn pipe_capture_is_independent_of_chunk_size_and_marks_only_an_actual_gap() {
+        let input = b"0123456789";
+        for limit in 0..=input.len() + 1 {
+            for chunk_size in 1..=input.len() {
+                let mut capture = super::PipeCapture::new(limit);
+                for chunk in input.chunks(chunk_size) {
+                    capture.append(chunk);
+                }
+                let output = capture.finish();
+                let omitted = input.len().saturating_sub(limit);
+                assert_eq!(output.truncated, omitted > 0);
+                assert_eq!(
+                    output.omitted_bytes,
+                    (omitted > 0).then_some(omitted as u64)
+                );
+                let expected = if omitted == 0 {
+                    input.to_vec()
+                } else {
+                    [
+                        &input[..limit / 2],
+                        &input[input.len() - (limit - limit / 2)..],
+                    ]
+                    .concat()
+                };
+                assert_eq!(output.bytes, expected);
+            }
+        }
     }
 
     #[test]
@@ -288,6 +437,52 @@ mod tests {
                 .expect("read spool");
         assert_eq!(stored, "abcd\nefgh\nijkl");
         assert!(!output.preview_text.contains("Use `read`"));
+    }
+
+    #[test]
+    fn shell_preview_keeps_the_last_line_of_each_stream_and_spools_the_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(temp.path()).unwrap();
+        let paths = crate::storage::StoragePaths {
+            data_dir: root.to_owned(),
+            database_path: root.join("test.db"),
+            truncation_dir: root.join("truncated"),
+        };
+        let sections = [
+            "Command: build\n\nExit code: 1".to_owned(),
+            format!("Stdout:\nSTART\n{}OUT END", "中間\n".repeat(60)),
+            format!("Stderr:\nSTART\n{}ERR END", "故障\n".repeat(60)),
+        ];
+        for (max_bytes, max_lines) in [(120, 200), (2000, 15)] {
+            let limits = crate::config::ToolOutputConfig {
+                max_bytes,
+                max_lines,
+                max_results: 10,
+            };
+            let output = super::ToolTruncator
+                .preview_shell(&sections, [Some(9000), Some(1200)], &limits, &paths)
+                .unwrap();
+            for marker in [
+                "Exit code: 1",
+                "Stdout:\nSTART",
+                "Stderr:\nSTART",
+                "OUT END",
+                "ERR END",
+                "9000 source bytes omitted during capture",
+                "1200 source bytes omitted during capture",
+                "Captured output saved",
+            ] {
+                assert!(
+                    output.preview_text.contains(marker),
+                    "{}",
+                    output.preview_text
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(output.truncated_output_path.unwrap()).unwrap(),
+                sections.join("\n\n")
+            );
+        }
     }
 
     #[test]

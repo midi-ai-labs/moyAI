@@ -17,6 +17,8 @@ fn stopped_output() -> CommandOutput {
         cleanup_failed: false,
         stdout_truncated: false,
         stderr_truncated: false,
+        stdout_omitted_bytes: None,
+        stderr_omitted_bytes: None,
     }
 }
 

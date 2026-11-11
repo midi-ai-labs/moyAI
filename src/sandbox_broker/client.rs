@@ -434,14 +434,8 @@ pub(crate) fn execute(
     if request.cancel.is_cancelled() {
         return Ok(SandboxedProcessOutput {
             exit_code: None,
-            stdout: crate::tool::truncate::BoundedPipeOutput {
-                bytes: Vec::new(),
-                truncated: false,
-            },
-            stderr: crate::tool::truncate::BoundedPipeOutput {
-                bytes: Vec::new(),
-                truncated: false,
-            },
+            stdout: Default::default(),
+            stderr: Default::default(),
             timed_out: false,
             cancelled: true,
             effect_started: false,

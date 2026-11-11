@@ -8,6 +8,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{McpConfig, McpServerConfig};
 use crate::error::ToolError;
@@ -40,6 +41,30 @@ struct ConnectedEndpoint {
     endpoint: String,
     /// None preserves legacy endpoints that accept tools/list without initialization.
     session: Option<NegotiatedSession>,
+}
+
+// Dropping a running tool also retires its HTTP waiter. The server can still
+// finish the original request, so cancellation uses that request's own ID.
+struct PendingToolCall(Option<reqwest::RequestBuilder>);
+
+impl PendingToolCall {
+    fn notify(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let request = self.0.take()?;
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        Some(runtime.spawn(async move {
+            let _ = request.send().await;
+        }))
+    }
+}
+
+impl Drop for PendingToolCall {
+    fn drop(&mut self) {
+        self.notify();
+    }
+}
+
+fn mcp_call_cancelled() -> ToolError {
+    ToolError::Message("MCP tool call cancelled".into())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +344,18 @@ impl McpClient {
         server_id: &str,
         tool_name: &str,
         arguments: Value,
+        effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
+    ) -> Result<McpOperationResult, ToolError> {
+        self.call_tool_with_cancel(server_id, tool_name, arguments, None, effect_checkpoint)
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_cancel(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        cancel: Option<&CancellationToken>,
         mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
         if !self.config.enabled {
@@ -338,31 +375,42 @@ impl McpClient {
             )));
         }
 
-        let cached = tokio::time::timeout_at(deadline, self.connections[&server.id].lock())
-            .await
-            .map_err(|_| mcp_deadline_error(server))?
-            .clone();
-        let connection = if let Some(connection) = cached {
-            connection
-        } else {
-            let (connection, response) = self
-                .resolve_endpoint_with_tools_list(server, deadline, &mut effect_checkpoint)
-                .await?;
-            let tools = parse_tools(&response)?;
-            if !tools.iter().any(|tool| tool.name == tool_name) {
-                return Err(ToolError::Message(format!(
-                    "mcp server `{}` did not advertise tool `{tool_name}` during endpoint resolution",
-                    server.id
-                )));
+        let resolve = async {
+            let cached = tokio::time::timeout_at(deadline, self.connections[&server.id].lock())
+                .await
+                .map_err(|_| mcp_deadline_error(server))?
+                .clone();
+            if let Some(connection) = cached {
+                Ok(connection)
+            } else {
+                let (connection, response) = self
+                    .resolve_endpoint_with_tools_list(server, deadline, &mut effect_checkpoint)
+                    .await?;
+                let tools = parse_tools(&response)?;
+                if !tools.iter().any(|tool| tool.name == tool_name) {
+                    return Err(ToolError::Message(format!(
+                        "mcp server `{}` did not advertise tool `{tool_name}` during endpoint resolution",
+                        server.id
+                    )));
+                }
+                Ok(connection)
             }
-            connection
+        };
+        let connection = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(mcp_call_cancelled()),
+                connection = resolve => connection?,
+            }
+        } else {
+            resolve.await?
         };
         // The effectful request has exactly one transport boundary. Endpoint
         // discovery is completed by a read-only tools/list call before this
         // point, so an ambiguous HTTP failure can never replay tools/call at a
         // fallback URL.
         let response = self
-            .post_wire(
+            .post_wire_with_cancel(
                 server,
                 &connection.endpoint,
                 json!({
@@ -376,6 +424,7 @@ impl McpClient {
                 }),
                 connection.session.as_ref(),
                 deadline,
+                cancel,
                 &mut effect_checkpoint,
             )
             .await?;
@@ -452,9 +501,32 @@ impl McpClient {
         &self,
         server: &McpServerConfig,
         endpoint: &str,
+        payload: Value,
+        session: Option<&NegotiatedSession>,
+        deadline: Instant,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
+    ) -> Result<McpHttpReply, ToolError> {
+        self.post_wire_with_cancel(
+            server,
+            endpoint,
+            payload,
+            session,
+            deadline,
+            None,
+            effect_checkpoint,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_wire_with_cancel(
+        &self,
+        server: &McpServerConfig,
+        endpoint: &str,
         mut payload: Value,
         session: Option<&NegotiatedSession>,
         deadline: Instant,
+        cancel: Option<&CancellationToken>,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpHttpReply, ToolError> {
         if payload.get("id").is_some() {
@@ -479,7 +551,6 @@ impl McpClient {
             request = request.header(name, value);
         }
 
-        let request = request.body(prepared.body);
         // Re-check the typed run owner at every actual send boundary. Endpoint
         // discovery may issue multiple read-only tools/list requests, while a
         // tools/call request reaches this boundary exactly once.
@@ -487,8 +558,23 @@ impl McpClient {
         if Instant::now() >= deadline {
             return Err(mcp_deadline_error(server));
         }
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(mcp_call_cancelled());
+        }
+        let mut pending = PendingToolCall(cancel.and_then(|_| {
+            Some(
+                request
+                    .try_clone()?
+                    .timeout(Duration::from_secs(2))
+                    .json(&json!({
+                        "jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": { "requestId": sent_id.as_ref()? }
+                    })),
+            )
+        }));
+        let request = request.body(prepared.body);
         let endpoint = prepared.endpoint.to_string();
-        tokio::time::timeout_at(deadline, async {
+        let response = tokio::time::timeout_at(deadline, async {
             let response = request
                 .send()
                 .await
@@ -551,9 +637,23 @@ impl McpClient {
                 invalid_session_header,
                 invalid_host,
             })
-        })
-        .await
-        .map_err(|_| mcp_deadline_error(server))?
+        });
+        let result = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                result = response => result,
+                _ = cancel.cancelled() => {
+                    if let Some(notification) = pending.notify() {
+                        let _ = tokio::time::timeout_at(deadline, notification).await;
+                    }
+                    return Err(mcp_call_cancelled());
+                }
+            }
+        } else {
+            response.await
+        };
+        pending.0 = None;
+        result.map_err(|_| mcp_deadline_error(server))?
     }
 
     async fn resolve_endpoint_with_tools_list(
@@ -1591,6 +1691,173 @@ mod tests {
         assert_eq!(target_requests.load(Ordering::SeqCst), 0);
         source_server.abort();
         target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn external_http_stop_cancels_only_the_in_flight_request_on_its_session() {
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = routed_config();
+        config.servers[0].base_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        config.servers[0]
+            .headers
+            .insert("authorization".into(), "Bearer fixture".into());
+        config.servers[0].timeout_ms = 8_000;
+        let client = Arc::new(McpClient::new(config));
+        let (observed, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let finish = CancellationToken::new();
+        let release = finish.clone();
+        let app = Router::new().route("/mcp", post(move |headers: axum::http::HeaderMap, Json(payload): Json<Value>| {
+            let observed = observed.clone();
+            let release = release.clone();
+            async move {
+                if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some("Bearer fixture") {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                let rpc = |result| Json(json!({"jsonrpc":"2.0","id":payload["id"],"result":result}));
+                if payload["method"] == "initialize" {
+                    return ([("mcp-session-id", "test-session")], rpc(json!({
+                        "protocolVersion": STREAMABLE_PROTOCOL_VERSION, "capabilities":{"tools":{}}, "serverInfo":{}
+                    }))).into_response();
+                }
+                if headers.get("mcp-session-id").and_then(|h| h.to_str().ok()) != Some("test-session") {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                match payload["method"].as_str() {
+                    Some("notifications/initialized") => StatusCode::ACCEPTED.into_response(),
+                    Some("tools/list") => rpc(json!({"tools":[{"name":"change"}]})).into_response(),
+                    Some("tools/call") => {
+                        observed.send(payload.clone()).unwrap();
+                        release.cancelled().await;
+                        rpc(json!({"content":[{"type":"text","text":"finished"}]})).into_response()
+                    }
+                    Some("notifications/cancelled") => {
+                        observed.send(payload).unwrap();
+                        StatusCode::ACCEPTED.into_response()
+                    }
+                    _ => StatusCode::BAD_REQUEST.into_response(),
+                }
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        client.list_tools("fixture", || Ok(())).await.unwrap();
+        let start = |label, cancel: CancellationToken| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .call_tool_with_cancel(
+                        "fixture",
+                        "change",
+                        json!({"label":label}),
+                        Some(&cancel),
+                        || Ok(()),
+                    )
+                    .await
+            })
+        };
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert!(start("never sent", stopped).await.unwrap().is_err());
+        let stop = CancellationToken::new();
+        let first = start("stop", stop.clone());
+        let other = start("keep", CancellationToken::new());
+        let dropped = start("drop", CancellationToken::new());
+        let mut ids = HashMap::new();
+        for _ in 0..3 {
+            let call = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(call["method"], "tools/call");
+            assert!(
+                ids.insert(
+                    call["params"]["arguments"]["label"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    call["id"].as_u64().unwrap()
+                )
+                .is_none()
+            );
+        }
+        assert_ne!(ids["keep"], ids["stop"]);
+        assert_ne!(ids["drop"], ids["stop"]);
+        assert_ne!(ids["keep"], ids["drop"]);
+        for (label, expected) in [("stop", ids["stop"]), ("drop", ids["drop"])] {
+            if label == "stop" {
+                stop.cancel();
+            } else {
+                dropped.abort();
+            }
+            let notification = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                notification,
+                json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":expected}})
+            );
+        }
+        assert!(
+            first
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(dropped.await.unwrap_err().is_cancelled());
+        assert!(!other.is_finished());
+        finish.cancel();
+        assert!(matches!(
+            other.await.unwrap().unwrap(),
+            McpOperationResult::ToolCalled { .. }
+        ));
+        client.list_tools("fixture", || Ok(())).await.unwrap();
+        assert!(events.try_recv().is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unresponsive_cancellation_notification_keeps_the_local_call_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = routed_config();
+        config.servers[0].base_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        config.servers[0].timeout_ms = 500;
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let (sent, mut notification) = tokio::sync::oneshot::channel();
+        let sent = Arc::new(std::sync::Mutex::new(Some(sent)));
+        let app = Router::new().route("/mcp", post(move |Json(call): Json<Value>| {
+            let cancel = signal.clone();
+            let sent = sent.clone();
+            async move {
+                if call["method"] == "tools/list" {
+                    return Json(json!({"jsonrpc":"2.0","id":call["id"],"result":{"tools":[{"name":"change"}]}}));
+                }
+                if call["method"] == "tools/call" {
+                    cancel.cancel();
+                } else if call["method"] == "notifications/cancelled" {
+                    let _ = sent.lock().unwrap().take().unwrap().send(());
+                }
+                std::future::pending().await
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = McpClient::new(config);
+        let call =
+            client.call_tool_with_cancel("fixture", "change", json!({}), Some(&cancel), || Ok(()));
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("call exceeded its own deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        notification.try_recv().expect("the server saw the stop");
+        server.abort();
     }
 
     #[tokio::test]

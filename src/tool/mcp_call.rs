@@ -101,10 +101,11 @@ impl Tool for McpCallTool {
                 Some(tool_name) => {
                     ctx.services
                         .mcp
-                        .call_tool(
+                        .call_tool_with_cancel(
                             &input.server_id,
                             tool_name,
                             input.arguments.unwrap_or(Value::Object(Default::default())),
+                            Some(&ctx.cancel),
                             || effect_admission.admit(),
                         )
                         .await?
