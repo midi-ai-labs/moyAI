@@ -90,6 +90,7 @@ function fakeSession({ clock, workspace = process.cwd(), approval = false, revie
   const turns = ["01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX", "01ARZ3NDEKTSV4RRFFQ69G5FAY", "01ARZ3NDEKTSV4RRFFQ69G5FAZ"];
   const events = [], calls = [], records = [], documents = [];
   let turn = 0, value = "", mode = "completed";
+  const pendingDialogs = [null, "41"];
   const surface = () => {
     const p = { confirmation_visible: mode === "approval", confirmation_id: mode === "approval" ? "42" : null,
       confirmation: mode === "approval" ? { summary: "Run tests", details: ["python -m unittest"], remote: null } : null,
@@ -99,9 +100,12 @@ function fakeSession({ clock, workspace = process.cwd(), approval = false, revie
       draft_target: { sessionId }, run_target: { workspacePath: workspace, sessionId,
         expectedState: { kind: "idle", latestTurnId: turns[turn], admissionRevision: String(turn) } },
       stop_target: { kind: "turn", workspacePath: workspace, sessionId, turnId: turns[turn], admissionRevision: String(turn) } };
+    let visiblePermissionId = null;
+    if (mode === "approval") visiblePermissionId = pendingDialogs.length ? pendingDialogs.shift() : p.confirmation_id;
     return { projection: p, composer: { count: 1, visible: true, run_target: structuredClone(p.run_target) },
       session_usage: { count: 0, visible: false, text: null, title: null, state: null },
-      visible_dialog_count: mode === "approval" ? 1 : 0, visible_modal_backdrop_count: mode === "approval" ? 1 : 0,
+      visible_permission_id: visiblePermissionId,
+      visible_dialog_count: visiblePermissionId ? 1 : 0, visible_modal_backdrop_count: visiblePermissionId ? 1 : 0,
       visible_fatal_count: 0, visible_recoverable_error_count: 0,
       prompt: { count: 1, visible: true, enabled: true, value }, send: { count: 1, visible: true, enabled: true } };
   };
@@ -197,6 +201,7 @@ test("operator review consumes the case budget and an expired approval uses the 
       reviewTimeouts.push(options.timeoutMs); clock.now += elapsed; return { status: "decided", decision: "approve" };
     } });
     const result = await live.send("canonical request");
+    assert.equal(documents.find(row => row.name.endsWith("/1-pending.json")).data.surface.visible_permission_id, "42");
     assert.deepEqual(reviewTimeouts, [1000]);
     assert.equal(live.observationBudget.remainingMs(), 1000 - elapsed);
     assert.equal(result.incomplete, elapsed === 1000);

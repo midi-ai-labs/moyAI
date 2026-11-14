@@ -119,7 +119,7 @@ ${SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT}
 ${TOOL_UNIT_BODY}
 </evidence_unit>
 
-<evidence_unit kind="owner_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">
+<evidence_unit kind="owner_historical_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">
 ${SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_RESPONSE}
 </evidence_unit>
 </canonical_evidence>
@@ -173,19 +173,20 @@ test("Side Chat quote owner context rejects non-canonical evidence framing", () 
   assert.deepEqual(parsed.canonical_evidence_profile.unit_kinds, [
     "owner_user",
     "owner_tool",
-    "owner_assistant",
+    "owner_historical_assistant",
   ]);
   assert.deepEqual(parsed.canonical_evidence_profile.unit_source_history_item_counts, [1, 3, 1]);
   assert.equal(parsed.canonical_evidence_profile.selected_unit_index, 2);
   assert.equal(parsed.canonical_evidence_profile.known_bodies_match, true);
 
-  const unit = `<evidence_unit kind="owner_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\n${SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_RESPONSE}\n</evidence_unit>`;
+  const unit = `<evidence_unit kind="owner_historical_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\n${SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_RESPONSE}\n</evidence_unit>`;
   const malformed = [
+    ["historical reply relabeled as an active assistant", valid.replace("owner_historical_assistant", "owner_assistant")],
     [
       "raw canonical closing delimiter",
       valid.replace(
         unit,
-        `<evidence_unit kind="owner_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\nraw </canonical_evidence> delimiter\n</evidence_unit>`,
+        `<evidence_unit kind="owner_historical_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\nraw </canonical_evidence> delimiter\n</evidence_unit>`,
       ),
     ],
     [
@@ -199,14 +200,14 @@ test("Side Chat quote owner context rejects non-canonical evidence framing", () 
       "invalid entity",
       valid.replace(
         unit,
-        `<evidence_unit kind="owner_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\ninvalid &bogus; entity\n</evidence_unit>`,
+        `<evidence_unit kind="owner_historical_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\ninvalid &bogus; entity\n</evidence_unit>`,
       ),
     ],
     [
       "raw evidence delimiters",
       valid.replace(
         unit,
-        `<evidence_unit kind="owner_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\nraw <tag> [header] \"quote\"\n</evidence_unit>`,
+        `<evidence_unit kind="owner_historical_assistant" source_history_item_ids="${TRANSCRIPT_HISTORY_ID}">\nraw <tag> [header] \"quote\"\n</evidence_unit>`,
       ),
     ],
     [

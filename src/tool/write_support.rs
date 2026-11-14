@@ -1749,10 +1749,16 @@ pub(crate) fn read_text_file_with_identity(
         size_bytes: after.len(),
         content_sha256: format!("{:x}", Sha256::digest(&bytes)),
     };
-    let text = String::from_utf8(bytes).map_err(|error| {
-        EditError::Message(format!("path `{path}` is not valid UTF-8 text: {error}"))
-    })?;
-    Ok((text, identity))
+    use crate::tool::text_encoding::{TextEncoding, decode_text};
+    let decoded = decode_text(bytes)
+        .map_err(|_| EditError::Message(format!("path `{path}` is not valid UTF-8 text")))?;
+    if decoded.encoding != TextEncoding::Utf8 {
+        return Err(EditError::Message(format!(
+            "path `{path}` can be read as {}. Editing an existing file requires UTF-8. Preserve its original encoding when using an editor.",
+            decoded.encoding.label()
+        )));
+    }
+    Ok((decoded.text, identity))
 }
 
 pub(crate) fn to_summary(change: &FileChange) -> ChangeSummary {
@@ -1782,6 +1788,18 @@ mod tests {
         )
         .expect("test workspace");
         PathGuard::require_path(&workspace, path, AccessKind::Edit).expect("guarded target")
+    }
+
+    #[test]
+    fn edit_reports_the_read_encoding_and_preserves_the_original_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("notes.txt")).unwrap();
+        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("確認");
+        std::fs::write(&path, &bytes).unwrap();
+        let error = super::read_text_file_with_identity(&guarded_path(&path), 1024).unwrap_err();
+        assert!(error.to_string().contains("shift_jis"));
+        assert!(error.to_string().contains("UTF-8"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_ref());
     }
 
     #[test]

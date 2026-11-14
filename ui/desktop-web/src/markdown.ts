@@ -4,28 +4,18 @@ export function renderMarkdown(value: string): string {
   const lines = value.replace(/\r\n/g, "\n").split("\n");
   let html = "";
   let paragraph: string[] = [];
-  let listItems: string[] = [];
-  let orderedItems: string[] = [];
+  const lists: { indent: number; tag: "ul" | "ol" }[] = [];
   let quoteLines: string[] = [];
   let tableLines: string[] = [];
   let codeLines: string[] = [];
-  let inCode = false;
+  let fence: { indent: number; length: number } | null = null;
 
   const flushParagraph = () => {
     if (paragraph.length === 0) return;
     html += `<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`;
     paragraph = [];
   };
-  const flushList = () => {
-    if (listItems.length > 0) {
-      html += `<ul>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`;
-      listItems = [];
-    }
-    if (orderedItems.length > 0) {
-      html += `<ol>${orderedItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ol>`;
-      orderedItems = [];
-    }
-  };
+  const closeList = () => { html += `</li></${lists.pop()!.tag}>`; };
   const flushQuote = () => {
     if (quoteLines.length === 0) return;
     html += `<blockquote>${quoteLines.map((line) => `<p>${renderInlineMarkdown(line)}</p>`).join("")}</blockquote>`;
@@ -59,30 +49,50 @@ export function renderMarkdown(value: string): string {
   const flushTextBlocks = () => {
     flushTable();
     flushParagraph();
-    flushList();
     flushQuote();
   };
 
   for (const line of lines) {
-    const fence = line.match(/^```/);
+    const trimmed = line.trim();
+    const indent = line.length - line.trimStart().length;
     if (fence) {
-      if (inCode) {
+      if (/^`{3,}$/.test(trimmed) && trimmed.length >= fence.length) {
         html += `<pre class="md-code"><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`;
         codeLines = [];
-        inCode = false;
+        fence = null;
       } else {
-        flushTextBlocks();
-        inCode = true;
+        codeLines.push(line.slice(Math.min(indent, fence.indent)));
       }
       continue;
     }
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-    const trimmed = line.trim();
     if (trimmed.length === 0) {
       flushTextBlocks();
+      continue;
+    }
+    const item = trimmed.match(/^(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/);
+    if (item) {
+      flushTextBlocks();
+      const tag = item[1] ? "ul" : "ol";
+      while (lists.length && lists.at(-1)!.indent > indent) closeList();
+      if (lists.at(-1)?.indent === indent && lists.at(-1)!.tag !== tag) closeList();
+      if (lists.at(-1)?.indent === indent) {
+        html += "</li>";
+      } else {
+        const start = tag === "ol" && Number(item[2]) !== 1 ? ` start="${Number(item[2])}"` : "";
+        html += `<${tag}${start}>`;
+        lists.push({ indent, tag });
+      }
+      html += `<li>${renderInlineMarkdown(item[3])}`;
+      continue;
+    }
+    if (lists.length && indent <= lists.at(-1)!.indent) {
+      flushTextBlocks();
+      while (lists.length && indent <= lists.at(-1)!.indent) closeList();
+    }
+    const opening = trimmed.match(/^(`{3,})[^`]*$/);
+    if (opening) {
+      flushTextBlocks();
+      fence = { indent, length: opening[1].length };
       continue;
     }
     if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
@@ -92,49 +102,33 @@ export function renderMarkdown(value: string): string {
     }
     if (looksLikeTableLine(trimmed)) {
       flushParagraph();
-      flushList();
       flushQuote();
       tableLines.push(trimmed);
       continue;
     }
     flushTable();
-    const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       flushTextBlocks();
-      const level = heading[1].length + 2;
+      const level = Math.min(6, heading[1].length + 2);
       html += `<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`;
-      continue;
-    }
-    const bullet = trimmed.match(/^[-*]\s+(.+)$/);
-    if (bullet) {
-      flushParagraph();
-      flushQuote();
-      listItems.push(bullet[1]);
-      continue;
-    }
-    const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
-    if (ordered) {
-      flushParagraph();
-      flushQuote();
-      orderedItems.push(ordered[1]);
       continue;
     }
     const quote = trimmed.match(/^>\s?(.*)$/);
     if (quote) {
       flushParagraph();
-      flushList();
       quoteLines.push(quote[1]);
       continue;
     }
-    flushList();
     flushQuote();
-    paragraph.push(line);
+    paragraph.push(lists.length ? trimmed : line);
   }
 
-  if (inCode) {
+  if (fence) {
     html += `<pre class="md-code"><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`;
   }
   flushTextBlocks();
+  while (lists.length) closeList();
   return html || `<p>${escapeHtml(value)}</p>`;
 }
 
@@ -165,13 +159,13 @@ function renderInlineMarkdown(value: string): string {
     html += escapeHtml(value.slice(cursor, token.start));
     if (token.kind === "code") {
       html += `<code>${escapeHtml(token.content)}</code>`;
-    } else if (token.kind === "strong") {
-      html += `<strong>${renderInlineMarkdown(token.content)}</strong>`;
-    } else {
+    } else if (token.kind === "link") {
       const href = safeMarkdownHref(token.href);
       html += href
-        ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${renderInlineMarkdown(token.content)}</a>`
+        ? `<a href="${escapeHtml(href)}"${href.startsWith("#") ? "" : ' data-markdown-web-link rel="noreferrer"'}>${renderInlineMarkdown(token.content)}</a>`
         : renderInlineMarkdown(token.content);
+    } else {
+      html += `<${token.kind}>${renderInlineMarkdown(token.content)}</${token.kind}>`;
     }
     cursor = token.end;
   }
@@ -180,7 +174,7 @@ function renderInlineMarkdown(value: string): string {
 
 type InlineToken =
   | { kind: "code"; start: number; end: number; content: string }
-  | { kind: "strong"; start: number; end: number; content: string }
+  | { kind: "strong" | "em" | "del"; start: number; end: number; content: string }
   | { kind: "link"; start: number; end: number; content: string; href: string };
 
 function nextInlineToken(value: string, cursor: number): InlineToken | null {
@@ -188,10 +182,18 @@ function nextInlineToken(value: string, cursor: number): InlineToken | null {
     delimitedInlineToken(value, cursor, "`", "code"),
     delimitedInlineToken(value, cursor, "**", "strong"),
     delimitedInlineToken(value, cursor, "__", "strong"),
+    matchedInlineToken(value, cursor, /(?<!\*)\*(?![\s*])([^*]+?)(?<!\s)\*(?!\*)/g, "em"),
+    matchedInlineToken(value, cursor, /~~(?![\s~])([^~]+?)(?<!\s)~~/g, "del"),
     markdownLinkToken(value, cursor),
   ].filter((candidate): candidate is InlineToken => candidate !== null);
   candidates.sort((left, right) => left.start - right.start || inlineTokenPriority(left) - inlineTokenPriority(right));
   return candidates[0] ?? null;
+}
+
+function matchedInlineToken(value: string, cursor: number, expression: RegExp, kind: "em" | "del"): InlineToken | null {
+  expression.lastIndex = cursor;
+  const match = expression.exec(value);
+  return match ? { kind, start: match.index, end: expression.lastIndex, content: match[1] } : null;
 }
 
 function delimitedInlineToken(
@@ -235,7 +237,7 @@ function safeMarkdownHref(value: string): string | null {
   if (trimmed.startsWith("#")) return trimmed;
   try {
     const parsed = new URL(trimmed);
-    return ["http:", "https:", "mailto:"].includes(parsed.protocol) ? trimmed : null;
+    return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password ? trimmed : null;
   } catch {
     return null;
   }

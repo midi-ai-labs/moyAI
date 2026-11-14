@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -54,6 +55,7 @@ const HTTP_FAILURE_SOURCE_DEPTH: usize = 8;
 pub struct OpenAiCompatClient {
     api_key: Option<String>,
     runtime_http: Option<reqwest::Client>,
+    direct_http: Arc<Mutex<Option<(u64, reqwest::Client)>>>,
 }
 
 struct StartedResponse {
@@ -65,6 +67,7 @@ impl OpenAiCompatClient {
         Self {
             api_key,
             runtime_http: None,
+            direct_http: Arc::new(Mutex::new(None)),
         }
     }
     /// Private transport supplied by the authenticated Hub route owner. It is
@@ -72,6 +75,28 @@ impl OpenAiCompatClient {
     pub(crate) fn with_runtime_http(mut self, http: reqwest::Client) -> Self {
         self.runtime_http = Some(http);
         self
+    }
+
+    fn http_client(&self, connect_timeout_ms: u64) -> Result<reqwest::Client, LlmError> {
+        if let Some(http) = &self.runtime_http {
+            return Ok(http.clone());
+        }
+        let mut cached = self
+            .direct_http
+            .lock()
+            .expect("direct HTTP client lock poisoned");
+        if let Some((timeout, client)) = cached.as_ref()
+            && *timeout == connect_timeout_ms
+        {
+            return Ok(client.clone());
+        }
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if connect_timeout_ms > 0 {
+            builder = builder.connect_timeout(Duration::from_millis(connect_timeout_ms));
+        }
+        let client = builder.build()?;
+        *cached = Some((connect_timeout_ms, client.clone()));
+        Ok(client)
     }
 }
 
@@ -533,16 +558,7 @@ impl OpenAiCompatClient {
         // attempt exists so invalid configuration cannot project provider lifecycle.
         let headers = self.request_headers(request)?;
         let deadlines = request.provider_target().deadlines();
-        let client_builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-        let client_builder = if deadlines.connect_timeout_ms > 0 {
-            client_builder.connect_timeout(Duration::from_millis(deadlines.connect_timeout_ms))
-        } else {
-            client_builder
-        };
-        let client = match &self.runtime_http {
-            Some(http) => http.clone(),
-            None => client_builder.build()?,
-        };
+        let client = self.http_client(deadlines.connect_timeout_ms)?;
         let endpoint_url = request
             .provider_target()
             .endpoint()
@@ -3788,6 +3804,64 @@ mod tests {
         assert!(error_summary.contains("provider message"));
         assert!(!error_summary.contains(late_marker));
         assert!(error_summary.contains("code=<object>"));
+    }
+
+    #[tokio::test]
+    async fn direct_http_reuses_connections_until_the_connect_timeout_changes() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let observed = peers.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/v1/responses",
+            post(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>, _: Bytes| {
+                    observed.lock().unwrap().push(peer);
+                    async { (StatusCode::BAD_REQUEST, "fixture") }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = OpenAiCompatClient::new(None);
+        for connect_ms in [1000, 1000, 2000] {
+            let mut request = responses_fixture_request(
+                &endpoint,
+                vec![ModelMessage::User {
+                    content: "ping".into(),
+                }],
+            );
+            replace_provider_deadlines(
+                &mut request,
+                ProviderDeadlines {
+                    request_timeout_ms: 5000,
+                    connect_timeout_ms: connect_ms,
+                    max_connect_retries: 0,
+                },
+            );
+            client
+                .stream_chat(
+                    request,
+                    CancellationToken::new(),
+                    &mut RecordingLlmEventSink::default(),
+                )
+                .await
+                .unwrap_err();
+        }
+        server.abort();
+        let peers = peers.lock().unwrap();
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0], peers[1]);
+        assert_ne!(peers[1], peers[2]);
     }
 
     #[tokio::test]

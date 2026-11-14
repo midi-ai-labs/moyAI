@@ -27,6 +27,7 @@ import {
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
 import { dispatchNewSessionMutation } from "../src/new_session_mutation.ts";
+import { deferredProjectionCandidatePreferred, retainDeferredCommand, type StateUpdate } from "../src/projection_state.ts";
 import {
   shouldDispatchDelegatedKeyboardAction,
   shouldInvalidateCommandPaletteInsertionForKeydown,
@@ -1628,6 +1629,36 @@ test("failed run start releases an unconsumed pending submission", () => {
   rejectDraftMutation(ui, "submit_prompt", snapshot);
   assert.equal(ui.drafts.pendingRunSubmission, null);
   assert.equal(snapshot?.runSettlement, "rejected");
+});
+
+test("a held Enter preserves the command once across a newer poll only for the same owner", () => {
+  const state = projection({ projection_revision: "2" });
+  const action: StateUpdate = { state, sequence: 1, mutationName: "select_session", forceRender: true,
+    scheduleNavigation: true, draftSnapshot: null, refreshPromptFocusContinuation: null, settingsAction: null };
+  const poll: StateUpdate = { ...action, state: { ...state, projection_revision: "3" }, sequence: 2,
+    mutationName: null, forceRender: false, scheduleNavigation: false };
+  for (const [first, last] of [[action, poll], [poll, action]]) {
+    const gate = new InteractionLifecycle<StateUpdate>((a, b) => deferredProjectionCandidatePreferred(
+      a.state.projection_revision, b.state.projection_revision, a.sequence, b.sequence), retainDeferredCommand);
+    gate.beginKey("Enter");
+    gate.defer(first, false, true);
+    gate.defer(last, false, true);
+    const delivered = gate.captureKeyEnd("Enter")!()!.deferred!;
+    assert.equal(delivered.state, poll.state);
+    assert.equal(delivered.mutationName, "select_session");
+    assert.equal(delivered.scheduleNavigation, true);
+    assert.equal(gate.cancel().deferred, null);
+  }
+  const relocated = { ...poll, state: { ...poll.state, draft_target: { ...state.draft_target, ownerGeneration: "10" } } };
+  assert.equal(retainDeferredCommand(relocated, action), relocated);
+  const anotherCommand = { ...poll, mutationName: "new_chat" };
+  assert.equal(retainDeferredCommand(anotherCommand, action), anotherCommand);
+  const loading = { ...action, navigationRowId: SESSION_A, state: { ...state, navigation_loading: true,
+    draft_target: { ...state.draft_target, sessionId: null, ownerGeneration: "9" } } };
+  assert.equal(retainDeferredCommand(relocated, loading).mutationName, "select_session");
+  assert.equal(retainDeferredCommand(relocated, { ...loading, navigationRowId: "different-session" }), relocated);
+  assert.equal(retainDeferredCommand(relocated, { ...loading, state: { ...loading.state,
+    draft_target: { ...loading.state.draft_target, ownerGeneration: "1" } } }), relocated);
 });
 
 test("deferred run-target conflict retains drafts across exact owner-generation drift", () => {
@@ -3328,7 +3359,7 @@ test("a Hub command starts ordinary polling before the Desktop snapshot advertis
   const idle = { status: "disconnected" as const, active_main: null, active_side_chat: null, active_approve: null };
   assert.equal(runtimePollingRequired(false, false, idle), false);
   assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connecting" }), true);
-  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connected" }), true);
+  assert.equal(runtimePollingRequired(false, false, { ...idle, status: "connected" }), false);
   assert.equal(runtimePollingRequired(false, false, { ...idle, status: "stale" }), false);
   assert.equal(runtimePollingRequired(false, false, { ...idle, status: "error" }), false);
   assert.equal(runtimePollingRequired(false, false, {

@@ -5,6 +5,7 @@ use std::io::{BufRead as _, Read as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use tokio_util::sync::CancellationToken;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -160,6 +161,14 @@ fn compare_traversal_path(left: &Path, right: &Path) -> Ordering {
     left.cmp(right)
 }
 
+pub(crate) fn check_read_active(stop: &CancellationToken) -> Result<(), ToolError> {
+    if stop.is_cancelled() {
+        Err(ToolError::RunInterrupted)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn walk_page(
     root: &Utf8Path,
     workspace: &Workspace,
@@ -167,7 +176,13 @@ pub fn walk_page(
     options: TraversalOptions,
 ) -> Result<TraversalPage, ToolError> {
     let guarded = PathGuard::require_path(workspace, root, AccessKind::Search)?;
-    walk_guarded_page(&guarded, workspace, cursor, options)
+    walk_guarded_page(
+        &guarded,
+        workspace,
+        cursor,
+        options,
+        &CancellationToken::new(),
+    )
 }
 
 pub(crate) fn walk_guarded_page(
@@ -175,14 +190,16 @@ pub(crate) fn walk_guarded_page(
     workspace: &Workspace,
     cursor: Option<&str>,
     options: TraversalOptions,
+    stop: &CancellationToken,
 ) -> Result<TraversalPage, ToolError> {
-    walk_page_with_before_release(root, workspace, cursor, options, |_, _| Ok(()))
+    walk_page_with_before_release(root, workspace, cursor, options, |_, _| Ok(()), stop)
 }
 
 pub(crate) fn find_exact_workspace_file_candidates(
     workspace: &Workspace,
     requested_basename: &str,
     requested_suffix: Option<&Utf8Path>,
+    stop: &CancellationToken,
 ) -> Result<ExactFileCandidateScan, ToolError> {
     find_exact_workspace_file_candidates_with_limits(
         workspace,
@@ -190,12 +207,14 @@ pub(crate) fn find_exact_workspace_file_candidates(
         requested_suffix,
         MAX_EXACT_FILE_CANDIDATES,
         MAX_EXACT_FILE_CANDIDATE_VISITS,
+        stop,
     )
 }
 
 pub(crate) fn find_similar_sibling_file_candidates(
     workspace: &Workspace,
     requested: &Utf8Path,
+    stop: &CancellationToken,
 ) -> Result<ExactFileCandidateScan, ToolError> {
     let requested_guard = PathGuard::require_path(workspace, requested, AccessKind::Read)?;
     if !requested_guard.inside_workspace {
@@ -234,6 +253,7 @@ pub(crate) fn find_similar_sibling_file_candidates(
         || Ok(()),
         || Ok(()),
         |_, _| Ok(()),
+        stop,
     )?;
     let Some(requested_stem) = requested_guard.absolute.file_stem() else {
         return Ok(ExactFileCandidateScan {
@@ -297,6 +317,7 @@ fn find_exact_workspace_file_candidates_with_limits(
     requested_suffix: Option<&Utf8Path>,
     result_limit: usize,
     visit_limit: usize,
+    stop: &CancellationToken,
 ) -> Result<ExactFileCandidateScan, ToolError> {
     let root = PathGuard::require_path(workspace, workspace.authority_root(), AccessKind::Search)?;
     let result_limit = result_limit.clamp(1, MAX_EXACT_FILE_CANDIDATES);
@@ -329,6 +350,7 @@ fn find_exact_workspace_file_candidates_with_limits(
         || Ok(()),
         || Ok(()),
         |_, _| Ok(()),
+        stop,
     )?;
     Ok(ExactFileCandidateScan {
         paths: page
@@ -346,6 +368,7 @@ fn walk_page_with_before_release(
     cursor: Option<&str>,
     options: TraversalOptions,
     before_release: impl FnOnce(usize, usize) -> Result<(), ToolError>,
+    stop: &CancellationToken,
 ) -> Result<TraversalPage, ToolError> {
     walk_page_with_observers(
         root,
@@ -355,6 +378,7 @@ fn walk_page_with_before_release(
         || Ok(()),
         || Ok(()),
         before_release,
+        stop,
     )
 }
 
@@ -366,6 +390,7 @@ fn walk_page_with_observers(
     after_ignore_capture: impl FnOnce() -> Result<(), ToolError>,
     before_ignore_revalidation: impl FnOnce() -> Result<(), ToolError>,
     before_release: impl FnOnce(usize, usize) -> Result<(), ToolError>,
+    stop: &CancellationToken,
 ) -> Result<TraversalPage, ToolError> {
     walk_page_filtered_with_observers(
         root,
@@ -377,6 +402,7 @@ fn walk_page_with_observers(
         after_ignore_capture,
         before_ignore_revalidation,
         before_release,
+        stop,
     )
 }
 
@@ -390,12 +416,14 @@ fn walk_page_filtered_with_observers(
     after_ignore_capture: impl FnOnce() -> Result<(), ToolError>,
     before_ignore_revalidation: impl FnOnce() -> Result<(), ToolError>,
     before_release: impl FnOnce(usize, usize) -> Result<(), ToolError>,
+    stop: &CancellationToken,
 ) -> Result<TraversalPage, ToolError> {
     if !retain_cursor_snapshot && options.include_directories {
         return Err(ToolError::Message(
             "non-paginated filtered traversal supports regular files only".to_string(),
         ));
     }
+    check_read_active(stop)?;
     let requested_root_handle = PathGuard::open_validated_metadata_handle(root)?;
     if !requested_root_handle.metadata()?.is_dir() {
         return Err(ToolError::Message(format!(
@@ -469,7 +497,9 @@ fn walk_page_filtered_with_observers(
     let retained_directory_sink = Arc::clone(&retained_directories);
     let boundary_workspace = workspace.clone();
     let boundary_root = traversal_guard.clone();
+    let filter_stop = stop.clone();
     builder.filter_entry(move |entry| {
+        if filter_stop.is_cancelled() { return false; }
         let Some(path) = Utf8Path::from_path(entry.path()) else {
             // Preserve fail-closed UTF-8 handling in the main traversal loop.
             return true;
@@ -599,6 +629,7 @@ fn walk_page_filtered_with_observers(
     let mut selection_truncated = false;
 
     for entry in builder.build() {
+        check_read_active(stop)?;
         if let Some(error) = filter_error
             .lock()
             .expect("traversal filter error mutex poisoned")
@@ -737,6 +768,7 @@ fn walk_page_filtered_with_observers(
         return Err(error);
     }
 
+    check_read_active(stop)?;
     before_ignore_revalidation()?;
     validate_directory_stamps(&snapshot.directory_stamps, workspace, &traversal_guard)?;
     {
@@ -764,6 +796,7 @@ fn walk_page_filtered_with_observers(
         .expect("retained traversal directory mutex poisoned")
         .len();
     before_release(retained_directory_count, retained_files.len())?;
+    check_read_active(stop)?;
     if !retain_cursor_snapshot {
         let mut ranked_entries = entries
             .into_iter()
@@ -1546,6 +1579,7 @@ fn is_hidden_entry(entry: &ignore::DirEntry) -> bool {
 mod tests {
     use std::fs::{FileTimes, OpenOptions};
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     use camino::Utf8PathBuf;
 
@@ -1712,6 +1746,7 @@ mod tests {
                 assert_sharing_violation(&child_error, "traversal child rename");
                 Ok(())
             },
+            &CancellationToken::new(),
         )
         .expect("bounded traversal page");
 
@@ -1772,6 +1807,7 @@ mod tests {
                 assert_eq!(retained_files, 0);
                 Ok(())
             },
+            &CancellationToken::new(),
         )
         .expect("second page");
         assert_eq!(second.entries[0].relative_path.as_str(), "b");
@@ -1842,6 +1878,7 @@ mod tests {
                 assert_eq!(retained_files, 0);
                 Ok(())
             },
+            &CancellationToken::new(),
         )
         .expect("large page without retained file descriptors");
 
@@ -2133,6 +2170,7 @@ mod tests {
                 Ok(())
             },
             |_, _| Ok(()),
+            &CancellationToken::new(),
         )
         .expect("walk fixed to source A despite the path-level ABA");
 
@@ -2803,6 +2841,7 @@ mod tests {
             Some(camino::Utf8Path::new("src/lib.rs")),
             5,
             128,
+            &CancellationToken::new(),
         )
         .expect("exact candidate scan");
 
@@ -2846,15 +2885,27 @@ mod tests {
         let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
             .expect("workspace");
 
-        let result_capped =
-            find_exact_workspace_file_candidates_with_limits(&workspace, "target.rs", None, 2, 128)
-                .expect("result-bounded scan");
+        let result_capped = find_exact_workspace_file_candidates_with_limits(
+            &workspace,
+            "target.rs",
+            None,
+            2,
+            128,
+            &CancellationToken::new(),
+        )
+        .expect("result-bounded scan");
         assert_eq!(result_capped.paths.len(), 2);
         assert!(result_capped.truncated);
 
-        let visit_capped =
-            find_exact_workspace_file_candidates_with_limits(&workspace, "target.rs", None, 5, 1)
-                .expect("visit-bounded scan");
+        let visit_capped = find_exact_workspace_file_candidates_with_limits(
+            &workspace,
+            "target.rs",
+            None,
+            5,
+            1,
+            &CancellationToken::new(),
+        )
+        .expect("visit-bounded scan");
         assert!(visit_capped.paths.is_empty());
         assert!(visit_capped.truncated);
     }
@@ -2881,6 +2932,7 @@ mod tests {
             Some(camino::Utf8Path::new("preferred/target.rs")),
             5,
             128,
+            &CancellationToken::new(),
         )
         .expect("priority candidate scan");
 
@@ -2938,6 +2990,7 @@ mod tests {
         let scan = find_similar_sibling_file_candidates(
             &workspace,
             &parent.join("sqlite_run_repository.py"),
+            &CancellationToken::new(),
         )
         .expect("similar sibling scan");
 

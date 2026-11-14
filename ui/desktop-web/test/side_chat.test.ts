@@ -1659,6 +1659,20 @@ test("Hub-origin Side Chat captures Direct only on an explicit targeted action a
   assert.equal(calls.length, 1);
 });
 
+test("cached transcript Markdown follows visible text while quoted and edited actions stay current", () => {
+  const markdownCache = new Map<string, string>();
+  const row = { row_kind: "assistant", stable_history_identity: "01J00000000000000000000002",
+    step: "1", title: "Assistant", body: "**answer**", file_changes: [] };
+  const options = { markdownCache, sideChatQuoteOwnerSessionId: "session-a" };
+  assert.equal(renderTranscriptRows([row], options), renderTranscriptRows([row], { ...options, markdownCache: undefined }));
+  assert.equal(markdownCache.size, 1);
+  const updated = { ...row, body: "new answer" };
+  assert.equal(renderTranscriptRows([updated], { markdownCache }), renderTranscriptRows([updated]));
+  assert.deepEqual([...markdownCache.keys()], ["new answer"]);
+  renderTranscriptRows([], { markdownCache });
+  assert.equal(markdownCache.size, 0);
+});
+
 test("settled canonical transcript and artifact rows expose one native quote action", () => {
   const html = renderTranscriptRows([
     {

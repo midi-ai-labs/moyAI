@@ -1466,7 +1466,8 @@ select:focus-visible,
 
 .markdown-body h3,
 .markdown-body h4,
-.markdown-body h5 {
+.markdown-body h5,
+.markdown-body h6 {
   margin: 14px 0 8px;
   color: #f4f4f4;
   font-weight: 680;
@@ -1478,7 +1479,8 @@ select:focus-visible,
 }
 
 .markdown-body h4,
-.markdown-body h5 {
+.markdown-body h5,
+.markdown-body h6 {
   font-size: 14px;
 }
 

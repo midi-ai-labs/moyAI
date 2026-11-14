@@ -50,6 +50,8 @@ moyai-runner stop --runner $runnerId --run $runId
 moyai-runner shutdown --runner $runnerId
 ```
 
+Runnerの起動ログはデータフォルダーの `runner.log` に追記します。次回起動時に1 MiBを超えていれば、前の世代を `runner.previous.log` に残します。稼働中のRunnerが書き込んでいるログは、終了後の起動時に切り替えます。
+
 ## 実行と結果の寿命
 
 一つのRunnerが同時に受け付けるrootは一つです。終了したrootがmanaged shell processを保持している場合は`processes_running`と表示し、実際のprocess終了まで次の投入を拒否します。`stop`はその実行のmanaged processも停止し、`shutdown`は全実行とmanaged processの終了を待ちます。共有提供PCの共通枠は別構成のmoyAI入口にも適用され、子Agentとmanaged processの終了まで返却しません。

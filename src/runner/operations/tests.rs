@@ -1,6 +1,32 @@
 use super::*;
 use serde_json::json;
 
+#[cfg(windows)]
+#[test]
+fn runner_log_rotation_preserves_live_output_and_starts_diagnostics_in_the_current_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(directory.path()).unwrap();
+    let path = root.join("runner.log");
+    let previous = root.join("runner.previous.log");
+    let (mut live, offset) = open_startup_log(&path).unwrap();
+    assert_eq!(offset, 0);
+    live.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let (other, offset) = open_startup_log(&path).unwrap();
+    assert_eq!(offset, 1024 * 1024 + 1);
+    drop(other);
+    assert!(!previous.exists());
+    drop(live);
+    std::fs::write(&previous, "old generation").unwrap();
+    let (mut fresh, offset) = open_startup_log(&path).unwrap();
+    assert_eq!(offset, 0);
+    fresh.write_all(b"new startup error").unwrap();
+    assert_eq!(
+        startup_log_since(&path, offset).unwrap(),
+        "new startup error"
+    );
+    assert_eq!(std::fs::metadata(previous).unwrap().len(), 1024 * 1024 + 1);
+}
+
 #[test]
 fn oversized_template_settings_preserve_the_saved_and_effective_configuration() {
     let base = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))

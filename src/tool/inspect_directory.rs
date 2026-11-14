@@ -104,6 +104,7 @@ impl Tool for InspectDirectoryTool {
                 result_limit: limit,
                 visit_limit,
             },
+            &ctx.stop_token(),
         )?;
 
         let mut lines = Vec::new();
@@ -116,7 +117,9 @@ impl Tool for InspectDirectoryTool {
         let max_lines = ctx.config().tool_output.max_lines.max(1);
         let max_bytes = ctx.config().tool_output.max_bytes.max(1);
 
+        let stop = ctx.stop_token();
         for entry in &page.entries {
+            crate::workspace::traversal::check_read_active(&stop)?;
             let relative = entry.relative_path.as_str().replace('\\', "/");
             let (mut line, size_bytes) = if entry.is_directory {
                 (format!("{relative}/"), None)

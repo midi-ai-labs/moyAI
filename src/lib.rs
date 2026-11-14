@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod app;
+mod browser;
 pub mod cli;
 pub mod config;
 pub mod context;

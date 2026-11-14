@@ -37,7 +37,7 @@ impl Tool for ReadTool {
         ToolSpec {
             name: ToolName::Read,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Read a bounded UTF-8 or Shift_JIS text range with line numbers. A full-content write baseline is recorded only when a UTF-8 read exposes the complete file without output truncation; targeted apply_patch updates match context against the current file and do not require this baseline.",
+            description: "Read a bounded UTF-8, Shift_JIS or BOM-marked UTF-16 text range with line numbers. A full-content write baseline is recorded only when a UTF-8 read exposes the complete file without output truncation; targeted apply_patch updates match context against the current UTF-8 file and do not require this baseline.",
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -102,20 +102,27 @@ impl Tool for ReadTool {
                 let (scan, candidate_kind) = match find_similar_sibling_file_candidates(
                     ctx.workspace(),
                     &request.absolute,
+                    &ctx.stop_token(),
                 ) {
                     Ok(scan) if !scan.paths.is_empty() => {
                         (scan, MissingCandidateKind::SimilarSibling)
                     }
                     Ok(_) => {
-                        let Ok(scan) = find_exact_workspace_file_candidates(
+                        let scan = match find_exact_workspace_file_candidates(
                             ctx.workspace(),
                             &request.basename,
                             request.suffix.as_deref(),
-                        ) else {
-                            return Err(error);
+                            &ctx.stop_token(),
+                        ) {
+                            Ok(scan) => scan,
+                            Err(ToolError::RunInterrupted) => {
+                                return Err(ToolError::RunInterrupted);
+                            }
+                            Err(_) => return Err(error),
                         };
                         (scan, MissingCandidateKind::Exact)
                     }
+                    Err(ToolError::RunInterrupted) => return Err(ToolError::RunInterrupted),
                     Err(_) => return Err(error),
                 };
                 return Err(ToolError::Message(render_missing_read_diagnostic(
@@ -171,8 +178,15 @@ impl Tool for ReadTool {
             ));
         }
 
-        let (bytes, exceeded_limit) = opened.with_file(|file| {
-            read_up_to_limit(file, ctx.config().file_guard.max_inline_read_bytes)
+        let stop = ctx.stop_token();
+        let mut bytes = Vec::new();
+        let exceeded_limit = opened.with_file(|file| {
+            read_up_to_limit(
+                file,
+                &mut bytes,
+                ctx.config().file_guard.max_inline_read_bytes,
+                &stop,
+            )
         })?;
         if exceeded_limit {
             return Ok(read_blocked_result(
@@ -212,6 +226,7 @@ impl Tool for ReadTool {
             ctx.config().tool_output.max_bytes,
         )?;
 
+        crate::workspace::traversal::check_read_active(&stop)?;
         let baseline = edit_baseline_decision(
             offset,
             page.visible_line_count,
@@ -447,13 +462,26 @@ fn bounded_line_page(
     })
 }
 
-fn read_up_to_limit(reader: &mut impl Read, max_bytes: u64) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut bytes = Vec::new();
-    reader
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    let exceeded_limit = bytes.len() as u64 > max_bytes;
-    Ok((bytes, exceeded_limit))
+pub(super) fn read_up_to_limit(
+    reader: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    max_bytes: u64,
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<bool, ToolError> {
+    let remaining = max_bytes
+        .saturating_add(1)
+        .saturating_sub(bytes.len() as u64);
+    let mut reader = reader.take(remaining);
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        crate::workspace::traversal::check_read_active(stop)?;
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(bytes.len() as u64 > max_bytes),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn require_readable_file_metadata(
@@ -1006,10 +1034,39 @@ mod tests {
     fn bounded_reader_never_materializes_more_than_limit_plus_one() {
         let mut input = std::io::Cursor::new(vec![b'x'; 4 * 1024]);
 
-        let (bytes, exceeded_limit) = read_up_to_limit(&mut input, 32).expect("bounded read");
+        let mut bytes = Vec::new();
+        let exceeded_limit = read_up_to_limit(
+            &mut input,
+            &mut bytes,
+            32,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("bounded read");
 
         assert!(exceeded_limit);
         assert_eq!(bytes.len(), 33);
+    }
+
+    #[test]
+    fn stopped_read_does_not_consume_a_second_chunk() {
+        struct StopsAfterRead(tokio_util::sync::CancellationToken, usize);
+        impl std::io::Read for StopsAfterRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.1 += 1;
+                self.0.cancel();
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut reader = StopsAfterRead(stop.clone(), 0);
+        let mut bytes = Vec::new();
+        let response = read_up_to_limit(&mut reader, &mut bytes, 1024 * 1024, &stop);
+        assert!(matches!(
+            response,
+            Err(crate::error::ToolError::RunInterrupted)
+        ));
+        assert_eq!(reader.1, 1);
     }
 
     #[test]

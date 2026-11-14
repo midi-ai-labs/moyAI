@@ -31,7 +31,11 @@ function Get-MoyaiComponentResultPath([string]$OperationId) {
     Resolve-MoyaiComponentChild (Get-MoyaiComponentResultRoot) ($OperationId+'.json')
 }
 
-function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[bool]$Success,[int]$ExitCode,[string]$Message,[string[]]$Messages=@()) {
+function Write-MoyaiRetainedItem([string]$Message) {
+    $Message | Add-Member -TypeName 'Moyai.RetainedItem' -PassThru
+}
+
+function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[bool]$Success,[int]$ExitCode,[string]$Message,[string[]]$Messages=@(),[string[]]$Retained=@()) {
     Assert-MoyaiSandboxAdministrator
     $path=Get-MoyaiComponentResultPath $OperationId
     $folder=Split-Path -Parent $path
@@ -46,7 +50,7 @@ function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256
         Assert-MoyaiSandboxProtectedPath $directory
     }
     Assert-MoyaiSandboxRegularPath $path
-    $value=[ordered]@{schema=1;operation_id=$OperationId;source_manifest_sha256=$ManifestSha256;components=@($Components | Where-Object {-not[string]::IsNullOrWhiteSpace($_)});success=$Success;exit_code=$ExitCode;message=$Message;messages=@($Messages);finished_at_utc=[DateTime]::UtcNow.ToString('o')}
+    $value=[ordered]@{schema=1;operation_id=$OperationId;source_manifest_sha256=$ManifestSha256;components=@($Components | Where-Object {-not[string]::IsNullOrWhiteSpace($_)});success=$Success;exit_code=$ExitCode;message=$Message;messages=@($Messages);retained=@($Retained);finished_at_utc=[DateTime]::UtcNow.ToString('o')}
     $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 8))
     $acl=[Security.AccessControl.FileSecurity]::new()
     $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;IU)')
@@ -57,6 +61,9 @@ function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256
 
 function Read-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[int]$ExitCode) {
     $path=Get-MoyaiComponentResultPath $OperationId
+    if(-not(Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "管理者処理の診断記録がありません。終了コード $ExitCode。配布物をローカルフォルダーへ展開したか、管理者側から起動できたかを確認してください。診断記録の予定先: $path"
+    }
     $folder=Split-Path -Parent $path
     Assert-MoyaiSandboxProtectedPath (Split-Path -Parent $folder)
     Assert-MoyaiSandboxProtectedPath $folder
@@ -64,6 +71,8 @@ function Read-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,
     $result=Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
     if($result.schema -ne 1 -or $result.operation_id -cne $OperationId -or $result.source_manifest_sha256 -cne $ManifestSha256 -or $result.components -isnot [array] -or @($result.components | Where-Object {$_ -isnot [string] -or $_ -cnotin @('Desktop','Hub')}).Count -or (($result.components | Sort-Object) -join ',') -cne (($Components | Sort-Object) -join ',') -or $result.exit_code -ne $ExitCode -or $result.success -isnot [bool] -or $result.success -ne ($ExitCode -eq 0)) { throw "管理者処理の結果が今回の要求と一致しません。保存データは追加で削除しません。診断記録: $path" }
     $result | Add-Member NoteProperty result_path $path -Force
+    if($null -eq $result.PSObject.Properties['retained']) { $result | Add-Member NoteProperty retained @() }
+    if($result.retained -isnot [array] -or @($result.retained | Where-Object {$_ -isnot [string]}).Count) { throw "管理者処理の保持対象を確認できません。診断記録: $path" }
     return $result
 }
 
@@ -199,7 +208,7 @@ function Read-MoyaiInstalledComponent([ValidateSet('Desktop','Hub')][string]$Com
 function Assert-MoyaiComponentStopped([string]$Root, [object[]]$Processes = @(Get-Process -ErrorAction SilentlyContinue)) {
     $boundary=[IO.Path]::GetFullPath($Root).TrimEnd('\','/') + '\'
     foreach ($process in $Processes) {
-        if ($process.Path -and $process.Path.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { throw "この導入先のアプリが起動中です。正常終了してから再実行してください。PID $($process.Id): $($process.Path)" }
+        if ($process.Path -and $process.Path.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { throw "この導入先のアプリが起動中です。Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選びます。単独のRunnerはWindows導入手順の「更新・アンインストール」、Hubは Stop-Hub.cmd を確認してください。PID $($process.Id): $($process.Path)" }
     }
 }
 
@@ -274,13 +283,13 @@ function Remove-MoyaiMachineLegacyModules([string[]]$Components,[switch]$SharedR
                 $receipt=Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 if($receipt.product -cne 'moyai-machine-component' -or $receipt.component -cne $component -or $receipt.install_root -ine (Get-MoyaiComponentLocation $component).root -or $receipt.source_manifest_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw '旧配置の導入記録が一致しません。' }
                 $removal=Remove-MoyaiComponentPayload $candidate.FullName $receipt
-                foreach($path in $removal.retained) { Write-Output "旧配置の追加・変更ファイルを保持しました: $path" }
-            } catch { Write-Output "旧配置を保持しました: $($candidate.FullName) / $($_.Exception.Message)" }
+                foreach($path in $removal.retained) { Write-MoyaiRetainedItem "旧配置の追加・変更ファイルを保持しました: $path" }
+            } catch { Write-MoyaiRetainedItem "旧配置を保持しました: $($candidate.FullName) / $($_.Exception.Message)" }
         }
     }
     if($SharedRuntime) {
         $legacy=Join-Path $parent 'Sandbox'
-        if(Test-Path -LiteralPath $legacy) { Write-Output "旧Sandboxを保持しました。現在の導入記録だけでは所有ファイルと参照元を確認できません: $legacy" }
+        if(Test-Path -LiteralPath $legacy) { Write-MoyaiRetainedItem "旧Sandboxを保持しました。現在の導入記録だけでは所有ファイルと参照元を確認できません: $legacy" }
         foreach($candidate in @(Get-ChildItem -LiteralPath $parent -Directory | Where-Object { $_.Name.StartsWith('SandboxService.previous-',[StringComparison]::OrdinalIgnoreCase) -or $_.Name.StartsWith('SandboxService.stage-',[StringComparison]::OrdinalIgnoreCase) })) {
             try {
                 Assert-MoyaiSandboxProtectedPath $candidate.FullName
@@ -299,7 +308,7 @@ function Remove-MoyaiMachineLegacyModules([string[]]$Components,[switch]$SharedR
                 $references=@(Get-CimInstance Win32_Service | Where-Object { $_.PathName -and $_.PathName.IndexOf($candidate.FullName,[StringComparison]::OrdinalIgnoreCase) -ge 0 })
                 if($references.Count) { throw '旧配置を参照するサービスが残っています。' }
                 Remove-MoyaiSandboxPayloadDirectory $candidate.FullName $receipt.files
-            } catch { Write-Output "共通サービスの旧配置を保持しました: $($candidate.FullName) / $($_.Exception.Message)" }
+            } catch { Write-MoyaiRetainedItem "共通サービスの旧配置を保持しました: $($candidate.FullName) / $($_.Exception.Message)" }
         }
     }
 }
@@ -316,7 +325,7 @@ function Remove-MoyaiEmptyMachineParent {
             # Delete-on-close keeps the lock exclusive through its removal.
             $lock=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
             $lock.Dispose()
-        } catch { Write-Output "使用中または所有を確認できない管理ファイルを保持しました: $path / $($_.Exception.Message)" }
+        } catch { Write-MoyaiRetainedItem "使用中または所有を確認できない管理ファイルを保持しました: $path / $($_.Exception.Message)" }
     }
     if(@(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) { Remove-Item -LiteralPath $parent -Force }
     else { Write-Output "残るコンポーネントまたは保持対象があるため共通フォルダーを保持しました: $parent" }
@@ -373,7 +382,7 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                 if($Uninstall) {
                     if($null -ne $old) {
                         $removal=Remove-MoyaiComponentPayload $location.root $old
-                        foreach($path in $removal.retained) { Write-Output "追加・変更されたファイルを保持しました: $path" }
+                        foreach($path in $removal.retained) { Write-MoyaiRetainedItem "追加・変更されたファイルを保持しました: $path" }
                     } else {
                         if(Test-Path -LiteralPath $location.root) {
                             if(@(Get-ChildItem -LiteralPath $location.root -Force).Count -ne 0) { throw '削除対象の内容が確認後に変更されました。再実行してください。' }
@@ -425,7 +434,7 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                 $backup=$transaction.backup
                 if($backup) {
                     $removal=Remove-MoyaiComponentPayload $backup $old
-                    foreach($path in $removal.retained) { Write-Output "追加・変更された旧配置ファイルを保持しました: $path" }
+                    foreach($path in $removal.retained) { Write-MoyaiRetainedItem "追加・変更された旧配置ファイルを保持しました: $path" }
                 }
                 Write-Output "導入が完了しました: $component $($receipt.version) / $($location.root)"
             }
@@ -565,7 +574,16 @@ function Invoke-MoyaiComponentElevation([string]$SourceRoot, $Manifest, [string[
                 }
                 Start-Sleep -Milliseconds 100; $process.Refresh()
             }
-            if(-not $ready) { throw '管理者による削除前の確認を完了できませんでした。保存データは初期化していません。' }
+            if(-not $ready) {
+                $detail="管理者処理が60秒以内に削除前の確認を返しませんでした。診断記録の予定先: $readyPath"
+                if($process.HasExited) {
+                    try {
+                        $earlyResult=Read-MoyaiComponentResult $operationId $Manifest.validated_manifest_sha256 $Components $process.ExitCode
+                        $detail="終了コード $($process.ExitCode)。$($earlyResult.message) 診断記録: $($earlyResult.result_path)"
+                    } catch { $detail=$_.Exception.Message }
+                }
+                throw "管理者による削除前の確認を完了できませんでした。保存データは初期化していません。`n$detail"
+            }
             try {
                 foreach($component in $ResetComponents) { Invoke-MoyaiComponentCleanup $component $HubDataDir $SourceRoot $Manifest }
             } catch {
@@ -579,8 +597,8 @@ function Invoke-MoyaiComponentElevation([string]$SourceRoot, $Manifest, [string[
             $process=Start-Process -FilePath $powershell -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -PassThru -Wait
         }
         $result=Read-MoyaiComponentResult $operationId $Manifest.validated_manifest_sha256 $Components $process.ExitCode
-        if(-not $result.success) { throw "管理者によるアプリの配置・削除を完了できませんでした。`n$($result.message)`n$($result.messages -join [Environment]::NewLine)`n診断記録: $($result.result_path)`n保存データは追加で削除しません。" }
-        return [pscustomobject]@{source_root=$SourceRoot;manifest=$Manifest;pins=$pins;temporary=($null -ne $snapshot);messages=@($result.messages);result_path=$result.result_path}
+        if(-not $result.success) { throw "管理者によるアプリの配置・削除を完了できませんでした。`n$($result.message)`n$(@($result.messages)+@($result.retained) -join [Environment]::NewLine)`n診断記録: $($result.result_path)`n保存データは追加で削除しません。" }
+        return [pscustomobject]@{source_root=$SourceRoot;manifest=$Manifest;pins=$pins;temporary=($null -ne $snapshot);messages=@($result.messages);retained=@($result.retained);result_path=$result.result_path}
     } catch {
         if($decisionPath -and $null -ne $process -and -not $process.HasExited) {
             if(-not(Test-Path -LiteralPath $decisionPath)) { Write-MoyaiRemovalDecision $SourceRoot $operationId $false }
@@ -591,6 +609,8 @@ function Invoke-MoyaiComponentElevation([string]$SourceRoot, $Manifest, [string[
             if($decisionPath -and (Test-Path -LiteralPath $decisionPath)) { Remove-Item -LiteralPath $decisionPath -Force }
             Remove-MoyaiComponentSourceSnapshot $snapshot.root $Manifest
         }
+        $cause=$_.Exception.GetBaseException()
+        if($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 1223) { throw '管理者承認が取り消されました。Setupを開き直し、続ける場合は管理者承認を完了してください。' }
         throw
     } finally {
         if($decisionPath -and $null -ne $process -and $process.HasExited -and (Test-Path -LiteralPath $decisionPath)) { Remove-Item -LiteralPath $decisionPath -Force }
@@ -820,7 +840,7 @@ function Remove-MoyaiLegacyUserModules([switch]$Preview,[switch]$IncludeHub,[swi
             if($manifest.hub -and -not $IncludeHub) { Write-Output "Hubを含む旧配置を保持しました。Hubは今回の更新・削除対象ではありません: $root"; continue }
             if($ForUpdate) {
                 $reference=Get-MoyaiLegacyRegistrationReference $root
-                if($reference) { Write-Output "旧配置を参照する変更された登録があるため保持しました: $root / $reference"; continue }
+                if($reference) { Write-MoyaiRetainedItem "旧配置を参照する変更された登録があるため保持しました: $root / $reference"; continue }
             }
             if(-not $ForUpdate) {
                 Remove-MoyaiAutostart $root $receipt $manifest -Preview:$Preview | Out-Host
@@ -844,10 +864,10 @@ function Remove-MoyaiLegacyUserModules([switch]$Preview,[switch]$IncludeHub,[swi
                     elseif($item.Name -cnotin @('installation.json','deployment.json') -and -not $retained.Contains($item.FullName)) { $retained.Add($item.FullName) }
                 }
             }
-            if($retained.Count) { foreach($path in $retained) { Write-Output "追加・変更された旧配置ファイルを保持しました: $path" } }
+            if($retained.Count) { foreach($path in $retained) { Write-MoyaiRetainedItem "追加・変更された旧配置ファイルを保持しました: $path" } }
             else { foreach($name in @('installation.json','deployment.json')) { $path=Join-Path $root $name; if(Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } } }
             foreach($directory in @($pending | Sort-Object Length -Descending)) { if(@(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { Remove-Item -LiteralPath $directory -Force } }
-        } catch { Write-Output "旧配置を保持しました: $root / $($_.Exception.Message)" }
+        } catch { Write-MoyaiRetainedItem "旧配置を保持しました: $root / $($_.Exception.Message)" }
     }
 }
 
@@ -950,15 +970,19 @@ function Invoke-MoyaiComponentUserSetup(
     }
     if($CheckOnly) { Write-Output '確認のみ完了しました。アプリ・保存データ・サービスは変更していません。'; return }
     $desktopRegistration=$null
-    if($Uninstall) {
-        foreach($component in $Components) {
-            if($component -ceq 'Desktop' -and (Test-Path -LiteralPath (Join-Path (Get-MoyaiComponentLocation 'Desktop').root 'deployment.json'))) {
-                $root=(Get-MoyaiComponentLocation 'Desktop').root
-                if(-not(Get-Command Read-MoyaiDeployment -ErrorAction SilentlyContinue)) { Import-MoyaiComponentDesktopCommands $SourceRoot; . $script:componentDesktopCommandsPath }
-                $installed=Read-MoyaiDeployment $root -AllowMissingFiles
-                $receipt=Get-MoyaiComponentUserReceipt $root $installed
-                $desktopRegistration=[pscustomobject]@{root=$root;manifest=$installed;receipt=$receipt}
-            }
+    if($Uninstall -and $Components -ccontains 'Desktop') {
+        $root=(Get-MoyaiComponentLocation 'Desktop').root
+        $rootMissing=-not(Test-Path -LiteralPath $root)
+        $hasManifest=Test-Path -LiteralPath (Join-Path $root 'deployment.json') -PathType Leaf
+        $machineReceipt=if(-not $rootMissing -and -not $hasManifest) { Read-MoyaiInstalledComponent 'Desktop' -AllowMissingFiles }
+        $removedFixed=$rootMissing -and (Test-Path -LiteralPath (Join-Path $SourceRoot 'scripts/common.ps1') -PathType Leaf)
+        if($hasManifest -or $null -ne $machineReceipt -or $removedFixed) {
+            if(-not(Get-Command Read-MoyaiDeployment -ErrorAction SilentlyContinue)) { Import-MoyaiComponentDesktopCommands $SourceRoot; . $script:componentDesktopCommandsPath }
+            $installed=if($hasManifest) { Read-MoyaiDeployment $root -AllowMissingFiles } else { $machineReceipt }
+            $receipt=if($null -ne $installed) { Get-MoyaiComponentUserReceipt $root $installed }
+            $desktopRegistration=[pscustomobject]@{root=$root;manifest=$installed;receipt=$receipt;removed_fixed=$removedFixed}
+        } elseif($rootMissing) {
+            Write-Output 'Desktop本体がなく、この配布物ではDesktopの利用者登録を確認できません。自動起動や関連付けが残る場合は、同じWindows利用者でDesktop配布物の Uninstall-moyAI.cmd を開いてください。'
         }
     }
     $resetComponents=@(); if($ResetDesktopData){$resetComponents+='Desktop'}; if($ResetHubData){$resetComponents+='Hub'}
@@ -969,13 +993,30 @@ function Invoke-MoyaiComponentUserSetup(
     try {
       if($Uninstall) {
         if($null -ne $desktopRegistration) {
-            [void](Remove-MoyaiAutostart $desktopRegistration.root $desktopRegistration.receipt $desktopRegistration.manifest)
-            [void](Remove-MoyaiJoinFileAssociation $desktopRegistration.root $desktopRegistration.receipt $desktopRegistration.manifest)
-            if(-not $NoShortcuts) { [void](Remove-MoyaiShortcuts $desktopRegistration.root (Get-MoyaiShortcutFolder) @('moyAI')) }
+            $retryOptions=@{}
+            if($desktopRegistration.removed_fixed) { $retryOptions.RemovedFixedDesktop=$true }
+            [void](Remove-MoyaiAutostart $desktopRegistration.root $desktopRegistration.receipt $desktopRegistration.manifest @retryOptions)
+            [void](Remove-MoyaiJoinFileAssociation $desktopRegistration.root $desktopRegistration.receipt $desktopRegistration.manifest @retryOptions)
+            if(-not $NoShortcuts) {
+                [void](Remove-MoyaiShortcuts $desktopRegistration.root (Get-MoyaiShortcutFolder) @('moyAI') @retryOptions)
+            }
         }
-        if($Components -ccontains 'Hub') { Remove-MoyaiHubUserRegistrations -NoShortcuts:$NoShortcuts }
-        if($Components -ccontains 'Desktop') { Remove-MoyaiLegacyUserModules -IncludeHub:($Components -ccontains 'Hub') -NoShortcuts:$NoShortcuts }
-        Write-Output 'アンインストールが完了しました。追加・変更されたファイルと、明示的に初期化を指定しなかった保存データは保持しています。'
+        $retained=[Collections.Generic.List[string]]::new()
+        if($elevation.PSObject.Properties['retained']) { foreach($item in $elevation.retained) { $retained.Add($item) } }
+        $userMessages=@(
+            if($Components -ccontains 'Hub') { Remove-MoyaiHubUserRegistrations -NoShortcuts:$NoShortcuts }
+            if($Components -ccontains 'Desktop') { Remove-MoyaiLegacyUserModules -IncludeHub:($Components -ccontains 'Hub') -NoShortcuts:$NoShortcuts }
+        )
+        foreach($item in $userMessages) {
+            if($item.PSObject.TypeNames -contains 'Moyai.RetainedItem') { $retained.Add([string]$item) } else { Write-Output $item }
+        }
+        if($retained.Count) {
+            Write-Output '一部を残してアンインストールが完了しました。残した対象と理由は次のとおりです。'
+            $retained | Select-Object -Unique
+        } else { Write-Output 'アンインストールが完了しました。' }
+        Write-Output '初期化を選ばなかった保存データは保持しています。'
+        if(-not $RemoveSharedRuntime) { Write-Output 'PC共通の実行補助サービスは今回の削除対象外です。このPCの全利用者が利用を終えたら、Uninstallをもう一度開き「PC共通の実行補助サービスも削除」を選べます。' }
+        Write-Output '自動起動やショートカットの整理は、Setupを開いたWindows利用者が対象です。'
         $completed=$true
         return
       }

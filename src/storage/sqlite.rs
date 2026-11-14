@@ -206,9 +206,47 @@ impl SqliteStore {
     }
 
     pub fn migrate(&self) -> Result<(), StorageError> {
-        crate::storage::migration::run_to_current(
-            &self.connection.lock().expect("sqlite mutex poisoned"),
-        )
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let snapshot = connection.unchecked_transaction()?;
+        let version = super::migration::pending_upgrade_version(&snapshot)?;
+        let backups = self
+            .paths
+            .database_path
+            .as_std_path()
+            .with_added_extension("migration-backups");
+        let pinned_backups = if let Some(version) = version {
+            // The schema marker and the backup use the same read snapshot, including committed WAL frames.
+            let parent = open_internal_data_root(backups.parent().ok_or_else(|| {
+                StorageError::Message("database has no parent directory".into())
+            })?)?;
+            let directory = ensure_internal_directory(&backups, &parent)?;
+            let file = tempfile::NamedTempFile::new_in(&directory.path)?;
+            snapshot.backup(rusqlite::DatabaseName::Main, file.path(), None)?;
+            file.as_file().sync_all()?;
+            file.persist(directory.path.join(format!("v{version}.sqlite3")))
+                .map_err(|error| error.error)?;
+            Some((version, directory))
+        } else {
+            None
+        };
+        snapshot.commit()?;
+        super::migration::run_to_current(&connection)?;
+        if let Some((version, directory)) = pinned_backups {
+            // Only prune product-created version names after the upgrade has succeeded.
+            let mut previous = 0;
+            for old in (0..version).rev() {
+                let path = directory.path.join(format!("v{old}.sqlite3"));
+                if path.is_file() {
+                    previous += 1;
+                    if previous > 2
+                        && let Err(error) = fs::remove_file(&path)
+                    {
+                        eprintln!("could not prune migration backup v{old}: {error}");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn session_repo(&self) -> SqliteSessionRepository {
@@ -1911,6 +1949,67 @@ mod tests {
             .expect("busy timeout");
 
         assert_eq!(timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn migration_backs_up_the_previous_schema_and_committed_wal_before_upgrading() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let store = SqliteStore::open(&paths).unwrap();
+        let backups = paths.data_dir.join("moyai.sqlite3.migration-backups");
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+        assert!(!backups.exists());
+        let writer = Connection::open(&paths.database_path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE backup_fixture (message TEXT);
+            INSERT INTO backup_fixture VALUES ('committed WAL row');
+            DELETE FROM moyai_schema_migrations WHERE version=70;",
+            )
+            .unwrap();
+        // An unwritable backup destination must leave the source at the old version.
+        fs::write(&backups, b"occupied").unwrap();
+        assert!(store.migrate().is_err());
+        let version = |db: &Connection| {
+            db.query_row(
+                "SELECT max(version) FROM moyai_schema_migrations",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(version(&writer), 69);
+        fs::remove_file(&backups).unwrap();
+        fs::create_dir(&backups).unwrap();
+        for name in ["v55.sqlite3", "v63.sqlite3", "v65.sqlite3", "notes.txt"] {
+            fs::write(backups.join(name), b"previous backup fixture").unwrap();
+        }
+        store.migrate().unwrap();
+        assert!(!backups.join("v55.sqlite3").exists());
+        for name in ["v63.sqlite3", "v65.sqlite3", "notes.txt"] {
+            assert!(backups.join(name).is_file());
+        }
+        let backup = Connection::open_with_flags(
+            backups.join("v69.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(version(&backup), 69);
+        assert_eq!(
+            backup
+                .query_row("SELECT message FROM backup_fixture", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "committed WAL row"
+        );
+        assert_eq!(version(&writer), 70);
     }
 
     #[test]

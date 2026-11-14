@@ -40,9 +40,11 @@ export class InteractionLifecycle<T> {
   private renderCurrent = false;
   private readonly idleWaiters = new Set<() => void>();
   private readonly preferCandidate: (current: T, candidate: T) => boolean;
+  private readonly combine: (preferred: T, other: T) => T;
 
-  constructor(preferCandidate: (current: T, candidate: T) => boolean) {
+  constructor(preferCandidate: (current: T, candidate: T) => boolean, combine = (preferred: T, _other: T) => preferred) {
     this.preferCandidate = preferCandidate;
+    this.combine = combine;
   }
 
   get active(): boolean {
@@ -102,10 +104,10 @@ export class InteractionLifecycle<T> {
       this.renderCurrent ||= shouldRender;
       return true;
     }
-    const renderCandidate = candidate;
-    if (!this.deferred || this.preferCandidate(this.deferred, renderCandidate)) {
-      this.deferred = renderCandidate;
-    }
+    const current = this.deferred;
+    if (current === null) this.deferred = candidate;
+    else this.deferred = this.preferCandidate(current, candidate)
+      ? this.combine(candidate, current) : this.combine(current, candidate);
     return true;
   }
 

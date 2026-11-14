@@ -1715,7 +1715,7 @@ function sideChatQuoteEvidenceProfile(units, sourceKind, historyItemId) {
   const unitSourceCounts = units?.map((unit) => unit.sourceHistoryItemIds.length) ?? [];
   const unitBodySha256 = units?.map((unit) => sha256(Buffer.from(unit.body, "utf8"))) ?? [];
   const selectedUnit = selectedUnitIndex === null ? null : units?.[selectedUnitIndex] ?? null;
-  const expectedKinds = ["owner_user", "owner_tool", "owner_assistant"];
+  const expectedKinds = ["owner_user", "owner_tool", "owner_historical_assistant"];
   const expectedSourceCounts = [1, 3, 1];
   const knownBodiesMatch = units?.[0]?.body
       === sideChatXmlEntitiesV1Encode(SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT)
@@ -1793,7 +1793,7 @@ export function sideChatSessionOwnerContext(text) {
     return { pass: false };
   }
   const units = sideChatQuoteEvidenceUnits(envelope[3]);
-  const expectedKinds = ["owner_user", "owner_assistant"];
+  const expectedKinds = ["owner_user", "owner_historical_assistant"];
   const expectedBodies = [
     SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT,
     SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE,

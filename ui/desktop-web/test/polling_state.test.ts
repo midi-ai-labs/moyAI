@@ -1,12 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation } from "../src/polling_state.ts";
+import { createDesktopRefresh, createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation } from "../src/polling_state.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("local progress continues during a slow Hub read and idle polls follow the Hub interval", async () => {
+  const blocked = deferred<void>();
+  let local = 0, hub = 0, time = 0;
+  const refresh = createDesktopRefresh(async () => { local++; }, async () => { hub++; await blocked.promise; }, () => time);
+  const started = refresh.refresh();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  time = 600;
+  await refresh.poll(true, 12_000);
+  assert.deepEqual([local, hub], [2, 1]);
+  time = 1200;
+  await refresh.poll(false, 12_000);
+  assert.deepEqual([local, hub], [2, 1]);
+  blocked.resolve();
+  await started;
+  time += 12_000;
+  await refresh.poll(false, 12_000);
+  assert.deepEqual([local, hub], [3, 2]);
+});
 
 // These generic lifecycle regressions previously lived with the retired manual
 // publishing editor. Their normal Desktop snapshot-owner coverage remains active.

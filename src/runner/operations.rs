@@ -617,7 +617,36 @@ pub fn shutdown_existing() -> Result<(), RunnerError> {
     }
 }
 
-fn launch_process() -> Result<std::process::Child, RunnerError> {
+#[cfg(windows)]
+fn open_startup_log(path: &Utf8Path) -> std::io::Result<(std::fs::File, u64)> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    // Serialize the length check and replacement across simultaneous Desktop launches.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_file_name("runner.log.lock"))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    if std::fs::metadata(path).is_ok_and(|file| file.len() > 1024 * 1024)
+        && let Err(reason) = std::fs::rename(path, path.with_file_name("runner.previous.log"))
+    {
+        eprintln!("Runner の起動ログを切り替えられません。現在のログに追記します。{reason}");
+    }
+    // A live child keeps appending to the current log until both inherited handles close.
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)?;
+    let offset = log.metadata()?.len();
+    Ok((log, offset))
+}
+
+fn launch_process() -> Result<(std::process::Child, u64), RunnerError> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -658,11 +687,7 @@ fn launch_process() -> Result<std::process::Child, RunnerError> {
         }
         let paths = crate::storage::StoragePaths::discover().map_err(error)?;
         std::fs::create_dir_all(&paths.data_dir).map_err(error)?;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(paths.data_dir.join("runner.log"))
-            .map_err(error)?;
+        let (log, offset) = open_startup_log(&paths.data_dir.join("runner.log")).map_err(error)?;
         let mut command = std::process::Command::new(executable);
         if let Some(endpoint) =
             crate::sandbox_broker::inherited_endpoint().map_err(|error| RunnerError::new(error))?
@@ -686,13 +711,14 @@ fn launch_process() -> Result<std::process::Child, RunnerError> {
         }
         #[cfg(not(feature = "desktop-e2e"))]
         command.args(["serve", "--background"]);
-        command
+        let child = command
             .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().map_err(error)?)
             .stderr(log)
             .spawn()
-            .map_err(error)
+            .map_err(error)?;
+        Ok((child, offset))
     }
     #[cfg(not(windows))]
     {
@@ -709,13 +735,11 @@ pub(crate) fn ensure_started() -> Result<super::RunnerIdentity, RunnerError> {
             .map_err(error)?
             .data_dir
             .join("runner.log");
-        let offset = std::fs::metadata(&log)
-            .map(|value| value.len())
-            .unwrap_or(0);
-        let child = if !super::windows::endpoint_present()? {
-            Some(launch_process()?)
+        let (child, offset) = if !super::windows::endpoint_present()? {
+            let (child, offset) = launch_process()?;
+            (Some(child), offset)
         } else {
-            None
+            (None, 0)
         };
         wait_for_startup(
             child,

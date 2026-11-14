@@ -210,7 +210,7 @@ function Test-MoyaiDesktopStartup([string]$Root, $Manifest, [int]$TimeoutMillise
       }
       if ($watch.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
         $diagnostic.status = 'timeout'
-        throw "初期画面の描画完了通知を時間内に受け取れませんでした。PID $($process.Id) のアプリは強制終了していません。画面とタスクトレイを確認してください。後から画面が表示された場合は、moyAIのメニューまたはタスクトレイから「終了」し、アプリが終了したことを確認してからセットアップをやり直してください。"
+        throw "初期画面の描画完了通知を時間内に受け取れませんでした。PID $($process.Id) のDesktopは起動を続けています。画面が表示されたら「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選んでください。画面が出ない場合はタスクマネージャーの「詳細」でこのPIDと実行ファイルを確認し、診断ログを配布担当に伝えてください。アプリの終了後にSetupをやり直せます。"
       }
       Start-Sleep -Milliseconds 50
     }
@@ -257,7 +257,7 @@ function Get-MoyaiShortcutRegistration([string]$Root, [string]$Name) {
   }
 }
 
-function Remove-MoyaiShortcuts([string]$Root, [string]$ShortcutFolder, [string[]]$Names = @('moyAI', 'moyAI Team Management'), [switch]$Preview) {
+function Remove-MoyaiShortcuts([string]$Root, [string]$ShortcutFolder, [string[]]$Names = @('moyAI', 'moyAI Team Management'), [switch]$Preview, [switch]$RemovedFixedDesktop) {
   if (-not (Test-Path -LiteralPath $ShortcutFolder -PathType Container)) { return }
   $shell = New-Object -ComObject WScript.Shell
   foreach ($name in $Names) {
@@ -268,7 +268,10 @@ function Remove-MoyaiShortcuts([string]$Root, [string]$ShortcutFolder, [string[]
     $actual = $shell.CreateShortcut($path)
     # Shared Start-menu names can point to another installation or a user-edited command.
     if ($actual.TargetPath -ine $expected.TargetPath -or $actual.Arguments -cne $expected.Arguments -or $actual.WorkingDirectory -ine $expected.WorkingDirectory -or $actual.IconLocation -ine $expected.IconLocation) { continue }
-    if (-not $Preview) { Remove-Item -LiteralPath $path -Force }
+    if (-not $Preview) {
+      if ($RemovedFixedDesktop) { Assert-MoyaiRemovedFixedDesktop $Root }
+      Remove-Item -LiteralPath $path -Force
+    }
     $path
   }
 }
@@ -291,7 +294,7 @@ function Get-MoyaiRunningAppNotice([string]$Root, [object[]]$Processes) {
   }
   $lines.Add('次の操作:')
   $lines.Add('1. 仕事を実行するPCでは新しい仕事の受付を一時停止し、実行中の仕事の完了と、停止を確認できない処理がないことを確認してください。')
-  $lines.Add('2. moyAIはタスクトレイのアイコンから「終了」してください。画面の×だけでは終了しません。')
+  $lines.Add('2. Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選びます。タスクトレイからも終了できます。画面の×を押すと仕事は続きます。')
   $lines.Add('3. 上にRunnerがある場合は実行PCの担当者に終了を依頼してください。Hubがある場合は管理者がそのHubを --stop で終了します。ブラウザーを閉じるだけではHubは終了しません。')
   $lines.Add('4. 終了後に同じセットアップを開き直してください。停止手順: docs/user/windows-setup.md「更新・アンインストール」')
   $lines.Add('セットアップは稼働中のアプリや仕事を強制停止しません。')
@@ -313,6 +316,10 @@ function Get-MoyaiAutostartCandidates([string]$Root, $Receipt, $Manifest, [objec
     if ((Test-Path -LiteralPath $executable) -and ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash -ine $files[0].sha256)) { continue }
     $owned[$relative] = $executable
   }
+  Select-MoyaiOwnedAutostartEntries $owned $Entries
+}
+
+function Select-MoyaiOwnedAutostartEntries($Owned, [object[]]$Entries) {
   foreach ($entry in $Entries) {
     if ($entry.kind -cne 'String' -or $entry.command -isnot [string] -or $entry.command.Length -gt 260 -or $entry.command.Contains([char]0)) { continue }
     $relative = $null; $match = $null
@@ -336,7 +343,14 @@ function Open-MoyaiRunKey([bool]$Writable) {
   return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run', $Writable)
 }
 
-function Remove-MoyaiAutostart([string]$Root, $Receipt, $Manifest, [switch]$Preview, $RegistryKey = $null) {
+function Assert-MoyaiRemovedFixedDesktop([string]$Root) {
+  $fixed=(Get-MoyaiComponentLocation 'Desktop').root
+  if([IO.Path]::GetFullPath($Root) -ine [IO.Path]::GetFullPath($fixed) -or (Test-Path -LiteralPath $fixed)) {
+    throw 'Desktopの固定配置に変更があります。現在の導入状態を確認してから再実行してください。'
+  }
+}
+
+function Remove-MoyaiAutostart([string]$Root, $Receipt, $Manifest, [switch]$Preview, $RegistryKey = $null, [switch]$RemovedFixedDesktop) {
   $ownsKey = $null -eq $RegistryKey
   $key = if ($ownsKey) { Open-MoyaiRunKey (-not $Preview) } else { $RegistryKey }
   if ($null -eq $key) { return }
@@ -345,15 +359,20 @@ function Remove-MoyaiAutostart([string]$Root, $Receipt, $Manifest, [switch]$Prev
       [pscustomobject]@{ name = $_; kind = $key.GetValueKind($_).ToString();
         command = $key.GetValue($_, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
     })
-    $selected = @(Get-MoyaiAutostartCandidates $Root $Receipt $Manifest $entries)
+    if($RemovedFixedDesktop) {
+      Assert-MoyaiRemovedFixedDesktop $Root
+      $owned=@{'app/bin/moyai-runner.exe'=(Resolve-MoyaiChild $Root 'app/bin/moyai-runner.exe')}
+      $selected=@(Select-MoyaiOwnedAutostartEntries $owned $entries)
+    } else { $selected = @(Get-MoyaiAutostartCandidates $Root $Receipt $Manifest $entries) }
     foreach ($entry in $selected) {
       if (-not $Preview) {
         # Re-read the complete command immediately before deleting its value, never the Run key.
         $current = $key.GetValue($entry.name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         if ($null -eq $current) { continue }
         if ($key.GetValueKind($entry.name).ToString() -cne 'String' -or $current -cne $entry.command) {
-          throw 'アンインストール中に自動起動の登録が変更されました。変更された登録とアプリ本体は残しています。自動起動の設定を変更した担当者に確認してから再実行してください。'
+          throw 'アンインストール中に自動起動の登録が変更されました。変更後の登録は保持しました。設定を変更した担当者に確認してから再実行してください。'
         }
+        if ($RemovedFixedDesktop) { Assert-MoyaiRemovedFixedDesktop $Root }
         $key.DeleteValue($entry.name, $false)
       }
       $entry
@@ -496,17 +515,22 @@ function Set-MoyaiJoinFileAssociation([string]$Root, $RegistryKey = $null, $Defa
   } finally { if ($ownsKey) { $key.Dispose() } }
 }
 
-function Remove-MoyaiJoinFileAssociation([string]$Root, $Receipt, $Manifest, [switch]$Preview, $RegistryKey = $null) {
-  if (-not (Test-MoyaiJoinFileReceipt $Root $Receipt $Manifest)) { return }
-  $launcher = Resolve-MoyaiChild $Root 'scripts/Start-moyAI.ps1'
-  $listed = @($Manifest.files | Where-Object { $_.path -ceq 'scripts/Start-moyAI.ps1' })
-  if ($listed.Count -ne 1 -or ((Test-Path -LiteralPath $launcher) -and (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash -ine $listed[0].sha256)) { return }
+function Remove-MoyaiJoinFileAssociation([string]$Root, $Receipt, $Manifest, [switch]$Preview, $RegistryKey = $null, [switch]$RemovedFixedDesktop) {
+  if($RemovedFixedDesktop) { Assert-MoyaiRemovedFixedDesktop $Root }
+  else {
+    if (-not (Test-MoyaiJoinFileReceipt $Root $Receipt $Manifest)) { return }
+    $launcher = Resolve-MoyaiChild $Root 'scripts/Start-moyAI.ps1'
+    $listed = @($Manifest.files | Where-Object { $_.path -ceq 'scripts/Start-moyAI.ps1' })
+    if ($listed.Count -ne 1 -or ((Test-Path -LiteralPath $launcher) -and (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash -ine $listed[0].sha256)) { return }
+  }
   $ownsKey = $null -eq $RegistryKey
   $key = if ($ownsKey) { Open-MoyaiClassesKey (-not $Preview) } else { $RegistryKey }
   if ($null -eq $key) { return }
   try {
     $registration = Get-MoyaiJoinFileRegistration $Root
-    $command = Get-MoyaiAssociationValue $key ($registration.prog_id + '\shell\open\command')
+    $commandPath = $registration.prog_id + '\shell\open\command'
+    $command = Get-MoyaiAssociationValue $key $commandPath
+    if($RemovedFixedDesktop -and $null -eq $command) { return }
     if ($null -ne $command -and ($command.kind -cne 'String' -or $command.value -cne $registration.command)) { return }
     foreach ($entry in @(Get-MoyaiAssociationValues $Root)) {
       $current = Get-MoyaiAssociationValue $key $entry.path
@@ -517,7 +541,14 @@ function Remove-MoyaiJoinFileAssociation([string]$Root, $Receipt, $Manifest, [sw
         try {
           $reread = $target.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
           if ($null -eq $reread) { continue }
-          if ($target.GetValueKind('').ToString() -cne 'String' -or $reread -cne $entry.value) { throw 'アンインストール中に接続ファイルを開くアプリの設定が変わりました。変更された設定とアプリ本体は残しています。Windowsの「既定のアプリ」を確認してから再実行してください。' }
+          if ($target.GetValueKind('').ToString() -cne 'String' -or $reread -cne $entry.value) { throw 'アンインストール中に接続ファイルを開くアプリの設定が変わりました。変更後の設定は保持しました。Windowsの「既定のアプリ」を確認してから再実行してください。' }
+          if ($RemovedFixedDesktop) {
+            Assert-MoyaiRemovedFixedDesktop $Root
+            $handler = Get-MoyaiAssociationValue $key $commandPath
+            if ($null -eq $handler -or $handler.kind -cne 'String' -or $handler.value -cne $registration.command) {
+              throw '接続ファイルを開くアプリが変更されたため、登録の整理を中止しました。Windowsの「既定のアプリ」を確認してください。'
+            }
+          }
           $target.DeleteValue('', $false)
         } finally { $target.Dispose() }
       }

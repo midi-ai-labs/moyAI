@@ -32,6 +32,31 @@ export function createSnapshotRefresh(readSnapshot: () => Promise<void>): (after
   };
 }
 
+export function createDesktopRefresh(readLocal: () => Promise<void>, readHub: () => Promise<void>, now = () => performance.now()) {
+  let lastHubRead = -Infinity;
+  const local = createSnapshotRefresh(readLocal);
+  const hub = createSnapshotRefresh(async () => {
+    lastHubRead = Infinity;
+    try {
+      await readHub();
+    } finally {
+      lastHubRead = now();
+    }
+  });
+  const refresh = async (afterInFlight = false) => {
+    await local(afterInFlight);
+    await hub(afterInFlight);
+  };
+  return {
+    local, refresh,
+    poll(localActive: boolean, hubIntervalMs: number | null) {
+      if (hubIntervalMs !== null && now() - lastHubRead >= hubIntervalMs) return refresh();
+      if (localActive) return local();
+      return Promise.resolve();
+    },
+  };
+}
+
 export async function installSnapshotInvalidation(
   subscribe: (onChanged: () => void) => Promise<() => void>,
   refresh: (afterInFlight?: boolean) => void,
@@ -75,7 +100,7 @@ export function runtimePollingRequired(
   // A Hub command can return its owner before the next ordinary Desktop snapshot.
   // Keep the existing poll alive across that handoff; both views come from Rust.
   return projectionRequiresPolling || runStartMutationPending
-    || hub?.status === "connecting" || hub?.status === "connected"
+    || hub?.status === "connecting"
     || Boolean(hub?.active_main || hub?.active_side_chat || hub?.active_approve)
     || Boolean(publish?.profiles.some((row) => ["starting", "running", "stopping"].includes(row.status)));
 }

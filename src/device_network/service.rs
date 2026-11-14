@@ -826,7 +826,7 @@ impl DeviceNetworkService {
             .state
             .lock()
             .expect("device network state poisoned");
-        state.client.is_some() || state.status == "pending" || state.receiver_status == "starting"
+        state.status == "pending" || state.receiver_status == "starting"
     }
     pub(crate) fn client(&self) -> Result<DeviceClient, DeviceError> {
         let state = self

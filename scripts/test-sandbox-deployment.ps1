@@ -18,6 +18,7 @@ $script:realElevation=${function:Invoke-MoyaiSandboxElevation}
 # boundaries are replaced before a product operation is called; no executable runs.
 $script:caseNumber=0
 function New-Case {
+    $script:markedForDeletion=$false; $script:keepDeletePending=$false
     $script:caseNumber++
     $script:caseRoot=Join-Path $EvidenceRoot ([string]$script:caseNumber)
     $script:machine=Join-Path $script:caseRoot 'machine'
@@ -53,7 +54,10 @@ function Copy-MoyaiSandboxPinnedPayload($Stream,[string]$Target) {
     try { $Stream.CopyTo($output) } finally { $output.Dispose(); $Stream.Position=0 }
     if ($script:corruptCopy) { [IO.File]::AppendAllText($Target,'injected mismatch'); $script:corruptCopy=$false }
 }
-function Get-MoyaiSandboxService([switch]$Security) { return $script:service }
+function Get-MoyaiSandboxService([switch]$Security) {
+    if($script:markedForDeletion) { throw [ComponentModel.Win32Exception]::new(1072) }
+    return $script:service
+}
 function Set-MoyaiSandboxService([string]$Command,[uint32]$Start,[switch]$Create) {
     $script:calls.Add("configure:$Start")
     if ($Start -eq 3 -and $script:failEnable) { $script:failEnable=$false; throw 'Injected change-config failure.' }
@@ -62,7 +66,12 @@ function Set-MoyaiSandboxService([string]$Command,[uint32]$Start,[switch]$Create
     if ($Start -eq 4 -and $script:raceStart) { $script:service.State=4; $script:raceStart=$false }
 }
 function Set-MoyaiSandboxServiceSecurity([string]$Sddl) { $script:calls.Add('security'); $script:service.Sddl=$Sddl }
-function Remove-MoyaiSandboxService { $script:calls.Add('delete'); if ($script:failDelete) { $script:failDelete=$false; throw 'Injected delete failure.' }; $script:service=$null }
+function Remove-MoyaiSandboxService {
+    $script:calls.Add('delete')
+    if ($script:failDelete) { $script:failDelete=$false; throw 'Injected delete failure.' }
+    if ($script:keepDeletePending) { $script:markedForDeletion=$true }
+    else { $script:service=$null }
+}
 function Assert-MoyaiSandboxClientsStopped { if($script:clientRunning){throw 'A client still owns work.'} }
 function Stop-MoyaiSandboxService { $script:calls.Add('stop'); if($script:failStop){throw 'Stop timed out.'}; $script:service.State=1 }
 function Invoke-MoyaiSandboxElevation([string]$SourceRoot,$Manifest) { $script:elevationCount++; throw 'Simulated user cancellation; no process was started.' }
@@ -132,6 +141,14 @@ Assert-That ((Test-Path -LiteralPath $location.helper) -and $script:service.Star
 $sentinel=Join-Path $script:caseRoot 'user-data.txt'; Write-MoyaiUtf8 $sentinel 'profile/history/device policy sentinel'
 Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
 Assert-That ($null -eq $script:service -and -not (Test-Path -LiteralPath $location.root) -and (Get-Content -LiteralPath $sentinel -Raw) -ceq 'profile/history/device policy sentinel') 'explicit machine removal deletes only owned payload and service'
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$script:keepDeletePending=$true
+$pendingReason=''
+try { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null } catch { $pendingReason=$_.Exception.Message }
+Assert-That ($pendingReason.Contains('削除を保留')) 'a marked-for-deletion service is reported as pending instead of complete'
+$script:keepDeletePending=$false; $script:markedForDeletion=$false; $script:service=$null
 Assert-That ((Get-Content -LiteralPath $legacySentinel -Raw) -ceq 'previous transient helper evidence') 'install, update and explicit removal preserve the legacy Sandbox directory'
 
 foreach($damage in @('helper','directory','parent','service','empty','disabled')) {
@@ -261,6 +278,11 @@ $script:service.Command='"C:\unrelated.exe" --service'
 Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall } 'a same-name service with another image path is not adopted or removed'
 Assert-That ((Test-Path -LiteralPath $location.helper) -and $script:service.Command -ceq '"C:\unrelated.exe" --service') 'foreign service conflict leaves both registrations and files unchanged'
 $script:service.Command='"'+$location.helper+'" --service'
+$script:service.Start=2
+$registrationFailure=''
+try { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null } catch { $registrationFailure=$_.Exception.Message }
+Assert-That ($registrationFailure.Contains('開始方法 2') -and $registrationFailure.Contains('想定 3 または 4') -and $script:service.Start -eq 2 -and (Test-Path -LiteralPath $location.helper)) 'unexpected registered start mode reports observed and expected values while preserving payload and configuration'
+$script:service.Start=3
 $script:service.Sddl='O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)'
 Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall } 'unexpected service authority fails closed before removal'
 $script:service.Sddl='O:IUG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x15;;;IU)'

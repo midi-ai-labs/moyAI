@@ -226,11 +226,15 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
         await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-sidebar-selected", owner: OWNER });
         const followupPrompt = "desktop-conversation-followup: 同じ会話で続けてください。";
         await fill(byId("shared-followup", "TEXTAREA"), followupPrompt);
-        await click(sharedActionTarget("continue"));
+        await state.input.keyDown("Control");
+        try { await state.input.pressKey("Enter"); } finally { await state.input.keyUp("Control"); }
         const second = await waitForTurn("Additional Send creates a later turn in the same Hub conversation",
           { projectId, title, prompt: followupPrompt, previousJobId: firstJobId, conversationId });
         if (second.error || second.detail?.state !== "succeeded" || second.detail.uncertainty_reason || second.detail.conversation_id !== conversationId)
           throw fail("Follow-up did not complete in the original conversation", { error: second.error, detail: second.detail, conversationId });
+        await wait("Ctrl+Enter leaves the empty follow-up editor ready for the next request",
+          () => cdp.evaluate("(() => { const field = document.querySelector('#shared-followup'); return field && document.activeElement === field && !field.readOnly && field.value === ''; })()"),
+          value => value === true, 5000);
         await wait("Both user turns and answers remain readable", () => cdp.evaluate(`document.querySelector('[data-shared-region="history-container"]')?.innerText`),
           text => text?.includes("desktop-conversation-start") && text.includes("desktop-conversation-followup")
             && text.includes("最初の依頼をこのプロジェクトで実行しました。") && text.includes("追加の依頼にも、同じ共有チャットで回答しました。"));

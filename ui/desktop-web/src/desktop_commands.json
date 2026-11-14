@@ -63,6 +63,7 @@
   "open_workspace_folder",
   "open_global_config_folder",
   "open_user_data_folder",
+  "open_web_link",
   "import_global_config_toml",
   "load_initial_setup_config_toml",
   "open_typed_path",

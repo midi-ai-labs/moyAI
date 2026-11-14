@@ -60,7 +60,7 @@ content_encoding: xml_entities_v1
 ${SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT}
 </evidence_unit>
 
-<evidence_unit kind="owner_assistant" source_history_item_ids="${ASSISTANT_ID}">
+<evidence_unit kind="owner_historical_assistant" source_history_item_ids="${ASSISTANT_ID}">
 ${SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE}
 </evidence_unit>
 </canonical_evidence>
@@ -111,7 +111,7 @@ test("Side Chat selected-session context binds exact Alpha units and canonical i
   assert.equal(parsed.pass, true);
   assert.equal(parsed.owner_session_id, OWNER_ID);
   assert.equal(parsed.as_of_append_position, APPEND_POSITION);
-  assert.deepEqual(parsed.unit_kinds, ["owner_user", "owner_assistant"]);
+  assert.deepEqual(parsed.unit_kinds, ["owner_user", "owner_historical_assistant"]);
   assert.deepEqual(parsed.source_history_item_ids, [USER_ID, ASSISTANT_ID]);
   assert.equal(parsed.truncated, false);
   assert.equal(parsed.content_encoding, "xml_entities_v1");
@@ -122,6 +122,7 @@ test("Side Chat selected-session context rejects cross-session data and malforme
   const valid = ownerContext();
   const userUnit = `<evidence_unit kind="owner_user" source_history_item_ids="${USER_ID}">\n${SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT}\n</evidence_unit>`;
   const malformed = [
+    ["historical reply relabeled as an active assistant", valid.replace("owner_historical_assistant", "owner_assistant")],
     ["Beta user body", valid.replace(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT, SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT)],
     ["Beta assistant body", valid.replace(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE, SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE)],
     ["Beta append", valid.replace(SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE, `${SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE}\n${SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE}`)],
@@ -141,7 +142,7 @@ test("Side Chat selected-session context rejects cross-session data and malforme
     ["truncated", valid.replace("truncated: false", "truncated: true")],
     ["wrong scope", valid.replace("scope: owner_session", "scope: all_sessions")],
     ["wrong encoding", valid.replace("xml_entities_v1", "raw")],
-    ["wrong unit kind", valid.replace("kind=\"owner_assistant\"", "kind=\"owner_tool\"")],
+    ["wrong unit kind", valid.replace("kind=\"owner_historical_assistant\"", "kind=\"owner_tool\"")],
     ["missing user unit", valid.replace(`\n${userUnit}\n`, "")],
     ["quoted context", valid.replace("\n<canonical_evidence>", "\n<selected_quote>quote</selected_quote>\n<canonical_evidence>")],
     ["trailing text", `${valid}\ntrailing`],

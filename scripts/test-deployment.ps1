@@ -538,14 +538,15 @@ foreach ($invalid in @(
 )) { Assert-That (@(Get-MoyaiAutostartCandidates $destination $receipt $installedManifest @($invalid)).Count -eq 0) 'foreign, custom, unknown-namespace or non-string startup registration retained' }
 $wrongReceipt = [pscustomobject]@{product=$receipt.product; version=$receipt.version; install_root=(Join-Path $EvidenceRoot 'other')}
 Assert-Fails { Get-MoyaiAutostartCandidates $destination $wrongReceipt $installedManifest $registrations } 'autostart cleanup rejects another installation receipt'
-function New-FakeRunKey([switch]$ChangeOnReread) {
+function New-FakeRunKey([switch]$ChangeOnReread,[string]$RestoreRootOnReread='') {
   $values = @{ unrelated='unrelated command' }; foreach ($row in $registrations) { $values[$row.name]=$row.command }
-  $key = [pscustomobject]@{Values=$values; Reads=@{}; Deleted=[Collections.Generic.List[string]]::new(); Change=[bool]$ChangeOnReread}
+  $key = [pscustomobject]@{Values=$values; Reads=@{}; Deleted=[Collections.Generic.List[string]]::new(); Change=[bool]$ChangeOnReread; RestoreRoot=$RestoreRootOnReread}
   $key | Add-Member ScriptMethod GetValueNames { return @($this.Values.Keys) }
   $key | Add-Member ScriptMethod GetValueKind { param($name) return [Microsoft.Win32.RegistryValueKind]::String }
   $key | Add-Member ScriptMethod GetValue {
     param($name, $fallback, $options)
     if (-not $this.Reads.ContainsKey($name)) { $this.Reads[$name]=0 }; $this.Reads[$name]++
+    if ($this.RestoreRoot -and $this.Reads[$name] -gt 1) { [void][IO.Directory]::CreateDirectory($this.RestoreRoot) }
     if ($this.Change -and $this.Reads[$name] -gt 1) { return 'changed after preview' }
     return $this.Values[$name]
   }
@@ -554,6 +555,32 @@ function New-FakeRunKey([switch]$ChangeOnReread) {
 }
 $fake = New-FakeRunKey
 Assert-That (@(Remove-MoyaiAutostart $destination $receipt $installedManifest -Preview -RegistryKey $fake).Count -eq 4 -and $fake.Deleted.Count -eq 0) 'uninstall preview leaves fake startup registrations untouched'
+& {
+  $missingRoot=Join-Path $EvidenceRoot 'removed-fixed-desktop'
+  function Get-MoyaiComponentLocation([string]$Name) { [pscustomobject]@{root=$missingRoot} }
+  $runKey=New-FakeRunKey
+  $runKey.Values['moyAI Runner']='"'+(Join-Path $missingRoot 'app\bin\moyai-runner.exe')+'" serve --background'
+  [void](Remove-MoyaiAutostart $missingRoot $null $null -RemovedFixedDesktop -RegistryKey $runKey)
+  Assert-That ($runKey.Deleted.Count -eq 1 -and $runKey.Deleted[0] -ceq 'moyAI Runner') 'retry after payload removal clears only the exact fixed Runner entry'
+  $runKey.Values['moyAI Runner']='"C:\Other\moyai-runner.exe" serve --background'
+  [void](Remove-MoyaiAutostart $missingRoot $null $null -RemovedFixedDesktop -RegistryKey $runKey)
+  Assert-That ($runKey.Deleted.Count -eq 1) 'a foreign Runner entry survives the retry'
+  $associationKey=New-FakeClassesKey
+  foreach($entry in @(Get-MoyaiAssociationValues $missingRoot)) { $key=$associationKey.CreateSubKey($entry.path); $key.SetValue('', $entry.value, [Microsoft.Win32.RegistryValueKind]::String) }
+  $removed=@(Remove-MoyaiJoinFileAssociation $missingRoot $null $null -RemovedFixedDesktop -RegistryKey $associationKey)
+  Assert-That ($removed.Count -eq 5) 'retry after payload removal clears the exact file association with its command last'
+  Assert-Fails { Remove-MoyaiAutostart $destination $null $null -RemovedFixedDesktop -RegistryKey $runKey } 'fixed retry rejects another installation'
+  $associationKey=New-FakeClassesKey
+  foreach($entry in @(Get-MoyaiAssociationValues $missingRoot)) { $key=$associationKey.CreateSubKey($entry.path); $key.SetValue('', $entry.value, [Microsoft.Win32.RegistryValueKind]::String) }
+  $associationKey.Store.RacePath=(Get-MoyaiJoinFileRegistration $missingRoot).prog_id+'\shell\open\command'
+  Assert-Fails { Remove-MoyaiJoinFileAssociation $missingRoot $null $null -RemovedFixedDesktop -RegistryKey $associationKey } 'retry detects a replacement handler before removing its associated values'
+  Assert-That ($associationKey.Store.Deleted.Count -eq 0) 'a replacement handler keeps every associated value during retry'
+  $racedRunKey=New-FakeRunKey -RestoreRootOnReread $missingRoot
+  $racedRunKey.Values['moyAI Runner']='"'+(Join-Path $missingRoot 'app\bin\moyai-runner.exe')+'" serve --background'
+  Assert-Fails { Remove-MoyaiAutostart $missingRoot $null $null -RemovedFixedDesktop -RegistryKey $racedRunKey } 'a concurrent reinstall stops removal of its exact Runner registration'
+  Assert-That ($racedRunKey.Deleted.Count -eq 0) 'the concurrently reinstalled Runner retains its startup entry'
+  Assert-Fails { Remove-MoyaiJoinFileAssociation $missingRoot $null $null -RemovedFixedDesktop -RegistryKey $associationKey } 'a reappearing Desktop directory stops registration cleanup'
+}
 $fake = New-FakeRunKey
 [void](Remove-MoyaiAutostart $destination $receipt $installedManifest -RegistryKey $fake)
 Assert-That ($fake.Deleted.Count -eq 4 -and $fake.Values.Count -eq 1 -and $fake.Values.ContainsKey('unrelated')) 'uninstall removes only exact owned values from an isolated fake Run key'

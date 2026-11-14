@@ -186,6 +186,7 @@ export interface DesktopMarkupOptions {
   readonly backgroundInert: boolean;
   readonly taskActivityDelay: string;
   readonly mcpActivityDelay?: string;
+  readonly markdownCache?: Map<string, string>;
 }
 
 /** Pure Desktop markup composition from one explicit immutable render model. */
@@ -234,7 +235,7 @@ function renderDesktopContent(model: DesktopRenderModel, options: DesktopMarkupO
         ${renderConversationMain({
           topbar: renderTopbar(state, local),
           activity: `${renderRunStatusStrip(state)}${renderReceiverActivity(local.deviceNetwork, local.sharedWork)}${renderOriginWork(local.deviceNetwork, state.draft_target.sessionId, state.can_cancel_run)}`,
-          thread: renderThreadContent(state, local),
+          thread: renderThreadContent(state, local, options.markdownCache),
           composer: renderComposer(state, local),
         })}
         ${renderArtifactPane(state, local)}
@@ -1180,6 +1181,7 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
 export function renderThreadContent(
   state: DesktopWebState,
   local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+  markdownCache?: Map<string, string>,
 ): string {
   const selectedTranscriptAgentPath = local.artifactPane.mode === "agents"
     ? local.artifactPane.selectedAgentPath
@@ -1226,6 +1228,7 @@ export function renderThreadContent(
   const transcript = state.thread_empty
     ? ""
     : renderTranscriptRows(state.transcript_rows, {
+      markdownCache,
       includeRail: true,
       agentActivityRows: state.agent_activity_rows,
       currentTurnAgentActivityRows: state.current_turn_agent_activity_rows,

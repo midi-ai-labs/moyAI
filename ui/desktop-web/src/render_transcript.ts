@@ -19,6 +19,7 @@ interface TranscriptRenderOptions {
   stableLatestAssistant?: boolean;
   sideChatQuoteOwnerSessionId?: string | null;
   editableUserHistoryId?: string | null;
+  markdownCache?: Map<string, string>;
 }
 
 interface AgentHistoryEvent {
@@ -42,6 +43,11 @@ export function renderTranscriptRows(
   const anchors = transcriptAnchors(rows, {
     stableLatestAssistant: options.stableLatestAssistant,
   });
+  const cache = options.markdownCache;
+  if (cache?.size) {
+    const visible = new Set(rows.map(row => row.body));
+    for (const text of cache.keys()) if (!visible.has(text)) cache.delete(text);
+  }
   const prefix = options.anchorPrefix?.trim() ?? "";
   let lastWorkSummaryIndex = -1;
   anchors.forEach((anchor, index) => {
@@ -86,6 +92,7 @@ export function renderTranscriptRows(
       prefixedAnchorId(prefix, anchor.id),
       options.sideChatQuoteOwnerSessionId ?? null,
       options.editableUserHistoryId ?? null,
+      cache,
     ));
   });
   if (pendingAgentEvents.length > 0) {
@@ -159,6 +166,7 @@ function renderTranscriptRow(
   anchorId: string,
   sideChatQuoteOwnerSessionId: string | null,
   editableUserHistoryId: string | null,
+  cache?: Map<string, string>,
 ): string {
   if (row.row_kind === "file_changes") {
     return renderFileChanges(row, anchorId, sideChatQuoteOwnerSessionId);
@@ -168,13 +176,18 @@ function renderTranscriptRow(
   const quoteSourceKind = durableIdentity && sideChatQuoteOwnerSessionId
     ? sideChatQuoteSourceKind(row)
     : null;
+  let markdown = cache?.get(row.body);
+  if (markdown === undefined) {
+    markdown = renderMarkdown(row.body);
+    if (durableIdentity) cache?.set(row.body, markdown);
+  }
   return `
     <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}" tabindex="-1" data-focus-key="history:${escapeHtml(anchorId)}"
       ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
       ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
         ${routineConversation ? "" : `<h2>${escapeHtml(row.title)}</h2>`}
-        <div class="markdown-body">${renderMarkdown(row.body)}</div>
+        <div class="markdown-body">${markdown}</div>
         ${row.row_kind === "user" && durableIdentity === editableUserHistoryId ? `<div class="message-edit-actions"><button type="button" data-action="edit-local-message" data-value="${escapeHtml(durableIdentity)}">編集して再送</button><span>作成済みファイルや起動中のアプリは元に戻りません。</span></div>` : ""}
         ${quoteSourceKind && durableIdentity ? renderSideChatQuoteAction(durableIdentity) : ""}
       </div>

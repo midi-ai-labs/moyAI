@@ -261,6 +261,7 @@ export async function observeProviderTurnSurface(cdp) {
     const prompt = document.querySelector('textarea#prompt');
     const send = document.querySelector('button[data-action="send"]');
     const composer = document.querySelector('section.composer');
+    const permissionDialogs = Array.from(document.querySelectorAll('.permission-confirmation[role="alertdialog"]')).filter(visible);
     let composerRunTarget = null;
     try { composerRunTarget = JSON.parse(composer?.getAttribute('data-run-target') ?? 'null'); }
     catch { composerRunTarget = { parse_error: true }; }
@@ -298,6 +299,7 @@ export async function observeProviderTurnSurface(cdp) {
       },
       visible_fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
       visible_recoverable_error_count: Array.from(document.querySelectorAll('.ui-error-notice')).filter(visible).length,
+      visible_permission_id: permissionDialogs.length === 1 ? permissionDialogs[0].getAttribute('data-permission-id') : null,
       visible_dialog_count: Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).filter(visible).length,
       visible_modal_backdrop_count: Array.from(document.querySelectorAll('.modal-backdrop')).filter(visible).length,
     };

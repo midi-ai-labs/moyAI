@@ -837,11 +837,8 @@ pub(crate) fn desktop_web_state_with_permission(
             || (hub.can_enable_side_chat_hub && hub.active_side_chat.is_none());
     }
     let hub_polling = hub.as_ref().is_some_and(|hub| {
-        matches!(
-            hub.status,
-            crate::hub::HubConnectionStatus::Connecting
-                | crate::hub::HubConnectionStatus::Connected
-        ) || hub.active_main.is_some()
+        hub.status == crate::hub::HubConnectionStatus::Connecting
+            || hub.active_main.is_some()
             || hub.active_side_chat.is_some()
             || hub.active_approve.is_some()
     });

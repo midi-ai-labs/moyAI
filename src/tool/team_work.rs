@@ -319,7 +319,7 @@ async fn upload_file(
             "The selected input must be one regular file of at most 8 MiB".into(),
         ));
     }
-    let bytes = opened.with_file(|file| {
+    let bytes = opened.with_file(|file| -> std::io::Result<_> {
         let mut bytes = Vec::new();
         file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
         Ok(bytes)

@@ -607,6 +607,26 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+pub(super) fn pending_upgrade_version(
+    connection: &Connection,
+) -> Result<Option<i64>, StorageError> {
+    if table_exists(connection, "moyai_schema_migrations")? {
+        let version: i64 = connection.query_row(
+            "SELECT coalesce(max(version), 0) FROM moyai_schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        return Ok((0..CLM_CHECKPOINT_VERSION)
+            .contains(&version)
+            .then_some(version));
+    }
+    let populated: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*')",
+        [], |row| row.get(0),
+    )?;
+    Ok(populated.then_some(0))
+}
+
 pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError> {
     // Recent migrations deliberately validate and commit one authority boundary at a time.
     // A product startup is nevertheless one user-visible migration attempt, so keep advancing

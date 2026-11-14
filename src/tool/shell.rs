@@ -902,17 +902,29 @@ fn captured_shell_text(output: &BoundedPipeOutput) -> String {
 }
 
 fn decode_shell_bytes_for_display(bytes: &[u8]) -> String {
-    match String::from_utf8(bytes.to_vec()) {
-        Ok(value) => value,
-        Err(_) => {
-            let (decoded, _, had_errors) = SHIFT_JIS.decode(bytes);
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return value.to_owned();
+    }
+    if let Some((codec, prefix)) = encoding_rs::Encoding::for_bom(bytes) {
+        let (decoded, errors) = codec.decode_without_bom_handling(&bytes[prefix..]);
+        if !errors {
+            return decoded.into_owned();
+        }
+    }
+    let mut text = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        if let Ok(value) = std::str::from_utf8(line) {
+            text.push_str(value);
+        } else {
+            let (decoded, had_errors) = SHIFT_JIS.decode_without_bom_handling(line);
             if had_errors {
-                String::from_utf8_lossy(bytes).into_owned()
+                text.push_str(&String::from_utf8_lossy(line));
             } else {
-                decoded.into_owned()
+                text.push_str(&decoded);
             }
         }
     }
+    text
 }
 
 #[cfg(test)]
@@ -4566,6 +4578,22 @@ mod tests {
         assert!(output.stdout.ends_with("FINAL"));
         assert!(output.stdout.contains("2026 bytes omitted"));
         assert_eq!(output.stdout_omitted_bytes, Some(2026));
+    }
+
+    #[test]
+    fn shell_capture_decodes_mixed_utf8_and_shift_jis_lines() {
+        let mut capture = crate::tool::truncate::PipeCapture::new(1024);
+        capture.append("結果を確認\r\n".as_bytes());
+        let (legacy, _, _) = encoding_rs::SHIFT_JIS.encode("処理に失敗\r\n");
+        capture.append(&legacy);
+        capture.append("次の行".as_bytes());
+        assert_eq!(
+            super::captured_shell_text(&capture.finish()),
+            "結果を確認\r\n処理に失敗\r\n次の行"
+        );
+        let mut wide = vec![0xff, 0xfe];
+        wide.extend("行\n末".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(super::decode_shell_bytes_for_display(&wide), "行\n末");
     }
 
     #[test]

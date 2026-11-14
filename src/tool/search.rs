@@ -285,6 +285,7 @@ impl Tool for ListTool {
                 result_limit: limit,
                 visit_limit: discovery_visit_limit(limit),
             },
+            &ctx.stop_token(),
         )?;
         let rendered = render_entries_bounded(
             &page.entries,
@@ -389,6 +390,7 @@ impl Tool for GlobTool {
                 result_limit: candidate_limit,
                 visit_limit: discovery_visit_limit(candidate_limit),
             },
+            &ctx.stop_token(),
         )?;
         let matching = page
             .entries
@@ -613,6 +615,7 @@ impl Tool for GrepTool {
                     result_limit: candidate_limit,
                     visit_limit: discovery_visit_limit(candidate_limit),
                 },
+                &ctx.stop_token(),
             )?
         };
         let in_file_fence = cursor_position
@@ -632,7 +635,9 @@ impl Tool for GrepTool {
         let mut scanned_files = 0usize;
         let output_byte_limit = ctx.config().tool_output.max_bytes.max(1);
 
+        let stop = ctx.stop_token();
         'files: for (file_index, entry) in page.entries.iter().enumerate() {
+            crate::workspace::traversal::check_read_active(&stop)?;
             let resumed_in_file = (file_index == 0).then_some(in_file_fence).flatten();
             if let Some(fence) = resumed_in_file {
                 validate_grep_resume_candidate(&entry.path, fence)?;
@@ -662,6 +667,7 @@ impl Tool for GrepTool {
                 &entry.path,
                 &ctx.config().file_guard,
                 opened_internal_file,
+                &stop,
             )? {
                 Ok(candidate) => {
                     let line_offset = if let Some(fence) = resumed_in_file {
@@ -671,6 +677,7 @@ impl Tool for GrepTool {
                         0
                     };
                     for (line_index, line) in candidate.text.lines().enumerate().skip(line_offset) {
+                        crate::workspace::traversal::check_read_active(&stop)?;
                         if !regex.is_match(line) {
                             continue;
                         }
@@ -1025,9 +1032,10 @@ fn read_grep_candidate(
     path: &Utf8Path,
     guard: &FileGuardConfig,
     opened_internal_file: Option<&mut std::fs::File>,
+    stop: &tokio_util::sync::CancellationToken,
 ) -> Result<Result<GrepCandidateText, GrepSkipReason>, ToolError> {
     if let Some(file) = opened_internal_file {
-        return read_grep_candidate_from_file(path, file, guard);
+        return read_grep_candidate_from_file(path, file, guard, stop);
     }
     let search_root = search_root.ok_or_else(|| {
         ToolError::Message(
@@ -1036,13 +1044,14 @@ fn read_grep_candidate(
     })?;
     let candidate = PathGuard::require_descendant(workspace, search_root, path)?;
     let mut file = PathGuard::open_validated_read_file(&candidate)?;
-    read_grep_candidate_from_file(path, &mut file, guard)
+    read_grep_candidate_from_file(path, &mut file, guard, stop)
 }
 
 fn read_grep_candidate_from_file(
     path: &Utf8Path,
     file: &mut std::fs::File,
     guard: &FileGuardConfig,
+    stop: &tokio_util::sync::CancellationToken,
 ) -> Result<Result<GrepCandidateText, GrepSkipReason>, ToolError> {
     let metadata = file.metadata()?;
     let extension = normalized_extension(path);
@@ -1072,9 +1081,7 @@ fn read_grep_candidate_from_file(
 
     let max_bytes = guard.max_inline_read_bytes.min(usize::MAX as u64) as usize;
     let mut bytes = sample;
-    file.take(max_bytes.saturating_sub(bytes.len()).saturating_add(1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
+    if crate::tool::read::read_up_to_limit(file, &mut bytes, max_bytes as u64, stop)? {
         return Ok(Err(GrepSkipReason::LargeFile));
     }
     if content_inspector::inspect(&bytes).is_binary() {
@@ -1270,6 +1277,34 @@ mod tests {
             assert!(output.contains("read"));
             assert!(output.contains("exact file path"));
         }
+    }
+
+    #[tokio::test]
+    async fn stop_requested_during_directory_grep_interrupts_the_current_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        for i in 0..512 {
+            fs::write(root.join(format!("input-{i:03}.txt")), [b'x'; 4096]).unwrap();
+        }
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).unwrap();
+        let control = RunControl::new();
+        let stop = control.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            stop.interrupt(crate::protocol::TurnInterruptionCause::UserStop);
+        });
+        let result = super::GrepTool
+            .execute_read(
+                serde_json::json!({"path": ".", "pattern": "not present", "limit":100}),
+                ReadToolContext::published(&workspace, &config, control),
+            )
+            .await;
+        thread.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::error::ToolError::RunInterrupted)
+        ));
     }
 
     #[tokio::test]
@@ -1547,32 +1582,60 @@ mod tests {
         let blocked = root.join("weights.bin");
         fs::write(&blocked, b"text").expect("write blocked fixture");
         assert_eq!(
-            read_grep_candidate(&workspace, Some(&search_root), &blocked, &guard, None)
-                .expect("guard result"),
+            read_grep_candidate(
+                &workspace,
+                Some(&search_root),
+                &blocked,
+                &guard,
+                None,
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .expect("guard result"),
             Err(GrepSkipReason::BlockedExtension)
         );
 
         let large = root.join("large.txt");
         fs::write(&large, b"0123456789").expect("write large fixture");
         assert_eq!(
-            read_grep_candidate(&workspace, Some(&search_root), &large, &guard, None)
-                .expect("guard result"),
+            read_grep_candidate(
+                &workspace,
+                Some(&search_root),
+                &large,
+                &guard,
+                None,
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .expect("guard result"),
             Err(GrepSkipReason::LargeFile)
         );
 
         let binary = root.join("binary.txt");
         fs::write(&binary, [0_u8, 1, 2]).expect("write binary fixture");
         assert_eq!(
-            read_grep_candidate(&workspace, Some(&search_root), &binary, &guard, None)
-                .expect("guard result"),
+            read_grep_candidate(
+                &workspace,
+                Some(&search_root),
+                &binary,
+                &guard,
+                None,
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .expect("guard result"),
             Err(GrepSkipReason::BinaryContent)
         );
 
         let text = root.join("source.txt");
         fs::write(&text, b"needle").expect("write text fixture");
         assert_eq!(
-            read_grep_candidate(&workspace, Some(&search_root), &text, &guard, None)
-                .expect("guard result"),
+            read_grep_candidate(
+                &workspace,
+                Some(&search_root),
+                &text,
+                &guard,
+                None,
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .expect("guard result"),
             Ok(super::GrepCandidateText {
                 text: "needle".to_string(),
                 content_sha256: Sha256::digest(b"needle").into(),
@@ -1617,7 +1680,14 @@ mod tests {
         link_directory(&external, &slot);
 
         let guard = ResolvedConfig::default().file_guard;
-        let result = read_grep_candidate(&workspace, Some(&search_root), &candidate, &guard, None);
+        let result = read_grep_candidate(
+            &workspace,
+            Some(&search_root),
+            &candidate,
+            &guard,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        );
 
         assert!(
             result.is_err(),
@@ -1645,7 +1715,14 @@ mod tests {
         link_file(&external, &candidate);
 
         let guard = ResolvedConfig::default().file_guard;
-        let result = read_grep_candidate(&workspace, Some(&search_root), &candidate, &guard, None);
+        let result = read_grep_candidate(
+            &workspace,
+            Some(&search_root),
+            &candidate,
+            &guard,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        );
 
         assert!(
             result.is_err(),
@@ -1681,6 +1758,7 @@ mod tests {
             &candidate,
             &ResolvedConfig::default().file_guard,
             Some(&mut opened),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("held candidate read")
         .expect("held candidate remains searchable");
@@ -1714,6 +1792,7 @@ mod tests {
             &entry.path,
             &config.file_guard,
             None,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("read candidate")
         .expect("searchable candidate");
@@ -1749,6 +1828,7 @@ mod tests {
             &resumed_entry.path,
             &config.file_guard,
             None,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("read rewritten candidate")
         .expect("rewritten candidate remains text");
@@ -1784,6 +1864,7 @@ mod tests {
             &entry.path,
             &config.file_guard,
             None,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("read candidate")
         .expect("searchable candidate");
@@ -1818,6 +1899,7 @@ mod tests {
             &resumed_entry.path,
             &config.file_guard,
             None,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("read rewritten candidate")
         .expect("rewritten candidate remains text");

@@ -36,12 +36,12 @@ function Assert-MoyaiComponentStopped([string]$Root,[object[]]$Processes=@()) { 
 function Get-MoyaiComponentLocation([string]$Component) { [pscustomobject]@{parent=$machine;root=(Join-Path $machine $Component);component=$Component} }
 function Invoke-MoyaiMachineSandboxSetup { throw 'Fixture attempted to access actual machine sandbox setup.' }
 function Get-MoyaiComponentResultRoot { Join-Path $EvidenceRoot 'ProgramData/moyAI/setup-results' }
-function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[bool]$Success,[int]$ExitCode,[string]$Message,[string[]]$Messages=@()) {
+function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[bool]$Success,[int]$ExitCode,[string]$Message,[string[]]$Messages=@(),[string[]]$Retained=@()) {
     $path=Get-MoyaiComponentResultPath $OperationId
     [void](New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force)
     $stream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
     try {
-        $bytes=[Text.Encoding]::UTF8.GetBytes((@{schema=1;operation_id=$OperationId;source_manifest_sha256=$ManifestSha256;components=@($Components | Where-Object {-not[string]::IsNullOrWhiteSpace($_)});success=$Success;exit_code=$ExitCode;message=$Message;messages=$Messages} | ConvertTo-Json -Depth 8))
+        $bytes=[Text.Encoding]::UTF8.GetBytes((@{schema=1;operation_id=$OperationId;source_manifest_sha256=$ManifestSha256;components=@($Components | Where-Object {-not[string]::IsNullOrWhiteSpace($_)});success=$Success;exit_code=$ExitCode;message=$Message;messages=$Messages;retained=$Retained} | ConvertTo-Json -Depth 8))
         $stream.Write($bytes,0,$bytes.Length)
     } finally { $stream.Dispose() }
 }
@@ -80,6 +80,7 @@ Assert-Fails { Read-MoyaiInstalledComponent 'Hub' } 'normal component lookup ref
 $removal=@(Invoke-MoyaiMachineComponent $package @('Hub') -Uninstall -ExpectedManifestSha256 $manifest.validated_manifest_sha256)
 Assert-That ((Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe')) -and (Test-Path -LiteralPath (Join-Path $hub 'machine-component.json'))) 'uninstall retains changed payload and its ownership receipt'
 Assert-That (($removal -join "`n").Contains('moyai-hub.exe')) 'uninstall reports changed files rather than claiming complete deletion'
+Assert-That (@($removal | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' -and ([string]$_).Contains('moyai-hub.exe') }).Count -eq 1) 'modified payload has a typed reason for the final partial-removal summary'
 Copy-Item -LiteralPath (Join-Path $package 'hub/bin/moyai-hub.exe') -Destination (Join-Path $hub 'moyai-hub.exe') -Force
 Invoke-MoyaiMachineComponent $package @('Hub') -Uninstall -ExpectedManifestSha256 $manifest.validated_manifest_sha256
 Assert-That (-not(Test-Path -LiteralPath $hub)) 'repeated uninstall can finish after partial removal'
@@ -167,7 +168,8 @@ function Start-Process($FilePath,$ArgumentList) {
     Write-MoyaiComponentResult $operation $expected @('Hub') $true 0 'completed fixture'
     [pscustomobject]@{ExitCode=0}
 }
-Invoke-MoyaiComponentUserSetup -SourceRoot $package -Components @('Hub') -Uninstall
+$ordinarySummary=@(Invoke-MoyaiComponentUserSetup -SourceRoot $package -Components @('Hub') -Uninstall)
+Assert-That (($ordinarySummary -ccontains 'アンインストールが完了しました。') -and @($ordinarySummary | Where-Object { $_.Contains('実行補助サービスは今回の削除対象外') }).Count -eq 1) 'ordinary uninstall reports completion and explicitly identifies the unselected shared helper'
 Assert-That (-not $script:legacySweepCalled) 'Hub-only removal never sweeps legacy Desktop installations'
 Set-Item -LiteralPath Function:Remove-MoyaiLegacyUserModules -Value $realLegacySweep
 $legacy=Join-Path $EvidenceRoot 'old Programs/moyAI'
@@ -201,8 +203,12 @@ Assert-That (-not(Test-Path -LiteralPath $legacy)) 'explicit combined legacy cle
 Assert-That ($script:oldShortcutsSelected -and $script:oldAssociationSelected -and @($script:oldStartupProjection.files).Count -eq 2) 'combined legacy uninstall retires owned startup, association and shortcut entries before payload deletion'
 Assert-That ((Get-MoyaiComponentUserReceiptPath 'Desktop') -notlike ((Get-MoyaiComponentUserRoot 'Desktop')+'\*')) 'installer metadata lives outside the Desktop data leaf and cannot block first data migration'
 $operation=[Guid]::NewGuid().ToString('N')
-Write-MoyaiComponentResult $operation ('1'*64) @('Hub') $false 1 'fixture: destination is busy; retained exact path' @('retained fixture directory')
+Write-MoyaiComponentResult $operation ('1'*64) @('Hub') $false 1 'fixture: destination is busy; retained exact path' @('retained fixture directory') @('changed executable')
 $failure=Read-MoyaiComponentResult $operation ('1'*64) @('Hub') 1
+Assert-That ($failure.retained.Count -eq 1 -and $failure.retained[0] -ceq 'changed executable') 'authenticated operation result carries retained targets separately from routine messages'
+$noResult=''
+try { Read-MoyaiComponentResult ([Guid]::NewGuid().ToString('N')) ('1'*64) @('Hub') 7 | Out-Null } catch { $noResult=$_.Exception.Message }
+Assert-That ($noResult.Contains('診断記録がありません') -and $noResult.Contains('終了コード 7')) 'missing elevated result reports the actual child exit code'
 Assert-That ($failure.message.Contains('destination is busy') -and $failure.messages[0].Contains('retained')) 'protected result preserves detailed failure and retained-path notices for the caller'
 Assert-Fails { Read-MoyaiComponentResult $operation ('2'*64) @('Hub') 1 } 'caller rejects a result for another source inventory'
 Assert-Fails { Read-MoyaiComponentResult $operation ('1'*64) @('Desktop') 1 } 'caller rejects a result for another selected component'
@@ -291,15 +297,32 @@ function Start-Process($FilePath,$ArgumentList) {
     $operation=[regex]::Match($ArgumentList,' -OperationId ([a-f0-9]{32})').Groups[1].Value
     $componentText=[regex]::Match($ArgumentList,' -Components "([^"]*)"').Groups[1].Value
     $selected=@($componentText.Split(',') | Where-Object {-not[string]::IsNullOrWhiteSpace($_)})
-    $messages=@(Invoke-MoyaiMachineComponent $snapshot $selected -Uninstall -RemoveSharedRuntime -ExpectedManifestSha256 $expected)
-    Write-MoyaiComponentResult -OperationId $operation -ManifestSha256 $expected -Components $selected -Success $true -ExitCode 0 -Message 'shared-only fixture' -Messages $messages
+    $output=@(Invoke-MoyaiMachineComponent $snapshot $selected -Uninstall -RemoveSharedRuntime -ExpectedManifestSha256 $expected)
+    $messages=@($output | Where-Object { $_.PSObject.TypeNames -notcontains 'Moyai.RetainedItem' })
+    $retained=@($output | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' })
+    Write-MoyaiComponentResult -OperationId $operation -ManifestSha256 $expected -Components $selected -Success $true -ExitCode 0 -Message 'shared-only fixture' -Messages $messages -Retained $retained
     [pscustomobject]@{ExitCode=0}
 }
 $script:serviceFixture=[pscustomobject]@{State=1}
 $beforeSharedOnly=(Get-FileHash -LiteralPath $newHub).Hash
-Invoke-MoyaiComponentUserSetup -SourceRoot $package -Uninstall -Interactive
+$legacySandbox=Join-Path $machine 'Sandbox'
+[void](New-Item -ItemType Directory -Path $legacySandbox -Force)
+$summary=@(Invoke-MoyaiComponentUserSetup -SourceRoot $package -Uninstall -Interactive)
+Assert-That ((Test-Path -LiteralPath $legacySandbox) -and @($summary | Where-Object { $_.StartsWith('一部を残してアンインストールが完了') }).Count -eq 1 -and @($summary | Where-Object { $_.Contains('所有ファイルと参照元を確認できません') -and $_.Contains($legacySandbox) }).Count -eq 1) 'interactive uninstall identifies partial completion with the retained path and its reason'
 Assert-That ($null -eq $script:serviceFixture -and (Get-FileHash -LiteralPath $newHub).Hash -ceq $beforeSharedOnly) 'interactive shared-service-only selection removes the service while preserving application payload'
 Assert-That ($script:sharedOnlyArguments.Contains('-Components ""') -and $script:sharedOnlyArguments.Contains('-RemoveSharedRuntime')) 'empty selected component set is passed as one safely quoted native argument'
+& {
+    $missingDesktop=Join-Path $EvidenceRoot 'missing Desktop'
+    function Get-MoyaiComponentLocation($Component) { [pscustomobject]@{parent=$EvidenceRoot;root=$missingDesktop;component=$Component} }
+    function Start-Process($FilePath,$ArgumentList) {
+        $expected=[regex]::Match($ArgumentList,' -ExpectedManifestSha256 ([a-f0-9]{64})').Groups[1].Value
+        $operation=[regex]::Match($ArgumentList,' -OperationId ([a-f0-9]{32})').Groups[1].Value
+        Write-MoyaiComponentResult $operation $expected @('Desktop') $true 0 'fixture: fixed Desktop already removed'
+        [pscustomobject]@{ExitCode=0}
+    }
+    $summary=@(Invoke-MoyaiComponentUserSetup -SourceRoot $package -Components @('Desktop') -Uninstall -NoShortcuts)
+    Assert-That (@($summary | Where-Object { $_.Contains('利用者登録を確認できません') -and $_.Contains('Uninstall-moyAI.cmd') }).Count -eq 1) 'a distribution without Desktop commands identifies the package needed to finish user cleanup after the fixed payload is gone'
+}
 $emptyOperation=[Guid]::NewGuid().ToString('N')
 Write-MoyaiComponentResult -OperationId $emptyOperation -ManifestSha256 ('7'*64) -Components @() -Success $true -ExitCode 0 -Message 'shared only'
 $emptyResult=Read-MoyaiComponentResult $emptyOperation ('7'*64) @() 0

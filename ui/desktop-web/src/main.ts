@@ -139,6 +139,8 @@ import {
 import {
   appliedProjectionRevision,
   deferredProjectionCandidatePreferred,
+  retainDeferredCommand,
+  type StateUpdate,
   projectionUpdateAccepted,
 } from "./projection_state";
 import {
@@ -147,7 +149,7 @@ import {
   type DesktopRenderModel,
 } from "./render_projection";
 import { isRegularModalOverlay, localModalIdentity, modalIdentity, modalIsOpen } from "./modal_state";
-import { autoRefreshAllowed, createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation, runtimePollingRequired } from "./polling_state";
+import { autoRefreshAllowed, createDesktopRefresh, installRuntimePolling, installSnapshotInvalidation, runtimePollingRequired } from "./polling_state";
 import {
   reconcileTaskActivityAnimationEpoch,
   taskActivityAnimationDelay,
@@ -239,6 +241,7 @@ import {
   reconcileUiDrafts,
   rejectDraftMutation,
 } from "./view_state";
+import { retainConversationThread } from "./conversation_surface";
 import "./styles.css";
 import "./hub_surface.css";
 import "./device_network_surface.css";
@@ -249,9 +252,15 @@ const desktopWindow = getCurrentWindow();
 let currentState: DesktopWebState | null = null;
 let lastRenderedState: DesktopViewState | null = null;
 let lastRenderedModel: DesktopRenderModel | null = null;
-const refresh = createSnapshotRefresh(async () => {
+const conversationMarkdown = new Map<string, string>();
+const desktopRefresh = createDesktopRefresh(async () => {
   try {
     acceptState(await command<DesktopWebState>("desktop_state"), false);
+  } catch (error) {
+    reportError(error);
+  }
+}, async () => {
+  try {
     await refreshDeviceNetworkJobs(eventContext);
     await refreshSharedWork(eventContext);
     await refreshDeviceExecution(eventContext);
@@ -262,6 +271,7 @@ const refresh = createSnapshotRefresh(async () => {
     reportError(error);
   }
 });
+const refresh = desktopRefresh.refresh;
 let previousSessionKey = "";
 let lastRenderedLocalModalIdentity: string | null = null;
 let splashDismissed = false;
@@ -286,17 +296,6 @@ let postRenderFocusInteractionEpoch = 0n;
 let pendingNewSessionInitiatingFocus: NewSessionFocusContinuation | null = null;
 let pendingNewSessionPromptFocus: SettledNewSessionFocusContinuation | null = null;
 
-interface StateUpdate {
-  state: DesktopWebState;
-  forceRender: boolean;
-  mutationName: string | null;
-  scheduleNavigation: boolean;
-  sequence: number;
-  draftSnapshot: DraftMutationSnapshot | null;
-  refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null;
-  settingsAction: SettingsActionFocusContinuation | null;
-}
-
 const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, candidate) =>
   deferredProjectionCandidatePreferred(
     current.state.projection_revision,
@@ -304,6 +303,7 @@ const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, can
     current.sequence,
     candidate.sequence,
   ),
+  retainDeferredCommand,
 );
 const postRenderFocusArbiter = new PostRenderFocusArbiter(
   animationFrameFocusScheduler(window),
@@ -372,11 +372,18 @@ void installSnapshotInvalidation(
   onChanged => desktopWindow.listen("desktop-state-changed", onChanged),
   refresh,
 ).catch(reportError);
-installRuntimePolling(window, document, () => Boolean(
-    currentState
-    && (currentState.hub_project_open === true || currentState.overlay === "mcp_history" || currentState.overlay === "hub" || Boolean(uiState.sharedWork.projection?.hub_url) || uiState.deviceNetwork.projection?.enrollment === "active" || Boolean(uiState.deviceNetwork.receiverActivity?.attempts.length || uiState.deviceNetwork.receiverActivity?.retained_services.length) || runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending, uiState.hub.projection, currentState.mcp_publish))
-    && shouldAutoRefresh(currentState)
-), refresh);
+installRuntimePolling(window, document, () => Boolean(currentState && shouldAutoRefresh(currentState)), force => {
+  if (force || !currentState) return refresh(true);
+  const localActive = runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending,
+    uiState.hub.projection, currentState.mcp_publish);
+  const receiver = uiState.deviceNetwork.receiverActivity;
+  const foregroundHub = currentState.hub_project_open || ["hub", "mcp_history"].includes(currentState.overlay)
+    || Boolean(receiver?.attempts.length || receiver?.retained_services.length);
+  const connected = uiState.sharedWork.projection?.hub_url || uiState.deviceNetwork.projection?.hub_url
+    || (uiState.hub.projection && uiState.hub.projection.status !== "disconnected");
+  const hubInterval = foregroundHub && !document.hidden ? 1_800 : connected || foregroundHub ? 12_000 : null;
+  return desktopRefresh.poll(localActive, hubInterval);
+});
 
 installGlobalKeyboardShortcuts(eventContext);
 
@@ -455,6 +462,7 @@ async function mutate(
         pendingHistoryPrepend = acknowledgePendingHistoryPrepend(pendingHistoryPrepend);
       }
       acknowledgeDraftMutation(uiState, state, name, draftSnapshot);
+      const row = args?.expectedTarget as { rowId?: string } | undefined;
       acceptState(
         state,
         true,
@@ -462,6 +470,8 @@ async function mutate(
         true,
         draftSnapshot,
         refreshPromptFocusContinuation,
+        null,
+        sessionSelectionRequestsComposerFocus(name) ? row?.rowId : undefined,
       );
       if (currentState && currentState !== state) acceptState(currentState, true);
     };
@@ -811,6 +821,7 @@ function acceptState(
   draftSnapshot: DraftMutationSnapshot | null = null,
   refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null = null,
   settingsAction: SettingsActionFocusContinuation | null = null,
+  navigationRowId?: string,
 ): void {
   const update: StateUpdate = {
     state,
@@ -821,6 +832,7 @@ function acceptState(
     draftSnapshot,
     refreshPromptFocusContinuation,
     settingsAction,
+    navigationRowId,
   };
   applyStateUpdate(update);
 }
@@ -1233,7 +1245,12 @@ function renderCommitted(
       uiState.focusPromptAfterRender = false;
     }
   }
-  const initiatingTriggerYieldsPromptFocus = newSessionFocusDecision.yieldsInitiatingFocus
+  const activeNavigation = activeElement?.dataset.action;
+  const selectedNavigationId = activeNavigation === "project" ? selectedProjectId : state.draft_target.sessionId;
+  const selectedRowYieldsFocus = uiState.focusPromptAfterRender && !state.navigation_loading && selectedNavigationId
+    && ["project", "session", "chat-session"].includes(activeNavigation ?? "")
+    && activeElement?.dataset.focusKey === `${activeNavigation}:${selectedNavigationId}:select`;
+  const initiatingTriggerYieldsPromptFocus = selectedRowYieldsFocus || newSessionFocusDecision.yieldsInitiatingFocus
     || newSessionFocusDecision.settled !== null
     || newSessionFocusDecision.continuation !== null
     || pendingNewSessionPromptFocus !== null;
@@ -1361,7 +1378,9 @@ function renderCommitted(
     ? appRoot.querySelector<HTMLElement>(".app-frame")
     : null;
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
+  if (sessionChanged || state.hub_project_open || state.thread_empty) conversationMarkdown.clear();
   const renderedMarkup = renderDesktopMarkup(model, {
+    markdownCache: conversationMarkdown,
     backgroundInert,
     taskActivityDelay,
     mcpActivityDelay,
@@ -1449,7 +1468,12 @@ function renderCommitted(
         previousSessionInteractionOwner,
         nextSessionInteractionOwner,
       );
-      appRoot.replaceChildren(template.content);
+      const retainThread = previous?.overlay === "none" && state.overlay === "none"
+        && !previous.hub_project_open && !state.hub_project_open && !backgroundInert
+        && !sessionChanged && !previous.confirmation_visible && !lastRenderedLocalModalIdentity;
+      if (!retainThread || !retainConversationThread(appRoot, template.content)) {
+        appRoot.replaceChildren(template.content);
+      }
     } else {
       appRoot.innerHTML = renderedMarkup;
     }
@@ -2620,7 +2644,10 @@ function noteUserThreadScrollAway(): void {
   threadTailFollow.noteUserScrollAway();
 }
 
+let wiredThread: HTMLElement | null = null;
 function wireThreadTailFollowEvents(thread: HTMLElement): void {
+  if (thread === wiredThread) return;
+  wiredThread = thread;
   let observationFrame: number | null = null;
   const observeUserViewport = () => {
     if (observationFrame !== null) window.cancelAnimationFrame(observationFrame);
@@ -2679,7 +2706,7 @@ function scheduleNavigationRefresh(state: DesktopWebState): void {
   }
   window.setTimeout(() => {
     if (currentState?.async_polling_required && currentState.navigation_loading) {
-      void refresh();
+      void desktopRefresh.local();
     }
   }, 80);
 }

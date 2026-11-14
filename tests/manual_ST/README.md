@@ -76,7 +76,7 @@ case間の継続はPID・起動時刻・実行ファイル・generationを照合
 
 machine gateの後も、各specの成果物、API / CLI、test内容、作業範囲、途中出力と最終回答をtask-local reviewで確認するまでは`manual_pending`である。Case1後にレビューする依頼では後続caseを自動実行しない。
 
-これらのscenarioは未レビューの承認要求を既定で操作停止する。`approval_mode: "operator"` を指定してstdinを保持すると、要求・生成source・画面を保存した後、stdoutへ `operator-review-request` が出る。operatorが内容を確認し、表示された `confirmation_id`、`request_sha256`、`decision`（`approve` / `stop` / `deny`）だけを持つJSONを1行でstdinへ返す。その一件のownerと内容を再確認して既存GUIボタンを操作し、許可した場合は同じ実行を続ける。恒久許可ルールは作らない。EOF、5分またはケース残予算の短い方のreview timeout、操作停止は未完了として扱う。
+これらのscenarioは未レビューの承認要求を既定で操作停止する。要求のIDと一致する承認ダイアログが表示された時点で、画面、要求、生成済みのソースを保存する。`approval_mode: "operator"` を指定してstdinを保持すると、保存後にstdoutへ `operator-review-request` が出る。operatorが内容を確認し、表示された `confirmation_id`、`request_sha256`、`decision`（`approve` / `stop` / `deny`）だけを持つJSONを1行でstdinへ返す。その一件のownerと内容を再確認して既存GUIボタンを操作し、許可した場合は同じ実行を続ける。恒久許可ルールは作らない。EOF、5分またはケース残予算の短い方のreview timeout、操作停止は未完了として扱う。
 
 Case1〜Case7（Case5_2を含む）は、ケース全体の観測期限を既定で設けない。通常の実行configでは `observation_timeout_ms` を省略し、過去の実行configにある120分指定を引き継がない。Case5_2以外の共通driverは、省略時の期限と残時間を `null`、終了記録のstatusを `unbounded` として保存する。通信待ち、個別verification、承認確認、Stop、cleanupの既存タイムアウトは維持する。
 

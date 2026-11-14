@@ -43,9 +43,11 @@ impl DeviceNetworkService {
                 "管理画面を開く前にHubまたは端末の設定が変わりました。",
             ));
         }
-        tokio::task::spawn_blocking(move || open_management_browser(&access.url))
-            .await
-            .map_err(|_| RequestError::Local("Hubの管理画面を開けませんでした。"))??;
+        tokio::task::spawn_blocking(move || {
+            crate::browser::open_web_url(&access.url).map_err(RequestError::Local)
+        })
+        .await
+        .map_err(|_| RequestError::Local("Hubの管理画面を開けませんでした。"))??;
         if self.shared_current(connection, generation, query) {
             self.inner.shared_work.0.lock().unwrap().view.feedback =
                 Some("Hubの管理画面を開きました。".into());
@@ -197,34 +199,4 @@ fn validate_management_url(value: &str) -> Result<(), RequestError> {
         return Err(invalid());
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn open_management_browser(url: &str) -> Result<(), RequestError> {
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    let operation = "open".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    let url = url.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    // Direct OS URL opening: no command shell, arguments, logging or webview ticket projection.
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            url.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        )
-    };
-    if result as isize <= 32 {
-        return Err(RequestError::Local(
-            "既定のブラウザーでHub管理画面を開けませんでした。",
-        ));
-    }
-    Ok(())
-}
-#[cfg(not(windows))]
-fn open_management_browser(_: &str) -> Result<(), RequestError> {
-    Err(RequestError::Local(
-        "この管理画面の起動入口はWindowsで利用できます。",
-    ))
 }

@@ -103,18 +103,38 @@ export function retainSharedWorkSurface(current: HTMLElement, next: HTMLElement)
       if (observation && nextObservation && !mcpHistoryRegionHasSelection(observation)
         && !observation.isEqualNode(nextObservation)) observation.replaceWith(nextObservation.cloneNode(true));
     }
-    if (region.isEqualNode(nextRegion)) continue;
     const active = region.contains(document.activeElement);
     if (active && document.activeElement?.matches("input,textarea,select") && ["account", "draft", "followup", "revision-editor"].includes(nextRegion.dataset.sharedRegion ?? "")) {
+      const activeField = (document.activeElement as HTMLElement).dataset?.sharedField;
+      if (activeField && !nextRegion.querySelector(`[data-shared-field="${activeField}"]`)) {
+        region.replaceWith(nextRegion);
+        continue;
+      }
       for (const field of region.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-shared-field]")) {
         const replacement = nextRegion.querySelector<HTMLInputElement>(`[data-shared-field="${field.dataset.sharedField}"]`);
-        if (replacement) field.disabled = replacement.disabled;
+        if (!replacement) continue;
+        field.disabled = replacement.disabled;
+        if ("readOnly" in field) {
+          field.readOnly = replacement.readOnly;
+          if (replacement.hasAttribute("aria-busy")) field.setAttribute("aria-busy", "true");
+          else field.removeAttribute("aria-busy");
+        }
+        // Input events already update the local draft. Set the live value only on
+        // a real difference, such as the acknowledged submission clearing it.
+        if (field.value !== replacement.value) field.value = replacement.value;
       }
       for (const button of region.querySelectorAll<HTMLButtonElement>("button[data-action]")) {
         const replacement = Array.from(nextRegion.querySelectorAll<HTMLButtonElement>("button[data-action]")).find(candidate => candidate.dataset.action === button.dataset.action && candidate.dataset.value === button.dataset.value);
-        if (replacement) { button.disabled = replacement.disabled; button.setAttribute("aria-disabled", String(replacement.disabled)); button.textContent = replacement.textContent; }
+        if (replacement) {
+          button.disabled = replacement.disabled;
+          button.setAttribute("aria-disabled", String(replacement.disabled));
+          if (button.textContent !== replacement.textContent) {
+            button.replaceChildren(...Array.from(replacement.childNodes, node => node.cloneNode(true)));
+          }
+        }
       }
-    } else if (!["transcript", "activity", "detail", "history-container"].includes(nextRegion.dataset.sharedRegion ?? "") || !retainWorkRecord(region, nextRegion)) region.replaceWith(nextRegion);
+    } else if (!region.isEqualNode(nextRegion)
+      && (!["transcript", "activity", "detail", "history-container"].includes(nextRegion.dataset.sharedRegion ?? "") || !retainWorkRecord(region, nextRegion))) region.replaceWith(nextRegion);
   }
   return true;
 }

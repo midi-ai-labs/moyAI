@@ -171,6 +171,7 @@ macro_rules! desktop_command_manifest {
             open_workspace_folder,
             open_global_config_folder,
             open_user_data_folder,
+            open_web_link,
             import_global_config_toml,
             load_initial_setup_config_toml,
             open_typed_path,
@@ -500,6 +501,18 @@ pub async fn run_with_startup_report(
                 // builder so ordinary launches use the migrated browser data.
                 tauri::WebviewWindowBuilder::from_config(app, window)?
                     .data_directory(webview_data.clone())
+                    .on_navigation({
+                        let dev = app.config().build.dev_url.clone();
+                        move |url| {
+                            matches!(url.scheme(), "http" | "https")
+                                && url.host_str() == Some("tauri.localhost")
+                                && url.port().is_none()
+                                || tauri::is_dev()
+                                    && dev
+                                        .as_ref()
+                                        .is_some_and(|origin| origin.origin() == url.origin())
+                        }
+                    })
                     .build()?;
             }
             install_tray(app.handle())?;
@@ -5223,6 +5236,14 @@ async fn open_global_config_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
     mutate_controller(controller, DesktopController::open_global_config_folder).await
+}
+
+#[tauri::command]
+async fn open_web_link(url: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::browser::open_web_url(&url))
+        .await
+        .map_err(|_| "リンクを開けませんでした。".to_owned())?
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]

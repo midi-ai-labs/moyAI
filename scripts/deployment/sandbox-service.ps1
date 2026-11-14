@@ -109,7 +109,11 @@ namespace MoyaiSandboxSetup {
   [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string text,uint revision,out IntPtr descriptor,out uint size);
   [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertSecurityDescriptorToStringSecurityDescriptor(byte[] descriptor,uint revision,uint info,out IntPtr text,out uint size);
   [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
-  static Exception Error() { return new Win32Exception(Marshal.GetLastWin32Error()); }
+  static Exception Error() {
+   int code=Marshal.GetLastWin32Error();
+   if(code==1072) return new Win32Exception(code,"WindowsがMoyAISandboxの削除を保留しています。サービスの管理画面や監視ツールを閉じて再実行してください。保留が続く場合はPCを再起動してください。");
+   return new Win32Exception(code);
+  }
   static IntPtr Manager(uint access) { var h=OpenSCManager(null,null,access); if(h==IntPtr.Zero) throw Error(); return h; }
   static IntPtr Service(IntPtr manager,uint access,bool optional) {
    var h=OpenService(manager,"MoyAISandbox",access); if(h==IntPtr.Zero && !(optional && Marshal.GetLastWin32Error()==1060)) throw Error(); return h;
@@ -182,12 +186,39 @@ function Set-MoyaiSandboxServiceSecurity([string]$Sddl) { Initialize-MoyaiSandbo
 function Remove-MoyaiSandboxService { Initialize-MoyaiSandboxNative; [MoyaiSandboxSetup.Native]::Remove() }
 function Stop-MoyaiSandboxService { Initialize-MoyaiSandboxNative; [MoyaiSandboxSetup.Native]::Stop(45000) }
 
+function Wait-MoyaiSandboxRemoval {
+    $elapsed=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        try { if($null -eq (Get-MoyaiSandboxService)) { return } }
+        catch {
+            $cause=$_.Exception.GetBaseException()
+            if($cause -isnot [ComponentModel.Win32Exception] -or $cause.NativeErrorCode -ne 1072) { throw }
+        }
+        Start-Sleep -Milliseconds 100
+    } while($elapsed.ElapsedMilliseconds -lt 3000)
+    throw 'WindowsがMoyAISandboxの削除を保留しています。サービスの管理画面や監視ツールを閉じて再実行してください。保留が続く場合はPCを再起動してください。'
+}
+
+function Move-MoyaiStoppedSandboxToBackup([string]$Source,[string]$Destination) {
+    $elapsed=[Diagnostics.Stopwatch]::StartNew()
+    while($true) {
+        try { [IO.Directory]::Move($Source,$Destination); return }
+        catch {
+            $cause=$_.Exception.GetBaseException()
+            $code=$cause.HResult -band 65535
+            # Directory.Move can report access denied while an open child still pins the directory.
+            if($cause -isnot [IO.IOException] -or $code -notin @(5,32,33) -or $elapsed.ElapsedMilliseconds -ge 2000) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
+
 function Assert-MoyaiSandboxClientsStopped {
     # Include portable and other-user clients: the helper is shared by the PC.
     $clients = @(Get-CimInstance Win32_Process -Filter "Name='moyai.exe' OR Name='moyai-desktop.exe' OR Name='moyai-runner.exe'" -ErrorAction Stop)
     if ($clients.Count) {
         $details = ($clients | ForEach-Object { "$($_.Name) (PID $($_.ProcessId))" }) -join ', '
-        throw "実行補助サービスを使用するアプリが起動中です。Desktopのメニューから「終了」し、CLI・Runnerも終了して再実行してください。対象: $details"
+        throw "実行補助サービスを使用するアプリが起動中です。Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選びます。CLIを閉じ、単独のRunnerはWindows導入手順の「更新・アンインストール」に従って終了してください。対象: $details"
     }
 }
 
@@ -240,21 +271,28 @@ function Copy-MoyaiSandboxPinnedPayload($Stream, [string]$Target) {
 
 function Assert-MoyaiSandboxService($Service, $Location, [switch]$Disabled, [switch]$AllowDisabled, [switch]$Security) {
     $start = if ($Disabled) { @(4) } elseif ($AllowDisabled) { @(3,4) } else { @(3) }
-    if ($null -eq $Service -or $Service.Type -ne 0x10 -or $Service.Start -notin $start -or $Service.ErrorControl -ne 1 -or $Service.Account -cne 'LocalSystem' -or $Service.Command -cne ('"' + $Location.helper + '" --service') -or $Service.Dependencies) {
-        throw 'MoyAISandbox has an unexpected service configuration. It was not replaced.'
-    }
+    if ($null -eq $Service) { throw 'MoyAISandboxの登録を確認できません。' }
+    $expectedCommand='"' + $Location.helper + '" --service'
+    $differences=[Collections.Generic.List[string]]::new()
+    if($Service.Type -ne 0x10) { $differences.Add("種類 $($Service.Type)（想定 16）") }
+    if($Service.Start -notin $start) { $differences.Add("開始方法 $($Service.Start)（想定 $($start -join ' または ')）") }
+    if($Service.ErrorControl -ne 1) { $differences.Add("エラー制御 $($Service.ErrorControl)（想定 1）") }
+    if($Service.Account -cne 'LocalSystem') { $differences.Add("実行アカウント $($Service.Account)（想定 LocalSystem）") }
+    if($Service.Command -cne $expectedCommand) { $differences.Add("起動コマンド $($Service.Command)（想定 $expectedCommand）") }
+    if($Service.Dependencies) { $differences.Add("依存サービス $($Service.Dependencies)（想定 なし）") }
+    if($differences.Count) { throw "MoyAISandboxの登録が導入時の設定と異なります。PCの管理者に確認してください。$($differences -join '、')" }
     if ($Security) {
         $actual = [Security.AccessControl.RawSecurityDescriptor]::new($Service.Sddl)
-        if ($null -eq $actual.Owner -or $actual.Owner.Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'MoyAISandbox service has an unexpected owner.' }
-        if ($null -eq $actual.DiscretionaryAcl -or $actual.DiscretionaryAcl.Count -ne 3) { throw 'MoyAISandbox service permissions differ from its installed configuration.' }
+        if ($null -eq $actual.Owner -or $actual.Owner.Value -notin @('S-1-5-18','S-1-5-32-544')) { throw "MoyAISandboxの所有者が想定外です。現在 $($actual.Owner)、想定 SYSTEM または Administrators。PCの管理者に確認してください。" }
+        if ($null -eq $actual.DiscretionaryAcl -or $actual.DiscretionaryAcl.Count -ne 3) { throw "MoyAISandboxのアクセス許可の項目数が想定の3件と異なります。PCの管理者に確認してください。現在の設定: $($Service.Sddl)" }
         $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($ace in $actual.DiscretionaryAcl) {
-            if ($ace -isnot [Security.AccessControl.CommonAce] -or $ace.IsCallback -or $ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed -or [int]$ace.AceFlags -ne 0) { throw 'Unexpected sandbox service permission entry.' }
+            if ($ace -isnot [Security.AccessControl.CommonAce] -or $ace.IsCallback -or $ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed -or [int]$ace.AceFlags -ne 0) { throw "MoyAISandboxのアクセス許可に想定外の項目があります。PCの管理者に確認してください。現在の設定: $($Service.Sddl)" }
             $sid = $ace.SecurityIdentifier.Value
-            if (-not $seen.Add($sid)) { throw 'Duplicate sandbox service permission entry.' }
+            if (-not $seen.Add($sid)) { throw "MoyAISandboxのアクセス許可で $sid が重複しています。PCの管理者に確認してください。" }
             # SCM may expand GENERIC_ALL to SERVICE_ALL_ACCESS when storing the DACL.
             $allowed = if ($sid -in @('S-1-5-18','S-1-5-32-544')) { $ace.AccessMask -in @(0x10000000,0x000f01ff) } elseif ($sid -ceq 'S-1-5-4') { $ace.AccessMask -eq 0x15 } else { $false }
-            if (-not $allowed) { throw 'MoyAISandbox service permissions differ from its installed configuration.' }
+            if (-not $allowed) { throw "MoyAISandboxのアクセス許可が導入時の設定と異なります。PCの管理者に確認してください。対象 $sid、アクセスマスク $($ace.AccessMask)。" }
         }
     }
 }
@@ -485,12 +523,13 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
                 Assert-MoyaiSandboxService $stopped $location -Disabled -Security
                 if ($stopped.State -ne 1) { throw 'Sandbox did not stop; no files were replaced.' }
             }
-            if($exists) { Move-Item -LiteralPath $location.root -Destination $backup; $movedOld = $true }
+            if($exists) { Move-MoyaiStoppedSandboxToBackup $location.root $backup; $movedOld = $true }
             if ($Uninstall) {
                 Remove-MoyaiSandboxService
                 $removed = $true
                 $disabled = $false
                 if($movedOld) { Remove-MoyaiSandboxPayloadDirectory $backup $(if($old){$old.files}else{@()}) }
+                Wait-MoyaiSandboxRemoval
                 Write-Output 'PC共通sandbox helperを削除しました。利用者の設定・会話・作業フォルダーは変更していません。'
                 return
             }
@@ -507,7 +546,7 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
             $disabled = $false
         } catch {
             $failure = $_
-            if ($removed) { throw 'The sandbox service was removed. Protected payload backup cleanup did not complete; inspect SandboxService.previous-* as administrator. User data was not changed.' }
+            if ($removed) { throw "サービスの削除要求は受理されました。$($failure.Exception.Message)" }
             try {
                 if($null -ne $RestoreComponent) { & $RestoreComponent $ComponentContext }
                 if ($disabled -and ($movedOld -or $movedNew)) {

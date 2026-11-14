@@ -466,6 +466,16 @@ export class ManualLiveSession {
         let reviewStopReason = null;
         const approvals = [];
         while (manualLiveTerminalDecision(observed.value) === "approval") {
+          const confirmationId = observed.value.projection.confirmation_id;
+          // The Rust request can arrive before WebView paints the matching dialog.
+          const label = `${prefix} permission dialog for request ${confirmationId}`;
+          observed = await waitForObservation({
+            label, timeoutMs: this.observationBudget.assertRemaining(label, 10_000), retrySampleErrors: false,
+            sample: () => observeProviderTurnSurface(cdp),
+            accept: surface => surface.visible_permission_id === confirmationId
+              && surface.projection?.confirmation_visible === true
+              && surface.projection.confirmation_id === confirmationId,
+          });
           const request = manualLivePermissionRequest(observed.value.projection);
           const number = approvals.length + 1;
           const requestSha256 = operatorRequestFingerprint(request);

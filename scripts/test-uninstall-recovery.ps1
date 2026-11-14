@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$EvidenceRoot,[switch]$ElevationSmoke)
+﻿param([Parameter(Mandatory=$true)][string]$EvidenceRoot,[switch]$ElevationSmoke)
 $ErrorActionPreference='Stop'
 $EvidenceRoot=[IO.Path]::GetFullPath($EvidenceRoot)
 if(Test-Path -LiteralPath $EvidenceRoot){throw 'Use a new evidence directory.'}
@@ -23,9 +23,9 @@ function Set-MoyaiSandboxParentAccess([string]$Path){Assert-FixturePath $Path}
 function Set-MoyaiComponentTreeOwner([string]$Root){Assert-FixturePath $Root}
 function Get-MoyaiComponentLocation([string]$Component){$parent=Join-Path $fixtureRoot 'machine';[pscustomobject]@{parent=$parent;root=(Join-Path $parent $Component);component=$Component}}
 function Get-MoyaiComponentResultRoot {Join-Path $fixtureRoot 'results'}
-function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[bool]$Success,[int]$ExitCode,[string]$Message,[string[]]$Messages=@()){
+function Write-MoyaiComponentResult([string]$OperationId,[string]$ManifestSha256,[string[]]$Components,[bool]$Success,[int]$ExitCode,[string]$Message,[string[]]$Messages=@(),[string[]]$Retained=@()){
  $path=Get-MoyaiComponentResultPath $OperationId;[void](New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force)
- $bytes=[Text.Encoding]::UTF8.GetBytes((@{schema=1;operation_id=$OperationId;source_manifest_sha256=$ManifestSha256;components=@($Components);success=$Success;exit_code=$ExitCode;message=$Message;messages=@($Messages)}|ConvertTo-Json -Depth 6))
+ $bytes=[Text.Encoding]::UTF8.GetBytes((@{schema=1;operation_id=$OperationId;source_manifest_sha256=$ManifestSha256;components=@($Components);success=$Success;exit_code=$ExitCode;message=$Message;messages=@($Messages);retained=@($Retained)}|ConvertTo-Json -Depth 6))
  $stream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
  try{$stream.Write($bytes,0,$bytes.Length)}finally{$stream.Dispose()}
 }
@@ -68,7 +68,8 @@ function Invoke-MoyaiComponentCleanup($Component,$HubDataDir,$SourceRoot,$Manife
 }
 function Start-Process([string]$FilePath,[string]$ArgumentList,[string]$Verb,[string]$WindowStyle,[switch]$PassThru,[switch]$Wait){
  if($Verb -cne 'RunAs'){throw 'Expected the elevation boundary'}
- if($script:cancelElevation){throw 'Injected UAC cancellation'}
+ if($script:cancelElevation){throw [ComponentModel.Win32Exception]::new(1223)}
+ if($script:exitBeforeResult){$ArgumentList='-NoProfile -NonInteractive -Command "exit 7"'}
  if($script:rejectChildPreflight){[IO.File]::WriteAllText((Join-Path $hub 'machine-component.json'),'invalid receipt')}
  if($ElevationSmoke){return Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Verb RunAs -WindowStyle Hidden -PassThru}
  Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $EvidenceRoot ('child-'+[Guid]::NewGuid().ToString('N')+'.stdout.log')) -RedirectStandardError (Join-Path $EvidenceRoot ('child-'+[Guid]::NewGuid().ToString('N')+'.stderr.log'))
@@ -77,6 +78,13 @@ if(-not $ElevationSmoke){
 Assert-Fails {Invoke-MoyaiComponentUserSetup $package @('Hub') -Uninstall -ResetHubData} 'UAC cancellation cannot begin profile cleanup'
 Assert-That ($script:cleanupCalls -eq 0 -and (Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe'))) 'cancelled elevation preserves app and profile'
 $script:cancelElevation=$false
+$script:exitBeforeResult=$true
+try {
+ $notice=''
+ try { Invoke-MoyaiComponentUserSetup $package @('Hub') -Uninstall -ResetHubData | Out-Null } catch { $notice=$_.Exception.Message }
+ Add-Content -LiteralPath (Join-Path $EvidenceRoot 'expected-failures.log') -Value ('child exited before reset preflight: '+$notice) -Encoding UTF8
+ Assert-That ($notice.Contains('終了コード 7') -and $notice.Contains('診断記録') -and $script:cleanupCalls -eq 0 -and (Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe'))) 'reset preflight reports a missing result with the actual child exit code before touching user data or app files'
+} finally {$script:exitBeforeResult=$false}
 $receiptPath=Join-Path $hub 'machine-component.json';$originalReceipt=[IO.File]::ReadAllText($receiptPath)
 $script:rejectChildPreflight=$true
 try {

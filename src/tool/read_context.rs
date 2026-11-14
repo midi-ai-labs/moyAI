@@ -160,6 +160,13 @@ impl<'a> ReadToolContext<'a> {
         }
     }
 
+    pub(crate) fn stop_token(&self) -> tokio_util::sync::CancellationToken {
+        match &self.owner {
+            ReadOwner::Agent(context) => context.cancel.clone(),
+            ReadOwner::Published { control, .. } => control.token(),
+        }
+    }
+
     pub(crate) fn workspace(&self) -> &Workspace {
         match &self.owner {
             ReadOwner::Agent(context) => context.workspace,

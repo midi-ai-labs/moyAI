@@ -110,10 +110,7 @@ impl ResolvedReadFile {
         self.file.metadata()
     }
 
-    pub(crate) fn with_file<T>(
-        &mut self,
-        operation: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
-    ) -> std::io::Result<T> {
+    pub(crate) fn with_file<T>(&mut self, operation: impl FnOnce(&mut std::fs::File) -> T) -> T {
         operation(&mut self.file)
     }
 }

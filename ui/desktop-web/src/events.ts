@@ -759,7 +759,16 @@ function installDelegatedActionEvents(context: ActionContext): void {
       window.setTimeout(() => sideChatPointerQuotes.delete(trigger), 0);
     }
   }, true);
+  const openMarkdownLink = (event: MouseEvent) => {
+    const link = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[data-markdown-web-link]") : null;
+    if (!link) return false;
+    event.preventDefault();
+    if (event.isTrusted && !link.closest("[inert]")) void command("open_web_link", { url: link.href }).catch(context.reportError);
+    return true;
+  };
+  document.addEventListener("auxclick", event => { if (event.button === 1) openMarkdownLink(event); });
   document.addEventListener("click", (event) => {
+    if (openMarkdownLink(event)) return;
     const target = event.target;
     if (!(target instanceof Element)) return;
     const currentState = context.getViewState();

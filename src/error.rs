@@ -565,7 +565,7 @@ pub enum ToolError {
     },
     #[error("permission request aborted by user")]
     PermissionAborted,
-    #[error("run interrupted while waiting for permission")]
+    #[error("run interrupted")]
     RunInterrupted,
     #[error("{0}")]
     Message(String),

@@ -79,7 +79,8 @@ try {
       if ((Test-Path -LiteralPath $directory) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { Remove-Item -LiteralPath $directory -Force }
     }
     if (@(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -eq 0) { Remove-Item -LiteralPath $InstallRoot -Force }
-    Write-Output "アンインストールが完了しました。`nアプリ本体と、この配置に一致するRunner・Hubの自動起動を取り除きました。`n設定・ログイン情報・履歴・作業フォルダー、追加・変更したファイル、別の導入先の登録は残しています。`nPC共通sandbox helperは他の利用者のために残しています。全員が利用を終了した場合の削除手順は docs/user/windows-setup.md を参照してください。`nこの画面を閉じてください。"
+    $finished=if(Test-Path -LiteralPath $InstallRoot) { "一部を残してアンインストールが完了しました。追加・変更されたファイルが残るフォルダー: $InstallRoot" } else { 'アンインストールが完了しました。' }
+    Write-Output "$finished`nこの配置に一致するRunner・Hubの自動起動を取り除きました。`n設定・ログイン情報・履歴・作業フォルダー、別の導入先の登録は残しています。`nPC共通の実行補助サービスは他の利用者のために残しています。全員が利用を終了した場合の削除手順は docs/user/windows-setup.md を参照してください。`nこの画面を閉じてください。"
     exit 0
   }
   $manifest = Read-MoyaiDeployment $sourceRoot -VerifyHashes

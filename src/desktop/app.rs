@@ -6486,7 +6486,10 @@ mod command_projection_owner_tests {
         assert_eq!(row.loaded_status, crate::session::LoadedSessionStatus::Idle);
         assert_eq!(row.active_turn_id, None);
         assert_eq!(applied.loaded.read.active_turn_id, None);
-        assert!(!applied.message.contains("unconfirmed"));
+        assert_eq!(
+            applied.message,
+            format!("チャット {session_id} の実行が終了しました。")
+        );
     }
 
     #[tokio::test]
@@ -6506,8 +6509,8 @@ mod command_projection_owner_tests {
         .expect("bounded observation");
         assert_eq!(applied.loaded.read.active_turn_id, Some(turn_id));
         assert_eq!(applied.loaded.read.session.status, SessionStatus::Running);
-        assert!(applied.message.contains("completion is unconfirmed"));
-        assert!(applied.message.contains("Refresh"));
+        assert!(applied.message.contains("終了は未確認です"));
+        assert!(applied.message.contains("一覧を更新"));
         finish_background_session_stop(&controller.app, session_id, turn_id, &admission).await;
     }
 
@@ -6548,8 +6551,7 @@ mod command_projection_owner_tests {
                 applied.loaded.read.admission_revision,
                 next.admission_revision
             );
-            assert!(applied.message.contains("replacement was not stopped"));
-            assert!(!applied.message.contains("unconfirmed"));
+            assert!(applied.message.contains("新しい実行は継続中です"));
         }
         finish_background_session_stop(&controller.app, session_id, replacement, &next).await;
     }
@@ -18367,7 +18369,7 @@ async fn load_stopped_session_operation_projection(
     confirmation_timeout: std::time::Duration,
 ) -> Result<DesktopSessionOperationLoaded, String> {
     let ActiveTurnExpectation::Turn { turn_id, revision } = expected_active_turn else {
-        return Err("the running chat target is no longer available".to_string());
+        return Err("停止する実行が見つかりません。".to_string());
     };
     let deadline = tokio::time::Instant::now() + confirmation_timeout;
     let message = loop {
@@ -18379,15 +18381,15 @@ async fn load_stopped_session_operation_projection(
         let read = &detail.read;
         if read.active_turn_id != Some(turn_id) || read.admission_revision != revision {
             break if read.active_turn_id.is_some() {
-                format!("chat {session_id} moved to another turn; the replacement was not stopped")
+                format!("チャット {session_id} の実行が切り替わりました。新しい実行は継続中です。")
             } else {
-                format!("Stop settled for chat {session_id}")
+                format!("チャット {session_id} の実行が終了しました。")
             };
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break format!(
-                "Stop request accepted for chat {session_id}; completion is unconfirmed. Refresh to check."
+                "チャット {session_id} の停止を受け付けました。終了は未確認です。一覧を更新して確認してください。"
             );
         }
         tokio::time::sleep_until(deadline.min(now + DESKTOP_SESSION_RUNTIME_POLL_INTERVAL)).await;

@@ -151,13 +151,22 @@ impl Journal {
             ));
         }
         let journal = Self { db, _lock: lock };
-        if !journal.active()?.is_empty()
-            || !journal.retained_services()?.is_empty()
-            || !journal.unsettled_checkpoints("")?.is_empty()
-        {
-            return Err(RunnerError::new(
-                "Runner work, retained applications, or checkpoints still need settlement before resource retirement",
-            ));
+        let pending = if let Some(entry) = journal.active()?.into_iter().next() {
+            Some((entry, "共有の仕事の終了を確認できません"))
+        } else if let Some(entry) = journal.retained_services()?.into_iter().next() {
+            Some((entry, "保持中のアプリの停止を確認できません"))
+        } else {
+            journal
+                .unsettled_checkpoints("")?
+                .into_iter()
+                .next()
+                .map(|entry| (entry, "再開用の記録の処理が完了していません"))
+        };
+        if let Some((entry, reason)) = pending {
+            return Err(RunnerError::new(format!(
+                "{reason}。仕事ID {}、試行ID {}。このPCのDesktopを元のHubに接続し、仕事と保持中のアプリの状態を確認してください。処理の完了または停止を確認してからDesktopとRunnerを終了し、やり直してください。記録ファイル {path}",
+                entry.assignment.job.id, entry.assignment.attempt_id
+            )));
         }
         let Self { db, _lock } = journal;
         drop(db);
@@ -768,7 +777,9 @@ mod retirement_tests {
             entry.phase = phase;
             journal.save(&entry).unwrap();
             drop(journal);
-            assert!(Journal::lock_for_retirement(&path).is_err());
+            let message = Journal::lock_for_retirement(&path).err().unwrap().message;
+            assert!(message.contains(&entry.assignment.attempt_id));
+            assert!(message.contains(path.as_str()));
         }
     }
 
@@ -793,7 +804,13 @@ mod retirement_tests {
             }
             journal.save(&entry).unwrap();
             drop(journal);
-            assert!(Journal::lock_for_retirement(&path).is_err());
+            let message = Journal::lock_for_retirement(&path).err().unwrap().message;
+            assert!(message.contains(&entry.assignment.attempt_id));
+            assert!(message.contains(if checkpoint {
+                "再開用の記録"
+            } else {
+                "保持中のアプリ"
+            }));
             let mut journal = Journal::open(&path, &settings).unwrap();
             if checkpoint {
                 journal
