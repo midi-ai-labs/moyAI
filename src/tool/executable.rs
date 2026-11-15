@@ -698,11 +698,13 @@ fn executable_path_candidates(
             reason: "captured process environment has no executable search authority".to_string(),
         });
     }
+    // Keep the first candidate for each identity key, in search order. A long PATH times
+    // PATHEXT yields about a thousand candidates, so compare keys through a set instead of
+    // against every kept candidate.
+    let mut seen = std::collections::HashSet::with_capacity(candidates.len());
     let mut deduplicated: Vec<Utf8PathBuf> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if !deduplicated.iter().any(|existing| {
-            PathGuard::stable_identity_key(existing) == PathGuard::stable_identity_key(&candidate)
-        }) {
+        if seen.insert(PathGuard::stable_identity_key(&candidate)) {
             deduplicated.push(candidate);
         }
     }
@@ -940,6 +942,35 @@ impl std::error::Error for ExecutableIdentityError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn search_path_candidates_keep_the_first_of_each_identity_in_order() {
+        let environment = HashMap::from([
+            (
+                "PATH".to_string(),
+                r"C:\Tools;c:\tools\;C:\Other;C:\TOOLS".to_string(),
+            ),
+            ("PATHEXT".to_string(), ".EXE;.exe;.CMD".to_string()),
+        ]);
+        let candidates = executable_path_candidates(
+            "tool",
+            Utf8Path::new(r"C:\work"),
+            &environment,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                Utf8PathBuf::from(r"C:\Tools\tool.exe"),
+                Utf8PathBuf::from(r"C:\Tools\tool.cmd"),
+                Utf8PathBuf::from(r"C:\Other\tool.exe"),
+                Utf8PathBuf::from(r"C:\Other\tool.cmd"),
+            ]
+        );
+    }
 
     #[test]
     fn bare_executable_is_resolved_to_an_absolute_pinned_identity() {
