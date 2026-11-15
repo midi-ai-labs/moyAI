@@ -149,7 +149,7 @@ import {
   type DesktopRenderModel,
 } from "./render_projection";
 import { isRegularModalOverlay, localModalIdentity, modalIdentity, modalIsOpen } from "./modal_state";
-import { autoRefreshAllowed, createDesktopRefresh, installRuntimePolling, installSnapshotInvalidation, runtimePollingRequired } from "./polling_state";
+import { autoRefreshAllowed, createDesktopRefresh, hubRefreshIntervalMs, installRuntimePolling, installSnapshotInvalidation, runtimePollingRequired } from "./polling_state";
 import {
   reconcileTaskActivityAnimationEpoch,
   taskActivityAnimationDelay,
@@ -242,6 +242,14 @@ import {
   rejectDraftMutation,
 } from "./view_state";
 import { retainConversationThread } from "./conversation_surface";
+import {
+  composerFallbackFocusWanted,
+  conversationThreadRetainable,
+  planThreadViewport,
+  selectedNavigationRowYieldsFocus,
+  threadContentAdvanced,
+  threadScrollTopAfterLayout,
+} from "./render_commit_plan";
 import "./styles.css";
 import "./hub_surface.css";
 import "./device_network_surface.css";
@@ -381,8 +389,7 @@ installRuntimePolling(window, document, () => Boolean(currentState && shouldAuto
     || Boolean(receiver?.attempts.length || receiver?.retained_services.length);
   const connected = uiState.sharedWork.projection?.hub_url || uiState.deviceNetwork.projection?.hub_url
     || (uiState.hub.projection && uiState.hub.projection.status !== "disconnected");
-  const hubInterval = foregroundHub && !document.hidden ? 1_800 : connected || foregroundHub ? 12_000 : null;
-  return desktopRefresh.poll(localActive, hubInterval);
+  return desktopRefresh.poll(localActive, hubRefreshIntervalMs(foregroundHub, Boolean(connected), document.hidden));
 });
 
 installGlobalKeyboardShortcuts(eventContext);
@@ -1245,11 +1252,14 @@ function renderCommitted(
       uiState.focusPromptAfterRender = false;
     }
   }
-  const activeNavigation = activeElement?.dataset.action;
-  const selectedNavigationId = activeNavigation === "project" ? selectedProjectId : state.draft_target.sessionId;
-  const selectedRowYieldsFocus = uiState.focusPromptAfterRender && !state.navigation_loading && selectedNavigationId
-    && ["project", "session", "chat-session"].includes(activeNavigation ?? "")
-    && activeElement?.dataset.focusKey === `${activeNavigation}:${selectedNavigationId}:select`;
+  const selectedRowYieldsFocus = selectedNavigationRowYieldsFocus({
+    focusPromptAfterRender: uiState.focusPromptAfterRender,
+    navigationLoading: state.navigation_loading,
+    activeAction: activeElement?.dataset.action,
+    activeFocusKey: activeElement?.dataset.focusKey,
+    selectedProjectId,
+    selectedSessionId: state.draft_target.sessionId,
+  });
   const initiatingTriggerYieldsPromptFocus = selectedRowYieldsFocus || newSessionFocusDecision.yieldsInitiatingFocus
     || newSessionFocusDecision.settled !== null
     || newSessionFocusDecision.continuation !== null
@@ -1315,9 +1325,6 @@ function renderCommitted(
     },
   );
   const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
-  const previousTranscriptCount = previous?.transcript_rows.length ?? 0;
-  const previousPendingInputCount = previous?.pending_turn_inputs.length ?? 0;
-  const previousChangeCount = previous?.file_change_rows.length ?? 0;
   const previousAgentRows = previous?.agent_activity_rows ?? [];
   const agentRows = state.agent_activity_rows ?? [];
   const sessionChanged = nextSessionKey !== previousSessionKey;
@@ -1326,9 +1333,7 @@ function renderCommitted(
   const prependViewportAnchor = historyPrependTransition.disposition === "consume" && previousThread
     ? captureViewportAnchor(previousThread)
     : null;
-  const contentAdvanced = state.transcript_rows.length > previousTranscriptCount
-    || state.pending_turn_inputs.length > previousPendingInputCount
-    || state.file_change_rows.length > previousChangeCount;
+  const contentAdvanced = threadContentAdvanced(previous, state);
   const agentActivityAdvanced = previous
     ? agentActivityRowsChanged(previousAgentRows, agentRows) || (!previous.agent_tree_active && state.agent_tree_active)
     : agentRows.length > 0;
@@ -1385,123 +1390,53 @@ function renderCommitted(
     taskActivityDelay,
     mcpActivityDelay,
   });
-  let retainedConnectedSettings = false;
-  let retainedConnectedPrompt = false;
-  if (shouldRetainSharedWorkMain(lastRenderedState, state, lastRenderedLocalModalIdentity, renderedLocalModalIdentity, backgroundInert)) {
-    const currentShared = appRoot.querySelector<HTMLElement>(".shared-work");
-    const template = document.createElement("template");
-    template.innerHTML = renderedMarkup;
-    const nextShared = template.content.querySelector<HTMLElement>(".shared-work");
-    if (currentShared && nextShared) {
-      retainedConnectedSettings = retainSharedWorkSurface(currentShared, nextShared);
-      if (retainedConnectedSettings) {
-        const sidebar = appRoot.querySelector<HTMLElement>(".sidebar");
-        const nextSidebar = template.content.querySelector<HTMLElement>(".sidebar");
-        if (sidebar && nextSidebar && !sidebar.isEqualNode(nextSidebar)) sidebar.replaceWith(nextSidebar);
-      }
-    }
-  }
-  if (currentSettingsModal && retainingInitialSetup) {
-    const template = document.createElement("template");
-    template.innerHTML = renderedMarkup;
-    const nextSettingsModal = template.content.querySelector<HTMLElement>(".initial-setup-shell");
-    if (nextSettingsModal) {
-      synchronizeRetainedSettingsSurface(
-        currentSettingsModal,
-        nextSettingsModal,
-        model.local.configMutationPending
-          || model.local.initialSetup.finishPending
-          || model.local.initialSetup.auxiliaryPendingKind !== null,
-        !uiState.configDirty,
-      );
-      retainedConnectedSettings = true;
-    }
-  }
-  if (currentSettingsModal && currentFrame) {
-    const template = document.createElement("template");
-    template.innerHTML = renderedMarkup;
-    const nextFrame = template.content.querySelector<HTMLElement>(".app-frame");
-    const nextSettingsModal = template.content.querySelector<HTMLElement>(".settings-modal");
-    if (nextFrame && nextSettingsModal) {
-      retainedConnectedPrompt = retainConnectedMainPrompt(
-        previousPrompt,
-        nextFrame.querySelector<HTMLTextAreaElement>("#prompt"),
-        previousSessionInteractionOwner,
-        nextSessionInteractionOwner,
-      );
-      const nextTitlebar = nextFrame.querySelector<HTMLElement>(".app-titlebar");
-      if (preservedTitlebar && nextTitlebar) nextTitlebar.replaceWith(preservedTitlebar);
-      currentFrame.replaceWith(nextFrame);
-      const currentStatus = currentSettingsModal.querySelector<HTMLElement>(".settings-status-stack");
-      const nextStatus = nextSettingsModal.querySelector<HTMLElement>(".settings-status-stack");
-      if (currentStatus && nextStatus && !currentStatus.contains(document.activeElement)) {
-        currentStatus.replaceWith(nextStatus);
-      }
-      if (state.overlay === "mcp_history") synchronizeMcpHistorySurface(currentSettingsModal, nextSettingsModal);
-      else synchronizeRetainedSettingsSurface(
-        currentSettingsModal,
-        nextSettingsModal,
-        model.local.configMutationPending || model.local.sessionSettings.mutationPending
-          || ((state.overlay === "hub" || state.overlay === "config") && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null)),
-        state.overlay === "hub" ? false : state.overlay === "session_settings"
-          ? !model.local.sessionSettings.dirty
-          : !uiState.configDirty,
-      );
-      if (state.overlay === "hub" || state.overlay === "config") {
-        synchronizeHubControlValues(currentSettingsModal, nextSettingsModal);
-        synchronizeDeviceNetworkControls(currentSettingsModal, nextSettingsModal);
-      }
-      retainedConnectedSettings = true;
-    }
-  }
-  if (!retainedConnectedSettings) {
-    preservedTitlebar?.remove();
-    if (
-      previousPrompt?.isConnected
-      && previousSessionInteractionOwner === nextSessionInteractionOwner
-    ) {
-      const template = document.createElement("template");
-      template.innerHTML = renderedMarkup;
-      retainedConnectedPrompt = retainConnectedMainPrompt(
-        previousPrompt,
-        template.content.querySelector<HTMLTextAreaElement>("#prompt"),
-        previousSessionInteractionOwner,
-        nextSessionInteractionOwner,
-      );
-      const retainThread = previous?.overlay === "none" && state.overlay === "none"
-        && !previous.hub_project_open && !state.hub_project_open && !backgroundInert
-        && !sessionChanged && !previous.confirmation_visible && !lastRenderedLocalModalIdentity;
-      if (!retainThread || !retainConversationThread(appRoot, template.content)) {
-        appRoot.replaceChildren(template.content);
-      }
-    } else {
-      appRoot.innerHTML = renderedMarkup;
-    }
-    const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
-    if (preservedTitlebar && nextTitlebar) nextTitlebar.replaceWith(preservedTitlebar);
-  }
-  if (preservedTitlebar?.isConnected) {
-    synchronizeTitlebarMenuState(preservedTitlebar, state.overlay, backgroundInert);
-  }
+  const { retainedConnectedPrompt } = commitRenderedMarkup({
+    renderedMarkup,
+    model,
+    previous,
+    renderedLocalModalIdentity,
+    backgroundInert,
+    sessionChanged,
+    currentSettingsModal,
+    retainingInitialSetup,
+    currentFrame,
+    preservedTitlebar,
+    previousPrompt,
+    previousSessionInteractionOwner,
+    nextSessionInteractionOwner,
+  });
   if (prependViewportAnchor) {
     restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
   }
   const thread = document.querySelector<HTMLElement>("#thread");
   let sessionThreadInteractionAfterLayout: SessionInteractionSnapshot | null = null;
-  let threadScrollTopAfterLayout: number | null = null;
+  let threadScrollTopToRestore: number | null = null;
   let pinnedToEnd = false;
   if (thread && prependViewportAnchor && restoreViewportAnchor(thread, prependViewportAnchor)) {
     // Preserve the visible message while an older bounded history chunk is prepended.
-  } else if (thread && rememberedSessionInteraction) {
-    // wireEvents autosizes the composer and changes the thread's available scroll range. Defer
-    // this session-owned viewport until that final geometry exists, or a short Quick Chat thread
-    // can clamp the offset against the default composer reserve and persist it on the next poll.
-    sessionThreadInteractionAfterLayout = rememberedSessionInteraction;
-  } else if (thread && shouldRevealEnd) {
-    revealThreadEnd(revealGeneration);
-    pinnedToEnd = true;
-  } else if (thread && previousThread) {
-    threadScrollTopAfterLayout = previousThreadScrollTop;
+  } else {
+    switch (planThreadViewport({
+      threadPresent: thread !== null,
+      rememberedSessionInteraction: rememberedSessionInteraction !== null,
+      revealEnd: shouldRevealEnd,
+      previousThreadPresent: previousThread !== null,
+    })) {
+      case "session-interaction":
+        // wireEvents autosizes the composer and changes the thread's available scroll range. Defer
+        // this session-owned viewport until that final geometry exists, or a short Quick Chat thread
+        // can clamp the offset against the default composer reserve and persist it on the next poll.
+        sessionThreadInteractionAfterLayout = rememberedSessionInteraction;
+        break;
+      case "reveal-end":
+        revealThreadEnd(revealGeneration);
+        pinnedToEnd = true;
+        break;
+      case "keep-scroll-top":
+        threadScrollTopToRestore = previousThreadScrollTop;
+        break;
+      case "none":
+        break;
+    }
   }
   previousSessionKey = nextSessionKey;
   lastRenderedLocalModalIdentity = renderedLocalModalIdentity;
@@ -1652,15 +1587,19 @@ function renderCommitted(
   }
   if (thread && sessionThreadInteractionAfterLayout) {
     restoreSessionThreadInteraction(sessionThreadInteractionAfterLayout, thread);
-  } else if (thread && threadScrollTopAfterLayout !== null) {
+  } else if (thread && threadScrollTopToRestore !== null) {
     // Restore after composer layout, before another projection can capture the replacement's
     // temporary zero offset. A queued frame can otherwise restore an already detached thread.
     // A pane width change can reflow the same conversation. Keep its near-tail distance so
     // layout alone does not turn the viewport into an older-history position.
-    const scrollTop = previousThreadWasNearEnd
-      && previousSessionInteractionOwner === nextSessionInteractionOwner
-      ? Math.max(0, thread.scrollHeight - thread.clientHeight - previousThreadEndGap)
-      : threadScrollTopAfterLayout;
+    const scrollTop = threadScrollTopAfterLayout({
+      previousScrollTop: threadScrollTopToRestore,
+      previousWasNearEnd: previousThreadWasNearEnd,
+      sameSessionOwner: previousSessionInteractionOwner === nextSessionInteractionOwner,
+      previousEndGap: previousThreadEndGap,
+      scrollHeight: thread.scrollHeight,
+      clientHeight: thread.clientHeight,
+    });
     restoreScrollPosition(thread, thread.scrollLeft, scrollTop);
   }
   if (promptSessionInteraction) {
@@ -1800,16 +1739,18 @@ function renderCommitted(
       ),
     });
   }
-  if (
-    (modalClosing || (titlebarMenuFocusAction !== null && !titlebarMenuFocusReserved)) &&
-    !initiatingTriggerYieldsPromptFocus &&
-    !newSessionFocusRejected &&
-    !focusSnapshotReserved &&
-    !quickChatDeleteFocusDecision.ownsModalCloseFallback &&
-    !state.confirmation_visible &&
-    !localModalPending &&
-    state.overlay === "none"
-  ) {
+  if (composerFallbackFocusWanted({
+    modalClosing,
+    titlebarMenuFocusAction,
+    titlebarMenuFocusReserved,
+    initiatingTriggerYieldsPromptFocus,
+    newSessionFocusRejected,
+    focusSnapshotReserved,
+    quickChatOwnsModalCloseFallback: quickChatDeleteFocusDecision.ownsModalCloseFallback,
+    confirmationVisible: state.confirmation_visible,
+    localModalPending,
+    overlay: state.overlay,
+  })) {
     postRenderFocusIntents.push({
       source: "composer-request",
       priority: "fallback",
@@ -1854,6 +1795,134 @@ function renderCommitted(
       : undefined,
   );
   notifyStartupReady();
+}
+
+/**
+ * Replaces or retains the rendered DOM for one projection. Retained surfaces keep focus,
+ * selection and in-progress input; everything else receives the fresh markup.
+ */
+function commitRenderedMarkup(input: {
+  renderedMarkup: string;
+  model: DesktopRenderModel;
+  previous: DesktopViewState | null;
+  renderedLocalModalIdentity: string | null;
+  backgroundInert: boolean;
+  sessionChanged: boolean;
+  currentSettingsModal: HTMLElement | null;
+  retainingInitialSetup: boolean;
+  currentFrame: HTMLElement | null;
+  preservedTitlebar: HTMLElement | null;
+  previousPrompt: HTMLTextAreaElement | null;
+  previousSessionInteractionOwner: string | null;
+  nextSessionInteractionOwner: string;
+}): { retainedConnectedPrompt: boolean } {
+  const {
+    renderedMarkup, model, previous, renderedLocalModalIdentity, backgroundInert, sessionChanged,
+    currentSettingsModal, retainingInitialSetup, currentFrame, preservedTitlebar, previousPrompt,
+    previousSessionInteractionOwner, nextSessionInteractionOwner,
+  } = input;
+  const state = model.view;
+  let retainedConnectedSettings = false;
+  let retainedConnectedPrompt = false;
+  if (shouldRetainSharedWorkMain(previous, state, lastRenderedLocalModalIdentity, renderedLocalModalIdentity, backgroundInert)) {
+    const currentShared = appRoot.querySelector<HTMLElement>(".shared-work");
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextShared = template.content.querySelector<HTMLElement>(".shared-work");
+    if (currentShared && nextShared) {
+      retainedConnectedSettings = retainSharedWorkSurface(currentShared, nextShared);
+      if (retainedConnectedSettings) {
+        const sidebar = appRoot.querySelector<HTMLElement>(".sidebar");
+        const nextSidebar = template.content.querySelector<HTMLElement>(".sidebar");
+        if (sidebar && nextSidebar && !sidebar.isEqualNode(nextSidebar)) sidebar.replaceWith(nextSidebar);
+      }
+    }
+  }
+  if (currentSettingsModal && retainingInitialSetup) {
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextSettingsModal = template.content.querySelector<HTMLElement>(".initial-setup-shell");
+    if (nextSettingsModal) {
+      synchronizeRetainedSettingsSurface(
+        currentSettingsModal,
+        nextSettingsModal,
+        model.local.configMutationPending
+          || model.local.initialSetup.finishPending
+          || model.local.initialSetup.auxiliaryPendingKind !== null,
+        !uiState.configDirty,
+      );
+      retainedConnectedSettings = true;
+    }
+  }
+  if (currentSettingsModal && currentFrame) {
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextFrame = template.content.querySelector<HTMLElement>(".app-frame");
+    const nextSettingsModal = template.content.querySelector<HTMLElement>(".settings-modal");
+    if (nextFrame && nextSettingsModal) {
+      retainedConnectedPrompt = retainConnectedMainPrompt(
+        previousPrompt,
+        nextFrame.querySelector<HTMLTextAreaElement>("#prompt"),
+        previousSessionInteractionOwner,
+        nextSessionInteractionOwner,
+      );
+      const nextTitlebar = nextFrame.querySelector<HTMLElement>(".app-titlebar");
+      if (preservedTitlebar && nextTitlebar) nextTitlebar.replaceWith(preservedTitlebar);
+      currentFrame.replaceWith(nextFrame);
+      const currentStatus = currentSettingsModal.querySelector<HTMLElement>(".settings-status-stack");
+      const nextStatus = nextSettingsModal.querySelector<HTMLElement>(".settings-status-stack");
+      if (currentStatus && nextStatus && !currentStatus.contains(document.activeElement)) {
+        currentStatus.replaceWith(nextStatus);
+      }
+      if (state.overlay === "mcp_history") synchronizeMcpHistorySurface(currentSettingsModal, nextSettingsModal);
+      else synchronizeRetainedSettingsSurface(
+        currentSettingsModal,
+        nextSettingsModal,
+        model.local.configMutationPending || model.local.sessionSettings.mutationPending
+          || ((state.overlay === "hub" || state.overlay === "config") && (model.local.hub.pending !== null || model.local.deviceNetwork.pending !== null)),
+        state.overlay === "hub" ? false : state.overlay === "session_settings"
+          ? !model.local.sessionSettings.dirty
+          : !uiState.configDirty,
+      );
+      if (state.overlay === "hub" || state.overlay === "config") {
+        synchronizeHubControlValues(currentSettingsModal, nextSettingsModal);
+        synchronizeDeviceNetworkControls(currentSettingsModal, nextSettingsModal);
+      }
+      retainedConnectedSettings = true;
+    }
+  }
+  if (!retainedConnectedSettings) {
+    preservedTitlebar?.remove();
+    if (
+      previousPrompt?.isConnected
+      && previousSessionInteractionOwner === nextSessionInteractionOwner
+    ) {
+      const template = document.createElement("template");
+      template.innerHTML = renderedMarkup;
+      retainedConnectedPrompt = retainConnectedMainPrompt(
+        previousPrompt,
+        template.content.querySelector<HTMLTextAreaElement>("#prompt"),
+        previousSessionInteractionOwner,
+        nextSessionInteractionOwner,
+      );
+      const retainThread = conversationThreadRetainable(previous, state, {
+        backgroundInert,
+        sessionChanged,
+        localModalWasOpen: Boolean(lastRenderedLocalModalIdentity),
+      });
+      if (!retainThread || !retainConversationThread(appRoot, template.content)) {
+        appRoot.replaceChildren(template.content);
+      }
+    } else {
+      appRoot.innerHTML = renderedMarkup;
+    }
+    const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
+    if (preservedTitlebar && nextTitlebar) nextTitlebar.replaceWith(preservedTitlebar);
+  }
+  if (preservedTitlebar?.isConnected) {
+    synchronizeTitlebarMenuState(preservedTitlebar, state.overlay, backgroundInert);
+  }
+  return { retainedConnectedPrompt };
 }
 
 function schedulePostRenderFocus(

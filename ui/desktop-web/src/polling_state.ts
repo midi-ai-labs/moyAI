@@ -32,6 +32,18 @@ export function createSnapshotRefresh(readSnapshot: () => Promise<void>): (after
   };
 }
 
+const HUB_FOREGROUND_REFRESH_MS = 1_800;
+const HUB_BACKGROUND_REFRESH_MS = 12_000;
+
+/**
+ * How often the Hub reads run while no Rust event asks for one. A visible Hub surface
+ * follows its work closely; a connected but unseen Hub keeps a slow check; otherwise none.
+ */
+export function hubRefreshIntervalMs(foreground: boolean, connected: boolean, hidden: boolean): number | null {
+  if (foreground && !hidden) return HUB_FOREGROUND_REFRESH_MS;
+  return connected || foreground ? HUB_BACKGROUND_REFRESH_MS : null;
+}
+
 export function createDesktopRefresh(readLocal: () => Promise<void>, readHub: () => Promise<void>, now = () => performance.now()) {
   let lastHubRead = -Infinity;
   const local = createSnapshotRefresh(readLocal);

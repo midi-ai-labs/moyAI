@@ -46,3 +46,28 @@ test("renders unfinished fenced code, deep headings and inline emphasis without 
     "<p><em>強調</em> <del>旧</del> <code>*code* ~~old~~</code> 2 * 3 * 4</p>");
   assert.equal(renderMarkdown("- 手順\n  ```\n  # 未完"), '<ul><li>手順<pre class="md-code"><code># 未完</code></pre></li></ul>');
 });
+
+test("spaced thematic breaks render as dividers, not as list items", () => {
+  for (const divider of ["- - -", "* * *", "_ _ _", "-  -  -  -", "***", "___"]) {
+    const html = renderMarkdown(["前の段落", "", divider, "", "後の段落"].join("\n"));
+    assert.match(html, /<hr class="md-divider">/, divider);
+    assert.doesNotMatch(html, /<ul>|<li>/, divider);
+  }
+});
+
+test("a list item whose text starts with markers stays a list item", () => {
+  const html = renderMarkdown(["- - x", "- * 強調ではない"].join("\n"));
+  assert.doesNotMatch(html, /md-divider/);
+  assert.equal((html.match(/<li>/g) ?? []).length, 2);
+});
+
+test("a spaced divider after a list closes the list", () => {
+  const html = renderMarkdown(["- 項目", "", "- - -", "", "本文"].join("\n"));
+  assert.match(html, /<ul><li>項目<\/li><\/ul><hr class="md-divider"><p>本文<\/p>/);
+});
+
+test("a spaced divider inside a code block stays code", () => {
+  const html = renderMarkdown(["```", "- - -", "```"].join("\n"));
+  assert.doesNotMatch(html, /md-divider/);
+  assert.match(html, /<pre class="md-code"><code>- - -<\/code><\/pre>/);
+});

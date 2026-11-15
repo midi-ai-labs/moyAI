@@ -2,6 +2,21 @@
 
 moyAI repositoryのルートから、既存の依存とruntimeを使って確認する。依存やruntimeを追加・downloadしない。対応するlocal SAM accountまたはActive Directory domain accountでログオンし、試験はmediumのPowerShellから実行する。ADの実機試験にはdomainに参加したPCと到達可能なdomain controllerが必要になる。固定serviceの初回導入・更新・削除だけは、管理者承認を受けた公式セットアップで行う。
 
+## 導入済みサービスを使うライブラリ試験
+
+通常ユーザーのPowerShellで次を実行すると、ライブラリ試験のビルド、testhostの起動、endpointの引継ぎ、testhostの終了までを行う。UACは求めず、サービスの登録・設定・ファイルは変更しない。
+
+```powershell
+& .\scripts\test-with-installed-sandbox.ps1 -EvidenceRoot '<project_sandbox\<task>\の新しいフォルダー>'
+```
+
+- 既定の引数は `--test-threads=1`。対象を絞る場合は `-TestArguments 'tool::sandbox_process::,--test-threads=1'` のようにコンマで区切る。`-Release`、`-Features` はビルドと試験の両方に使う。
+- 開発ビルドの `moyai-sandbox.exe` が導入済みのものと同じ場合は、ビルドした場所で試験する。異なる場合は、試験バイナリを証拠フォルダーへコピーし、導入済みhelperの複製を隣に置いて試験する。この場合はサービス側の変更を確認できないと警告する。サービス側を変更したときは、下の手順で導入し直してから実行する。
+- 結果は証拠フォルダーの `summary.json`（方式、両helperのSHA-256、試験の集計、失敗した試験名）と各ログに残る。条件に一致する試験が0件の場合は失敗として終了する。
+- testhostの終了を30秒以内に確認できない場合は、強制終了せず証拠フォルダーを保持してエラーで終了する。
+
+## 開発ビルドのhelperを導入する試験
+
 Windowsのworkspace-write試験は、実製品と同じ固定sandbox serviceを使う。通常ユーザーのPowerShellで、先にhelperとlibtestを同じsource・build profile・featuresからビルドし、compiler-artifactの`profile.test=true`、`target.kind=["lib"]`に対応する`executable`を明示して選ぶ。次はdebugの例であり、releaseで確認する場合は両コマンドに`--release`を付ける。必要なfeaturesも両コマンドに揃える。最新時刻のglobで実行ファイルを選ばない。
 
 ```powershell

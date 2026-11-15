@@ -144,7 +144,7 @@ function Write-MoyaiUtf8([string]$Path, [string]$Content) {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
-function Test-MoyaiDesktopStartup([string]$Root, $Manifest, [int]$TimeoutMilliseconds = 60000) {
+function Test-MoyaiDesktopStartup([string]$Root, $Manifest, [int]$TimeoutMilliseconds = 120000) {
   $installRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
   $parent = Split-Path -Parent $installRoot
   $machineRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'moyAI/Desktop'

@@ -296,25 +296,6 @@ impl RunMutationFence {
         self.turn_id
     }
 
-    /// Bind a Hub origin to the exact durable local turn order. The revision is
-    /// read while this turn still owns the session, so a later Stop can fence a
-    /// delayed Hub admission without relying on wall-clock or ULID ordering.
-    pub(crate) async fn origin_turn_revision(&self) -> Result<u64, ToolError> {
-        self.assert_owned().await?;
-        match self
-            .repo
-            .active_turn_expectation_for_session(self.session_id)
-            .await?
-        {
-            Some(crate::session::ActiveTurnExpectation::Turn { turn_id, revision })
-                if turn_id == self.turn_id =>
-            {
-                Ok(revision)
-            }
-            _ => Err(self.rejected_error("the active turn changed before Hub admission")),
-        }
-    }
-
     pub(crate) fn has_pending_turn_steer_input(&self) -> Result<bool, ToolError> {
         Ok(self.repo.has_pending_turn_steers_for_admitted_turn(
             self.session_id,
@@ -2213,10 +2194,6 @@ mod tests {
             admission_id,
             turn_id,
             RunControl::new(),
-        );
-        assert_eq!(
-            fence.origin_turn_revision().await.unwrap(),
-            admitted.admission_revision
         );
         assert!(!fence.has_pending_turn_steer_input().unwrap());
         let other_store = StoreBundle::new(SqliteStore::open(store.paths()).unwrap());

@@ -208,45 +208,42 @@ impl SqliteStore {
     pub fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let snapshot = connection.unchecked_transaction()?;
-        let version = super::migration::pending_upgrade_version(&snapshot)?;
-        let backups = self
-            .paths
-            .database_path
-            .as_std_path()
-            .with_added_extension("migration-backups");
-        let pinned_backups = if let Some(version) = version {
-            // The schema marker and the backup use the same read snapshot, including committed WAL frames.
-            let parent = open_internal_data_root(backups.parent().ok_or_else(|| {
-                StorageError::Message("database has no parent directory".into())
-            })?)?;
-            let directory = ensure_internal_directory(&backups, &parent)?;
-            let file = tempfile::NamedTempFile::new_in(&directory.path)?;
-            snapshot.backup(rusqlite::DatabaseName::Main, file.path(), None)?;
-            file.as_file().sync_all()?;
-            file.persist(directory.path.join(format!("v{version}.sqlite3")))
-                .map_err(|error| error.error)?;
-            Some((version, directory))
-        } else {
-            None
+        let pinned_backups = match super::migration::pending_upgrade_version(&snapshot)? {
+            Some(version) => Some((version, self.back_up_before_upgrade(&snapshot, version)?)),
+            None => None,
         };
         snapshot.commit()?;
         super::migration::run_to_current(&connection)?;
         if let Some((version, directory)) = pinned_backups {
             // Only prune product-created version names after the upgrade has succeeded.
-            let mut previous = 0;
-            for old in (0..version).rev() {
-                let path = directory.path.join(format!("v{old}.sqlite3"));
-                if path.is_file() {
-                    previous += 1;
-                    if previous > 2
-                        && let Err(error) = fs::remove_file(&path)
-                    {
-                        eprintln!("could not prune migration backup v{old}: {error}");
-                    }
-                }
-            }
+            prune_migration_backups(&directory.path, version);
         }
         Ok(())
+    }
+
+    /// Copies the database at `version` before an upgrade. The caller's read snapshot is the
+    /// same one that reported the schema version, so the copy includes committed WAL frames.
+    fn back_up_before_upgrade(
+        &self,
+        snapshot: &rusqlite::Transaction<'_>,
+        version: i64,
+    ) -> Result<StableDirectoryHandle, StorageError> {
+        let backups = self
+            .paths
+            .database_path
+            .as_std_path()
+            .with_added_extension("migration-backups");
+        let parent =
+            open_internal_data_root(backups.parent().ok_or_else(|| {
+                StorageError::Message("database has no parent directory".into())
+            })?)?;
+        let directory = ensure_internal_directory(&backups, &parent)?;
+        let file = tempfile::NamedTempFile::new_in(&directory.path)?;
+        snapshot.backup(rusqlite::DatabaseName::Main, file.path(), None)?;
+        file.as_file().sync_all()?;
+        file.persist(directory.path.join(format!("v{version}.sqlite3")))
+            .map_err(|error| error.error)?;
+        Ok(directory)
     }
 
     pub fn session_repo(&self) -> SqliteSessionRepository {
@@ -668,6 +665,23 @@ fn open_internal_data_root(data_root: &Path) -> Result<StableDirectoryHandle, St
         )));
     }
     Ok(stable)
+}
+
+/// Keeps the backup just taken for `version` and the two newest older `v{N}.sqlite3` files.
+/// Other names in the directory are not product backups and stay untouched.
+fn prune_migration_backups(directory: &Path, version: i64) {
+    let mut previous = 0;
+    for old in (0..version).rev() {
+        let path = directory.join(format!("v{old}.sqlite3"));
+        if path.is_file() {
+            previous += 1;
+            if previous > 2
+                && let Err(error) = fs::remove_file(&path)
+            {
+                eprintln!("could not prune migration backup v{old}: {error}");
+            }
+        }
+    }
 }
 
 fn ensure_internal_directory(

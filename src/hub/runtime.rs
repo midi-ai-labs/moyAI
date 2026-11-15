@@ -252,7 +252,7 @@ impl HubTurnRoute {
         {
             return Err(HubError::RouteBusy);
         }
-        let turn_id = ulid::Ulid::new().to_string();
+        let turn_id = state.next_delegated_turn_id();
         state.delegated_active.insert(
             turn_id.clone(),
             (
@@ -334,7 +334,7 @@ impl HubTurnRoute {
         {
             return Err(HubError::RouteBusy);
         }
-        let turn_id = ulid::Ulid::new().to_string();
+        let turn_id = state.next_delegated_turn_id();
         state.delegated_active.insert(
             turn_id.clone(),
             (

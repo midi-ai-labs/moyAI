@@ -21,8 +21,6 @@ use crate::tool::{
 };
 use crate::workspace::{AccessKind, PathGuard};
 
-pub(crate) struct TeamPcsTool;
-pub(crate) struct TeamUploadFileTool;
 pub(crate) struct SharedUploadFileTool {
     pub project_id: String,
     pub job_id: String,
@@ -55,40 +53,12 @@ struct SharedChildScope<'a> {
     attempt_id: &'a str,
     generation: u64,
 }
-pub(crate) struct TeamDelegateTool;
 pub(crate) struct TeamRetrySubmissionTool;
 pub(crate) struct TeamWaitTool;
 pub(crate) struct TeamReadArtifactTool;
 pub(crate) struct TeamSaveArtifactTool;
 pub(crate) struct TeamStopServiceTool;
 pub(crate) struct TeamStopConversationTool;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PcsInput {
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    pc_name: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DelegateInput {
-    project_id: String,
-    environment_id: String,
-    title: String,
-    prompt: String,
-    #[serde(default)]
-    input_refs: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UploadFileInput {
-    project_id: String,
-    path: Utf8PathBuf,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,62 +146,6 @@ fn result(title: &str, value: Value) -> Result<ToolResult, ToolError> {
         change_summaries: Vec::new(),
         _internal_file_lease: None,
     })
-}
-
-#[async_trait(?Send)]
-impl Tool for TeamPcsTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::TeamPcs,
-            effect: ToolEffectPolicy::read(),
-            description: "List Hub project PCs this device may use for team work. Resolve a user's PC name here before delegating. Declared software capabilities are hints; confirm the program actually runs on that PC. Do not substitute another PC when the user explicitly named one.",
-            input_schema: json!({
-                "type":"object", "additionalProperties":false,
-                "properties":{
-                    "project_id":{"type":"string","description":"Optional Hub project ID. Omit to list all projects this device may submit to."},
-                    "pc_name":{"type":"string","description":"Optional exact PC label to resolve."}
-                }
-            }),
-        }
-    }
-
-    async fn execute(
-        &self,
-        raw_arguments: Value,
-        ctx: ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let input: PcsInput = serde_json::from_value(raw_arguments)?;
-        let value = network(&ctx)?
-            .agent_environments(input.project_id.as_deref(), input.pc_name.as_deref())
-            .await
-            .map_err(ToolError::Message)?;
-        result("チームで使えるPCを確認", value)
-    }
-}
-
-#[async_trait(?Send)]
-impl Tool for TeamUploadFileTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::TeamUploadFile,
-            effect: ToolEffectPolicy::mutation(),
-            description: "Upload one selected file (at most 8 MiB) from the current workspace to an authorized Hub project as an immutable input copy. This does not share the whole workspace or conversation. Pass the returned asset_id in team_delegate input_refs; verify the result before applying changes back locally.",
-            input_schema: json!({
-                "type":"object","additionalProperties":false,
-                "required":["project_id","path"],
-                "properties":{"project_id":{"type":"string"},"path":{"type":"string"}}
-            }),
-        }
-    }
-
-    async fn execute(
-        &self,
-        raw_arguments: Value,
-        ctx: ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let input: UploadFileInput = serde_json::from_value(raw_arguments)?;
-        upload_file(&input.project_id, &input.path, None, ctx).await
-    }
 }
 
 #[async_trait(?Send)]
@@ -370,70 +284,6 @@ async fn upload_file(
     }
     .map_err(ToolError::Message)?;
     result("別PCへ渡すファイルを保存", value)
-}
-
-#[async_trait(?Send)]
-impl Tool for TeamDelegateTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::TeamDelegate,
-            effect: ToolEffectPolicy::mutation(),
-            description: "Send a bounded job from this ordinary conversation to an authorized Hub project PC returned by team_pcs. The Hub checks the grant again. Include only the necessary instructions and file references; local conversation history is not copied. The returned job ID is durable: use team_wait or inspect that job rather than resubmitting on uncertainty. Explicit user PC choices are binding.",
-            input_schema: json!({
-                "type":"object", "additionalProperties":false,
-                "required":["project_id","environment_id","title","prompt"],
-                "properties":{
-                    "project_id":{"type":"string","description":"Hub project ID from team_pcs."},
-                    "environment_id":{"type":"string","description":"Environment ID for the requested PC from team_pcs."},
-                    "title":{"type":"string","minLength":1,"maxLength":256},
-                    "prompt":{"type":"string","minLength":1,"maxLength":32768}
-                    ,"input_refs":{"type":"array","maxItems":32,"uniqueItems":true,
-                        "items":{"type":"string"},"description":"Immutable asset IDs returned by team_upload_file."}
-                }
-            }),
-        }
-    }
-
-    async fn execute(
-        &self,
-        raw_arguments: Value,
-        mut ctx: ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let input: DelegateInput = serde_json::from_value(raw_arguments)?;
-        ctx.run_mutation_fence.assert_owned().await?;
-        let admission = ctx
-            .confirm_if_needed(
-                AccessKind::Edit,
-                format!("{} のPCへ「{}」を依頼", input.project_id, input.title),
-                Vec::new(),
-                false,
-                ToolEffectClass::Mutation.permission_risks(),
-            )
-            .await?;
-        let origin_turn_revision = ctx.run_mutation_fence.origin_turn_revision().await?;
-        let network = network(&ctx)?;
-        let value = network
-            .agent_submit_job(
-                &ctx.tool_call_id.to_string(),
-                &ctx.session.session.id.to_string(),
-                &ctx.run_mutation_fence.turn_id().to_string(),
-                origin_turn_revision,
-                &input.project_id,
-                &input.environment_id,
-                &input.title,
-                &input.prompt,
-                &input.input_refs,
-                || {
-                    admission.admit().map_err(|error| error.to_string())?;
-                    ctx.run_mutation_fence
-                        .begin_effect_commit()
-                        .map_err(|error| error.to_string())
-                },
-            )
-            .await
-            .map_err(ToolError::Message)?;
-        result("PCへ仕事を依頼", value)
-    }
 }
 
 #[async_trait(?Send)]
@@ -948,9 +798,6 @@ mod tests {
     #[test]
     fn team_tools_have_distinct_canonical_names_and_mutation_boundary() {
         for (name, tool) in [
-            ("team_pcs", TeamPcsTool.spec()),
-            ("team_upload_file", TeamUploadFileTool.spec()),
-            ("team_delegate", TeamDelegateTool.spec()),
             ("team_retry_submission", TeamRetrySubmissionTool.spec()),
             ("team_wait", TeamWaitTool.spec()),
             ("team_read_artifact", TeamReadArtifactTool.spec()),
@@ -961,7 +808,10 @@ mod tests {
             assert_eq!(tool.name.to_string(), name);
             assert_eq!(ToolName::parse(name), tool.name);
         }
-        assert_eq!(TeamDelegateTool.spec().effect, ToolEffectPolicy::mutation());
+        // The retired local tools keep their canonical names for saved history.
+        for name in ["team_pcs", "team_upload_file", "team_delegate"] {
+            assert_eq!(ToolName::parse(name).to_string(), name);
+        }
         assert_eq!(
             TeamStopConversationTool.spec().effect,
             ToolEffectPolicy::mutation()

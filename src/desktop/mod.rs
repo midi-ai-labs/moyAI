@@ -11,6 +11,8 @@ mod attention;
 pub mod composer_state;
 pub mod distribution;
 #[cfg(feature = "tauri-desktop")]
+mod exit_progress;
+#[cfg(feature = "tauri-desktop")]
 pub mod join_config;
 #[cfg(feature = "tauri-desktop")]
 pub(crate) mod mcp_peers;

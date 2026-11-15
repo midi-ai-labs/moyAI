@@ -145,6 +145,9 @@ $zipShaPath = Assert-ReleaseOutputPath $OutputRoot "$zipPath.sha256" "release ch
 Push-Location $repoRoot
 try {
   if ($Target -ne 'windows-x86_64') { throw 'The current deployment scripts support only windows-x86_64.' }
+  # The setup scripts shared with Hub change only through the sync script, which records them.
+  & (Join-Path $repoRoot 'scripts\sync-shared-scripts.ps1') -Check -LocalOnly
+  if ($LASTEXITCODE -ne 0) { throw 'Hubと共有するセットアップスクリプトが記録と一致しません。scripts\sync-shared-scripts.ps1 で同期してから配布物を作成してください。' }
   if ($RuntimeMode -eq 'Bundled') {
     if (-not $WebView2FixedRuntimePath -or -not $VcRuntimePath -or -not (Test-Path -LiteralPath $WebView2FixedRuntimePath -PathType Container) -or -not (Test-Path -LiteralPath $VcRuntimePath -PathType Container)) {
       throw 'The offline package requires -WebView2FixedRuntimePath (extracted x64 fixed runtime) and -VcRuntimePath (licensed x64 app-local VC++ DLLs). No download is performed. Use -RuntimeMode Installed only for machines with centrally installed prerequisites.'

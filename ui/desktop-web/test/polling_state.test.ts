@@ -1,12 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createDesktopRefresh, createSnapshotRefresh, installRuntimePolling, installSnapshotInvalidation } from "../src/polling_state.ts";
+import { createDesktopRefresh, createSnapshotRefresh, hubRefreshIntervalMs, installRuntimePolling, installSnapshotInvalidation } from "../src/polling_state.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("Hub reads follow a visible Hub closely, a connected background Hub slowly, and stop otherwise", () => {
+  assert.equal(hubRefreshIntervalMs(true, false, false), 1_800);
+  assert.equal(hubRefreshIntervalMs(true, true, false), 1_800);
+  assert.equal(hubRefreshIntervalMs(true, false, true), 12_000);
+  assert.equal(hubRefreshIntervalMs(false, true, false), 12_000);
+  assert.equal(hubRefreshIntervalMs(false, true, true), 12_000);
+  assert.equal(hubRefreshIntervalMs(false, false, false), null);
+  assert.equal(hubRefreshIntervalMs(false, false, true), null);
+});
 
 test("local progress continues during a slow Hub read and idle polls follow the Hub interval", async () => {
   const blocked = deferred<void>();

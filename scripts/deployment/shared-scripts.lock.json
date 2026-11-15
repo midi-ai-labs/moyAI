@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "canonical": "moyAI/scripts/deployment",
+  "files": {
+    "component-install.ps1": "2bf4c4fed78553d82bb3e638aefdb2c9b4d64990777133f366691e1a4afe23b4",
+    "sandbox-service.ps1": "59b7f2865b75ed3471a24e724263a17053c5d03776b772a0474f6401e5905ae7",
+    "Setup-Component.ps1": "f76e355c8fa50197f832438a21d41bba84bb49e0e9769809c20ed3b88acb6127"
+  }
+}

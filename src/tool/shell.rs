@@ -749,6 +749,63 @@ fn resolve_shell_programs(
     }
 }
 
+/// Names the program the next shell command would start with, using the same selection as
+/// execution. Windows PowerShell 5.1 and PowerShell 7 differ in syntax and default file
+/// encodings, so the model needs the actual one. `None` when no candidate resolves.
+pub(crate) fn default_shell_program_description(
+    shell: &crate::config::ShellConfig,
+    workdir: &Utf8Path,
+    workspace_root: &Utf8Path,
+) -> Option<String> {
+    // Resolving the candidates validates every PATH entry and can take more than a second.
+    // The environment section is rebuilt for every model request, so reuse the answer while
+    // the inputs of the selection stay the same.
+    static DESCRIPTIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    let family = configured_shell_family(shell);
+    let environment = crate::tool::sandbox_process::captured_process_environment(shell);
+    let path = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.as_str());
+    let key = format!(
+        "{family:?}\0{:?}\0{workdir}\0{workspace_root}\0{path:?}",
+        shell.program
+    );
+    let descriptions = DESCRIPTIONS.get_or_init(Default::default);
+    if let Some(description) = descriptions
+        .lock()
+        .expect("shell description cache poisoned")
+        .get(&key)
+    {
+        return description.clone();
+    }
+    let description = describe_selected_shell(shell, family, &environment, workdir, workspace_root);
+    descriptions
+        .lock()
+        .expect("shell description cache poisoned")
+        .insert(key, description.clone());
+    description
+}
+
+fn describe_selected_shell(
+    shell: &crate::config::ShellConfig,
+    family: ShellFamily,
+    environment: &std::collections::HashMap<String, String>,
+    workdir: &Utf8Path,
+    workspace_root: &Utf8Path,
+) -> Option<String> {
+    let selected =
+        resolve_shell_executables(shell, family, environment, workdir, workspace_root).ok()?;
+    let name = selected.first()?.path().file_name()?.to_ascii_lowercase();
+    Some(match name.as_str() {
+        "powershell.exe" => "Windows PowerShell 5.1 (powershell.exe)".to_string(),
+        "pwsh.exe" => "PowerShell 7 or later (pwsh.exe)".to_string(),
+        _ => name,
+    })
+}
+
 fn configured_shell_family(shell: &crate::config::ShellConfig) -> ShellFamily {
     shell.family.unwrap_or(if cfg!(windows) {
         ShellFamily::PowerShell
@@ -4664,18 +4721,6 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn installed_default_pwsh_supports_conjunction_in_both_process_profiles() {
-        let pwsh_probe = std::process::Command::new("pwsh")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "exit 0",
-            ])
-            .status();
-        if !matches!(pwsh_probe, Ok(status) if status.success()) {
-            return;
-        }
         std::fs::create_dir_all("target").expect("target directory");
         let temp = tempfile::Builder::new()
             .prefix("moyai-shell-pwsh-")
@@ -4684,6 +4729,25 @@ mod tests {
         let workspace_root =
             Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
         let config = ResolvedConfig::default();
+        // Ask the product's own default selection. A Store app alias for pwsh can start
+        // from a plain process launch, yet moyAI declines it and uses Windows PowerShell 5.1,
+        // which has no `&&`. PCs without an admissible PowerShell 7 have nothing to check here.
+        let environment = crate::tool::sandbox_process::captured_process_environment(&config.shell);
+        let selected = super::resolve_shell_executables(
+            &config.shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workspace_root,
+            &workspace_root,
+        )
+        .expect("default PowerShell selection");
+        if !selected[0]
+            .path()
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("pwsh.exe"))
+        {
+            return;
+        }
         let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
             .expect("workspace discovery");
         let workspace_plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
@@ -4795,6 +4859,11 @@ mod tests {
         )
         .expect("workspace plan");
 
+        // Both candidates are Windows PowerShell 5.1, so the check also runs on PCs without
+        // PowerShell 7. Every launch appends one line; a replay would leave two.
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+        let second_candidate =
+            format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe");
         for (label, plan) in [
             ("workspace-write", workspace_plan),
             (
@@ -4802,13 +4871,10 @@ mod tests {
                 crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
             ),
         ] {
-            let first_marker = workspace_root.join(format!("{label}-first.txt"));
-            let replay_marker = workspace_root.join(format!("{label}-replayed.txt"));
-            let quote = |path: &camino::Utf8Path| path.as_str().replace('\'', "''");
+            let runs = workspace_root.join(format!("{label}-runs.txt"));
             let command = format!(
-                "if ($PSVersionTable.PSEdition -eq 'Desktop') {{ Set-Content -LiteralPath '{}' -Value first; exit 23 }} else {{ Set-Content -LiteralPath '{}' -Value replayed; exit 0 }}",
-                quote(&first_marker),
-                quote(&replay_marker)
+                "Add-Content -LiteralPath '{}' -Value run; exit 23",
+                runs.as_str().replace('\'', "''")
             );
 
             let output = super::execute_shell_command_with_programs(
@@ -4821,15 +4887,16 @@ mod tests {
                 &plan,
                 crate::config::ShellFamily::PowerShell,
                 environment.clone(),
-                vec!["powershell".to_string(), "pwsh".to_string()],
+                vec!["powershell".to_string(), second_candidate.clone()],
             )
             .await
             .expect("a launched candidate's nonzero exit is a completed execution");
 
             assert_eq!(output.exit_code, Some(23), "stderr={}", output.stderr);
-            assert!(first_marker.exists(), "first candidate did not run");
-            assert!(
-                !replay_marker.exists(),
+            let launches = std::fs::read_to_string(&runs).expect("first candidate did not run");
+            assert_eq!(
+                launches.lines().count(),
+                1,
                 "second candidate replayed an already-started effect"
             );
             assert!(!output.cleanup_failed);

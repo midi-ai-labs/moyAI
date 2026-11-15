@@ -53,7 +53,8 @@ export function retainConversationThread(root: HTMLElement, nextRoot: DocumentFr
     if (old.isEqualNode(next)) return old;
     const body = old.querySelector<HTMLElement>(":scope > .message-body > .markdown-body");
     const nextBody = next.querySelector<HTMLElement>(":scope > .message-body > .markdown-body");
-    if (!body || !nextBody || !body.isEqualNode(nextBody)) return next;
+    if (!body || !nextBody) return next;
+    if (!body.isEqualNode(nextBody)) retainUnchangedLeadingBlocks(body, nextBody);
     retainBranch(body, nextBody, old);
     return old;
   });
@@ -69,6 +70,20 @@ export function retainConversationThread(root: HTMLElement, nextRoot: DocumentFr
   // fresh markup and event bindings, including newly added or removed overlays.
   retainBranch(thread, nextThread, root);
   return true;
+}
+
+/**
+ * An answer that is still being written changes only at its end. Keep the
+ * leading Markdown blocks that did not change, so a selection inside them
+ * survives; replace the first changed block and everything after it.
+ */
+export function retainUnchangedLeadingBlocks(live: HTMLElement, next: HTMLElement): void {
+  const liveNodes = Array.from(live.childNodes);
+  const nextNodes = Array.from(next.childNodes);
+  let same = 0;
+  while (same < liveNodes.length && same < nextNodes.length && liveNodes[same].isEqualNode(nextNodes[same])) same += 1;
+  for (const node of liveNodes.slice(same)) node.remove();
+  live.append(...nextNodes.slice(same));
 }
 
 function retainBranch(live: HTMLElement, next: HTMLElement, root: HTMLElement): void {

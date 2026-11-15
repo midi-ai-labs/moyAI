@@ -31,6 +31,9 @@ use super::app::{
     RootSessionSettingsPersistenceOutcome,
 };
 use super::args::DesktopArgs;
+use super::exit_progress::{
+    EXIT_NOTICE_AFTER, ExitStage, await_exit_with_notice, slow_exit_notice,
+};
 use super::models::DesktopStopMutationTarget;
 use super::query::{
     DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, build_session_detail_with_roots,
@@ -905,7 +908,8 @@ fn exit_desktop_and_runner(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _exit_guard = exit_guard;
-        let stopped: Result<(), String> = async {
+        let stage = ExitStage::new("このPCの仕事の停止の開始");
+        let sequence = async {
             let runtime = {
                 let controller = app.state::<SharedController>();
                 let mut controller = controller.lock().await;
@@ -916,8 +920,11 @@ fn exit_desktop_and_runner(app: &tauri::AppHandle) {
                 controller.app.process_runtime.agent_runtime()
             };
             let _ = app.emit_to("main", "desktop-state-changed", ());
+            stage.enter("Hubとの接続の終了");
             connection.shutdown().await;
+            stage.enter("端末ネットワークの終了");
             network.shutdown().await;
+            stage.enter("このPCの仕事の停止");
             loop {
                 if app
                     .state::<SharedController>()
@@ -929,19 +936,42 @@ fn exit_desktop_and_runner(app: &tauri::AppHandle) {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
+            stage.enter("共有プロジェクトの公開の停止");
             while !publish.shutdown().await {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            stage.enter("継続コマンドの停止");
             managed_shells.shutdown().await;
             // Local work returns its shared capacity through this Runner. Keep
             // it alive until worker cleanup and ExternalFinish have settled.
+            stage.enter("仕事の後始末");
             runtime.wait_for_resource_drains().await?;
+            stage.enter("実行機能（Runner）の終了");
             tauri::async_runtime::spawn_blocking(crate::runner::operations::shutdown_existing)
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.message)
-        }
-        .await;
+        };
+        let notice_app = app.clone();
+        let stopped: Result<(), String> =
+            await_exit_with_notice(sequence, &stage, EXIT_NOTICE_AFTER, move |current| {
+                let app = notice_app.clone();
+                // The exit keeps running; give the window back with what it waits on.
+                tauri::async_runtime::spawn(async move {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window
+                            .set_title(&format!("moyAI — 終了処理を待っています（{current}）"));
+                        let _ = window.set_enabled(true);
+                    }
+                    app.state::<SharedController>()
+                        .lock()
+                        .await
+                        .state
+                        .set_status_message(&slow_exit_notice(current, EXIT_NOTICE_AFTER));
+                    let _ = app.emit_to("main", "desktop-state-changed", ());
+                });
+            })
+            .await;
         if let Err(error) = stopped {
             let message = format!(
                 "このPCの仕事や実行機能の終了を確認できなかったため、moyAIの画面を残しています。\nもう一度「終了」を選んでください。解消しない場合は、この表示を管理者へ伝えてください。\n\n{error}"

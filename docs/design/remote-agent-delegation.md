@@ -22,7 +22,7 @@
 
 Hub管理者による旧MCP履歴の読取りも既存の認証済み要求と期限付きsnapshotを使う。本文を全端末から自動収集せず、履歴・実行権限・承認の正本を端末から移さない。詳細は `moyAI-Hub/src/network/history.rs` と [Hubの履歴ガイド](../../../moyAI-Hub/docs/mcp-history.md) を参照する。
 
-旧ローカルoriginでHubへ送った仕事は、さらに元会話・元操作PC・現在の利用者資格と停止receiptを照合する。`team_retry_submission`・待機・成果・停止toolはこの清算に必要なため保持するが、`team_delegate` 等を新しいローカル会話へ提供しない。新規共有仕事との寿命・保存の違いは [共有仕事と独立Runner](../../../docs/design/shared-work-runner.md) に集約する。
+旧ローカルoriginでHubへ送った仕事は、さらに元会話・元操作PC・現在の利用者資格と停止receiptを照合する。`team_retry_submission`・待機・成果・停止toolはこの清算に必要なため保持するが、`team_delegate` 等を新しいローカル会話へ提供しない。`team_pcs`・`team_upload_file`・`team_delegate` の実装は削除し、保存済みの履歴を読むためのtool名だけを残す。新規共有仕事との寿命・保存の違いは [共有仕事と独立Runner](../../../docs/design/shared-work-runner.md) に集約する。
 
 ## 検証上の区別
 

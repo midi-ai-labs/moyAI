@@ -82,7 +82,7 @@ SubはDirect未設定でも確認済みHubモデルから開始できる。履�
 
 子agentは親のHub接続世代・確認済み選択を捕捉し、独立したexecution context・heartbeat・permit・終了を持つ。親終了で子contextを誤終了せず、子Stopで親・兄弟の取消ownerを置き換えない。親Stopの伝播は既存agent treeに従う。旧Hubに必要な機能がなければ理由を示し、Directへ戻さない。
 
-ApproveはMain開始時に確認済み選択を捕捉し、子agentにも同じsnapshotを渡す。審査開始時に現在のcatalogとApproveの確認済み選択を照合し、一致しなければ `ReviewRequired` で止める。Approve未設定で始めたMainへ、後から保存した選択を追加しない。審査ごとに短い `purpose:"delegated"`、`context:"approve"` の独立scopeを作り、そのULIDにheartbeat、permit、finish/cancelを結び付ける。成功、失敗、deadline、取消、worker終了時も同じ実行ownerが清算する。通常Main/Subの子context上限14は維持し、Approve審査は最大15件、3用途を含む全体は32 contextまで。同じmapから数え、FIFOとGateway容量は共通のままとする。Guardianの判定契約やpromptは変更せず、審査に用いる通常LLMの接続先・モデルだけを置換する。
+ApproveはMain開始時に確認済み選択を捕捉し、子agentにも同じsnapshotを渡す。審査開始時に現在のcatalogとApproveの確認済み選択を照合し、一致しなければ `ReviewRequired` で止める。Approve未設定で始めたMainへ、後から保存した選択を追加しない。審査ごとに短い `purpose:"delegated"`、`context:"approve"` の独立scopeを作り、そのULIDにheartbeat、permit、finish/cancelを結び付ける。成功、失敗、deadline、取消、worker終了時も同じ実行ownerが清算する。通常Main/Subの子context上限14は維持し、Approve審査は最大15件、3用途を含む全体は32 contextまで。同じmapから数え、FIFOとGateway容量は共通のままとする。Guardianの判定契約やpromptは変更せず、審査に用いる通常LLMの接続先・モデルだけを置換する。子agentとApprove審査のULIDは、同じプロセスの中で前回より必ず大きい値にする。PCの時刻が戻っても、Hubが退役済みとする境界（Hubの `docs/delegated-execution.md`）以下のIDを作らない。
 
 ## 保存・競合・接続変更
 

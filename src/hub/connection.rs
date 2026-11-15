@@ -137,6 +137,14 @@ pub struct HubConnectionProjection {
     pub can_change_approve_mode: bool,
 }
 
+/// `fresh` unless the clock moved back to or before `last`; then the next ID after `last`.
+fn next_increasing_ulid(last: Option<ulid::Ulid>, fresh: ulid::Ulid) -> ulid::Ulid {
+    match last {
+        Some(last) if fresh <= last => last.increment().unwrap_or(fresh),
+        _ => fresh,
+    }
+}
+
 struct ConnectionState {
     settings: HubSettings,
     storage_error: Option<HubError>,
@@ -151,9 +159,18 @@ struct ConnectionState {
     error: Option<HubError>,
     active: [Option<ActiveHubTurn>; 3],
     delegated_active: std::collections::BTreeMap<String, (HubReviewContext, ActiveHubTurn)>,
+    /// The Hub rejects a delegated execution at or below the oldest retired one
+    /// of this registration, so delegated IDs must keep increasing even when the
+    /// PC clock moves back.
+    last_delegated_turn_id: Option<ulid::Ulid>,
 }
 
 impl ConnectionState {
+    fn next_delegated_turn_id(&mut self) -> String {
+        let id = next_increasing_ulid(self.last_delegated_turn_id, ulid::Ulid::new());
+        self.last_delegated_turn_id = Some(id);
+        id.to_string()
+    }
     fn approve_active(&self) -> bool {
         self.active[HubReviewContext::Approve.index()].is_some()
             || self
@@ -452,6 +469,7 @@ impl HubConnection {
                     error: storage_error,
                     active: [None, None, None],
                     delegated_active: Default::default(),
+                    last_delegated_turn_id: None,
                 }),
                 store: Some(store),
                 network_http: std::sync::Mutex::new(None),
@@ -631,6 +649,7 @@ impl HubConnection {
                     error: None,
                     active: [None, None, None],
                     delegated_active: Default::default(),
+                    last_delegated_turn_id: None,
                 }),
                 store: None,
                 network_http: std::sync::Mutex::new(Some(http)),

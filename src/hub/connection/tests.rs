@@ -3647,3 +3647,20 @@ async fn endpoint_switch_clears_both_reviews_and_same_endpoint_replacement_is_re
     );
     service.shutdown().await;
 }
+
+#[test]
+fn delegated_ids_keep_increasing_when_the_clock_moves_back() {
+    let issued = ulid::Ulid::from_parts(1_800_000_000_000, 7);
+    // The PC clock moved back by an hour: a fresh ID would sort before the last one,
+    // and the Hub would reject it once the last one is behind its retired boundary.
+    let behind = ulid::Ulid::from_parts(1_800_000_000_000 - 3_600_000, 99);
+    let next = next_increasing_ulid(Some(issued), behind);
+    assert!(next > issued);
+    assert_eq!(next.timestamp_ms(), issued.timestamp_ms());
+    let same_time = ulid::Ulid::from_parts(1_800_000_000_000, 7);
+    assert!(next_increasing_ulid(Some(issued), same_time) > issued);
+    // A normal clock keeps using the fresh time-ordered ID.
+    let ahead = ulid::Ulid::from_parts(1_800_000_000_001, 0);
+    assert_eq!(next_increasing_ulid(Some(issued), ahead), ahead);
+    assert_eq!(next_increasing_ulid(None, behind), behind);
+}

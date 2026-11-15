@@ -6,6 +6,9 @@ Run a PowerShell command in a fresh, non-profile shell.
   `COMPUTERNAME` being inherited.
 - Use descriptive scratch variables such as `$machineName`. Names are
   case-insensitive; do not assign to automatic variables such as `$Host` or `$PID`.
+- `environment_context.shell_program` names the PowerShell that runs. Windows
+  PowerShell 5.1's `Get-Content` reads a UTF-8 file without a BOM as the ANSI code
+  page, so pass `-Encoding utf8` when reading text back to check it.
 - Check the requested data and stderr as well as the exit code. A non-terminating
   PowerShell error can be followed by successful statements and exit code 0.
 - In scripts you create or modify, stop on errors in required work and return

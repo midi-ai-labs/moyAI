@@ -17,6 +17,7 @@ struct SharedChildArtifacts {
     items: Vec<WorkAsset>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize, Serialize)]
 struct AgentEnvironment {
     id: String,
@@ -36,6 +37,7 @@ struct AgentEnvironment {
     runner_contact: Option<WorkRunnerContact>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct AgentOriginTurnAdmission {
     origin_session_ref: String,
@@ -669,8 +671,11 @@ impl DeviceNetworkService {
         Ok((connection, session))
     }
 
+    /// Test-only since the local `team_pcs` tool was retired (c44ed1b). Tests use it to
+    /// exercise the shared device session that the remaining agent calls still reuse.
     /// Every row is returned by the Hub under this device's current project grant.
     /// Capabilities are declared hints, not proof that a program can be executed.
+    #[cfg(test)]
     pub(crate) async fn agent_environments(
         &self,
         project_id: Option<&str>,
@@ -754,7 +759,11 @@ impl DeviceNetworkService {
         )
     }
 
+    /// Test-only since the local `team_delegate` tool was retired (c44ed1b). Older versions
+    /// saved submission receipts through this path, and `team_retry_submission` still settles
+    /// them; tests use it to create such receipts.
     /// A durable receipt fences an unknown POST; a new model call cannot silently resubmit it.
+    #[cfg(test)]
     pub(crate) async fn agent_submit_job(
         &self,
         request_id: &str,

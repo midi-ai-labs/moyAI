@@ -69,7 +69,9 @@ export function renderMarkdown(value: string): string {
       flushTextBlocks();
       continue;
     }
-    const item = trimmed.match(/^(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/);
+    // `- - -` and `* * *` would otherwise read as a list item that starts with a marker.
+    const divider = /^(?:-[ \t]*){3,}$|^(?:\*[ \t]*){3,}$|^(?:_[ \t]*){3,}$/.test(trimmed);
+    const item = divider ? null : trimmed.match(/^(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/);
     if (item) {
       flushTextBlocks();
       const tag = item[1] ? "ul" : "ol";
@@ -95,7 +97,7 @@ export function renderMarkdown(value: string): string {
       fence = { indent, length: opening[1].length };
       continue;
     }
-    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+    if (divider) {
       flushTextBlocks();
       html += '<hr class="md-divider">';
       continue;
