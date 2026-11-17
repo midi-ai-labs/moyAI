@@ -620,7 +620,7 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
             push_metadata_line(output, "Severity", feedback.severity.key());
             push_metadata_line(output, "Category", feedback.category.key());
             output.push('\n');
-            output.push_str(&feedback.public_message);
+            output.push_str(feedback.display_message());
             output.push_str("\n\n");
         }
         HistoryItemPayload::ToolCall {

@@ -6,7 +6,7 @@ export function renderMarkdown(value: string): string {
   let paragraph: string[] = [];
   const lists: { indent: number; tag: "ul" | "ol" }[] = [];
   let quoteLines: string[] = [];
-  let tableLines: string[] = [];
+  let table: { headers: string[]; rows: string[][] } | null = null;
   let codeLines: string[] = [];
   let fence: { indent: number; length: number } | null = null;
 
@@ -21,21 +21,8 @@ export function renderMarkdown(value: string): string {
     html += `<blockquote>${quoteLines.map((line) => `<p>${renderInlineMarkdown(line)}</p>`).join("")}</blockquote>`;
     quoteLines = [];
   };
-  const flushTable = () => {
-    if (tableLines.length < 2) {
-      if (tableLines.length > 0) paragraph.push(...tableLines);
-      tableLines = [];
-      return;
-    }
-    const rows = parseTableRows(tableLines);
-    tableLines = [];
-    if (rows.length < 2 || !isAlignmentRow(rows[1])) {
-      paragraph.push(...rows.map((row) => `| ${row.join(" | ")} |`));
-      return;
-    }
-    const headers = rows[0];
-    const bodyRows = rows.slice(2);
-    html += `<div class="md-table-wrap"><table class="md-table"><thead><tr>${headers
+  const renderTable = (headers: string[], bodyRows: string[][]) =>
+    `<div class="md-table-wrap"><table class="md-table"><thead><tr>${headers
       .map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`)
       .join("")}</tr></thead><tbody>${bodyRows
       .map(
@@ -45,14 +32,17 @@ export function renderMarkdown(value: string): string {
             .join("")}</tr>`
       )
       .join("")}</tbody></table></div>`;
-  };
   const flushTextBlocks = () => {
-    flushTable();
+    if (table) {
+      html += renderTable(table.headers, table.rows);
+      table = null;
+    }
     flushParagraph();
     flushQuote();
   };
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     const trimmed = line.trim();
     const indent = line.length - line.trimStart().length;
     if (fence) {
@@ -102,13 +92,24 @@ export function renderMarkdown(value: string): string {
       html += '<hr class="md-divider">';
       continue;
     }
-    if (looksLikeTableLine(trimmed)) {
-      flushParagraph();
-      flushQuote();
-      tableLines.push(trimmed);
-      continue;
+    if (table) {
+      const row = parseTableRow(trimmed);
+      if (row.length) {
+        table.rows.push(row);
+        continue;
+      }
+      flushTextBlocks();
     }
-    flushTable();
+    if (trimmed.includes("|") && lines[index + 1]?.includes("|")) {
+      const headers = parseTableRow(trimmed);
+      const alignment = parseTableRow(lines[index + 1]);
+      if (headers.length === alignment.length && isAlignmentRow(alignment)) {
+        flushTextBlocks();
+        table = { headers, rows: [] };
+        index++;
+        continue;
+      }
+    }
     const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       flushTextBlocks();
@@ -134,15 +135,29 @@ export function renderMarkdown(value: string): string {
   return html || `<p>${escapeHtml(value)}</p>`;
 }
 
-function looksLikeTableLine(line: string): boolean {
-  return line.includes("|") && line.split("|").length >= 3;
-}
-
-function parseTableRows(lines: string[]): string[][] {
-  return lines.map((line) => {
-    const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
-    return trimmed.split("|").map((cell) => cell.trim());
-  });
+function parseTableRow(line: string): string[] {
+  const text = line.trim();
+  if (!text.includes("|")) return [];
+  const cells: string[] = [];
+  let cell = "";
+  let backslashes = 0;
+  for (const char of text) {
+    if (char === "|") {
+      if (backslashes % 2 === 1) {
+        cell = cell.slice(0, -1) + "|";
+      } else {
+        cells.push(cell.trim());
+        cell = "";
+      }
+    } else {
+      cell += char;
+    }
+    backslashes = char === "\\" ? backslashes + 1 : 0;
+  }
+  if (!cells.length) return [];
+  if (text.startsWith("|")) cells.shift();
+  if (cell.length) cells.push(cell.trim());
+  return cells;
 }
 
 function isAlignmentRow(row: string[]): boolean {

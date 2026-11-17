@@ -39,7 +39,8 @@ import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.m
 const OWNER = "scenario:provider.responses-compaction-retry";
 export const PROVIDER_RESPONSES_COMPACTION_CONTEXT_WINDOW = 32_768;
 export const PROVIDER_RESPONSES_COMPACTION_INPUT_BYTE_THRESHOLD = 32_000;
-export const PROVIDER_RESPONSES_COMPACTION_SENTINEL_LINE_BYTES = 12_000;
+// Eight reads should trigger the bounded retry and leave room to resume once.
+export const PROVIDER_RESPONSES_COMPACTION_SENTINEL_LINE_BYTES = 9_600;
 const REASONING_STREAM_EVENT_TYPES = Object.freeze([
   "response.output_item.added",
   "response.reasoning_text.delta",

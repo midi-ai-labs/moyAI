@@ -237,11 +237,12 @@ import {
   operationInvalidatesComposer,
   composerOwner,
   composerSessionOwner,
+  localSearchOwner,
   projectViewState,
   reconcileUiDrafts,
   rejectDraftMutation,
 } from "./view_state";
-import { retainConversationThread } from "./conversation_surface";
+import { retainConnectedBranch, retainConversationThread } from "./conversation_surface";
 import {
   composerFallbackFocusWanted,
   conversationThreadRetainable,
@@ -1892,10 +1893,13 @@ function commitRenderedMarkup(input: {
     }
   }
   if (!retainedConnectedSettings) {
+    const active = document.activeElement;
+    const search = previous?.overlay === "command_palette" && state.overlay === "command_palette"
+      && localSearchOwner(previous) === localSearchOwner(state)
+      && active instanceof HTMLInputElement && active.id === "local-search" ? active : null;
     preservedTitlebar?.remove();
     if (
-      previousPrompt?.isConnected
-      && previousSessionInteractionOwner === nextSessionInteractionOwner
+      search || (previousPrompt?.isConnected && previousSessionInteractionOwner === nextSessionInteractionOwner)
     ) {
       const template = document.createElement("template");
       template.innerHTML = renderedMarkup;
@@ -1910,7 +1914,10 @@ function commitRenderedMarkup(input: {
         sessionChanged,
         localModalWasOpen: Boolean(lastRenderedLocalModalIdentity),
       });
-      if (!retainThread || !retainConversationThread(appRoot, template.content)) {
+      const nextSearch = search && template.content.querySelector<HTMLInputElement>("#local-search");
+      if (search && nextSearch) {
+        retainConnectedBranch(search, nextSearch, appRoot);
+      } else if (!retainThread || !retainConversationThread(appRoot, template.content)) {
         appRoot.replaceChildren(template.content);
       }
     } else {

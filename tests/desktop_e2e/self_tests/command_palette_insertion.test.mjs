@@ -21,9 +21,10 @@ test("no-match oracle rejects stale candidates even when the feedback says there
   const query = "e2e-no-such-result-99283";
   const good = { projection: { overlay: "command_palette", local_search_text: query },
     palette: { visible: true, search_active: true, search: query,
-      feedback: "一致するプロジェクト・チャット・履歴・成果物・コマンドはありません。", commands: [] }, error_count: 0 };
+      feedback: "一致する項目はありません。", action_count: 0, commands: [] }, error_count: 0 };
   assert.equal(paletteNoMatchReady(good, query), true);
   for (const change of [
+    next => { next.palette.action_count = 1; },
     next => { next.palette.commands.push({ index: 0, label: "/e2e-palette", visible: true }); },
     next => { next.palette.commands.push({ index: 0, label: "/e2e-palette", visible: false }); },
     next => { next.palette.search = "stale"; },

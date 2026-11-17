@@ -3,6 +3,30 @@ import test from "node:test";
 
 import { renderMarkdown } from "../src/markdown.ts";
 
+test("escaped pipes remain in a table cell and preserve the following result", () => {
+  const html = renderMarkdown([
+    "| チェック | 結果 |",
+    "| :--- | ---: |",
+    '| `echo "2 * 3" \\| python calculator.py` | `6`（exit 0） |',
+  ].join("\n"));
+  assert.match(html, /<td><code>echo &quot;2 \* 3&quot; \| python calculator\.py<\/code><\/td><td><code>6<\/code>（exit 0）<\/td>/);
+});
+
+test("table separators respect escaped final pipes, backslash pairs and empty cells", () => {
+  const table = renderMarkdown([
+    "Left | Middle | Right", "--- | --- | ---",
+    String.raw`| a\\| | c\|`,
+    String.raw`| a\\\|b | x | y |`,
+    "- an item | with | pipes",
+  ].join("\n"));
+  assert.ok(table.includes(String.raw`<td>a\\</td><td></td><td>c|</td>`));
+  assert.ok(table.includes(String.raw`<td>a\\|b</td><td>x</td><td>y</td>`));
+  assert.match(table, /<\/table><\/div><ul><li>an item \| with \| pipes/);
+  assert.match(renderMarkdown(["left | right", "--- | ---", String.raw`plain | end\|`].join("\n")),
+    /<td>plain<\/td><td>end\|<\/td>/);
+  assert.equal(renderMarkdown(String.raw`two \| literal \| pipes`), String.raw`<p>two \| literal \| pipes</p>`);
+});
+
 test("markdown renders Codex-style summary structure without leaking source markers", () => {
   const html = renderMarkdown([
     "作業を完了しました。",

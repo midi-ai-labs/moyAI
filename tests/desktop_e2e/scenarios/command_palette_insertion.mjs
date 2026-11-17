@@ -32,6 +32,7 @@ async function observe(cdp) {
         value: prompt?.value, start: prompt?.selectionStart, end: prompt?.selectionEnd, active: document.activeElement === prompt },
       palette: { visible: visible(dialog), search: search?.value ?? null, search_active: document.activeElement === search,
         feedback: dialog?.querySelector('.feedback')?.textContent?.trim() ?? null,
+        action_count: dialog?.querySelectorAll('button[data-focus-key^="palette-action:"]').length ?? 0,
         commands: [...(dialog?.querySelectorAll('[data-action="insert-command"]') ?? [])].map(el => ({index: Number(el.dataset.index), label: el.querySelector('span')?.textContent?.trim(), active: el === document.activeElement, visible: visible(el)})) },
       error_count: [...document.querySelectorAll('.fatal, .ui-error-notice')].filter(visible).length };
   })()`);
@@ -57,7 +58,7 @@ export function paletteNoMatchReady(surface, query) {
     && surface.projection.local_search_text === query
     && surface.palette?.visible === true && surface.palette.search_active === true
     && surface.palette.search === query
-    && surface.palette.feedback === "一致するプロジェクト・チャット・履歴・成果物・コマンドはありません。"
+    && surface.palette.feedback === "一致する項目はありません。" && surface.palette.action_count === 0
     && Array.isArray(surface.palette.commands) && surface.palette.commands.length === 0
     && surface.error_count === 0;
 }
@@ -140,8 +141,18 @@ export function createCommandPaletteInsertionScenario() {
         await wait(cdp, "initial local draft and insertion caret", value => paletteDraftUnchanged(value, initial, { value: INITIAL_DRAFT, caret: 7 }));
         await chord(input, "k");
         await wait(cdp, "palette search receives focus", value => value.projection.overlay === "command_palette" && value.palette.search_active);
-        await text(input, SEARCH, COMMAND_NAME, sink);
-        await wait(cdp, "real command search settles", value => value.projection.local_search_text === COMMAND_NAME && value.palette.feedback?.includes(`コマンド: /${COMMAND_NAME}`));
+        const searchField = await cdp.call("Runtime.evaluate", { expression: "document.activeElement" });
+        try {
+          await text(input, SEARCH, COMMAND_NAME, sink);
+          await wait(cdp, "real command search settles", value => value.projection.local_search_text === COMMAND_NAME && value.palette.feedback?.includes(`コマンド: /${COMMAND_NAME}`));
+          const retained = await cdp.call("Runtime.callFunctionOn", {
+            objectId: searchField.result.objectId, returnByValue: true,
+            functionDeclaration: "function () { return this.id === 'local-search' && this.isConnected && this === document.activeElement; }",
+          });
+          if (!retained.result.value) throw new DesktopE2eError("product", "palette-search-focus-lost", "Updating results disconnected the focused search field");
+        } finally {
+          await cdp.call("Runtime.releaseObject", { objectId: searchField.result.objectId });
+        }
         const before = await input.snapshotProbe();
         await input.pressKey("Tab");
         const after = await input.snapshotProbe(before.sequence);

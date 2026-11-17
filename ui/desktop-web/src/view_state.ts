@@ -694,6 +694,8 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     workspace_input: uiState.drafts.workspaceInput,
     review_draft_text: uiState.drafts.reviewDraft,
     local_search_text: uiState.drafts.localSearch,
+    local_search_results_text: state.local_search_text === uiState.drafts.localSearch
+      ? state.local_search_results_text : "検索中…",
     session_search_text: uiState.drafts.sessionSearch,
     provider_base_url: providerDraft.baseUrl,
     provider_profile: providerDraft.providerProfile,

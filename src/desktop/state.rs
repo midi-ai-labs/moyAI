@@ -2135,8 +2135,7 @@ impl DesktopState {
     pub fn local_search_results_text(&self) -> String {
         let needle = self.view.local_search_text.trim().to_lowercase();
         if needle.is_empty() {
-            return "プロジェクト、チャット、履歴、アーティファクト、コマンドを検索できます。"
-                .to_string();
+            return String::new();
         }
         let mut lines = Vec::new();
         for row in &self.snapshot.project_rows {
@@ -2174,11 +2173,7 @@ impl DesktopState {
                 lines.push(format!("コマンド: {} ({})", command.label, command.path));
             }
         }
-        if lines.is_empty() {
-            "一致するプロジェクト・チャット・履歴・成果物・コマンドはありません。".to_string()
-        } else {
-            lines.into_iter().take(24).collect::<Vec<_>>().join("\n")
-        }
+        lines.into_iter().take(24).collect::<Vec<_>>().join("\n")
     }
 
     pub fn show_command_palette(&mut self) -> bool {

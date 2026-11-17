@@ -905,9 +905,9 @@ impl AppState {
             }
             RunEvent::RecoverableRuntimeFeedback { feedback, .. } => {
                 self.run_status = RunStatus::Running;
-                self.status_message = Some(feedback.public_message.clone());
+                self.status_message = Some(feedback.display_message().to_owned());
                 self.progress.current_phase = RunProgressPhase::RuntimeFeedback;
-                self.progress.active_step = feedback.public_message.clone();
+                self.progress.active_step = feedback.display_message().to_owned();
                 self.transcript_entries.push(TranscriptEntry {
                     kind: if feedback.severity == DurableFeedbackSeverity::Error {
                         TranscriptKind::Error
@@ -915,7 +915,7 @@ impl AppState {
                         TranscriptKind::System
                     },
                     title: feedback.public_title(),
-                    body: feedback.public_message.clone(),
+                    body: feedback.display_message().to_owned(),
                     response_id: None,
                     tool_call_id: None,
                 });
@@ -1700,7 +1700,7 @@ fn transcript_entries_from_turn_items_with_roots(
                     TranscriptKind::System
                 },
                 title: feedback.public_title(),
-                body: feedback.public_message.clone(),
+                body: feedback.display_message().to_owned(),
                 response_id: None,
                 tool_call_id: None,
             }),

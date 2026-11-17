@@ -1094,9 +1094,10 @@ select:focus-visible,
 }
 
 .status-line > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  max-height: 4.5em;
+  overflow-y: auto;
 }
 
 .status-line.has-detail > span {

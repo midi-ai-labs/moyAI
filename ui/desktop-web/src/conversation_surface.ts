@@ -55,7 +55,7 @@ export function retainConversationThread(root: HTMLElement, nextRoot: DocumentFr
     const nextBody = next.querySelector<HTMLElement>(":scope > .message-body > .markdown-body");
     if (!body || !nextBody) return next;
     if (!body.isEqualNode(nextBody)) retainUnchangedLeadingBlocks(body, nextBody);
-    retainBranch(body, nextBody, old);
+    retainConnectedBranch(body, nextBody, old);
     return old;
   });
   const retained = new Set(children);
@@ -68,7 +68,7 @@ export function retainConversationThread(root: HTMLElement, nextRoot: DocumentFr
 
   // Keep the thread and its ancestors attached. Sibling surfaces receive the normal
   // fresh markup and event bindings, including newly added or removed overlays.
-  retainBranch(thread, nextThread, root);
+  retainConnectedBranch(thread, nextThread, root);
   return true;
 }
 
@@ -86,7 +86,8 @@ export function retainUnchangedLeadingBlocks(live: HTMLElement, next: HTMLElemen
   live.append(...nextNodes.slice(same));
 }
 
-function retainBranch(live: HTMLElement, next: HTMLElement, root: HTMLElement): void {
+/** Keep the active element and its ancestors connected while updating their attributes and siblings. */
+export function retainConnectedBranch(live: HTMLElement, next: HTMLElement, root: HTMLElement): void {
   while (live !== root) {
     syncAttributes(live, next);
     const siblings = Array.from(next.parentNode!.childNodes);

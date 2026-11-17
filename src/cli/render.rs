@@ -208,7 +208,7 @@ impl EventRenderer for HumanRenderer {
                     "[feedback/{:?}/{:?}] {}",
                     feedback.severity,
                     feedback.category,
-                    terminal_safe_inline(&feedback.public_message)
+                    terminal_safe_inline(feedback.display_message())
                 )?;
             }
             RunEvent::TurnTerminal {

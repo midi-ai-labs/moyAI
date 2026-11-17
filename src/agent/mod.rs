@@ -64,7 +64,7 @@ use crate::tool::registry::ToolRegistry;
 
 const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
-const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+const COMPACTION_ACCURACY_WARNING: &str = "会話が長くなり、履歴の圧縮を繰り返すと、回答の精度が下がることがあります。必要に応じて作業を分け、新しいチャットで続けてください。";
 // This reserves planning space inside the input window; it is not an output
 // target or a generation override. Sampling and output limits remain host-owned.
 const COMPACTION_CHECKPOINT_RESERVE_TOKENS: usize = 1_800;
@@ -679,11 +679,7 @@ impl AgentLoop {
                                 Some(request.context.revision().as_str().to_string());
                             sink.emit(RunEvent::RecoverableRuntimeFeedback {
                                 session_id: request.session.session.id,
-                                feedback: crate::session::DurableRuntimeFeedback::new(
-                                    crate::session::DurableFeedbackSeverity::Warning,
-                                    crate::session::DurableFeedbackCategory::Context,
-                                    "Semantic compaction was unavailable, so the task continued with the existing history. If the context fills up, start a new task or reduce the request.",
-                                ),
+                                feedback: crate::session::DurableRuntimeFeedback::compaction_unavailable(),
                             })?;
                         }
                         Err(error) => {
@@ -699,11 +695,7 @@ impl AgentLoop {
                                 Some(request.context.revision().as_str().to_string());
                             sink.emit(RunEvent::RecoverableRuntimeFeedback {
                                 session_id: request.session.session.id,
-                                feedback: crate::session::DurableRuntimeFeedback::new(
-                                    crate::session::DurableFeedbackSeverity::Warning,
-                                    crate::session::DurableFeedbackCategory::Context,
-                                    "Semantic compaction was unavailable, so the task continued with the existing history. If the context fills up, start a new task or reduce the request.",
-                                ),
+                                feedback: crate::session::DurableRuntimeFeedback::compaction_unavailable(),
                             })?;
                         }
                     }

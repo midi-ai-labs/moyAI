@@ -581,7 +581,7 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots
                     },
                     String::new(),
                     feedback.public_title(),
-                    feedback.public_message.clone(),
+                    feedback.display_message().to_owned(),
                     Vec::new(),
                 ));
             }

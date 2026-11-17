@@ -211,21 +211,26 @@ test("palette command candidates match the query and retain their original mutat
     { name: "build-local", path: "C:/fixture/commands/build.md" },
     { name: "review-local", path: "C:/fixture/資料/review.md" },
   ];
-  const palette = (query: string) => renderOverlay(viewState({
-    overlay: "command_palette", local_search_text: query, local_search_results_text: "",
+  const palette = (query: string, results = "") => renderOverlay(viewState({
+    overlay: "command_palette", local_search_text: query, local_search_results_text: results,
     command_rows: rows, session_rows: [], config_draft: { dirty: false },
   }));
   const byName = palette(" REVIEW-LOCAL ");
   assert.doesNotMatch(byName, /<span>\/build-local<\/span>/);
   assert.match(byName, /data-action="insert-command" data-index="1"/);
   assert.match(byName, /<span>\/review-local<\/span>/);
-  assert.doesNotMatch(byName, /実行できる操作はありません/);
+  assert.doesNotMatch(byName, /一致する項目はありません/);
   const byPath = palette("資料");
   assert.doesNotMatch(byPath, /<span>\/build-local<\/span>/);
   assert.match(byPath, /data-action="insert-command" data-index="1"/);
   const noMatch = palette("no-matching-command-99283");
   assert.doesNotMatch(noMatch, /data-action="insert-command"/);
-  assert.match(noMatch, /実行できる操作はありません/);
+  assert.match(noMatch, /一致する項目はありません/);
+  const builtIn = palette("show-workspace-picker");
+  assert.match(builtIn, /data-action="show-workspace-picker"/);
+  assert.doesNotMatch(builtIn, /一致する項目はありません/);
+  assert.match(palette("報告", "履歴: 調査報告"), /履歴: 調査報告/);
+  assert.doesNotMatch(palette("報告", "履歴: 調査報告"), /一致する項目はありません/);
   assert.deepEqual(rows.map(row => row.name), ["build-local", "review-local"]);
 });
 

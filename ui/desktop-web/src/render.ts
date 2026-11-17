@@ -2898,18 +2898,22 @@ function renderCommandPalette(
   // index for the exact-target insertion command.
   const commands = state.command_rows.map((row, index) => ({ row, index }))
     .filter(({ row }) => !query || row.name.toLowerCase().includes(query) || row.path.toLowerCase().includes(query));
+  let feedback = state.local_search_results_text;
+  if (!query) {
+    feedback = "操作、プロジェクト、チャット、履歴、成果物、コマンドを検索できます。";
+  } else if (!feedback && !actions.length && !commands.length) {
+    feedback = "一致する項目はありません。";
+  }
   return `
     <div class="modal-backdrop" data-action="close-overlay">
       <section class="modal command" data-modal role="dialog" aria-modal="true" aria-labelledby="command-palette-dialog-title" tabindex="-1">
         <h2 id="command-palette-dialog-title">コマンドパレット</h2>
         <label class="sr-only" for="local-search">操作、チャット、コマンドを検索</label>
         <input id="local-search" value="${escapeHtml(state.local_search_text)}" placeholder="操作、チャット、/コマンドを検索" />
-        <pre class="feedback">${escapeHtml(state.local_search_results_text)}</pre>
+        ${feedback ? `<pre class="feedback">${escapeHtml(feedback)}</pre>` : ""}
         <div class="select-list compact">
           ${
-            actions.length === 0 && commands.length === 0
-              ? '<div class="empty">実行できる操作はありません</div>'
-              : actions
+            actions
                   .map(
                     (action) => `
                       <button data-action="${escapeHtml(action.id)}" data-focus-key="palette-action:${escapeHtml(action.id)}">

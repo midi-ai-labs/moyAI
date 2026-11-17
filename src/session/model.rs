@@ -1306,6 +1306,29 @@ pub struct DurableRuntimeFeedback {
 }
 
 impl DurableRuntimeFeedback {
+    const COMPACTION_UNAVAILABLE: &str = "Semantic compaction was unavailable, so the task continued with the existing history. If the context fills up, start a new task or reduce the request.";
+
+    pub(crate) fn compaction_unavailable() -> Self {
+        Self::new(
+            DurableFeedbackSeverity::Warning,
+            DurableFeedbackCategory::Context,
+            Self::COMPACTION_UNAVAILABLE,
+        )
+    }
+
+    pub fn display_message(&self) -> &str {
+        match (self.severity, self.category, self.public_message.as_str()) {
+            (
+                DurableFeedbackSeverity::Warning,
+                DurableFeedbackCategory::Context,
+                Self::COMPACTION_UNAVAILABLE,
+            ) => {
+                "履歴を圧縮できなかったため、これまでの履歴を使って作業を続けます。文脈の上限に達したら、新しいチャットを始めるか、依頼の範囲を絞ってください。"
+            }
+            _ => &self.public_message,
+        }
+    }
+
     pub fn new(
         severity: DurableFeedbackSeverity,
         category: DurableFeedbackCategory,
@@ -1815,6 +1838,26 @@ mod tests {
         assert_eq!(effective.model.api_key_env, None);
         assert!(effective.model.extra_headers.is_empty());
         assert_eq!(effective.model.extra_body_json, None);
+    }
+
+    #[test]
+    fn compaction_feedback_renders_saved_warnings_without_changing_the_record() {
+        let feedback = DurableRuntimeFeedback::compaction_unavailable();
+        let saved = serde_json::to_string(&feedback).unwrap();
+        let restored: DurableRuntimeFeedback = serde_json::from_str(&saved).unwrap();
+        assert!(
+            restored
+                .display_message()
+                .contains("履歴を圧縮できなかった")
+        );
+        assert_eq!(serde_json::to_string(&restored).unwrap(), saved);
+
+        let other = DurableRuntimeFeedback::new(
+            DurableFeedbackSeverity::Warning,
+            DurableFeedbackCategory::Context,
+            "other context warning",
+        );
+        assert_eq!(other.display_message(), other.public_message);
     }
 
     #[test]

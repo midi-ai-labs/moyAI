@@ -125,6 +125,7 @@ let opacityPreviewFrame: number | null = null;
 let opacityPreviewInFlight = false;
 let delegatedEventsInstalled = false;
 const wiredOpacityInputs = new WeakSet<HTMLInputElement>();
+const wiredLocalSearchInputs = new WeakSet<HTMLInputElement>();
 interface CapturedSideChatPointerQuote {
   ownerSessionId: string;
   quote: SideChatPendingQuote;
@@ -543,24 +544,19 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     context.uiState.drafts.workspaceRevision += 1;
   });
   const localSearch = document.querySelector<HTMLInputElement>("#local-search");
-  const updateLocalSearch = (input: HTMLInputElement, commit: boolean) => {
-    const text = input.value;
-    context.uiState.drafts.localSearch = text;
-    if (commit) scheduleTextMutation(
-      "local-search",
-      "set_local_search",
-      { text, expectedTarget: draftMutationTarget(state) },
-      context,
-      localSearchOwner(state),
-      true,
-    );
-  };
-  localSearch?.addEventListener("input", (event) => {
-    updateLocalSearch(event.currentTarget as HTMLInputElement, !(event as InputEvent).isComposing);
-  });
-  localSearch?.addEventListener("compositionend", (event) => {
-    updateLocalSearch(event.currentTarget as HTMLInputElement, true);
-  });
+  if (localSearch && !wiredLocalSearchInputs.has(localSearch)) {
+    wiredLocalSearchInputs.add(localSearch);
+    const updateLocalSearch = (commit: boolean) => {
+      const text = localSearch.value;
+      context.uiState.drafts.localSearch = text;
+      if (commit) scheduleTextMutation(
+        "local-search", "set_local_search", { text, expectedTarget: draftMutationTarget(state) },
+        context, localSearchOwner(state), true,
+      );
+    };
+    localSearch.addEventListener("input", (event) => updateLocalSearch(!(event as InputEvent).isComposing));
+    localSearch.addEventListener("compositionend", () => updateLocalSearch(true));
+  }
   const sessionSearch = document.querySelector<HTMLInputElement>("#session-search");
   const updateSessionSearch = (input: HTMLInputElement, commit: boolean) => {
     const text = input.value;
