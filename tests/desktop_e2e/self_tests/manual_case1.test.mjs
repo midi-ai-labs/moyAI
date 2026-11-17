@@ -57,6 +57,7 @@ test("Case1 options require explicit endpoint/model/Python identity and carry on
 test("Case1 uses the current profile and local context budget with Default permissions and no generation overrides", () => {
   const config = manualCase1FixtureConfig(normalizeManualCase1Options(RAW));
   assert.match(config, /provider_profile = "openai_compatible"/);
+  assert.doesNotMatch(config, /^api_key_env\s*=/m);
   assert.match(config, /context_window = 131072/);
   assert.match(config, /access_mode = "default"/);
   assert.doesNotMatch(config, /temperature|top_p|top_k|max_tokens|thinking|reasoning|extra_body|request_timeout/);

@@ -91,7 +91,7 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 ### GUI を手動で操作するセッション
 
-`manual_session.mjs` は、隔離 Desktop A/B、一つの Hub、固定応答 provider の準備と終了だけを共通 owner へ接続する。Hub の管理画面を開き、端末参加、PC・プロジェクト設定、実行許可、仕事の投入・承認を GUI から手動で行う。管理画面はHubの起動操作で得た一度だけ使えるアクセス情報で開き、プロジェクトを API で事前作成しない。A/B のローカルモデル設定だけは fixture として用意する。
+`manual_session.mjs` は、隔離したDesktop A/Bと一つのHubを起動する。既定では固定応答providerを用い、`--config-file` で開発用設定を指定すると実LLMを使う。Hub の管理画面を開き、端末参加、PC・プロジェクト設定、実行許可、仕事の投入・承認を GUI から手動で行う。管理画面はHubの起動操作で得た一度だけ使えるアクセス情報で開き、プロジェクトを API で事前作成しない。A/B のローカルモデル設定だけは fixture として用意する。
 
 `moyAI/` で次を実行する。五つのパスはすべて絶対パスで指定し、stdin を保持する。Desktop は `desktop-e2e` 専用 build、`runner-test-binary` は同じ source の libtest を使う。この入口は常に fixture 隔離で起動する。
 

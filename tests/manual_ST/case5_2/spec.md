@@ -63,6 +63,8 @@ current directory の `task.md` に従って作業してください。
 
 単独実行ではStage 3 terminal completion後、suiteでは通常ケース完了後に、選択した復元試験を行う。suiteで他ケースへ移動した場合は本ケースの設定・workspace・元の会話へ戻り、保存したStage 3のownerと履歴を照合する。その後、共通actual E2E hostのgraceful exit contractでDesktop appを通常終了し、exact PID / start time / executableとprofile WebViewのzeroを確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使って共通hostがfresh process generationとして再起動し、同じProject Chat session、latest turn、admission revision、canonical turn totalを再開する。再起動直後の表示はStage 3と同じ上限のbounded latest turn pageでよく、offsetが正ならGUIの「以前の履歴」をtrusted操作でoffset 0までprependし、User本文、canonical Errorの順序・本文・利用可能なidentityのexact一致とterminal Assistantのcanonical completionを確認する。runtime-only System notice、work summaryのlive表現、tool detail、file-change rowをraw配列の同一性判定へ混ぜないが、durable Error rowは除外しない。新しいsessionを作らず、履歴を手動要約または再投入しない。
 
+再起動は作業フォルダーや会話を引数で指定せず、Desktopに保存した直前の選択から行う。同じプロジェクト内で別の作業フォルダーの会話を後に実行した場合も、終了直前に画面で選択したStage 3の会話に戻ることを確認する。
+
 ### Stage 4: regression repair
 
 `stage4-regression.txt` をreopenした同じsessionへ送る。完了後、external backend suiteとworkspace外のhidden evaluatorを実行する。

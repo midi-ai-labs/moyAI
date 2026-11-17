@@ -25,6 +25,7 @@ import {
 import {
   assertCase52PhysicalFileIdentity,
   case52EvaluatorWorkspaceDiff,
+  case52EvidenceMatrixRows,
   case52EvidenceOptions,
   case52ExpectedMainGlobalSave,
   case52ExpectedSideGlobalSave,
@@ -2120,6 +2121,26 @@ test("restart decision exposes complete terminal and continuity reasons", () => 
   );
   assert.equal(failed.decision, "fail");
   assert.equal(failed.terminal_failures.includes("run-not-completed"), true);
+});
+
+test("Stage 1 counts the facts in each evidence table without counting repeated headings or examples", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "moyai-case5-2-matrix-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "evidence_matrix.md");
+  const groups = ["backend", "frontend", "examples", "tests", "data"];
+  const tables = groups.map((group, index) => [
+    `## ${group}`, "", "| Fact | Source |", "| :--- | ---: |",
+    ...Array.from({ length: index === 4 ? 4 : 5 }, (_, row) => `| ${group} ${row + 1} | ${group}/ |`),
+  ].join("\r\n"));
+  const fencedExample = ["~~~~markdown", "| Fact | Source |", "| --- | --- |", "| Example | Example |", "~~~~"].join("\r\n");
+  const markdown = [fencedExample, ...tables].join("\r\n\r\n");
+  assert.equal(await case52EvidenceMatrixRows(root), 0);
+  await writeFile(file, markdown);
+  const count = await case52EvidenceMatrixRows(root);
+  assert.equal(count, 24);
+  assert.ok(case52Stage1ManifestFailures(stage1Manifest({ evidence_matrix_rows: count })).includes("stage1-evidence-matrix-too-small"));
+  await writeFile(file, `${markdown}\r\n\r\nFact | Source\r\n:--- | ---:\r\n- last fact | data/`);
+  assert.equal(await case52EvidenceMatrixRows(root), 25);
 });
 
 test("Stage 1 permits exactly four root documents and at least 25 evidence rows", () => {

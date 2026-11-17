@@ -1663,11 +1663,34 @@ async function documentRows(workspace) {
   }));
 }
 
-async function evidenceMatrixRows(workspace) {
+export async function case52EvidenceMatrixRows(workspace) {
   try {
     const content = await readFile(path.join(workspace, "evidence_matrix.md"), "utf8");
-    const rows = content.split(/\r?\n/).filter((line) => /^\s*\|/.test(line) && !/^\s*\|\s*[-:]/.test(line));
-    return Math.max(0, rows.length - 1);
+    const lines = content.split(/\r\n?|\n/);
+    const delimiter = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
+    let fence = "";
+    let inTable = false;
+    let rows = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (marker) {
+        if (!fence) fence = marker[1];
+        else if (marker[1].startsWith(fence) && !marker[2].trim()) fence = "";
+        inTable = false;
+      } else if (!fence && line.includes("|")) {
+        const next = lines[i + 1] ?? "";
+        if (next.includes("|") && delimiter.test(next)) {
+          inTable = true;
+          i++;
+        } else if (inTable) {
+          rows++;
+        }
+      } else {
+        inTable = false;
+      }
+    }
+    return rows;
   } catch (error) {
     if (error?.code === "ENOENT") return 0;
     throw error;
@@ -1685,7 +1708,7 @@ async function captureWorkspaceManifest({ context, baseline, stage }) {
     files,
     diff: manifestDiff(baseline, files),
     documents: await documentRows(context.paths.workspace),
-    evidence_matrix_rows: await evidenceMatrixRows(context.paths.workspace),
+    evidence_matrix_rows: await case52EvidenceMatrixRows(context.paths.workspace),
   };
 }
 
@@ -4629,6 +4652,9 @@ export function createCase52Scenario(rawOptions = {}) {
     productOracle: "pass",
     manualGate: "pending",
     databaseRequired: true,
+    get startupTarget() {
+      return state.restorationStages.restart === "running" ? "preferences" : "workspace";
+    },
     requestGracefulExit,
     environment: {},
     restorationCheckpoint() {

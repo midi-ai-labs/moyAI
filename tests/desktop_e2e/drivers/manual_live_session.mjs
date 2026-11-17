@@ -87,7 +87,8 @@ export function normalizeManualLiveOptions(raw) {
 export function manualLiveFixtureConfig(options) {
   const roles = ["side", "approve"].filter(role => options[`${role}Model`] !== undefined).map(role =>
     `[${role === "side" ? "side_chat" : role}]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options[`${role}Model`])}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options[`${role}ApiKeyEnv`])}\n\n`).join("");
-  return `[model]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.model)}\nprovider_profile = "openai_compatible"\napi_key_env = ${JSON.stringify(options.apiKeyEnv)}\ncontext_window = ${options.contextWindow ?? 131072}\n\n${roles}[permissions]\naccess_mode = ${JSON.stringify(options.accessMode ?? "default")}\n\n[multi_agent]\nenabled = false\n\n[docling]\nenabled = false\n\n[mcp]\nenabled = false\n`;
+  const mainKey = options.apiKeyEnv ? `api_key_env = ${JSON.stringify(options.apiKeyEnv)}\n` : "";
+  return `[model]\nbase_url = ${JSON.stringify(options.providerBaseUrl)}\nmodel = ${JSON.stringify(options.model)}\nprovider_profile = "openai_compatible"\n${mainKey}context_window = ${options.contextWindow ?? 131072}\n\n${roles}[permissions]\naccess_mode = ${JSON.stringify(options.accessMode ?? "default")}\n\n[multi_agent]\nenabled = false\n\n[docling]\nenabled = false\n\n[mcp]\nenabled = false\n`;
 }
 
 function manualLiveConfiguredFields(options) {
@@ -490,7 +491,7 @@ export class ManualLiveSession {
           });
           const item = { ...request, request_sha256: requestSha256, evidence, pending_evidence: pendingEvidence, screenshot };
           approvals.push(item);
-          await sink.record("case1-approval-awaiting-review", item, { phase: "executing", owner: OWNER });
+          await sink.record(`${prefix}-approval-awaiting-review`, item, { phase: "executing", owner: OWNER });
           const reviewed = options.approvalMode === "operator"
             ? await this.operatorReview(request, { timeoutMs: this.observationBudget.assertRemaining(`${prefix} operator review`, 5 * 60 * 1000),
               evidence: { request: evidence, pending: pendingEvidence, screenshot } })
@@ -512,7 +513,7 @@ export class ManualLiveSession {
             if (call.command !== "cancel_run" || JSON.stringify(call.args?.expectedTarget) !== JSON.stringify(request.stop_target)) throw new DesktopE2eError("harness", "case1-review-stop-owner", "GUI Stop did not address the reviewed runtime owner", { request, call });
           }
           item.commands_after_decision = commandsAfter.value;
-          await sink.record("case1-approval-decision", item, { phase: "executing", owner: OWNER });
+          await sink.record(`${prefix}-approval-decision`, item, { phase: "executing", owner: OWNER });
           if (decision === "approve") { observed = await waitTerminal(request.confirmation_id); continue; }
           approval = true;
           reviewStopReason = this.observationBudget.expired ? "observation-timeout" : reviewed.status === "decided" ? `operator-${decision}` : reviewed.reason;

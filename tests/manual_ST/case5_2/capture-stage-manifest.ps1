@@ -72,14 +72,31 @@ $documents = @(
 }
 
 $evidencePath = Join-Path $workspaceRoot "evidence_matrix.md"
-$evidenceRows = if (Test-Path -LiteralPath $evidencePath -PathType Leaf) {
-    @(
-        Get-Content -LiteralPath $evidencePath -Encoding UTF8 |
-            Where-Object { $_ -match '^\s*\|' -and $_ -notmatch '^\s*\|\s*[-:]' } |
-            Select-Object -Skip 1
-    ).Count
-} else {
-    0
+$evidenceRows = 0
+if (Test-Path -LiteralPath $evidencePath -PathType Leaf) {
+    $lines = @(Get-Content -LiteralPath $evidencePath -Encoding UTF8)
+    $delimiter = '^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$'
+    $fence = ''
+    $inTable = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match '^ {0,3}(`{3,}|~{3,})(.*)$') {
+            $marker = $Matches[1]
+            if (-not $fence) { $fence = $marker }
+            elseif ($marker.StartsWith($fence) -and -not $Matches[2].Trim()) { $fence = '' }
+            $inTable = $false
+        } elseif (-not $fence -and $line.Contains('|')) {
+            $next = if ($i + 1 -lt $lines.Count) { $lines[$i + 1] } else { '' }
+            if ($next -and $next.Contains('|') -and $next -match $delimiter) {
+                $inTable = $true
+                $i++
+            } elseif ($inTable) {
+                $evidenceRows++
+            }
+        } else {
+            $inTable = $false
+        }
+    }
 }
 
 $manifest = [ordered]@{
