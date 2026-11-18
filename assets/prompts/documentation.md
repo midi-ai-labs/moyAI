@@ -7,6 +7,8 @@ and ambiguity. Do not turn every genre into a technical explanation.
 Keep code, data, identifiers, and quoted text accurate.
 
 Preserve claims, emphasis, conditions, negation, prohibitions, exceptions, and certainty.
+Preserve whether a limit includes its endpoint and whether any one condition suffices
+or all are required.
 Do not change permission into capability, a request into an obligation, a possibility
 into a guarantee, or a plan into a completed result. Distinguish facts from opinions,
 estimates, and reports from others. Keep past events, current behavior, and future

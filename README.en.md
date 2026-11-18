@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="README.md">日本語</a> ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.0.8">Download v3.0.8</a> ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v3.1.0">Download v3.1.0</a> ·
   <a href="https://github.com/midi-ai-labs/moyAI-Hub">moyAI Hub</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#license">License</a>
@@ -22,7 +22,7 @@
 
 moyAI is a Rust coding agent with Desktop, CLI and TUI interfaces. It connects to an external OpenAI-compatible LLM server, reads projects, edits files, runs commands and records conversations and results. It does not start, stop or download the LLM server or its models.
 
-**Desktop 3.0.8 fixes Windows reinstallation and cleanup.** Setup repairs recognized orphaned service registrations and incomplete installations. Explicit data cleanup can remove obsolete shared-execution registrations after verifying that their owners have stopped. Hub is distributed separately and is needed only on the Hub host. Installed WebView2 and x64 VC++ runtimes are required. See the [3.0.8 release notes](docs/release/v3.0.8.md).
+**moyAI Desktop v3.1.0 LYNX** improves conversation restoration, text selection in streaming answers, and Markdown table rendering. When a Hub administrator revokes a PC's access, Desktop shows how to request access again. The Windows x64 package requires WebView2 and the x64 Visual C++ runtime. See the [3.1.0 release notes](docs/release/v3.1.0.md).
 
 ## Desktop and Hub
 
@@ -49,7 +49,7 @@ Security review uses original guidance informed by OWASP, a built-in Skill, and 
 
 ## Quick Start
 
-For the 3.0.8 Windows package:
+For the 3.1.0 Windows package:
 
 1. Extract the whole ZIP and run `Setup-moyAI.cmd` normally. Approve the separate administrator prompt to install the executable files under Program Files. Setup opens **moyAI** as the original standard user and checks that its initial screen appears. Continue in the opened window; use the Start menu for later launches. If startup fails or remains unconfirmed after 60 seconds, Setup shows the result and diagnostic log location and leaves the app running if it has not exited. Follow the [Windows setup guide](docs/user/windows-setup.md).
 2. Choose your role in the first-use screen:
@@ -108,7 +108,7 @@ moyai desktop --dir /path/to/workspace
 moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
 ```
 
-The 3.0.8 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
+The 3.1.0 package keeps binaries in `app/bin/`. CLI, TUI and Desktop share the Rust core and user configuration. Use `moyai --help` and command-specific help for the current options.
 
 On Windows, Run and TUI use the installed sandbox helper without startup UAC. Help, version and metadata-only commands do not start the helper.
 
