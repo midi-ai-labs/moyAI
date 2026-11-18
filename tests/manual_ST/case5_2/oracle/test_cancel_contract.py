@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import threading
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -252,3 +253,136 @@ def test_in_flight_generation_cannot_commit_after_cancel(tmp_path: Path) -> None
     state = _state_json(settings, run_id)
     assert state["status"] == "cancelled"
     assert datetime.fromisoformat(str(state["finished_at"])) == finished_at
+
+
+@pytest.mark.parametrize("publication", ["event", "state"])
+def test_cancel_serializes_with_worker_publication(tmp_path: Path, publication: str) -> None:
+    settings, container, client = _new_app(tmp_path)
+    service = container.simulation_service
+    entered = threading.Event()
+    release = threading.Event()
+    cancel_started = threading.Event()
+    cancel_returned = threading.Event()
+    worker_finished = threading.Event()
+    response: dict[str, object] = {}
+    errors: list[str] = []
+    states_after_cancel: list[dict[str, object]] = []
+    generation_count = 0
+    original_execute = service._execute
+    original_generate = service._generate_event
+    original_append = service.artifact_store.append_event
+    original_write = service.artifact_store.write_run_state
+    original_cancel = service.cancel
+
+    def pause_publication() -> None:
+        if not entered.is_set():
+            entered.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("oracle did not release worker publication")
+
+    def observed_execute(*args, **kwargs):
+        try:
+            return original_execute(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    def observed_generate(*args, **kwargs):
+        nonlocal generation_count
+        generation_count += 1
+        # Keep the run active while a serialized cancel waits for publication.
+        # Generation itself must remain cancellable without waiting for the LLM.
+        wait_for_cancel = publication == "state" or generation_count > 1
+        if wait_for_cancel and not cancel_returned.wait(timeout=10):
+            raise RuntimeError("cancel did not return while generation was held")
+        return original_generate(*args, **kwargs)
+
+    def observed_append(event):
+        if publication == "event":
+            pause_publication()
+        return original_append(event)
+
+    def observed_write(run):
+        if publication == "state" and run.status is RunStatus.RUNNING:
+            pause_publication()
+        original_write(run)
+        if cancel_returned.is_set():
+            states_after_cancel.append(_state_json(settings, run.run_id))
+
+    def observed_cancel(run_id):
+        cancel_started.set()
+        return original_cancel(run_id)
+
+    def snapshot(run_id):
+        run = service.get(run_id)
+        assert run is not None
+        return {
+            "status": run.status,
+            "finished_at": run.finished_at,
+            "completed_rounds": run.completed_rounds,
+            "events": service.list_events(run_id),
+            "frames": service.list_replay_frames(run_id),
+            "propagation": service.list_propagation_traces(run_id),
+            "node_states": service.artifact_store.list_all_node_state_histories(run_id),
+            "state_file": _state_json(settings, run_id),
+        }
+
+    def request_cancel(run_id):
+        try:
+            result = client.post(f"/api/v1/simulations/{run_id}/cancel")
+            response.update(status=result.status_code, body=result.json(), snapshot=snapshot(run_id))
+        except Exception:
+            errors.append(traceback.format_exc())
+        finally:
+            cancel_returned.set()
+
+    service._execute = observed_execute
+    service._generate_event = observed_generate
+    service.artifact_store.append_event = observed_append
+    service.artifact_store.write_run_state = observed_write
+    service.cancel = observed_cancel
+    with client:
+        scenario = client.post(
+            "/api/v1/scenarios",
+            json={"title": "publication race", "objective": "accepted cancel", "context": "fixture"},
+        )
+        assert scenario.status_code == 200
+        started = client.post(
+            "/api/v1/simulations",
+            json={"scenario_id": scenario.json()["scenario_id"], "total_rounds": 2, "tick_minutes": 15},
+        )
+        assert started.status_code == 200
+        run_id = started.json()["run_id"]
+        cancel_thread = threading.Thread(target=request_cancel, args=(run_id,))
+        worker_settled = False
+        try:
+            assert entered.wait(timeout=10), "worker did not reach publication"
+            cancel_thread.start()
+            assert cancel_started.wait(timeout=5), "cancel did not enter the service"
+            # A correct implementation can wait on the publisher. Elapsed time
+            # is only used to release it; it is never the failure assertion.
+            cancel_returned.wait(timeout=1)
+            release.set()
+            cancel_thread.join(timeout=15)
+            worker_settled = worker_finished.wait(timeout=10)
+        finally:
+            release.set()
+            if cancel_thread.ident is not None:
+                cancel_thread.join(timeout=15)
+            cancel_returned.set()
+            service.runner_registry.stop(run_id, timeout=15)
+
+        assert not cancel_thread.is_alive()
+        assert not errors, "\n".join(errors)
+        assert worker_settled, "worker did not settle before test cleanup"
+        assert response["status"] == 200
+        assert response["body"] == {"cancelled": True}
+        at_cancel = response["snapshot"]
+        assert at_cancel["status"] is RunStatus.CANCELLED
+        finished_at = at_cancel["finished_at"]
+        assert finished_at is not None
+        assert at_cancel["state_file"]["status"] == "cancelled"
+        assert datetime.fromisoformat(str(at_cancel["state_file"]["finished_at"])) == finished_at
+        for state in states_after_cancel:
+            assert state["status"] == "cancelled"
+            assert datetime.fromisoformat(str(state["finished_at"])) == finished_at
+        assert snapshot(run_id) == at_cancel

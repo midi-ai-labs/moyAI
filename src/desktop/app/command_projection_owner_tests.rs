@@ -6326,6 +6326,70 @@ async fn runtime_listener_generation_rejects_target_aba() {
 }
 
 #[tokio::test]
+async fn a_previous_worker_cannot_append_text_or_finish_the_current_session() {
+    let (_temp, _root, mut controller) = empty_access_test_controller().await;
+    let previous_generation = 1;
+    let current_generation = 2;
+    let current_session = SessionId::new();
+    controller.state.app_state.current_session_id = Some(current_session);
+    controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+    controller.state.begin_agent_run();
+    controller
+        .run_lifecycle
+        .begin(current_generation, RunControl::new());
+
+    let previous_response = crate::protocol::ModelResponseId::new();
+    let current_response = crate::protocol::ModelResponseId::new();
+    for (generation, response_id, delta) in [
+        (previous_generation, previous_response, "previous response"),
+        (current_generation, current_response, "current response"),
+    ] {
+        controller
+            .runtime_tx
+            .try_send(RuntimeMessage::RunEvent {
+                run_generation: generation,
+                event: RunEvent::TextDelta {
+                    response_id,
+                    delta: delta.to_string(),
+                },
+            })
+            .expect("queue worker text");
+    }
+    controller
+        .control_tx
+        .send(RuntimeMessage::Finished {
+            run_generation: previous_generation,
+            result: Ok(RunSummary::from_terminal(
+                SessionId::new(),
+                TurnId::new(),
+                crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                        cause: crate::protocol::TurnInterruptionCause::UserStop,
+                    },
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                },
+            )),
+        })
+        .expect("queue previous worker finish");
+    controller.drain_runtime_messages();
+
+    let state = &controller.state.app_state;
+    assert_eq!(state.current_session_id, Some(current_session));
+    assert_eq!(state.run_status, crate::tui::state::RunStatus::Running);
+    assert_eq!(controller.root_run_generation(), Some(current_generation));
+    let replies: Vec<_> = state
+        .transcript_entries
+        .iter()
+        .filter_map(|entry| Some((entry.response_id?, entry.body.as_str())))
+        .collect();
+    assert_eq!(replies, [(current_response, "current response")]);
+}
+
+#[tokio::test]
 async fn worker_finished_overtakes_a_stale_running_refresh_and_leaves_no_listener() {
     let (_temp, root, mut controller) = empty_access_test_controller().await;
     let run_generation = 28;
