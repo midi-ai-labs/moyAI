@@ -43,7 +43,9 @@ export function createProjectFolderRecoveryScenario(options = {}) {
 }
 export function createSharedWorkContinuationScenario(options = {}, folderRecovery = false) {
   const ID = folderRecovery ? "settings.project-folder-recovery" : "settings.shared-work-continuation", OWNER = `scenario:${ID}`;
-  const { runnerBinary, runnerTestBinary, ...hubOptions } = options;
+  const { runnerBinary, runnerTestBinary, recoveryAudit, ...hubOptions } = options;
+  if (recoveryAudit !== undefined && (folderRecovery || !["crash", "revoke"].includes(recoveryAudit)))
+    throw new TypeError("shared-work-continuation recoveryAudit must be crash or revoke");
   const settings = normalizeHubBrowserOptions(hubOptions);
   const state = { resource: null, provider: null, runner: null, input: null, close: null, environment: {},
     consent: false, nativeOwner: null, nativeCandidate: null, nativeBefore: null, importDispatched: false };
@@ -224,6 +226,18 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
           p => p.selected_conversation_id === conversationId && p.selected_job_id === firstJobId
             && p.detail?.id === firstJobId && p.detail.state === "succeeded" && p.conversation_history?.conversation_id === conversationId);
         await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-sidebar-selected", owner: OWNER });
+        if (recoveryAudit === "crash") {
+          const recovery = await state.resource.restartHostingWithBackup();
+          const active = await wait("The original PC reconnects to the restarted Hub", () => invokeDesktopCommand(cdp, "device_network_projection"),
+            p => p.enrollment === "active" && p.device_id === enrolled.network.device_id);
+          const identity = (await state.runner.command(["identity"])).identity;
+          if (identity.runner_id !== runner.identity.runner_id || identity.process_id !== runner.identity.process_id)
+            throw fail("Hub restart replaced the live Runner", { identity });
+          await wait("The same selected conversation and first turn remain readable", shared,
+            p => !p.error && p.detail?.id === firstJobId && p.selected_conversation_id === conversationId);
+          await sink.record("recovery-hub-restarted", { ...recovery, deviceId: active.device_id, runnerPid: identity.process_id,
+            firstJobId, conversationId }, { phase: "executing", owner: OWNER });
+        }
         const followupPrompt = "desktop-conversation-followup: 同じ会話で続けてください。";
         await fill(byId("shared-followup", "TEXTAREA"), followupPrompt);
         await state.input.keyDown("Control");
@@ -248,6 +262,52 @@ export function createSharedWorkContinuationScenario(options = {}, folderRecover
         await wait("This PC shows the received work while it is running", () => cdp.evaluate(`Boolean(document.querySelector('section.receiver-activity'))`),
           visible => visible === true, 15000);
         await captureScenarioScreenshot({ cdp, sink, name: "shared-conversation-running-stop", owner: OWNER });
+        if (recoveryAudit) {
+          const { exerciseRunnerRecovery } = await import("./shared_work_recovery.mjs");
+          const result = await exerciseRunnerRecovery({ mode: recoveryAudit, state, page, cdp, sink, shared, click, stoppedJobId,
+            conversationId, firstJobId, secondJobId: second.detail.id, deviceId: enrolled.network.device_id });
+          if (recoveryAudit === "crash") {
+            const restored = await state.resource.restoreWithStoppedRunner(state.runner);
+            await page.locator('nav a[href="#clients"]').click();
+            const deviceRow = page.locator(`[data-id="device:${enrolled.network.device_id}"]`);
+            await deviceRow.getByRole("button", { name: /の再許可$/ }).waitFor();
+            await state.resource.screenshot("restored-device-paused");
+            const requestsAtRestore = state.provider.requests.length;
+            await deviceRow.getByRole("button", { name: /の再許可$/ }).click();
+            await deviceRow.getByRole("button", { name: /の停止$/ }).waitFor();
+            await settleInput();
+            const next = await host.restart({ context, scenario: this, sink, driver: cdp,
+              beforeRelaunch: async () => {
+                if (!(await state.runner.quiesce()).pass) throw fail("The old Runner is still active");
+                state.runner = createManagedExecutionRunner({ context, sink, runnerBinary, runnerTestBinary });
+              } });
+            cdp = next.driver; runtime = next.runtime;
+            await cdp.call("Runtime.enable"); await cdp.call("DOM.enable");
+            state.input = new WebviewInput(cdp, { probeId: ID }); await state.input.installProbe();
+            await wait("A fresh Runner connects using the original local data", execution, p => p.can_pause, 60_000);
+            const rebound = await state.runner.capture(runtime.desktop_process_id);
+            await wait("The restored project is available after explicit device readmission", shared,
+              p => p.projects.some(row => row.id === projectId && row.can_submit), 60_000);
+            const desktop = await invokeDesktopCommand(cdp, "desktop_state");
+            if (desktop.overlay === "hub") await click(hubSettingsCloseTarget);
+            await click({ selector: `.sidebar button[data-action="open-hub-project"][data-value=${JSON.stringify(projectId)}]`,
+              identity: { tag: "BUTTON", action: "open-hub-project" } });
+            await click({ selector: `.sidebar button[data-action="shared-select-conversation"][data-value=${JSON.stringify(conversationId)}]`,
+              identity: { tag: "BUTTON", action: "shared-select-conversation" } });
+            const retained = await wait("The restored history ends at the backup's successful first job", shared,
+              p => p.detail?.id === firstJobId && p.detail.state === "succeeded" && p.selected_conversation_id === conversationId);
+            await wait("Only the backed-up answer appears in the restored chat", () => cdp.evaluate(
+              `document.querySelector('[data-shared-region="history-container"]')?.innerText`),
+              text => text?.includes("最初の依頼をこのプロジェクトで実行しました。") && !text.includes("desktop-conversation-followup"));
+            if (rebound.identity.runner_id === runner.identity.runner_id || state.provider.requests.length !== requestsAtRestore)
+              throw fail("Restoration replayed work or reused the old Runner");
+            await captureScenarioScreenshot({ cdp, sink, name: "restored-original-history", owner: OWNER });
+            await sink.record("recovery-backup-restored", { ...restored, retainedJobId: retained.detail.id, conversationId,
+              newRunner: rebound.identity.runner_id, previousRunner: runner.identity.runner_id, providerCalls: requestsAtRestore },
+              { phase: "executing", owner: OWNER });
+          }
+          return result;
+        }
         await click(sharedActionTarget("cancel", stoppedJobId));
         const stopped = await wait("Stop has settled and the latest message can be edited", shared,
           p => p.detail?.id === stoppedJobId && p.detail.state === "cancelled" && p.detail.can_revise, 60000);

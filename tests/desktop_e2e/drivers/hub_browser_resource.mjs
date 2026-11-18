@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
-import { mkdir } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdir, realpath, rename } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -72,7 +74,41 @@ export async function startHubBrowserResource({ context, sink, phase = "prepared
         return hub.command(name);
       },
     });
-    return Object.freeze({ hub: readOnlyHub, page, provider, downloads, close, administrator,
+    const runHub = (...args) => promisify(execFile)(hub.binary, ["--data-dir", hub.dataDirectory, ...args], { windowsHide: true });
+    const backup = path.join(root, "offline-backup");
+    async function restartHosting() {
+      const previousPid = hub.pid;
+      await hub.restart();
+      await runHub("--launch", "--no-browser");
+      const network = await hub.observeNetwork();
+      if (hub.pid === previousPid || !network.server.running || !network.server.gateway_bind)
+        throw new Error("The new Hub did not resume its saved listeners");
+      // Acquire a fresh management ticket without putting it in the evidence.
+      await page.goto((await hub.command("hub_web_open")).url);
+      await page.locator("#management-status").filter({ hasText: "Hub本体に接続中" }).waitFor();
+      return { previousPid, resumedPid: hub.pid, backup, hubId: network.hub_id };
+    }
+    async function stopHosting() {
+      if (!(await hub.close()).pass) throw new Error("The original Hub did not close all listeners");
+    }
+    async function restartHostingWithBackup() {
+      await stopHosting();
+      await runHub("--backup-dir", backup);
+      return restartHosting();
+    }
+    async function restoreWithStoppedRunner(runner) {
+      if (!(await runner.verifyExited()).pass) throw new Error("Restoring requires the captured Runner to have exited");
+      await stopHosting();
+      // Keep the later Hub database intact and retain the fixture's original listener addresses.
+      const parent = await realpath(root);
+      const source = await realpath(hub.dataDirectory);
+      if (source !== path.join(parent, "data") || await realpath(backup) !== path.join(parent, "offline-backup"))
+        throw new Error("Restore paths must belong to the current Hub fixture");
+      await rename(source, path.join(parent, "before-restore"));
+      await runHub("--restore-from", backup, "--acknowledge-runners-stopped");
+      return restartHosting();
+    }
+    return Object.freeze({ hub: readOnlyHub, page, provider, downloads, close, administrator, restartHostingWithBackup, restoreWithStoppedRunner,
       pageErrors: () => [...pageErrors],
       screenshot: async name => {
         evidencePhase = "executing";

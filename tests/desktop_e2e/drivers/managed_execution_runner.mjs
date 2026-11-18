@@ -98,6 +98,12 @@ export function createManagedExecutionRunner({ context, sink, runnerBinary, runn
     command,
     capture,
     verifyExited,
+    async interruptCapturedProcess() {
+      if (!identity || !ownerPath) throw new Error("Capture the test Runner before simulating its crash");
+      const stopped = await processCommand("StopOwner", { ExecutionRoot: context.root, OwnerPath: ownerPath });
+      if (!stopped.stopped || !(await verifyExited()).pass) throw new Error("The captured Runner did not exit");
+      return identity.process_id;
+    },
     get identity() { return identity === null ? null : structuredClone(identity); },
     quiesce() { settlement ??= settle(); return settlement; },
   });

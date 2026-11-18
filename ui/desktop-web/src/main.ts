@@ -44,6 +44,7 @@ import {
   beginAgentExecutionPrependContinuation,
   agentExecutionPrependFocusCandidates,
   reconcileAgentExecutionPrependContinuation,
+  type AgentExecutionPrependDecision,
   restoreAgentExecutionPrependViewport,
 } from "./agent_execution_prepend_continuation";
 import {
@@ -61,6 +62,7 @@ import {
   syncResolvedInactiveThreadViewport,
   ThreadTailFollowAffinity,
   type PendingHistoryPrepend,
+  type HistoryPrependTransition,
   revealHistoryAnchor,
 } from "./history_navigation";
 import { commandConflictState, commandInternalState } from "./command_error";
@@ -1476,58 +1478,9 @@ function renderCommitted(
   );
   const focusSnapshotReserved = focusSnapshotIntent !== null;
   if (focusSnapshotIntent) postRenderFocusIntents.push(focusSnapshotIntent);
-  const settingsActionFocusContinuation = acceptedSettingsAction ?? uiState.settingsActionFocusContinuation;
-  uiState.settingsActionFocusContinuation = null;
-  const settingsActionModal = settingsActionFocusContinuation
-    && settingsActionFocusStillTargets(settingsActionFocusContinuation, state)
-    ? document.querySelector<HTMLElement>(".settings-modal")
-    : null;
-  if (settingsActionFocusContinuation) {
-    postRenderFocusIntents.push({
-      source: "settings-action",
-      priority: "explicit-transfer",
-      claim: { kind: "unowned" },
-      candidates: settingsActionFocusCandidates(
-        settingsActionFocusContinuation,
-        (selector) => selector === ".settings-modal"
-          ? settingsActionModal
-          : settingsActionModal?.querySelector<HTMLElement>(selector) ?? null,
-      ),
-      isCurrent: () => settingsActionFocusStillTargets(
-        settingsActionFocusContinuation,
-        state,
-      ),
-    });
-  }
-  const titlebarForContinuation = titlebarMenuFocusAction
-    ? document.querySelector<HTMLElement>(".app-titlebar")
-    : null;
-  const titlebarMenuFocusIntent: PostRenderFocusIntent | null =
-    !initiatingTriggerYieldsPromptFocus
-    && titlebarForContinuation
-    && titlebarMenuFocusAction
-      ? {
-          source: "titlebar-menu",
-          priority: "explicit-transfer",
-          claim: { kind: "unowned" },
-          candidates: [{
-            resolve: () => Array.from(
-              titlebarForContinuation.querySelectorAll<HTMLElement>(
-                "button[data-action]:not(:disabled):not([aria-disabled='true'])",
-              ),
-            ).find((candidate) => candidate.dataset.action === titlebarMenuFocusAction) ?? null,
-          }],
-          isCurrent: () => (
-            lastRenderedState === state
-            && state.overlay === "none"
-            && !state.confirmation_visible
-            && uiState.pendingLocalConfirmation === null
-            && uiState.sideChatDeleteConfirmation === null
-          ),
-        }
-      : null;
-  const titlebarMenuFocusReserved = titlebarMenuFocusIntent !== null;
-  if (titlebarMenuFocusIntent) postRenderFocusIntents.push(titlebarMenuFocusIntent);
+  const { settingsActionModal, titlebarMenuFocusReserved } = collectSettingsAndTitlebarFocus(
+    state, acceptedSettingsAction, initiatingTriggerYieldsPromptFocus ? null : titlebarMenuFocusAction, postRenderFocusIntents,
+  );
   wireEvents(state, eventContext);
   // A current Settings continuation is already constrained to the exact modal owner and ends
   // with that dialog as its fallback. Do not let the generic modal-primary intent replace the
@@ -1536,56 +1489,7 @@ function renderCommitted(
     ? null
     : focusOverlayPrimary(state, uiState);
   if (overlayPrimaryFocusIntent) postRenderFocusIntents.push(overlayPrimaryFocusIntent);
-  if (
-    historyPrependTransition.focusContinuation
-    && historyPrependTransition.focusPhase
-  ) {
-    const settledState = state;
-    const settledRenderGeneration = revealGeneration;
-    const continuation = historyPrependTransition.focusContinuation;
-    const phase = historyPrependTransition.focusPhase;
-    postRenderFocusIntents.push({
-      source: "history-prepend",
-      priority: "operation-return",
-      claim: { kind: "unowned" },
-      candidates: historyPrependFocusCandidates(document, continuation),
-      isCurrent: () => (
-        lastRenderedState === settledState
-        && threadEndRevealGeneration === settledRenderGeneration
-        && historyPrependFocusContinuationIsCurrent(
-          continuation,
-          settledState,
-          pendingHistoryPrepend,
-          nextHistoryPrependGeneration - 1,
-          phase,
-        )
-      ),
-    });
-  }
-  if (agentExecutionPrependDecision.restoreFocus) {
-    const settledState = state;
-    const settledRenderGeneration = revealGeneration;
-    const continuation = agentExecutionPrependDecision.restoreFocus;
-    postRenderFocusIntents.push({
-      source: "agent-execution-prepend",
-      priority: "operation-return",
-      claim: { kind: "unowned" },
-      candidates: agentExecutionPrependFocusCandidates(document, continuation),
-      isCurrent: () => {
-      const execution = selectedAgentExecution(uiState, settledState);
-      return (
-        lastRenderedState === settledState
-        && threadEndRevealGeneration === settledRenderGeneration
-        && agentExecutionPrependOwnerMatches(
-          continuation,
-          settledState,
-          uiState.selectedAgentPath,
-          execution,
-        )
-      );
-      },
-    });
-  }
+  collectPrependFocus(state, revealGeneration, historyPrependTransition, agentExecutionPrependDecision, postRenderFocusIntents);
   if (thread && sessionThreadInteractionAfterLayout) {
     restoreSessionThreadInteraction(sessionThreadInteractionAfterLayout, thread);
   } else if (thread && threadScrollTopToRestore !== null) {
@@ -1930,6 +1834,121 @@ function commitRenderedMarkup(input: {
     synchronizeTitlebarMenuState(preservedTitlebar, state.overlay, backgroundInert);
   }
   return { retainedConnectedPrompt };
+}
+
+function collectSettingsAndTitlebarFocus(
+  state: DesktopViewState,
+  acceptedSettingsAction: SettingsActionFocusContinuation | null,
+  titlebarMenuFocusAction: string | null,
+  postRenderFocusIntents: PostRenderFocusIntent[],
+) {
+  const settingsActionFocusContinuation = acceptedSettingsAction ?? uiState.settingsActionFocusContinuation;
+  uiState.settingsActionFocusContinuation = null;
+  const settingsActionModal = settingsActionFocusContinuation
+    && settingsActionFocusStillTargets(settingsActionFocusContinuation, state)
+    ? document.querySelector<HTMLElement>(".settings-modal")
+    : null;
+  if (settingsActionFocusContinuation) {
+    postRenderFocusIntents.push({
+      source: "settings-action",
+      priority: "explicit-transfer",
+      claim: { kind: "unowned" },
+      candidates: settingsActionFocusCandidates(
+        settingsActionFocusContinuation,
+        (selector) => selector === ".settings-modal"
+          ? settingsActionModal
+          : settingsActionModal?.querySelector<HTMLElement>(selector) ?? null,
+      ),
+      isCurrent: () => settingsActionFocusStillTargets(
+        settingsActionFocusContinuation,
+        state,
+      ),
+    });
+  }
+  const titlebarForContinuation = titlebarMenuFocusAction
+    ? document.querySelector<HTMLElement>(".app-titlebar")
+    : null;
+  const titlebarMenuFocusIntent: PostRenderFocusIntent | null =
+    titlebarForContinuation
+    && titlebarMenuFocusAction
+      ? {
+          source: "titlebar-menu",
+          priority: "explicit-transfer",
+          claim: { kind: "unowned" },
+          candidates: [{
+            resolve: () => Array.from(
+              titlebarForContinuation.querySelectorAll<HTMLElement>(
+                "button[data-action]:not(:disabled):not([aria-disabled='true'])",
+              ),
+            ).find((candidate) => candidate.dataset.action === titlebarMenuFocusAction) ?? null,
+          }],
+          isCurrent: () => (
+            lastRenderedState === state
+            && state.overlay === "none"
+            && !state.confirmation_visible
+            && uiState.pendingLocalConfirmation === null
+            && uiState.sideChatDeleteConfirmation === null
+          ),
+        }
+      : null;
+  const titlebarMenuFocusReserved = titlebarMenuFocusIntent !== null;
+  if (titlebarMenuFocusIntent) postRenderFocusIntents.push(titlebarMenuFocusIntent);
+  return { settingsActionModal, titlebarMenuFocusReserved };
+}
+
+function collectPrependFocus(
+  state: DesktopViewState,
+  revealGeneration: number,
+  historyPrependTransition: HistoryPrependTransition,
+  agentExecutionPrependDecision: AgentExecutionPrependDecision,
+  postRenderFocusIntents: PostRenderFocusIntent[],
+): void {
+  if (
+    historyPrependTransition.focusContinuation
+    && historyPrependTransition.focusPhase
+  ) {
+    const continuation = historyPrependTransition.focusContinuation;
+    const phase = historyPrependTransition.focusPhase;
+    postRenderFocusIntents.push({
+      source: "history-prepend",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: historyPrependFocusCandidates(document, continuation),
+      isCurrent: () => (
+        lastRenderedState === state
+        && threadEndRevealGeneration === revealGeneration
+        && historyPrependFocusContinuationIsCurrent(
+          continuation,
+          state,
+          pendingHistoryPrepend,
+          nextHistoryPrependGeneration - 1,
+          phase,
+        )
+      ),
+    });
+  }
+  if (agentExecutionPrependDecision.restoreFocus) {
+    const continuation = agentExecutionPrependDecision.restoreFocus;
+    postRenderFocusIntents.push({
+      source: "agent-execution-prepend",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: agentExecutionPrependFocusCandidates(document, continuation),
+      isCurrent: () => {
+        const execution = selectedAgentExecution(uiState, state);
+        return (
+          lastRenderedState === state
+          && threadEndRevealGeneration === revealGeneration
+          && agentExecutionPrependOwnerMatches(
+            continuation,
+            state,
+            uiState.selectedAgentPath,
+            execution,
+          )
+        );
+      },
+    });
+  }
 }
 
 function schedulePostRenderFocus(

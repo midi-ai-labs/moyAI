@@ -47,6 +47,17 @@ test("pending enrollment and rejected or old Hub responses retain the next actio
   assert.equal(sharedWorkActionEnabled(local, "refresh", ""), true);
 });
 
+test("a stopped or revoked PC sees its actual enrollment and recovery instructions in shared chat", () => {
+  const local = sharedUiFixture();
+  for (const [enrollment, connected, label] of [["stopped", true, "利用停止"], ["revoked", false, "認証が失効"]] as const) {
+    local.projection = sharedProjection({ enrollment, connected, principal: null, projects: [], selected_project_id: null, status: null });
+    const html = renderHubConversation(local, "");
+    assert.match(html, new RegExp(`data-shared-region="connection"[^>]*>[\\s\\S]*?${label}[\\s\\S]*?</section>`));
+    assert.match(html, new RegExp(`このPCの参加 · [^<]*${label}`));
+    assert.doesNotMatch(html, /このPCの参加 · 接続済み|管理者の割り当て待ち/);
+  }
+});
+
 test("management opening is available only for a projected administrator without exposing a ticket", () => {
   const local = sharedUiFixture();
   assert.equal(sharedWorkActionEnabled(local, "open-management", ""), false);

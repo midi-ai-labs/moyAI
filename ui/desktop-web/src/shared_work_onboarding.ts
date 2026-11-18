@@ -4,6 +4,12 @@ import { escapeHtml } from "./utils.ts";
 export const SAMPLE_TITLE = "最初の仕事：件数と合計の確認";
 export const SAMPLE_PROMPT = "添付した moyai-sample-numbers.csv の value 列について、データの件数と合計を計算してください。結果を日本語で回答し、件数と合計を記載した moyai-sample-result.md を作業フォルダーに作成してください。ほかのファイルの変更や外部への接続は不要です。";
 
+export function sharedEnrollmentRestriction(enrollment?: string) {
+  if (enrollment === "revoked") return { label: "このPCの認証が失効しています", detail: "Hub管理者に連絡してください。再参加する場合は、Hubの接続設定をリセットしてから、接続ファイルを読み込んで申請してください。" };
+  if (enrollment === "stopped") return { label: "このPCは利用停止中です", detail: "新しい仕事を依頼するには、Hub管理者に「接続PC」でこのPCを再許可してもらってください。" };
+  return null;
+}
+
 /** Presentation only: every step is derived from the current authenticated snapshot. */
 export function renderSharedWorkOnboarding(local: SharedWorkPresentation): string {
   const p = local.projection;
@@ -11,9 +17,10 @@ export function renderSharedWorkOnboarding(local: SharedWorkPresentation): strin
   const project = p.projects.find(row => row.id === p.selected_project_id);
   const projectHint = "管理者に、このPCをプロジェクトの操作PCへ追加するよう依頼してください。";
   if (p.detail) return "";
+  const restriction = sharedEnrollmentRestriction(p.enrollment);
   const steps = [
-    [p.connected ? "接続済み" : p.enrollment === "pending" ? "管理者の承認待ち" : "未接続", "このPCの参加", p.connected ? "Hubに接続しています。" : "管理者から接続ファイルを受け取り、このPCの申請を承認してもらいます。"],
-    [project ? "参加済み" : p.connected ? "管理者の割り当て待ち" : "PCの参加後に表示", "プロジェクト", project ? `${project.label} · ${project.can_submit ? "依頼できます" : "閲覧できます"}` : p.connected ? projectHint : "PCの参加が承認され、操作PCに指定されると、左側のプロジェクト一覧に表示されます。"],
+    [restriction?.label ?? (p.connected ? "接続済み" : p.enrollment === "pending" ? "管理者の承認待ち" : "未接続"), "このPCの参加", restriction?.detail ?? (p.connected ? "Hubに接続しています。" : "管理者から接続ファイルを受け取り、このPCの申請を承認してもらいます。")],
+    [project ? "参加済み" : p.connected && !restriction ? "管理者の割り当て待ち" : "PCの参加後に表示", "プロジェクト", project ? `${project.label} · ${project.can_submit ? "依頼できます" : "閲覧できます"}` : p.connected && !restriction ? projectHint : "PCの参加が承認され、操作PCに指定されると、左側のプロジェクト一覧に表示されます。"],
   ];
   const available = p.status?.environments.filter(row => row.enabled) ?? [];
   const executionHint = available.length ? "下のチャットから、サンプルの仕事を試せます。"

@@ -16,6 +16,16 @@ function Check([bool]$Condition, [string]$Message) {
 }
 $desktop = Get-MoyaiReleaseComponentFile $packageRoot (Fixture 'app/bin/moyai-desktop.exe') $true
 Check ($desktop.component -ceq 'Desktop' -and $desktop.path -ceq 'app/bin/moyai-desktop.exe') 'Desktop component retains its runtime layout'
+# Exercise the public entry point with the inbox interpreter. An unsupported target
+# must reach validation before any build or output changes are attempted.
+$shellPath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+$packager = Join-Path $PSScriptRoot 'package-release.ps1'
+$stderr = Join-Path $EvidenceRoot 'packager-target.stderr.txt'
+$probe = Start-Process -FilePath $shellPath -WindowStyle Hidden -PassThru -Wait -RedirectStandardError $stderr -ArgumentList @(
+  '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $packager + '"'),
+  '-Version', '0.0.0', '-Target', 'unsupported', '-OutputRoot', ('"' + $packageRoot + '"')
+)
+Check ($probe.ExitCode -ne 0 -and (Select-String -Quiet -LiteralPath $stderr -SimpleMatch 'support only windows-x86_64')) 'Windows PowerShell 5.1 loads the packager and reaches target validation'
 $hub = Get-MoyaiReleaseComponentFile $packageRoot (Fixture 'hub/bin/moyai-hub.exe') $true
 Check ($hub.component -ceq 'Hub' -and $hub.install_path -ceq 'moyai-hub.exe') 'Hub executable installs beside the standalone launchers'
 $hubCleanup = Get-MoyaiReleaseComponentFile $packageRoot (Fixture 'hub/bin/moyai-cleanup-hub.exe') $true

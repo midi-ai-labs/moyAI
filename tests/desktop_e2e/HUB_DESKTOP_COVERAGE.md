@@ -38,7 +38,7 @@
 | I16 / A | 実行同意、Runner開始/停止、Desktop再起動、設定パス表記差 | 同意と準備状態を区別し、正しいRunnerへ接続。Hub認証だけではRunnerを要求しない。同じ設定の`/`・`\`表記差で通信先を分けない | R `settings.device-execution`、実process IPCの表記差・旧版接続・多重起動・移行時の確保。D `hub.model-propagation`で認証・生成前後のRunner不在。配布Runnerの通常起動/自動復帰は別受入 |
 | I17 / A | projectフォルダー選択、未選択/消失/拒否、停止後の変更 | 登録した実フォルダーだけで実行。停止未確認時は再割当不可。復旧後も仕事を重複実行しない | R `settings.project-folder-recovery`。UNC/物理別PC/組織policyは別 |
 | I18 / A | Hub project作成/改名/削除/用途解除→複数Desktopへ反映 | 対象とrevisionを確認。別PC・別projectのdraftを変更しない | B shared-management、D isolationで接続中のproject/利用者改名、別PCのdraft保持、A用途解除後のB継続。実行中の解除を含むR通しは不足 |
-| I19 / A | PC停止/再許可/恒久失効/削除、オフライン/実行中 | 旧証明書と操作を拒否。未確認の仕事枠を再利用せず、別PCを保持 | B device-management＋network/shared_work tests。失効中D/RのUI反映と実効果の同時確認が不足 |
+| I19 / A | PC停止/再許可/恒久失効/削除、オフライン/実行中 | 旧証明書と操作を拒否。未確認の仕事枠を再利用せず、別PCを保持 | B device-management、`recoveryAudit=revoke` で実行中の端末を失効し、Desktopの理由・再参加案内、旧会話と操作権限の消失、同じ依頼の再送0を確認。物理別PCの同時利用は別試験 |
 | I20 / A | 利用者再割当、個人/既存group権限、最後の管理者 | 新しい権限へ古い応答を適用しない。管理者を失う更新を拒否 | B既存権限の保存、D shared-work再割当、identity tests。update/delete全GUIは不足 |
 | I21 / A | 通常のHub chatから新規依頼→同じ会話へ追加 | 同じconversationに別turnを一つ作り、Hub/Runner/画面の状態が一致 | R `settings.shared-work-continuation`。Fの固定応答でありモデル品質の証拠ではない |
 | I22 / A | 依頼元A、実行先B、A/Bが実行候補、操作専用D | 依頼元の操作権限とAIの実行先選択を分け、正しい環境でだけ効果が出る | R `onboarding.win-a-to-win-b` / `project.four-device-acceptance`。同一Windowsの隔離PCでありPではない |
@@ -46,11 +46,11 @@
 | I24 / A | 添付追加/取消、転送、成果の版選択・保存 | 入力/成果のhashと会話への帰属が一致。元ファイル変更で別内容へ入替わらない | R onboarding、Hub data tests。OS保存取消・巨大添付・削除済み内容のGUIは別 |
 | I25 / A | 承認/拒否、期限切れ→再確認、別PCからの操作 | 依頼元の現在の許可に限る。古いapproval IDを使わず、確認前に効果を出さない | D shared-workのRunner応答はF。実Runnerの15分期限と実shell効果までの通しは不足 |
 | I26 / A | 実行中/待機中/子仕事/保持サービスへの停止 | 依頼元と停止範囲が一致。全子process・枠解放を確認して完了表示 | R four-device/native integration、shared_work stop_scope tests。Dからのすべての停止経路は未網羅 |
-| I27 / A | Runner異常終了、Hub再起動、再接続、ACK欠落 | 旧仕事を再実行せず、uncertain状態を成功と扱わない。親子再開と保存済み成果を保持 | `real_hub_two_runners_resume_parent_after_restart_without_repeating_child`はcfg(test)独立host＋配布CLI。GUI再開表示と配布hostの通常起動は別途必要 |
-| I28 / A | 停止未確認の一覧/ページ送り/手動解放、古いgeneration | 現物停止の確認と理由を要求。別世代・別仕事を解放しない | B/F shared-managementで確認なし拒否→停止確認→次の仕事の割当→旧試行の報告拒否。独立Runnerの実停止・再利用は別 |
+| I27 / A | Runner異常終了、Hub再起動、再接続、ACK欠落 | 旧仕事を再実行せず、uncertain状態を成功と扱わない。親子再開と保存済み成果を保持 | 独立2 Runnerの親子再開に加え、`recoveryAudit=crash` でHub再起動後の同一会話への追加依頼と実行中のRunner異常終了を実GUIで確認。配布Runnerによる同じ経路とACK欠落は別試験 |
+| I28 / A | 停止未確認の一覧/ページ送り/手動解放、古いgeneration | 現物停止の確認と理由を要求。別世代・別仕事を解放しない | B/F shared-managementで再割当と旧試行の報告拒否。`recoveryAudit=crash` で独立Runner終了後も停止確認待ち、理由のみでは解放不可、実停止の確認後に対象の試行だけが終了することを確認 |
 | I29 / A | ローカル仕事と共有仕事が同居、終了/再開 | 共通資源枠を越えず、ローカルdraft/履歴/停止先を混同しない | runtime admission、R multi-PC。通常Desktopを終了させる実機受入は別 |
 | I30 / A | 保存容量上限、整理preview→変更→確定、参照中データ | 現在参照中の入力を保持。previewの対象変更を再確認し、履歴と内容削除を区別 | B/F shared-managementで非空整理preview→実削除→404、待機仕事の入力は同hashで再取得。停止中に日時だけを過去にしたfixture。Desktop保存画面との通しは別 |
-| I31 / A | backup/restore、旧schema、既存Runner/journal、新保存先 | 証明書・catalog履歴・会話を整合させ、古い実行権限を復活させない | Hub backup/migrationとDesktop lineage tests。復元後の実D/R通しは不足 |
+| I31 / A | backup/restore、旧schema、既存Runner/journal、新保存先 | 証明書・catalog履歴・会話を整合させ、古い実行権限を復活させない | Hub backup/migrationとDesktop lineage tests。`recoveryAudit=crash` で停止したRunnerを照合してオフライン復元し、PC再許可・Runner再起動後にバックアップ時点の会話と仕事だけが残ることを確認。旧版混在や物理別PCは別試験 |
 | I32 / B | PCを残したHub更新、Desktop更新、旧版混在 | protocol/capabilityを確認し、未対応を説明。新デフォルトで旧個別設定を上書きしない | schema/capability tests。版の組合せ表を作り実byteで確認するまで互換合格にしない |
 | I33 / B | legacy MCP履歴の一覧/詳細/export、遅い旧応答 | 現行の共有会話と混同せず、選択した端末・種類・要求の履歴だけを表示 | B/F device-management＋Rust履歴tests。実Desktop履歴との全件一致は別 |
 | I34 / A | 二つの管理画面で保存、比較後の再競合、認証切替 | draftを保持し、古いrevisionの副作用を拒否。廃止された対象を再作成しない | B shared-management/management-workflows/authentication。D保存と同時更新の全組合せは不足 |
@@ -95,7 +95,7 @@
 | `settings.shared-work` | D/F | I15/I20/I25、参加・権限・依頼/取消・承認 | Runner応答を模す。実仕事ではない |
 | `settings.shared-work-isolation` | D×2 | I15/I18、PCごとのproject可視性 | fixture isolation、生成なし |
 | `settings.device-execution` | D/R/F | I16、同意・Runner開始・最初の仕事・再起動 | desktop-e2e/current libtest、手動判定別 |
-| `settings.shared-work-continuation` | D/R/F | I17/I21/I23、通常chat・追加依頼・再起動 | fixture isolation/current libtest、物理別PCなし |
+| `settings.shared-work-continuation` | D/R/F | I17/I21/I23、通常chat・追加依頼・再起動。任意の `recoveryAudit` でI19/I27/I28/I31の一部 | fixture isolation/current libtest、物理別PCなし |
 | `settings.project-folder-recovery` | D/R/F | I17、消失・拒否・停止後再bind | fixture isolation/current libtest、UNC別 |
 | `onboarding.win-a-to-win-b` | D×2/R/F | I22/I24、添付→実装→成果→追加依頼 | liveProviderなしは固定応答。物理2台ではない |
 | `project.four-device-acceptance` | D×4/R/F | I22/I26/I29、環境分離・承認・停止・枠 | liveProviderなしは制御検査。物理4台ではない |

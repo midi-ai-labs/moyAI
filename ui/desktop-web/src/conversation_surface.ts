@@ -73,17 +73,51 @@ export function retainConversationThread(root: HTMLElement, nextRoot: DocumentFr
 }
 
 /**
- * An answer that is still being written changes only at its end. Keep the
- * leading Markdown blocks that did not change, so a selection inside them
- * survives; replace the first changed block and everything after it.
+ * Keep the rendered prefix connected while a streamed answer grows. Markdown
+ * can reinterpret an unfinished link or emphasis delimiter on the next update.
  */
 export function retainUnchangedLeadingBlocks(live: HTMLElement, next: HTMLElement): void {
   const liveNodes = Array.from(live.childNodes);
   const nextNodes = Array.from(next.childNodes);
   let same = 0;
   while (same < liveNodes.length && same < nextNodes.length && liveNodes[same].isEqualNode(nextNodes[same])) same += 1;
+  const current = liveNodes[same], replacement = nextNodes[same];
+  if (current instanceof HTMLParagraphElement && replacement instanceof HTMLParagraphElement) {
+    syncAttributes(current, replacement);
+    retainParagraphPrefix(current, replacement);
+    same += 1;
+  }
   for (const node of liveNodes.slice(same)) node.remove();
   live.append(...nextNodes.slice(same));
+}
+
+function retainParagraphPrefix(live: Element, next: Element): void {
+  let current = live.firstChild, incoming = next.firstChild;
+  while (current && incoming) {
+    if (!current.isEqualNode(incoming)) {
+      if (current instanceof Text && incoming instanceof Text && incoming.data.startsWith(current.data)) {
+        // appendData keeps range offsets inside the existing text node.
+        current.appendData(incoming.data.slice(current.length));
+      } else if (current instanceof Element && incoming instanceof Element
+        && current.cloneNode(false).isEqualNode(incoming.cloneNode(false))) {
+        retainParagraphPrefix(current, incoming);
+      } else {
+        break;
+      }
+    }
+    current = current.nextSibling;
+    incoming = incoming.nextSibling;
+  }
+  while (current) {
+    const following = current.nextSibling;
+    current.remove();
+    current = following;
+  }
+  while (incoming) {
+    const following = incoming.nextSibling;
+    live.appendChild(incoming);
+    incoming = following;
+  }
 }
 
 /** Keep the active element and its ancestors connected while updating their attributes and siblings. */

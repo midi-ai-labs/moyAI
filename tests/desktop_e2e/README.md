@@ -323,6 +323,8 @@ npm run qualify:desktop-e2e-harness -- --binary <absolute-desktop-e2e-binary> --
 
 `settings.shared-work-continuation` はHub上で操作・実行を許可した1台のDesktopを用い、実Runnerの初回同意、既存のプロジェクトフォルダの選択、通常のチャット欄からの送信、同じ共有会話への追加送信を実GUIで確認する。さらに最新の仕事を実行中に停止し、その依頼を編集して同じ会話へ再送する。利用者に実行PC・仕事の種類・チャット名を入力させないこと、SendがHub jobを作ること、追加Sendと編集後の仕事が同じconversation IDに属することを観測する。scenario configにはHubの `hubBinary` / `hubRepository`、製品 `runnerBinary`、現在sourceから作ったlibtestの絶対path `runnerTestBinary` を指定する。対象は同一Windows上の仮想的な端末試験であり、物理WinBは試験しない。2台の登録・実行・成果確認は `onboarding.win-a-to-win-b` が担当する。
 
+同じシナリオの設定に `"recoveryAudit": "crash"` を加えると、最初の仕事の後に試験用Hubをバックアップして再起動する。続く仕事で隔離Runnerを異常終了させ、停止確認欄を空にした場合と、現物の停止を確認して解放した場合の両方を管理画面で試す。最後にバックアップをオフライン復元し、端末の再許可後に元の会話・仕事が戻ることを調べる。`"recoveryAudit": "revoke"` では、実行中の端末認証を管理画面で失効させ、Desktopが旧会話・操作を閉じて再参加の案内を出すところまで確認する。どちらも試験専用のHub、保存先、Runnerを使う。指定を省くと通常の停止・編集・再送を確認する。
+
 `run.latest-message-edit` はローカルチャットで完了済みの最新依頼だけに編集ボタンが出ること、編集で元の会話を保持した新チャットへ分岐し、元の本文が入力欄に戻ること、修正して再送できることを実Tauri画面で確認する。実行先やHubの設定は不要で、隔離したscripted providerを使う。
 
 `settings.project-folder-recovery` は `settings.shared-work-continuation` と同じ初期設定・Hub登録・native pickerを使い、既存フォルダーを選んだ後にDesktopとRunnerを停止する。隔離fixtureのHub/Runner双方を旧 `desktop-default` 形式へ合わせ、作成先ごとフォルダーを移動してから再起動する。実行機能が起動したまま対象プロジェクトの問題と選び直し操作を表示すること、GUIから作業フォルダーと新規作成先をそれぞれ保存できること、再度両プロセスを起動しても保存先・既存ファイルを保持し、古いフォルダーを勝手に再作成しないことを確認する。共通hostの `beforeRelaunch` は対象Desktop/WebViewが完全に終了し、Runnerも捕捉済み所有情報で終了確認できた後だけfixtureを準備する。再起動後は新Runnerを捕捉する。Hub/Runnerの構造を旧形式にする操作はfixture準備であり、復旧操作は実GUIを通す。物理別PC・UNC疎通は対象外。実行引数とscenario configは `settings.shared-work-continuation` と共通で、scenario名だけを指定し直す。

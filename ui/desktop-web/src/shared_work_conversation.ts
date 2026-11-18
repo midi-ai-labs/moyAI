@@ -3,7 +3,7 @@ import { renderMarkdown } from "./markdown.ts";
 import { renderConversationInput, renderConversationMain } from "./conversation_surface.ts";
 import { renderTranscriptRows } from "./render_transcript.ts";
 import { icon } from "./icons.ts";
-import { renderSharedWorkOnboarding } from "./shared_work_onboarding.ts";
+import { renderSharedWorkOnboarding, sharedEnrollmentRestriction } from "./shared_work_onboarding.ts";
 import { deviceNetworkError } from "./device_network_state.ts";
 import { selectedSharedConversationDeletePending, selectedSharedJobIsLatest, selectedSharedRequestHasAttachments, sharedWorkActionEnabled, workStateLabel, type SharedWorkPresentation, type WorkExecutionDevice, type WorkRunnerContact } from "./shared_work_state.ts";
 import { renderWorkDetails, renderWorkInbox, renderWorkInputs, renderWorkResult, workRecordOwner } from "./shared_work_details.ts";
@@ -61,7 +61,10 @@ export function renderHubConversation(local: SharedWorkPresentation, approvalMar
   const selectedJob = status?.jobs.find(row => row.id === detail?.id)
     ?? p?.conversation_history?.jobs.find(row => row.job.id === detail?.id)?.job;
   const projectAccessHint = "管理者に、このPCをプロジェクトの操作PCへ追加するよう依頼してください。";
-  const connection = `<section data-shared-region="connection" class="shared-card"><h2>${p?.connected ? "このPCの利用登録を確認" : "このPCをHubに接続"}</h2>${!p?.connected ? `<p>管理者から受け取った接続ファイル（.moyai-join または .toml）を読み込み、このPCの参加を申請してください。</p><div class="shared-actions">${button("import", "Hubの設定ファイルを読み込む", "", busy)}${button("reconnect", "再接続", "", busy)}</div>` : `<p>Hubに接続しています。管理者がこのPCを承認し、プロジェクトの操作PCに指定すると、そのまま利用できます。</p>${button("refresh", "利用できるプロジェクトを確認", "", busy)}`}</section>`;
+  const restriction = sharedEnrollmentRestriction(p?.enrollment);
+  const connection = restriction
+    ? `<section data-shared-region="connection" class="shared-card"><h2>${esc(restriction.label)}</h2><p>${esc(restriction.detail)}</p></section>`
+    : `<section data-shared-region="connection" class="shared-card"><h2>${p?.connected ? "このPCの利用登録を確認" : "このPCをHubに接続"}</h2>${!p?.connected ? `<p>管理者から受け取った接続ファイル（.moyai-join または .toml）を読み込み、このPCの参加を申請してください。</p><div class="shared-actions">${button("import", "Hubの設定ファイルを読み込む", "", busy)}${button("reconnect", "再接続", "", busy)}</div>` : `<p>Hubに接続しています。管理者がこのPCを承認し、プロジェクトの操作PCに指定すると、そのまま利用できます。</p>${button("refresh", "利用できるプロジェクトを確認", "", busy)}`}</section>`;
   const fallbackRecord = detail ? `<section data-shared-region="detail" data-shared-record-owner="${esc(recordOwner)}" class="shared-card shared-conversation-record"><p>Hubの会話履歴を読み込めません。選択した仕事の記録を表示しています。</p><h2>${esc(detail.title)}</h2><p>${esc(workStateLabel(detail.state))}${selectedJob ? ` · ${esc(selectedJob.requestor.display_name)} → ${esc(selectedJob.device_label ?? selectedJob.environment_label)}` : ""}</p><div data-shared-runner-observation>${contact(detail.runner_contact)}</div>${detail.wait_reason ? `<p>${esc(detail.wait_reason)}</p>` : ""}${detail.uncertainty_reason ? `<p class="shared-error">${esc(detail.uncertainty_reason)}</p>` : ""}<div class="markdown-body shared-user-message">${renderMarkdown(typeof object(detail.input).prompt === "string" ? String(object(detail.input).prompt) : "")}</div>${renderWorkResult(detail.result, recordOwner, Boolean(detail.can_continue && p && selectedSharedJobIsLatest(p)))}${detail.start_before_ms != null ? `<details data-details-key="hub-job-deadline"><summary>実行の設定</summary><p>開始期限: ${esc(new Date(detail.start_before_ms).toLocaleString("ja-JP"))}</p></details>` : ""}${selectedJob?.can_cancel ? button("cancel", "実行を停止", detail.id, busy) : ""}</section>` : "";
   const history = `<div data-shared-region="history-container" data-shared-record-owner="${esc(owner)}">${p?.conversation_history ? renderConversationHistory(local, detail?.id ?? null) : fallbackRecord || '<div class="empty-thread"><h2>新しいチャット</h2><p>このプロジェクトで行いたいことを入力してください。</p></div>'}</div>`;
   // Busy text fields stay focusable and keep the caret; only their value is locked.
