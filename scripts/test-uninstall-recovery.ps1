@@ -71,8 +71,11 @@ function Start-Process([string]$FilePath,[string]$ArgumentList,[string]$Verb,[st
  if($script:cancelElevation){throw [ComponentModel.Win32Exception]::new(1223)}
  if($script:exitBeforeResult){$ArgumentList='-NoProfile -NonInteractive -Command "exit 7"'}
  if($script:rejectChildPreflight){[IO.File]::WriteAllText((Join-Path $hub 'machine-component.json'),'invalid receipt')}
- if($ElevationSmoke){return Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Verb RunAs -WindowStyle Hidden -PassThru}
- Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $EvidenceRoot ('child-'+[Guid]::NewGuid().ToString('N')+'.stdout.log')) -RedirectStandardError (Join-Path $EvidenceRoot ('child-'+[Guid]::NewGuid().ToString('N')+'.stderr.log'))
+ if($ElevationSmoke){$child=Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Verb RunAs -WindowStyle Hidden -PassThru}
+ else{$child=Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $EvidenceRoot ('child-'+[Guid]::NewGuid().ToString('N')+'.stdout.log')) -RedirectStandardError (Join-Path $EvidenceRoot ('child-'+[Guid]::NewGuid().ToString('N')+'.stderr.log'))}
+ # Honour -Wait like the real cmdlet: the plain uninstall reads the result after exit.
+ if($Wait){$child.WaitForExit()}
+ $child
 }
 if(-not $ElevationSmoke){
 Assert-Fails {Invoke-MoyaiComponentUserSetup $package @('Hub') -Uninstall -ResetHubData} 'UAC cancellation cannot begin profile cleanup'
@@ -99,6 +102,10 @@ $script:cleanupFails=$false
 Invoke-MoyaiComponentUserSetup $package @('Hub') -Uninstall -ResetHubData|Out-Null
 $expectedCalls=if($ElevationSmoke){1}else{2}
 Assert-That ($script:cleanupCalls -eq $expectedCalls -and -not(Test-Path -LiteralPath $hub) -and (Test-Path -LiteralPath (Join-Path $EvidenceRoot 'cleanup-completed'))) 'successful reset precedes app deletion and the same request is not replayed'
+if(-not $ElevationSmoke){
+ $again=@(Invoke-MoyaiComponentUserSetup $package @('Hub') -Uninstall)
+ Assert-That (@($again|Where-Object{[string]$_ -like '*既に削除されています: Hub*'}).Count -eq 1 -and @($again|Where-Object{[string]$_ -like '*アンインストールが完了しました*'}).Count -eq 1 -and $script:cleanupCalls -eq $expectedCalls) 'uninstalling an already removed app completes successfully without another data reset'
+}
 Assert-That (@(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'moyai-uninstall-*').Count -eq 0) 'both success and cleanup refusal release and remove control snapshots'
 $decisionRoot=Join-Path $EvidenceRoot 'decision';[void](New-Item -ItemType Directory -Path $decisionRoot)
 $operation=[Guid]::NewGuid().ToString('N')

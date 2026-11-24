@@ -65,7 +65,7 @@ try {
 
 endpointはtest子processだけへ渡し、親PowerShellやmachine/user環境へ設定しない。追加のignored gateを動かす場合も、同じ生存testhostと明示した入力を使い、全test子processの終了を確認してから`stop`を書く。プロセス名で一括終了したり、SCMの設定を直接変更したりしない。testhost終了が未確認ならfixtureを保持する。起動中はhelperとruntimeがpinされるため、helper/libtestの再ビルド・置換はtesthostとその子の終了後に行う。
 
-serviceは最後のfamilyとJobの清算後に停止するが、登録と固定helperは残る。別のmoyAIやRunnerが使っているserviceを、試験の終了処理で停止・削除しない。PC共通helperの削除が必要な場合は、すべての利用を正常終了してから、管理者承認を受けた`Setup-Sandbox.ps1 -Uninstall`を明示実行する。導入・更新・削除、実callerの拒否、複数familyとRunnerの寿命は、上記の手順記載やビルド成功だけで検証済みとせず、実結果を別に記録する。
+serviceは最後のfamilyとJobの清算後に停止するが、登録と固定helperは残る。別のmoyAIやRunnerが使っているserviceを、試験の終了処理で停止・削除しない。PC共通helperの削除が必要な場合は、すべての利用を正常終了してから、管理者承認を受けた`Setup-Sandbox.ps1 -Uninstall`を明示実行する。testhostやlibtestの子processも固定helperを開いたままにするため、生存中は削除・更新が使用中としてprocess名とPIDを表示して中止する。導入・更新・削除、実callerの拒否、複数familyとRunnerの寿命は、上記の手順記載やビルド成功だけで検証済みとせず、実結果を別に記録する。
 
 ## AD domain accountの確認
 

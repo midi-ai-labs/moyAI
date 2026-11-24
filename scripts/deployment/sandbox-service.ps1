@@ -95,6 +95,25 @@ namespace MoyaiSandboxSetup {
   [StructLayout(LayoutKind.Sequential)] struct Status {
    public uint type, state, accepted, win32exit, specificexit, checkpoint, waitHint;
   }
+  [StructLayout(LayoutKind.Sequential)] struct StatusProcess {
+   public uint type, state, accepted, win32exit, specificexit, checkpoint, waitHint, pid, flags;
+  }
+  [StructLayout(LayoutKind.Sequential)] struct UniqueProcess { public uint pid; public System.Runtime.InteropServices.ComTypes.FILETIME start; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct RmProcessInfo {
+   public UniqueProcess process;
+   [MarshalAs(UnmanagedType.ByValTStr,SizeConst=256)] public string app;
+   [MarshalAs(UnmanagedType.ByValTStr,SizeConst=64)] public string service;
+   public uint type, status, session;
+   [MarshalAs(UnmanagedType.Bool)] public bool restartable;
+  }
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool QueryServiceStatusEx(IntPtr service,int level,ref StatusProcess status,uint size,out uint needed);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] static extern int RmStartSession(out uint session,int flags,System.Text.StringBuilder key);
+  [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint session);
+  [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] static extern int RmRegisterResources(uint session,uint files,string[] names,uint applications,IntPtr processes,uint services,string[] serviceNames);
+  [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint session,out uint needed,ref uint count,[In,Out] RmProcessInfo[] processes,ref uint reasons);
   [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenSCManager(string machine,string database,uint access);
   [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenService(IntPtr manager,string name,uint access);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool CloseServiceHandle(IntPtr handle);
@@ -153,27 +172,65 @@ namespace MoyaiSandboxSetup {
    try { h=Service(m,0x10000,false); if(!DeleteService(h)) throw Error(); }
    finally { if(h!=IntPtr.Zero) CloseServiceHandle(h); CloseServiceHandle(m); }
   }
+  static StatusProcess Query(IntPtr service) {
+   var s=new StatusProcess(); uint needed;
+   if(!QueryServiceStatusEx(service,0,ref s,(uint)Marshal.SizeOf(typeof(StatusProcess)),out needed)) throw Error();
+   return s;
+  }
+  // Sends one ordinary STOP and waits for the helper to drain its own work. The
+  // reported STOPPED state precedes process exit, and a still-mapped helper image
+  // cannot be deleted, so the old helper process is also awaited. Nothing is killed.
   public static void Stop(uint timeoutMs) {
-   var m=Manager(1); IntPtr h=IntPtr.Zero;
+   var m=Manager(1); IntPtr h=IntPtr.Zero, process=IntPtr.Zero;
    try {
-    h=Service(m,0x24,false); Status s;
-    if(!QueryServiceStatus(h,out s)) throw Error();
+    h=Service(m,0x24,false);
+    var s=Query(h);
     if(s.state==1) return;
-    if(s.state!=3 && !ControlService(h,1,out s)) {
-     int code=Marshal.GetLastWin32Error();
-     if(code!=1062) throw new Win32Exception(code);
-    }
     var timer=System.Diagnostics.Stopwatch.StartNew();
-    do {
-     if(!QueryServiceStatus(h,out s)) throw Error();
-     if(s.state==1) {
-      if(s.win32exit!=0 || s.specificexit!=0) throw new IOException("Sandbox stopped with an error; cleanup is not confirmed.");
-      return;
+    bool requested=s.state==3;
+    while(true) {
+     if(process==IntPtr.Zero && s.pid!=0) process=OpenProcess(0x00100000,false,s.pid);
+     if(!requested) {
+      Status ignored;
+      if(ControlService(h,1,out ignored)) requested=true;
+      else {
+       int code=Marshal.GetLastWin32Error();
+       if(code==1062) requested=true;
+       // START_PENDING cannot accept STOP yet; ask again after it reports.
+       else if(code!=1061) throw new Win32Exception(code);
+      }
      }
+     if(timer.ElapsedMilliseconds>=timeoutMs) throw new TimeoutException("MoyAISandboxが"+(timeoutMs/1000)+"秒以内に停止しませんでした。実行中の処理は強制停止していません。moyAIの仕事が終わってから再実行してください。停止しない状態が続く場合はPCを再起動してから再実行してください。");
      System.Threading.Thread.Sleep(100);
-    } while(timer.ElapsedMilliseconds<timeoutMs);
-    throw new TimeoutException("Sandbox did not finish stopping. Existing files were retained; no process was killed.");
-   } finally { if(h!=IntPtr.Zero) CloseServiceHandle(h); CloseServiceHandle(m); }
+     s=Query(h);
+     if(s.state==1) break;
+     if(s.state==3) requested=true;
+    }
+    if(s.win32exit!=0 || s.specificexit!=0) throw new IOException("MoyAISandboxは停止しましたが、終了時の片付けを確認できませんでした（Windowsの終了コード "+s.win32exit+"、サービスの終了コード "+s.specificexit+"）。今回は変更を中止しました。再実行すると、停止済みのサービスとして処理を続けます。");
+    if(process!=IntPtr.Zero) {
+     long remaining=Math.Max(5000L,timeoutMs-timer.ElapsedMilliseconds);
+     if(WaitForSingleObject(process,(uint)remaining)!=0) throw new TimeoutException("MoyAISandboxは停止を報告しましたが、helperのプロセス（PID "+s.pid+"）がまだ終了していません。強制終了はしていません。しばらく待ってから再実行してください。続く場合はPCを再起動してから再実行してください。");
+    }
+   } finally { if(process!=IntPtr.Zero) CloseHandle(process); if(h!=IntPtr.Zero) CloseServiceHandle(h); CloseServiceHandle(m); }
+  }
+  // Read-only Restart Manager query: which processes hold any of these files.
+  public static string[] FileHolders(string[] files) {
+   if(files==null || files.Length==0) return new string[0];
+   uint session; var key=new System.Text.StringBuilder(64);
+   int e=RmStartSession(out session,0,key); if(e!=0) throw new Win32Exception(e);
+   try {
+    e=RmRegisterResources(session,(uint)files.Length,files,0,IntPtr.Zero,0,null); if(e!=0) throw new Win32Exception(e);
+    uint needed=0,count=0,reasons=0; RmProcessInfo[] info=null;
+    for(int attempt=0;attempt<4;attempt++) {
+     e=RmGetList(session,out needed,ref count,info,ref reasons);
+     if(e!=234) break;
+     info=new RmProcessInfo[needed]; count=needed;
+    }
+    if(e!=0) throw new Win32Exception(e);
+    var result=new string[count];
+    for(int i=0;i<count;i++) result[i]=info[i].process.pid+"|"+info[i].app+"|"+info[i].service;
+    return result;
+   } finally { RmEndSession(session); }
   }
  }
 }
@@ -186,38 +243,189 @@ function Set-MoyaiSandboxServiceSecurity([string]$Sddl) { Initialize-MoyaiSandbo
 function Remove-MoyaiSandboxService { Initialize-MoyaiSandboxNative; [MoyaiSandboxSetup.Native]::Remove() }
 function Stop-MoyaiSandboxService { Initialize-MoyaiSandboxNative; [MoyaiSandboxSetup.Native]::Stop(45000) }
 
-function Wait-MoyaiSandboxRemoval {
-    $elapsed=[Diagnostics.Stopwatch]::StartNew()
-    do {
-        try { if($null -eq (Get-MoyaiSandboxService)) { return } }
-        catch {
-            $cause=$_.Exception.GetBaseException()
-            if($cause -isnot [ComponentModel.Win32Exception] -or $cause.NativeErrorCode -ne 1072) { throw }
-        }
-        Start-Sleep -Milliseconds 100
-    } while($elapsed.ElapsedMilliseconds -lt 3000)
-    throw 'WindowsがMoyAISandboxの削除を保留しています。サービスの管理画面や監視ツールを閉じて再実行してください。保留が続く場合はPCを再起動してください。'
+# The SCM keeps a deleted service until its process has exited and every open
+# service handle is closed. It records that pending state as DeleteFlag; reading
+# the value does not change the registration.
+function Test-MoyaiSandboxServiceDeletePending {
+    $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\MoyAISandbox',$false)
+    if($null -eq $key) { return $false }
+    try { return [int]$key.GetValue('DeleteFlag',0) -eq 1 } finally { $key.Dispose() }
 }
 
-function Move-MoyaiStoppedSandboxToBackup([string]$Source,[string]$Destination) {
+function Test-MoyaiSandboxDeletePendingError($Exception) {
+    for($cause=$Exception; $null -ne $cause; $cause=$cause.InnerException) {
+        if($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 1072) { return $true }
+    }
+    return $false
+}
+
+function Get-MoyaiSandboxServiceState([switch]$Security) {
+    try { $service=Get-MoyaiSandboxService -Security:$Security }
+    catch { if(Test-MoyaiSandboxDeletePendingError $_.Exception) { return [pscustomobject]@{service=$null;pending=$true} }; throw }
+    $pending=$null -ne $service -and (Test-MoyaiSandboxServiceDeletePending)
+    [pscustomobject]@{service=$service;pending=$pending}
+}
+
+function Get-MoyaiSandboxRemovalWaitMilliseconds { 30000 }
+
+# Windows does not report which process keeps a service handle open. These are the
+# usual viewers of service registrations; listing them only helps the user choose.
+function Get-MoyaiServiceViewerProcesses {
+    @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -in @('mmc','Taskmgr','perfmon','resmon') -or $_.ProcessName -like 'procexp*' -or $_.ProcessName -like 'ProcessHacker*' -or $_.ProcessName -like 'SystemInformer*' } | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" })
+}
+
+function Get-MoyaiSandboxPendingRemovalNotice {
+    $viewers=@(Get-MoyaiServiceViewerProcesses)
+    $candidates=if($viewers.Count){"起動中の該当しそうなアプリ: $($viewers -join '、')。"}else{''}
+    'Windowsは実行補助サービス（MoyAISandbox）の削除を受け付けましたが、登録の消去を保留しています。Windowsの「サービス」画面、タスクマネージャーの「サービス」、監視ツールなど、サービスを表示しているアプリを閉じると消去されます。' + $candidates + '消えない場合はPCを再起動してください。同じ名前での再導入は、Windowsが登録を消去した後に行えます。'
+}
+
+# Returns $true once the registration is gone; $false while Windows still keeps
+# a deleted registration. Callers decide whether that blocks their operation.
+function Wait-MoyaiSandboxRemoval {
+    $elapsed=[Diagnostics.Stopwatch]::StartNew()
+    $limit=Get-MoyaiSandboxRemovalWaitMilliseconds
+    do {
+        $state=Get-MoyaiSandboxServiceState
+        if($null -eq $state.service -and -not $state.pending) { return $true }
+        Start-Sleep -Milliseconds 200
+    } while($elapsed.ElapsedMilliseconds -lt $limit)
+    return $false
+}
+
+function Get-MoyaiSandboxFileHolders([string[]]$Paths) {
+    $files=@($Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) })
+    if(-not $files.Count) { return @() }
+    Initialize-MoyaiSandboxNative
+    try { $entries=[MoyaiSandboxSetup.Native]::FileHolders([string[]]$files) }
+    catch { return @("使用中のアプリを特定できませんでした（$($_.Exception.Message)）") }
+    foreach($entry in $entries) {
+        $parts=$entry.Split('|')
+        $name=if($parts[2]){"サービス $($parts[2])"}elseif($parts[1]){$parts[1]}else{'不明なアプリ'}
+        "$name (PID $($parts[0]))"
+    }
+}
+
+function Get-MoyaiSandboxInUseMessage([string]$Path,[string[]]$Holders) {
+    $detail=if(@($Holders).Count){"使用中: $(@($Holders) -join '、')。"}else{''}
+    "ファイルが使用中のため、$Path を入れ替え・片付けできません。$detail" +
+    'moyAI Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選び、CLI・Runner・試験用のmoyAIプロセスも通常の方法で終了してから再実行してください。終了できない場合や使用中のアプリが分からない場合は、PCを再起動してから再実行してください。Setupはプロセスを強制終了しません。'
+}
+
+function Get-MoyaiSandboxProcessWaitMilliseconds { 20000 }
+
+function Get-MoyaiProcessesUnderRoot([string]$Root) {
+    $boundary=[IO.Path]::GetFullPath($Root).TrimEnd('\')+'\'
+    @(foreach($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+        try { $path=$process.Path } catch { $path=$null }
+        if($path -and $path.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { "$($process.ProcessName) (PID $($process.Id)): $path" }
+    })
+}
+
+# An app or helper that was just closed can still be leaving for a few seconds.
+# Wait for such processes to exit on their own; nothing is terminated.
+function Wait-MoyaiProcessesExit([scriptblock]$Query) {
+    $elapsed=[Diagnostics.Stopwatch]::StartNew()
+    $limit=Get-MoyaiSandboxProcessWaitMilliseconds
+    while($true) {
+        $remaining=@(& $Query)
+        if(-not $remaining.Count -or $elapsed.ElapsedMilliseconds -ge $limit) { return $remaining }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# A process started from the helper folder keeps its image mapped: the folder can
+# still be renamed, but its files cannot be deleted. Other open files are found by
+# the move or delete itself and are then diagnosed with Restart Manager.
+function Assert-MoyaiSandboxPayloadUnused([string]$Root) {
+    if(-not(Test-Path -LiteralPath $Root)) { return }
+    $holders=@(Wait-MoyaiProcessesExit { Get-MoyaiProcessesUnderRoot $Root })
+    if($holders.Count) { throw (Get-MoyaiSandboxInUseMessage $Root $holders) }
+}
+
+function Get-MoyaiSandboxFileRetryMilliseconds { 10000 }
+
+function Invoke-MoyaiSandboxFileRetry([scriptblock]$Action) {
+    $TimeoutMs=Get-MoyaiSandboxFileRetryMilliseconds
     $elapsed=[Diagnostics.Stopwatch]::StartNew()
     while($true) {
-        try { [IO.Directory]::Move($Source,$Destination); return }
+        try { return (& $Action) }
         catch {
             $cause=$_.Exception.GetBaseException()
             $code=$cause.HResult -band 65535
-            # Directory.Move can report access denied while an open child still pins the directory.
-            if($cause -isnot [IO.IOException] -or $code -notin @(5,32,33) -or $elapsed.ElapsedMilliseconds -ge 2000) { throw }
-            Start-Sleep -Milliseconds 100
+            # A helper that just reported STOPPED may still be leaving; directory
+            # rename reports access denied while an open child pins the folder.
+            if(($cause -isnot [IO.IOException] -and $cause -isnot [UnauthorizedAccessException]) -or $code -notin @(5,32,33) -or $elapsed.ElapsedMilliseconds -ge $TimeoutMs) { throw }
+            Start-Sleep -Milliseconds 200
         }
     }
 }
 
-function Assert-MoyaiSandboxClientsStopped {
+function Move-MoyaiStoppedSandboxToBackup([string]$Source,[string]$Destination) {
+    try { Invoke-MoyaiSandboxFileRetry { [IO.Directory]::Move($Source,$Destination) } }
+    catch {
+        $holders=@(Get-MoyaiSandboxFileHolders @(Get-ChildItem -LiteralPath $Source -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
+        throw (Get-MoyaiSandboxInUseMessage $Source $holders)
+    }
+}
+
+function New-MoyaiSandboxRetainedItem([string]$Message) {
+    # Same type name as component setup, so its summary lists the item as retained.
+    $Message | Add-Member -TypeName 'Moyai.RetainedItem' -PassThru
+}
+
+function Get-MoyaiServicesReferencingPath([string]$Path) {
+    @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.PathName -and $_.PathName.IndexOf($Path,[StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { $_.Name })
+}
+
+function Get-MoyaiSandboxLeftoverDirectories($Location) {
+    if(-not(Test-Path -LiteralPath $Location.parent)) { return @() }
+    @(Get-ChildItem -LiteralPath $Location.parent -Directory -Force | Where-Object { $_.Name.StartsWith('SandboxService.previous-',[StringComparison]::OrdinalIgnoreCase) -or $_.Name.StartsWith('SandboxService.stage-',[StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.FullName })
+}
+
+# Removes owned backup/staging copies left by an interrupted update or uninstall.
+# Unverifiable or in-use copies are kept and returned as retained items.
+function Remove-MoyaiSandboxLeftovers($Location) {
+    foreach($candidate in @(Get-MoyaiSandboxLeftoverDirectories $Location)) {
+        try {
+            Assert-MoyaiSandboxProtectedPath $candidate
+            $receiptPath=Join-Path $candidate 'installation.json'
+            if(-not(Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+                if(@(Get-ChildItem -LiteralPath $candidate -Force).Count -eq 0) { Remove-Item -LiteralPath $candidate; continue }
+                throw '導入記録がないため、所有を確認できません。中身を確認してから管理者が削除してください。'
+            }
+            Assert-MoyaiSandboxProtectedPath $receiptPath
+            $receipt=Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if($receipt.schema -ne 1 -or $receipt.product -cne 'moyai-machine-sandbox' -or $receipt.service -cne 'MoyAISandbox' -or $receipt.install_root -cne $Location.root) { throw '共通サービスの旧導入記録を確認できません。' }
+            foreach($file in @($receipt.files)) {
+                if($file.name -cne [IO.Path]::GetFileName($file.name) -or $file.name -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$' -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw '旧導入記録のファイル一覧が不正です。' }
+                $path=Join-Path $candidate $file.name
+                if(-not(Test-Path -LiteralPath $path)) { continue }
+                Assert-MoyaiSandboxProtectedPath $path
+                if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $file.sha256) { throw '旧実行ファイルが導入記録と一致しません。中身を確認してから管理者が削除してください。' }
+            }
+            $owned=@('installation.json')+@($receipt.files | ForEach-Object { $_.name })
+            if(@(Get-ChildItem -LiteralPath $candidate -Force | Where-Object { $_.PSIsContainer -or $_.Name -notin $owned }).Count) { throw '導入記録にないファイルがあるため、所有を確認できません。中身を確認してから管理者が削除してください。' }
+            if(@(Get-MoyaiServicesReferencingPath $candidate).Count) { throw '旧配置を参照するサービスが残っています。' }
+            Assert-MoyaiSandboxPayloadUnused $candidate
+            try { Invoke-MoyaiSandboxFileRetry { Remove-MoyaiSandboxPayloadDirectory $candidate $receipt.files } | Out-Null }
+            catch {
+                $holders=@(Get-MoyaiSandboxFileHolders @(Get-ChildItem -LiteralPath $candidate -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
+                throw ((Get-MoyaiSandboxInUseMessage $candidate $holders) + ' 再実行すると、残ったファイルだけを片付けます。')
+            }
+        } catch { New-MoyaiSandboxRetainedItem "共通サービスの旧配置を保持しました: $candidate / $($_.Exception.Message)" }
+    }
+}
+
+function Get-MoyaiSandboxClientProcesses {
     # Include portable and other-user clients: the helper is shared by the PC.
-    $clients = @(Get-CimInstance Win32_Process -Filter "Name='moyai.exe' OR Name='moyai-desktop.exe' OR Name='moyai-runner.exe'" -ErrorAction Stop)
+    @(Get-CimInstance Win32_Process -Filter "Name='moyai.exe' OR Name='moyai-desktop.exe' OR Name='moyai-runner.exe'" -ErrorAction Stop | ForEach-Object { "$($_.Name) (PID $($_.ProcessId))" })
+}
+
+function Assert-MoyaiSandboxClientsStopped {
+    $clients = @(Wait-MoyaiProcessesExit { Get-MoyaiSandboxClientProcesses })
     if ($clients.Count) {
-        $details = ($clients | ForEach-Object { "$($_.Name) (PID $($_.ProcessId))" }) -join ', '
+        $details = $clients -join ', '
         throw "実行補助サービスを使用するアプリが起動中です。Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選びます。CLIを閉じ、単独のRunnerはWindows導入手順の「更新・アンインストール」に従って終了してください。対象: $details"
     }
 }
@@ -350,6 +558,16 @@ function Read-MoyaiSandboxInstallation($Location, [switch]$AllowMissingFiles) {
     return $receipt
 }
 
+# Separates "this setup cannot prove it owns the fixed folder" from unsafe paths.
+# An unverifiable folder is moved aside intact so the fixed path can be reused;
+# a reparse point or an unprotected parent still stops the operation.
+function Read-MoyaiSandboxInstallationState($Location) {
+    Assert-MoyaiSandboxProtectedPath $Location.parent
+    Assert-MoyaiSandboxRegularPath $Location.root
+    try { [pscustomobject]@{receipt=(Read-MoyaiSandboxInstallation $Location -AllowMissingFiles);unverified=$false;reason=''} }
+    catch { [pscustomobject]@{receipt=$null;unverified=$true;reason=$_.Exception.Message} }
+}
+
 function Test-MoyaiSandboxPayloadMatch($Receipt, $Payload, [string]$RuntimeMode) {
     if ($null -eq $Receipt) { return $false }
     if ($Receipt.visual_cpp -cne $RuntimeMode -or @($Receipt.files).Count -ne @($Payload).Count) { return $false }
@@ -364,12 +582,14 @@ function Get-MoyaiSandboxInstallPlan([string]$SourceRoot, $Manifest) {
     $location = Get-MoyaiSandboxLocation
     Assert-MoyaiSandboxRegularPath $location.root
     $payload = @(Get-MoyaiSandboxPayload $SourceRoot $Manifest)
-    $service = Get-MoyaiSandboxService
+    $state = Get-MoyaiSandboxServiceState
+    $service = $state.service
     $exists = Test-Path -LiteralPath $location.root
     if ($null -ne $service) { Assert-MoyaiSandboxService $service $location -AllowDisabled }
     if ($exists) {
-        $receipt = Read-MoyaiSandboxInstallation $location -AllowMissingFiles
-        $needed = $null -eq $service -or $service.Start -ne 3 -or -not (Test-MoyaiSandboxPayloadMatch $receipt $payload $Manifest.runtime.visual_cpp)
+        $installation = Read-MoyaiSandboxInstallationState $location
+        $receipt = $installation.receipt
+        $needed = $installation.unverified -or $state.pending -or $null -eq $service -or $service.Start -ne 3 -or -not (Test-MoyaiSandboxPayloadMatch $receipt $payload $Manifest.runtime.visual_cpp)
     } else { $needed = $true }
     [pscustomobject]@{ needed=$needed; location=$location; payload=$payload }
 }
@@ -434,25 +654,100 @@ function Remove-MoyaiSandboxPayloadDirectory([string]$Path, $Files) {
     Remove-Item -LiteralPath $Path
 }
 
+function Invoke-MoyaiSandboxUninstall($Location) {
+    $command = '"' + $Location.helper + '" --service'
+    if (-not (Test-Path -LiteralPath $Location.parent)) {
+        $state = Get-MoyaiSandboxServiceState
+        if ($null -eq $state.service -and -not $state.pending) { Write-Output 'PC共通の実行補助サービスは導入されていません。既に削除済みとして終了します。'; return }
+        if ($null -eq $state.service) { New-MoyaiSandboxRetainedItem (Get-MoyaiSandboxPendingRemovalNotice); return }
+        [void](New-Item -ItemType Directory -Path $Location.parent)
+        Set-MoyaiSandboxProtection $Location.parent $true
+    }
+    Assert-MoyaiSandboxProtectedPath $Location.parent
+    $lockPath = Join-Path $Location.parent 'sandbox-setup.lock'
+    Assert-MoyaiSandboxRegularPath $lockPath
+    $lock = [IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    try {
+        $state = Get-MoyaiSandboxServiceState -Security
+        $service = $state.service; $pending = $state.pending
+        # A same-name registration that this setup did not create is never removed.
+        if ($null -ne $service) { Assert-MoyaiSandboxService $service $Location -AllowDisabled -Security }
+        $exists = Test-Path -LiteralPath $Location.root
+        # An unverifiable fixed folder is moved aside intact and reported, not deleted.
+        if ($exists) { [void](Read-MoyaiSandboxInstallationState $Location) }
+        $leftovers = @(Get-MoyaiSandboxLeftoverDirectories $Location)
+        if ($null -eq $service -and -not $exists -and -not $leftovers.Count) {
+            if ($pending) { New-MoyaiSandboxRetainedItem (Get-MoyaiSandboxPendingRemovalNotice) }
+            else { Write-Output 'PC共通の実行補助サービスは導入されていません。既に削除済みとして終了します。' }
+            return
+        }
+        if ($null -ne $service -or $exists) { Assert-MoyaiSandboxClientsStopped }
+        $backup = Join-Path $Location.parent ('SandboxService.previous-' + [Guid]::NewGuid().ToString('N'))
+        $disabled = $false; $movedOld = $false; $removed = $false
+        $originalStart = if ($null -ne $service) { $service.Start } else { 3 }
+        try {
+            if ($null -ne $service) {
+                if (-not $pending) {
+                    try { Set-MoyaiSandboxService $command 4; $disabled = $true }
+                    catch { if (-not (Test-MoyaiSandboxDeletePendingError $_.Exception)) { throw }; $pending = $true }
+                    Assert-MoyaiSandboxClientsStopped
+                }
+                # STOP lets the helper cancel and drain its own work; never kill its process.
+                # Windows completes a pending deletion once a stopped service is unused.
+                if (-not $pending -or $service.State -ne 1) { Stop-MoyaiSandboxService }
+                $stopped = (Get-MoyaiSandboxServiceState -Security).service
+                if ($null -ne $stopped) {
+                    if ($disabled) { Assert-MoyaiSandboxService $stopped $Location -Disabled -Security }
+                    if ($stopped.State -ne 1) { throw 'MoyAISandboxの停止を確認できないため、ファイルとサービス登録は変更していません。moyAIの仕事が終わってから再実行してください。' }
+                }
+            }
+            if ($exists) {
+                Assert-MoyaiSandboxPayloadUnused $Location.root
+                Move-MoyaiStoppedSandboxToBackup $Location.root $backup
+                $movedOld = $true
+            }
+            if ($null -ne $service -and -not $pending) {
+                Remove-MoyaiSandboxService
+                $removed = $true
+            }
+        } catch {
+            $failure = $_
+            try {
+                if ($movedOld) { Move-Item -LiteralPath $backup -Destination $Location.root; $movedOld = $false }
+                if ($disabled) { Set-MoyaiSandboxService $command $originalStart; $disabled = $false }
+            } catch { throw "実行補助サービスの削除を中止しましたが、元の状態へ戻せませんでした。保護された退避先は残しています: $backup / $($_.Exception.Message)" }
+            throw $failure
+        }
+        # From here the registration is deleted or pending deletion; nothing is rolled back.
+        # The moved payload is a SandboxService.previous-* copy and is removed with
+        # any copies that earlier interrupted runs left behind.
+        # Collect plain text; the retained type is attached on output because .NET
+        # collections drop the PowerShell type name.
+        $retained = [Collections.Generic.List[string]]::new()
+        foreach ($item in @(Remove-MoyaiSandboxLeftovers $Location)) { $retained.Add([string]$item) }
+        if (($removed -or $pending) -and -not (Wait-MoyaiSandboxRemoval)) { $retained.Add((Get-MoyaiSandboxPendingRemovalNotice)) }
+        if ($retained.Count) {
+            Write-Output 'PC共通の実行補助サービスの削除を、一部を残して完了しました。残した対象と次の操作は次のとおりです。'
+            foreach ($message in $retained) { New-MoyaiSandboxRetainedItem $message }
+        } else { Write-Output 'PC共通の実行補助サービスを削除しました。利用者の設定・会話・作業フォルダーは変更していません。' }
+    } finally { $lock.Dispose() }
+}
+
 function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall, [string]$ExpectedManifestSha256 = '', [scriptblock]$PublishComponent, [scriptblock]$RestoreComponent, $ComponentContext) {
     if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Run machine sandbox setup with 64-bit Windows PowerShell 5.1 (powershell.exe), not PowerShell 7 (pwsh.exe).' }
     Assert-MoyaiSandboxAdministrator
     if (($null -ne $PublishComponent) -ne ($null -ne $RestoreComponent) -or ($Uninstall -and $null -ne $PublishComponent)) { throw 'Component publication requires paired install/rollback callbacks and cannot be combined with uninstall.' }
     $location = Get-MoyaiSandboxLocation
     Assert-MoyaiSandboxRegularPath $location.root
-    $manifest = $null; $payload = @()
-    if (-not $Uninstall) {
-        $manifestPath = Join-Path $SourceRoot 'deployment.json'
-        Assert-MoyaiSandboxRegularPath $manifestPath
-        $manifest = Read-MoyaiDeployment $SourceRoot -VerifyHashes -ExpectedSha256 $ExpectedManifestSha256
-        if ($manifest.PSObject.Properties.Name -notcontains 'machine_sandbox' -or $manifest.machine_sandbox.service -cne 'MoyAISandbox' -or $manifest.machine_sandbox.setup -cne 'scripts/Setup-Sandbox.ps1') { throw 'This package does not declare the installed sandbox service contract.' }
-        $payload = @(Get-MoyaiSandboxPayload $SourceRoot $manifest)
-    }
-    $pins = $null
-    if (-not $Uninstall) { $pins = New-MoyaiSandboxSourcePins $SourceRoot $manifest }
+    if ($Uninstall) { Invoke-MoyaiSandboxUninstall $location; return }
+    $manifestPath = Join-Path $SourceRoot 'deployment.json'
+    Assert-MoyaiSandboxRegularPath $manifestPath
+    $manifest = Read-MoyaiDeployment $SourceRoot -VerifyHashes -ExpectedSha256 $ExpectedManifestSha256
+    if ($manifest.PSObject.Properties.Name -notcontains 'machine_sandbox' -or $manifest.machine_sandbox.service -cne 'MoyAISandbox' -or $manifest.machine_sandbox.setup -cne 'scripts/Setup-Sandbox.ps1') { throw 'This package does not declare the installed sandbox service contract.' }
+    $payload = @(Get-MoyaiSandboxPayload $SourceRoot $manifest)
+    $pins = New-MoyaiSandboxSourcePins $SourceRoot $manifest
     try {
     if (-not (Test-Path -LiteralPath $location.parent)) {
-        if ($Uninstall -and $null -eq (Get-MoyaiSandboxService)) { Write-Output 'PC共通sandbox helperは既に削除されています。'; return }
         [void](New-Item -ItemType Directory -Path $location.parent)
         Set-MoyaiSandboxProtection $location.parent $true
     }
@@ -461,15 +756,25 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
     Assert-MoyaiSandboxRegularPath $lockPath
     $lock = [IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
     try {
-        $service = Get-MoyaiSandboxService -Security
+        $state = Get-MoyaiSandboxServiceState -Security
+        if ($state.pending) {
+            # An accepted uninstall must finish before the same name can be registered again.
+            # Windows keeps it while the old helper still runs, so ask it to stop normally.
+            if ($null -ne $state.service -and $state.service.State -ne 1) { Assert-MoyaiSandboxClientsStopped; Stop-MoyaiSandboxService }
+            if (-not (Wait-MoyaiSandboxRemoval)) { throw ('実行補助サービスを導入できません。' + (Get-MoyaiSandboxPendingRemovalNotice)) }
+            $state = Get-MoyaiSandboxServiceState -Security
+        }
+        $service = $state.service
         $exists = Test-Path -LiteralPath $location.root
         $old = $null
         if($null -ne $service) {
             Assert-MoyaiSandboxService $service $location -AllowDisabled -Security
         }
+        $installation = [pscustomobject]@{receipt=$null;unverified=$false;reason=''}
         if ($exists) {
-            $old = Read-MoyaiSandboxInstallation $location -AllowMissingFiles
-            if (-not $Uninstall -and $null -ne $service -and $service.Start -eq 3 -and (Test-MoyaiSandboxPayloadMatch $old $payload $manifest.runtime.visual_cpp)) {
+            $installation = Read-MoyaiSandboxInstallationState $location
+            $old = $installation.receipt
+            if (-not $installation.unverified -and $null -ne $service -and $service.Start -eq 3 -and (Test-MoyaiSandboxPayloadMatch $old $payload $manifest.runtime.visual_cpp)) {
                 if($null -ne $PublishComponent) {
                     try { & $PublishComponent $ComponentContext }
                     catch { & $RestoreComponent $ComponentContext; throw }
@@ -478,39 +783,28 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
             }
         }
         Assert-MoyaiSandboxClientsStopped
-        if($Uninstall -and $null -eq $service) {
-            if($exists) {
-                foreach($process in @(Get-Process -ErrorAction SilentlyContinue)) { if($process.Path -and $process.Path.StartsWith($location.root+'\',[StringComparison]::OrdinalIgnoreCase)) { throw '共通helperの実行ファイルが使用中です。終了してから再実行してください。' } }
-                if($null -ne (Get-MoyaiSandboxService)) { throw '削除中にサービス登録が変わりました。再実行してください。' }
-                Remove-MoyaiSandboxPayloadDirectory $location.root $(if($old){$old.files}else{@()})
-            }
-            Write-Output 'PC共通sandbox helperは削除済みです。残っていた所有ファイルの整理も完了しました。'
-            return
-        }
         Set-MoyaiSandboxParentAccess $location.parent
         $command = '"' + $location.helper + '" --service'
         $stage = Join-Path $location.parent ('SandboxService.stage-' + [Guid]::NewGuid().ToString('N'))
         $backup = Join-Path $location.parent ('SandboxService.previous-' + [Guid]::NewGuid().ToString('N'))
-        $disabled = $false; $created = $false; $removed = $false; $movedOld = $false; $movedNew = $false
+        $disabled = $false; $created = $false; $movedOld = $false; $movedNew = $false
         $originalStart = if($null -ne $service){$service.Start}else{3}
         try {
-            if (-not $Uninstall) {
-                [void](New-Item -ItemType Directory -Path $stage)
-                Set-MoyaiSandboxProtection $stage $true -Private
-                foreach ($file in $payload) {
-                    Assert-MoyaiSandboxRegularPath $file.source
-                    $target = Join-Path $stage $file.name
-                    Copy-MoyaiSandboxPinnedPayload $pins.files['app/bin/'+$file.name] $target
-                    Set-MoyaiSandboxProtection $target $false -Private
-                    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne $file.sha256) { throw 'Sandbox payload changed while it was copied.' }
-                }
-                $receipt = [ordered]@{schema=1;product='moyai-machine-sandbox';service=$location.service;install_root=$location.root;version=$manifest.version;visual_cpp=$manifest.runtime.visual_cpp;files=@($payload | ForEach-Object { [ordered]@{name=$_.name;sha256=$_.sha256} })}
-                Write-MoyaiUtf8 (Join-Path $stage 'installation.json') ($receipt | ConvertTo-Json -Depth 5)
-                Set-MoyaiSandboxProtection (Join-Path $stage 'installation.json') $false -Private
-                foreach ($file in $payload) { Set-MoyaiSandboxProtection (Join-Path $stage $file.name) $false }
-                Set-MoyaiSandboxProtection (Join-Path $stage 'installation.json') $false
-                Set-MoyaiSandboxProtection $stage $true
+            [void](New-Item -ItemType Directory -Path $stage)
+            Set-MoyaiSandboxProtection $stage $true -Private
+            foreach ($file in $payload) {
+                Assert-MoyaiSandboxRegularPath $file.source
+                $target = Join-Path $stage $file.name
+                Copy-MoyaiSandboxPinnedPayload $pins.files['app/bin/'+$file.name] $target
+                Set-MoyaiSandboxProtection $target $false -Private
+                if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne $file.sha256) { throw 'Sandbox payload changed while it was copied.' }
             }
+            $receipt = [ordered]@{schema=1;product='moyai-machine-sandbox';service=$location.service;install_root=$location.root;version=$manifest.version;visual_cpp=$manifest.runtime.visual_cpp;files=@($payload | ForEach-Object { [ordered]@{name=$_.name;sha256=$_.sha256} })}
+            Write-MoyaiUtf8 (Join-Path $stage 'installation.json') ($receipt | ConvertTo-Json -Depth 5)
+            Set-MoyaiSandboxProtection (Join-Path $stage 'installation.json') $false -Private
+            foreach ($file in $payload) { Set-MoyaiSandboxProtection (Join-Path $stage $file.name) $false }
+            Set-MoyaiSandboxProtection (Join-Path $stage 'installation.json') $false
+            Set-MoyaiSandboxProtection $stage $true
             if ($null -ne $service) {
                 Assert-MoyaiSandboxClientsStopped
                 Set-MoyaiSandboxService $command 4
@@ -523,15 +817,9 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
                 Assert-MoyaiSandboxService $stopped $location -Disabled -Security
                 if ($stopped.State -ne 1) { throw 'Sandbox did not stop; no files were replaced.' }
             }
-            if($exists) { Move-MoyaiStoppedSandboxToBackup $location.root $backup; $movedOld = $true }
-            if ($Uninstall) {
-                Remove-MoyaiSandboxService
-                $removed = $true
-                $disabled = $false
-                if($movedOld) { Remove-MoyaiSandboxPayloadDirectory $backup $(if($old){$old.files}else{@()}) }
-                Wait-MoyaiSandboxRemoval
-                Write-Output 'PC共通sandbox helperを削除しました。利用者の設定・会話・作業フォルダーは変更していません。'
-                return
+            if($exists) {
+                Assert-MoyaiSandboxPayloadUnused $location.root
+                Move-MoyaiStoppedSandboxToBackup $location.root $backup; $movedOld = $true
             }
             Move-Item -LiteralPath $stage -Destination $location.root
             $movedNew = $true
@@ -546,7 +834,6 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
             $disabled = $false
         } catch {
             $failure = $_
-            if ($removed) { throw "サービスの削除要求は受理されました。$($failure.Exception.Message)" }
             try {
                 if($null -ne $RestoreComponent) { & $RestoreComponent $ComponentContext }
                 if ($disabled -and ($movedOld -or $movedNew)) {
@@ -560,8 +847,15 @@ function Invoke-MoyaiMachineSandboxSetup([string]$SourceRoot, [switch]$Uninstall
             } catch { throw "Sandbox setup failed and rollback requires administrator inspection. Protected staging/backup files were retained. $($_.Exception.Message)" }
             throw $failure
         }
-        if ($movedOld) { Remove-MoyaiSandboxPayloadDirectory $backup $(if($old){$old.files}else{@()}) }
         Write-Output 'PC共通sandbox helperを準備しました。通常の起動で管理者承認は不要です。'
+        # The new helper is active. A still-used old copy is kept for the next update or uninstall;
+        # an unverifiable one is never deleted and is reported by the leftover cleanup.
+        if ($movedOld -and -not $installation.unverified) {
+            try { Invoke-MoyaiSandboxFileRetry { Remove-MoyaiSandboxPayloadDirectory $backup $(if($old){$old.files}else{@()}) } | Out-Null }
+            catch { New-MoyaiSandboxRetainedItem "以前のhelperは使用中のため保持しました。次回の更新・削除で片付けます: $backup" }
+        }
+        # Component setup reports leftovers once, after all selected applications.
+        if ($null -eq $PublishComponent) { Remove-MoyaiSandboxLeftovers $location }
     } finally { $lock.Dispose() }
     } finally { Close-MoyaiSandboxSourcePins $pins }
 }

@@ -205,26 +205,45 @@ function Read-MoyaiInstalledComponent([ValidateSet('Desktop','Hub')][string]$Com
     return $receipt
 }
 
-function Assert-MoyaiComponentStopped([string]$Root, [object[]]$Processes = @(Get-Process -ErrorAction SilentlyContinue)) {
+# Separates "this setup cannot prove it owns the component folder" from unsafe
+# paths. Setup moves an unverifiable folder aside intact instead of refusing.
+function Read-MoyaiInstalledComponentState([ValidateSet('Desktop','Hub')][string]$Component) {
+    $location = Get-MoyaiComponentLocation $Component
+    Assert-MoyaiSandboxRegularPath $location.root
+    try { [pscustomobject]@{receipt=(Read-MoyaiInstalledComponent $Component -AllowMissingFiles);unverified=$false;reason=''} }
+    catch { [pscustomobject]@{receipt=$null;unverified=$true;reason=$_.Exception.Message} }
+}
+
+function Assert-MoyaiComponentStopped([string]$Root, [object[]]$Processes) {
     $boundary=[IO.Path]::GetFullPath($Root).TrimEnd('\','/') + '\'
-    foreach ($process in $Processes) {
-        if ($process.Path -and $process.Path.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { throw "この導入先のアプリが起動中です。Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選びます。単独のRunnerはWindows導入手順の「更新・アンインストール」、Hubは Stop-Hub.cmd を確認してください。PID $($process.Id): $($process.Path)" }
+    $find={ param($List) foreach ($process in $List) { try { $path=$process.Path } catch { $path=$null }; if ($path -and $path.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { "PID $($process.Id): $path" } } }
+    # Without an explicit list, an app that was just closed gets time to leave on its own.
+    $running=@(if($PSBoundParameters.ContainsKey('Processes')) { & $find $Processes } else { Wait-MoyaiProcessesExit { & $find @(Get-Process -ErrorAction SilentlyContinue) } })
+    if ($running.Count) { throw "この導入先のアプリが起動中です。Desktopは「ファイル」から「moyAIを終了（このPCの仕事も停止）」を選びます。単独のRunnerはWindows導入手順の「更新・アンインストール」、Hubは Stop-Hub.cmd を確認してください。終了できない場合はPCを再起動してから再実行してください。$($running -join ', ')" }
+}
+
+function Move-MoyaiComponentDirectory([string]$From,[string]$To) {
+    try { Invoke-MoyaiSandboxFileRetry { [IO.Directory]::Move($From,$To) } }
+    catch {
+        $files=@(Get-ChildItem -LiteralPath $From -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.exe','.dll','.json') } | Select-Object -First 200 | ForEach-Object { $_.FullName })
+        throw (Get-MoyaiSandboxInUseMessage $From @(Get-MoyaiSandboxFileHolders $files))
     }
 }
 
 function Publish-MoyaiComponentPayload($Transaction) {
     $location=$Transaction.location
     Assert-MoyaiComponentStopped $location.root
-    if($null -eq $Transaction.old -and (Test-Path -LiteralPath $location.root)) {
+    if($null -eq $Transaction.old -and -not $Transaction.unverified -and (Test-Path -LiteralPath $location.root)) {
         if(@(Get-ChildItem -LiteralPath $location.root -Force).Count -ne 0) { throw '導入先の内容が確認後に変更されました。再実行してください。' }
         Remove-Item -LiteralPath $location.root
     }
     if(Test-Path -LiteralPath $location.root) {
+        # An unverifiable old folder is moved aside intact; maintenance reports it later.
         $backup=Join-Path $location.parent ($location.component+'.previous-'+[Guid]::NewGuid().ToString('N'))
-        Move-Item -LiteralPath $location.root -Destination $backup
+        Move-MoyaiComponentDirectory $location.root $backup
         $Transaction.backup=$backup
     }
-    Move-Item -LiteralPath $Transaction.stage -Destination $location.root
+    Move-MoyaiComponentDirectory $Transaction.stage $location.root
     $Transaction.published=$true
     [void](Read-MoyaiInstalledComponent $location.component -VerifyHashes)
 }
@@ -233,11 +252,11 @@ function Restore-MoyaiComponentPayload($Transaction) {
     $location=$Transaction.location
     if($Transaction.published) {
         Assert-MoyaiComponentStopped $location.root
-        Move-Item -LiteralPath $location.root -Destination $Transaction.stage
+        Move-MoyaiComponentDirectory $location.root $Transaction.stage
         $Transaction.published=$false
     }
     if($Transaction.backup -and -not(Test-Path -LiteralPath $location.root)) {
-        Move-Item -LiteralPath $Transaction.backup -Destination $location.root
+        Move-MoyaiComponentDirectory $Transaction.backup $location.root
         $Transaction.backup=$null
     }
 }
@@ -279,6 +298,7 @@ function Remove-MoyaiMachineLegacyModules([string[]]$Components,[switch]$SharedR
                 Assert-MoyaiSandboxProtectedPath $candidate.FullName
                 Assert-MoyaiComponentStopped $candidate.FullName
                 $receiptPath=Join-Path $candidate.FullName 'machine-component.json'
+                if(-not(Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw '導入記録がないため、所有を確認できません。中身を確認してから管理者が削除してください。' }
                 Assert-MoyaiSandboxProtectedPath $receiptPath
                 $receipt=Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 if($receipt.product -cne 'moyai-machine-component' -or $receipt.component -cne $component -or $receipt.install_root -ine (Get-MoyaiComponentLocation $component).root -or $receipt.source_manifest_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw '旧配置の導入記録が一致しません。' }
@@ -290,26 +310,7 @@ function Remove-MoyaiMachineLegacyModules([string[]]$Components,[switch]$SharedR
     if($SharedRuntime) {
         $legacy=Join-Path $parent 'Sandbox'
         if(Test-Path -LiteralPath $legacy) { Write-MoyaiRetainedItem "旧Sandboxを保持しました。現在の導入記録だけでは所有ファイルと参照元を確認できません: $legacy" }
-        foreach($candidate in @(Get-ChildItem -LiteralPath $parent -Directory | Where-Object { $_.Name.StartsWith('SandboxService.previous-',[StringComparison]::OrdinalIgnoreCase) -or $_.Name.StartsWith('SandboxService.stage-',[StringComparison]::OrdinalIgnoreCase) })) {
-            try {
-                Assert-MoyaiSandboxProtectedPath $candidate.FullName
-                Assert-MoyaiComponentStopped $candidate.FullName
-                $receiptPath=Join-Path $candidate.FullName 'installation.json'
-                Assert-MoyaiSandboxProtectedPath $receiptPath
-                $receipt=Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                if($receipt.schema -ne 1 -or $receipt.product -cne 'moyai-machine-sandbox' -or $receipt.service -cne 'MoyAISandbox' -or $receipt.install_root -cne (Get-MoyaiSandboxLocation).root) { throw '共通サービスの旧導入記録を確認できません。' }
-                foreach($file in $receipt.files) {
-                    if($file.name -cne [IO.Path]::GetFileName($file.name) -or $file.name -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$' -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw '旧導入記録のファイル一覧が不正です。' }
-                    $path=Join-Path $candidate.FullName $file.name
-                    if(-not(Test-Path -LiteralPath $path)) { continue }
-                    Assert-MoyaiSandboxProtectedPath $path
-                    if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $file.sha256) { throw '旧実行ファイルが導入記録と一致しません。' }
-                }
-                $references=@(Get-CimInstance Win32_Service | Where-Object { $_.PathName -and $_.PathName.IndexOf($candidate.FullName,[StringComparison]::OrdinalIgnoreCase) -ge 0 })
-                if($references.Count) { throw '旧配置を参照するサービスが残っています。' }
-                Remove-MoyaiSandboxPayloadDirectory $candidate.FullName $receipt.files
-            } catch { Write-MoyaiRetainedItem "共通サービスの旧配置を保持しました: $($candidate.FullName) / $($_.Exception.Message)" }
-        }
+        Remove-MoyaiSandboxLeftovers (Get-MoyaiSandboxLocation)
     }
 }
 
@@ -353,13 +354,16 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
             foreach($component in $Components) {
                 $location=Get-MoyaiComponentLocation $component
                 Assert-MoyaiComponentStopped $location.root
-                [void](Read-MoyaiInstalledComponent $component -AllowMissingFiles)
+                $state=Read-MoyaiInstalledComponentState $component
+                # A data reset is allowed only when the app itself will be removed afterwards.
+                if($state.unverified -and $null -ne $BeforeRemoval) { throw "導入記録を確認できないため、保存データの初期化とアプリの削除を中止しました: $($location.root) / $($state.reason)" }
                 if(-not $Uninstall -and [IO.Path]::GetFullPath($SourceRoot).TrimEnd('\','/') -ieq $location.root) { throw '導入先から更新はできません。新しい配布物を別フォルダーへ展開し、そちらのSetupを実行してください。' }
             }
             if($RemoveSharedRuntime) {
                 foreach($component in @('Desktop','Hub')) { Assert-MoyaiComponentStopped (Get-MoyaiComponentLocation $component).root }
                 $sandbox=Get-MoyaiSandboxLocation
-                $service=Get-MoyaiSandboxService -Security
+                # A pending deletion that Windows no longer lets setup open is not an error here.
+                $service=(Get-MoyaiSandboxServiceState -Security).service
                 if($null -ne $service) {
                     Assert-MoyaiSandboxService $service $sandbox -AllowDisabled -Security
                     if(Test-Path -LiteralPath $sandbox.root) { [void](Read-MoyaiSandboxInstallation $sandbox -AllowMissingFiles) }
@@ -378,8 +382,13 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
             }
             foreach($component in $Components) {
                 $location=Get-MoyaiComponentLocation $component
-                $old=Read-MoyaiInstalledComponent $component -AllowMissingFiles
+                $state=Read-MoyaiInstalledComponentState $component
+                $old=$state.receipt
                 if($Uninstall) {
+                    if($state.unverified) {
+                        Write-MoyaiRetainedItem "導入記録を確認できないため、削除せずに残しました: $($location.root) / $($state.reason) 中身を確認してから管理者が削除してください。"
+                        continue
+                    }
                     if($null -ne $old) {
                         $removal=Remove-MoyaiComponentPayload $location.root $old
                         foreach($path in $removal.retained) { Write-MoyaiRetainedItem "追加・変更されたファイルを保持しました: $path" }
@@ -422,7 +431,7 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                 Write-MoyaiComponentJson (Join-Path $stage 'machine-component.json') $receipt
                 Set-MoyaiComponentTreeOwner $stage
                 Set-MoyaiSandboxProtection $stage $true
-                $transaction=[pscustomobject]@{location=$location;stage=$stage;old=$old;backup=$null;published=$false}
+                $transaction=[pscustomobject]@{location=$location;stage=$stage;old=$old;unverified=$state.unverified;backup=$null;published=$false}
                 # Finish copying and checking the new application before stopping
                 # its shared helper. Source/download failures leave the old install usable.
                 if($component -ceq 'Desktop') {
@@ -432,7 +441,7 @@ function Invoke-MoyaiMachineComponent([string]$SourceRoot, [string[]]$Components
                     catch { Restore-MoyaiComponentPayload $transaction; throw }
                 }
                 $backup=$transaction.backup
-                if($backup) {
+                if($backup -and $null -ne $old) {
                     $removal=Remove-MoyaiComponentPayload $backup $old
                     foreach($path in $removal.retained) { Write-MoyaiRetainedItem "追加・変更された旧配置ファイルを保持しました: $path" }
                 }
@@ -466,7 +475,7 @@ function New-MoyaiComponentSourceSnapshot([string]$SourceRoot,$Manifest,[string[
         $snapshotManifest | Add-Member NoteProperty uninstall_only $true -Force
         foreach($component in $Components) {
             if($snapshotManifest.components.PSObject.Properties.Name -ccontains $component) { continue }
-            $installed=Read-MoyaiInstalledComponent $component -AllowMissingFiles
+            $installed=(Read-MoyaiInstalledComponentState $component).receipt
             if($null -eq $installed) { continue }
             $snapshotManifest.components | Add-Member NoteProperty $component ([pscustomobject]@{version=$installed.version})
             $cleanup=if($component -ceq 'Desktop'){'app/maintenance/moyai-cleanup-desktop.exe'}else{'moyai-cleanup-hub.exe'}
@@ -960,7 +969,9 @@ function Invoke-MoyaiComponentUserSetup(
     foreach($component in $Components) {
         $location=Get-MoyaiComponentLocation $component
         Assert-MoyaiComponentStopped $location.root
-        [void](Read-MoyaiInstalledComponent $component -AllowMissingFiles)
+        $state=Read-MoyaiInstalledComponentState $component
+        if($state.unverified -and (($component -ceq 'Desktop' -and $ResetDesktopData) -or ($component -ceq 'Hub' -and $ResetHubData))) { throw "導入記録を確認できないため、${component}のアプリ本体を削除できません。保存データは初期化していません。初期化を選ばずにアンインストールするか、PCの管理者に確認してください。対象: $($location.root) / $($state.reason)" }
+        if($state.unverified) { Write-Output "導入記録を確認できない既存のフォルダーがあります: $($location.root) / $($state.reason) $(if($Uninstall){'削除せずに残し、理由を表示します。'}else{'削除せずに退避してから導入します。'})" }
         Write-Output "$(if($Uninstall){'削除'}else{'導入'})対象: $component / $($location.root)"
     }
     if(-not $Uninstall -and $Components -ccontains 'Desktop') {
@@ -974,13 +985,18 @@ function Invoke-MoyaiComponentUserSetup(
         $root=(Get-MoyaiComponentLocation 'Desktop').root
         $rootMissing=-not(Test-Path -LiteralPath $root)
         $hasManifest=Test-Path -LiteralPath (Join-Path $root 'deployment.json') -PathType Leaf
-        $machineReceipt=if(-not $rootMissing -and -not $hasManifest) { Read-MoyaiInstalledComponent 'Desktop' -AllowMissingFiles }
+        $machineReceipt=if(-not $rootMissing -and -not $hasManifest) { (Read-MoyaiInstalledComponentState 'Desktop').receipt }
         $removedFixed=$rootMissing -and (Test-Path -LiteralPath (Join-Path $SourceRoot 'scripts/common.ps1') -PathType Leaf)
         if($hasManifest -or $null -ne $machineReceipt -or $removedFixed) {
             if(-not(Get-Command Read-MoyaiDeployment -ErrorAction SilentlyContinue)) { Import-MoyaiComponentDesktopCommands $SourceRoot; . $script:componentDesktopCommandsPath }
-            $installed=if($hasManifest) { Read-MoyaiDeployment $root -AllowMissingFiles } else { $machineReceipt }
-            $receipt=if($null -ne $installed) { Get-MoyaiComponentUserReceipt $root $installed }
-            $desktopRegistration=[pscustomobject]@{root=$root;manifest=$installed;receipt=$receipt;removed_fixed=$removedFixed}
+            try {
+                $installed=if($hasManifest) { Read-MoyaiDeployment $root -AllowMissingFiles } else { $machineReceipt }
+                $receipt=if($null -ne $installed) { Get-MoyaiComponentUserReceipt $root $installed }
+                $desktopRegistration=[pscustomobject]@{root=$root;manifest=$installed;receipt=$receipt;removed_fixed=$removedFixed}
+            } catch {
+                # A damaged old Desktop must not block removal; its HKCU entries are only kept.
+                Write-Output "Desktopの自動起動・接続ファイルの関連付け・ショートカットは、導入記録を確認できないため今回は解除しません。必要な場合は、Windowsの設定から個別に解除してください。理由: $($_.Exception.Message)"
+            }
         } elseif($rootMissing) {
             Write-Output 'Desktop本体がなく、この配布物ではDesktopの利用者登録を確認できません。自動起動や関連付けが残る場合は、同じWindows利用者でDesktop配布物の Uninstall-moyAI.cmd を開いてください。'
         }

@@ -617,6 +617,9 @@ Invoke-FixtureSetup -Extra @('-Uninstall', '-CheckOnly') -Shortcuts
 Assert-That ((Test-Path -LiteralPath $mainLink) -and (Test-Path -LiteralPath $teamLink) -and $lastSetupOutput.Contains($teamLink) -and -not $lastSetupOutput.Contains($mainLink)) 'uninstall preview selects only shortcuts pointing at the selected installation and deletes none'
 Invoke-FixtureSetup -Extra @('-Uninstall') -Shortcuts
 Assert-That ((Test-Path -LiteralPath $mainLink) -and -not (Test-Path -LiteralPath $teamLink) -and $shell.CreateShortcut($mainLink).WorkingDirectory -ieq $desktopInstallation) 'uninstall removes its own Team Management shortcut and preserves another installation main shortcut'
+Assert-That (-not (Test-Path -LiteralPath $hubInstallation)) 'an unmodified installation is removed completely'
+Invoke-FixtureSetup -Extra @('-Uninstall') -Shortcuts
+Assert-That ($lastSetupOutput.Contains('既に削除済み') -and $lastSetupOutput.Contains($hubInstallation) -and (Test-Path -LiteralPath $mainLink) -and -not (Test-Path -LiteralPath $hubInstallation)) 'repeated uninstall of an absent installation succeeds, names the folder and changes nothing'
 $editedLink = $shell.CreateShortcut($mainLink)
 $editedLink.Arguments += ' -CustomArgument'
 $editedLink.Save()

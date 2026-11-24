@@ -11,6 +11,11 @@ function Assert-Fails([scriptblock]$Action,[string]$Message) { $failed=$false; t
 # Compile declarations without invoking any Windows service API.
 Initialize-MoyaiSandboxNative
 Assert-That ($null -ne ('MoyaiSandboxSetup.Native' -as [type])) 'native SCM interop declarations compile without invoking SCM'
+# Restart Manager is read-only; this checks the real query on a task-local file.
+$heldPath=Join-Path $EvidenceRoot 'held-by-this-test.exe'; [IO.File]::WriteAllText($heldPath,'inert')
+$held=[IO.File]::Open($heldPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+try { $reported=@([MoyaiSandboxSetup.Native]::FileHolders(@($heldPath))) } finally { $held.Dispose() }
+Assert-That (@($reported | Where-Object { $_.StartsWith("$PID|") }).Count -eq 1 -and @([MoyaiSandboxSetup.Native]::FileHolders(@($heldPath))).Count -eq 0) 'Restart Manager names the process that holds a helper file and nothing after release'
 $script:realProtection=${function:Set-MoyaiSandboxProtection}
 $script:realElevation=${function:Invoke-MoyaiSandboxElevation}
 
@@ -18,7 +23,8 @@ $script:realElevation=${function:Invoke-MoyaiSandboxElevation}
 # boundaries are replaced before a product operation is called; no executable runs.
 $script:caseNumber=0
 function New-Case {
-    $script:markedForDeletion=$false; $script:keepDeletePending=$false
+    $script:markedForDeletion=$false; $script:keepDeletePending=$false; $script:pendingReadable=$false; $script:pendingService=$null
+    $script:holders=@(); $script:payloadRemovalFailures=0; $script:pendingClearsOnStop=$false
     $script:caseNumber++
     $script:caseRoot=Join-Path $EvidenceRoot ([string]$script:caseNumber)
     $script:machine=Join-Path $script:caseRoot 'machine'
@@ -55,11 +61,24 @@ function Copy-MoyaiSandboxPinnedPayload($Stream,[string]$Target) {
     if ($script:corruptCopy) { [IO.File]::AppendAllText($Target,'injected mismatch'); $script:corruptCopy=$false }
 }
 function Get-MoyaiSandboxService([switch]$Security) {
-    if($script:markedForDeletion) { throw [ComponentModel.Win32Exception]::new(1072) }
+    if($script:markedForDeletion -and -not $script:pendingReadable) { throw [ComponentModel.Win32Exception]::new(1072) }
+    if($script:markedForDeletion) { return $script:pendingService }
     return $script:service
+}
+function Test-MoyaiSandboxServiceDeletePending { [bool]$script:markedForDeletion }
+function Get-MoyaiSandboxRemovalWaitMilliseconds { 300 }
+function Get-MoyaiSandboxFileRetryMilliseconds { 400 }
+function Get-MoyaiSandboxProcessWaitMilliseconds { 8000 }
+function Get-MoyaiSandboxFileHolders([string[]]$Paths) { if(@($Paths).Count){ @($script:holders) } }
+function Get-MoyaiServicesReferencingPath([string]$Path) { @() }
+$script:realPayloadRemoval=${function:Remove-MoyaiSandboxPayloadDirectory}
+function Remove-MoyaiSandboxPayloadDirectory([string]$Path,$Files) {
+    if($script:payloadRemovalFailures -gt 0) { $script:payloadRemovalFailures--; throw [IO.IOException]::new('Injected sharing violation.',[int]0x80070020) }
+    & $script:realPayloadRemoval $Path $Files
 }
 function Set-MoyaiSandboxService([string]$Command,[uint32]$Start,[switch]$Create) {
     $script:calls.Add("configure:$Start")
+    if ($script:markedForDeletion) { throw [ComponentModel.Win32Exception]::new(1072) }
     if ($Start -eq 3 -and $script:failEnable) { $script:failEnable=$false; throw 'Injected change-config failure.' }
     if ($Create) { if ($null -ne $script:service) { throw 'Service already exists.' }; $script:service=[pscustomobject]@{Type=16;Start=$Start;ErrorControl=1;State=1;Command=$Command;Account='LocalSystem';Dependencies='';Sddl='D:'} }
     else { if ($null -eq $script:service) { throw 'Missing service.' }; $script:service.Start=$Start; $script:service.Command=$Command }
@@ -69,11 +88,15 @@ function Set-MoyaiSandboxServiceSecurity([string]$Sddl) { $script:calls.Add('sec
 function Remove-MoyaiSandboxService {
     $script:calls.Add('delete')
     if ($script:failDelete) { $script:failDelete=$false; throw 'Injected delete failure.' }
-    if ($script:keepDeletePending) { $script:markedForDeletion=$true }
+    if ($script:keepDeletePending) { $script:markedForDeletion=$true; $script:pendingService=$script:service; $script:service=$null }
     else { $script:service=$null }
 }
 function Assert-MoyaiSandboxClientsStopped { if($script:clientRunning){throw 'A client still owns work.'} }
-function Stop-MoyaiSandboxService { $script:calls.Add('stop'); if($script:failStop){throw 'Stop timed out.'}; $script:service.State=1 }
+function Stop-MoyaiSandboxService {
+    $script:calls.Add('stop'); if($script:failStop){throw 'Stop timed out.'}
+    if($script:markedForDeletion) { $script:pendingService.State=1; if($script:pendingClearsOnStop) { $script:markedForDeletion=$false; $script:pendingService=$null } ; return }
+    $script:service.State=1
+}
 function Invoke-MoyaiSandboxElevation([string]$SourceRoot,$Manifest) { $script:elevationCount++; throw 'Simulated user cancellation; no process was started.' }
 
 New-Case
@@ -144,12 +167,133 @@ Assert-That ($null -eq $script:service -and -not (Test-Path -LiteralPath $locati
 
 New-Case
 Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
 $script:keepDeletePending=$true
-$pendingReason=''
-try { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null } catch { $pendingReason=$_.Exception.Message }
-Assert-That ($pendingReason.Contains('削除を保留')) 'a marked-for-deletion service is reported as pending instead of complete'
-$script:keepDeletePending=$false; $script:markedForDeletion=$false; $script:service=$null
+$pendingOutput=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+$pendingNotice=@($pendingOutput | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' })
+Assert-That ($pendingNotice.Count -eq 1 -and $pendingNotice[0].Contains('消去を保留') -and $pendingNotice[0].Contains('再起動') -and -not(Test-Path -LiteralPath $location.root) -and @(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.*').Count -eq 0) 'an accepted deletion that Windows keeps pending completes the uninstall with a retained notice and next steps'
+$before=$script:calls.Count
+$script:clientRunning=$true
+$repeatPending=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+Assert-That (@($repeatPending | Where-Object { $_.Contains('消去を保留') }).Count -eq 1 -and $script:calls.Count -eq $before+1) 'repeated uninstall while deletion is pending succeeds without client checks or SCM changes'
+$script:clientRunning=$false
+$installFailure=''
+try { Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null } catch { $installFailure=$_.Exception.Message }
+Assert-That ($installFailure.Contains('導入できません') -and $installFailure.Contains('再起動') -and -not(Test-Path -LiteralPath $location.root) -and @(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.stage-*').Count -eq 0) 'install waits for a pending deletion and explains the next step without creating files'
+$script:keepDeletePending=$false; $script:markedForDeletion=$false; $script:pendingService=$null
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+Assert-That ($script:service.Start -eq 3 -and -not(Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed) 'reinstall succeeds once Windows has finished the pending deletion'
+Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+Assert-That ($script:service.Start -eq 3 -and -not(Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed) 'uninstall before an update followed by install completes end to end'
 Assert-That ((Get-Content -LiteralPath $legacySentinel -Raw) -ceq 'previous transient helper evidence') 'install, update and explicit removal preserve the legacy Sandbox directory'
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
+# DeleteService accepted earlier, but the registration can still be opened and read.
+$script:service.Start=4; $script:pendingService=$script:service; $script:service=$null; $script:markedForDeletion=$true; $script:pendingReadable=$true
+$before=$script:calls.Count
+$readablePending=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+Assert-That (-not(Test-Path -LiteralPath $location.root) -and @($readablePending | Where-Object { $_.Contains('消去を保留') }).Count -eq 1 -and -not(@($script:calls | Select-Object -Skip $before) -contains 'delete')) 'a readable pending registration is not deleted again while its owned payload is removed'
+$script:markedForDeletion=$false; $script:pendingReadable=$false; $script:pendingService=$null
+
+New-Case
+[void](New-Item -ItemType Directory -Path $script:machine)
+Write-MoyaiUtf8 (Join-Path $script:machine 'sandbox-setup.lock') ''
+$script:clientRunning=$true
+$absent=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+Assert-That ($absent.Count -eq 1 -and $absent[0].Contains('既に削除済み')) 'uninstall of an absent helper succeeds even while a moyAI app is running'
+Remove-Item -LiteralPath (Join-Path $script:machine 'sandbox-setup.lock'); Remove-Item -LiteralPath $script:machine
+$absent=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+Assert-That ($absent.Count -eq 1 -and $absent[0].Contains('既に削除済み') -and -not(Test-Path -LiteralPath $script:machine)) 'uninstall without the machine folder is a successful no-op that creates nothing'
+$script:clientRunning=$false
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
+# A client keeps the helper pinned like InstalledService does (read, no delete sharing).
+$pin=[IO.File]::Open($location.helper,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+$script:holders=@('moyai-0123456789abcdef (PID 4242)')
+$busy=''
+try { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null } catch { $busy=$_.Exception.Message } finally { $pin.Dispose() }
+Assert-That ($busy.Contains('使用中') -and $busy.Contains('PID 4242') -and $busy.Contains('再起動') -and $busy.Contains('強制終了しません')) 'a pinned helper folder names the holder and the next step instead of a raw access error'
+Assert-That ($null -ne $script:service -and $script:service.Start -eq 3 -and (Test-Path -LiteralPath $location.helper)) 'an in-use helper keeps both its registration and files usable'
+$script:holders=@()
+Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
+Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root)) 'uninstall succeeds after the holder exits'
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
+# The helper reported STOPPED but its image is still mapped, so deletion keeps failing.
+$script:payloadRemovalFailures=1000; $script:holders=@('moyai-sandbox.exe (PID 777)')
+$partial=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+$kept=@($partial | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' })
+$leftover=@(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.previous-*')
+Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root) -and $leftover.Count -eq 1 -and $kept.Count -eq 1 -and $kept[0].Contains('PID 777') -and $kept[0].Contains('残ったファイルだけ')) 'a still-used old helper is kept outside the fixed path with guidance after the registration is removed'
+$script:payloadRemovalFailures=0; $script:holders=@()
+$retry=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+Assert-That (@(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.previous-*').Count -eq 0 -and @($retry | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' }).Count -eq 0) 'rerunning uninstall removes only the leftover copy'
+$script:payloadRemovalFailures=1
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall | Out-Null
+Assert-That ($null -eq $script:service -and @(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.*').Count -eq 0) 'a helper that leaves within the retry window is removed in the same run'
+$foreign=Join-Path $location.parent 'SandboxService.previous-foreign'
+[void](New-Item -ItemType Directory -Path $foreign); Write-MoyaiUtf8 (Join-Path $foreign 'notes.txt') 'not created by setup'
+$foreignRun=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+Assert-That ((Test-Path -LiteralPath (Join-Path $foreign 'notes.txt')) -and @($foreignRun | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' -and $_.Contains('所有を確認できません') }).Count -eq 1) 'a leftover folder without an installation record is kept and reported'
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
+# Damaged old module: its record is gone and an unknown file was added.
+Remove-Item -LiteralPath (Join-Path $location.root 'installation.json')
+Write-MoyaiUtf8 (Join-Path $location.root 'notes.txt') 'kept by an administrator'
+Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'helper for overwrite install'
+Write-FixtureManifest 'system-installed'
+Assert-That (Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed 'an unverifiable old module is seen as an update before UAC instead of an error'
+$overwrite=@(Invoke-MoyaiMachineSandboxSetup $script:source)
+$aside=@(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.previous-*' | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'notes.txt') })
+Assert-That ($script:service.Start -eq 3 -and -not(Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed -and $aside.Count -eq 1 -and (Get-Content -LiteralPath (Join-Path $aside[0].FullName 'notes.txt') -Raw) -ceq 'kept by an administrator' -and @($overwrite | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' -and $_.Contains('所有を確認できません') }).Count -eq 1) 'overwrite install replaces an unverifiable old module, keeps it intact aside and reports it'
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
+# A process started from the old helper folder that is still leaving (a just-stopped helper).
+$lingering=Join-Path $location.root 'lingering.exe'
+Copy-Item -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'PING.EXE') -Destination $lingering
+$process=Start-Process -FilePath $lingering -ArgumentList @('-n','4','127.0.0.1') -WindowStyle Hidden -PassThru
+try {
+    Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'helper installed after the old process left'
+    Write-FixtureManifest 'system-installed'
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+    Assert-That ($process.HasExited -and $timer.ElapsedMilliseconds -ge 1000 -and $script:service.Start -eq 3 -and -not(Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed) 'overwrite install waits for a just-closed process from the old folder to leave instead of failing'
+} finally { [void]$process.WaitForExit(15000) }
+$process=Start-Process -FilePath (Join-Path ([Environment]::SystemDirectory) 'PING.EXE') -ArgumentList @('-n','12','127.0.0.1') -WindowStyle Hidden -PassThru
+$realProcessQuery=${function:Get-MoyaiProcessesUnderRoot}
+try {
+    # A process that does not leave keeps the update from starting; nothing is killed.
+    function Get-MoyaiProcessesUnderRoot([string]$Root) { if(-not $process.HasExited){ "held (PID $($process.Id)): $Root\held.exe" } }
+    $helperBefore=(Get-FileHash -LiteralPath $location.helper).Hash
+    Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'helper blocked by a live process'
+    Write-FixtureManifest 'system-installed'
+    $blocked=''
+    try { Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null } catch { $blocked=$_.Exception.Message }
+    Assert-That ($blocked.Contains("PID $($process.Id)") -and $blocked.Contains('再起動') -and -not $process.HasExited -and (Get-FileHash -LiteralPath $location.helper).Hash -ceq $helperBefore -and $script:service.Start -eq 3) 'a process that keeps running is named, left running, and the old helper stays usable'
+} finally { Set-Item Function:Get-MoyaiProcessesUnderRoot $realProcessQuery; if(-not $process.HasExited){ [void]$process.WaitForExit(20000) } }
+
+New-Case
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+$location=Get-MoyaiSandboxLocation
+# Uninstall was accepted while the old helper still ran; Windows keeps the name until it stops.
+$script:service.State=4; $script:service.Start=4; $script:pendingService=$script:service; $script:service=$null
+$script:markedForDeletion=$true; $script:pendingReadable=$true; $script:pendingClearsOnStop=$true
+Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/moyai-sandbox.exe') 'helper after pending deletion'
+Write-FixtureManifest 'system-installed'
+Invoke-MoyaiMachineSandboxSetup $script:source | Out-Null
+Assert-That ($script:calls -contains 'stop' -and $null -ne $script:service -and $script:service.Start -eq 3 -and -not(Get-MoyaiSandboxInstallPlan $script:source $script:manifest).needed) 'install stops a still-running pending registration normally and registers again once Windows removes it'
 
 foreach($damage in @('helper','directory','parent','service','empty','disabled')) {
     New-Case
@@ -266,7 +410,9 @@ Remove-Item -LiteralPath $extraInstalled
 Remove-Item -LiteralPath (Join-Path $script:source 'app/bin/msvcp140.dll'); Write-FixtureManifest 'app-local'
 Assert-Fails { Get-MoyaiSandboxInstallPlan $script:source $script:manifest } 'incomplete bundled runtime is rejected before any service mutation'
 Write-MoyaiUtf8 (Join-Path $location.root 'unexpected.dll') 'unowned'
-Assert-Fails { Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall } 'machine uninstall refuses unowned files rather than recursively deleting them'
+$unowned=@(Invoke-MoyaiMachineSandboxSetup $script:source -Uninstall)
+$aside=@(Get-ChildItem -LiteralPath $location.parent -Directory -Filter 'SandboxService.previous-*' | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'unexpected.dll') })
+Assert-That ($null -eq $script:service -and -not(Test-Path -LiteralPath $location.root) -and $aside.Count -eq 1 -and @($unowned | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' -and $_.Contains('所有を確認できません') }).Count -eq 1) 'uninstall with unowned files removes the registration and moves the folder aside intact instead of deleting it'
 
 New-Case
 Write-MoyaiUtf8 (Join-Path $script:source 'app/bin/foreign.dll') 'not inventoried'

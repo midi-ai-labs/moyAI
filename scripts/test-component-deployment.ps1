@@ -94,6 +94,32 @@ Assert-That (Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe')) 'setup acc
 Remove-Item -LiteralPath (Join-Path $hub 'moyai-hub.exe')
 Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
 Assert-That (Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe')) 'setup repairs a partially removed component without resetting its sibling'
+# Damaged old module: the record is gone while files remain.
+Remove-Item -LiteralPath (Join-Path $hub 'machine-component.json')
+[IO.File]::WriteAllText((Join-Path $hub 'admin-notes.txt'),'keep this')
+$before=@(Get-ChildItem -LiteralPath $machine -Directory -Filter 'Hub.previous-*' | ForEach-Object { $_.FullName })
+$overwrite=@(Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256)
+$aside=@(Get-ChildItem -LiteralPath $machine -Directory -Filter 'Hub.previous-*' | Where-Object { $_.FullName -notin $before })
+Assert-That ($null -ne (Read-MoyaiInstalledComponent 'Hub' -VerifyHashes) -and $aside.Count -eq 1 -and (Get-Content -LiteralPath (Join-Path $aside[0].FullName 'admin-notes.txt') -Raw) -ceq 'keep this' -and (Test-Path -LiteralPath (Join-Path $aside[0].FullName 'moyai-hub.exe'))) 'overwrite install replaces an unverifiable old component and keeps the old folder intact aside'
+Assert-That (@($overwrite | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' -and ([string]$_).Contains($aside[0].FullName) -and ([string]$_).Contains('導入記録がない') }).Count -eq 1) 'the set-aside old component is reported with the reason it was not deleted'
+Remove-Item -LiteralPath $aside[0].FullName -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $hub 'machine-component.json')
+$unverifiedRemoval=@(Invoke-MoyaiMachineComponent $package @('Hub') -Uninstall -ExpectedManifestSha256 $manifest.validated_manifest_sha256)
+Assert-That ((Test-Path -LiteralPath (Join-Path $hub 'moyai-hub.exe')) -and @($unverifiedRemoval | Where-Object { $_.PSObject.TypeNames -contains 'Moyai.RetainedItem' -and ([string]$_).Contains('削除せずに残しました') }).Count -eq 1) 'uninstall of an unverifiable component completes, keeps its files and reports the reason'
+Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
+Get-ChildItem -LiteralPath $machine -Directory -Filter 'Hub.previous-*' | Where-Object { $_.FullName -notin $before } | Remove-Item -Recurse -Force
+Assert-That ($null -ne (Read-MoyaiInstalledComponent 'Hub' -VerifyHashes)) 'a later overwrite install restores a verified component without an uninstall'
+$held=[IO.File]::Open((Join-Path $hub 'moyai-hub.exe'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+$realRetry=${function:Get-MoyaiSandboxFileRetryMilliseconds}; $realHolders=${function:Get-MoyaiSandboxFileHolders}
+function Get-MoyaiSandboxFileRetryMilliseconds { 400 }
+function Get-MoyaiSandboxFileHolders([string[]]$Paths) { @("moyai-hub (PID $PID)") }
+try {
+    $busy=''
+    try { Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null } catch { $busy=$_.Exception.Message }
+} finally { $held.Dispose(); Set-Item Function:Get-MoyaiSandboxFileRetryMilliseconds $realRetry; Set-Item Function:Get-MoyaiSandboxFileHolders $realHolders }
+Assert-That ($busy.Contains('使用中') -and $busy.Contains("PID $PID") -and $null -ne (Read-MoyaiInstalledComponent 'Hub' -VerifyHashes)) 'a component held open by another process names the holder and keeps the installed version'
+Invoke-MoyaiMachineComponent $package @('Hub') -ExpectedManifestSha256 $manifest.validated_manifest_sha256 | Out-Null
+Assert-That ($null -ne (Read-MoyaiInstalledComponent 'Hub' -VerifyHashes)) 'overwrite install succeeds after the holder closes'
 $savedRead=${function:Read-MoyaiInstalledComponent}
 function Read-MoyaiInstalledComponent($Component,[switch]$AllowMissingFiles,[switch]$VerifyHashes) {
     if($VerifyHashes){throw 'Injected final placement validation failure'}

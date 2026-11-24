@@ -47,7 +47,7 @@ try {
     try { $receipt = Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw "導入記録を読み込めません。記録を削除せず、配布担当へ確認してください。対象: $receiptPath`n詳細: $($_.Exception.Message)" }
     if ($receipt.product -ne 'moyai-windows-user' -or $receipt.install_root -ine $InstallRoot) { throw '導入記録と現在のフォルダーが一致しません。元の導入先から実行するか、配布担当へ確認してください。対象: installation.json' }
-  } elseif ($Uninstall) { throw '指定した導入先にmoyAIがありません。アンインストールする導入先を確認してください。' }
+  } elseif ($Uninstall) { Write-Output "指定した導入先にmoyAIはありません。既に削除済みとして終了します。`n導入先: $InstallRoot`n別の場所へ導入した場合は、その導入先を指定して再実行してください。"; exit 0 }
   if ($sourceRoot -eq $InstallRoot -and -not $Uninstall) { throw '導入済みフォルダーから更新はできません。新しいZIPを別のフォルダーへ展開し、そちらのSetup-moyAI.cmdを開いてください。' }
   if ($sourceRoot.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase) -and -not $Uninstall) { throw '新しいZIPが導入済みフォルダーの内側にあります。導入先の外へ展開し直し、そちらのSetup-moyAI.cmdを開いてください。' }
   $runningNotice = Get-MoyaiRunningAppNotice $InstallRoot @(Get-Process -ErrorAction SilentlyContinue)

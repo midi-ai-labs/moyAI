@@ -132,10 +132,41 @@ impl Drop for Allocation {
     }
 }
 
+const NO_FALLBACK: &str = "通常起動で管理者承認や制限外実行へ切り替えることはありません。";
+// Setup creates these states on purpose while it updates or removes the helper.
+// They have a known next step, unlike a damaged or foreign registration.
+const NOT_INSTALLED: &str =
+    "実行補助サービス（MoyAISandbox）が導入されていません。Setup-moyAI.cmdで導入してください。";
+const STARTS_DISABLED: &str = "実行補助サービス（MoyAISandbox）は更新または削除の処理中のため、新しい開始を止めています。Setupの完了を待ってからmoyAIを起動し直してください。Setupを中断した場合は、Setup-moyAI.cmdをもう一度実行してください。";
+const DELETE_PENDING: &str = "Windowsが実行補助サービス（MoyAISandbox）の削除を保留しています。Windowsの「サービス」画面や監視ツールを閉じるか、PCを再起動してから、Setup-moyAI.cmdで導入し直してください。";
+const ERROR_SERVICE_DISABLED: i32 = 1058;
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
+
 fn setup_error(detail: impl std::fmt::Display) -> String {
+    let detail = detail.to_string();
+    if [NOT_INSTALLED, STARTS_DISABLED, DELETE_PENDING].contains(&detail.as_str()) {
+        return format!("{detail}{NO_FALLBACK}");
+    }
     format!(
-        "Windows実行補助サービスを確認できません。Setup-moyAI.ps1で導入・更新してください。通常起動で管理者承認や制限外実行へ切り替えることはありません。{detail}"
+        "Windows実行補助サービスを確認できません。Setup-moyAI.ps1で導入・更新してください。{NO_FALLBACK}{detail}"
     )
+}
+
+fn service_condition(code: Option<i32>) -> Option<&'static str> {
+    match code? {
+        ERROR_SERVICE_DISABLED => Some(STARTS_DISABLED),
+        ERROR_SERVICE_DOES_NOT_EXIST => Some(NOT_INSTALLED),
+        ERROR_SERVICE_MARKED_FOR_DELETE => Some(DELETE_PENDING),
+        _ => None,
+    }
+}
+
+fn scm_error(stage: &str) -> String {
+    let error = std::io::Error::last_os_error();
+    service_condition(error.raw_os_error())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{stage}: {error}"))
 }
 
 fn wide(value: &std::ffi::OsStr) -> Result<Vec<u16>, String> {
@@ -269,6 +300,23 @@ fn config_matches(kind: u32, start: u32, binary: &str, account: &str, image: &Pa
         && binary.eq_ignore_ascii_case(&format!("\"{}\" --service", image.display()))
 }
 
+fn config_problem(
+    kind: u32,
+    start: u32,
+    binary: &str,
+    account: &str,
+    image: &Path,
+) -> Option<&'static str> {
+    if config_matches(kind, start, binary, account, image) {
+        return None;
+    }
+    // Setup disables new starts of its own registration during update and removal.
+    if start == 4 && config_matches(kind, 3, binary, account, image) {
+        return Some(STARTS_DISABLED);
+    }
+    Some("installed service has an unexpected image, account, type, or start mode")
+}
+
 pub(super) struct InstalledService {
     service: ServiceHandle,
     image: PathBuf,
@@ -287,7 +335,13 @@ impl InstalledService {
         let base = program_files()?.join("moyAI");
         let directory = base.join("SandboxService");
         let image = directory.join("moyai-sandbox.exe");
-        let ancestors = pin_source_ancestors(&image)?;
+        let ancestors = pin_source_ancestors(&image).map_err(|error| {
+            if matches!(directory.try_exists(), Ok(false)) {
+                NOT_INSTALLED.to_string()
+            } else {
+                error
+            }
+        })?;
         let mut directories = Vec::new();
         for path in [&base, &directory] {
             let file = OpenOptions::new()
@@ -316,7 +370,7 @@ impl InstalledService {
         let name = wide(std::ffi::OsStr::new(super::SERVICE_NAME))?;
         let raw = unsafe { OpenServiceW(manager.0, name.as_ptr(), 0x15) };
         if raw.is_null() {
-            return Err(native::last("open installed sandbox service"));
+            return Err(scm_error("open installed sandbox service"));
         }
         let result = Self {
             service: ServiceHandle(raw),
@@ -353,12 +407,10 @@ impl InstalledService {
         let config = unsafe { &*buffer.as_ptr().cast::<Config>() };
         let binary = config_string(&buffer, config.binary)?;
         let account = config_string(&buffer, config.account)?;
-        if !config_matches(config.kind, config.start, &binary, &account, &self.image) {
-            return Err(
-                "installed service has an unexpected image, account, type, or start mode".into(),
-            );
+        match config_problem(config.kind, config.start, &binary, &account, &self.image) {
+            Some(problem) => Err(problem.into()),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     fn status(&self) -> Result<Status, String> {
@@ -375,7 +427,7 @@ impl InstalledService {
             )
         } == 0
         {
-            return Err(native::last("query installed sandbox service state"));
+            return Err(scm_error("query installed sandbox service state"));
         }
         if status.kind != 0x10 {
             return Err("installed service changed process type".into());
@@ -391,7 +443,7 @@ impl InstalledService {
                 if unsafe { StartServiceW(self.service.0, 0, null()) } == 0
                     && std::io::Error::last_os_error().raw_os_error() != Some(1056)
                 {
-                    return Err(native::last("start installed sandbox service"));
+                    return Err(scm_error("start installed sandbox service"));
                 }
                 Ok(None)
             }
@@ -453,6 +505,56 @@ mod tests {
         ] {
             assert!(!config_matches(kind, start, &binary, account, image));
         }
+    }
+
+    #[test]
+    fn setup_disabled_registration_is_explained_but_never_accepted() {
+        let image = Path::new(r"C:\Program Files\moyAI\SandboxService\moyai-sandbox.exe");
+        let command = format!("\"{}\" --service", image.display());
+        assert_eq!(
+            config_problem(0x10, 3, &command, "LocalSystem", image),
+            None
+        );
+        assert_eq!(
+            config_problem(0x10, 4, &command, "LocalSystem", image),
+            Some(STARTS_DISABLED)
+        );
+        // A disabled start mode does not hide any other difference.
+        for (kind, binary, account) in [
+            (0x20, command.clone(), "LocalSystem"),
+            (
+                0x10,
+                command.replace("Program Files", "Users"),
+                "LocalSystem",
+            ),
+            (0x10, command.clone(), "LocalService"),
+        ] {
+            let problem = config_problem(kind, 4, &binary, account, image).unwrap();
+            assert_ne!(problem, STARTS_DISABLED);
+        }
+        assert_ne!(
+            config_problem(0x10, 2, &command, "LocalSystem", image),
+            Some(STARTS_DISABLED)
+        );
+    }
+
+    #[test]
+    fn setup_transition_states_name_the_next_step() {
+        assert_eq!(service_condition(Some(1058)), Some(STARTS_DISABLED));
+        assert_eq!(service_condition(Some(1060)), Some(NOT_INSTALLED));
+        assert_eq!(service_condition(Some(1072)), Some(DELETE_PENDING));
+        assert_eq!(service_condition(Some(5)), None);
+        assert_eq!(service_condition(None), None);
+        for condition in [NOT_INSTALLED, STARTS_DISABLED, DELETE_PENDING] {
+            let message = setup_error(condition);
+            assert!(message.starts_with(condition));
+            assert!(message.ends_with(NO_FALLBACK));
+            assert!(!message.contains("確認できません"));
+        }
+        let other = setup_error("installed helper differs from this moyAI version");
+        assert!(other.starts_with("Windows実行補助サービスを確認できません。"));
+        assert!(other.contains(NO_FALLBACK));
+        assert!(other.ends_with("installed helper differs from this moyAI version"));
     }
 
     #[test]
