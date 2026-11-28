@@ -6,7 +6,7 @@
 
 Hub側の操作がDesktop/Runnerへ反映する境界は [HUB_DESKTOP_COVERAGE.md](HUB_DESKTOP_COVERAGE.md) で管理する。通常の `smoke` / `regression` はHub結合セットを含まない。Hub browserのprotocol fixture、実Desktop、独立Runner、物理別PCを区別し、必要な結合scenarioを明示して実行する。
 
-`hub.model-propagation` はHubの表示名・標準・指示・無効化・削除を実画面から変更し、接続済みDesktopの自動取得、3用途の選択肢、入力中draft、保存済み個別選択を確認する。Main/Sub/Approveの実Gateway要求を一時的に応答待ちにし、変更前の経路で完了すること、再確認後の要求に新しい経路と指示を使うことを照合する。Approveは実Guardian判定と試験フォルダー内への限定した書込を通す。設定変更後の未確認のMain続行は拒否し、結果と再確認の案内を残す。生成内容は固定応答で、実LLMの推論品質は対象外。
+`hub.model-propagation` はHubの表示名・標準・指示・無効化・削除を実画面から変更し、接続済みDesktopの自動取得、3用途の選択肢、入力中draft、保存済み個別選択を確認する。選択が新しいcatalogでも成り立つ用途は保存操作なしで自動確認され、変更内容がHub設定に表示されることを確認する。Main/Sub/Approveの実Gateway要求を一時的に応答待ちにし、変更前の経路で完了すること、応答終了後に自動確認された要求が新しい経路と指示を使うことを照合する。Approveは実Guardian判定と試験フォルダー内への限定した書込を通す。応答中の設定変更後のMain続行は拒否し、結果と案内を残す。登録先を無効にしたモデルへの要求はHubで待機し、別モデルへ送られないことを停止操作まで確認する。削除されたモデルを選んでいた用途だけを明示的に選び直す。生成内容は固定応答で、実LLMの推論品質は対象外。
 
 隔離Desktopでの同シナリオは、Hub認証と最初のローカル生成の前後でRunnerが未起動であることも確認する。Desktopの隣に現行の`moyai-runner.exe`を置く。scenario configに`"previousPublication": true`を指定すると、隔離した資源台帳へ旧Hub・端末IDの登録と空の旧実行記録だけを用意する。実画面で新Hubに認証した後、Main生成が成功し、旧登録だけが整理され、現在の認証と旧実行記録が保持されることを確認する。実ユーザーのProgramDataや共有実行許可は変更しない。
 

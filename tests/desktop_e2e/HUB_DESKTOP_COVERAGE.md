@@ -31,7 +31,7 @@
 | I09 / A | Hubが停止中のreset、取消、別Hubへ再参加、旧共有登録の残置 | 手入力AI・会話・作業ファイルを保持し、新Hubの端末鍵を作る。清算済み旧登録だけを整理し、旧仕事を再送しない | D `hub.offline-reset`、`hub.model-propagation`の`previousPublication`で新Hub認証・Runnerなしのローカル生成・認証と旧journal保持。停止未確認・欠損・別利用者はbackend tests |
 | I10 / A | 初回接続、標準モデルあり/なし、用途ごとの既存選択 | 未設定のMain/Sub/Approveだけに利用可能な標準を設定。既存個別選択は保持 | D `settings.initial-setup-hub` / `hub.browser-enrollment`、connection tests。標準なし3用途のGUI一括確認は不足 |
 | I11 / A | モデル変更→元へ戻す→再接続→再変更・保存 | 3用途で保存できる。本当の未保存変更と古いtargetは混同しない | D `hub.browser-enrollment`、Hub draft unit tests |
-| I12 / A | Hub標準変更/モデル削除/無効化/prompt変更、編集中/実行中 | 更新差分を確認させ、保存済み個別選択を勝手に置換しない。実行中の捕捉済み経路と次回設定を分離 | D/F `hub.model-propagation`で3用途の自動取得・名前表示・draft保持、各用途の応答中変更と確認後の実要求、無効化・削除後の明示再選択。許可済み代替モデルとの全組合せは別 |
+| I12 / A | Hub標準変更/モデル削除/無効化/prompt変更、編集中/実行中 | 選択が新catalogでも成り立つ用途は自動で確認し、個別選択は維持、Hub標準を使う用途は新しい標準へ移す。変更内容をHub設定に表示する。成り立たない用途だけ保存まで止める。実行中の捕捉済み経路と次回設定を分離 | D/F `hub.model-propagation`で3用途の自動取得・自動確認・名前表示・draft保持、各用途の応答中変更と終了後の自動確認・実要求、無効化時のHub待機と停止、削除後のSub/Approveの明示再選択。許可済み代替モデルとの全組合せは別 |
 | I13 / A | Main/Sub/Approveの実要求、追加prompt、APIキー | 役割別のモデル・経路・権限を使う。Hub秘密情報をDesktop/履歴へ出さない | 同scenarioで3用途の接続先・更新済み指示を実Gatewayで確認。Approveの実判定→限定したファイル書込→未確認の次要求を停止→再確認後の依頼まで。任意のliveProvider指定で3用途の実モデル生成を追加。品質全般や秘密情報全経路の証明ではない |
 | I14 / A | モデル容量待ち、代替選択、取消、provider失敗 | 承認した候補だけを使い、許可枠を解放。Hub障害でDirectへ勝手に戻らず、実行要求を再送しない | Hub service/gateway＋Desktop runtime tests。待機表示→実取消のD/R確認は別 |
 | I15 / A | 操作専用/実行専用/両方のPC、複数project | 権限・project・環境・workspaceが一致。操作専用PCにRunner/作業フォルダーを要求しない | D `settings.shared-work-isolation`、B project用途。実仕事はRで追加確認 |
@@ -65,7 +65,7 @@
 
 | 起点と事前状態 | 相手側で確認する表示・保存状態 | 次の実行・副作用で確認すること | 現行入口 / 残り |
 | --- | --- | --- | --- |
-| 接続済みDesktopに対してHubの3用途標準をA→B | 更新操作なしに新catalog・推奨Bを取得。保存済みAは確認待ちになり、個別設定を上書きしない | 明示確認後に新しい要求がBへ届く。既に実行中の要求は別条件で確認 | `hub.model-propagation`で3用途の応答中変更と次の実生成。開始済み応答と、確認が必要な次要求を分ける |
+| 接続済みDesktopに対してHubの3用途標準をA→B | 更新操作なしに新catalog・推奨Bを取得。Hub標準を使う用途は保存なしでBへ移り、個別設定は上書きしない | 保存操作なしに新しい要求がBへ届く。既に実行中の要求は別条件で確認 | `hub.model-propagation`で3用途の応答中変更と次の実生成。開始済み応答と、応答終了後に自動確認される次要求を分ける |
 | Hubで表示名を変更。Desktopで別候補を編集中 | Hubの登録先名、公開する論理モデル名、Desktopの選択肢を比較。更新番号だけで名称反映を合格にしない | 名前の違いで別モデルIDへ切り替わらず、編集中候補を保持 | 同scenarioで3用途の選択肢に新しい名前が表示され、登録先名とdraftが保持されることをassert |
 | Hubでモデルの指示を変更。Desktopで別候補を編集中 | 更新操作なしに新catalogと差分を表示し、編集中候補と保存済み候補を区別。旧targetでの保存を拒否 | 確認後のmodel IDと要求中のsystem promptが一致 | 同scenarioでMain draft保持→確認保存、3用途の変更前後の実Gateway要求本文まで |
 | Hubで使用モデルを無効化/削除。Desktopは接続済み | 更新を自動取得し、無効/消失/確認待ちを説明。旧選択を黙って別モデルへ置換しない | 未確認要求を送らず、許可していない別接続先へfallbackしない | 同scenarioで無効化→送信禁止→削除→別候補を明示保存→Main要求。許可済み代替との全組合せは別 |
@@ -87,7 +87,7 @@
 | `hub.join-config-cold` | D | I06/I07、初回のnative確認 | fixture isolation、関連付け操作は別 |
 | `hub.join-config-warm` | D | I06/I07、取消・URL変更・別CA拒否 | fixture isolation、Runner停止は別 |
 | `hub.browser-enrollment` | D/F | I10/I11、3用途保存と再接続 | providerはmetadata、生成なし |
-| `hub.model-propagation` | D/F、任意で実LLM | I12/I13、Hub変更→3用途の自動取得/GUI確認待ち→3用途の次のGateway要求 | 名前・指示・標準・無効化・削除、draft/個別選択保持、Main/Sub/Approveの応答中変更と承認後の限定した実効果。liveProviderを指定しない実行は固定応答のみ |
+| `hub.model-propagation` | D/F、任意で実LLM | I12/I13、Hub変更→3用途の自動取得/自動確認（削除時は確認待ち）→3用途の次のGateway要求 | 名前・指示・標準・無効化・削除、draft/個別選択保持、Main/Sub/Approveの応答中変更と承認後の限定した実効果。liveProviderを指定しない実行は固定応答のみ |
 | `hub.offline-reset` | D | I09、取消・旧Hub停止・別Hub | Runner停止未確認はbackend |
 | `hub.join-retry-controls` | D | I08、信頼済み接続の明示再申請 | 自動pollの再申請を成功にしない |
 | `settings.initial-setup-hub` | D/F | I10、初回案内→3用途の標準 | native入力の手動判定は別 |

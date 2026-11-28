@@ -18,12 +18,27 @@ const ID = "hub.model-propagation", OWNER = `scenario:${ID}`;
 const contexts = ["main", "side_chat", "approve"];
 const fail = (message, evidence = {}) => new DesktopE2eError("product", "hub-model-propagation-mismatch", message, evidence);
 
-export function catalogPropagationAccepted(before, after, revision) {
-  return after?.status === "connected" && after.catalog?.revision === revision && after.hub_id === before.hub_id
-    && after.settings_revision === before.settings_revision
-    && contexts.every(context => after[`${context}_confirmation`] === "review_required"
-      && isDeepStrictEqual(after[`${context}_review`], before[`${context}_review`])
-      && after[`${context}_uses_default`] === before[`${context}_uses_default`]);
+/**
+ * A role whose saved choice still fits the new catalog follows it without a user save: an
+ * explicit choice keeps its selection, a Hub-default choice adopts the current Hub default
+ * (or keeps its selection while Hub offers none). `expected[role] = "review_required"` marks a
+ * role whose choice no longer fits and must stay unchanged until the user saves.
+ */
+export function catalogPropagationAccepted(before, after, revision, expected = {}) {
+  if (after?.status !== "connected" || after.catalog?.revision !== revision || after.hub_id !== before.hub_id) return false;
+  const followed = contexts.filter(context => (expected[context] ?? "followed") === "followed");
+  if (!followed.length && after.settings_revision !== before.settings_revision) return false;
+  return contexts.every(context => {
+    const prior = before[`${context}_review`], current = after[`${context}_review`];
+    const usesDefault = before[`${context}_uses_default`];
+    if (after[`${context}_uses_default`] !== usesDefault) return false;
+    if (!followed.includes(context))
+      return after[`${context}_confirmation`] === "review_required" && isDeepStrictEqual(current, prior);
+    const selection = usesDefault && after[`recommended_${context}_selection`] ? after[`recommended_${context}_selection`] : prior?.selection;
+    return after[`${context}_confirmation`] === "confirmed" && current?.reviewed_revision === revision
+      && current.hub_id === prior?.hub_id && isDeepStrictEqual(current.selection, selection)
+      && Boolean(after[`${context}_auto_update`]);
+  });
 }
 
 export function createHubModelPropagationScenario(options = {}) {
@@ -111,15 +126,15 @@ export function createHubModelPropagationScenario(options = {}) {
         })),value=>value.revision===String(saved.store.revision) && value.busy===false && !value.status.includes("未保存"));
         return saved;
       }
-      async function propagated(name, before, snapshot, afterSequence, extra = () => true) {
+      async function propagated(name, before, snapshot, afterSequence, extra = () => true, expected = {}) {
         const started = Date.now();
         const after = await wait(`${name}: connected Desktop receives the new catalog without a refresh click`, projection,
-          value => catalogPropagationAccepted(before, value, snapshot.store.revision) && extra(value), 45_000);
+          value => catalogPropagationAccepted(before, value, String(snapshot.store.revision), expected) && extra(value), 45_000);
         const visible=await wait(`${name}: all three settings forms display the new catalog revision`, form,
           value=>contexts.every(context=>value[context].currentRevision===String(snapshot.store.revision)));
         const commands = await state.commands.snapshot(afterSequence);
         if (commands.dropped_through > afterSequence || commands.calls.length) throw fail("Passive catalog propagation issued an explicit review or refresh command", commands);
-        await sink.record("hub-model-propagated", { name, elapsed_ms: Date.now()-started, before, after, form: visible, explicit_commands: commands.calls }, { phase: "executing", owner: OWNER });
+        await sink.record("hub-model-propagated", { name, expected, elapsed_ms: Date.now()-started, before, after, form: visible, explicit_commands: commands.calls }, { phase: "executing", owner: OWNER });
         return after;
       }
       async function saveRole(name) {
@@ -127,10 +142,11 @@ export function createHubModelPropagationScenario(options = {}) {
         await trustedClick(input, cdp, action(`hub-save-${name === "side_chat" ? "side" : name}`, `[data-ai-connection="${name}"]`), sink);
         return wait(`${name} explicitly confirms the current catalog`, projection, value => value[`${name}_confirmation`] === "confirmed");
       }
-      async function confirmAll() {
+      // Only roles with a user edit or a pending review have an enabled save control.
+      async function confirmAll(names = contexts) {
         await navigateRole("main");
         await trustedClick(input, cdp, action("hub-refresh", '[data-ai-connection="main"]'), sink);
-        for (const name of contexts) await saveRole(name);
+        for (const name of names) await saveRole(name);
       }
       async function closeSettings() {
         await trustedClick(input, cdp, action("close-overlay", ".settings-modal"), sink);
@@ -190,7 +206,7 @@ export function createHubModelPropagationScenario(options = {}) {
         if(!rows.length || rows.some(row=>row.upstream!==upstream || (prompt && !row.request.messages.some(message=>message.role==="system" && String(message.content).includes(prompt)))))
           throw fail("Role generation used the wrong upstream or model instructions",{role,upstream,prompt,observed:rows.map(row=>({role:row.role,upstream:row.upstream}))});
         if(role==="approve" && await readFile(state.receipt,"utf8")!=="HUB_APPROVED_EFFECT") throw fail("Approved tool did not perform its bounded effect");
-        if(expectedStatus==="failed" && (!result.status_message.includes("catalog_changed") || !result.status_message.includes("モデル選択を確認・保存")
+        if(expectedStatus==="failed" && (!result.status_message.includes("catalog_changed") || !result.status_message.includes("Desktopが新しい設定を自動で確認")
           || !isDeepStrictEqual(state.requests.slice(start).map(row=>row.role),["main","approve"])))
           throw fail("The next request must stop with review instructions, without replaying work",{status:result.status_message,roles:state.requests.slice(start).map(row=>row.role)});
         if(role==="side_chat") {
@@ -260,10 +276,11 @@ export function createHubModelPropagationScenario(options = {}) {
           value => contexts.every(name=>value[`recommended_${name}_selection`]?.preferred_model_id===b));
         const unchanged=await form();
         if (!contexts.every(name=>unchanged[name].choice===":hub-default")) throw fail("Passive standard update changed the user's choice type", unchanged);
-        await captureScenarioScreenshot({ cdp, sink, name: "model-standard-update-review-required", owner: OWNER });
-        await confirmAll();
-        await wait("Explicit save adopts B separately for all contexts", projection, value => contexts.every(name=>value[`${name}_uses_default`] && value[`${name}_review`]?.selection.preferred_model_id===b));
-        await sendMain("after-standard-save", 1);
+        await wait("Hub settings say each role followed the update", () => cdp.evaluate(`[...document.querySelectorAll("[data-hub-auto-update]")].map(node=>node.dataset.hubAutoUpdate)`),
+          value => contexts.every(name => value.includes(name)));
+        await captureScenarioScreenshot({ cdp, sink, name: "model-standard-update-followed", owner: OWNER });
+        await wait("Hub-default roles follow B without a save", projection, value => contexts.every(name=>value[`${name}_uses_default`] && value[`${name}_review`]?.selection.preferred_model_id===b));
+        await sendMain("after-standard-follow", 1);
 
         // Model names propagate to every client without overwriting per-deployment labels.
         await chooseModel(input, cdp, "main", a, sink);
@@ -297,14 +314,13 @@ export function createHubModelPropagationScenario(options = {}) {
         const draft=await wait("Main input survives the changed Hub instructions", form, value => value.main.choice===a);
         if (!draft.main.saveDisabled) throw fail("Stale draft may not save before reviewing the changed Hub", draft);
         await captureScenarioScreenshot({ cdp, sink, name: "model-instruction-update-draft-preserved", owner: OWNER });
-        await confirmAll();
+        await confirmAll(["main"]);
         const explicit=await projection();
         if (explicit.main_uses_default || explicit.main_review.selection.preferred_model_id!==a) throw fail("Review refresh discarded the explicit Main draft", explicit);
         await sendMain("after-instruction-save", 0, updatedPrompt);
 
         before=explicit; afterSequence=(await state.commands.snapshot()).sequence;
         await propagated("standard-change-preserves-explicit-main", before, await defaults(a), afterSequence);
-        await confirmAll();
         const retained=await projection();
         if (retained.main_uses_default || retained.main_review.selection.preferred_model_id!==a) throw fail("Hub default overwrote an existing individual selection", retained);
 
@@ -338,11 +354,10 @@ export function createHubModelPropagationScenario(options = {}) {
           const previousResult=await finishRole(role,start,upstream,prompts.get(current),role==="approve" ? "failed" : "completed");
           state.held=null;
           await propagated(`${role}-finished-after-hub-change`,before,changed,afterSequence);
-          await confirmAll();
           prompts.set(next,nextPrompt);
           const nextStart=await beginRole(role,`after-${role.replaceAll("_","-")}`);
           const nextResult=await finishRole(role,nextStart,nextUpstream,nextPrompt);
-          await sink.record("hub-role-active-change",{role,captured:previousResult,next:nextResult,started_response_preserved:true,unreviewed_continuation_blocked:role==="approve",new_catalog_reviewed:true},{phase:"executing",owner:OWNER});
+          await sink.record("hub-role-active-change",{role,captured:previousResult,next:nextResult,started_response_preserved:true,unreviewed_continuation_blocked:role==="approve",new_catalog_followed:true},{phase:"executing",owner:OWNER});
           current=next;
         }
 
@@ -352,24 +367,30 @@ export function createHubModelPropagationScenario(options = {}) {
         await page.locator("#edit-enabled").uncheck();
         await page.locator("#save-edit").click(); await page.locator("#edit-dialog").waitFor({ state: "hidden" });
         await propagated("selected-deployment-disabled", before, await hub.command("hub_snapshot"), afterSequence);
-        await captureScenarioScreenshot({ cdp, sink, name: "model-disabled-review-required", owner: OWNER });
+        await captureScenarioScreenshot({ cdp, sink, name: "model-disabled-followed", owner: OWNER });
         const counts=providers.map(provider=>provider.requests.length);
         await closeSettings();
         await trustedClick(input, cdp, byId("prompt", "TEXTAREA"), sink);
         await input.insertText(byId("prompt", "TEXTAREA"), "hub-model-propagation-disabled: must not reach another model");
-        const blocked=await wait("Unreviewed model change disables the next Main submission", async () => ({
-          desktop:await invokeDesktopCommand(cdp,"desktop_state"),
-          sendDisabled:await cdp.evaluate('document.querySelector("section.composer button[data-action=send]")?.disabled'),
-        }), value=>value.desktop.can_submit===false && value.sendDisabled===true);
-        if (!isDeepStrictEqual(counts, providers.map(provider=>provider.requests.length))) throw fail("Unreviewed disabled model was used or silently fell back");
+        // The logical model stays in the catalog, so the choice follows; Hub holds the request.
+        await trustedClick(input, cdp, action("send", "section.composer"), sink);
+        const blocked=await wait("Hub holds the request for the disabled deployment without using another model", async () => ({
+          hub:await projection(), counts:providers.map(provider=>provider.requests.length),
+        }), value=>value.hub.active_main?.phase==="waiting" && isDeepStrictEqual(value.counts,counts), 30_000);
+        await captureScenarioScreenshot({ cdp, sink, name: "model-disabled-waiting", owner: OWNER });
+        await trustedClick(input,cdp,{selector:'section.run-strip [data-action="cancel-run"]',identity:{tag:"BUTTON",action:"cancel-run"}},sink);
+        await wait("Stopping the held request reopens the composer",()=>invokeDesktopCommand(cdp,"desktop_state"),
+          value=>value.can_submit===true && value.run_status_key!=="running" && !value.hub?.active_main,30_000);
+        if (!isDeepStrictEqual(counts, providers.map(provider=>provider.requests.length))) throw fail("Disabled model was used or silently fell back");
         await trustedClick(input,cdp,action("show-config","aside.sidebar"),sink);
         before=await projection(); afterSequence=(await state.commands.snapshot()).sequence;
         await page.locator("#model-rows tr").filter({hasText:current===a ? "Propagation A" : "Propagation B renamed"}).getByRole("button",{name:/を編集/}).click();
         await page.locator("#remove-model").click();
         await page.locator("#remove-model").click();
         await page.locator("#edit-dialog").waitFor({state:"hidden"});
+        // Main follows the Hub default that remains; Sub and Approve have no default and wait for a save.
         await propagated("selected-model-deleted",before,await hub.command("hub_snapshot"),afterSequence,
-          value=>!value.catalog.models.some(model=>model.id===current));
+          value=>!value.catalog.models.some(model=>model.id===current),{side_chat:"review_required",approve:"review_required"});
         if (!isDeepStrictEqual(counts, providers.map(provider=>provider.requests.length))) throw fail("Model deletion silently submitted work to another upstream");
         const remaining=current===a ? b : a;
         for(const role of contexts) await chooseModel(input,cdp,role,remaining,sink);
@@ -433,7 +454,7 @@ export function createHubModelPropagationScenario(options = {}) {
             await trustedClick(input,cdp,action("show-config","aside.sidebar"),sink);
           }
         }
-        await sink.record("hub-model-propagation-complete", { explicit_main_preserved:true, default_change_requires_review:true, roles_with_active_and_next_generation:contexts, updated_instructions_forwarded:true, disabled_send_control:blocked.sendDisabled, disabled_request_forwarded:false, scope:"Actual Main/Sub/Approve Gateway requests and an authorized tool effect, with deterministic upstream responses. No live LLM quality claim." }, { phase:"executing", owner:OWNER });
+        await sink.record("hub-model-propagation-complete", { explicit_main_preserved:true, default_change_followed:true, removed_choice_requires_review:true, roles_with_active_and_next_generation:contexts, updated_instructions_forwarded:true, disabled_request_held:blocked.hub.active_main.phase==="waiting", disabled_request_forwarded:false, scope:"Actual Main/Sub/Approve Gateway requests and an authorized tool effect, with deterministic upstream responses. No live LLM quality claim." }, { phase:"executing", owner:OWNER });
         if (resource.pageErrors().length) throw fail("Hub browser page errors", resource.pageErrors());
         return { acquisition:"pass", oracle:"pass", manual:"pending" };
       } catch(error) {

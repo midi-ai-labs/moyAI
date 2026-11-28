@@ -473,6 +473,21 @@ async fn shared_worker_reviews_saved_main_rejects_plaintext_gateway_and_stale_se
     assert_eq!(server.state.gateway_requests.lock().unwrap().len(), 0);
     route.finish().await;
     server.state.revision.store(2, Ordering::SeqCst);
+    // A newer catalog that still offers the saved model is followed for this run only.
+    let followed = HubConnection::device_worker_route_with_settings(
+        &server.endpoint,
+        http(),
+        Some(saved.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(followed.logical_model(), "deep");
+    followed.finish().await;
+    assert_eq!(store(&temp).load().unwrap(), saved);
+    *server.state.catalog_override.lock().unwrap() =
+        json!({"models":[{"id":"fast","label":"Fast","capabilities":["chat"]}]});
+    server.state.revision.store(3, Ordering::SeqCst);
     let error = HubConnection::device_worker_route_with_settings(
         &server.endpoint,
         http(),
@@ -594,7 +609,7 @@ async fn managed_default_sources_are_independent_durable_and_reset_without_hub_c
 }
 
 #[tokio::test]
-async fn managed_rejoin_reconfirms_unchanged_models_but_keeps_changed_catalog_unreviewed() {
+async fn managed_rejoin_reconfirms_unchanged_models_and_follows_newer_hub_catalogs() {
     let server = Server::start(60_000).await;
     let temp = tempfile::tempdir().unwrap();
     let persisted = store(&temp);
@@ -604,6 +619,9 @@ async fn managed_rejoin_reconfirms_unchanged_models_but_keeps_changed_catalog_un
     );
     let first = service
         .connect_device(&server.endpoint, http.clone(), true, None)
+        .await
+        .unwrap();
+    let explicit = save(&service, &first, HubReviewContext::Main, "deep")
         .await
         .unwrap();
     let saved = persisted.load().unwrap();
@@ -616,23 +634,121 @@ async fn managed_rejoin_reconfirms_unchanged_models_but_keeps_changed_catalog_un
         rejoined.side_chat_confirmation,
         HubReviewConfirmation::Confirmed
     );
-    assert_eq!(rejoined.settings_revision, first.settings_revision);
+    assert_eq!(rejoined.settings_revision, explicit.settings_revision);
+    assert!(rejoined.main_auto_update.is_none());
     assert_eq!(persisted.load().unwrap(), saved);
+
+    // An administrator edits the Hub (here: a new Hub version and an unrelated model).
     server.state.revision.store(2, Ordering::SeqCst);
+    *server.state.catalog_override.lock().unwrap() = json!({"software_version":"0.2.0",
+        "models":[{"id":"fast","label":"Fast","capabilities":["chat"]},
+        {"id":"deep","label":"Deep","capabilities":["chat"]},
+        {"id":"new","label":"New","capabilities":["chat"]}]});
     let changed = service
-        .connect_device(&server.endpoint, http, true, None)
+        .connect_device(&server.endpoint, http.clone(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(changed.main_confirmation, HubReviewConfirmation::Confirmed);
+    assert_eq!(
+        changed.side_chat_confirmation,
+        HubReviewConfirmation::Confirmed
+    );
+    assert!(changed.can_enable_main_hub && changed.can_enable_side_chat_hub);
+    assert_eq!(changed.error, None);
+    let followed = persisted.load().unwrap();
+    let main = followed.main_review.as_ref().unwrap();
+    assert_eq!(main.reviewed_revision, CatalogRevision::new(2).unwrap());
+    assert_eq!(main.selection, selection("deep"));
+    assert!(!followed.main_uses_default && followed.side_chat_uses_default);
+    assert_eq!(
+        followed.main_catalog_baseline.as_ref().unwrap().revision,
+        CatalogRevision::new(2).unwrap()
+    );
+    let update = changed.main_auto_update.as_ref().unwrap();
+    assert_eq!(
+        update.status,
+        super::super::HubCatalogComparisonStatus::Compared
+    );
+    assert_eq!(update.reviewed_revision, CatalogRevision::new(1).ok());
+    assert_eq!(update.current_revision, CatalogRevision::new(2).ok());
+    assert_eq!(update.software_after.as_deref(), Some("0.2.0"));
+    assert_eq!(update.models.len(), 1);
+    assert_eq!(update.models[0].id, "new");
+
+    // A restart reuses the followed choice; only an explicit save ends the update notice.
+    service.shutdown().await;
+    let restarted = HubConnection::new(persisted.clone());
+    let reconnected = restarted
+        .connect_device(&server.endpoint, http.clone(), true, None)
         .await
         .unwrap();
     assert_eq!(
-        changed.main_confirmation,
-        HubReviewConfirmation::ReviewRequired
+        reconnected.main_confirmation,
+        HubReviewConfirmation::Confirmed
     );
+    assert!(reconnected.main_auto_update.is_none());
+    assert_eq!(persisted.load().unwrap(), followed);
+    server.state.revision.store(3, Ordering::SeqCst);
+    let again = restarted
+        .connect_device(&server.endpoint, http, true, None)
+        .await
+        .unwrap();
+    assert!(again.main_auto_update.is_some());
+    let saved_again = save(&restarted, &again, HubReviewContext::Main, "deep")
+        .await
+        .unwrap();
+    assert!(saved_again.main_auto_update.is_none());
+    assert!(saved_again.side_chat_auto_update.is_some());
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_hub_default_follows_the_new_default_and_removed_choice_stays_unreviewed() {
+    let server = Server::start(60_000).await;
+    let temp = tempfile::tempdir().unwrap();
+    let persisted = store(&temp);
+    let service = HubConnection::new(persisted.clone());
+    let first = service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    assert!(first.main_uses_default);
+    save(&service, &first, HubReviewContext::SideChat, "fast")
+        .await
+        .unwrap();
+    let before = persisted.load().unwrap();
+
+    // The administrator replaces the standard model and removes the old one.
+    server.state.revision.store(2, Ordering::SeqCst);
+    *server.state.catalog_override.lock().unwrap() = json!({
+        "models":[{"id":"deep","label":"Deep","capabilities":["chat"]}],
+        "default_selections":{"main":serde_json::to_value(selection("deep")).unwrap(),
+            "side_chat":serde_json::to_value(selection("deep")).unwrap(),"approve":null}});
+    let changed = service
+        .connect_device(&server.endpoint, managed_http(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(changed.main_confirmation, HubReviewConfirmation::Confirmed);
+    assert!(changed.can_enable_main_hub);
+    assert_eq!(
+        changed.main_review.as_ref().unwrap().selection,
+        selection("deep")
+    );
+    assert!(changed.main_uses_default);
+    // The explicit Sub choice names a removed model, so it is not replaced silently.
     assert_eq!(
         changed.side_chat_confirmation,
         HubReviewConfirmation::ReviewRequired
     );
-    assert!(!changed.can_enable_main_hub && !changed.can_enable_side_chat_hub);
-    assert_eq!(persisted.load().unwrap(), saved);
+    assert!(!changed.can_enable_side_chat_hub);
+    assert!(changed.side_chat_auto_update.is_none());
+    let after = persisted.load().unwrap();
+    assert_eq!(after.side_chat_review, before.side_chat_review);
+    assert_eq!(
+        after.side_chat_catalog_baseline,
+        before.side_chat_catalog_baseline
+    );
+    assert!(!after.side_chat_uses_default);
     service.shutdown().await;
 }
 
@@ -749,23 +865,28 @@ async fn managed_revision_during_active_scope(context: HubReviewContext, delegat
     })
     .await
     .expect("the same heartbeat owner must refresh after the final active scope ends");
+    // The heartbeat-driven refresh follows the newer catalog without a user save.
     let refreshed = service.projection_now();
     assert_eq!(
         refreshed.main_confirmation,
-        HubReviewConfirmation::ReviewRequired
+        HubReviewConfirmation::Confirmed
     );
     assert_eq!(
         refreshed.side_chat_confirmation,
-        HubReviewConfirmation::ReviewRequired
+        HubReviewConfirmation::Confirmed
     );
-    assert_eq!(persisted.load().unwrap(), before);
+    assert!(refreshed.can_enable_main_hub && refreshed.can_enable_side_chat_hub);
+    assert!(refreshed.main_auto_update.is_some() && refreshed.side_chat_auto_update.is_some());
+    let followed = persisted.load().unwrap();
+    assert_ne!(followed, before);
+    assert_eq!(
+        followed.main_review.unwrap().reviewed_revision,
+        CatalogRevision::new(2).unwrap()
+    );
     let side = save(&service, &refreshed, HubReviewContext::SideChat, "deep")
         .await
         .unwrap();
-    assert_eq!(
-        side.main_confirmation,
-        HubReviewConfirmation::ReviewRequired
-    );
+    assert_eq!(side.main_confirmation, HubReviewConfirmation::Confirmed);
     assert_eq!(
         side.side_chat_confirmation,
         HubReviewConfirmation::Confirmed
@@ -976,7 +1097,7 @@ async fn catalog_restore_missing_legacy_baseline_requires_only_that_context_to_b
 }
 
 #[tokio::test]
-async fn catalog_restore_reconnect_ignores_journal_pruning_but_keeps_revision_review_gate() {
+async fn catalog_restore_reconnect_ignores_journal_pruning_and_follows_newer_revision() {
     let server = Server::start(60_000).await;
     *server.state.catalog_override.lock().unwrap() =
         json!({"changes":[{"revision":"1","at_ms":1,"summary":"Initial catalog"}]});
@@ -1009,28 +1130,25 @@ async fn catalog_restore_reconnect_ignores_journal_pruning_but_keeps_revision_re
         .connect_device(&server.endpoint, managed_http(), true, None)
         .await
         .unwrap();
-    assert_eq!(
-        changed.main_confirmation,
-        HubReviewConfirmation::ReviewRequired
-    );
+    assert_eq!(changed.main_confirmation, HubReviewConfirmation::Confirmed);
     assert_eq!(
         changed.side_chat_confirmation,
-        HubReviewConfirmation::ReviewRequired
+        HubReviewConfirmation::Confirmed
     );
     let side = save(&restarted, &changed, HubReviewContext::SideChat, "deep")
         .await
         .unwrap();
-    assert_eq!(
-        side.main_confirmation,
-        HubReviewConfirmation::ReviewRequired
-    );
+    assert_eq!(side.main_confirmation, HubReviewConfirmation::Confirmed);
     assert_eq!(
         side.side_chat_confirmation,
         HubReviewConfirmation::Confirmed
     );
+    // The followed Main baseline advances with its review; the journal is never part of it.
+    let main_baseline = persisted.load().unwrap().main_catalog_baseline.unwrap();
+    assert_eq!(main_baseline.revision, CatalogRevision::new(2).unwrap());
     assert_eq!(
-        persisted.load().unwrap().main_catalog_baseline,
-        saved.main_catalog_baseline
+        main_baseline.models,
+        saved.main_catalog_baseline.unwrap().models
     );
     restarted.shutdown().await;
 }

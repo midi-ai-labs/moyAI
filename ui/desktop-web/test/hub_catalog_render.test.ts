@@ -74,3 +74,27 @@ test("Main and Side show their own reviewed revisions inside independent retaine
   assert.match(side, /data-settings-passive="ai-side_chat-comparison"/);
   assert.doesNotMatch(side, /Former name|削除 1/);
 });
+
+test("a choice that followed Hub updates says so and shows changes since the user's save", () => {
+  const state = createHubUiState();
+  state.projection = {
+    settings_revision: "5", connection_generation: "2", status: "connected", endpoint: "http://127.0.0.1:9470/",
+    label: "Desktop", hub_id: "hub-a", catalog: null, main_review: null, side_chat_review: null, approve_review: null,
+    main_confirmation: "confirmed", side_chat_confirmation: "confirmed", approve_confirmation: "unconfirmed", error: null,
+    main_mode: "hub", side_chat_mode: "hub", approve_mode: "direct", active_main: null, active_side_chat: null, active_approve: null,
+    can_enable_main_hub: true, can_enable_side_chat_hub: true, can_enable_approve_hub: false,
+    can_change_main_mode: false, can_change_side_chat_mode: false, can_change_approve_mode: false,
+    main_catalog_comparison: comparison({ reviewed_revision: "8", models: [], software_before: "0.2.0" }),
+    main_auto_update: comparison(),
+    side_chat_catalog_comparison: comparison({ reviewed_revision: "8", models: [], software_before: "0.2.0" }),
+    side_chat_auto_update: null,
+  } satisfies HubProjection;
+  const main = renderManagedAiConnection(state, "main");
+  assert.match(main, /data-hub-auto-update="main"/);
+  assert.match(main, /自動で確認しました。このまま使えます/);
+  assert.match(main, /確認時の更新 3 → 現在の更新 8/);
+  assert.match(main, /追加 1 \/ 削除 1 \/ 変更 1/);
+  const side = renderManagedAiConnection(state, "side_chat");
+  assert.doesNotMatch(side, /data-hub-auto-update/);
+  assert.match(side, /確認時の更新 8 → 現在の更新 8/);
+});

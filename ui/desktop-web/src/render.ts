@@ -1318,10 +1318,13 @@ export function renderComposer(
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const receiverBlocked = receiverBlocksLocalSend(local.deviceNetwork);
   const receiverUnknown = receiverBlocked && Boolean(local.deviceNetwork.receiverActivity?.unavailable);
+  const hubRoute = hubExecutionRoute(state.hub, "main");
+  // The Hub gate disables sending without closing composer admission, so name it here too.
   const sendTitle = receiverBlocked
     ? receiverUnknown ? "このPCの実行状態を確認できません" : "このPCの受信作業が終了してから送信できます"
-    : composerSendTitle(state, state.draft_prompt);
-  const hubRoute = hubExecutionRoute(state.hub, "main");
+    : !state.can_submit && hubRoute?.blockedReason
+      ? hubRoute.blockedReason
+      : composerSendTitle(state, state.draft_prompt);
   const enhanceTitle = state.navigation_loading
     ? "画面の切り替え後に依頼文を整えられます"
     : state.busy

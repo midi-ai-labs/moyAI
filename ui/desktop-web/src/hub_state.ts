@@ -50,6 +50,10 @@ export interface HubProjection {
   main_catalog_comparison?: HubCatalogComparison;
   side_chat_catalog_comparison?: HubCatalogComparison;
   approve_catalog_comparison?: HubCatalogComparison;
+  /** Present after a saved choice followed Hub updates without a user save. */
+  main_auto_update?: HubCatalogComparison | null;
+  side_chat_auto_update?: HubCatalogComparison | null;
+  approve_auto_update?: HubCatalogComparison | null;
   main_confirmation: "unconfirmed" | "confirmed" | "review_required";
   side_chat_confirmation: "unconfirmed" | "confirmed" | "review_required";
   approve_confirmation: "unconfirmed" | "confirmed" | "review_required";

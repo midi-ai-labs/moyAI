@@ -60,6 +60,42 @@ impl HubReviewContext {
             .ok_or(HubError::ReviewRequired)?
             .check_successor(catalog)
     }
+    fn uses_default(self, settings: &HubSettings) -> bool {
+        match self {
+            Self::Main => settings.main_uses_default,
+            Self::SideChat => settings.side_chat_uses_default,
+            Self::Approve => settings.approve_uses_default,
+        }
+    }
+    /// Hub administrators replace models and update Hub itself, and each change advances the
+    /// catalog revision. A saved choice follows a newer revision of the same reviewed catalog
+    /// when its models still satisfy it; a Hub-default choice follows the current default.
+    /// Rollback, same-revision replacement and a missing baseline keep the explicit review.
+    fn carried_review(
+        self,
+        settings: &HubSettings,
+        catalog: &HubCatalog,
+        recommendation: Option<&ReviewedHubSelection>,
+    ) -> Option<ReviewedHubSelection> {
+        let saved = self.review(settings).as_ref()?;
+        if catalog.revision <= saved.reviewed_revision {
+            return None;
+        }
+        self.baseline(settings)?.check_successor(catalog).ok()?;
+        if self.uses_default(settings)
+            && let Some(recommendation) = recommendation
+                .filter(|recommendation| recommendation.check_admission(catalog).is_ok())
+        {
+            return Some(recommendation.clone());
+        }
+        ReviewedHubSelection::review(
+            catalog,
+            &saved.hub_id,
+            catalog.revision,
+            saved.selection.clone(),
+        )
+        .ok()
+    }
     fn set(self, settings: &mut HubSettings, review: ReviewedHubSelection, catalog: &HubCatalog) {
         match self {
             Self::Main => {
@@ -119,6 +155,10 @@ pub struct HubConnectionProjection {
     pub main_catalog_comparison: HubCatalogComparison,
     pub side_chat_catalog_comparison: HubCatalogComparison,
     pub approve_catalog_comparison: HubCatalogComparison,
+    /// Present after a saved choice followed Hub updates without a user save.
+    pub main_auto_update: Option<HubCatalogComparison>,
+    pub side_chat_auto_update: Option<HubCatalogComparison>,
+    pub approve_auto_update: Option<HubCatalogComparison>,
     pub main_confirmation: HubReviewConfirmation,
     pub side_chat_confirmation: HubReviewConfirmation,
     pub approve_confirmation: HubReviewConfirmation,
@@ -155,6 +195,9 @@ struct ConnectionState {
     recommendations: [Option<ReviewedHubSelection>; 3],
     // These are remote acknowledgements for the current registration, not extra durable truth.
     confirmed: [Option<ReviewedHubSelection>; 3],
+    // The review and baseline before choices followed Hub updates automatically, kept until
+    // the user saves that context so the settings screen can show what was adopted.
+    followed_from: [Option<(ReviewedHubSelection, HubCatalogBaseline)>; 3],
     cancellation: CancellationToken,
     error: Option<HubError>,
     active: [Option<ActiveHubTurn>; 3],
@@ -284,6 +327,13 @@ impl ConnectionState {
             HubReviewConfirmation::Unconfirmed
         }
     }
+    fn auto_update(&self, context: HubReviewContext) -> Option<HubCatalogComparison> {
+        self.followed_from[context.index()]
+            .as_ref()
+            .map(|(review, baseline)| {
+                HubCatalogComparison::between(Some(review), Some(baseline), self.catalog.as_ref())
+            })
+    }
     // Device ownership is sampled before taking the Hub state lock. Both command receipts
     // and polling must describe this same effective connection, not raw legacy mode fields.
     fn projection(&self, managed_endpoint: Option<&str>) -> HubConnectionProjection {
@@ -321,6 +371,9 @@ impl ConnectionState {
                 self.settings.approve_catalog_baseline.as_ref(),
                 self.catalog.as_ref(),
             ),
+            main_auto_update: self.auto_update(HubReviewContext::Main),
+            side_chat_auto_update: self.auto_update(HubReviewContext::SideChat),
+            approve_auto_update: self.auto_update(HubReviewContext::Approve),
             main_confirmation: self.confirmation(HubReviewContext::Main),
             side_chat_confirmation: self.confirmation(HubReviewContext::SideChat),
             approve_confirmation: self.confirmation(HubReviewContext::Approve),
@@ -420,6 +473,12 @@ impl HubConnection {
         }
         Ok(result)
     }
+    fn default_review(
+        catalog: &HubCatalog,
+        selection: Option<HubSelection>,
+    ) -> Option<ReviewedHubSelection> {
+        ReviewedHubSelection::review(catalog, &catalog.hub_id, catalog.revision, selection?).ok()
+    }
     fn check_saved_catalog(settings: &HubSettings, catalog: &HubCatalog) -> Result<(), HubError> {
         if settings
             .hub_id
@@ -465,6 +524,7 @@ impl HubConnection {
                     catalog: None,
                     recommendations: [None, None, None],
                     confirmed: [None, None, None],
+                    followed_from: [None, None, None],
                     cancellation: CancellationToken::new(),
                     error: storage_error,
                     active: [None, None, None],
@@ -515,6 +575,7 @@ impl HubConnection {
         state.status = HubConnectionStatus::Disconnected;
         state.catalog = None;
         state.recommendations = [None, None, None];
+        state.followed_from = [None, None, None];
         *self.inner.network_http.lock().unwrap() = None;
         Ok(state.projection(managed.as_deref()))
     }
@@ -563,9 +624,16 @@ impl HubConnection {
             if let Err(error) = Self::check_saved_catalog(&saved, &catalog) {
                 Err(error)
             } else if let Some(review) = saved.main_review.as_ref() {
+                // Same follow rule as Desktop reconnect; the runtime review is never saved.
                 HubReviewContext::Main
                     .check_review(&saved, &catalog)
                     .map(|()| review.clone())
+                    .or_else(|error| {
+                        let default = Self::default_review(&catalog, defaults.main.clone());
+                        HubReviewContext::Main
+                            .carried_review(saved, &catalog, default.as_ref())
+                            .ok_or(error)
+                    })
             } else {
                 defaults
                     .main
@@ -618,18 +686,23 @@ impl HubConnection {
             runtime_settings.approve_catalog_baseline = saved.approve_catalog_baseline.clone();
             runtime_settings.approve_mode = HubRouteMode::Hub;
             runtime_settings.approve_uses_default = saved.approve_uses_default;
-            if HubReviewContext::Approve
+            let approve = if HubReviewContext::Approve
                 .check_review(saved, &catalog)
                 .is_ok()
             {
-                let approve = saved.approve_review.as_ref().expect("filtered review");
-                if client
-                    .review(HubReviewContext::Approve, approve)
+                saved.approve_review.clone()
+            } else {
+                let default = Self::default_review(&catalog, defaults.approve.clone());
+                HubReviewContext::Approve.carried_review(saved, &catalog, default.as_ref())
+            };
+            if let Some(approve) = approve
+                && client
+                    .review(HubReviewContext::Approve, &approve)
                     .await
                     .is_ok()
-                {
-                    confirmed[2] = Some(approve.clone());
-                }
+            {
+                HubReviewContext::Approve.set(&mut runtime_settings, approve.clone(), &catalog);
+                confirmed[2] = Some(approve);
             }
         }
         let cancellation = CancellationToken::new();
@@ -645,6 +718,7 @@ impl HubConnection {
                     catalog: Some(catalog),
                     recommendations: [None, None, None],
                     confirmed,
+                    followed_from: [None, None, None],
                     cancellation: cancellation.clone(),
                     error: None,
                     active: [None, None, None],
@@ -701,17 +775,35 @@ impl HubConnection {
             proposed.endpoint = endpoint;
             proposed.hub_id = Some(catalog.hub_id.clone());
             let mut confirmed = [None, None, None];
+            let mut followed_from = [None, None, None];
             let recommendations = Self::reviewed_defaults(&catalog, defaults)?;
             for context in HubReviewContext::ALL {
-                let review = context.review(&proposed).clone();
-                if let Some(review) =
-                    review.filter(|_| context.check_review(&proposed, &catalog).is_ok())
-                {
-                    match client.review(context, &review).await {
-                        Ok(()) => confirmed[context.index()] = Some(review),
-                        Err(_) if context == HubReviewContext::Approve => {}
-                        Err(error) => return Err(error),
+                let (review, followed) = if context.check_review(&proposed, &catalog).is_ok() {
+                    (context.review(&proposed).clone(), false)
+                } else {
+                    let carried = context.carried_review(
+                        &proposed,
+                        &catalog,
+                        recommendations[context.index()].as_ref(),
+                    );
+                    (carried, true)
+                };
+                let Some(review) = review else {
+                    continue;
+                };
+                match client.review(context, &review).await {
+                    Ok(()) => {
+                        if followed {
+                            followed_from[context.index()] = context
+                                .review(&proposed)
+                                .clone()
+                                .zip(context.baseline(&proposed).cloned());
+                            context.set(&mut proposed, review.clone(), &catalog);
+                        }
+                        confirmed[context.index()] = Some(review);
                     }
+                    Err(_) if context == HubReviewContext::Approve => {}
+                    Err(error) => return Err(error),
                 }
             }
             for context in HubReviewContext::ALL {
@@ -750,6 +842,12 @@ impl HubConnection {
             state.recommendations = recommendations;
             state.client = Some(client.clone());
             state.confirmed = confirmed;
+            // Repeated automatic follows keep the oldest unsaved origin for comparison.
+            for (current, followed) in state.followed_from.iter_mut().zip(followed_from) {
+                if current.is_none() {
+                    *current = followed;
+                }
+            }
             state.status = HubConnectionStatus::Connected;
             state.error = None;
             *self.inner.network_http.lock().unwrap() = Some(http);
@@ -1094,6 +1192,7 @@ impl HubConnection {
             // back; the durable choice remains visibly unconfirmed and can be explicitly retried.
             state.settings = self.persisted_store()?.save(&proposed)?;
             state.confirmed[context.index()] = None;
+            state.followed_from[context.index()] = None;
             (client, review, state.generation)
         };
         let result = client.review(context, &review).await;

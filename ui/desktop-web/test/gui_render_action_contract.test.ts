@@ -2011,3 +2011,20 @@ test("Desktop markup is pure across A to B to A local-presentation renders", () 
   assert.doesNotMatch(firstA, /B-only draft marker/);
   assert.match(onlyB, /B-only draft marker/);
 });
+
+test("send button names the Hub review gate when Hub blocks an otherwise open composer", () => {
+  const hub = {
+    settings_revision: "4", connection_generation: "1", status: "connected", endpoint: "https://hub.example.test:9470/",
+    label: "Desktop", hub_id: "hub-a", catalog: null, main_review: null, side_chat_review: null, approve_review: null,
+    main_confirmation: "review_required", side_chat_confirmation: "confirmed", approve_confirmation: "unconfirmed", error: null,
+    main_mode: "hub", side_chat_mode: "hub", approve_mode: "direct", active_main: null, active_side_chat: null, active_approve: null,
+    can_enable_main_hub: false, can_enable_side_chat_hub: true, can_enable_approve_hub: false,
+    can_change_main_mode: false, can_change_side_chat_mode: false, can_change_approve_mode: false,
+  } satisfies NonNullable<DesktopViewState["hub"]>;
+  const blocked = renderComposer(representativeState({ hub, can_submit: false }), defaultRenderLocal());
+  const send = /<button class="send composer-text-action"[^>]*>/.exec(blocked)?.[0] ?? "";
+  assert.match(send, /title="Hubのモデル選択を再確認・保存してください。"/);
+  assert.match(send, /\bdisabled\b/);
+  const open = renderComposer(representativeState({ hub: { ...hub, main_confirmation: "confirmed", can_enable_main_hub: true } }), defaultRenderLocal());
+  assert.match(/<button class="send composer-text-action"[^>]*>/.exec(open)?.[0] ?? "", /title="送信"/);
+});
